@@ -66,3 +66,47 @@ fn casting_player_reports_failure_since_casting_is_not_implemented() -> anyhow::
 
     Ok(())
 }
+
+/// stremio-video's createTorrent.js checks `resp.ok` before reading the
+/// body (createTorrent.js:62); a 200 on failure leaves `guessedFileIdx`
+/// undefined downstream and produces a broken `/{infoHash}/undefined`
+/// stream URL. `POST /create` must fail with a non-2xx status for
+/// malformed requests instead.
+#[test]
+fn create_engine_reports_failure_with_non_2xx_status() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_dir.path().join("cache")),
+        ..stream_server::ServerConfig::default()
+    })?;
+
+    let client = reqwest::blocking::Client::new();
+    let base = format!("http://{}", handle.http_addr());
+
+    // Neither `from` nor `torrent` given.
+    let response = client
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({}))
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = response.json()?;
+    assert!(body.get("error").is_some(), "expected an error body");
+
+    // `torrent` blob is not valid hex.
+    let response = client
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": "not-hex!" }))
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = response.json()?;
+    assert!(body.get("error").is_some(), "expected an error body");
+
+    handle.shutdown()?;
+    handle.join()?;
+
+    Ok(())
+}

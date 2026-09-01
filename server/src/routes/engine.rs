@@ -2,6 +2,7 @@ use crate::routes::compat;
 use crate::state::AppState;
 use axum::{
     extract::{Json, State},
+    http::StatusCode,
     response::IntoResponse,
 };
 use enginefs::backend::TorrentHandle;
@@ -37,12 +38,20 @@ pub async fn create_engine(
     let source = if let Some(hex_str) = payload.torrent {
         match hex::decode(hex_str) {
             Ok(bytes) => enginefs::backend::TorrentSource::Bytes(bytes),
-            Err(e) => return Json(json!({ "error": format!("Invalid hex blob: {}", e) })),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": format!("Invalid hex blob: {}", e) })),
+                );
+            }
         }
     } else if let Some(from) = payload.from {
         enginefs::backend::TorrentSource::Url(from)
     } else {
-        return Json(json!({ "error": "Missing 'from' or 'torrent' field" }));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Missing 'from' or 'torrent' field" })),
+        );
     };
 
     let trackers = merged_trackers(payload.announce, payload.peer_search);
@@ -56,9 +65,16 @@ pub async fn create_engine(
     {
         Ok(engine) => {
             let stats = stats_with_guess(&engine, &file_must_include, should_guess).await;
-            Json(stats)
+            (StatusCode::OK, Json(stats))
         }
-        Err(e) => Json(json!({ "error": e.to_string() })),
+        // stremio-video's createTorrent.js checks resp.ok before reading the
+        // body (createTorrent.js:62); a 200 here on failure leaves
+        // guessedFileIdx undefined and produces a broken /{infoHash}/undefined
+        // stream URL, so fail with a non-2xx status instead.
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        ),
     }
 }
 pub async fn list_engines(State(state): State<AppState>) -> impl IntoResponse {
@@ -132,9 +148,14 @@ pub async fn create_magnet(
     {
         Ok(engine) => {
             let stats = stats_with_guess(&engine, &file_must_include, should_guess).await;
-            Json(stats)
+            (StatusCode::OK, Json(stats))
         }
-        Err(e) => Json(json!({ "error": e.to_string() })),
+        // See the matching comment in create_engine: stremio-video's
+        // createTorrent.js requires a non-2xx status to detect failure.
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        ),
     }
 }
 
@@ -148,9 +169,12 @@ pub async fn create_magnet_get(
     match state.stream_engine().add_torrent(source, None).await {
         Ok(engine) => {
             let stats = stats_with_guess(&engine, &[], false).await;
-            Json(stats)
+            (StatusCode::OK, Json(stats))
         }
-        Err(e) => Json(json!({ "error": e.to_string() })),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        ),
     }
 }
 
