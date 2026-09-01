@@ -41,7 +41,20 @@ base64 = "0.22.1"
 walkdir = "2.5.0"
 url = "2.5.7"
 mime_guess = "2.0.5"
-async-rar = { path = "../bindings/async-rar", optional = true }
+# RAR archive streaming via the pure-Rust `unrar-rs` crate. LICENSING: this
+# crate is GPL-3.0-or-later. The repo SOURCE stays MIT (the LICENSE file is
+# unchanged and contains no unrar-rs code — the crate is only fetched at build
+# time), but because the DEFAULT build links unrar-rs, compiled/distributed
+# DEFAULT binaries of stream-server are covered by GPL-3.0-or-later. Build with
+# `--no-default-features` (plus a backend, e.g. `--features librqbit`) to
+# produce an MIT-licensed binary with no RAR support.
+#
+# default-features=false + crypto-rust keeps the crypto path pure-Rust: the
+# crate's DEFAULT `crypto-aws-lc` feature pulls the C library aws-lc-sys (needs
+# a C toolchain), which this build must NOT use.
+unrar-rs = { version = "0.7", default-features = false, features = [
+    "crypto-rust",
+], optional = true }
 lz-str = "0.2.1"
 tempfile = "3.23.0"
 mimalloc = { version = "0.1.48", default-features = false }
@@ -92,13 +105,15 @@ windows = { version = "0.62.2", features = [
 
 
 [features]
-default = ["librqbit"]
+# RAR is DEFAULT-ON. The pure-Rust `unrar-rs` backend needs no libclang/C++
+# toolchain, so it can ship in the default build. LICENSING: unrar-rs is
+# GPL-3.0-or-later, so the default binary is GPL-3.0-or-later (see the dep
+# comment above). Build `--no-default-features --features librqbit` for an
+# MIT binary with no RAR (RAR requests then return a 501 JSON error).
+default = ["librqbit", "rar"]
 libtorrent = ["enginefs/libtorrent"]
 librqbit = ["enginefs/librqbit"]
-# RAR archive streaming via the vendored UnRAR C++ sources. Off by default
-# because building async-rar requires libclang and a C++ toolchain (autocxx).
-# Without it, RAR requests return a 501 JSON error instead of streaming.
-rar = ["dep:async-rar"]
+rar = ["dep:unrar-rs"]
 
 [package.metadata.deb]
 maintainer = "stream-server maintainers"
