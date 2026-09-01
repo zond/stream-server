@@ -149,9 +149,18 @@ pub async fn player_control(
         query_params
     };
 
+    // stremio-core's play_on_device (models/streaming_server.rs:716-744) POSTs
+    // here and treats a successful (2xx) response as `PlayingOnDevice` — a
+    // 200 here would make official UIs report success while nothing plays.
+    // Casting isn't implemented, so fail visibly instead.
+    tracing::warn!(
+        device_id = %dev_id,
+        "Casting request rejected: device casting is not implemented"
+    );
     let response_json = json!({
         "deviceId": dev_id,
         "status": "not_implemented",
+        "error": { "message": "Device casting is not implemented" },
         "params": {
             "source": params.source,
             "paused": params.paused,
@@ -162,5 +171,5 @@ pub async fn player_control(
         }
     });
 
-    Json(response_json)
+    (StatusCode::NOT_IMPLEMENTED, Json(response_json))
 }

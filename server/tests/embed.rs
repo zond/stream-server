@@ -25,3 +25,44 @@ fn starts_and_stops_embedded_server() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// stremio-core's play_on_device (models/streaming_server.rs:716-744) POSTs
+/// to `casting/{device}/player` and treats any 2xx response as
+/// `PlayingOnDevice`. Casting isn't implemented, so the endpoint must fail
+/// visibly (non-2xx) instead of the official client silently believing
+/// playback started on the device.
+#[test]
+fn casting_player_reports_failure_since_casting_is_not_implemented() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_dir.path().join("cache")),
+        ..stream_server::ServerConfig::default()
+    })?;
+
+    let client = reqwest::blocking::Client::new();
+    let response = client
+        .post(format!(
+            "http://{}/casting/some-device/player",
+            handle.http_addr()
+        ))
+        .json(&serde_json::json!({ "source": "http://example.com/video.mp4", "time": 0 }))
+        .send()?;
+
+    assert!(
+        !response.status().is_success(),
+        "expected a non-2xx status, got {}",
+        response.status()
+    );
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_IMPLEMENTED);
+    let body: serde_json::Value = response.json()?;
+    assert!(body.get("error").is_some(), "expected an error body");
+
+    handle.shutdown()?;
+    handle.join()?;
+
+    Ok(())
+}
