@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -100,6 +101,7 @@ impl ProgressiveCache {
             pos: 0,
             total_size: self.total_size,
             notify: self.notify.clone(),
+            wait: None,
         })
     }
 }
@@ -215,6 +217,12 @@ pub struct ProgressiveReader {
     pos: u64,
     total_size: Option<u64>,
     notify: Arc<Notify>,
+    /// In-flight wait for a writer notification. This future owns a clone of
+    /// `notify` and MUST be kept across `poll_read` calls that return
+    /// `Poll::Pending`: dropping a `Notified` future deregisters its waker, so
+    /// a locally created-and-dropped future would miss every
+    /// `notify_waiters()` from the writer and the reader would hang forever.
+    wait: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
 }
 
 impl AsyncRead for ProgressiveReader {
@@ -224,7 +232,21 @@ impl AsyncRead for ProgressiveReader {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         loop {
-            // 1. Snapshot state
+            // 1. Arm a waiter BEFORE snapshotting state, so a notification
+            // that fires between the snapshot and returning Pending re-wakes
+            // this task instead of being lost.
+            if self.wait.is_none() {
+                let notify = self.notify.clone();
+                self.wait = Some(Box::pin(async move { notify.notified().await }));
+            }
+            let mut wait = self.wait.take().expect("wait future just set");
+            let wait_ready = wait.as_mut().poll(cx).is_ready();
+            if !wait_ready {
+                // Keep the registration alive across Pending returns.
+                self.wait = Some(wait);
+            }
+
+            // 2. Snapshot state
             let current_state = self.state_rx.borrow().clone();
 
             // Check errors
@@ -249,17 +271,22 @@ impl AsyncRead for ProgressiveReader {
                 // Let's assume it's safe.
 
                 let mut sub_buf = buf.take(needed);
-                let start_filled = sub_buf.filled().len();
                 let poll = Pin::new(&mut self.file).poll_read(cx, &mut sub_buf);
 
                 match poll {
                     Poll::Ready(Ok(())) => {
-                        let bytes_read = sub_buf.filled().len() - start_filled;
+                        let bytes_read = sub_buf.filled().len();
+                        // `sub_buf` borrows the parent's unfilled memory, but
+                        // filling it does not advance the parent `buf`, so
+                        // propagate the progress manually.
+                        // SAFETY: the file read initialized `bytes_read` bytes
+                        // of the parent's unfilled region through `sub_buf`.
+                        unsafe { buf.assume_init(bytes_read) };
+                        buf.advance(bytes_read);
                         if bytes_read == 0 && needed > 0 {
-                            // Should theoretically not happen if written_bytes > pos
-                            // But could happen if seek pointer is messed up?
-                            // Or filesystem lag?
-                            // Return pending to wait for more?
+                            // The state said data was available but the file
+                            // returned EOF (e.g. write not yet visible). Fall
+                            // through to the completion check / waiter below.
                         } else {
                             self.pos += bytes_read as u64;
                             return Poll::Ready(Ok(()));
@@ -275,19 +302,13 @@ impl AsyncRead for ProgressiveReader {
                 return Poll::Ready(Ok(()));
             }
 
-            // Wait for notification
-            // We use `notify.notified()` which gives a future.
-            // We need to poll that future.
-
-            // NOTE: We recreate the future every time. `notified()` is cancel-safe.
-            // Efficient implementation would cache it, but this is fine for now.
-            let notified = self.notify.notified();
-            tokio::pin!(notified);
-
-            match notified.poll(cx) {
-                Poll::Ready(()) => continue, // Woke up, retry
-                Poll::Pending => return Poll::Pending,
+            // Wait for a writer notification. The waiter armed at the top of
+            // the loop is already registered; if it fired, retry immediately,
+            // otherwise park until the writer's next notify_waiters().
+            if wait_ready {
+                continue;
             }
+            return Poll::Pending;
         }
     }
 }

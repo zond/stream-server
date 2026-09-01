@@ -74,7 +74,9 @@ open = "5.3.3"
 image = "0.25.9"
 ico = "0.5.0"
 zip = "8.6.0"
-async-sevenz = { path = "../bindings/async-sevenz" }
+# Pure-Rust 7z decompression (also used by tests to write fixtures via the
+# default "compress" feature); no C++ toolchain or libclang required.
+sevenz-rust2 = "0.22.2"
 chrono = "0.4.42"
 sysinfo = "0.39.5"
 
