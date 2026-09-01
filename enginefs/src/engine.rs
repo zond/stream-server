@@ -18,10 +18,99 @@ type ProbeInflight = HashMap<usize, ProbeCell>;
 type OpensubHashCell = Arc<OnceCell<Result<String, String>>>;
 type OpensubHashInflight = HashMap<usize, OpensubHashCell>;
 
-#[derive(serde::Deserialize, serde::Serialize)]
+/// Season/episode hints sent by stremio-video's createTorrent.js as
+/// `guessFileIdx: {season, episode}` (stremio-core: `CreatedTorrent.guess_file_idx`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct SeriesInfo {
     pub season: Option<usize>,
     pub episode: Option<usize>,
+}
+
+impl SeriesInfo {
+    /// True when at least one of season/episode is present — an empty
+    /// `guessFileIdx: {}` (movies) must not trigger episode-tag matching,
+    /// otherwise resolution strings like `1920x1080` get treated as tags.
+    pub fn has_hints(&self) -> bool {
+        self.season.is_some() || self.episode.is_some()
+    }
+}
+
+/// Extensions the guesser considers playable media (mirrors server.js).
+const GUESS_MEDIA_EXTENSIONS: [&str; 14] = [
+    ".mkv", ".avi", ".mp4", ".wmv", ".mov", ".mpg", ".ts", ".webm", ".flac", ".mp3", ".wav",
+    ".wma", ".aac", ".ogg",
+];
+
+/// Guess which file in `files` should be played, mirroring server.js's
+/// `guessFileIdx`: among media files, prefer ones whose name carries an
+/// episode tag (`SxxEyy` or `NxM`, case-insensitive) matching `series_info`;
+/// otherwise fall back to the largest media file. Non-media files are never
+/// chosen. Ties on size resolve to the lowest file index. Returns an index
+/// into `files`, or `None` when the list holds no media file at all.
+pub fn guess_file_index_in(
+    files: &[crate::backend::BackendFileInfo],
+    series_info: Option<&SeriesInfo>,
+) -> Option<usize> {
+    use std::cmp::Reverse;
+    use std::sync::LazyLock;
+
+    static RE_SXE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[sS](\d+)[eE](\d+)").unwrap());
+    static RE_XX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+)x(\d+)").unwrap());
+
+    let media_files: Vec<(usize, u64, String)> = files
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, file)| {
+            let filename = file.name.to_lowercase();
+            if GUESS_MEDIA_EXTENSIONS
+                .iter()
+                .any(|ext| filename.ends_with(ext))
+            {
+                Some((idx, file.length, filename))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if media_files.is_empty() {
+        return None;
+    }
+
+    if let Some(series) = series_info.filter(|series| series.has_hints()) {
+        let mut candidates = Vec::new();
+        for (idx, length, filename) in &media_files {
+            let mut found_s = None;
+            let mut found_e = None;
+
+            if let Some(caps) = RE_SXE.captures(filename) {
+                found_s = caps.get(1).and_then(|m| m.as_str().parse::<usize>().ok());
+                found_e = caps.get(2).and_then(|m| m.as_str().parse::<usize>().ok());
+            } else if let Some(caps) = RE_XX.captures(filename) {
+                found_s = caps.get(1).and_then(|m| m.as_str().parse::<usize>().ok());
+                found_e = caps.get(2).and_then(|m| m.as_str().parse::<usize>().ok());
+            }
+
+            let s_match = series.season.is_none() || found_s == series.season;
+            let e_match = series.episode.is_none() || found_e == series.episode;
+
+            if s_match && e_match && (found_s.is_some() || found_e.is_some()) {
+                candidates.push((*idx, *length));
+            }
+        }
+        if !candidates.is_empty() {
+            return candidates
+                .into_iter()
+                .max_by_key(|&(idx, len)| (len, Reverse(idx)))
+                .map(|(idx, _)| idx);
+        }
+    }
+
+    // Fallback to the largest media file
+    media_files
+        .into_iter()
+        .max_by_key(|&(idx, len, _)| (len, Reverse(idx)))
+        .map(|(idx, _, _)| idx)
 }
 
 pub struct Engine<H: TorrentHandle> {
@@ -214,62 +303,7 @@ impl<H: TorrentHandle> Engine<H> {
         series_info: Option<&crate::engine::SeriesInfo>,
     ) -> Option<usize> {
         let files = self.handle.get_files().await;
-
-        let media_extensions = [
-            ".mkv", ".avi", ".mp4", ".wmv", ".mov", ".mpg", ".ts", ".webm", ".flac", ".mp3",
-            ".wav", ".wma", ".aac", ".ogg",
-        ];
-
-        let mut media_files = Vec::new();
-
-        for (idx, file) in files.iter().enumerate() {
-            let filename = file.name.to_lowercase();
-            if media_extensions.iter().any(|ext| filename.ends_with(ext)) {
-                media_files.push((idx, file.length, filename));
-            }
-        }
-
-        if media_files.is_empty() {
-            return None;
-        }
-
-        if let Some(series) = series_info {
-            let re_sxe = Regex::new(r"[sS](\d+)[eE](\d+)").unwrap();
-            let re_xx = Regex::new(r"(\d+)x(\d+)").unwrap();
-
-            let mut candidates = Vec::new();
-            for (idx, length, filename) in &media_files {
-                let mut found_s = None;
-                let mut found_e = None;
-
-                if let Some(caps) = re_sxe.captures(filename) {
-                    found_s = caps.get(1).and_then(|m| m.as_str().parse::<usize>().ok());
-                    found_e = caps.get(2).and_then(|m| m.as_str().parse::<usize>().ok());
-                } else if let Some(caps) = re_xx.captures(filename) {
-                    found_s = caps.get(1).and_then(|m| m.as_str().parse::<usize>().ok());
-                    found_e = caps.get(2).and_then(|m| m.as_str().parse::<usize>().ok());
-                }
-
-                let s_match = series.season.is_none() || found_s == series.season;
-                let e_match = series.episode.is_none() || found_e == series.episode;
-
-                if s_match && e_match && (found_s.is_some() || found_e.is_some()) {
-                    candidates.push((*idx, *length));
-                }
-            }
-            if !candidates.is_empty() {
-                return candidates
-                    .into_iter()
-                    .max_by_key(|&(_, len)| len)
-                    .map(|(idx, _)| idx);
-            }
-        }
-
-        // Fallback to largest media file
-        media_files
-            .into_iter()
-            .max_by_key(|&(_, len, _)| len)
-            .map(|(idx, _, _)| idx)
+        guess_file_index_in(&files, series_info)
     }
 
     pub async fn get_statistics(&self) -> EngineStats {

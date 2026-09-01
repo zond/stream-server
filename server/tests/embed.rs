@@ -111,6 +111,96 @@ fn create_engine_reports_failure_with_non_2xx_status() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Builds a minimal valid multi-file .torrent (bencoded metainfo) so the
+/// create endpoint can resolve metadata without touching the network.
+/// File order: 0 = S01E01 (largest video), 1 = S01E02, 2 = readme.txt.
+fn season_pack_torrent_bytes() -> Vec<u8> {
+    fn bstr(value: &str) -> String {
+        format!("{}:{}", value.len(), value)
+    }
+    fn file_entry(length: u64, name: &str) -> String {
+        format!(
+            "d{}i{}e{}l{}ee",
+            bstr("length"),
+            length,
+            bstr("path"),
+            bstr(name)
+        )
+    }
+
+    // Total length 1700 < piece length, so exactly one (dummy) piece hash.
+    let files = [
+        file_entry(900, "Show.S01E01.1080p.mkv"),
+        file_entry(700, "Show.S01E02.1080p.mkv"),
+        file_entry(100, "readme.txt"),
+    ]
+    .concat();
+    let info = format!(
+        "d{}l{}e{}{}{}i16384e{}20:{}e",
+        bstr("files"),
+        files,
+        bstr("name"),
+        bstr("Show Season 1"),
+        bstr("piece length"),
+        bstr("pieces"),
+        "A".repeat(20),
+    );
+    format!("d{}{}e", bstr("info"), info).into_bytes()
+}
+
+/// stremio-video's createTorrent.js:41-53 sends
+/// `guessFileIdx: {season, episode}` when playing an episode without a known
+/// fileIdx, and streams `/{infoHash}/{resp.guessedFileIdx}`. For a season
+/// pack the server must return the file matching the episode, not the
+/// largest file (which is a different episode here).
+#[test]
+fn create_engine_guesses_episode_from_season_pack() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_dir.path().join("cache")),
+        ..stream_server::ServerConfig::default()
+    })?;
+
+    let client = reqwest::blocking::Client::new();
+    let blob = hex::encode(season_pack_torrent_bytes());
+
+    // Episode hints pick S01E02 (file 1) even though S01E01 (file 0) is larger.
+    let response = client
+        .post(format!("http://{}/create", handle.http_addr()))
+        .json(&serde_json::json!({
+            "torrent": blob,
+            "guessFileIdx": { "season": 1, "episode": 2 }
+        }))
+        .send()?
+        .error_for_status()?;
+    let body: serde_json::Value = response.json()?;
+    assert_eq!(
+        body["guessedFileIdx"], 1,
+        "expected the S01E02 file, got: {body}"
+    );
+
+    // Without hints the guess falls back to the largest media file.
+    let response = client
+        .post(format!("http://{}/create", handle.http_addr()))
+        .json(&serde_json::json!({ "torrent": blob, "guessFileIdx": {} }))
+        .send()?
+        .error_for_status()?;
+    let body: serde_json::Value = response.json()?;
+    assert_eq!(
+        body["guessedFileIdx"], 0,
+        "expected the largest video file, got: {body}"
+    );
+
+    handle.shutdown()?;
+    handle.join()?;
+
+    Ok(())
+}
+
 /// `GET /stats.json?sys=1` is polled roughly once a second by players.
 /// Confirms the response still carries the `sys.loadavg`/`sys.cpus` shape
 /// after moving the sysinfo sweep to a cached spawn_blocking call.

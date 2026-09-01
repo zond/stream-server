@@ -1697,7 +1697,7 @@ mod tests {
     struct FakeHandle {
         info_hash: String,
         counters: Arc<FakeCounters>,
-        file_count: usize,
+        files: Vec<BackendFileInfo>,
     }
 
     struct FakeBackend {
@@ -1744,14 +1744,21 @@ mod tests {
         }
 
         async fn stats(&self) -> EngineStats {
-            let files = (0..self.file_count)
-                .map(|idx| StatsFile {
-                    name: format!("video-{idx}.mkv"),
-                    path: format!("video-{idx}.mkv"),
-                    length: 100,
-                    offset: idx as u64 * 100,
-                    downloaded: 50,
-                    progress: 0.5,
+            let mut offset = 0u64;
+            let files = self
+                .files
+                .iter()
+                .map(|file| {
+                    let stats_file = StatsFile {
+                        name: file.name.clone(),
+                        path: file.name.clone(),
+                        length: file.length,
+                        offset,
+                        downloaded: file.length / 2,
+                        progress: 0.5,
+                    };
+                    offset += file.length;
+                    stats_file
                 })
                 .collect();
             EngineStats {
@@ -1788,7 +1795,7 @@ mod tests {
                 swarm_paused: false,
                 swarm_size: 0,
                 is_finished: false,
-                has_metadata: self.file_count > 0,
+                has_metadata: !self.files.is_empty(),
             }
         }
 
@@ -1836,12 +1843,7 @@ mod tests {
         }
 
         async fn get_files(&self) -> Vec<BackendFileInfo> {
-            (0..self.file_count)
-                .map(|idx| BackendFileInfo {
-                    name: format!("video-{idx}.mkv"),
-                    length: 100,
-                })
-                .collect()
+            self.files.clone()
         }
 
         async fn get_file_path(&self, _file_idx: usize) -> Option<String> {
@@ -1886,11 +1888,24 @@ mod tests {
     fn test_enginefs_with_file_count(
         file_count: usize,
     ) -> (BackendEngineFS<FakeBackend>, Arc<FakeCounters>) {
+        test_enginefs_with_files(
+            (0..file_count)
+                .map(|idx| (format!("video-{idx}.mkv"), 100))
+                .collect(),
+        )
+    }
+
+    fn test_enginefs_with_files(
+        files: Vec<(String, u64)>,
+    ) -> (BackendEngineFS<FakeBackend>, Arc<FakeCounters>) {
         let counters = Arc::new(FakeCounters::default());
         let handle = FakeHandle {
             info_hash: TEST_HASH.to_string(),
             counters: counters.clone(),
-            file_count,
+            files: files
+                .into_iter()
+                .map(|(name, length)| BackendFileInfo { name, length })
+                .collect(),
         };
         let mut restored = HashMap::new();
         restored.insert(TEST_HASH.to_string(), handle.clone());
@@ -2145,5 +2160,115 @@ mod tests {
         cleanup.await.expect("cleanup task completed");
 
         assert_eq!(counters.clear_file_streaming.load(Ordering::SeqCst), 1);
+    }
+
+    // --- season-pack episode guessing (server.js guessFileIdx parity) ---
+
+    fn series(season: usize, episode: usize) -> crate::engine::SeriesInfo {
+        crate::engine::SeriesInfo {
+            season: Some(season),
+            episode: Some(episode),
+        }
+    }
+
+    async fn guess_with(
+        files: &[(&str, u64)],
+        series: Option<crate::engine::SeriesInfo>,
+    ) -> Option<usize> {
+        let (enginefs, _counters) = test_enginefs_with_files(
+            files
+                .iter()
+                .map(|(name, length)| (name.to_string(), *length))
+                .collect(),
+        );
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        engine.guess_file_index(series.as_ref()).await
+    }
+
+    #[tokio::test]
+    async fn guess_picks_matching_episode_over_larger_files() {
+        let files = [
+            ("Show.S01E01.1080p.mkv", 5_000),
+            ("Show.S01E02.1080p.mkv", 1_000),
+            ("Show.S01E03.1080p.mkv", 8_000),
+        ];
+        assert_eq!(guess_with(&files, Some(series(1, 2))).await, Some(1));
+    }
+
+    #[tokio::test]
+    async fn guess_matches_1x02_notation() {
+        let files = [
+            ("show.1x01.mkv", 4_000),
+            ("show.1x02.mkv", 100),
+            ("show.1x03.mkv", 6_000),
+        ];
+        assert_eq!(guess_with(&files, Some(series(1, 2))).await, Some(1));
+    }
+
+    #[tokio::test]
+    async fn guess_is_case_insensitive() {
+        let files = [("SHOW.S01E01.MKV", 9_000), ("SHOW.s01E02.MKV", 10)];
+        assert_eq!(guess_with(&files, Some(series(1, 2))).await, Some(1));
+    }
+
+    #[tokio::test]
+    async fn guess_breaks_size_ties_on_lowest_index() {
+        let files = [
+            ("intro.mkv", 500),
+            ("Show.S01E02.CUT-A.mkv", 1_000),
+            ("Show.S01E02.CUT-B.mkv", 1_000),
+        ];
+        assert_eq!(guess_with(&files, Some(series(1, 2))).await, Some(1));
+    }
+
+    #[tokio::test]
+    async fn guess_prefers_larger_file_among_matching_episodes() {
+        let files = [
+            ("Show.S01E02.480p.mkv", 1_000),
+            ("Show.S01E02.1080p.mkv", 4_000),
+        ];
+        assert_eq!(guess_with(&files, Some(series(1, 2))).await, Some(1));
+    }
+
+    #[tokio::test]
+    async fn guess_falls_back_to_largest_media_when_no_episode_matches() {
+        let files = [
+            ("Show.S01E01.mkv", 2_000),
+            ("Show.S01E02.mkv", 7_000),
+            ("notes.txt", 90_000),
+        ];
+        assert_eq!(guess_with(&files, Some(series(9, 9))).await, Some(1));
+    }
+
+    #[tokio::test]
+    async fn guess_never_picks_non_media_files() {
+        let files = [
+            ("readme.txt", 900_000),
+            ("Show.S01E02.nfo", 800_000),
+            ("Show.S01E02.mkv", 10),
+        ];
+        assert_eq!(guess_with(&files, Some(series(1, 2))).await, Some(2));
+        assert_eq!(guess_with(&files, None).await, Some(2));
+    }
+
+    #[tokio::test]
+    async fn guess_returns_none_without_any_media_file() {
+        let files = [("readme.txt", 900_000), ("cover.jpg", 5_000)];
+        assert_eq!(guess_with(&files, Some(series(1, 2))).await, None);
+        assert_eq!(guess_with(&files, None).await, None);
+    }
+
+    #[tokio::test]
+    async fn empty_hints_do_not_trigger_episode_tag_matching() {
+        // guessFileIdx: {} (movies) must pick the largest media file, not a
+        // small file whose name happens to carry a resolution like 1920x1080.
+        let files = [
+            ("sample.1920x1080.mkv", 100),
+            ("Movie.2024.1080p.mkv", 9_000),
+        ];
+        assert_eq!(
+            guess_with(&files, Some(crate::engine::SeriesInfo::default())).await,
+            Some(1)
+        );
     }
 }

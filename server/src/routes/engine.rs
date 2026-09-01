@@ -6,6 +6,7 @@ use axum::{
     response::IntoResponse,
 };
 use enginefs::backend::TorrentHandle;
+use enginefs::engine::SeriesInfo;
 use hex;
 use serde::Deserialize;
 use serde_json::json;
@@ -56,7 +57,7 @@ pub async fn create_engine(
 
     let trackers = merged_trackers(payload.announce, payload.peer_search);
     let file_must_include = payload.file_must_include;
-    let should_guess = guess_file_idx_requested(payload.guess_file_idx.as_ref());
+    let guess = parse_guess_file_idx(payload.guess_file_idx.as_ref());
 
     match state
         .stream_engine()
@@ -64,7 +65,7 @@ pub async fn create_engine(
         .await
     {
         Ok(engine) => {
-            let stats = stats_with_guess(&engine, &file_must_include, should_guess).await;
+            let stats = stats_with_guess(&engine, &file_must_include, guess).await;
             (StatusCode::OK, Json(stats))
         }
         // stremio-video's createTorrent.js checks resp.ok before reading the
@@ -139,7 +140,7 @@ pub async fn create_magnet(
 
     let trackers = merged_trackers(None, payload.peer_search);
     let file_must_include = payload.file_must_include;
-    let should_guess = guess_file_idx_requested(payload.guess_file_idx.as_ref());
+    let guess = parse_guess_file_idx(payload.guess_file_idx.as_ref());
 
     match state
         .stream_engine()
@@ -147,7 +148,7 @@ pub async fn create_magnet(
         .await
     {
         Ok(engine) => {
-            let stats = stats_with_guess(&engine, &file_must_include, should_guess).await;
+            let stats = stats_with_guess(&engine, &file_must_include, guess).await;
             (StatusCode::OK, Json(stats))
         }
         // See the matching comment in create_engine: stremio-video's
@@ -168,7 +169,7 @@ pub async fn create_magnet_get(
 
     match state.stream_engine().add_torrent(source, None).await {
         Ok(engine) => {
-            let stats = stats_with_guess(&engine, &[], false).await;
+            let stats = stats_with_guess(&engine, &[], None).await;
             (StatusCode::OK, Json(stats))
         }
         Err(e) => (
@@ -189,18 +190,32 @@ fn merged_trackers(
     compat::normalize_tracker_sources(sources)
 }
 
-fn guess_file_idx_requested(value: Option<&serde_json::Value>) -> bool {
+/// Parse the request's `guessFileIdx` field, mirroring stremio-core's
+/// `CreatedTorrent.guess_file_idx: Option<SeriesInfo>`: `false`/`null`/absent
+/// means no guessing; `{}` means guess with no episode hints (movies);
+/// `{season, episode}` (stremio-video createTorrent.js:41-53) carries the
+/// hints; any other truthy value degrades to a hint-less guess.
+fn parse_guess_file_idx(value: Option<&serde_json::Value>) -> Option<SeriesInfo> {
     match value {
-        Some(serde_json::Value::Bool(false)) | None => false,
-        Some(serde_json::Value::Null) => false,
-        Some(_) => true,
+        None | Some(serde_json::Value::Bool(false)) | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Object(obj)) => Some(SeriesInfo {
+            season: obj
+                .get("season")
+                .and_then(serde_json::Value::as_u64)
+                .map(|v| v as usize),
+            episode: obj
+                .get("episode")
+                .and_then(serde_json::Value::as_u64)
+                .map(|v| v as usize),
+        }),
+        Some(_) => Some(SeriesInfo::default()),
     }
 }
 
 async fn stats_with_guess<H>(
     engine: &Arc<enginefs::engine::Engine<H>>,
     filters: &[String],
-    should_guess: bool,
+    guess: Option<SeriesInfo>,
 ) -> serde_json::Value
 where
     H: TorrentHandle,
@@ -208,26 +223,94 @@ where
     let stats = engine.get_statistics().await;
     let mut value = serde_json::to_value(stats).unwrap_or_else(|_| json!({}));
 
-    if filters.is_empty() && !should_guess {
+    if filters.is_empty() && guess.is_none() {
         return value;
     }
 
     let files = engine.handle.get_files().await;
-    let candidates = files
-        .iter()
-        .enumerate()
-        .map(|(index, file)| compat::FileCandidate {
-            index,
-            name: file.name.clone(),
-            length: file.length,
-        })
-        .collect::<Vec<_>>();
 
-    if let Ok(idx) = compat::resolve_file_idx("-1", &candidates, filters)
+    // fileMustInclude takes precedence: the stream explicitly names its file.
+    let mut guessed = files.iter().position(|file| {
+        filters
+            .iter()
+            .any(|filter| compat::file_matches_filter(&file.name, filter))
+    });
+
+    // Then the series-aware guess (SxxEyy / NxM episode tags, largest-media
+    // fallback) — this is what picks the right episode out of a season pack.
+    if guessed.is_none() && guess.is_some() {
+        guessed = enginefs::engine::guess_file_index_in(&files, guess.as_ref());
+    }
+
+    // Last resort (e.g. no media-extension file at all): largest video file,
+    // then largest file of any kind.
+    if guessed.is_none() {
+        let candidates = files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| compat::FileCandidate {
+                index,
+                name: file.name.clone(),
+                length: file.length,
+            })
+            .collect::<Vec<_>>();
+        guessed = compat::resolve_file_idx("-1", &candidates, &[]).ok();
+    }
+
+    if let Some(idx) = guessed
         && let Some(obj) = value.as_object_mut()
     {
         obj.insert("guessedFileIdx".to_string(), json!(idx));
     }
 
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(value: serde_json::Value) -> Option<SeriesInfo> {
+        parse_guess_file_idx(Some(&value))
+    }
+
+    #[test]
+    fn guess_file_idx_false_null_or_absent_means_no_guess() {
+        assert_eq!(parse_guess_file_idx(None), None);
+        assert_eq!(parse(json!(false)), None);
+        assert_eq!(parse(json!(null)), None);
+    }
+
+    #[test]
+    fn guess_file_idx_object_carries_season_and_episode() {
+        assert_eq!(
+            parse(json!({ "season": 2, "episode": 5 })),
+            Some(SeriesInfo {
+                season: Some(2),
+                episode: Some(5),
+            })
+        );
+    }
+
+    #[test]
+    fn guess_file_idx_empty_object_guesses_without_hints() {
+        assert_eq!(parse(json!({})), Some(SeriesInfo::default()));
+    }
+
+    #[test]
+    fn guess_file_idx_other_truthy_values_guess_without_hints() {
+        assert_eq!(parse(json!(true)), Some(SeriesInfo::default()));
+        assert_eq!(parse(json!(1)), Some(SeriesInfo::default()));
+    }
+
+    #[test]
+    fn guess_file_idx_ignores_non_numeric_hints() {
+        assert_eq!(
+            parse(json!({ "season": "x", "episode": 5 })),
+            Some(SeriesInfo {
+                season: None,
+                episode: Some(5),
+            })
+        );
+    }
 }
