@@ -1,4 +1,5 @@
 use crate::routes::compat;
+use crate::routes::util::parse_range;
 use crate::state::AppState;
 use axum::{
     body::Body,
@@ -935,44 +936,6 @@ pub async fn stream_video(
     }
 }
 
-fn parse_range(header: &str, size: u64) -> Option<(u64, u64)> {
-    let prefix = "bytes=";
-    if !header.starts_with(prefix) || size == 0 {
-        return None;
-    }
-
-    let range_str = &header[prefix.len()..];
-    let parts: Vec<&str> = range_str.split('-').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-
-    let start_str = parts[0];
-    let end_str = parts[1];
-
-    if start_str.is_empty() {
-        let suffix: u64 = end_str.parse().ok()?;
-        if suffix == 0 {
-            return None;
-        }
-        let start = size.saturating_sub(suffix);
-        return Some((start, size - 1));
-    }
-
-    let start: u64 = start_str.parse().ok()?;
-    let end = if end_str.is_empty() {
-        size - 1
-    } else {
-        end_str.parse().ok()?
-    };
-
-    if start > end || start >= size {
-        return None;
-    }
-
-    Some((start, end.min(size - 1)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -988,21 +951,6 @@ mod tests {
             assert_eq!(active_readers.load(Ordering::SeqCst), 1);
         }
         assert_eq!(active_readers.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn parses_standard_ranges() {
-        assert_eq!(parse_range("bytes=0-0", 10), Some((0, 0)));
-        assert_eq!(parse_range("bytes=5-", 10), Some((5, 9)));
-        assert_eq!(parse_range("bytes=-4", 10), Some((6, 9)));
-    }
-
-    #[test]
-    fn rejects_invalid_ranges() {
-        assert_eq!(parse_range("items=0-1", 10), None);
-        assert_eq!(parse_range("bytes=9-1", 10), None);
-        assert_eq!(parse_range("bytes=10-11", 10), None);
-        assert_eq!(parse_range("bytes=0-0", 0), None);
     }
 
     #[test]

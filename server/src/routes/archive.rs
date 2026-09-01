@@ -1,5 +1,6 @@
 use crate::archives::ArchiveSession;
 use crate::routes::compat;
+use crate::routes::util::parse_range;
 use crate::state::AppState;
 use axum::{
     Json, Router,
@@ -622,43 +623,4 @@ async fn stream_file(
     }
 
     Ok(builder.body(body).unwrap())
-}
-
-fn parse_range(header: &str, size: u64) -> Option<(u64, u64)> {
-    let prefix = "bytes=";
-    if !header.starts_with(prefix) {
-        return None;
-    }
-    let range_str = &header[prefix.len()..];
-    let parts: Vec<&str> = range_str.split('-').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-
-    let start_str = parts[0];
-    let end_str = parts[1];
-
-    if start_str.is_empty() {
-        // Suffix byte range: bytes=-500 (last 500 bytes)
-        let suffix: u64 = end_str.parse().ok()?;
-        if suffix == 0 {
-            return None;
-        }
-        let start = size.saturating_sub(suffix);
-        return Some((start, size - 1));
-    }
-
-    let start: u64 = start_str.parse().ok()?;
-
-    let end = if end_str.is_empty() {
-        size - 1
-    } else {
-        end_str.parse().ok()?
-    };
-
-    if start > end || start >= size {
-        return None;
-    }
-
-    Some((start, std::cmp::min(end, size - 1)))
 }

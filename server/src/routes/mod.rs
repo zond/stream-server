@@ -13,4 +13,5 @@ pub mod stream;
 pub mod subtitles;
 pub mod system;
 pub mod update;
+pub(crate) mod util;
 pub mod youtube;
