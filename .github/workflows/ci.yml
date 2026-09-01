@@ -58,9 +58,9 @@ jobs:
       # warnings (e.g. collapsible_if in enginefs), so gate hard only on the
       # correctness and suspicious groups; everything else stays a warning.
       #
-      # No --workspace: that would select settings-gui and the native binding
-      # crates (async-rar needs libclang, libtorrent-sys needs libtorrent).
-      # The bare invocation lints the workspace default-members, which is
+      # No --workspace: that would select the native binding crates
+      # (async-rar needs libclang, libtorrent-sys needs libtorrent). The
+      # bare invocation lints the workspace default-members, which is
       # exactly the pure-Rust set.
       - name: Clippy
         run: >-
@@ -77,16 +77,14 @@ jobs:
       - uses: actions/checkout@v7
 
       # Opt-in feature paths need native toolchains/headers:
-      #   rar          -> libclang (autocxx bindings for unrar)
-      #   gui          -> fontconfig, gtk3, ayatana-appindicator
-      #   settings-gui -> fontconfig, gtk3
+      #   rar -> libclang (autocxx bindings for unrar)
       # The libtorrent feature is intentionally NOT checked here; it needs a
       # multi-minute source build and is already covered by the check job in
       # release.yml.
       - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libclang-dev libfontconfig1-dev libgtk-3-dev libayatana-appindicator3-dev
+          sudo apt-get install -y libclang-dev
 
       # Matches the 1.98.0 pin in rust-toolchain.toml. The @master ref of
       # this action requires an explicit `toolchain` input; the version-named
@@ -101,9 +99,3 @@ jobs:
 
       - name: Check rar feature
         run: cargo check -p server --features rar
-
-      - name: Check gui feature
-        run: cargo check -p server --features gui
-
-      - name: Check settings-gui
-        run: cargo check -p settings-gui

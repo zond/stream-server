@@ -110,7 +110,6 @@ section = "net"
 priority = "optional"
 assets = [
     ["target/release/server", "usr/bin/stream-server", "755"],
-    ["target/release/settings-gui", "usr/bin/settings-gui", "755"],
 ]
 
 [package.metadata.wix]
