@@ -3,15 +3,13 @@ resolver = "2"
 members = [
     "enginefs",
     "server",
-    "bindings/libtorrent-sys",
     "stremio-runtime-stub",
     "updater-helper",
 ]
-# libtorrent-sys needs the libtorrent system library; keep it out of bare
-# `cargo build`/`cargo test` so headless machines build cleanly. It remains a
-# workspace member and is built explicitly with `-p <crate>` or via the opt-in
-# `libtorrent` feature. (RAR is now pure-Rust `unrar-rs`, a direct `server`
-# dependency behind the default-on `rar` feature — no separate binding crate.)
+# The workspace is pure Rust: librqbit is the sole torrent backend and RAR is
+# the pure-Rust `unrar-rs` crate (a direct `server` dependency behind the
+# default-on `rar` feature). `members` and `default-members` are identical, so
+# bare `cargo build`/`cargo test` build everything with no system libraries.
 default-members = [
     "enginefs",
     "server",
