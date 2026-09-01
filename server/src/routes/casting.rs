@@ -2,27 +2,12 @@ use crate::state::AppState;
 use axum::{
     Json, Router,
     extract::{Path, Query},
-    http::{StatusCode, header},
-    response::{IntoResponse, Response},
+    http::StatusCode,
+    response::IntoResponse,
     routing::get,
 };
 use serde::Deserialize;
 use serde_json::json;
-use std::process::Stdio;
-use tokio::process::Command;
-use tokio_util::io::ReaderStream;
-
-#[derive(Debug, Deserialize)]
-pub struct TranscodeParams {
-    pub video: String,
-    pub time: Option<f64>,
-    #[serde(rename = "audioTrack")]
-    pub _audio_track: Option<usize>,
-    pub fmp4: Option<String>,
-    pub _subtitles: Option<String>,
-    #[serde(rename = "subtitlesDelay")]
-    pub _subtitles_delay: Option<f64>,
-}
 
 #[derive(Debug, Deserialize)]
 pub struct PlayerParams {
@@ -59,82 +44,17 @@ pub async fn get_device(Path(dev_id): Path<String>) -> impl IntoResponse {
         .into_response()
 }
 
-pub async fn transcode(Query(params): Query<TranscodeParams>) -> Response {
-    let video_url = params.video;
-    let offset = params.time.unwrap_or(0.0);
-    let is_fmp4 = params.fmp4.is_some();
-
-    let mut args = vec![
-        "-copyts".to_string(),
-        "-ss".to_string(),
-        offset.to_string(),
-        "-i".to_string(),
-        video_url,
-    ];
-
-    args.extend(vec![
-        "-c:v".to_string(),
-        "libx264".to_string(),
-        "-preset".to_string(),
-        "ultrafast".to_string(),
-        "-tune".to_string(),
-        "zerolatency".to_string(),
-        "-pix_fmt".to_string(),
-        "yuv420p".to_string(),
-        "-c:a".to_string(),
-        "aac".to_string(),
-        "-ac".to_string(),
-        "2".to_string(),
-        "-threads".to_string(),
-        "0".to_string(),
-    ]);
-
-    if is_fmp4 {
-        args.extend(vec![
-            "-movflags".to_string(),
-            "frag_keyframe+empty_moov".to_string(),
-            "-f".to_string(),
-            "mp4".to_string(),
-        ]);
-    } else {
-        args.extend(vec!["-f".to_string(), "matroska".to_string()]);
-    }
-
-    args.push("pipe:1".to_string());
-
-    let mut cmd = Command::new("ffmpeg");
-    cmd.args(&args).stdout(Stdio::piped()).stderr(Stdio::null());
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to spawn ffmpeg: {}", e),
-            )
-                .into_response();
-        }
-    };
-
-    let stdout = child.stdout.take().expect("Failed to open stdout");
-    let stream = ReaderStream::new(stdout);
-
-    let content_type = if is_fmp4 {
-        "video/mp4"
-    } else {
-        "video/x-matroska"
-    };
-
-    Response::builder()
-        .header(header::CONTENT_TYPE, content_type)
-        .header(header::TRANSFER_ENCODING, "chunked")
-        .header("transferMode.dlna.org", "Streaming")
-        .header(
-            "contentFeatures.dlna.org",
-            "DLNA.ORG_OP=01;DLNA.ORG_CI=1;DLNA.ORG_FLAGS=01300000000000000000000000000000",
-        )
-        .body(axum::body::Body::from_stream(stream))
-        .unwrap()
+// On-the-fly DLNA transcoding used to shell out to ffmpeg. Transcoding has been
+// removed (the server is pure-Rust, direct-play only), so this reports
+// not-implemented rather than pretending to serve a transcoded stream.
+pub async fn transcode() -> impl IntoResponse {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "status": "not_implemented",
+            "error": { "message": "Transcoding is not supported" }
+        })),
+    )
 }
 
 pub async fn player_control(
