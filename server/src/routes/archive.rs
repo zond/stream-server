@@ -54,6 +54,24 @@ pub fn router() -> Router<AppState> {
         .route("/stream/{key}/{*file}", get(stream_content_path))
 }
 
+/// 501 JSON response returned for RAR requests when the "rar" cargo feature
+/// is not compiled into this build.
+#[cfg(not(feature = "rar"))]
+fn rar_disabled_response() -> Response {
+    tracing::warn!("RAR request rejected: RAR support is not compiled into this build");
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({ "error": crate::archives::RAR_DISABLED_ERROR })),
+    )
+        .into_response()
+}
+
+/// True when `path` points at a RAR archive that this build cannot handle.
+#[cfg(not(feature = "rar"))]
+fn is_unsupported_rar(path: &std::path::Path) -> bool {
+    path.to_string_lossy().to_lowercase().ends_with(".rar")
+}
+
 async fn resolve_path(url: &str) -> Result<PathBuf, StatusCode> {
     if url.starts_with("http://") || url.starts_with("https://") {
         tracing::info!("Downloading archive from URL: {}", url);
@@ -302,6 +320,11 @@ async fn create_session_internal(
         Err(status) => return (status, "Failed to resolve archive URL").into_response(),
     };
 
+    #[cfg(not(feature = "rar"))]
+    if is_unsupported_rar(&path) {
+        return rar_disabled_response();
+    }
+
     let selected_file = match select_archive_file(&state, &path, &payload).await {
         Ok(file) => file,
         Err(status) => return (status, "Failed to select archive file").into_response(),
@@ -523,6 +546,12 @@ async fn stream_file(
         let session_map = state.archive_cache.clone();
         let session = session_map.get(key).ok_or(StatusCode::NOT_FOUND)?;
         let path = session.path.clone();
+
+        #[cfg(not(feature = "rar"))]
+        if is_unsupported_rar(&path) {
+            return Ok(rar_disabled_response());
+        }
+
         crate::archives::get_archive_reader_with_config(&path, cache_config)
             .await
             .map_err(|e| {

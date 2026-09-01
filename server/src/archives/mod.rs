@@ -6,11 +6,18 @@ use tokio::io::{AsyncRead, AsyncSeek};
 pub mod bridge;
 pub mod cache;
 pub mod nzb;
+#[cfg(feature = "rar")]
 pub mod rar;
 pub mod sevenz;
 pub mod tar;
 pub mod tgz;
 pub mod zip;
+
+/// Error message used when a RAR archive is requested but this binary was
+/// built without the "rar" cargo feature.
+#[cfg(not(feature = "rar"))]
+pub const RAR_DISABLED_ERROR: &str =
+    "RAR support is not compiled into this build (rebuild with the \"rar\" cargo feature)";
 
 /// Represents a file inside an archive
 #[derive(Debug, Clone)]
@@ -117,15 +124,26 @@ pub async fn get_archive_reader_with_config(
         tracing::info!("Archive detected: ZIP at {:?}", path);
         Ok(Box::new(zip::ZipHandler::new(path.to_path_buf())))
     } else if path_str.ends_with(".rar") {
-        tracing::info!(
-            "Archive detected: RAR at {:?}, cache_dir={:?}",
-            path,
-            cache_config.cache_dir
-        );
-        Ok(Box::new(rar::RarHandler::new_with_config(
-            path.to_path_buf(),
-            cache_config,
-        )))
+        #[cfg(feature = "rar")]
+        {
+            tracing::info!(
+                "Archive detected: RAR at {:?}, cache_dir={:?}",
+                path,
+                cache_config.cache_dir
+            );
+            Ok(Box::new(rar::RarHandler::new_with_config(
+                path.to_path_buf(),
+                cache_config,
+            )))
+        }
+        #[cfg(not(feature = "rar"))]
+        {
+            tracing::warn!(
+                "RAR archive requested but RAR support is not compiled in: {:?}",
+                path
+            );
+            Err(anyhow::anyhow!(RAR_DISABLED_ERROR))
+        }
     } else if path_str.ends_with(".7z") {
         tracing::info!(
             "Archive detected: 7z at {:?}, cache_dir={:?}",

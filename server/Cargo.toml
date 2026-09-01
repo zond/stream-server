@@ -42,7 +42,7 @@ base64 = "0.22.1"
 walkdir = "2.5.0"
 url = "2.5.7"
 mime_guess = "2.0.5"
-async-rar = { path = "../bindings/async-rar" }
+async-rar = { path = "../bindings/async-rar", optional = true }
 lz-str = "0.2.1"
 tempfile = "3.23.0"
 mimalloc = { version = "0.1.48", default-features = false }
@@ -116,6 +116,10 @@ librqbit = ["enginefs/librqbit", "dep:librqbit"]
 # target-specific optional dependencies; on targets where a dependency table
 # does not apply (e.g. Android) enabling the feature is a no-op for it.
 gui = ["dep:tao", "dep:settings-gui", "dep:tray-icon"]
+# RAR archive streaming via the vendored UnRAR C++ sources. Off by default
+# because building async-rar requires libclang and a C++ toolchain (autocxx).
+# Without it, RAR requests return a 501 JSON error instead of streaming.
+rar = ["dep:async-rar"]
 
 [package.metadata.deb]
 maintainer = "stream-server maintainers"
