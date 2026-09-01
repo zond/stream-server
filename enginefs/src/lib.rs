@@ -30,6 +30,8 @@ pub use trackers::TrackerStorage;
 use crate::backend::librqbit::LibrqbitBackend;
 #[cfg(feature = "libtorrent")]
 use crate::backend::libtorrent::LibtorrentBackend;
+#[cfg(all(feature = "librqbit", not(feature = "libtorrent")))]
+use crate::backend::priorities::EngineCacheConfig;
 
 use crate::backend::{
     BackendMemoryDiagnostics, HotFilePriorityPlan, TorrentBackend, TorrentFilePriorityPlan,
