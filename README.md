@@ -2,9 +2,9 @@
 
 <div align="center">
 
-**🚀 Open Source Torrent Streaming Engine**
+**🚀 Pure-Rust Torrent Streaming Engine**
 
-*A modern, high-performance alternative to Stremio's closed-source `server.js`*
+*A headless, zero-system-dependency streaming backend, forked from Stremio's `server.js` replacement*
 
 [![Release Build](https://github.com/perpetus/stream-server/actions/workflows/release.yml/badge.svg)](https://github.com/perpetus/stream-server/actions/workflows/release.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
@@ -16,9 +16,11 @@
 
 ## 💡 About
 
-Stream Server is a **fully open-source** replacement for Stremio's proprietary `server.js`. While Stremio's streaming backend remains closed-source, this project provides complete transparency, community-driven development, and the freedom to run your streaming engine locally on your own terms.
+Stream Server is a hard fork of [perpetus/stream-server](https://github.com/perpetus/stream-server) (itself an open-source alternative to Stremio's closed-source `server.js`). This fork has a narrower, sharper goal: a **pure-Rust, headless torrent-streaming server with zero external binary or system-library requirements in its default build**. `cargo build` on a bare machine — no libtorrent, no libclang, no FFmpeg, no GUI toolkits — is enough to produce a working server.
 
-**Built in Rust** for maximum performance, minimal memory footprint, and rock-solid reliability.
+To get there, this fork **deliberately drops Stremio server.js API compatibility**: there is no HLS transcoding, no FFmpeg/FFprobe integration, and no video-probing endpoints. Those existed to reformat video for Stremio's web-based player. This server instead sits behind a **new native client app** (Flutter, with `libmpv`/`media_kit` for playback) that does direct play and handles codecs and subtitles itself — so the server's only job is getting torrent and archive bytes onto an HTTP connection efficiently, not transcoding them.
+
+The torrent engine itself is [`librqbit`](https://github.com/rqbit-torrent/rqbit), consumed via a fork ([`zond/rqbit`](https://github.com/zond/rqbit)) that adds a configurable per-stream lookahead window, so the engine can prioritize the bytes a player is about to read differently for sequential playback, seeks, and background downloads.
 
 ### Projects using Stream Server
 
@@ -27,38 +29,40 @@ Stream Server is a **fully open-source** replacement for Stremio's proprietary `
 
 ---
 
-## 🌟 Why Stream Server?
+## 🌟 Why this fork?
 
-| Feature | Stream Server | Stremio server.js |
-|---------|--------------|-------------------|
-| **Open Source** | ✅ **Yes** (MIT License) | ❌ Closed source |
-| **Performance** | ⚡ Native Rust | Node.js overhead |
-| **Memory Usage** | ~50MB | ~200MB+ |
-| **Control** | ✅ Full local control | ⚠️ Limited |
-| **Customizable** | ✅ Fork & modify | ❌ No access |
-| **Seekable Streams** | ✅ Instant | ⚠️ Variable |
-| **Archive Streaming** | ✅ ZIP/7Z/TAR (RAR opt-in) | ✅ |
+| | Stream Server (this fork) | Upstream `server.js` / stream-server |
+|---|---|---|
+| **Default build deps** | ✅ None — just the Rust toolchain | FFmpeg/FFprobe required at runtime; Node.js for `server.js` |
+| **Transcoding** | ❌ Not the server's job — client plays containers/codecs directly | ✅ HLS transcoding via FFmpeg |
+| **Torrent backend** | Pure-Rust `librqbit` by default | Native libtorrent (or Node bindings) |
+| **Open Source** | ✅ Yes (MIT License) | Upstream `server.js` is closed source |
+| **Seekable Streams** | ✅ Instant, via HTTP range requests | ⚠️ Variable |
+| **Archive Streaming** | ✅ ZIP/7Z/TAR built in (pure Rust), RAR opt-in | ✅ |
+| **Headless** | ✅ No tray, no desktop GUI in this repo | Varies |
 
-> **Seamless Migration**: Drop-in compatible with existing Stremio setups. Same API endpoints, same functionality — just faster and open source.
+This is not a drop-in replacement for `server.js` — the API surface it exposes is intentionally smaller. It's built to be the backend of one specific client, not a generic Stremio-compatible service.
 
 ---
 
 ## ✨ Features
 
 ### Core Streaming
-- **🚀 High Performance**: Pure Rust by default, with an optional C++ libtorrent backend
-- **🔧 Multiple Backends**: `librqbit` (pure Rust, default) or `libtorrent` (battle-tested C++, opt-in)
-- **📡 HTTP Range Requests**: Full support for instant seeking (direct play, no transcoding)
+- **🚀 Pure Rust by default**: the default build has no system-library or external-binary dependencies — only the pinned Rust toolchain
+- **🔧 Multiple Backends**: `librqbit` (pure Rust, default, via the `zond/rqbit` fork with configurable per-stream lookahead) or `libtorrent` (battle-tested C++, opt-in)
+- **📡 HTTP Range Requests**: torrent pieces are streamed straight to HTTP range requests for instant seeking — direct play, no transcoding step in between
 
-### Media Support
-- **📝 Subtitles**: External subtitle-file detection with pure-Rust SRT/ASS→VTT conversion, plus OpenSubtitles hash calculation
-- **📦 Archive Streaming**: Direct playback from ZIP, 7Z, and TAR archives out of the box (pure Rust); RAR via the opt-in `rar` feature
+### Media & Archives
+- **📦 Archive Streaming**: direct playback from ZIP, 7Z, TAR, and NZB archives out of the box (pure Rust); RAR via the opt-in `rar` feature
+- **📝 Subtitles**: external subtitle-file detection with pure-Rust SRT/ASS→VTT conversion, plus OpenSubtitles hash calculation (embedded-track extraction, which used FFmpeg, has been removed — the client handles embedded tracks itself)
+- **🎬 YouTube resolution**: resolves YouTube URLs to a direct playable stream via a managed `yt-dlp` (auto-downloaded and refreshed at runtime, not a build dependency)
 
-### API Compatibility
-- **🔌 Stats API**: `/stats.json` for server status and torrent info
-- **🌐 Network Info**: `/network-info` endpoint for interface discovery
+### Addon & Status API
+- **🔌 Local Stremio addon**: serves a Stremio-protocol addon (`manifest.json`, `catalog`, `meta`, `stream`) over scanned local/torrent content
+- **📊 Stats API**: `/stats.json` for server status and torrent info
+- **🌐 Network Info**: `/network-info` for interface discovery
 - **💓 Heartbeat**: `/heartbeat` for health checks
-- **⚙️ Settings**: Runtime-configurable via `/settings`
+- **⚙️ Settings**: runtime-configurable via `/settings`
 - **🔒 BitTorrent Privacy Controls**: DHT, PeX, LSD, encryption, interface binding, ports, and proxy settings. See [BitTorrent Settings](docs/bittorrent-settings.md).
 
 ---
@@ -79,26 +83,34 @@ Download from [Releases](https://github.com/perpetus/stream-server/releases):
 | Arch Linux | [Download package](https://github.com/perpetus/stream-server/releases/latest/download/stream-server-arch-x86_64.pkg.tar.zst) |
 | Checksums and all assets | [View latest release](https://github.com/perpetus/stream-server/releases/latest) |
 
+Note: release binaries are built with the opt-in `libtorrent` backend (`--features libtorrent --no-default-features`), not the default `librqbit` build — see [Backend Comparison](#-backend-comparison).
+
 ### Build from Source
 
-The default build is **pure Rust** and needs **zero system libraries** — no libtorrent, no libclang, no GUI toolkits. The pinned toolchain in `rust-toolchain.toml` (Rust 1.98.0) is picked up automatically by rustup:
+The **default build is pure Rust and needs zero system libraries** — no libtorrent, no libclang, no FFmpeg, no GUI toolkits. The pinned toolchain in `rust-toolchain.toml` (Rust 1.98.0) is picked up automatically by rustup, and this is exactly what CI verifies with no `apt install` step at all:
 
 ```bash
-# Default build (pure Rust librqbit backend - recommended)
+# Default build: pure-Rust librqbit backend, zero system deps
 cargo build --release
 ```
 
-Optional features pull in native dependencies:
+Everything else is opt-in and pulls in native dependencies only when you ask for it:
 
 ```bash
 # libtorrent backend (advanced; needs libtorrent-rasterbar + boost)
 cargo build --release --no-default-features --features libtorrent
 
-# RAR archive streaming (needs libclang + a C++ toolchain)
+# RAR archive streaming (needs libclang + a C++ toolchain — see below)
 cargo build --release --features rar
 ```
 
-Without the `rar` feature, RAR requests return a 501 JSON error; ZIP, 7Z, and TAR streaming are always built in.
+| Feature | What it adds | Extra system deps |
+|---|---|---|
+| *(default)* | `librqbit` torrent backend | None |
+| `libtorrent` | Alternative torrent backend, C++ libtorrent-rasterbar via FFI | `libtorrent-rasterbar` 2.1.1+, Boost headers, pkg-config, a C++17 compiler |
+| `rar` | RAR archive streaming, over vendored UnRAR C++ sources via `autocxx` | libclang, a C++ toolchain |
+
+Without the `rar` feature, RAR requests return a 501 JSON error; ZIP, 7Z, TAR, and NZB streaming are always built in. `libtorrent` and `librqbit` are mutually exclusive — build libtorrent with `--no-default-features` so it isn't compiled alongside the default backend.
 
 ---
 
@@ -219,7 +231,7 @@ prebuilt Skia binaries.
 
 ## 📊 Backend Comparison
 
-`librqbit` is the **default** backend: pure Rust, no system libraries, builds anywhere the pinned toolchain does. `libtorrent` is **opt-in** (`--no-default-features --features libtorrent`) for those who want the battle-tested C++ engine and are willing to install its native dependencies.
+`librqbit` is the **default** backend: pure Rust, no system libraries, builds anywhere the pinned toolchain does. It's consumed from the [`zond/rqbit`](https://github.com/zond/rqbit) fork, which adds a configurable per-stream lookahead window so piece priority can be tuned per playback intent (sequential play, seek, background download, etc). `libtorrent` is **opt-in** (`--no-default-features --features libtorrent`) for those who want the battle-tested C++ engine and are willing to install its native dependencies; it's also what the published release binaries ship with.
 
 | Feature | librqbit (default) | libtorrent (opt-in) |
 |---------|----------|------------|
@@ -230,6 +242,7 @@ prebuilt Skia binaries.
 | **DHT** | ✅ | ✅ |
 | **uTP** | ✅ | ✅ |
 | **Piece Deadline** | ❌ | ✅ |
+| **Configurable stream lookahead** | ✅ (via `zond/rqbit` fork) | N/A |
 | **Windows Setup** | ✅ Easy | ⚠️ Complex (vcpkg) |
 
 ---
@@ -238,14 +251,14 @@ prebuilt Skia binaries.
 
 ```
 stream-server/
-├── server/           # HTTP server and API routes
+├── server/           # HTTP server, API routes, local Stremio-addon plumbing
 ├── enginefs/         # Torrent engine abstraction
 │   └── src/backend/
 │       ├── librqbit.rs   # Pure Rust backend (default)
-│       └── libtorrent.rs # Native C++ backend (opt-in)
+│       └── libtorrent/   # Native C++ backend (opt-in)
 └── bindings/
     ├── libtorrent-sys/   # FFI bindings to libtorrent-rasterbar (libtorrent feature)
-    └── async-rar/        # Vendored UnRAR bindings (rar feature)
+    └── async-rar/        # Vendored UnRAR C++ bindings (rar feature)
 ```
 
 ---
@@ -289,4 +302,4 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 ## Keywords
 
-`stremio server.js alternative` `open source streaming engine` `torrent streaming` `local streaming` `desktop streaming` `rust torrent` `libtorrent` `video streaming server` `media engine` `torrent player` `stream torrents` `stremio alternative` `enginefs` `stremio open source`
+`pure rust torrent streaming` `headless torrent server` `librqbit` `rust torrent` `libtorrent` `video streaming server` `http range streaming` `torrent to http` `archive streaming` `stremio addon` `enginefs` `no ffmpeg`
