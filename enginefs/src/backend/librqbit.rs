@@ -1,11 +1,11 @@
 use crate::backend::{
     BackendFileInfo, BackendMemoryDiagnostics, EngineStats, FileStreamTrait, Growler, PeerSearch,
-    PieceReadiness, StatsFile, StatsOptions, SwarmCap, TorrentBackend, TorrentHandle,
-    TorrentSource,
+    PieceReadiness, StatsFile, StatsOptions, SwarmCap, TorrentBackend, TorrentFilePriorityPlan,
+    TorrentHandle, TorrentSource,
 };
 use anyhow::{Context, Result};
 use librqbit::{ManagedTorrent, Session};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -133,6 +133,74 @@ fn file_progress_fields(len: u64, have: u64) -> (u64, f64) {
         downloaded as f64 / len as f64
     };
     (downloaded, progress)
+}
+
+/// A file-selection operation on a multi-file torrent, mapped by
+/// `plan_only_files` onto librqbit's `only_files` want-set.
+#[derive(Debug, Clone, Copy)]
+enum SelectionOp {
+    /// Exclusive selection of one file for streaming.
+    Prepare(usize),
+    /// Deselect one file, keeping the rest of the selection.
+    Clear(usize),
+    /// Want exactly the union of the active and hot files.
+    Reconcile {
+        active: Option<usize>,
+        hot: Option<usize>,
+    },
+}
+
+/// Pure planner mapping the current `only_files` selection and an operation to
+/// the new selection to apply. `None` means "apply nothing".
+///
+/// Invariants enforced here (unit-tested):
+/// - Single-file torrents are always fully wanted: never touch selection.
+/// - The result is never an empty set (that would make nothing wanted and
+///   starve playback).
+/// - `Clear` of a file that is not currently selected (a newer `Prepare`
+///   already switched away) is a no-op, so late delayed-cleanup and HLS-lease
+///   expiry cannot clobber the active selection.
+/// - Out-of-range indices are dropped; a plan left empty by that is a no-op.
+fn plan_only_files(
+    current: Option<&[usize]>,
+    file_count: usize,
+    op: SelectionOp,
+) -> Option<HashSet<usize>> {
+    if file_count <= 1 {
+        return None;
+    }
+    match op {
+        SelectionOp::Prepare(idx) => {
+            if idx >= file_count {
+                return None;
+            }
+            Some(std::iter::once(idx).collect())
+        }
+        SelectionOp::Clear(idx) => {
+            let current = current?;
+            if !current.contains(&idx) {
+                return None;
+            }
+            let remainder: HashSet<usize> = current
+                .iter()
+                .copied()
+                .filter(|i| *i != idx && *i < file_count)
+                .collect();
+            if remainder.is_empty() {
+                None
+            } else {
+                Some(remainder)
+            }
+        }
+        SelectionOp::Reconcile { active, hot } => {
+            let set: HashSet<usize> = active
+                .into_iter()
+                .chain(hot)
+                .filter(|i| *i < file_count)
+                .collect();
+            if set.is_empty() { None } else { Some(set) }
+        }
+    }
 }
 
 pub struct LibrqbitHandle {
@@ -423,16 +491,75 @@ impl TorrentHandle for LibrqbitHandle {
         None
     }
 
-    async fn prepare_file_for_streaming(&self, _file_idx: usize) -> Result<()> {
-        Ok(())
+    /// Select `file_idx` as the only wanted file (exclusive downloading, per
+    /// the trait contract) on multi-file torrents. Best-effort: selection
+    /// failures (e.g. "can't update initializing torrent" during hash-check)
+    /// are logged and swallowed because run_probe propagates this error with
+    /// `?` and playback still works with the selection unchanged. Err is
+    /// returned only for a provably-bad file index, matching libtorrent.
+    ///
+    /// librqbit persists only_files across restarts; the next prepare or
+    /// reconcile simply rewrites it.
+    async fn prepare_file_for_streaming(&self, file_idx: usize) -> Result<()> {
+        let Some(file_count) = self.file_count_from_metadata() else {
+            warn!(
+                info_hash = %self.info_hash,
+                file_idx,
+                "prepare_file_for_streaming: metadata not resolved; skipping file gating"
+            );
+            return Ok(());
+        };
+        if file_idx >= file_count {
+            anyhow::bail!("File index {file_idx} out of range ({file_count} files)");
+        }
+        self.apply_selection(
+            SelectionOp::Prepare(file_idx),
+            file_count,
+            "prepare_file_for_streaming",
+        )
+        .await
     }
 
+    // keep_file_downloading stays the default-equivalent no-op: its only call
+    // site (lib.rs activate_file) is guarded by !is_multifile, where the whole
+    // torrent is a single file and therefore always wanted.
     async fn keep_file_downloading(&self, _file_idx: usize) -> Result<()> {
         Ok(())
     }
 
-    async fn clear_file_streaming(&self, _file_idx: usize) -> Result<()> {
-        Ok(())
+    /// Deselect `file_idx`, keeping the rest of the current selection. Called
+    /// from delayed cleanup and HLS-lease expiry, possibly AFTER a newer file
+    /// was prepared -- the planner refuses to clear a file that is no longer
+    /// selected and refuses to produce an empty want-set, so stale cleanups
+    /// can never clobber the active selection.
+    async fn clear_file_streaming(&self, file_idx: usize) -> Result<()> {
+        let Some(file_count) = self.file_count_from_metadata() else {
+            return Ok(());
+        };
+        self.apply_selection(
+            SelectionOp::Clear(file_idx),
+            file_count,
+            "clear_file_streaming",
+        )
+        .await
+    }
+
+    /// The engine's primary multi-file switching hook
+    /// (reconcile_multifile_engine in lib.rs): want exactly the union of the
+    /// active and hot files.
+    async fn reconcile_file_priorities(&self, plan: TorrentFilePriorityPlan) -> Result<()> {
+        let Some(file_count) = self.file_count_from_metadata() else {
+            return Ok(());
+        };
+        self.apply_selection(
+            SelectionOp::Reconcile {
+                active: plan.active_file,
+                hot: plan.hot_file.map(|h| h.file_idx),
+            },
+            file_count,
+            "reconcile_file_priorities",
+        )
+        .await
     }
 
     /// Block until the piece covering `offset` of `file_idx` is readable, or
@@ -544,6 +671,47 @@ impl TorrentHandle for LibrqbitHandle {
 }
 
 impl LibrqbitHandle {
+    /// File count from resolved metadata; None while a magnet is resolving.
+    fn file_count_from_metadata(&self) -> Option<usize> {
+        self.handle.metadata.load_full().map(|m| m.file_infos.len())
+    }
+
+    /// Run the pure planner against the live `only_files` selection and apply
+    /// the result via `Session::update_only_files`. Best-effort: librqbit
+    /// bails while the torrent is Initializing (hash-check), and callers like
+    /// run_probe propagate prepare errors with `?`, so an apply failure is
+    /// logged and swallowed -- with the selection unchanged librqbit still
+    /// downloads and playback works through the blocking reader.
+    async fn apply_selection(
+        &self,
+        op: SelectionOp,
+        file_count: usize,
+        context: &'static str,
+    ) -> Result<()> {
+        let current = self.handle.only_files();
+        let Some(set) = plan_only_files(current.as_deref(), file_count, op) else {
+            return Ok(());
+        };
+        if let Err(e) = self.session.update_only_files(&self.handle, &set).await {
+            warn!(
+                info_hash = %self.info_hash,
+                ?op,
+                context,
+                error = %e,
+                "Failed to update librqbit file selection (best-effort; selection unchanged)"
+            );
+        } else {
+            debug!(
+                info_hash = %self.info_hash,
+                ?op,
+                context,
+                selection = ?set,
+                "Updated librqbit file selection"
+            );
+        }
+        Ok(())
+    }
+
     /// Build a PieceReadiness with live peer count and download rate filled
     /// from one stats snapshot.
     fn readiness(
@@ -875,6 +1043,165 @@ mod tests {
         eprintln!("readiness: {r:?}");
         assert!(r.ready, "first piece did not arrive: {}", r.reason);
         assert_eq!(r.reason, "stream-read");
+    }
+
+    #[test]
+    fn plan_only_files_rules() {
+        use SelectionOp::*;
+        let plan = plan_only_files;
+        let set = |v: &[usize]| Some(v.iter().copied().collect::<HashSet<usize>>());
+
+        // Single-file torrents: never touch selection, for any op.
+        assert_eq!(plan(None, 1, Prepare(0)), None);
+        assert_eq!(plan(Some(&[0]), 1, Clear(0)), None);
+        assert_eq!(
+            plan(
+                None,
+                0,
+                Reconcile {
+                    active: Some(0),
+                    hot: None
+                }
+            ),
+            None
+        );
+
+        // Prepare: exclusive selection.
+        assert_eq!(plan(None, 3, Prepare(1)), set(&[1]));
+        assert_eq!(plan(Some(&[0, 2]), 3, Prepare(1)), set(&[1]));
+        // Prepare out of range: apply nothing.
+        assert_eq!(plan(None, 3, Prepare(3)), None);
+
+        // Clear: refuse to empty the set.
+        assert_eq!(plan(Some(&[1]), 3, Clear(1)), None);
+        // Clear of a stale file after a switch: no-op.
+        assert_eq!(plan(Some(&[0]), 3, Clear(1)), None);
+        // Clear with no selection at all: no-op.
+        assert_eq!(plan(None, 3, Clear(1)), None);
+        // Clear leaving a non-empty remainder applies it.
+        assert_eq!(plan(Some(&[0, 1]), 3, Clear(1)), set(&[0]));
+
+        // Reconcile: union of active and hot, never empty.
+        assert_eq!(
+            plan(
+                Some(&[1]),
+                3,
+                Reconcile {
+                    active: Some(0),
+                    hot: Some(2)
+                }
+            ),
+            set(&[0, 2])
+        );
+        assert_eq!(
+            plan(
+                Some(&[1]),
+                3,
+                Reconcile {
+                    active: None,
+                    hot: None
+                }
+            ),
+            None
+        );
+        // Out-of-range indices are dropped; empty result applies nothing.
+        assert_eq!(
+            plan(
+                None,
+                3,
+                Reconcile {
+                    active: Some(9),
+                    hot: Some(1)
+                }
+            ),
+            set(&[1])
+        );
+        assert_eq!(
+            plan(
+                None,
+                3,
+                Reconcile {
+                    active: Some(9),
+                    hot: None
+                }
+            ),
+            None
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn multifile_selection_lifecycle() {
+        use crate::backend::priorities::PlaybackIntent;
+        use crate::backend::{TorrentFilePriorityPlan, TorrentHandle};
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        // Multi-file torrents land in <download_dir>/<torrent name>/, so seed
+        // the payloads exactly there by creating the torrent from that dir.
+        let content_dir = dir.join("multi");
+        tokio::fs::create_dir_all(&content_dir).await.unwrap();
+        write_payload(&content_dir.join("a.bin"), 48 * 1024).await;
+        write_payload(&content_dir.join("b.bin"), 64 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&content_dir).await;
+
+        let (_backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
+        handle.handle.wait_until_initialized().await.unwrap();
+        assert_eq!(handle.file_count().await, 2);
+
+        let selection = |h: &LibrqbitHandle| {
+            let mut v = h.handle.only_files().unwrap_or_default();
+            v.sort_unstable();
+            v
+        };
+
+        // Prepare selects exclusively.
+        handle.prepare_file_for_streaming(1).await.unwrap();
+        assert_eq!(selection(&handle), vec![1]);
+
+        // Clearing the only selected file would empty the set -> no-op.
+        handle.clear_file_streaming(1).await.unwrap();
+        assert_eq!(selection(&handle), vec![1]);
+
+        // Reconcile switches to the active file.
+        handle
+            .reconcile_file_priorities(TorrentFilePriorityPlan {
+                active_file: Some(0),
+                hot_file: None,
+                generation: 1,
+                reason: "test",
+            })
+            .await
+            .unwrap();
+        assert_eq!(selection(&handle), vec![0]);
+
+        // Stale clear of a file that is no longer selected -> no-op.
+        handle.clear_file_streaming(1).await.unwrap();
+        assert_eq!(selection(&handle), vec![0]);
+
+        // Gating must not starve the selected, streamed file.
+        let r = handle
+            .wait_for_piece_ready(0, 0, Duration::from_secs(5), PlaybackIntent::DirectInitial)
+            .await
+            .unwrap();
+        assert!(r.ready, "selected file must stay readable: {}", r.reason);
+
+        // Out-of-range prepare is a structural error.
+        assert!(handle.prepare_file_for_streaming(2).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn single_file_torrent_selection_is_untouched() {
+        use crate::backend::TorrentHandle;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let payload = dir.join("payload.bin");
+        write_payload(&payload, 32 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+        let (_backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
+        handle.handle.wait_until_initialized().await.unwrap();
+
+        handle.prepare_file_for_streaming(0).await.unwrap();
+        handle.clear_file_streaming(0).await.unwrap();
+        assert_eq!(handle.handle.only_files(), None);
     }
 
     #[tokio::test]
