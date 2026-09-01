@@ -435,23 +435,148 @@ impl TorrentHandle for LibrqbitHandle {
         Ok(())
     }
 
+    /// Block until the piece covering `offset` of `file_idx` is readable, or
+    /// the timeout elapses. Mirrors the libtorrent behavioral contract:
+    /// timeouts and soft conditions return Ok(ready: false, reason), Err is
+    /// reserved for structural failures (bad file index).
+    ///
+    /// Mechanism: open a short-lived librqbit FileStream and seek to `offset`.
+    /// Registering the stream moves librqbit's per-stream lookahead window
+    /// (32MiB by default) to that offset and reconnects not-needed peers --
+    /// the deadline-equivalent priority yank -- and the subsequent 1-byte read
+    /// parks on the piece waker until the piece covering `offset` verifies.
+    /// The temporary stream drops at function exit, deregistering its window.
     async fn wait_for_piece_ready(
         &self,
-        _file_idx: usize,
-        _offset: u64,
-        _timeout: Duration,
-        _intent: crate::backend::priorities::PlaybackIntent,
+        file_idx: usize,
+        offset: u64,
+        timeout: Duration,
+        intent: crate::backend::priorities::PlaybackIntent,
     ) -> Result<PieceReadiness> {
-        Ok(PieceReadiness {
-            ready: true,
-            piece: -1,
-            ready_pieces: 1,
-            target_pieces: 1,
-            elapsed_ms: 0,
-            peers: 0,
-            download_rate: 0,
-            reason: "librqbit-reader".to_string(),
-        })
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+        let start = std::time::Instant::now();
+        debug!(
+            info_hash = %self.info_hash,
+            file_idx,
+            offset,
+            timeout_ms = timeout.as_millis() as u64,
+            ?intent,
+            "wait_for_piece_ready: begin"
+        );
+
+        // Phase 1: wait for metadata (a magnet may still be resolving).
+        let metadata = loop {
+            if let Some(m) = self.handle.metadata.load_full() {
+                break m;
+            }
+            if start.elapsed() >= timeout {
+                return Ok(self.readiness(start, false, -1, 0, 1, "no-metadata".to_string()));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+
+        let fi = metadata
+            .file_infos
+            .get(file_idx)
+            .with_context(|| format!("File index {file_idx} out of range"))?;
+        let piece_length = metadata.lengths.default_piece_length() as u64;
+        let piece = ((fi.offset_in_torrent + offset) / piece_length) as i32;
+        if fi.len > 0 && offset >= fi.len {
+            return Ok(self.readiness(
+                start,
+                false,
+                piece,
+                0,
+                1,
+                "piece-out-of-file-range".to_string(),
+            ));
+        }
+
+        // Phase 2: open the stream, retrying while the torrent is still
+        // initializing/checking (FileStream requires Paused or Live state).
+        let mut stream = loop {
+            match self.handle.clone().stream(file_idx) {
+                Ok(s) => break s,
+                Err(e) => {
+                    if start.elapsed() >= timeout {
+                        return Ok(self.readiness(
+                            start,
+                            false,
+                            piece,
+                            0,
+                            1,
+                            format!("stream-unavailable: {e:#}"),
+                        ));
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        };
+
+        // Seek completes synchronously for FileStream (poll_complete is
+        // always Ready) and also moves the shared per-stream window.
+        if let Err(e) = stream.seek(std::io::SeekFrom::Start(offset)).await {
+            return Ok(self.readiness(start, false, piece, 0, 1, format!("seek-error: {e}")));
+        }
+
+        // Phase 3: 1-byte read bounded by the remaining timeout. A successful
+        // read of 0 bytes is EOF at the exact file end, which still means the
+        // requested position is servable.
+        let remaining = timeout.saturating_sub(start.elapsed());
+        let mut buf = [0u8; 1];
+        let result = match tokio::time::timeout(remaining, stream.read(&mut buf)).await {
+            Ok(Ok(_n)) => self.readiness(start, true, piece, 1, 1, "stream-read".to_string()),
+            Ok(Err(e)) => self.readiness(start, false, piece, 0, 1, format!("read-error: {e}")),
+            Err(_) => self.readiness(start, false, piece, 0, 1, "timeout".to_string()),
+        };
+        debug!(
+            info_hash = %self.info_hash,
+            file_idx,
+            offset,
+            ready = result.ready,
+            reason = %result.reason,
+            elapsed_ms = result.elapsed_ms,
+            "wait_for_piece_ready: end"
+        );
+        Ok(result)
+    }
+}
+
+impl LibrqbitHandle {
+    /// Build a PieceReadiness with live peer count and download rate filled
+    /// from one stats snapshot.
+    fn readiness(
+        &self,
+        start: std::time::Instant,
+        ready: bool,
+        piece: i32,
+        ready_pieces: u32,
+        target_pieces: u32,
+        reason: String,
+    ) -> PieceReadiness {
+        let stats = self.handle.stats();
+        let (peers, download_rate) = stats
+            .live
+            .as_ref()
+            .map(|l| {
+                (
+                    l.snapshot.peer_stats.live as u64,
+                    // Speed.mbps is MiB/s; convert to bytes/s.
+                    (l.download_speed.mbps * 1_048_576.0) as u64,
+                )
+            })
+            .unwrap_or((0, 0));
+        PieceReadiness {
+            ready,
+            piece,
+            ready_pieces,
+            target_pieces,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+            peers,
+            download_rate,
+            reason,
+        }
     }
 }
 
@@ -615,6 +740,141 @@ mod tests {
 
         assert!(!TorrentHandle::is_finished(&handle).await);
         assert!(!handle.is_file_complete(0).await);
+    }
+
+    // Multi-thread flavor: FileStream reads go through block_in_place.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wait_for_piece_ready_is_ready_on_seeded_torrent() {
+        use crate::backend::TorrentHandle;
+        use crate::backend::priorities::PlaybackIntent;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let payload = dir.join("payload.bin");
+        write_payload(&payload, 96 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+        let (_backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
+        handle.handle.wait_until_initialized().await.unwrap();
+
+        let r = handle
+            .wait_for_piece_ready(0, 0, Duration::from_secs(5), PlaybackIntent::DirectInitial)
+            .await
+            .unwrap();
+        assert!(r.ready, "seeded torrent must be ready: {}", r.reason);
+        assert_eq!(r.reason, "stream-read");
+        assert_eq!(r.piece, 0);
+        assert_eq!((r.ready_pieces, r.target_pieces), (1, 1));
+
+        // Mid-file offset: piece index = offset / piece_length (single-file
+        // torrent, so the file starts at torrent offset 0).
+        let offset = 40_000u64;
+        let r = handle
+            .wait_for_piece_ready(
+                0,
+                offset,
+                Duration::from_secs(5),
+                PlaybackIntent::DirectSeek,
+            )
+            .await
+            .unwrap();
+        assert!(r.ready, "mid-file offset must be ready: {}", r.reason);
+        assert_eq!(r.piece, (offset / 16384) as i32);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wait_for_piece_ready_times_out_without_peers() {
+        use crate::backend::TorrentHandle;
+        use crate::backend::priorities::PlaybackIntent;
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        tokio::fs::create_dir_all(&src_dir).await.unwrap();
+        let payload = src_dir.join("payload.bin");
+        write_payload(&payload, 64 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+        let (_backend, handle) = backend_with_torrent(&tmp.path().join("dl"), &torrent_bytes).await;
+        handle.handle.wait_until_initialized().await.unwrap();
+
+        let timeout = Duration::from_millis(300);
+        let r = handle
+            .wait_for_piece_ready(0, 0, timeout, PlaybackIntent::DirectInitial)
+            .await
+            .unwrap();
+        assert!(!r.ready);
+        assert_eq!(r.reason, "timeout");
+        assert!(r.elapsed_ms >= 300, "elapsed_ms = {}", r.elapsed_ms);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wait_for_piece_ready_rejects_bad_targets() {
+        use crate::backend::TorrentHandle;
+        use crate::backend::priorities::PlaybackIntent;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let payload = dir.join("payload.bin");
+        write_payload(&payload, 32 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+        let (_backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
+        handle.handle.wait_until_initialized().await.unwrap();
+
+        // Offset past the end of the file: soft failure, not Err.
+        let r = handle
+            .wait_for_piece_ready(
+                0,
+                1_000_000,
+                Duration::from_secs(1),
+                PlaybackIntent::DirectSeek,
+            )
+            .await
+            .unwrap();
+        assert!(!r.ready);
+        assert_eq!(r.reason, "piece-out-of-file-range");
+
+        // Bad file index: structural failure -> Err.
+        assert!(
+            handle
+                .wait_for_piece_ready(7, 0, Duration::from_secs(1), PlaybackIntent::DirectInitial)
+                .await
+                .is_err()
+        );
+    }
+
+    /// Real-swarm integration test for the piece-yank path (needs actual
+    /// piece download from live peers, which the hermetic harness cannot
+    /// provide). Run manually with a well-seeded magnet link:
+    ///
+    /// ```sh
+    /// STREAM_SERVER_TEST_MAGNET='magnet:?xt=urn:btih:...' \
+    ///     cargo test -p enginefs --release wait_for_piece_ready_live_swarm -- --ignored --nocapture
+    /// ```
+    ///
+    /// Uses a network-enabled session (DHT on, real listen port), so it must
+    /// stay #[ignore]d in CI.
+    #[ignore = "requires network and STREAM_SERVER_TEST_MAGNET; see doc comment"]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wait_for_piece_ready_live_swarm() {
+        use crate::backend::TorrentHandle;
+        use crate::backend::priorities::PlaybackIntent;
+        let magnet = std::env::var("STREAM_SERVER_TEST_MAGNET")
+            .expect("set STREAM_SERVER_TEST_MAGNET to a magnet link");
+        let tmp = tempfile::tempdir().unwrap();
+        let (backend, _restored) = LibrqbitBackend::new(tmp.path().to_path_buf())
+            .await
+            .expect("network session");
+        let handle = backend
+            .add_torrent(TorrentSource::Url(magnet), vec![])
+            .await
+            .expect("add magnet");
+        let r = handle
+            .wait_for_piece_ready(
+                0,
+                0,
+                Duration::from_secs(120),
+                PlaybackIntent::DirectInitial,
+            )
+            .await
+            .expect("structural failure");
+        eprintln!("readiness: {r:?}");
+        assert!(r.ready, "first piece did not arrive: {}", r.reason);
+        assert_eq!(r.reason, "stream-read");
     }
 
     #[tokio::test]
