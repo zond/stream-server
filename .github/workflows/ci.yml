@@ -99,3 +99,30 @@ jobs:
 
       - name: Check rar feature
         run: cargo check -p server --features rar
+
+  windows:
+    name: Windows Build and Test
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v7
+
+      # Matches the 1.98.0 pin in rust-toolchain.toml. The @master ref of
+      # this action requires an explicit `toolchain` input; the version-named
+      # ref installs that version directly.
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.98.0
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      # Default features only (pure-Rust librqbit backend): no vcpkg, no
+      # libtorrent, no ffmpeg, no libclang. This is a cheap cross-platform
+      # guard for the default build; the expensive libtorrent+vcpkg Windows
+      # build stays in release.yml, tag-triggered only.
+      - name: Build
+        run: cargo build
+
+      - name: Test
+        run: cargo test
