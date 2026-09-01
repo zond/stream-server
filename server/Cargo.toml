@@ -79,14 +79,16 @@ chrono = "0.4.42"
 sysinfo = "0.39.5"
 
 [target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))'.dependencies]
-tao = "0.35.3"
-settings-gui = { path = "../settings-gui" }
+tao = { version = "0.35.3", optional = true }
+settings-gui = { path = "../settings-gui", optional = true }
 
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
-tray-icon = { version = "0.24.1", default-features = false }
+tray-icon = { version = "0.24.1", default-features = false, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-tray-icon = { version = "0.24.1", default-features = false, features = ["gtk"] }
+tray-icon = { version = "0.24.1", default-features = false, features = [
+    "gtk",
+], optional = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 rustls-platform-verifier = "0.7.0"
@@ -109,6 +111,11 @@ windows = { version = "0.62.2", features = [
 default = ["librqbit"]
 libtorrent = ["enginefs/libtorrent"]
 librqbit = ["enginefs/librqbit", "dep:librqbit"]
+# Desktop system tray + Slint settings window. Off by default so headless
+# builds need no fontconfig/gtk/Slint toolchain. The dep: entries reference
+# target-specific optional dependencies; on targets where a dependency table
+# does not apply (e.g. Android) enabling the feature is a no-op for it.
+gui = ["dep:tao", "dep:settings-gui", "dep:tray-icon"]
 
 [package.metadata.deb]
 maintainer = "stream-server maintainers"

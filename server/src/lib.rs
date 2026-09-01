@@ -20,10 +20,19 @@ pub const DEFAULT_HTTPS_PORT: u16 = 12470;
 pub static GLOBAL_STATE: once_cell::sync::Lazy<std::sync::RwLock<Option<AppState>>> =
     once_cell::sync::Lazy::new(|| std::sync::RwLock::new(None));
 
-#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+#[cfg(all(
+    feature = "gui",
+    any(target_os = "windows", target_os = "macos", target_os = "linux")
+))]
 pub mod tray;
 
-#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+/// Headless fallback: keeps the `tray::TrayStats` plumbing compiling when the
+/// desktop tray is unavailable (non-desktop targets, or the `gui` feature is
+/// disabled). Stats updates become no-ops and the server just runs headless.
+#[cfg(not(all(
+    feature = "gui",
+    any(target_os = "windows", target_os = "macos", target_os = "linux")
+)))]
 pub mod tray {
     #[derive(Default)]
     pub struct TrayStats;

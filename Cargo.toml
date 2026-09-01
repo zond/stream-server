@@ -10,6 +10,18 @@ members = [
     "updater-helper",
     "settings-gui",
 ]
+# settings-gui (Slint) needs fontconfig/gtk dev headers; keep it out of bare
+# `cargo build`/`cargo test` so headless machines build cleanly. It remains a
+# workspace member and is built explicitly with `-p settings-gui`.
+default-members = [
+    "enginefs",
+    "server",
+    "bindings/async-rar",
+    "bindings/libtorrent-sys",
+    "bindings/async-sevenz",
+    "stremio-runtime-stub",
+    "updater-helper",
+]
 
 [profile.release]
 opt-level = "z"
