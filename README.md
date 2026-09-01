@@ -36,7 +36,6 @@ Stream Server is a **fully open-source** replacement for Stremio's proprietary `
 | **Memory Usage** | ~50MB | ~200MB+ |
 | **Control** | ✅ Full local control | ⚠️ Limited |
 | **Customizable** | ✅ Fork & modify | ❌ No access |
-| **HLS Transcoding** | ✅ Built-in | ✅ |
 | **Seekable Streams** | ✅ Instant | ⚠️ Variable |
 | **Archive Streaming** | ✅ ZIP/7Z/TAR (RAR opt-in) | ✅ |
 
@@ -48,13 +47,11 @@ Stream Server is a **fully open-source** replacement for Stremio's proprietary `
 
 ### Core Streaming
 - **🚀 High Performance**: Pure Rust by default, with an optional C++ libtorrent backend
-- **📺 HLS Transcoding**: Real-time video transcoding via FFmpeg (master.m3u8, stream.m3u8)
 - **🔧 Multiple Backends**: `librqbit` (pure Rust, default) or `libtorrent` (battle-tested C++, opt-in)
-- **📡 HTTP Range Requests**: Full support for instant seeking
+- **📡 HTTP Range Requests**: Full support for instant seeking (direct play, no transcoding)
 
 ### Media Support
-- **📝 Subtitle Extraction**: Automatic detection, OpenSubtitles hash calculation
-- **🎬 Video Probing**: FFprobe integration for track analysis
+- **📝 Subtitles**: External subtitle-file detection with pure-Rust SRT/ASS→VTT conversion, plus OpenSubtitles hash calculation
 - **📦 Archive Streaming**: Direct playback from ZIP, 7Z, and TAR archives out of the box (pure Rust); RAR via the opt-in `rar` feature
 
 ### API Compatibility
@@ -292,4 +289,4 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 ## Keywords
 
-`stremio server.js alternative` `open source streaming engine` `torrent streaming` `local streaming` `desktop streaming` `hls transcoding` `rust torrent` `libtorrent` `video streaming server` `media engine` `torrent player` `stream torrents` `stremio alternative` `enginefs` `stremio open source`
+`stremio server.js alternative` `open source streaming engine` `torrent streaming` `local streaming` `desktop streaming` `rust torrent` `libtorrent` `video streaming server` `media engine` `torrent player` `stream torrents` `stremio alternative` `enginefs` `stremio open source`
