@@ -75,11 +75,9 @@ Download from [Releases](https://github.com/perpetus/stream-server/releases):
 | Platform | Download |
 |----------|----------|
 | Windows (portable) | [Download EXE](https://github.com/perpetus/stream-server/releases/latest/download/stream-server-windows-amd64.exe) |
-| Windows settings GUI | [Download EXE](https://github.com/perpetus/stream-server/releases/latest/download/stream-server-settings-windows-amd64.exe) |
 | Windows installer | [Download MSI](https://github.com/perpetus/stream-server/releases/latest/download/stream-server-windows-amd64.msi) |
 | Debian / Ubuntu | [Download DEB](https://github.com/perpetus/stream-server/releases/latest/download/stream-server-linux-amd64.deb) |
 | Linux (portable) | [Download binary](https://github.com/perpetus/stream-server/releases/latest/download/stream-server-linux-amd64) |
-| Linux settings GUI | [Download binary](https://github.com/perpetus/stream-server/releases/latest/download/stream-server-settings-linux-amd64) |
 | Linux (AppImage) | [Download AppImage](https://github.com/perpetus/stream-server/releases/latest/download/stream-server-linux-amd64.AppImage) |
 | Arch Linux | [Download package](https://github.com/perpetus/stream-server/releases/latest/download/stream-server-arch-x86_64.pkg.tar.zst) |
 | Checksums and all assets | [View latest release](https://github.com/perpetus/stream-server/releases/latest) |
@@ -98,9 +96,6 @@ Optional features pull in native dependencies:
 ```bash
 # libtorrent backend (advanced; needs libtorrent-rasterbar + boost)
 cargo build --release --no-default-features --features libtorrent
-
-# Desktop tray + settings GUI (needs fontconfig/gtk on Linux)
-cargo build --release --features gui
 
 # RAR archive streaming (needs libclang + a C++ toolchain)
 cargo build --release --features rar
@@ -132,7 +127,7 @@ For the **default build**, all you need on any platform is Rust via [rustup](htt
 cargo build --release
 ```
 
-The platform notes below are only needed for the **opt-in features** (`libtorrent`, `gui`, `rar`).
+The platform notes below are only needed for the **opt-in features** (`libtorrent`, `rar`).
 
 <details>
 <summary><b>🐧 Arch Linux</b></summary>
@@ -142,9 +137,6 @@ sudo pacman -S rustup
 
 # For the libtorrent backend (--no-default-features --features libtorrent)
 sudo pacman -S libtorrent-rasterbar boost pkg-config
-
-# For the tray + settings GUI (--features gui)
-sudo pacman -S fontconfig gtk3
 
 # For RAR streaming (--features rar)
 sudo pacman -S clang
@@ -162,9 +154,6 @@ source ~/.cargo/env
 # For the libtorrent backend (--no-default-features --features libtorrent)
 sudo apt install build-essential pkg-config libtorrent-rasterbar-dev libboost-all-dev
 
-# For the tray + settings GUI (--features gui)
-sudo apt install libfontconfig1-dev libgtk-3-dev
-
 # For RAR streaming (--features rar)
 sudo apt install build-essential libclang-dev
 ```
@@ -180,9 +169,6 @@ source ~/.cargo/env
 
 # For the libtorrent backend (--no-default-features --features libtorrent)
 sudo dnf install gcc gcc-c++ pkg-config rb_libtorrent-devel boost-devel
-
-# For the tray + settings GUI (--features gui)
-sudo dnf install fontconfig-devel gtk3-devel
 
 # For RAR streaming (--features rar)
 sudo dnf install gcc-c++ clang-devel
