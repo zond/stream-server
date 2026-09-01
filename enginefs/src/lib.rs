@@ -1431,6 +1431,99 @@ impl BackendEngineFS<LibrqbitBackend> {
             download_dir,
         ))
     }
+
+    pub async fn new_with_storage(
+        root_dir: std::path::PathBuf,
+        _config: crate::backend::BackendConfig,
+        tracker_storage: Option<Arc<dyn crate::trackers::TrackerStorage>>,
+    ) -> Result<Self> {
+        let download_dir = root_dir.join("rqbit-downloads");
+        let (backend, restored) = LibrqbitBackend::new(download_dir.clone()).await?;
+        Ok(Self::new_with_backend_and_storage(
+            backend,
+            restored,
+            root_dir.join("cache"),
+            download_dir,
+            tracker_storage,
+        ))
+    }
+
+    /// librqbit sessions always persist downloads to disk, so the disk-backed
+    /// constructor is the same as the regular one.
+    pub async fn new_disk_backed(
+        root_dir: std::path::PathBuf,
+        config: crate::backend::BackendConfig,
+        tracker_storage: Option<Arc<dyn crate::trackers::TrackerStorage>>,
+    ) -> Result<Self> {
+        Self::new_with_storage(root_dir, config, tracker_storage).await
+    }
+
+    /// librqbit does not support reconfiguring a live session; settings apply
+    /// on the next restart.
+    pub async fn update_torrent_settings(
+        &self,
+        _profile: &crate::backend::TorrentSpeedProfile,
+        _privacy: &crate::backend::TorrentPrivacyConfig,
+    ) {
+        tracing::debug!(
+            "librqbit backend does not support dynamic session settings; they apply on restart"
+        );
+    }
+
+    pub fn set_seeding_enabled(&self, enabled: bool) {
+        self.seeding_enabled.store(enabled, Ordering::Relaxed);
+        self.backend.set_seeding_enabled(enabled);
+        tracing::info!(seeding_enabled = enabled, "Seeding policy updated");
+
+        // When seeding is turned back on, resume torrents the seeding-disabled
+        // policy had paused so they can seed again. Turning seeding off is
+        // handled lazily by the periodic loop / schedule_torrent_pause.
+        if enabled {
+            let engines = self.engines.clone();
+            tokio::spawn(async move {
+                let read = engines.read().await;
+                for engine in read.values() {
+                    if engine.handle.manages_playback_lifecycle() {
+                        continue;
+                    }
+                    if engine.idle_paused.swap(false, Ordering::Relaxed)
+                        && let Err(err) = engine.handle.resume_torrent().await
+                    {
+                        tracing::warn!(
+                            info_hash = %engine.info_hash,
+                            error = %err,
+                            "Failed to resume torrent after re-enabling seeding"
+                        );
+                        engine.idle_paused.store(true, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+    }
+
+    pub fn seeding_enabled(&self) -> bool {
+        self.seeding_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Mark the torrent as active. librqbit has no session-wide streaming mode,
+    /// so this is a best-effort resume of a torrent the idle policy had paused.
+    pub async fn focus_torrent(&self, target_info_hash: &str) {
+        if let Some(engine) = self.get_engine(&target_info_hash.to_lowercase()).await {
+            if engine.handle.manages_playback_lifecycle() {
+                return;
+            }
+            if engine.idle_paused.swap(false, Ordering::Relaxed)
+                && let Err(err) = engine.handle.resume_torrent().await
+            {
+                tracing::warn!(
+                    info_hash = %engine.info_hash,
+                    error = %err,
+                    "Failed to resume torrent on focus"
+                );
+                engine.idle_paused.store(true, Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 #[cfg(feature = "libtorrent")]
