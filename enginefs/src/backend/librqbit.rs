@@ -121,6 +121,20 @@ impl LibrqbitBackend {
     }
 }
 
+/// Pure helper mapping a file's length and chunk-tracker have-bytes to the
+/// (downloaded, progress) pair reported in /stats.json. Clamps have > len
+/// (last-piece rounding in the chunk tracker) and treats zero-length files as
+/// fully downloaded with progress 1.0.
+fn file_progress_fields(len: u64, have: u64) -> (u64, f64) {
+    let downloaded = have.min(len);
+    let progress = if len == 0 {
+        1.0
+    } else {
+        downloaded as f64 / len as f64
+    };
+    (downloaded, progress)
+}
+
 pub struct LibrqbitHandle {
     pub handle: Arc<ManagedTorrent>,
     pub info_hash: String,
@@ -233,26 +247,36 @@ impl TorrentHandle for LibrqbitHandle {
 
     async fn stats(&self) -> EngineStats {
         let stats = self.handle.stats();
+        // CAUTION: librqbit's Speed.mbps is MiB/s, NOT megabits/s
+        // (librqbit-core speed_estimator.rs: mbps() = bps()/1024/1024), so the
+        // conversion to bytes/s is a plain * 1 MiB with no /8.
         let (download_speed, upload_speed) = if let Some(ref live) = stats.live {
             (
-                live.download_speed.mbps * 1_048_576.0 / 8.0,
-                live.upload_speed.mbps * 1_048_576.0 / 8.0,
+                live.download_speed.mbps * 1_048_576.0,
+                live.upload_speed.mbps * 1_048_576.0,
             )
         } else {
             (0.0, 0.0)
         };
 
-        let (downloaded, uploaded) = if let Some(ref live) = stats.live {
-            (live.snapshot.fetched_bytes, live.snapshot.uploaded_bytes)
-        } else {
-            (0, 0)
-        };
+        // progress_bytes is persisted have-bytes (survives restarts), matching
+        // libtorrent's total_done semantics; fetched_bytes resets each session.
+        let downloaded = stats.progress_bytes;
+        let uploaded = stats.uploaded_bytes;
 
-        let peers = stats
+        let (peers, queued, unique) = stats
             .live
             .as_ref()
-            .map(|l| l.snapshot.peer_stats.live as u64)
-            .unwrap_or(0);
+            .map(|l| {
+                (
+                    l.snapshot.peer_stats.live as u64,
+                    l.snapshot.peer_stats.queued as u64,
+                    l.snapshot.peer_stats.seen as u64,
+                )
+            })
+            .unwrap_or((0, 0, 0));
+
+        let has_metadata = self.handle.metadata.load().is_some();
 
         let mut files = Vec::new();
         let mut total_size = 0u64;
@@ -260,15 +284,18 @@ impl TorrentHandle for LibrqbitHandle {
         if let Some(m) = self.handle.metadata.load_full()
             && let Ok(iter) = m.info.iter_file_details()
         {
-            for f in iter {
+            for (i, f) in iter.enumerate() {
                 let filename = f.filename.to_string().unwrap_or_default();
+                // file_progress is empty while the torrent is Initializing.
+                let have = stats.file_progress.get(i).copied().unwrap_or(0);
+                let (file_downloaded, file_progress) = file_progress_fields(f.len, have);
                 files.push(StatsFile {
                     name: filename.clone(),
                     path: filename,
                     length: f.len,
                     offset,
-                    downloaded: 0, // TODO: Implement per-file progress for librqbit if needed
-                    progress: 0.0,
+                    downloaded: file_downloaded,
+                    progress: file_progress,
                 });
                 total_size += f.len;
                 offset += f.len;
@@ -308,23 +335,48 @@ impl TorrentHandle for LibrqbitHandle {
             uploaded,
             peers,
             unchoked: peers,
-            queued: 0,
-            unique: peers,
+            queued,
+            unique,
             connection_tries: 0,
             peer_search_running: true,
             stream_len: total_size,
             stream_name: "".to_string(),
-            stream_progress: if total_size > 0 {
-                downloaded as f64 / total_size as f64
+            stream_progress: if stats.total_bytes > 0 {
+                stats.progress_bytes as f64 / stats.total_bytes as f64
             } else {
                 0.0
             },
             swarm_connections: peers,
             swarm_paused: false,
             swarm_size: peers,
-            is_finished: total_size > 0 && downloaded >= total_size,
-            has_metadata: total_size > 0,
+            is_finished: stats.finished,
+            has_metadata,
         }
+    }
+
+    /// Cheap: librqbit's TorrentStats.finished is precomputed from the chunk
+    /// tracker's have/needed counters (no per-piece walk here).
+    async fn is_finished(&self) -> bool {
+        self.handle.stats().finished
+    }
+
+    /// Per-file completion from chunk-tracker have-bytes. `file_progress` is
+    /// empty while the torrent is still Initializing, in which case the file
+    /// is reported incomplete.
+    async fn is_file_complete(&self, file_idx: usize) -> bool {
+        let stats = self.handle.stats();
+        let Some(have) = stats.file_progress.get(file_idx).copied() else {
+            return false;
+        };
+        let Some(len) = self
+            .handle
+            .metadata
+            .load_full()
+            .and_then(|m| m.file_infos.get(file_idx).map(|fi| fi.len))
+        else {
+            return false;
+        };
+        have >= len
     }
 
     async fn add_trackers(&self, _trackers: Vec<String>) -> Result<()> {
@@ -363,8 +415,11 @@ impl TorrentHandle for LibrqbitHandle {
     }
 
     async fn get_file_path(&self, _file_idx: usize) -> Option<String> {
-        // librqbit doesn't expose local file paths easily
-        // Return None to fall back to HTTP URL probing
+        // A real path is not obtainable through librqbit 8.1.1's public API:
+        // the torrent's resolved output folder lives in ManagedTorrentOptions,
+        // which is pub(crate). Returning None makes the engine probe through
+        // the HTTP loopback stream instead, which blocks correctly on pieces
+        // that are not downloaded yet (a sparse local file would not).
         None
     }
 
@@ -489,6 +544,77 @@ mod tests {
         assert!(backend.get_torrent(&expected_hash).await.is_none());
         // Removing again is an error (matches libtorrent's not-found Err).
         assert!(backend.remove_torrent(&expected_hash).await.is_err());
+    }
+
+    #[test]
+    fn file_progress_fields_maps_have_bytes() {
+        // Normal partial progress.
+        assert_eq!(file_progress_fields(100, 25), (25, 0.25));
+        // Complete.
+        assert_eq!(file_progress_fields(100, 100), (100, 1.0));
+        // have > len is clamped (last-piece rounding in the chunk tracker).
+        assert_eq!(file_progress_fields(100, 120), (100, 1.0));
+        // Zero-length files are trivially complete.
+        assert_eq!(file_progress_fields(0, 0), (0, 1.0));
+        // Initializing torrents report an empty file_progress vec -> have = 0.
+        assert_eq!(file_progress_fields(100, 0), (0, 0.0));
+    }
+
+    #[tokio::test]
+    async fn stats_report_full_progress_for_seeded_torrent() {
+        use crate::backend::TorrentHandle;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let payload = dir.join("payload.bin");
+        let payload_len = 96 * 1024u64;
+        write_payload(&payload, payload_len as usize).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+
+        let (_backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
+        handle.handle.wait_until_initialized().await.unwrap();
+
+        let stats = TorrentHandle::stats(&handle).await;
+        assert!(stats.has_metadata);
+        assert!(stats.is_finished);
+        assert_eq!(stats.downloaded, payload_len);
+        assert!((stats.stream_progress - 1.0).abs() < f64::EPSILON);
+        assert_eq!(stats.files.len(), 1);
+        assert_eq!(stats.files[0].length, payload_len);
+        assert_eq!(stats.files[0].downloaded, payload_len);
+        assert!((stats.files[0].progress - 1.0).abs() < f64::EPSILON);
+
+        assert!(TorrentHandle::is_finished(&handle).await);
+        assert!(handle.is_file_complete(0).await);
+        assert!(!handle.is_file_complete(1).await, "out-of-range file");
+    }
+
+    #[tokio::test]
+    async fn stats_report_zero_progress_for_unseeded_torrent() {
+        use crate::backend::TorrentHandle;
+        let tmp = tempfile::tempdir().unwrap();
+        // Create the torrent from a payload OUTSIDE the download dir so the
+        // session has none of the data.
+        let src_dir = tmp.path().join("src");
+        tokio::fs::create_dir_all(&src_dir).await.unwrap();
+        let payload = src_dir.join("payload.bin");
+        let payload_len = 64 * 1024u64;
+        write_payload(&payload, payload_len as usize).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+
+        let download_dir = tmp.path().join("dl");
+        let (_backend, handle) = backend_with_torrent(&download_dir, &torrent_bytes).await;
+        handle.handle.wait_until_initialized().await.unwrap();
+
+        let stats = TorrentHandle::stats(&handle).await;
+        assert!(stats.has_metadata);
+        assert!(!stats.is_finished);
+        assert_eq!(stats.downloaded, 0);
+        assert_eq!(stats.files.len(), 1);
+        assert_eq!(stats.files[0].downloaded, 0);
+        assert_eq!(stats.files[0].progress, 0.0);
+
+        assert!(!TorrentHandle::is_finished(&handle).await);
+        assert!(!handle.is_file_complete(0).await);
     }
 
     #[tokio::test]
