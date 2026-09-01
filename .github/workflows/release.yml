@@ -14,64 +14,10 @@ env:
   CARGO_HTTP_MULTIPLEXING: false
 
 jobs:
-  check:
-    name: Check
-    runs-on: ubuntu-24.04
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/v'))
-    env:
-      LIBTORRENT_STATIC: "1"
-      PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - name: Install cargo-chef
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-chef
-
-      - name: Install System Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake curl pkg-config libssl-dev libfuse2 libboost-dev libclang-dev
-
-      - name: Install libtorrent 2.1.1
-        run: bash .github/scripts/install-libtorrent.sh
-
-      - name: Cargo Chef Prepare
-        run: cargo chef prepare --recipe-path recipe.json
-
-      - name: Cargo Chef Cache
-        uses: actions/cache@v6
-        with:
-          path: target
-          key: ${{ runner.os }}-check-cargo-chef-${{ hashFiles('recipe.json') }}
-          restore-keys: |
-            ${{ runner.os }}-check-cargo-chef-
-
-      - name: Cargo Chef Cook
-        run: |
-          cargo chef cook --recipe-path recipe.json --features libtorrent --no-default-features
-
-      - name: Restore Source Code
-        run: git restore server enginefs bindings stremio-runtime-stub updater-helper
-
-      - name: Run Clippy
-        run: cargo clippy --workspace --features libtorrent --no-default-features
-
-      - name: Run Tests
-        run: cargo test --workspace --features libtorrent --no-default-features
-
   build-windows:
     name: Build Windows
     runs-on: windows-2022
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-    env:
-      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
     steps:
       - uses: actions/checkout@v7
 
@@ -81,10 +27,10 @@ jobs:
             toolchain: stable
             target: x86_64-pc-windows-msvc
 
-      - name: Install cargo-chef and cargo-wix
+      - name: Install cargo-wix
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-chef,cargo-wix
+          tool: cargo-wix
 
       - name: Cargo Registry Cache
         uses: actions/cache@v6
@@ -96,74 +42,11 @@ jobs:
           restore-keys: |
             Windows-cargo-registry-
 
-      - name: Export GitHub Actions cache env for vcpkg
-        uses: actions/github-script@v9
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL);
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN);
-
-      - name: Cache vcpkg installed packages
-        id: vcpkg-cache
-        uses: actions/cache@v6
-        with:
-          path: vcpkg_installed
-          key: Windows-vcpkg-x86-64-v3-static-md-release-v1-${{ hashFiles('vcpkg.json','triplets/**','vcpkg-overlays/**') }}
-          restore-keys: |
-            Windows-vcpkg-x86-64-v3-static-md-release-v1-
-            Windows-vcpkg-x86-64-v3-static-md-release-
-
-      - name: Setup vcpkg
-        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
-        uses: lukka/run-vcpkg@v11
-        with:
-          vcpkgGitCommitId: '84bab45d415d22042bd0b9081aea57f362da3f35'
-          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
-          vcpkgJsonGlob: 'vcpkg.json'
-          runVcpkgInstall: true
-        env:
-          VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vcpkg_installed
-          VCPKG_DEFAULT_TRIPLET: x64-windows-v3-static-md-release
-          VCPKG_OVERLAY_TRIPLETS: ${{ github.workspace }}/triplets
-          # The overlay pins libtorrent 2.1.1 and carries the complete official
-          # vcpkg port for that release, including its verified source checksum.
-          VCPKG_OVERLAY_PORTS: ${{ github.workspace }}/vcpkg-overlays
-
-      - name: Cargo Chef Prepare
-        run: cargo chef prepare --recipe-path recipe.json
-
-      - name: Cargo Chef Cache
-        uses: actions/cache@v6
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-chef-${{ hashFiles('recipe.json') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-chef-
-
-      - name: Cargo Chef Cook
-        run: |
-          $env:VCPKG_ROOT = "${{ github.workspace }}\vcpkg"
-          cargo chef cook --release --recipe-path recipe.json --target x86_64-pc-windows-msvc --features libtorrent --no-default-features
-        env:
-          VCPKG_ROOT: ${{ github.workspace }}\vcpkg
-          VCPKG_INSTALLED_DIR: ${{ github.workspace }}\vcpkg_installed
-          VCPKGRS_TRIPLET: x64-windows-v3-static-md-release
-          PKG_CONFIG_PATH: ${{ github.workspace }}\vcpkg_installed\x64-windows-v3-static-md-release\lib\pkgconfig
-
-      - name: Restore Source Code
-        run: git restore server enginefs bindings stremio-runtime-stub updater-helper
-
       - name: Build Release
         run: |
-          cargo clean -p server --release
-          cargo build --release --target x86_64-pc-windows-msvc --features libtorrent --no-default-features
+          cargo build --release --target x86_64-pc-windows-msvc
           cargo build --release --target x86_64-pc-windows-msvc -p stremio-runtime-stub
           cargo build --release --target x86_64-pc-windows-msvc -p updater-helper
-        env:
-          VCPKG_ROOT: ${{ github.workspace }}\vcpkg
-          VCPKG_INSTALLED_DIR: ${{ github.workspace }}\vcpkg_installed
-          VCPKGRS_TRIPLET: x64-windows-v3-static-md-release
-          PKG_CONFIG_PATH: ${{ github.workspace }}\vcpkg_installed\x64-windows-v3-static-md-release\lib\pkgconfig
 
       - name: Upload EXE
         uses: actions/upload-artifact@v7
@@ -176,12 +59,6 @@ jobs:
 
       - name: Build MSI Installer
         run: cargo wix --package server --no-build --nocapture --target x86_64-pc-windows-msvc
-        env:
-          VCPKG_ROOT: ${{ github.workspace }}\vcpkg
-          VCPKG_INSTALLED_DIR: ${{ github.workspace }}\vcpkg_installed
-          VCPKGRS_TRIPLET: x64-windows-v3-static-md-release
-          PKG_CONFIG_PATH: ${{ github.workspace }}\vcpkg_installed\x64-windows-v3-static-md-release\lib\pkgconfig
-
 
       - name: Upload MSI
         uses: actions/upload-artifact@v7
@@ -189,60 +66,39 @@ jobs:
           name: server-windows-msi
           path: target/wix/*.msi
 
-      - name: Debug VCPKG Location
-        if: always()
-        run: |
-          Get-ChildItem -Path . -Force
-          if (Test-Path vcpkg) { Get-ChildItem -Path vcpkg -Force }
-          if (Test-Path vcpkg_installed) { Get-ChildItem -Path vcpkg_installed -Force }
-
   build-linux:
     name: Build Linux
     runs-on: ubuntu-24.04
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-    env:
-      LIBTORRENT_STATIC: "1"
-      PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
     steps:
       - uses: actions/checkout@v7
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install cargo-chef and cargo-deb
+      - name: Install cargo-deb
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-chef,cargo-deb
+          tool: cargo-deb
 
-      - name: Install System Dependencies
+      - name: Install AppImage Tooling
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake curl pkg-config libssl-dev libfuse2 libboost-dev libclang-dev
+          sudo apt-get install -y libfuse2 wget imagemagick
 
-      - name: Install libtorrent 2.1.1
-        run: bash .github/scripts/install-libtorrent.sh
-
-      - name: Cargo Chef Prepare
-        run: cargo chef prepare --recipe-path recipe.json
-
-      - name: Cargo Chef Cache
+      - name: Cargo Cache
         uses: actions/cache@v6
         with:
-          path: target
-          key: ${{ runner.os }}-cargo-chef-${{ hashFiles('recipe.json') }}
+          path: |
+            target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-chef-
-
-      - name: Cargo Chef Cook
-        run: |
-          cargo chef cook --release --recipe-path recipe.json --features libtorrent --no-default-features
-
-      - name: Restore Source Code
-        run: git restore server enginefs bindings
+            ${{ runner.os }}-cargo-
 
       - name: Build Release
-        run: |
-          cargo build --release --features libtorrent --no-default-features
+        run: cargo build --release
 
       - name: Build DEB Package
         run: cargo deb --package server --no-build
@@ -300,19 +156,13 @@ jobs:
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     container: archlinux:latest
-    env:
-      LIBTORRENT_STATIC: "1"
-      PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
     steps:
       - uses: actions/checkout@v7
 
       - name: Install dependencies
         run: |
           pacman -Syu --noconfirm
-          pacman -S --needed --noconfirm base-devel cmake curl rust git openssl pkg-config boost clang
-
-      - name: Install libtorrent 2.1.1
-        run: bash .github/scripts/install-libtorrent.sh
+          pacman -S --needed --noconfirm base-devel cmake curl rust git openssl pkg-config
 
       - name: Cargo Cache
         uses: actions/cache@v6
@@ -326,8 +176,7 @@ jobs:
             arch-cargo-
 
       - name: Build binary
-        run: |
-          cargo build --release --features libtorrent --no-default-features
+        run: cargo build --release
 
       - name: Create PKGBUILD
         run: |
@@ -341,7 +190,7 @@ jobs:
           arch=('x86_64')
           url="https://github.com/perpetus/stream-server"
           license=('MIT')
-          depends=('openssl' 'boost-libs')
+          depends=('openssl')
           source=("stream-server")
           sha256sums=('SKIP')
 

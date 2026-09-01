@@ -51,17 +51,15 @@ jobs:
         with:
           cache-on-failure: true
 
-      # No apt installs here on purpose: the default feature set must build
-      # on a machine with no libclang, fontconfig/gtk headers, or libtorrent.
+      # No apt installs here on purpose: the pure-Rust build must succeed
+      # on a machine with no libclang, fontconfig/gtk headers, or system libs.
       #
       # The tree currently carries pre-existing non-correctness clippy
       # warnings (e.g. collapsible_if in enginefs), so gate hard only on the
       # correctness and suspicious groups; everything else stays a warning.
       #
-      # No --workspace: that would select the native binding crates
-      # (async-rar needs libclang, libtorrent-sys needs libtorrent). The
-      # bare invocation lints the workspace default-members, which is
-      # exactly the pure-Rust set.
+      # The bare invocation lints the workspace default-members, which is
+      # exactly the pure-Rust set (identical to `members`).
       - name: Clippy
         run: >-
           cargo clippy --all-targets --
@@ -79,13 +77,11 @@ jobs:
       # RAR is now pure-Rust (`unrar-rs`) and ON BY DEFAULT, so the default
       # test job above already builds and tests it — no libclang, no separate
       # rar job. What still needs its own guard is the MIT escape hatch:
-      # `--no-default-features --features librqbit` must keep building WITHOUT
-      # unrar-rs (GPL-3.0-or-later), so a distributor can produce an
-      # MIT-licensed binary. No apt installs: this path is pure Rust too.
-      #
-      # The libtorrent feature is intentionally NOT checked here; it needs a
-      # multi-minute source build and is already covered by the check job in
-      # release.yml.
+      # `--no-default-features` must keep building WITHOUT unrar-rs
+      # (GPL-3.0-or-later), so a distributor can produce an MIT-licensed binary.
+      # The librqbit backend is always compiled (it is no longer a feature), so
+      # no backend feature needs to be named. No apt installs: this path is pure
+      # Rust too.
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@1.98.0
 
@@ -94,8 +90,8 @@ jobs:
         with:
           cache-on-failure: true
 
-      - name: Build MIT escape hatch (librqbit only, no rar)
-        run: cargo build -p server --no-default-features --features librqbit
+      - name: Build MIT escape hatch (no rar)
+        run: cargo build -p server --no-default-features
 
   windows:
     name: Windows Build and Test
@@ -114,10 +110,9 @@ jobs:
         with:
           cache-on-failure: true
 
-      # Default features only (pure-Rust librqbit backend): no vcpkg, no
-      # libtorrent, no ffmpeg, no libclang. This is a cheap cross-platform
-      # guard for the default build; the expensive libtorrent+vcpkg Windows
-      # build stays in release.yml, tag-triggered only.
+      # Default features only (pure-Rust librqbit backend): no ffmpeg, no
+      # libclang, no system libraries. This is a cheap cross-platform guard for
+      # the default build; the tag-triggered release build stays in release.yml.
       - name: Build
         run: cargo build
 
