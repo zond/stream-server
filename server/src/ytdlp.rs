@@ -113,8 +113,7 @@ fn is_stale(path: &Path) -> bool {
         .is_ok_and(|age| age > REFRESH_AFTER)
 }
 
-/// Where the server keeps its own copy. Mirrors the FFmpeg setup's preference
-/// order so both tools land in the same place on a given machine.
+/// Where the server keeps its own copy of the yt-dlp binary.
 fn managed_path(config_dir: &Path) -> Result<PathBuf> {
     let file_name = if cfg!(windows) {
         "yt-dlp.exe"

@@ -17,16 +17,7 @@ mod app {
         let args: Vec<String> = std::env::args().collect();
         let use_tui = args.iter().any(|a| a == "--tui");
 
-        if let Err(err) = run(use_tui) {
-            if let Some(missing) = err.downcast_ref::<stream_server::MissingFfmpegError>() {
-                eprintln!("{}", missing.details());
-                eprintln!(
-                    "Install FFmpeg, make sure both ffmpeg and ffprobe are available in PATH, then start Stream Server again."
-                );
-                std::process::exit(1);
-            }
-            return Err(err);
-        }
+        run(use_tui)?;
 
         Ok(())
     }

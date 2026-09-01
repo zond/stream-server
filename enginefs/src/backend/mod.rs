@@ -113,10 +113,10 @@ pub trait TorrentHandle: Send + Sync + Clone {
     async fn file_count(&self) -> usize {
         self.get_files().await.len()
     }
-    /// Get the local filesystem path for a file (for probing without HTTP loopback)
+    /// Get the local filesystem path for a file (for local reads without HTTP loopback)
     async fn get_file_path(&self, file_idx: usize) -> Option<String>;
     /// Prepare a file for streaming by setting its priority and waiting for initial pieces.
-    /// This should be called BEFORE probing the file with ffprobe.
+    /// This should be called BEFORE reading from the file.
     /// Returns Ok(()) when initial pieces are available, or Err on timeout.
     async fn prepare_file_for_streaming(&self, file_idx: usize) -> Result<()>;
     /// Clear streaming state for a file (set priority to 0, clear piece deadlines).

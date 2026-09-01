@@ -21,7 +21,6 @@ pub mod jni;
 mod archives;
 mod cache_cleaner;
 mod diagnostics;
-mod ffmpeg_setup;
 mod local_addon;
 mod routes;
 mod ssdp;
@@ -29,8 +28,6 @@ mod state;
 mod tui;
 mod updater;
 pub mod ytdlp;
-
-pub use ffmpeg_setup::MissingFfmpegError;
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -42,7 +39,6 @@ pub struct ServerConfig {
     pub use_tui: bool,
     pub init_logging: bool,
     pub manage_process_globals: bool,
-    pub setup_ffmpeg: bool,
     pub listen_for_ctrl_c: bool,
     pub print_startup: bool,
     pub exit_process_on_shutdown_timeout: bool,
@@ -72,7 +68,6 @@ impl ServerConfig {
             use_tui: false,
             init_logging: false,
             manage_process_globals: false,
-            setup_ffmpeg: false,
             listen_for_ctrl_c: false,
             print_startup: false,
             exit_process_on_shutdown_timeout: false,
@@ -96,7 +91,6 @@ impl ServerConfig {
             use_tui: false,
             init_logging: true,
             manage_process_globals: true,
-            setup_ffmpeg: true,
             listen_for_ctrl_c: true,
             print_startup: true,
             exit_process_on_shutdown_timeout: true,
@@ -292,13 +286,6 @@ pub async fn run(
             diagnostics::logging::store_log_guards(guards);
             startup_log_paths = Some((human_log_path, archive_log_path, json_log_path));
         }
-    }
-
-    if cfg.setup_ffmpeg
-        && let Err(e) = ffmpeg_setup::setup_ffmpeg().await
-    {
-        tracing::error!("FFmpeg setup failed: {}", e);
-        return Err(e).context("FFmpeg setup failed");
     }
 
     tracing::info!("Config Dir: {:?}", config_dir);
