@@ -116,8 +116,11 @@ impl MetadataInspector {
         // First 1MB for EBML header, SeekHead, Segment info
         ranges.push((0, 1_048_576.min(total_size)));
 
-        // Try to find Cues location from SeekHead
-        if let Ok(Some(cues_offset)) = Self::find_mkv_cues_offset(reader, total_size).await {
+        // Try to find Cues location from SeekHead. A crafted SeekHead can point
+        // past EOF, so only trust offsets inside the file.
+        if let Ok(Some(cues_offset)) = Self::find_mkv_cues_offset(reader, total_size).await
+            && cues_offset < total_size
+        {
             info!("MetadataInspector: Found Cues at offset {}", cues_offset);
             // Prioritize Cues area (usually 100KB-500KB)
             let cues_size = 500_000.min(total_size - cues_offset);
@@ -272,7 +275,11 @@ impl MetadataInspector {
                     return Some(cues_pos);
                 }
 
-                pos += header_size + size as usize;
+                // Crafted sizes can overflow the advance; saturate and let the
+                // loop condition terminate the scan.
+                pos = pos
+                    .saturating_add(header_size)
+                    .saturating_add(size as usize);
                 continue;
             }
             pos += 1;
@@ -301,7 +308,9 @@ impl MetadataInspector {
                     }
                     seek_id = Some(id);
                 }
-                pos += header_size + size as usize;
+                pos = pos
+                    .saturating_add(header_size)
+                    .saturating_add(size as usize);
                 continue;
             }
 
@@ -318,7 +327,9 @@ impl MetadataInspector {
                     }
                     seek_position = Some(position);
                 }
-                pos += header_size + size as usize;
+                pos = pos
+                    .saturating_add(header_size)
+                    .saturating_add(size as usize);
                 continue;
             }
 
@@ -341,8 +352,10 @@ impl MetadataInspector {
     {
         let mut keyframes = Vec::new();
 
-        // Try to find and parse Cues
-        if let Ok(Some(cues_offset)) = Self::find_mkv_cues_offset(reader, total_size).await {
+        // Try to find and parse Cues (ignore crafted offsets past EOF)
+        if let Ok(Some(cues_offset)) = Self::find_mkv_cues_offset(reader, total_size).await
+            && cues_offset < total_size
+        {
             reader.seek(SeekFrom::Start(cues_offset)).await?;
 
             // Read Cues data (up to 1MB)
@@ -393,7 +406,9 @@ impl MetadataInspector {
                     positions.push(cluster_pos);
                 }
 
-                pos += header_size + size as usize;
+                pos = pos
+                    .saturating_add(header_size)
+                    .saturating_add(size as usize);
                 continue;
             }
             pos += 1;
@@ -432,7 +447,9 @@ impl MetadataInspector {
                     tpos += 1;
                 }
 
-                pos += header_size + size as usize;
+                pos = pos
+                    .saturating_add(header_size)
+                    .saturating_add(size as usize);
                 continue;
             }
             pos += 1;
@@ -773,5 +790,87 @@ impl MetadataInspector {
         }
 
         chunk as usize
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// Build a minimal MKV prefix: EBML header, Segment, and a SeekHead whose
+    /// single Seek entry points the Cues at `cues_pos` (relative to segment data
+    /// start). The file is zero-padded to `total_size`. Returns the bytes and
+    /// the segment data start offset.
+    fn mkv_with_cues_pos(cues_pos: u64, total_size: usize) -> (Vec<u8>, u64) {
+        let mut file = Vec::new();
+        // EBML header: 4-byte id, 1-byte size vint (4), 4 payload bytes
+        file.extend_from_slice(&[0x1A, 0x45, 0xDF, 0xA3, 0x84, 0, 0, 0, 0]);
+        // Segment: 4-byte id + unknown-size vint
+        file.extend_from_slice(&[0x18, 0x53, 0x80, 0x67, 0xFF]);
+        let segment_data_start = file.len() as u64;
+        // Seek entry: SeekID (Cues) + SeekPosition
+        let mut seek_entry = Vec::new();
+        seek_entry.extend_from_slice(&[0x53, 0xAB, 0x84, 0x1C, 0x53, 0xBB, 0x6B]);
+        seek_entry.extend_from_slice(&[0x53, 0xAC, 0x88]);
+        seek_entry.extend_from_slice(&cues_pos.to_be_bytes());
+        // Seek element wrapping the entry
+        let mut seek = vec![0x4D, 0xBB, 0x80 | seek_entry.len() as u8];
+        seek.extend_from_slice(&seek_entry);
+        // SeekHead wrapping the Seek element
+        file.extend_from_slice(&[0x11, 0x4D, 0x9B, 0x74, 0x80 | seek.len() as u8]);
+        file.extend_from_slice(&seek);
+        file.resize(total_size, 0);
+        (file, segment_data_start)
+    }
+
+    #[tokio::test]
+    async fn mkv_seekhead_pointing_past_eof_falls_back() {
+        let total = 1_100_000usize;
+        let (file, _) = mkv_with_cues_pos(0xFFFF_FFFF, total);
+        let mut cursor = Cursor::new(file);
+        let ranges =
+            MetadataInspector::find_critical_ranges(&mut cursor, total as u64, "movie.mkv").await;
+        assert!(
+            ranges.contains(&(total as u64 - 1_000_000, 1_000_000)),
+            "must fall back to the end-of-file range: {ranges:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mkv_seekhead_valid_cues_prioritized() {
+        let total = 400_000usize;
+        let (file, segment_data_start) = mkv_with_cues_pos(300_000, total);
+        let mut cursor = Cursor::new(file);
+        let ranges =
+            MetadataInspector::find_critical_ranges(&mut cursor, total as u64, "movie.mkv").await;
+        let cues_offset = segment_data_start + 300_000;
+        assert!(
+            ranges
+                .iter()
+                .any(|&(start, len)| start == cues_offset && len == total as u64 - cues_offset),
+            "cues range must be prioritized: {ranges:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mkv_keyframes_with_cues_past_eof_no_panic() {
+        let total = 200_000usize;
+        let (file, _) = mkv_with_cues_pos(u64::MAX / 2, total);
+        let mut cursor = Cursor::new(file);
+        let keyframes =
+            MetadataInspector::find_keyframe_offsets(&mut cursor, total as u64, "movie.mkv").await;
+        assert!(keyframes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn truncated_ebml_returns_cleanly() {
+        // Claims 2MB but only the 9-byte EBML header is present: the SeekHead
+        // read fails and the inspector must fall back without panicking.
+        let file = vec![0x1A, 0x45, 0xDF, 0xA3, 0x84, 0, 0, 0, 0];
+        let mut cursor = Cursor::new(file);
+        let ranges =
+            MetadataInspector::find_critical_ranges(&mut cursor, 2_000_000, "movie.mkv").await;
+        assert!(ranges.contains(&(1_000_000, 1_000_000)), "{ranges:?}");
     }
 }
