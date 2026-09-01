@@ -892,6 +892,86 @@ mod tests {
         assert_eq!(MetadataInspector::sample_to_chunk(1, &[(1, 2)]), 1);
     }
 
+    /// Build an MP4 box: 32-bit size, 4-byte type, payload.
+    fn mp4_box(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&(payload.len() as u32 + 8).to_be_bytes());
+        b.extend_from_slice(kind);
+        b.extend_from_slice(payload);
+        b
+    }
+
+    #[tokio::test]
+    async fn mp4_moov_at_front_yields_head_range() {
+        let mut file = mp4_box(b"ftyp", &[0u8; 8]);
+        let moov_pos = file.len() as u64;
+        let moov = mp4_box(b"moov", &[0u8; 100]);
+        let moov_len = moov.len() as u64;
+        file.extend_from_slice(&moov);
+        let total = file.len() as u64;
+        let mut cursor = Cursor::new(file);
+        let ranges = MetadataInspector::find_critical_ranges(&mut cursor, total, "movie.mp4").await;
+        assert!(
+            ranges.contains(&(moov_pos, moov_len)),
+            "moov head range expected: {ranges:?}"
+        );
+        // No range beyond the moov itself (no tail fallback)
+        assert!(ranges.iter().all(|&(start, _)| start <= moov_pos));
+    }
+
+    #[tokio::test]
+    async fn mp4_moov_at_end_tail_range_covers_moov() {
+        let mut file = mp4_box(b"ftyp", &[0u8; 8]);
+        // mdat declaring a huge (>10MB) size triggers the end-of-file moov scan
+        file.extend_from_slice(&20_000_000u32.to_be_bytes());
+        file.extend_from_slice(b"mdat");
+        file.extend_from_slice(&[0u8; 4096]);
+        let moov_pos = file.len() as u64;
+        let moov = mp4_box(b"moov", &[0u8; 64]);
+        let moov_len = moov.len() as u64;
+        file.extend_from_slice(&moov);
+        let total = file.len() as u64;
+        let mut cursor = Cursor::new(file);
+        let ranges = MetadataInspector::find_critical_ranges(&mut cursor, total, "movie.mp4").await;
+        assert!(
+            ranges
+                .iter()
+                .any(|&(start, len)| start == moov_pos && len >= moov_len),
+            "tail range must cover moov: {ranges:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mp4_zero_and_overflowing_box_sizes_terminate() {
+        // Box size 0: extends to end of file, scan must stop there
+        let mut file = Vec::new();
+        file.extend_from_slice(&0u32.to_be_bytes());
+        file.extend_from_slice(b"free");
+        file.extend_from_slice(&[0u8; 64]);
+        let total = file.len() as u64;
+        let mut cursor = Cursor::new(file);
+        let _ = MetadataInspector::find_critical_ranges(&mut cursor, total, "a.mp4").await;
+
+        // 32-bit box size far past the end of the file
+        let mut file = Vec::new();
+        file.extend_from_slice(&0xFFFF_FFF0u32.to_be_bytes());
+        file.extend_from_slice(b"free");
+        file.extend_from_slice(&[0u8; 64]);
+        let total = file.len() as u64;
+        let mut cursor = Cursor::new(file);
+        let _ = MetadataInspector::find_critical_ranges(&mut cursor, total, "a.mp4").await;
+
+        // Extended (64-bit) box size of u64::MAX
+        let mut file = Vec::new();
+        file.extend_from_slice(&1u32.to_be_bytes());
+        file.extend_from_slice(b"free");
+        file.extend_from_slice(&u64::MAX.to_be_bytes());
+        file.extend_from_slice(&[0u8; 64]);
+        let total = file.len() as u64;
+        let mut cursor = Cursor::new(file);
+        let _ = MetadataInspector::find_critical_ranges(&mut cursor, total, "a.mp4").await;
+    }
+
     #[tokio::test]
     async fn truncated_ebml_returns_cleanly() {
         // Claims 2MB but only the 9-byte EBML header is present: the SeekHead
