@@ -200,8 +200,10 @@ impl MetadataInspector {
                     // Parse SeekHead to find Cues offset
                     if let Some(cues_pos) = Self::parse_seek_head(&seek_head_data[..seek_head_size])
                     {
-                        // Cues position is relative to Segment data start
-                        return Ok(Some(segment_data_start + cues_pos));
+                        // Cues position is relative to Segment data start.
+                        // Saturate: a crafted SeekPosition near u64::MAX must not
+                        // overflow; the callers' `< total_size` guards reject it.
+                        return Ok(Some(segment_data_start.saturating_add(cues_pos)));
                     }
                 }
             }
@@ -860,7 +862,7 @@ mod tests {
     #[tokio::test]
     async fn mkv_keyframes_with_cues_past_eof_no_panic() {
         let total = 200_000usize;
-        let (file, _) = mkv_with_cues_pos(u64::MAX / 2, total);
+        let (file, _) = mkv_with_cues_pos(u64::MAX, total);
         let mut cursor = Cursor::new(file);
         let keyframes =
             MetadataInspector::find_keyframe_offsets(&mut cursor, total as u64, "movie.mkv").await;
