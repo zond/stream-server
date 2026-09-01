@@ -120,9 +120,12 @@ impl TrackerManager {
         };
 
         let last_updated = storage.get_last_updated();
+        // A clock before 1970 (dead RTC on Android/embedded) makes
+        // duration_since fail; treat it as the epoch instead of panicking —
+        // cached trackers are then reused, or fetched when none exist.
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs() as i64;
 
         let age_secs = now - last_updated;
