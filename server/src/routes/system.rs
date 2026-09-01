@@ -94,8 +94,12 @@ pub struct ServerSettings {
     pub server_version: String,
     #[serde(rename = "cacheRoot")]
     pub cache_root: String,
+    // Option<f64> matches stremio-core's Settings.cache_size
+    // (stremio-core/src/types/streaming_server/settings.rs:19): `null` means
+    // UNLIMITED cache (see response.rs:90-123, where the "∞" option's `val`
+    // is `null`), while `Some(0.0)` is the distinct "no caching" selection.
     #[serde(rename = "cacheSize")]
-    pub cache_size: f64,
+    pub cache_size: Option<f64>,
     #[serde(rename = "proxyStreamsEnabled")]
     pub proxy_streams_enabled: bool,
     #[serde(rename = "btMaxConnections")]
@@ -201,6 +205,35 @@ pub struct ServerSettings {
     /// peers.  When false, torrents are paused once their download finishes.
     #[serde(rename = "seedingEnabled", default = "default_seeding_enabled")]
     pub seeding_enabled: bool,
+}
+
+/// Resolve the `cacheSize` field of a `POST /settings` payload into the
+/// `ServerSettings.cache_size` value it should produce. Returns `None` when
+/// `v` is neither `null` nor a number (leaving the current setting
+/// unchanged, matching `update_settings`'s merge-on-present-and-valid
+/// semantics for every other field).
+///
+/// stremio-core maps its "∞" cache-size option to JSON `null`
+/// (stremio-core/src/types/streaming_server/response.rs:90-123): `null`
+/// means UNLIMITED cache (`Some(None)` here), never "no caching" — that's
+/// the distinct, explicit `0` selection (`Some(Some(0.0))`).
+fn resolve_cache_size(v: &Value) -> Option<Option<f64>> {
+    if v.is_null() {
+        Some(None)
+    } else {
+        v.as_f64().map(Some)
+    }
+}
+
+/// Convert the client-facing `cacheSize` (bytes, `None` = unlimited) into a
+/// byte cap for the engine/eviction code. `None` (and any out-of-range or
+/// non-finite value) saturates to `u64::MAX`, which is effectively
+/// unbounded for every downstream size comparison.
+pub fn cache_size_bytes(cache_size: Option<f64>) -> u64 {
+    match cache_size {
+        Some(n) => n as u64,
+        None => u64::MAX,
+    }
 }
 
 pub fn default_trackers_url() -> String {
@@ -383,7 +416,7 @@ impl Default for ServerSettings {
                 .unwrap_or_else(|_| "/usr/bin/stremio-server".to_string()),
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             cache_root,
-            cache_size: 10.0 * 1024.0 * 1024.0 * 1024.0, // 10GB
+            cache_size: Some(10.0 * 1024.0 * 1024.0 * 1024.0), // 10GB
             proxy_streams_enabled: false,
             bt_max_connections: enginefs::backend::DEFAULT_BT_MAX_CONNECTIONS,
             bt_handshake_timeout: 20000,
@@ -451,12 +484,10 @@ pub async fn update_settings(state: &AppState, payload: &Value) -> anyhow::Resul
                 settings.transcode_profile = Some(s.to_string());
             }
         }
-        if let Some(v) = obj.get("cacheSize") {
-            if v.is_null() {
-                settings.cache_size = 0.0;
-            } else if let Some(n) = v.as_f64() {
-                settings.cache_size = n;
-            }
+        if let Some(v) = obj.get("cacheSize")
+            && let Some(resolved) = resolve_cache_size(v)
+        {
+            settings.cache_size = resolved;
         }
         if let Some(v) = obj.get("cacheRoot")
             && let Some(s) = v.as_str()
@@ -1032,5 +1063,58 @@ mod tests {
     fn server_version_default_uses_crate_version() {
         let settings = ServerSettings::default();
         assert_eq!(settings.server_version, env!("CARGO_PKG_VERSION"));
+    }
+
+    /// Ground truth: stremio-core's response.rs (lines 90-123) maps its
+    /// "∞" cacheSize option to a JSON `null` value, distinct from the
+    /// explicit `0` ("no caching") option. A client sending `cacheSize:
+    /// null` wants UNLIMITED cache, so the server must not collapse that
+    /// into the same value as "no caching".
+    #[test]
+    fn cache_size_null_means_unlimited_not_no_caching() {
+        assert_eq!(resolve_cache_size(&json!(null)), Some(None));
+        assert_ne!(resolve_cache_size(&json!(null)), Some(Some(0.0)));
+    }
+
+    #[test]
+    fn cache_size_zero_stays_a_distinct_finite_value() {
+        assert_eq!(resolve_cache_size(&json!(0)), Some(Some(0.0)));
+    }
+
+    #[test]
+    fn cache_size_number_resolves_to_some() {
+        assert_eq!(
+            resolve_cache_size(&json!(2147483648_u64)),
+            Some(Some(2147483648.0))
+        );
+    }
+
+    #[test]
+    fn cache_size_wrong_type_leaves_setting_unchanged() {
+        assert_eq!(resolve_cache_size(&json!("not-a-number")), None);
+    }
+
+    #[test]
+    fn cache_size_bytes_treats_none_as_effectively_unbounded() {
+        assert_eq!(cache_size_bytes(None), u64::MAX);
+        assert_eq!(cache_size_bytes(Some(0.0)), 0);
+        assert_eq!(cache_size_bytes(Some(2147483648.0)), 2147483648);
+    }
+
+    /// `ServerSettings.cache_size` must serialize `None` to JSON `null` and
+    /// round-trip back to `None` — otherwise a client picking "unlimited"
+    /// would get a `settings.json` that fails to deserialize on the next
+    /// server start (see `AppState::load_settings`, which silently falls
+    /// back to defaults on any parse error).
+    #[test]
+    fn cache_size_none_round_trips_through_json() {
+        let settings = ServerSettings {
+            cache_size: None,
+            ..ServerSettings::default()
+        };
+        let json = serde_json::to_value(&settings).unwrap();
+        assert_eq!(json["cacheSize"], Value::Null);
+        let round_tripped: ServerSettings = serde_json::from_value(json).unwrap();
+        assert_eq!(round_tripped.cache_size, None);
     }
 }

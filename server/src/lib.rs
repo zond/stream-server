@@ -346,7 +346,7 @@ pub async fn run(
 
     let backend_config = enginefs::backend::BackendConfig {
         cache: enginefs::backend::priorities::EngineCacheConfig {
-            size: settings.cache_size as u64,
+            size: routes::system::cache_size_bytes(settings.cache_size),
             enabled: true,
         },
         growler: enginefs::backend::Growler::default(),

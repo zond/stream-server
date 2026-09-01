@@ -223,7 +223,7 @@ async fn select_archive_file(
     let settings = state.settings.read().await;
     let cache_config = crate::archives::CacheConfig {
         cache_dir: Some(std::path::PathBuf::from(&settings.cache_root)),
-        _cache_size: settings.cache_size as u64,
+        _cache_size: crate::routes::system::cache_size_bytes(settings.cache_size),
     };
     drop(settings);
 
@@ -540,7 +540,7 @@ async fn stream_file(
         let settings = state.settings.read().await;
         let cache_config = crate::archives::CacheConfig {
             cache_dir: Some(std::path::PathBuf::from(&settings.cache_root)),
-            _cache_size: settings.cache_size as u64,
+            _cache_size: crate::routes::system::cache_size_bytes(settings.cache_size),
         };
         drop(settings);
 

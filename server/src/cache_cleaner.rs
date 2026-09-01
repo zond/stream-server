@@ -104,7 +104,7 @@ pub fn start(state: Arc<AppState>) -> JoinHandle<()> {
 
 async fn clean_cache(state: &Arc<AppState>) -> anyhow::Result<()> {
     let settings = state.settings.read().await;
-    let limit = settings.cache_size as u64;
+    let limit = crate::routes::system::cache_size_bytes(settings.cache_size);
     drop(settings); // Release lock
 
     let mut download_dirs = vec![
