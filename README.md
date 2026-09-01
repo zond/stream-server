@@ -38,7 +38,7 @@ Stream Server is a **fully open-source** replacement for Stremio's proprietary `
 | **Customizable** | ✅ Fork & modify | ❌ No access |
 | **HLS Transcoding** | ✅ Built-in | ✅ |
 | **Seekable Streams** | ✅ Instant | ⚠️ Variable |
-| **Archive Streaming** | ✅ RAR/ZIP/7Z | ✅ |
+| **Archive Streaming** | ✅ ZIP/7Z/TAR (RAR opt-in) | ✅ |
 
 > **Seamless Migration**: Drop-in compatible with existing Stremio setups. Same API endpoints, same functionality — just faster and open source.
 
@@ -47,15 +47,15 @@ Stream Server is a **fully open-source** replacement for Stremio's proprietary `
 ## ✨ Features
 
 ### Core Streaming
-- **🚀 High Performance**: Native Rust with optional C++ libtorrent backend
+- **🚀 High Performance**: Pure Rust by default, with an optional C++ libtorrent backend
 - **📺 HLS Transcoding**: Real-time video transcoding via FFmpeg (master.m3u8, stream.m3u8)
-- **🔧 Multiple Backends**: `librqbit` (pure Rust) or `libtorrent` (battle-tested C++)
+- **🔧 Multiple Backends**: `librqbit` (pure Rust, default) or `libtorrent` (battle-tested C++, opt-in)
 - **📡 HTTP Range Requests**: Full support for instant seeking
 
 ### Media Support
 - **📝 Subtitle Extraction**: Automatic detection, OpenSubtitles hash calculation
 - **🎬 Video Probing**: FFprobe integration for track analysis
-- **📦 Archive Streaming**: Direct playback from RAR, ZIP, 7Z, TAR archives
+- **📦 Archive Streaming**: Direct playback from ZIP, 7Z, and TAR archives out of the box (pure Rust); RAR via the opt-in `rar` feature
 
 ### API Compatibility
 - **🔌 Stats API**: `/stats.json` for server status and torrent info
@@ -86,13 +86,27 @@ Download from [Releases](https://github.com/perpetus/stream-server/releases):
 
 ### Build from Source
 
-```bash
-# Default build (librqbit - recommended)
-cargo build --release
+The default build is **pure Rust** and needs **zero system libraries** — no libtorrent, no libclang, no GUI toolkits. The pinned toolchain in `rust-toolchain.toml` (Rust 1.98.0) is picked up automatically by rustup:
 
-# With libtorrent backend (advanced)
-cargo build --release --features libtorrent --no-default-features
+```bash
+# Default build (pure Rust librqbit backend - recommended)
+cargo build --release
 ```
+
+Optional features pull in native dependencies:
+
+```bash
+# libtorrent backend (advanced; needs libtorrent-rasterbar + boost)
+cargo build --release --no-default-features --features libtorrent
+
+# Desktop tray + settings GUI (needs fontconfig/gtk on Linux)
+cargo build --release --features gui
+
+# RAR archive streaming (needs libclang + a C++ toolchain)
+cargo build --release --features rar
+```
+
+Without the `rar` feature, RAR requests return a 501 JSON error; ZIP, 7Z, and TAR streaming are always built in.
 
 ---
 
@@ -112,15 +126,28 @@ The server starts on `http://localhost:11470` by default (compatible with standa
 
 ## 🔧 Build Instructions
 
+For the **default build**, all you need on any platform is Rust via [rustup](https://rustup.rs) — `rust-toolchain.toml` pins the exact toolchain (1.98.0) and rustup installs it automatically on first build:
+
+```bash
+cargo build --release
+```
+
+The platform notes below are only needed for the **opt-in features** (`libtorrent`, `gui`, `rar`).
+
 <details>
 <summary><b>🐧 Arch Linux</b></summary>
 
 ```bash
 sudo pacman -S rustup
-rustup default stable
 
-# For libtorrent backend
+# For the libtorrent backend (--no-default-features --features libtorrent)
 sudo pacman -S libtorrent-rasterbar boost pkg-config
+
+# For the tray + settings GUI (--features gui)
+sudo pacman -S fontconfig gtk3
+
+# For RAR streaming (--features rar)
+sudo pacman -S clang
 ```
 
 </details>
@@ -132,11 +159,14 @@ sudo pacman -S libtorrent-rasterbar boost pkg-config
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source ~/.cargo/env
 
-sudo apt update
-sudo apt install build-essential pkg-config libssl-dev
+# For the libtorrent backend (--no-default-features --features libtorrent)
+sudo apt install build-essential pkg-config libtorrent-rasterbar-dev libboost-all-dev
 
-# For libtorrent backend
-sudo apt install libtorrent-rasterbar-dev libboost-all-dev
+# For the tray + settings GUI (--features gui)
+sudo apt install libfontconfig1-dev libgtk-3-dev
+
+# For RAR streaming (--features rar)
+sudo apt install build-essential libclang-dev
 ```
 
 </details>
@@ -148,10 +178,14 @@ sudo apt install libtorrent-rasterbar-dev libboost-all-dev
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source ~/.cargo/env
 
-sudo dnf install gcc gcc-c++ pkg-config openssl-devel
+# For the libtorrent backend (--no-default-features --features libtorrent)
+sudo dnf install gcc gcc-c++ pkg-config rb_libtorrent-devel boost-devel
 
-# For libtorrent backend
-sudo dnf install rb_libtorrent-devel boost-devel
+# For the tray + settings GUI (--features gui)
+sudo dnf install fontconfig-devel gtk3-devel
+
+# For RAR streaming (--features rar)
+sudo dnf install gcc-c++ clang-devel
 ```
 
 </details>
@@ -163,8 +197,12 @@ sudo dnf install rb_libtorrent-devel boost-devel
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source ~/.cargo/env
 
-# For libtorrent backend
+# For the libtorrent backend (--no-default-features --features libtorrent)
 brew install libtorrent-rasterbar boost pkg-config
+
+# For RAR streaming (--features rar), Xcode Command Line Tools provide
+# the C++ toolchain and libclang:
+xcode-select --install
 ```
 
 </details>
@@ -173,9 +211,12 @@ brew install libtorrent-rasterbar boost pkg-config
 <summary><b>🪟 Windows</b></summary>
 
 ```powershell
-# 1. Install Rust from https://rustup.rs
-# 2. Install Visual Studio Build Tools with "Desktop development with C++"
-# 3. For libtorrent, use vcpkg with the repository's v3 triplet:
+# Default build: install Rust from https://rustup.rs — that's it.
+
+# For the rar/libtorrent features: install Visual Studio Build Tools
+# with "Desktop development with C++".
+
+# For libtorrent, use vcpkg with the repository's v3 triplet:
 git clone https://github.com/microsoft/vcpkg
 .\vcpkg\bootstrap-vcpkg.bat
 .\vcpkg\vcpkg install `
@@ -195,15 +236,18 @@ prebuilt Skia binaries.
 
 ## 📊 Backend Comparison
 
-| Feature | librqbit | libtorrent |
+`librqbit` is the **default** backend: pure Rust, no system libraries, builds anywhere the pinned toolchain does. `libtorrent` is **opt-in** (`--no-default-features --features libtorrent`) for those who want the battle-tested C++ engine and are willing to install its native dependencies.
+
+| Feature | librqbit (default) | libtorrent (opt-in) |
 |---------|----------|------------|
 | **Language** | Pure Rust | C++ via FFI |
+| **System Dependencies** | ✅ None | libtorrent-rasterbar + boost |
 | **Binary Size** | Smaller | Larger |
 | **Maturity** | Newer | Battle-tested |
 | **DHT** | ✅ | ✅ |
 | **uTP** | ✅ | ✅ |
 | **Piece Deadline** | ❌ | ✅ |
-| **Windows Setup** | ✅ Easy | ⚠️ Complex |
+| **Windows Setup** | ✅ Easy | ⚠️ Complex (vcpkg) |
 
 ---
 
@@ -214,14 +258,18 @@ stream-server/
 ├── server/           # HTTP server and API routes
 ├── enginefs/         # Torrent engine abstraction
 │   └── src/backend/
-│       ├── librqbit.rs   # Pure Rust backend
-│       └── libtorrent.rs # Native C++ backend
-└── libtorrent-sys/   # FFI bindings to libtorrent-rasterbar
+│       ├── librqbit.rs   # Pure Rust backend (default)
+│       └── libtorrent.rs # Native C++ backend (opt-in)
+└── bindings/
+    ├── libtorrent-sys/   # FFI bindings to libtorrent-rasterbar (libtorrent feature)
+    └── async-rar/        # Vendored UnRAR bindings (rar feature)
 ```
 
 ---
 
 ## 🐛 Troubleshooting
+
+The default build has no system-library dependencies — the issues below only apply to the opt-in `libtorrent` feature.
 
 <details>
 <summary><b>libtorrent not found</b></summary>
