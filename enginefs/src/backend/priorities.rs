@@ -263,7 +263,10 @@ impl PlaybackPriorityPolicy {
         }
 
         let max_cache_pieces = if ctx.cache_size_bytes > 0 {
-            (ctx.cache_size_bytes / ctx.piece_length).max(1) as i32
+            // Clamp before the i32 cast: an unlimited cache (u64::MAX) divided
+            // by a power-of-two piece length has all-ones low 32 bits, which a
+            // bare `as i32` would truncate to -1 and poison every window below.
+            (ctx.cache_size_bytes / ctx.piece_length).clamp(1, i32::MAX as u64) as i32
         } else {
             MAX_HOT_PIECES
         };
@@ -604,6 +607,20 @@ mod tests {
         assert!(decision.target_window_pieces <= MAX_STARTUP_PIECES);
         assert_eq!(decision.assignments[0].deadline, 0);
         assert_eq!(decision.assignments[0].piece_priority, 7);
+    }
+
+    #[test]
+    fn unlimited_cache_size_does_not_overflow_windows() {
+        // cacheSize:null (unlimited) flows in as u64::MAX; with a power-of-two
+        // piece length the quotient's low 32 bits are all ones, which used to
+        // truncate to max_cache_pieces = -1 and panic on Vec::with_capacity.
+        let mut ctx = base_context(PlaybackIntent::DirectSequential);
+        ctx.cache_size_bytes = u64::MAX;
+        let decision = PlaybackPriorityPolicy::decide(ctx);
+
+        assert!(decision.target_window_pieces > 0);
+        assert!(decision.hot_window_pieces >= MIN_SEEK_HOT_PIECES);
+        assert!(!decision.assignments.is_empty());
     }
 
     #[test]
