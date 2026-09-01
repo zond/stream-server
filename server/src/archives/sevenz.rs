@@ -3,7 +3,7 @@ use super::{
     cache::{ProgressiveCache, SyncCacheWriter},
 };
 use anyhow::{Result, anyhow};
-use sevenz_rust2::{ArchiveReader as SevenZReader, Password};
+use sevenz_rust2::{Archive, ArchiveReader as SevenZReader, BlockDecoder, Password};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -48,38 +48,57 @@ impl SevenZHandler {
 
 /// Decompress a single entry into the progressive cache's sync writer.
 ///
-/// Runs on the blocking pool. Uses `for_each_entries` so the entry is streamed
-/// out as it is decoded (important for solid archives where random access is
-/// not possible: earlier entries in the block are decoded and skipped).
+/// Runs on the blocking pool. Only the block containing the target entry is
+/// decoded, so unrelated blocks are never decompressed. Within a solid block
+/// the compressed stream is strictly sequential, so entries stored before the
+/// target are decoded and drained to reach the target's data at the correct
+/// stream offset.
 fn extract_entry(archive_path: &Path, entry_name: &str, out: &mut SyncCacheWriter) -> Result<()> {
-    let mut reader = SevenZReader::open(archive_path, Password::empty())
-        .map_err(|e| anyhow!("Failed to open 7z: {}", e))?;
+    let archive = Archive::open(archive_path).map_err(|e| anyhow!("Failed to open 7z: {}", e))?;
 
-    let mut found = false;
-    let mut write_err: Option<std::io::Error> = None;
+    let file_index = archive
+        .files
+        .iter()
+        .position(|f| !f.is_directory() && f.name() == entry_name)
+        .ok_or_else(|| anyhow!("File not found in archive: {}", entry_name))?;
 
-    reader
-        .for_each_entries(|entry, entry_reader| {
-            if !entry.is_directory() && entry.name() == entry_name {
-                found = true;
-                match std::io::copy(entry_reader, out) {
-                    Ok(_) => Ok(false), // Done, stop iterating
-                    Err(e) => {
-                        write_err = Some(e);
-                        Ok(false)
+    // Empty entries have no associated block; there is nothing to decode.
+    if let Some(block_index) = archive.stream_map.file_block_index[file_index] {
+        let mut source =
+            std::fs::File::open(archive_path).map_err(|e| anyhow!("Failed to open 7z: {}", e))?;
+        let password = Password::empty();
+        let target = &archive.files[file_index];
+
+        let mut extracted = false;
+        let mut write_err: Option<std::io::Error> = None;
+
+        BlockDecoder::new(1, block_index, &archive, &password, &mut source)
+            .for_each_entries(&mut |entry, entry_reader| {
+                if std::ptr::eq(entry, target) {
+                    extracted = true;
+                    match std::io::copy(entry_reader, out) {
+                        Ok(_) => Ok(false), // Done, stop iterating
+                        Err(e) => {
+                            write_err = Some(e);
+                            Ok(false)
+                        }
                     }
+                } else {
+                    // A preceding entry in a solid block: its bytes come first
+                    // in the shared stream and must be fully drained, or the
+                    // target would be read from the wrong offset.
+                    std::io::copy(entry_reader, &mut std::io::sink())?;
+                    Ok(true)
                 }
-            } else {
-                Ok(true) // Keep looking
-            }
-        })
-        .map_err(|e| anyhow!("7z decompression failed: {}", e))?;
+            })
+            .map_err(|e| anyhow!("7z decompression failed: {}", e))?;
 
-    if let Some(e) = write_err {
-        return Err(anyhow!("Failed to write decompressed data: {}", e));
-    }
-    if !found {
-        return Err(anyhow!("File not found in archive: {}", entry_name));
+        if let Some(e) = write_err {
+            return Err(anyhow!("Failed to write decompressed data: {}", e));
+        }
+        if !extracted {
+            return Err(anyhow!("Entry missing from its 7z block: {}", entry_name));
+        }
     }
 
     use std::io::Write;
@@ -173,7 +192,7 @@ impl ArchiveReader for SevenZHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sevenz_rust2::{ArchiveEntry as SevenZEntry, ArchiveWriter};
+    use sevenz_rust2::{ArchiveEntry as SevenZEntry, ArchiveWriter, SourceReader};
     use std::io::Cursor;
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -204,6 +223,35 @@ mod tests {
             )
             .expect("push second entry");
         writer.finish().expect("finish 7z archive");
+        path
+    }
+
+    /// Build a solid 7z archive (the 7-Zip CLI default): both entries share
+    /// one compressed block, so the second entry's data sits behind the
+    /// first's in the same stream.
+    fn write_solid_fixture(dir: &Path) -> PathBuf {
+        let path = dir.join("solid.7z");
+        let mut writer = ArchiveWriter::create(&path).expect("create 7z writer");
+        writer
+            .push_archive_entries(
+                vec![
+                    SevenZEntry::new_file("first.txt"),
+                    SevenZEntry::new_file("videos/second.bin"),
+                ],
+                vec![
+                    SourceReader::new(Cursor::new(FIRST_CONTENT.to_vec())),
+                    SourceReader::new(Cursor::new(second_content())),
+                ],
+            )
+            .expect("push solid entries");
+        writer.finish().expect("finish 7z archive");
+
+        // Pin the fixture shape: both files must live in a single block, or
+        // this fixture no longer exercises the solid-archive path.
+        let archive = Archive::open(&path).expect("reopen solid fixture");
+        assert_eq!(archive.blocks.len(), 1, "fixture must be a solid archive");
+        assert_eq!(archive.files.len(), 2);
+
         path
     }
 
@@ -289,6 +337,30 @@ mod tests {
         let mut tail = vec![0u8; len];
         reader.read_exact(&mut tail).await.expect("read tail");
         assert_eq!(tail, expected[expected.len() - len..]);
+    }
+
+    #[tokio::test]
+    async fn reads_entry_from_solid_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = write_solid_fixture(dir.path());
+        let handler = handler_for(&dir, archive);
+
+        // The target is NOT the first file in the solid block, so extraction
+        // must decode and drain "first.txt" before copying the target, or the
+        // bytes come from the wrong stream offset (CRC failure or corruption).
+        let mut reader = handler
+            .open_file("videos/second.bin")
+            .await
+            .expect("open entry");
+        let mut data = Vec::new();
+        reader.read_to_end(&mut data).await.expect("read entry");
+        assert_eq!(data, second_content());
+
+        // The first entry of the block still extracts correctly.
+        let mut reader = handler.open_file("first.txt").await.expect("open entry");
+        let mut data = Vec::new();
+        reader.read_to_end(&mut data).await.expect("read entry");
+        assert_eq!(data, FIRST_CONTENT);
     }
 
     #[tokio::test]
