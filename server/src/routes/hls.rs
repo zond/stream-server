@@ -43,8 +43,12 @@ fn stremio_probe_json(
         "infoHash": info_hash,
         "fileIdx": file_idx,
         "format": {
-            "name": stremio_format_name(&probe.container)
+            "name": stremio_format_name(&probe.container),
+            // stremio-video's fetchVideoParams.js reads duration from
+            // probe.format.duration (seconds) to compute durationMs.
+            "duration": probe.duration
         },
+        // Kept for back-compat with anything still reading the top-level field.
         "duration": probe.duration,
         "streams": probe.streams.iter().map(|stream| {
             serde_json::json!({
@@ -54,6 +58,10 @@ fn stremio_probe_json(
                 "channels": if stream.codec_type == "audio" { stream.channels.unwrap_or(2) } else { 0 },
                 "width": stream.width,
                 "height": stream.height,
+                // stremio-video's fetchVideoParams.js reads frameRate from the
+                // video-track stream (probe.streams.find(track === 'video'))
+                // to compute fpsMilli; fps is kept for back-compat.
+                "frameRate": stream.fps,
                 "fps": stream.fps,
                 "bitrate": stream.bitrate,
                 "lang": stream.lang,
@@ -1035,5 +1043,119 @@ fn hls_v2_segment_alias(resource: &str) -> Option<String> {
         Some(segment.to_string())
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod probe_json_tests {
+    use super::*;
+    use enginefs::hls::{ProbeResult, VideoStream};
+
+    fn sample_probe() -> ProbeResult {
+        ProbeResult {
+            duration: 5445.5,
+            container: "matroska".to_string(),
+            streams: vec![
+                VideoStream {
+                    index: 0,
+                    codec_type: "video".to_string(),
+                    codec_name: "h264".to_string(),
+                    width: Some(1920),
+                    height: Some(1080),
+                    channels: None,
+                    bitrate: Some(4_000_000),
+                    fps: Some(23.976),
+                    lang: None,
+                    is_default: true,
+                    profile: Some("High".to_string()),
+                    pix_fmt: Some("yuv420p".to_string()),
+                },
+                VideoStream {
+                    index: 1,
+                    codec_type: "audio".to_string(),
+                    codec_name: "aac".to_string(),
+                    width: None,
+                    height: None,
+                    channels: Some(2),
+                    bitrate: Some(192_000),
+                    fps: None,
+                    lang: Some("eng".to_string()),
+                    is_default: true,
+                    profile: None,
+                    pix_fmt: None,
+                },
+            ],
+        }
+    }
+
+    /// Ground truth: stremio-video's fetchVideoParams.js reads
+    /// `probe.format.duration` (fetchVideoParams.js:152) and
+    /// `videoStream.frameRate` off the video-track stream
+    /// (fetchVideoParams.js:151, where videoStream is
+    /// `probe.streams.find(track === 'video')`). Both fields must exist at
+    /// exactly those paths or official clients silently get null
+    /// durationMs/fpsMilli.
+    #[test]
+    fn probe_json_exposes_duration_under_format_and_frame_rate_on_video_stream() {
+        let json = stremio_probe_json("deadbeef", 0, &sample_probe());
+
+        assert_eq!(json["format"]["duration"], serde_json::json!(5445.5));
+        // Back-compat: keep the legacy top-level field too.
+        assert_eq!(json["duration"], serde_json::json!(5445.5));
+
+        let video_stream = json["streams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["track"] == "video")
+            .expect("video stream present");
+        assert_eq!(video_stream["frameRate"], serde_json::json!(23.976));
+        // Back-compat: keep the legacy `fps` field too.
+        assert_eq!(video_stream["fps"], serde_json::json!(23.976));
+    }
+
+    #[test]
+    fn probe_json_snapshot_matches_stremio_contract() {
+        let json = stremio_probe_json("deadbeef", 0, &sample_probe());
+        let expected = serde_json::json!({
+            "infoHash": "deadbeef",
+            "fileIdx": 0,
+            "format": {
+                "name": "matroska,webm",
+                "duration": 5445.5
+            },
+            "duration": 5445.5,
+            "streams": [
+                {
+                    "index": 0,
+                    "track": "video",
+                    "codec": "h264",
+                    "channels": 0,
+                    "width": 1920,
+                    "height": 1080,
+                    "frameRate": 23.976,
+                    "fps": 23.976,
+                    "bitrate": 4_000_000,
+                    "lang": null,
+                    "default": true,
+                    "profile": "High"
+                },
+                {
+                    "index": 1,
+                    "track": "audio",
+                    "codec": "aac",
+                    "channels": 2,
+                    "width": null,
+                    "height": null,
+                    "frameRate": null,
+                    "fps": null,
+                    "bitrate": 192_000,
+                    "lang": "eng",
+                    "default": true,
+                    "profile": null
+                }
+            ]
+        });
+        assert_eq!(json, expected);
     }
 }
