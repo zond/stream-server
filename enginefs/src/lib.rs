@@ -92,7 +92,10 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     /// wanted at a time. Single-file torrents bypass this selector.
     active_multifile_files: Arc<RwLock<HashMap<String, MultiFileActiveSelection>>>,
     priority_generation: Arc<AtomicU64>,
-    /// Optional disk cache for persisting completed files
+    /// Optional disk cache for persisting completed files. Only the
+    /// libtorrent-gated constructor populates it today; nothing reads it yet,
+    /// so it is dead code in the default (librqbit) build.
+    #[allow(dead_code)]
     disk_cache: Option<Arc<disk_cache::DiskCacheManager>>,
     /// When false, torrents are paused once their download completes.
     seeding_enabled: Arc<AtomicBool>,
