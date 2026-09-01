@@ -923,4 +923,196 @@ mod tests {
         assert!(video_stream(None, Some("p010le")).is_high_bit_depth_video());
         assert!(!video_stream(Some("High"), Some("yuv420p")).is_high_bit_depth_video());
     }
+
+    fn audio_stream(index: usize, lang: Option<&str>, is_default: bool) -> VideoStream {
+        VideoStream {
+            index,
+            codec_type: "audio".to_string(),
+            codec_name: "aac".to_string(),
+            width: None,
+            height: None,
+            channels: Some(2),
+            bitrate: None,
+            fps: None,
+            lang: lang.map(str::to_string),
+            is_default,
+            profile: None,
+            pix_fmt: None,
+        }
+    }
+
+    fn probe_with(duration: f64, streams: Vec<VideoStream>) -> ProbeResult {
+        ProbeResult {
+            duration,
+            container: "matroska".to_string(),
+            streams,
+        }
+    }
+
+    // --- get_segments ---
+
+    #[test]
+    fn get_segments_zero_duration_is_empty() {
+        assert!(HlsEngine::get_segments(0.0).is_empty());
+    }
+
+    #[test]
+    fn get_segments_exact_multiple_has_no_trailing_zero_length_segment() {
+        // 8.0s / 4.0s segment_duration => exactly two full segments, no dangling remainder.
+        let segments = HlsEngine::get_segments(8.0);
+        assert_eq!(segments, vec![(0.0, 4.0), (4.0, 4.0)]);
+    }
+
+    #[test]
+    fn get_segments_9_5_seconds_has_short_last_segment() {
+        let segments = HlsEngine::get_segments(9.5);
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0], (0.0, 4.0));
+        assert_eq!(segments[1], (4.0, 4.0));
+        let (start, dur) = segments[2];
+        assert_eq!(start, 8.0);
+        assert!((dur - 1.5).abs() < 1e-9, "expected 1.5, got {dur}");
+    }
+
+    #[test]
+    fn get_segments_durations_sum_to_input_duration() {
+        for duration in [0.5, 4.0, 7.25, 12.0, 100.3] {
+            let segments = HlsEngine::get_segments(duration);
+            let total: f64 = segments.iter().map(|(_, dur)| dur).sum();
+            assert!(
+                (total - duration).abs() < 1e-6,
+                "duration {duration}: segment durations summed to {total}"
+            );
+        }
+    }
+
+    // --- get_stream_playlist ---
+
+    #[test]
+    fn get_stream_playlist_empty_probe_omits_endlist() {
+        let probe = probe_with(0.0, vec![]);
+        let playlist = HlsEngine::get_stream_playlist(&probe, 0, "http://x/", None, "q=1");
+        assert!(!playlist.contains("#EXT-X-ENDLIST"));
+        assert!(playlist.contains("#EXTM3U"));
+    }
+
+    #[test]
+    fn get_stream_playlist_normal_probe_ends_with_endlist() {
+        let probe = probe_with(8.0, vec![]);
+        let playlist = HlsEngine::get_stream_playlist(&probe, 0, "http://x/", None, "q=1");
+        assert!(playlist.trim_end().ends_with("#EXT-X-ENDLIST"));
+    }
+
+    #[test]
+    fn get_stream_playlist_target_duration_is_ceil_of_max_segment() {
+        // 9.5s duration => segments of 4.0, 4.0, 1.5 => max is 4.0 => TARGETDURATION:4
+        let probe = probe_with(9.5, vec![]);
+        let playlist = HlsEngine::get_stream_playlist(&probe, 0, "http://x/", None, "q=1");
+        assert!(playlist.contains("#EXT-X-TARGETDURATION:4\n"));
+    }
+
+    #[test]
+    fn get_stream_playlist_audio_track_idx_changes_segment_filenames() {
+        let probe = probe_with(4.0, vec![]);
+
+        let no_audio = HlsEngine::get_stream_playlist(&probe, 0, "http://x/", None, "q=1");
+        assert!(no_audio.contains("http://x/0.ts?q=1"));
+        assert!(!no_audio.contains("audio-"));
+
+        let with_audio = HlsEngine::get_stream_playlist(&probe, 0, "http://x/", Some(2), "q=1");
+        assert!(with_audio.contains("http://x/audio-2-0.ts?q=1"));
+        assert!(!with_audio.contains("http://x/0.ts?q=1"));
+    }
+
+    // --- get_master_playlist ---
+
+    #[test]
+    fn get_master_playlist_no_audio_no_subtitles() {
+        let probe = probe_with(10.0, vec![]);
+        let m3u = HlsEngine::get_master_playlist(&probe, "abc123", 0, "http://base", "t=1", &[]);
+
+        assert!(!m3u.contains("EXT-X-MEDIA:TYPE=AUDIO"));
+        assert!(!m3u.contains("EXT-X-MEDIA:TYPE=SUBTITLES"));
+        assert!(!m3u.contains("AUDIO=\"audio\""));
+        assert!(!m3u.contains("SUBTITLES=\"subs\""));
+        assert!(m3u.contains("http://base/hlsv2/abc123/0/stream-0.m3u8?t=1"));
+    }
+
+    #[test]
+    fn get_master_playlist_three_audio_streams_default_only_on_first() {
+        let probe = probe_with(
+            10.0,
+            vec![
+                audio_stream(1, Some("eng"), false),
+                audio_stream(2, Some("fre"), false),
+                audio_stream(3, Some("ger"), false),
+            ],
+        );
+        let m3u = HlsEngine::get_master_playlist(&probe, "abc123", 0, "http://base", "t=1", &[]);
+
+        let media_lines: Vec<&str> = m3u
+            .lines()
+            .filter(|l| l.starts_with("#EXT-X-MEDIA:TYPE=AUDIO"))
+            .collect();
+        assert_eq!(media_lines.len(), 3);
+        assert!(media_lines[0].contains("DEFAULT=YES"));
+        assert!(media_lines[1].contains("DEFAULT=NO"));
+        assert!(media_lines[2].contains("DEFAULT=NO"));
+        assert!(m3u.contains("GROUP-ID=\"audio\""));
+        assert!(m3u.contains("AUDIO=\"audio\""));
+
+        // URIs embed base_url/info_hash/file_idx/query verbatim, keyed by global stream index.
+        assert!(m3u.contains("http://base/hlsv2/abc123/0/audio-1.m3u8?t=1"));
+        assert!(m3u.contains("http://base/hlsv2/abc123/0/audio-2.m3u8?t=1"));
+        assert!(m3u.contains("http://base/hlsv2/abc123/0/audio-3.m3u8?t=1"));
+    }
+
+    #[test]
+    fn get_master_playlist_two_subtitle_tracks_default_only_on_first() {
+        let probe = probe_with(10.0, vec![]);
+        let subs = vec![
+            SubtitleTrack {
+                id: 5,
+                name: "English".to_string(),
+                size: 100,
+            },
+            SubtitleTrack {
+                id: 6,
+                name: "French".to_string(),
+                size: 100,
+            },
+        ];
+        let m3u = HlsEngine::get_master_playlist(&probe, "abc123", 0, "http://base", "t=1", &subs);
+
+        let media_lines: Vec<&str> = m3u
+            .lines()
+            .filter(|l| l.starts_with("#EXT-X-MEDIA:TYPE=SUBTITLES"))
+            .collect();
+        assert_eq!(media_lines.len(), 2);
+        assert!(media_lines[0].contains("DEFAULT=YES"));
+        assert!(media_lines[1].contains("DEFAULT=NO"));
+        assert!(m3u.contains("GROUP-ID=\"subs\""));
+        assert!(m3u.contains("SUBTITLES=\"subs\""));
+
+        assert!(m3u.contains("http://base/abc123/5/subtitles.vtt?t=1"));
+        assert!(m3u.contains("http://base/abc123/6/subtitles.vtt?t=1"));
+    }
+
+    #[test]
+    fn get_master_playlist_subtitle_name_with_quotes_is_unescaped() {
+        // KNOWN BUG (pinned, not fixed here): SubtitleTrack names are interpolated
+        // directly into the NAME="..." attribute with no escaping. A name containing a
+        // double quote produces invalid/broken M3U8 attribute syntax instead of being
+        // escaped or rejected. This test pins current behavior.
+        let probe = probe_with(10.0, vec![]);
+        let subs = vec![SubtitleTrack {
+            id: 1,
+            name: "Weird \"Quoted\" Name".to_string(),
+            size: 10,
+        }];
+        let m3u = HlsEngine::get_master_playlist(&probe, "abc123", 0, "http://base", "t=1", &subs);
+
+        // The raw quotes pass through unescaped, breaking the NAME="..." attribute.
+        assert!(m3u.contains("NAME=\"Weird \"Quoted\" Name\""));
+    }
 }
