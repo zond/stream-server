@@ -273,7 +273,7 @@ async fn proxy_subtitles_response(ext: &str, query: ProxySubtitlesQuery) -> Resp
     }
 }
 
-fn apply_subtitle_offset(content: &str, offset_ms: i64) -> String {
+pub(crate) fn apply_subtitle_offset(content: &str, offset_ms: i64) -> String {
     if offset_ms == 0 {
         return content.to_string();
     }
@@ -299,4 +299,75 @@ fn apply_subtitle_offset(content: &str, offset_ms: i64) -> String {
             format!("{h:02}:{m:02}:{s:02}{}{ms:03}", &caps[4])
         })
         .to_string()
+}
+
+#[cfg(test)]
+mod offset_tests {
+    use super::*;
+
+    #[test]
+    fn zero_offset_is_identity() {
+        let srt = "1\n00:00:01,000 --> 00:00:02,000\nHello\n";
+        assert_eq!(apply_subtitle_offset(srt, 0), srt);
+    }
+
+    #[test]
+    fn zero_offset_is_identity_for_malformed_content() {
+        let malformed = "not a timestamp at all\njust some text 12:34";
+        assert_eq!(apply_subtitle_offset(malformed, 0), malformed);
+    }
+
+    #[test]
+    fn positive_offset_crosses_minute_boundary() {
+        // 00:00:59,000 + 1500ms => 00:01:00,500
+        let input = "00:00:59,000";
+        let result = apply_subtitle_offset(input, 1500);
+        assert_eq!(result, "00:01:00,500");
+    }
+
+    #[test]
+    fn negative_offset_clamps_at_zero() {
+        let input = "00:00:01,000";
+        let result = apply_subtitle_offset(input, -5000);
+        assert_eq!(result, "00:00:00,000");
+    }
+
+    #[test]
+    fn comma_separator_preserved() {
+        let input = "00:00:01,000";
+        let result = apply_subtitle_offset(input, 500);
+        assert_eq!(result, "00:00:01,500");
+    }
+
+    #[test]
+    fn dot_separator_preserved() {
+        // VTT-style timestamps use '.' as the separator; it must be preserved, not
+        // switched to ',' by the shift.
+        let input = "00:00:01.000";
+        let result = apply_subtitle_offset(input, 500);
+        assert_eq!(result, "00:00:01.500");
+    }
+
+    #[test]
+    fn hour_rollover_on_positive_offset() {
+        // 00:59:59,500 + 1000ms => 01:00:00,500
+        let input = "00:59:59,500";
+        let result = apply_subtitle_offset(input, 1000);
+        assert_eq!(result, "01:00:00,500");
+    }
+
+    #[test]
+    fn digit_patterns_without_millis_are_untouched() {
+        // Looks like a timestamp prefix but has no ",mmm"/"​.mmm" suffix, so the
+        // regex should not match and the text must pass through unchanged.
+        let input = "00:00:01 is not a full timestamp";
+        assert_eq!(apply_subtitle_offset(input, 1000), input);
+    }
+
+    #[test]
+    fn both_arrow_timestamps_are_shifted() {
+        let input = "00:00:01,000 --> 00:00:03,000";
+        let result = apply_subtitle_offset(input, 2000);
+        assert_eq!(result, "00:00:03,000 --> 00:00:05,000");
+    }
 }
