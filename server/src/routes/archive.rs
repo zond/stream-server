@@ -452,39 +452,9 @@ async fn stream_file(
                         StatusCode::INTERNAL_SERVER_ERROR
                     })?;
 
-                // Define Wrapper to bridge enginefs::backend::FileStreamTrait to AsyncSeekableReader
-                // FileStreamTrait requires AsyncRead + AsyncSeek + Unpin + Send
-                // AsyncSeekableReader requires AsyncRead + AsyncSeek + Unpin + Send + Sync
-                // Wait, FileStreamTrait is Send?
-                // Checking libtorrent.rs: returns Result<Box<dyn FileStreamTrait>>.
-                // We need to wrap it.
-
+                // Wrapper bridging enginefs::backend::FileStreamTrait (AsyncRead +
+                // AsyncSeek + Unpin + Send) to this module's AsyncSeekableReader.
                 struct BackendStreamWrapper(Box<dyn enginefs::backend::FileStreamTrait>);
-                // Safety: We assume FileStreamTrait is Send. LibtorrentFileStream is Send.
-                // But generic trait object?
-                // enginefs definition: trait FileStreamTrait: AsyncRead + AsyncSeek + Unpin + Send {}
-                // So wrapper is Send.
-                // Is it Sync? Box<...> is Sync if dyn Trait + Sync.
-                // If not Sync, we can't implement AsyncSeekableReader if it requires Sync.
-                // server/src/archives/mod.rs: pub trait AsyncSeekableReader: ... + Sync {}
-                // We need Sync.
-                // LibtorrentFileStream contains Arc<RwLock<...>> which is Sync.
-                // BUT Type alias is Box<dyn FileStreamTrait>.
-                // If the trait doesn't enforce Sync, we can't guarantee it.
-                // However, we can wrap it in a Mutex? No, that's heavy.
-                // Or we can just implement UnsafeSync wrapper if we are sure?
-                // Or better: Change AsyncSeekableReader to NOT require Sync?
-                // sevenz bridge requires Send (for moving to thread). Does it require Sync?
-                // It takes `Box<dyn AsyncSeekableReader>`.
-                // Bridge moves it to async task (spawn).
-                // Async task is Send.
-                // So reader must be Send. Sync is only needed if accessed from multiple threads concurrently.
-                // We don't do that.
-                // So I should REMOVE Sync from AsyncSeekableReader in `mod.rs`.
-
-                // For now, let's wrap and unsafe impl Sync if needed, OR fix mod.rs.
-                // Fixing mod.rs is cleaner. I will do that in next step.
-                // But for now, let's assume valid.
 
                 // Wrapper impls
                 impl tokio::io::AsyncRead for BackendStreamWrapper {

@@ -158,8 +158,8 @@ pub fn disk_backed_forward_window_pieces_for(intent: PlaybackIntent, piece_lengt
 /// Per-stream lookahead window (in bytes) for librqbit's `FileStreamOptions`,
 /// sized by playback intent instead of librqbit's fixed 32 MiB default. Reuses
 /// the same `MAX_*_WINDOW_BYTES` caps `disk_backed_forward_window_pieces_for`
-/// maps each intent onto, so the librqbit and libtorrent backends read ahead by
-/// the same byte budget. `stream_with_options` rejects a zero window, so the
+/// maps each intent onto, so librqbit reads ahead by the same byte budget the
+/// disk-cache path uses. `stream_with_options` rejects a zero window, so the
 /// result is clamped to at least 1 (all constants are already > 0).
 pub fn librqbit_stream_lookahead_bytes(intent: PlaybackIntent) -> u64 {
     match intent {

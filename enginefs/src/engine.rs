@@ -291,7 +291,7 @@ impl<H: TorrentHandle> Engine<H> {
         self.active_streams.fetch_add(1, Ordering::SeqCst);
 
         // Use raw reader directly for better performance
-        // The libtorrent backend reads from local files, caching adds overhead
+        // The torrent backend reads from local files, caching adds overhead
         Some(FileHandle::new(length, name, reader, self.clone()))
     }
 

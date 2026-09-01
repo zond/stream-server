@@ -54,13 +54,13 @@ pub trait TorrentHandle: Send + Sync + Clone {
     fn manages_playback_lifecycle(&self) -> bool {
         false
     }
-    /// Record HLS activity without forcing shared backends to implement a
-    /// libtorrent-specific lease controller.
+    /// Record HLS activity without forcing shared backends to implement their
+    /// own lease controller; a native-lifecycle backend overrides this.
     async fn refresh_hls_activity(&self, _file_idx: usize, _source: &'static str) -> Result<()> {
         Ok(())
     }
-    /// End HLS activity immediately. Libtorrent overrides this to cancel the
-    /// selected generation and confirm a normal torrent pause.
+    /// End HLS activity immediately. A native-lifecycle backend overrides this
+    /// to cancel the selected generation and confirm a normal torrent pause.
     async fn end_hls_activity(&self, _file_idx: usize, _reason: &'static str) -> Result<()> {
         Ok(())
     }

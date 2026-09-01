@@ -35,7 +35,7 @@ use crate::backend::{
 const INACTIVE_TORRENT_REMOVE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
 const INACTIVE_TORRENT_PAUSE_GRACE: Duration = Duration::from_secs(15);
 const HLS_PLAYBACK_LEASE_TTL: Duration = Duration::from_secs(300);
-const LIBTORRENT_HLS_PLAYBACK_LEASE_TTL: Duration = Duration::from_secs(15);
+const NATIVE_LIFECYCLE_HLS_PLAYBACK_LEASE_TTL: Duration = Duration::from_secs(15);
 
 static START_TIME: OnceLock<Instant> = OnceLock::new();
 
@@ -86,9 +86,9 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     /// wanted at a time. Single-file torrents bypass this selector.
     active_multifile_files: Arc<RwLock<HashMap<String, MultiFileActiveSelection>>>,
     priority_generation: Arc<AtomicU64>,
-    /// Optional disk cache for persisting completed files. Only the
-    /// libtorrent-gated constructor populates it today; nothing reads it yet,
-    /// so it is dead code in the default (librqbit) build.
+    /// Optional disk cache for persisting completed files. No constructor
+    /// populates it in the librqbit-only build, and nothing reads it either,
+    /// so it is dead code today; kept for a future backend that wants it.
     #[allow(dead_code)]
     disk_cache: Option<Arc<disk_cache::DiskCacheManager>>,
     /// When false, torrents are paused once their download completes.
@@ -298,7 +298,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     };
                     if let Some(engine) = engine {
                         if engine.handle.manages_playback_lifecycle() {
-                            // The libtorrent coordinator expires its own
+                            // A native-lifecycle backend expires its own
                             // generation-scoped HLS lease and performs the
                             // acknowledged pause. Shared delayed cleanup must
                             // not race it.
@@ -932,7 +932,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             .as_ref()
             .is_some_and(|engine| engine.handle.manages_playback_lifecycle());
         let ttl = if native_lifecycle {
-            LIBTORRENT_HLS_PLAYBACK_LEASE_TTL
+            NATIVE_LIFECYCLE_HLS_PLAYBACK_LEASE_TTL
         } else {
             HLS_PLAYBACK_LEASE_TTL
         };
@@ -963,7 +963,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                             file_idx,
                             source,
                             %error,
-                            "Failed to refresh existing libtorrent HLS playback"
+                            "Failed to refresh existing native-lifecycle HLS playback"
                         );
                     }
                 } else {
