@@ -1159,3 +1159,139 @@ mod probe_json_tests {
         assert_eq!(json, expected);
     }
 }
+
+#[cfg(test)]
+mod url_grammar_tests {
+    use super::*;
+
+    // --- stremio_format_name ---
+
+    #[test]
+    fn stremio_format_name_maps_matroska_and_webm_to_combined_name() {
+        assert_eq!(stremio_format_name("matroska"), "matroska,webm");
+        assert_eq!(stremio_format_name("webm"), "matroska,webm");
+    }
+
+    #[test]
+    fn stremio_format_name_passes_other_containers_through() {
+        assert_eq!(stremio_format_name("mp4"), "mp4");
+        assert_eq!(stremio_format_name("unknown"), "unknown");
+    }
+
+    // --- hls_v2_segment_alias ---
+
+    #[test]
+    fn hls_v2_segment_alias_strips_segment_prefix() {
+        assert_eq!(hls_v2_segment_alias("segment3.ts").as_deref(), Some("3.ts"));
+    }
+
+    #[test]
+    fn hls_v2_segment_alias_passes_through_bare_numeric_ts() {
+        assert_eq!(hls_v2_segment_alias("3.ts").as_deref(), Some("3.ts"));
+    }
+
+    #[test]
+    fn hls_v2_segment_alias_rejects_non_ts_resource() {
+        assert_eq!(hls_v2_segment_alias("init.mp4"), None);
+    }
+
+    #[test]
+    fn hls_v2_segment_alias_rejects_non_numeric_segment() {
+        assert_eq!(hls_v2_segment_alias("foo.ts"), None);
+    }
+
+    // --- legacy_stream_playlist ---
+
+    #[test]
+    fn legacy_stream_playlist_accepts_stream_prefixed_m3u8() {
+        assert!(legacy_stream_playlist("stream-0.m3u8"));
+        assert!(legacy_stream_playlist("stream-q-720p.m3u8"));
+    }
+
+    #[test]
+    fn legacy_stream_playlist_rejects_non_stream_or_non_m3u8() {
+        assert!(!legacy_stream_playlist("stream-0.ts"));
+        assert!(!legacy_stream_playlist("master.m3u8"));
+        assert!(!legacy_stream_playlist("hls.m3u8"));
+    }
+
+    // --- legacy_pair ---
+
+    #[test]
+    fn legacy_pair_accepts_40_hex_hash_and_numeric_index() {
+        let hash = "a".repeat(40);
+        let result = legacy_pair(&hash, "3");
+        assert_eq!(result, Some((hash, "3".to_string())));
+    }
+
+    #[test]
+    fn legacy_pair_accepts_negative_one_as_auto_index() {
+        let hash = "b".repeat(40);
+        let result = legacy_pair(&hash, "-1");
+        assert_eq!(result, Some((hash, "-1".to_string())));
+    }
+
+    #[test]
+    fn legacy_pair_lowercases_uppercase_hash() {
+        let hash = "A".repeat(40);
+        let result = legacy_pair(&hash, "0");
+        assert_eq!(result, Some(("a".repeat(40), "0".to_string())));
+    }
+
+    #[test]
+    fn legacy_pair_rejects_junk_hash_or_index() {
+        assert_eq!(legacy_pair("not-a-hash", "0"), None);
+        assert_eq!(legacy_pair(&"a".repeat(39), "0"), None); // too short
+        assert_eq!(legacy_pair(&"a".repeat(41), "0"), None); // too long
+        assert_eq!(legacy_pair(&"g".repeat(40), "0"), None); // non-hex
+        assert_eq!(legacy_pair(&"a".repeat(40), "not-a-number"), None);
+        assert_eq!(legacy_pair(&"a".repeat(40), "-2"), None);
+    }
+
+    // --- normalize_media_url ---
+
+    #[test]
+    fn normalize_media_url_prefixes_absolute_path_with_base_url() {
+        let result = normalize_media_url("/abc123/0?", "http://127.0.0.1:11470/");
+        assert_eq!(result, "http://127.0.0.1:11470/abc123/0?");
+    }
+
+    #[test]
+    fn normalize_media_url_leaves_full_url_but_trims_trailing_question_mark() {
+        let result = normalize_media_url(
+            "http://127.0.0.1:11470/abc123/0?",
+            "http://127.0.0.1:11470/",
+        );
+        assert_eq!(result, "http://127.0.0.1:11470/abc123/0");
+    }
+
+    // --- parse_tracks_path ---
+
+    #[test]
+    fn parse_tracks_path_accepts_hash_and_index() {
+        let hash = "a".repeat(40);
+        let path = format!("/{}/2", hash);
+        assert_eq!(parse_tracks_path(&path), Some((hash, 2)));
+    }
+
+    #[test]
+    fn parse_tracks_path_lowercases_hash() {
+        let hash = "A".repeat(40);
+        let path = format!("/{}/2", hash);
+        assert_eq!(parse_tracks_path(&path), Some(("a".repeat(40), 2)));
+    }
+
+    #[test]
+    fn parse_tracks_path_rejects_extra_segments() {
+        let hash = "a".repeat(40);
+        let path = format!("/{}/2/extra", hash);
+        assert_eq!(parse_tracks_path(&path), None);
+    }
+
+    #[test]
+    fn parse_tracks_path_rejects_non_hash_or_non_numeric_index() {
+        assert_eq!(parse_tracks_path("/not-a-hash/2"), None);
+        let hash = "a".repeat(40);
+        assert_eq!(parse_tracks_path(&format!("/{}/nope", hash)), None);
+    }
+}
