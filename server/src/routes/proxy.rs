@@ -2,13 +2,76 @@ use crate::state::AppState;
 use axum::{
     Router,
     extract::{Path, Query},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header, response::Builder},
     response::{IntoResponse, Response},
     routing::any,
 };
 use reqwest::{Client, Method};
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use url::Url;
+
+/// Lazily-built, process-wide reqwest client for the proxy route.
+///
+/// `Client::builder().build()` can fail (e.g. if the TLS backend can't be
+/// initialized), so building it once at startup-on-first-use and reusing it
+/// avoids both a per-request `.unwrap()` panic and the cost of rebuilding a
+/// client for every proxied request.
+static HTTP_CLIENT: OnceLock<Option<Client>> = OnceLock::new();
+
+fn http_client() -> Option<&'static Client> {
+    HTTP_CLIENT
+        .get_or_init(|| {
+            Client::builder()
+                .danger_accept_invalid_certs(true) // Parity with rejectUnauthorized: false
+                .build()
+                .map_err(|e| tracing::error!("Failed to build proxy HTTP client: {e}"))
+                .ok()
+        })
+        .as_ref()
+}
+
+/// Applies the `r=` (Core-format) custom response headers to a response
+/// builder, validating each name/value pair first so that a malicious or
+/// malformed header (e.g. containing a newline) can never poison the
+/// builder's internal error state. Invalid pairs are skipped and logged at
+/// debug level rather than propagated.
+fn apply_custom_response_headers(
+    mut builder: Builder,
+    custom_response_headers: HashMap<String, String>,
+) -> Builder {
+    for (name, value) in custom_response_headers {
+        match (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(&value),
+        ) {
+            (Ok(header_name), Ok(header_value)) => {
+                builder = builder.header(header_name, header_value);
+            }
+            _ => {
+                tracing::debug!(
+                    name = %name,
+                    value = %value,
+                    "Skipping invalid custom response header from r= proxy param"
+                );
+            }
+        }
+    }
+    builder
+}
+
+/// Finishes building a response, turning a builder error (which can no
+/// longer happen for headers we control, but is handled defensively for any
+/// other builder failure) into a 502 instead of panicking via `.unwrap()`.
+fn finalize_response(builder: Builder, body: axum::body::Body) -> Response {
+    match builder.body(body) {
+        Ok(resp) => resp.into_response(),
+        Err(e) => {
+            tracing::error!("Failed to build proxy response: {e}");
+            (StatusCode::BAD_GATEWAY, "Proxy response error").into_response()
+        }
+    }
+}
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -94,10 +157,16 @@ pub async fn proxy_handler(
         url.set_query(Some(&q));
     }
 
-    let client = Client::builder()
-        .danger_accept_invalid_certs(true) // Parity with rejectUnauthorized: false
-        .build()
-        .unwrap();
+    let client = match http_client() {
+        Some(c) => c,
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Proxy client unavailable",
+            )
+                .into_response();
+        }
+    };
 
     let mut req_builder = client.request(method, url.clone());
 
@@ -152,10 +221,9 @@ pub async fn proxy_handler(
         }
     }
 
-    // Apply custom response headers (Core format)
-    for (name, value) in custom_response_headers {
-        res_builder = res_builder.header(name, value);
-    }
+    // Apply custom response headers (Core format), validated so a malformed
+    // r= param can never poison the response builder.
+    res_builder = apply_custom_response_headers(res_builder, custom_response_headers);
 
     // CORS headers
     res_builder = res_builder
@@ -177,17 +245,11 @@ pub async fn proxy_handler(
         // then add rewriting if segments fail.
         let body = response.text().await.unwrap_or_default();
         let rewritten = rewrite_playlist(&body, &url);
-        return res_builder
-            .body(axum::body::Body::from(rewritten))
-            .unwrap()
-            .into_response();
+        return finalize_response(res_builder, axum::body::Body::from(rewritten));
     }
 
     let stream = response.bytes_stream();
-    res_builder
-        .body(axum::body::Body::from_stream(stream))
-        .unwrap()
-        .into_response()
+    finalize_response(res_builder, axum::body::Body::from_stream(stream))
 }
 
 fn rewrite_playlist(body: &str, base_url: &Url) -> String {
@@ -237,4 +299,169 @@ fn rewrite_playlist(body: &str, base_url: &Url) -> String {
         }
     }
     rewritten
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base() -> Url {
+        Url::parse("http://example.com/streams/master.m3u8").unwrap()
+    }
+
+    fn proxied(target: &str) -> String {
+        format!("/proxy/?d={}", urlencoding::encode(target))
+    }
+
+    #[test]
+    fn relative_segment_is_joined_against_base_and_wrapped() {
+        let body = "seg-0.ts\n";
+        let rewritten = rewrite_playlist(body, &base());
+        assert_eq!(
+            rewritten,
+            format!("{}\n", proxied("http://example.com/streams/seg-0.ts"))
+        );
+    }
+
+    #[test]
+    fn absolute_http_line_is_wrapped_without_double_joining() {
+        let body = "http://cdn.example.org/other/seg-0.ts\n";
+        let rewritten = rewrite_playlist(body, &base());
+        assert_eq!(
+            rewritten,
+            format!("{}\n", proxied("http://cdn.example.org/other/seg-0.ts"))
+        );
+    }
+
+    #[test]
+    fn absolute_https_line_is_wrapped_without_double_joining() {
+        let body = "https://cdn.example.org/other/seg-0.ts\n";
+        let rewritten = rewrite_playlist(body, &base());
+        assert_eq!(
+            rewritten,
+            format!("{}\n", proxied("https://cdn.example.org/other/seg-0.ts"))
+        );
+    }
+
+    #[test]
+    fn ext_x_media_uri_is_rewritten_and_other_attributes_are_preserved() {
+        let body = concat!(
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"English\",",
+            "URI=\"audio/en.m3u8\",DEFAULT=YES,AUTOSELECT=YES\n"
+        );
+        let rewritten = rewrite_playlist(body, &base());
+        let expected = format!(
+            concat!(
+                "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"English\",",
+                "URI=\"{}\",DEFAULT=YES,AUTOSELECT=YES\n"
+            ),
+            proxied("http://example.com/streams/audio/en.m3u8")
+        );
+        assert_eq!(rewritten, expected);
+    }
+
+    #[test]
+    fn ext_x_media_with_absolute_uri_is_wrapped_without_double_joining() {
+        let body = concat!(
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"English\",",
+            "URI=\"https://cdn.example.org/audio/en.m3u8\"\n"
+        );
+        let rewritten = rewrite_playlist(body, &base());
+        let expected = format!(
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"English\",URI=\"{}\"\n",
+            proxied("https://cdn.example.org/audio/en.m3u8")
+        );
+        assert_eq!(rewritten, expected);
+    }
+
+    /// Pins current behavior: EXT-X-KEY's URI is rewritten through the same
+    /// generic `URI="..."` handling as EXT-X-MEDIA, so encryption key
+    /// fetches ARE proxied (not left pointing at the origin directly). If
+    /// that's ever intentionally changed, update this test alongside it.
+    #[test]
+    fn ext_x_key_uri_is_proxied_like_other_uri_attributes() {
+        let body = "#EXT-X-KEY:METHOD=AES-128,URI=\"key/enc.key\",IV=0x0123456789abcdef\n";
+        let rewritten = rewrite_playlist(body, &base());
+        let expected = format!(
+            "#EXT-X-KEY:METHOD=AES-128,URI=\"{}\",IV=0x0123456789abcdef\n",
+            proxied("http://example.com/streams/key/enc.key")
+        );
+        assert_eq!(rewritten, expected);
+    }
+
+    #[test]
+    fn root_relative_path_resolves_against_origin() {
+        let body = "/videos/seg-0.ts\n";
+        let rewritten = rewrite_playlist(body, &base());
+        assert_eq!(
+            rewritten,
+            format!("{}\n", proxied("http://example.com/videos/seg-0.ts"))
+        );
+    }
+
+    #[test]
+    fn comment_and_blank_lines_are_left_unchanged() {
+        let body = "#EXTM3U\n#EXT-X-VERSION:3\n\n#EXT-X-TARGETDURATION:10\n";
+        let rewritten = rewrite_playlist(body, &base());
+        assert_eq!(rewritten, body);
+    }
+
+    #[test]
+    fn apply_custom_response_headers_skips_invalid_name_and_value() {
+        let mut headers = HashMap::new();
+        // Valid pair: should be applied.
+        headers.insert("X-Proxy-Ok".to_string(), "yes".to_string());
+        // Invalid value: embedded CR/LF must never reach the header map.
+        headers.insert(
+            "X-Evil".to_string(),
+            "bad\r\nInjected-Header: true".to_string(),
+        );
+        // Invalid name: space is not a legal header-name character.
+        headers.insert("Bad Name".to_string(), "value".to_string());
+
+        let builder = apply_custom_response_headers(Response::builder().status(200), headers);
+        let response = builder.body(axum::body::Body::empty()).unwrap();
+
+        assert_eq!(response.headers().get("x-proxy-ok").unwrap(), "yes");
+        assert!(response.headers().get("x-evil").is_none());
+        assert!(!response.headers().contains_key("injected-header"));
+    }
+
+    #[test]
+    fn malicious_r_header_value_does_not_panic_and_yields_a_response() {
+        // Simulates parsing r=X-Evil:bad%0d%0aInjected:1 from the proxy URL:
+        // once percent-decoded and split on ':', the value carries a raw
+        // newline. Feeding this straight into a response builder (the old
+        // `.header(name, value)` + `.unwrap()` code path) would poison the
+        // builder and panic at `.body()`. The validated path must not.
+        let mut custom_response_headers = HashMap::new();
+        custom_response_headers.insert("X-Evil".to_string(), "bad\r\nInjected: true".to_string());
+
+        let builder =
+            apply_custom_response_headers(Response::builder().status(200), custom_response_headers);
+        let response = finalize_response(builder, axum::body::Body::empty());
+
+        // No panic occurred (we got here), and the handler degrades to a
+        // clean response rather than crashing the whole process.
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get("x-evil").is_none());
+    }
+
+    #[test]
+    fn finalize_response_returns_502_on_builder_error_instead_of_panicking() {
+        // Bypass our own validation to force the underlying http builder
+        // into an error state, the way an unvalidated header ingest used to.
+        let builder = Response::builder()
+            .status(200)
+            .header("Bad Header Name\r\n", "value");
+
+        let response = finalize_response(builder, axum::body::Body::empty());
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn http_client_builds_successfully() {
+        assert!(http_client().is_some());
+    }
 }
