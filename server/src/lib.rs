@@ -705,8 +705,6 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::subtitles::opensub_hash_path),
         )
         .route("/subtitlesTracks", get(routes::subtitles::subtitles_tracks))
-        .route("/device-info", get(routes::system::get_device_info))
-        .route("/hwaccel-profiler", get(routes::system::hwaccel_profiler))
         .route("/get-https", get(routes::system::get_https))
         .nest("/yt", routes::youtube::router())
         .nest("/rar", routes::archive::router())

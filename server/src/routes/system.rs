@@ -743,21 +743,6 @@ pub async fn set_settings(
         }
     }
 }
-pub async fn get_device_info() -> impl IntoResponse {
-    let profiles = probe_hwaccel().await;
-    Json(json!({
-        "availableHardwareAccelerations": profiles
-    }))
-}
-
-pub async fn hwaccel_profiler() -> impl IntoResponse {
-    let profiles = probe_hwaccel().await;
-    Json(json!({
-        "success": true,
-        "profiles": profiles
-    }))
-}
-
 static HWACCEL_PROFILES: tokio::sync::OnceCell<Vec<String>> = tokio::sync::OnceCell::const_new();
 
 pub async fn probe_hwaccel() -> Vec<String> {
