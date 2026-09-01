@@ -38,7 +38,7 @@ The torrent engine itself is [`librqbit`](https://github.com/rqbit-torrent/rqbit
 | **Torrent backend** | Pure-Rust `librqbit` by default | Native libtorrent (or Node bindings) |
 | **Open Source** | ✅ Yes (MIT License) | Upstream `server.js` is closed source |
 | **Seekable Streams** | ✅ Instant, via HTTP range requests | ⚠️ Variable |
-| **Archive Streaming** | ✅ ZIP/7Z/TAR built in (pure Rust), RAR opt-in | ✅ |
+| **Archive Streaming** | ✅ ZIP/7Z/TAR/RAR built in (pure Rust) | ✅ |
 | **Headless** | ✅ No tray, no desktop GUI in this repo | Varies |
 
 This is not a drop-in replacement for `server.js` — the API surface it exposes is intentionally smaller. It's built to be the backend of one specific client, not a generic Stremio-compatible service.
@@ -53,7 +53,7 @@ This is not a drop-in replacement for `server.js` — the API surface it exposes
 - **📡 HTTP Range Requests**: torrent pieces are streamed straight to HTTP range requests for instant seeking — direct play, no transcoding step in between
 
 ### Media & Archives
-- **📦 Archive Streaming**: direct playback from ZIP, 7Z, TAR, and NZB archives out of the box (pure Rust); RAR via the opt-in `rar` feature
+- **📦 Archive Streaming**: direct playback from ZIP, 7Z, TAR, NZB, and RAR archives out of the box (all pure Rust). RAR uses `unrar-rs`, which is GPL-3.0-or-later, so the default binary is GPL-3.0-or-later — see [License](#-license); build `--no-default-features --features librqbit` for an MIT binary without RAR
 - **📝 Subtitles**: external subtitle-file detection with pure-Rust SRT/ASS→VTT conversion, plus OpenSubtitles hash calculation (embedded-track extraction, which used FFmpeg, has been removed — the client handles embedded tracks itself)
 - **🎬 YouTube resolution**: resolves YouTube URLs to a direct playable stream via a managed `yt-dlp` (auto-downloaded and refreshed at runtime, not a build dependency)
 
@@ -90,27 +90,29 @@ Note: release binaries are built with the opt-in `libtorrent` backend (`--featur
 The **default build is pure Rust and needs zero system libraries** — no libtorrent, no libclang, no FFmpeg, no GUI toolkits. The pinned toolchain in `rust-toolchain.toml` (Rust 1.98.0) is picked up automatically by rustup, and this is exactly what CI verifies with no `apt install` step at all:
 
 ```bash
-# Default build: pure-Rust librqbit backend, zero system deps
+# Default build: pure-Rust librqbit backend + pure-Rust RAR, zero system deps.
+# NOTE: this links unrar-rs (GPL-3.0-or-later), so this binary is
+# GPL-3.0-or-later — see the License section below.
 cargo build --release
 ```
 
-Everything else is opt-in and pulls in native dependencies only when you ask for it:
+The `libtorrent` backend is opt-in and pulls in native dependencies only when you ask for it. The `librqbit`-only build is also the way to get an MIT-licensed binary without RAR:
 
 ```bash
 # libtorrent backend (advanced; needs libtorrent-rasterbar + boost)
 cargo build --release --no-default-features --features libtorrent
 
-# RAR archive streaming (needs libclang + a C++ toolchain — see below)
-cargo build --release --features rar
+# MIT binary: pure-Rust librqbit backend, no RAR (no unrar-rs, no GPL)
+cargo build --release --no-default-features --features librqbit
 ```
 
 | Feature | What it adds | Extra system deps |
 |---|---|---|
-| *(default)* | `librqbit` torrent backend | None |
+| *(default)* | `librqbit` torrent backend + `rar` (pure-Rust RAR via `unrar-rs`) | None |
+| `rar` | RAR archive streaming via pure-Rust `unrar-rs` (**on by default**) | None |
 | `libtorrent` | Alternative torrent backend, C++ libtorrent-rasterbar via FFI | `libtorrent-rasterbar` 2.1.1+, Boost headers, pkg-config, a C++17 compiler |
-| `rar` | RAR archive streaming, over vendored UnRAR C++ sources via `autocxx` | libclang, a C++ toolchain |
 
-Without the `rar` feature, RAR requests return a 501 JSON error; ZIP, 7Z, TAR, and NZB streaming are always built in. `libtorrent` and `librqbit` are mutually exclusive — build libtorrent with `--no-default-features` so it isn't compiled alongside the default backend.
+RAR streaming is **on by default** and pure Rust — no libclang or C++ toolchain. ZIP, 7Z, TAR, and NZB streaming are always built in too. Because `unrar-rs` is GPL-3.0-or-later, the default binary is GPL-3.0-or-later; drop the `rar` feature (`--no-default-features --features librqbit`) for an MIT binary, where RAR requests then return a 501 JSON error. `libtorrent` and `librqbit` are mutually exclusive — build libtorrent with `--no-default-features` so it isn't compiled alongside the default backend.
 
 ---
 
@@ -136,7 +138,7 @@ For the **default build**, all you need on any platform is Rust via [rustup](htt
 cargo build --release
 ```
 
-The platform notes below are only needed for the **opt-in features** (`libtorrent`, `rar`).
+The platform notes below are only needed for the **opt-in `libtorrent` backend**. RAR streaming is pure Rust and on by default — it needs no extra system packages.
 
 <details>
 <summary><b>🐧 Arch Linux</b></summary>
@@ -146,9 +148,6 @@ sudo pacman -S rustup
 
 # For the libtorrent backend (--no-default-features --features libtorrent)
 sudo pacman -S libtorrent-rasterbar boost pkg-config
-
-# For RAR streaming (--features rar)
-sudo pacman -S clang
 ```
 
 </details>
@@ -162,9 +161,6 @@ source ~/.cargo/env
 
 # For the libtorrent backend (--no-default-features --features libtorrent)
 sudo apt install build-essential pkg-config libtorrent-rasterbar-dev libboost-all-dev
-
-# For RAR streaming (--features rar)
-sudo apt install build-essential libclang-dev
 ```
 
 </details>
@@ -178,9 +174,6 @@ source ~/.cargo/env
 
 # For the libtorrent backend (--no-default-features --features libtorrent)
 sudo dnf install gcc gcc-c++ pkg-config rb_libtorrent-devel boost-devel
-
-# For RAR streaming (--features rar)
-sudo dnf install gcc-c++ clang-devel
 ```
 
 </details>
@@ -194,10 +187,6 @@ source ~/.cargo/env
 
 # For the libtorrent backend (--no-default-features --features libtorrent)
 brew install libtorrent-rasterbar boost pkg-config
-
-# For RAR streaming (--features rar), Xcode Command Line Tools provide
-# the C++ toolchain and libclang:
-xcode-select --install
 ```
 
 </details>
@@ -208,8 +197,8 @@ xcode-select --install
 ```powershell
 # Default build: install Rust from https://rustup.rs — that's it.
 
-# For the rar/libtorrent features: install Visual Studio Build Tools
-# with "Desktop development with C++".
+# For the libtorrent feature: install Visual Studio Build Tools
+# with "Desktop development with C++". (RAR is pure Rust — nothing extra.)
 
 # For libtorrent, use vcpkg with the repository's v3 triplet:
 git clone https://github.com/microsoft/vcpkg
@@ -257,9 +246,10 @@ stream-server/
 │       ├── librqbit.rs   # Pure Rust backend (default)
 │       └── libtorrent/   # Native C++ backend (opt-in)
 └── bindings/
-    ├── libtorrent-sys/   # FFI bindings to libtorrent-rasterbar (libtorrent feature)
-    └── async-rar/        # Vendored UnRAR C++ bindings (rar feature)
+    └── libtorrent-sys/   # FFI bindings to libtorrent-rasterbar (libtorrent feature)
 ```
+
+(RAR is handled by the pure-Rust `unrar-rs` crate — a direct `server` dependency behind the default-on `rar` feature — so there is no separate RAR binding crate.)
 
 ---
 
@@ -292,7 +282,17 @@ Install boost development headers:
 
 ## 📄 License
 
-MIT License - see [LICENSE](LICENSE) for details.
+**The source in this repository is MIT** — see [LICENSE](LICENSE). It contains no GPL code; the `LICENSE` file is unchanged and stays MIT.
+
+**Compiled default binaries are GPL-3.0-or-later, however.** RAR streaming is on by default and is powered by the [`unrar-rs`](https://crates.io/crates/unrar-rs) crate, which is licensed **GPL-3.0-or-later**. That crate is fetched and linked only at build time, but linking it means a **default-built, distributed binary of stream-server is covered by GPL-3.0-or-later**. This is a deliberate choice: RAR support is wanted on by default, and the project is released openly.
+
+To produce an **MIT-licensed binary with no GPL code**, build without the `rar` feature (RAR requests then return a 501 JSON error):
+
+```bash
+cargo build --release --no-default-features --features librqbit
+```
+
+MIT is GPL-compatible, so shipping the MIT source alongside GPL default binaries is fine; the GPL obligation attaches to the compiled/distributed default binary, not to this repository's source.
 
 ---
 
