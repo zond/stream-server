@@ -110,3 +110,39 @@ fn create_engine_reports_failure_with_non_2xx_status() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// `GET /stats.json?sys=1` is polled roughly once a second by players.
+/// Confirms the response still carries the `sys.loadavg`/`sys.cpus` shape
+/// after moving the sysinfo sweep to a cached spawn_blocking call.
+#[test]
+fn stats_json_sys_reports_loadavg_and_cpus() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_dir.path().join("cache")),
+        ..stream_server::ServerConfig::default()
+    })?;
+
+    let response =
+        reqwest::blocking::get(format!("http://{}/stats.json?sys=1", handle.http_addr()))?
+            .error_for_status()?;
+    let body: serde_json::Value = response.json()?;
+    let loadavg = body["sys"]["loadavg"]
+        .as_array()
+        .expect("sys.loadavg array");
+    assert_eq!(loadavg.len(), 3);
+    assert!(
+        body["sys"]["cpus"]
+            .as_array()
+            .is_some_and(|c| !c.is_empty()),
+        "expected at least one reported CPU"
+    );
+
+    handle.shutdown()?;
+    handle.join()?;
+
+    Ok(())
+}

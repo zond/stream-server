@@ -12,6 +12,7 @@ use enginefs::backend::{
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 async fn combined_engine_stats(
     state: &AppState,
@@ -34,6 +35,52 @@ pub struct StatsParams {
     pub sys: Option<String>, // "1"
 }
 
+// stats.json?sys=1 is polled by players roughly once a second. A full
+// `System::new_all()` + `refresh_all()` sweeps processes, memory, and every
+// disk on top of CPU info — 50-300ms of synchronous /proc scanning that,
+// run inline in an async handler, blocks a tokio worker thread on every
+// poll. Refresh only the CPU specifics the response actually reads (brand,
+// frequency) off the blocking thread pool, and cache the short-lived result
+// the same way DISK_SPACE_CACHE caches disk space (routes/stream.rs).
+type SysInfoCache = std::sync::Mutex<Option<(Instant, Value)>>;
+static SYS_INFO_CACHE: std::sync::OnceLock<SysInfoCache> = std::sync::OnceLock::new();
+const SYS_INFO_CACHE_TTL: Duration = Duration::from_secs(1);
+
+async fn cached_sys_info() -> Value {
+    let cache = SYS_INFO_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+
+    if let Ok(guard) = cache.lock()
+        && let Some((at, value)) = guard.as_ref()
+        && at.elapsed() < SYS_INFO_CACHE_TTL
+    {
+        return value.clone();
+    }
+
+    let value = tokio::task::spawn_blocking(sys_info_uncached)
+        .await
+        .unwrap_or_else(|_| json!({ "loadavg": [0.0, 0.0, 0.0], "cpus": [] }));
+
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((Instant::now(), value.clone()));
+    }
+    value
+}
+
+fn sys_info_uncached() -> Value {
+    let refresh = sysinfo::RefreshKind::nothing().with_cpu(sysinfo::CpuRefreshKind::everything());
+    let system = sysinfo::System::new_with_specifics(refresh);
+    let loadavg = sysinfo::System::load_average();
+    json!({
+        "loadavg": [loadavg.one, loadavg.five, loadavg.fifteen],
+        "cpus": system.cpus().iter().map(|cpu| {
+            json!({
+                "model": cpu.brand(),
+                "speed": cpu.frequency(),
+            })
+        }).collect::<Vec<_>>()
+    })
+}
+
 pub async fn get_stats(
     State(state): State<AppState>,
     Query(params): Query<StatsParams>,
@@ -48,21 +95,7 @@ pub async fn get_stats(
     }
 
     if params.sys.as_deref() == Some("1") {
-        let mut system = sysinfo::System::new_all();
-        system.refresh_all();
-        let loadavg = sysinfo::System::load_average();
-        root.insert(
-            "sys".to_string(),
-            json!({
-                "loadavg": [loadavg.one, loadavg.five, loadavg.fifteen],
-                "cpus": system.cpus().iter().map(|cpu| {
-                    json!({
-                        "model": cpu.brand(),
-                        "speed": cpu.frequency(),
-                    })
-                }).collect::<Vec<_>>()
-            }),
-        );
+        root.insert("sys".to_string(), cached_sys_info().await);
     }
 
     Json(Value::Object(root))
@@ -1058,6 +1091,42 @@ pub async fn get_file_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sys_info_uncached_has_the_shape_stats_json_needs() {
+        let value = sys_info_uncached();
+        let loadavg = value["loadavg"].as_array().expect("loadavg array");
+        assert_eq!(loadavg.len(), 3);
+
+        let cpus = value["cpus"].as_array().expect("cpus array");
+        assert!(!cpus.is_empty(), "expected at least one reported CPU");
+        for cpu in cpus {
+            assert!(cpu["model"].is_string());
+            assert!(cpu["speed"].is_number());
+        }
+    }
+
+    /// stats.json?sys=1 is polled ~1Hz by players; a fresh call after the
+    /// TTL and a repeat call within it must both return the same shape, and
+    /// the cached path must not re-run the sysinfo sweep (asserted here by
+    /// checking the second call is effectively instantaneous, unlike the
+    /// 50-300ms a real /proc sweep takes).
+    #[tokio::test]
+    async fn cached_sys_info_serves_repeat_calls_from_cache() {
+        let first = cached_sys_info().await;
+        assert!(first["cpus"].is_array());
+
+        let start = Instant::now();
+        let second = cached_sys_info().await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(first, second);
+        assert!(
+            elapsed < Duration::from_millis(20),
+            "expected a cache hit to be near-instant, took {:?}",
+            elapsed
+        );
+    }
 
     #[test]
     fn server_version_default_uses_crate_version() {
