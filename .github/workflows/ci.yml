@@ -21,9 +21,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Reads the toolchain from rust-toolchain.toml (pinned to 1.98.0).
+      # Matches the 1.98.0 pin in rust-toolchain.toml. The @master ref of
+      # this action requires an explicit `toolchain` input; the version-named
+      # ref installs that version directly.
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: rustfmt
 
@@ -36,9 +38,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Reads the toolchain from rust-toolchain.toml (pinned to 1.98.0).
+      # Matches the 1.98.0 pin in rust-toolchain.toml. The @master ref of
+      # this action requires an explicit `toolchain` input; the version-named
+      # ref installs that version directly.
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: clippy
 
@@ -53,9 +57,14 @@ jobs:
       # The tree currently carries pre-existing non-correctness clippy
       # warnings (e.g. collapsible_if in enginefs), so gate hard only on the
       # correctness and suspicious groups; everything else stays a warning.
+      #
+      # No --workspace: that would select settings-gui and the native binding
+      # crates (async-rar needs libclang, libtorrent-sys needs libtorrent).
+      # The bare invocation lints the workspace default-members, which is
+      # exactly the pure-Rust set.
       - name: Clippy
         run: >-
-          cargo clippy --workspace --exclude settings-gui --all-targets --
+          cargo clippy --all-targets --
           -D clippy::correctness -D clippy::suspicious -W clippy::all
 
       - name: Test
@@ -79,9 +88,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libclang-dev libfontconfig1-dev libgtk-3-dev libayatana-appindicator3-dev
 
-      # Reads the toolchain from rust-toolchain.toml (pinned to 1.98.0).
+      # Matches the 1.98.0 pin in rust-toolchain.toml. The @master ref of
+      # this action requires an explicit `toolchain` input; the version-named
+      # ref installs that version directly.
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@1.98.0
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
