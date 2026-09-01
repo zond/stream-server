@@ -251,6 +251,7 @@ impl PlaybackPriorityPolicy {
         if ctx.piece_length == 0
             || ctx.current_piece < ctx.first_piece
             || ctx.last_piece < ctx.first_piece
+            || ctx.current_piece > ctx.last_piece
         {
             return PriorityDecision {
                 assignments: Vec::new(),
@@ -621,6 +622,27 @@ mod tests {
         assert!(decision.target_window_pieces > 0);
         assert!(decision.hot_window_pieces >= MIN_SEEK_HOT_PIECES);
         assert!(!decision.assignments.is_empty());
+    }
+
+    #[test]
+    fn current_piece_past_last_piece_does_not_panic() {
+        // current_piece can exceed last_piece when a seek lands past the
+        // torrent's declared piece count (e.g. a stale/racy stats snapshot,
+        // or a crafted seek offset). Previously nothing clamped this, so
+        // remaining_pieces went negative, hot/warm followed it negative,
+        // and `Vec::with_capacity(target_window as usize)` turned a small
+        // negative i32 into a huge usize and panicked with "capacity
+        // overflow".
+        let mut ctx = base_context(PlaybackIntent::DirectSeek);
+        ctx.first_byte_sent = true;
+        ctx.current_piece = 5000;
+        ctx.last_piece = 999;
+        let decision = PlaybackPriorityPolicy::decide(ctx);
+
+        assert!(decision.target_window_pieces >= 0);
+        assert!(decision.hot_window_pieces >= 0);
+        assert!(decision.warm_window_pieces >= 0);
+        assert!(decision.assignments.is_empty());
     }
 
     #[test]
