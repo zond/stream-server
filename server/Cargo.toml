@@ -106,7 +106,7 @@ windows = { version = "0.62.2", features = [
 
 
 [features]
-default = ["libtorrent"]
+default = ["librqbit"]
 libtorrent = ["enginefs/libtorrent"]
 librqbit = ["enginefs/librqbit", "dep:librqbit"]
 

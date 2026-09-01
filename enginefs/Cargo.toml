@@ -36,6 +36,6 @@ memmap2 = "0.9.9"
 parking_lot = "0.12.5"
 
 [features]
-default = ["libtorrent"]
+default = ["librqbit"]
 librqbit = ["dep:librqbit"]
 libtorrent = ["dep:libtorrent-sys"]
