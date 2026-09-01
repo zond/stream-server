@@ -1186,4 +1186,248 @@ mod tests {
         let round_tripped: ServerSettings = serde_json::from_value(json).unwrap();
         assert_eq!(round_tripped.cache_size, None);
     }
+
+    // --- parse_torrent_encryption_mode ---
+
+    #[test]
+    fn parse_torrent_encryption_mode_accepts_numeric_codes() {
+        assert_eq!(
+            parse_torrent_encryption_mode(&json!(0)),
+            Some(TorrentEncryptionMode::Allow)
+        );
+        assert_eq!(
+            parse_torrent_encryption_mode(&json!(1)),
+            Some(TorrentEncryptionMode::Require)
+        );
+        assert_eq!(
+            parse_torrent_encryption_mode(&json!(2)),
+            Some(TorrentEncryptionMode::Disable)
+        );
+        assert_eq!(parse_torrent_encryption_mode(&json!(3)), None);
+    }
+
+    #[test]
+    fn parse_torrent_encryption_mode_accepts_string_spellings() {
+        for spelling in ["allow", "ALLOW", "allowEncryption", "enabled"] {
+            assert_eq!(
+                parse_torrent_encryption_mode(&json!(spelling)),
+                Some(TorrentEncryptionMode::Allow),
+                "spelling: {spelling}"
+            );
+        }
+        for spelling in ["require", "requireEncryption", "forced"] {
+            assert_eq!(
+                parse_torrent_encryption_mode(&json!(spelling)),
+                Some(TorrentEncryptionMode::Require),
+                "spelling: {spelling}"
+            );
+        }
+        for spelling in ["disable", "disableEncryption", "disabled"] {
+            assert_eq!(
+                parse_torrent_encryption_mode(&json!(spelling)),
+                Some(TorrentEncryptionMode::Disable),
+                "spelling: {spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_torrent_encryption_mode_rejects_unknown_values() {
+        assert_eq!(parse_torrent_encryption_mode(&json!("bogus")), None);
+        assert_eq!(parse_torrent_encryption_mode(&json!(null)), None);
+        assert_eq!(parse_torrent_encryption_mode(&json!(true)), None);
+        assert_eq!(parse_torrent_encryption_mode(&json!(-1)), None);
+    }
+
+    // --- parse_torrent_proxy_type ---
+
+    #[test]
+    fn parse_torrent_proxy_type_accepts_numeric_codes() {
+        assert_eq!(
+            parse_torrent_proxy_type(&json!(0)),
+            Some(TorrentProxyType::None)
+        );
+        assert_eq!(
+            parse_torrent_proxy_type(&json!(1)),
+            Some(TorrentProxyType::Socks4)
+        );
+        assert_eq!(
+            parse_torrent_proxy_type(&json!(2)),
+            Some(TorrentProxyType::Socks5)
+        );
+        assert_eq!(
+            parse_torrent_proxy_type(&json!(3)),
+            Some(TorrentProxyType::Socks5Password)
+        );
+        assert_eq!(
+            parse_torrent_proxy_type(&json!(4)),
+            Some(TorrentProxyType::Http)
+        );
+        assert_eq!(
+            parse_torrent_proxy_type(&json!(5)),
+            Some(TorrentProxyType::HttpPassword)
+        );
+        assert_eq!(parse_torrent_proxy_type(&json!(6)), None);
+    }
+
+    #[test]
+    fn parse_torrent_proxy_type_accepts_string_spellings() {
+        for spelling in ["none", "disabled"] {
+            assert_eq!(
+                parse_torrent_proxy_type(&json!(spelling)),
+                Some(TorrentProxyType::None),
+                "spelling: {spelling}"
+            );
+        }
+        assert_eq!(
+            parse_torrent_proxy_type(&json!("socks4")),
+            Some(TorrentProxyType::Socks4)
+        );
+        assert_eq!(
+            parse_torrent_proxy_type(&json!("SOCKS5")),
+            Some(TorrentProxyType::Socks5)
+        );
+        for spelling in ["socks5Password", "socks5_password", "socks5_pw"] {
+            assert_eq!(
+                parse_torrent_proxy_type(&json!(spelling)),
+                Some(TorrentProxyType::Socks5Password),
+                "spelling: {spelling}"
+            );
+        }
+        assert_eq!(
+            parse_torrent_proxy_type(&json!("http")),
+            Some(TorrentProxyType::Http)
+        );
+        for spelling in ["httpPassword", "http_password", "http_pw"] {
+            assert_eq!(
+                parse_torrent_proxy_type(&json!(spelling)),
+                Some(TorrentProxyType::HttpPassword),
+                "spelling: {spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_torrent_proxy_type_rejects_unknown_values() {
+        assert_eq!(parse_torrent_proxy_type(&json!("bogus")), None);
+        assert_eq!(parse_torrent_proxy_type(&json!(null)), None);
+        assert_eq!(parse_torrent_proxy_type(&json!(-1)), None);
+    }
+
+    // --- value_as_u16 ---
+
+    #[test]
+    fn value_as_u16_accepts_boundary_values() {
+        assert_eq!(value_as_u16(&json!(0)), Some(0));
+        assert_eq!(value_as_u16(&json!(65535)), Some(65535));
+    }
+
+    #[test]
+    fn value_as_u16_rejects_overflow_without_wrapping() {
+        // 65536 must not silently wrap to 0 — it must be rejected entirely.
+        assert_eq!(value_as_u16(&json!(65536)), None);
+    }
+
+    #[test]
+    fn value_as_u16_rejects_negative_numbers() {
+        assert_eq!(value_as_u16(&json!(-1)), None);
+    }
+
+    #[test]
+    fn value_as_u16_rejects_string_numbers() {
+        // A numeric string is not a JSON number, so it must be rejected too.
+        assert_eq!(value_as_u16(&json!("123")), None);
+    }
+
+    // --- update_bool_setting / update_u16_setting / update_string_setting ---
+
+    #[test]
+    fn update_bool_setting_leaves_target_on_absent_key() {
+        let obj = serde_json::Map::new();
+        let mut target = true;
+        update_bool_setting(&obj, "missing", &mut target);
+        assert!(target);
+    }
+
+    #[test]
+    fn update_bool_setting_leaves_target_on_wrong_type() {
+        let mut obj = serde_json::Map::new();
+        obj.insert("flag".to_string(), json!("not-a-bool"));
+        let mut target = true;
+        update_bool_setting(&obj, "flag", &mut target);
+        assert!(target);
+    }
+
+    #[test]
+    fn update_bool_setting_applies_matching_key() {
+        let mut obj = serde_json::Map::new();
+        obj.insert("flag".to_string(), json!(false));
+        let mut target = true;
+        update_bool_setting(&obj, "flag", &mut target);
+        assert!(!target);
+    }
+
+    #[test]
+    fn update_u16_setting_leaves_target_on_absent_key() {
+        let obj = serde_json::Map::new();
+        let mut target: u16 = 42;
+        update_u16_setting(&obj, "missing", &mut target);
+        assert_eq!(target, 42);
+    }
+
+    #[test]
+    fn update_u16_setting_leaves_target_on_wrong_type() {
+        let mut obj = serde_json::Map::new();
+        obj.insert("port".to_string(), json!("not-a-number"));
+        let mut target: u16 = 42;
+        update_u16_setting(&obj, "port", &mut target);
+        assert_eq!(target, 42);
+    }
+
+    #[test]
+    fn update_u16_setting_applies_matching_key() {
+        let mut obj = serde_json::Map::new();
+        obj.insert("port".to_string(), json!(8080));
+        let mut target: u16 = 42;
+        update_u16_setting(&obj, "port", &mut target);
+        assert_eq!(target, 8080);
+    }
+
+    #[test]
+    fn update_string_setting_leaves_target_on_absent_key() {
+        let obj = serde_json::Map::new();
+        let mut target = "original".to_string();
+        update_string_setting(&obj, "missing", &mut target, true, false);
+        assert_eq!(target, "original");
+    }
+
+    #[test]
+    fn update_string_setting_leaves_target_on_wrong_type() {
+        let mut obj = serde_json::Map::new();
+        obj.insert("name".to_string(), json!(123));
+        let mut target = "original".to_string();
+        update_string_setting(&obj, "name", &mut target, true, false);
+        assert_eq!(target, "original");
+    }
+
+    #[test]
+    fn update_string_setting_applies_matching_key() {
+        let mut obj = serde_json::Map::new();
+        obj.insert("name".to_string(), json!("  new value  "));
+        let mut target = "original".to_string();
+        update_string_setting(&obj, "name", &mut target, true, false);
+        assert_eq!(target, "new value");
+    }
+
+    #[test]
+    fn update_string_setting_disallows_empty_unless_allowed() {
+        let mut obj = serde_json::Map::new();
+        obj.insert("name".to_string(), json!("   "));
+        let mut target = "original".to_string();
+        update_string_setting(&obj, "name", &mut target, true, false);
+        assert_eq!(target, "original", "empty-after-trim should be rejected");
+
+        update_string_setting(&obj, "name", &mut target, true, true);
+        assert_eq!(target, "", "allow_empty=true should accept it");
+    }
 }
