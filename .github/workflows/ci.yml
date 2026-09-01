@@ -70,25 +70,22 @@ jobs:
       - name: Test
         run: cargo test
 
-  features:
-    name: Optional Features
+  mit-build:
+    name: MIT build (no RAR)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
-      # Opt-in feature paths need native toolchains/headers:
-      #   rar -> libclang (autocxx bindings for unrar)
+      # RAR is now pure-Rust (`unrar-rs`) and ON BY DEFAULT, so the default
+      # test job above already builds and tests it — no libclang, no separate
+      # rar job. What still needs its own guard is the MIT escape hatch:
+      # `--no-default-features --features librqbit` must keep building WITHOUT
+      # unrar-rs (GPL-3.0-or-later), so a distributor can produce an
+      # MIT-licensed binary. No apt installs: this path is pure Rust too.
+      #
       # The libtorrent feature is intentionally NOT checked here; it needs a
       # multi-minute source build and is already covered by the check job in
       # release.yml.
-      - name: Install System Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libclang-dev
-
-      # Matches the 1.98.0 pin in rust-toolchain.toml. The @master ref of
-      # this action requires an explicit `toolchain` input; the version-named
-      # ref installs that version directly.
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@1.98.0
 
@@ -97,8 +94,8 @@ jobs:
         with:
           cache-on-failure: true
 
-      - name: Check rar feature
-        run: cargo check -p server --features rar
+      - name: Build MIT escape hatch (librqbit only, no rar)
+        run: cargo build -p server --no-default-features --features librqbit
 
   windows:
     name: Windows Build and Test
