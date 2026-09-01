@@ -16,40 +16,6 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 pub const DEFAULT_HTTP_PORT: u16 = 11470;
 pub const DEFAULT_HTTPS_PORT: u16 = 12470;
 
-#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
-pub static GLOBAL_STATE: once_cell::sync::Lazy<std::sync::RwLock<Option<AppState>>> =
-    once_cell::sync::Lazy::new(|| std::sync::RwLock::new(None));
-
-#[cfg(all(
-    feature = "gui",
-    any(target_os = "windows", target_os = "macos", target_os = "linux")
-))]
-pub mod tray;
-
-/// Headless fallback: keeps the `tray::TrayStats` plumbing compiling when the
-/// desktop tray is unavailable (non-desktop targets, or the `gui` feature is
-/// disabled). Stats updates become no-ops and the server just runs headless.
-#[cfg(not(all(
-    feature = "gui",
-    any(target_os = "windows", target_os = "macos", target_os = "linux")
-)))]
-pub mod tray {
-    #[derive(Default)]
-    pub struct TrayStats;
-    impl TrayStats {
-        pub fn new() -> Self {
-            Self
-        }
-        pub fn update(&self, _down: f64, _up: f64, _peers: u64, _active: usize) {}
-        pub fn set_auto_update_enabled(&self, _enabled: bool) {}
-        pub fn set_seeding_enabled(&self, _enabled: bool) {}
-        pub fn update_update_status(&self, _label: String, _install_enabled: bool) {}
-        pub fn format_update_line(&self) -> String {
-            String::new()
-        }
-    }
-}
-
 pub mod jni;
 
 mod archives;
@@ -221,25 +187,7 @@ pub fn start(cfg: ServerConfig) -> anyhow::Result<ServerHandle> {
 
 pub async fn run(
     cfg: ServerConfig,
-    external_shutdown_rx: tokio::sync::mpsc::Receiver<()>,
-    ready_tx: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
-) -> anyhow::Result<Option<ShutdownSource>> {
-    run_inner(cfg, external_shutdown_rx, None, ready_tx).await
-}
-
-pub async fn run_with_tray_stats(
-    cfg: ServerConfig,
-    external_shutdown_rx: tokio::sync::mpsc::Receiver<()>,
-    tray_stats: Arc<tray::TrayStats>,
-    ready_tx: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
-) -> anyhow::Result<Option<ShutdownSource>> {
-    run_inner(cfg, external_shutdown_rx, Some(tray_stats), ready_tx).await
-}
-
-async fn run_inner(
-    cfg: ServerConfig,
     mut external_shutdown_rx: tokio::sync::mpsc::Receiver<()>,
-    tray_stats: Option<Arc<tray::TrayStats>>,
     ready_tx: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
 ) -> anyhow::Result<Option<ShutdownSource>> {
     let listener = tokio::net::TcpListener::bind(cfg.http_addr)
@@ -476,13 +424,6 @@ async fn run_inner(
     state.http_addr = public_http_addr;
     state.update_install_exit_enabled = cfg.enable_update_exit;
 
-    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
-    {
-        if let Ok(mut guard) = GLOBAL_STATE.write() {
-            *guard = Some(state.clone());
-        }
-    }
-
     {
         let settings = settings_arc.read().await;
         state.engine.set_seeding_enabled(settings.seeding_enabled);
@@ -510,71 +451,6 @@ async fn run_inner(
         background_tasks.push(diagnostics::logging::spawn_logged(
             "ssdp-discovery",
             crate::ssdp::start_discovery(state.devices.clone()),
-        ));
-    }
-
-    if let Some(stats) = tray_stats {
-        let engine_clone = state.engine.clone();
-        let download_engine_clone = state.download_engine.clone();
-        let updater_clone = state.updater.clone();
-        let settings_clone = state.settings.clone();
-        background_tasks.push(diagnostics::logging::spawn_logged(
-            "tray-stats",
-            async move {
-                loop {
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    let mut all_stats = engine_clone.get_all_statistics().await;
-                    let download_stats = download_engine_clone.get_all_statistics().await;
-                    for (hash, stats) in download_stats {
-                        all_stats.insert(hash, stats);
-                    }
-
-                    let mut total_down = 0.0;
-                    let mut total_up = 0.0;
-                    let mut total_peers = 0u64;
-                    let active = all_stats.len();
-
-                    for (_, s) in all_stats {
-                        total_down += s.download_speed;
-                        total_up += s.upload_speed;
-                        total_peers += s.peers;
-                    }
-
-                    stats.update(total_down, total_up, total_peers, active);
-
-                    let settings = settings_clone.read().await.clone();
-                    stats.set_auto_update_enabled(settings.auto_update_enabled);
-                    stats.set_seeding_enabled(settings.seeding_enabled);
-                    let update_status = updater_clone.status(settings.update_channel).await;
-                    let install_enabled = matches!(
-                        update_status.state,
-                        crate::updater::state::UpdateOperationState::Available
-                            | crate::updater::state::UpdateOperationState::Staged
-                    );
-                    let label = if let Some(version) = update_status.staged_version {
-                        format!("Update: v{} staged", version)
-                    } else if let Some(version) = update_status.latest_version {
-                        format!("Update: v{} available", version)
-                    } else {
-                        match update_status.state {
-                            crate::updater::state::UpdateOperationState::Checking => {
-                                "Update: checking".to_string()
-                            }
-                            crate::updater::state::UpdateOperationState::Downloading => {
-                                "Update: downloading".to_string()
-                            }
-                            crate::updater::state::UpdateOperationState::Installing => {
-                                "Update: installing".to_string()
-                            }
-                            crate::updater::state::UpdateOperationState::Failed => {
-                                "Update: failed".to_string()
-                            }
-                            _ => "Update: up to date".to_string(),
-                        }
-                    };
-                    stats.update_update_status(label, install_enabled);
-                }
-            },
         ));
     }
 
@@ -706,13 +582,6 @@ async fn run_inner(
 
     for task in background_tasks {
         task.abort();
-    }
-
-    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
-    {
-        if let Ok(mut guard) = GLOBAL_STATE.write() {
-            *guard = None;
-        }
     }
 
     Ok(shutdown_source)
