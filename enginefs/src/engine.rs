@@ -13,8 +13,6 @@ use tokio::sync::{Mutex, OnceCell};
 use crate::files::FileHandle;
 use regex::Regex;
 
-type ProbeCell = Arc<OnceCell<Result<crate::hls::ProbeResult, String>>>;
-type ProbeInflight = HashMap<usize, ProbeCell>;
 type OpensubHashCell = Arc<OnceCell<Result<String, String>>>;
 type OpensubHashInflight = HashMap<usize, OpensubHashCell>;
 
@@ -118,8 +116,6 @@ pub struct Engine<H: TorrentHandle> {
     pub handle: H,
     pub last_accessed: AtomicU64,
     pub active_streams: Arc<AtomicUsize>,
-    pub probe_cache: Mutex<HashMap<usize, crate::hls::ProbeResult>>,
-    probe_inflight: Mutex<ProbeInflight>,
     opensub_hash_cache: Mutex<HashMap<usize, String>>,
     opensub_hash_inflight: Mutex<OpensubHashInflight>,
     pub data_cache: DataCache,
@@ -135,8 +131,6 @@ impl<H: TorrentHandle> Engine<H> {
             handle,
             last_accessed: AtomicU64::new(crate::now_secs()),
             active_streams: Arc::new(AtomicUsize::new(0)),
-            probe_cache: Mutex::new(HashMap::new()),
-            probe_inflight: Mutex::new(HashMap::new()),
             opensub_hash_cache: Mutex::new(HashMap::new()),
             opensub_hash_inflight: Mutex::new(HashMap::new()),
             data_cache: moka::future::Cache::builder()
@@ -150,145 +144,6 @@ impl<H: TorrentHandle> Engine<H> {
     pub fn touch(&self) {
         self.last_accessed
             .store(crate::now_secs(), Ordering::SeqCst);
-    }
-
-    pub async fn get_probe_result(
-        &self,
-        file_idx: usize,
-        fallback_url: &str,
-    ) -> anyhow::Result<crate::hls::ProbeResult> {
-        let cache = self.probe_cache.lock().await;
-        if let Some(res) = cache.get(&file_idx) {
-            if res.is_hls_ready() {
-                tracing::debug!(
-                    "[HLS STREAMING] Using cached probe result for file {}",
-                    file_idx
-                );
-                return Ok(res.clone());
-            }
-            tracing::warn!(
-                file_idx,
-                streams = res.streams.len(),
-                duration = res.duration,
-                "Ignoring incomplete cached HLS probe result"
-            );
-        }
-        drop(cache); // Release lock before potentially slow operations
-
-        let inflight = {
-            let mut probes = self.probe_inflight.lock().await;
-            probes
-                .entry(file_idx)
-                .or_insert_with(|| Arc::new(OnceCell::new()))
-                .clone()
-        };
-        let result = inflight
-            .get_or_init(|| async {
-                self.run_probe(file_idx, fallback_url)
-                    .await
-                    .map_err(|error| format!("{error:#}"))
-            })
-            .await
-            .clone();
-        {
-            let mut probes = self.probe_inflight.lock().await;
-            if probes
-                .get(&file_idx)
-                .is_some_and(|current| Arc::ptr_eq(current, &inflight))
-            {
-                probes.remove(&file_idx);
-            }
-        }
-        let res = result.map_err(anyhow::Error::msg)?;
-
-        if res.is_hls_ready() {
-            let mut cache = self.probe_cache.lock().await;
-            cache.insert(file_idx, res.clone());
-        }
-        Ok(res)
-    }
-
-    async fn run_probe(
-        &self,
-        file_idx: usize,
-        fallback_url: &str,
-    ) -> anyhow::Result<crate::hls::ProbeResult> {
-        let startup = Instant::now();
-        tracing::debug!(
-            "[HLS STREAMING] Preparing file {} for HLS playback",
-            file_idx
-        );
-
-        let native_lifecycle = self.handle.manages_playback_lifecycle();
-        if !native_lifecycle {
-            let prepare_start = Instant::now();
-            self.handle.prepare_file_for_streaming(file_idx).await?;
-            tracing::info!(
-                "startup: prepare_file_for_streaming completed in {:?} for probe file {}",
-                prepare_start.elapsed(),
-                file_idx
-            );
-        }
-
-        let can_probe_local = !native_lifecycle || self.handle.is_file_complete(file_idx).await;
-        let (probe_path, probe_source) = if can_probe_local {
-            if let Some(local_path) = self.handle.get_file_path(file_idx).await {
-                tracing::info!("Probing via local file path: {}", local_path);
-                (local_path, "local-file")
-            } else {
-                tracing::debug!(
-                    path = fallback_url.split('?').next().unwrap_or(fallback_url),
-                    "Probing via HTTP fallback"
-                );
-                (fallback_url.to_string(), "stream-url")
-            }
-        } else {
-            tracing::info!(
-                file_idx,
-                "Incomplete libtorrent file will be probed through the loopback stream"
-            );
-            (fallback_url.to_string(), "stream-url")
-        };
-
-        let probe_start = Instant::now();
-        let mut res = crate::hls::HlsEngine::probe_video(&probe_path).await?;
-        tracing::debug!(
-            "startup: probe finished in {:?} via {} (streams={}, duration={:.2}s, total={:?})",
-            probe_start.elapsed(),
-            probe_source,
-            res.streams.len(),
-            res.duration,
-            startup.elapsed()
-        );
-
-        if !res.is_hls_ready() && probe_source == "local-file" {
-            tracing::warn!(
-                file_idx,
-                streams = res.streams.len(),
-                duration = res.duration,
-                "Local file probe did not produce playable HLS metadata; retrying via stream URL"
-            );
-            let stream_probe_start = Instant::now();
-            let stream_res = crate::hls::HlsEngine::probe_video(fallback_url).await?;
-            tracing::info!(
-                "startup: fallback stream probe finished in {:?} (streams={}, duration={:.2}s, total={:?})",
-                stream_probe_start.elapsed(),
-                stream_res.streams.len(),
-                stream_res.duration,
-                startup.elapsed()
-            );
-            res = stream_res;
-        }
-
-        if !res.is_hls_ready() {
-            tracing::warn!(
-                file_idx,
-                streams = res.streams.len(),
-                duration = res.duration,
-                "HLS probe result is incomplete; leaving it uncached so a later request can recover"
-            );
-        }
-        Ok(res)
     }
 
     pub fn find_file_by_regex(&self, regex_str: &str) -> Option<usize> {
@@ -391,26 +246,6 @@ impl<H: TorrentHandle> Engine<H> {
         let length = files[file_idx].length;
         let name = files[file_idx].name.clone();
 
-        // Try to recover bitrate from probe cache if available
-        let bitrate = {
-            let cache = self.probe_cache.lock().await;
-            cache.get(&file_idx).and_then(|res| {
-                // Find video stream and get its bitrate
-                res.streams
-                    .iter()
-                    .filter(|s| s.codec_type == "video")
-                    .find_map(|s| s.bitrate)
-            })
-        };
-
-        if let Some(br) = bitrate {
-            tracing::debug!(
-                "get_file: using bitrate {} B/s from probe cache for file {}",
-                br / 8,
-                file_idx
-            );
-        }
-
         if !self.handle.manages_playback_lifecycle()
             && priority != 255
             && start_offset == 0
@@ -442,13 +277,7 @@ impl<H: TorrentHandle> Engine<H> {
         let reader_start = Instant::now();
         let reader = self
             .handle
-            .get_file_reader(
-                file_idx,
-                start_offset,
-                priority,
-                bitrate.map(|b| b / 8),
-                intent,
-            )
+            .get_file_reader(file_idx, start_offset, priority, None, intent)
             .await
             .ok()?;
         tracing::debug!(

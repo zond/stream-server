@@ -144,7 +144,6 @@ fn parse_trackers(query_str: Option<&str>) -> Vec<String> {
 #[derive(Default)]
 struct PlaybackQuery {
     download: bool,
-    hls: bool,
     filters: Vec<String>,
 }
 
@@ -159,10 +158,6 @@ impl PlaybackQuery {
             let (key, raw_value) = field.split_once('=').unwrap_or((field, ""));
             match key {
                 "download" => parsed.download = query_value_is_true(raw_value),
-                "hls" => parsed.hls = query_value_is_true(raw_value),
-                "enginefs-intent" if raw_value.eq_ignore_ascii_case("hls") => {
-                    parsed.hls = true;
-                }
                 "f" => {
                     if let Some((_, value)) = url::form_urlencoded::parse(field.as_bytes()).next() {
                         parsed.filters.push(value.into_owned());
@@ -719,7 +714,7 @@ pub async fn stream_video(
         1
     };
     let playback_intent = playback_intent_for_request(
-        query.hls,
+        false,
         priority,
         start,
         requested_content_length,
@@ -740,11 +735,6 @@ pub async fn stream_video(
 
     // --- Stream Lifecycle: Notify start only after validation has succeeded. ---
     engine_fs.on_stream_start(&info_hash, idx).await;
-    if query.hls {
-        engine_fs
-            .refresh_hls_playback(&info_hash, idx, "hls-loopback")
-            .await;
-    }
     if !native_lifecycle {
         engine_fs
             .activate_multifile_file_for_playback(
@@ -1048,11 +1038,10 @@ mod tests {
     #[test]
     fn playback_query_extracts_controls_without_decoding_trackers() {
         let query = PlaybackQuery::parse(Some(
-            "tr=udp%3A%2F%2Fone&tr=https%3A%2F%2Ftwo&f=Episode+02&download=1&hls=true",
+            "tr=udp%3A%2F%2Fone&tr=https%3A%2F%2Ftwo&f=Episode+02&download=1",
         ));
 
         assert!(query.download);
-        assert!(query.hls);
         assert_eq!(query.filters, ["Episode 02"]);
     }
 }

@@ -13,8 +13,6 @@ pub mod cache;
 pub mod disk_cache;
 pub mod engine;
 pub mod files;
-pub mod hls;
-pub mod hwaccel;
 pub mod metadata_cache;
 pub mod metadata_pins;
 pub mod piece_cache;
@@ -927,63 +925,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         true
     }
 
-    /// Refresh an HLS playback lease. HLS segment reads are short-lived, so this
-    /// keeps the requested file wanted while the player is buffered.
-    pub async fn refresh_hls_playback(
-        &self,
-        info_hash: &str,
-        file_idx: usize,
-        source: &'static str,
-    ) {
-        let info_hash = info_hash.to_lowercase();
-        let now = now_secs();
-        let engine = self.get_engine(&info_hash).await;
-        let native_lifecycle = engine
-            .as_ref()
-            .is_some_and(|engine| engine.handle.manages_playback_lifecycle());
-        let ttl = if native_lifecycle {
-            LIBTORRENT_HLS_PLAYBACK_LEASE_TTL
-        } else {
-            HLS_PLAYBACK_LEASE_TTL
-        };
-        {
-            let mut leases = self.active_playback_leases.write().await;
-            leases.insert(
-                (info_hash.clone(), file_idx),
-                PlaybackLease {
-                    last_seen_secs: now,
-                    expires_at_secs: now.saturating_add(ttl.as_secs()),
-                },
-            );
-        }
-
-        if let Some(engine) = engine {
-            engine.touch();
-            if native_lifecycle {
-                *self.active_file.write().await = Some((info_hash.clone(), file_idx));
-                if let Err(error) = engine.handle.refresh_hls_activity(file_idx, source).await {
-                    tracing::warn!(
-                        info_hash = %info_hash,
-                        file_idx,
-                        source,
-                        %error,
-                        "Failed to refresh libtorrent HLS playback"
-                    );
-                }
-            } else {
-                self.activate_file(&info_hash, file_idx, true, source).await;
-            }
-        }
-
-        tracing::debug!(
-            info_hash = %info_hash,
-            file_idx,
-            source,
-            ttl_secs = ttl.as_secs(),
-            "HLS playback lease refreshed"
-        );
-    }
-
     /// Refresh a lease only if playback is already known to be active. This is
     /// used by stats.json so a progress poll cannot create a new download.
     pub async fn refresh_existing_hls_playback(
@@ -1046,47 +987,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
 
         refreshed
-    }
-
-    /// End an HLS playback lease immediately when the client sends an explicit
-    /// destroy signal. Silent page closes are handled by lease expiry.
-    pub async fn end_hls_playback(&self, info_hash: &str, file_idx: usize, reason: &'static str) {
-        let info_hash = info_hash.to_lowercase();
-        let removed = {
-            let mut leases = self.active_playback_leases.write().await;
-            leases.remove(&(info_hash.clone(), file_idx)).is_some()
-        };
-
-        let engine = self.get_engine(&info_hash).await;
-        let native_lifecycle = engine
-            .as_ref()
-            .is_some_and(|engine| engine.handle.manages_playback_lifecycle());
-
-        if removed || native_lifecycle {
-            tracing::info!(
-                info_hash = %info_hash,
-                file_idx,
-                reason,
-                "HLS playback lease ended"
-            );
-            if let Some(engine) = engine
-                && native_lifecycle
-            {
-                if let Err(error) = engine.handle.end_hls_activity(file_idx, reason).await {
-                    tracing::warn!(
-                        info_hash = %info_hash,
-                        file_idx,
-                        reason,
-                        %error,
-                        "Failed to end libtorrent HLS playback"
-                    );
-                }
-                return;
-            }
-            self.schedule_file_cleanup(info_hash.clone(), file_idx)
-                .await;
-            self.schedule_torrent_pause(info_hash);
-        }
     }
 
     /// Called when a stream ends for a torrent file
@@ -1922,6 +1822,20 @@ mod tests {
         (enginefs, counters)
     }
 
+    /// Insert an active playback lease directly. Production leases are created
+    /// elsewhere now; tests that exercise the generic lease/cleanup machinery
+    /// seed a lease this way.
+    async fn insert_active_lease(enginefs: &BackendEngineFS<FakeBackend>, file_idx: usize) {
+        let now = now_secs();
+        enginefs.active_playback_leases.write().await.insert(
+            (TEST_HASH.to_string(), file_idx),
+            PlaybackLease {
+                last_seen_secs: now,
+                expires_at_secs: now.saturating_add(300),
+            },
+        );
+    }
+
     #[tokio::test]
     async fn refresh_existing_hls_playback_does_not_create_lease() {
         let (enginefs, counters) = test_enginefs();
@@ -1939,19 +1853,6 @@ mod tests {
                 .active_playback_leases
                 .is_empty()
         );
-    }
-
-    #[tokio::test]
-    async fn refresh_hls_playback_creates_lease_and_keeps_file_wanted() {
-        let (enginefs, counters) = test_enginefs();
-
-        enginefs.refresh_hls_playback(TEST_HASH, 0, "test").await;
-
-        let snapshot = enginefs.stream_activity_snapshot().await;
-        assert_eq!(snapshot.active_playback_leases.len(), 1);
-        assert_eq!(counters.keep_file_downloading.load(Ordering::SeqCst), 1);
-        assert_eq!(counters.resume_torrent.load(Ordering::SeqCst), 1);
-        assert_eq!(snapshot.active_file.map(|active| active.file_idx), Some(0));
     }
 
     #[tokio::test]
@@ -1989,24 +1890,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hls_lease_switch_removes_sibling_lease() {
-        let (enginefs, _counters) = test_enginefs_with_file_count(3);
-
-        enginefs.refresh_hls_playback(TEST_HASH, 1, "test").await;
-        enginefs.refresh_hls_playback(TEST_HASH, 2, "test").await;
-
-        let snapshot = enginefs.stream_activity_snapshot().await;
-        assert_eq!(snapshot.active_playback_leases.len(), 1);
-        assert_eq!(snapshot.active_playback_leases[0].file_idx, 2);
-        assert_eq!(snapshot.active_multifile_selections.len(), 1);
-        assert_eq!(snapshot.active_multifile_selections[0].file_idx, 2);
-    }
-
-    #[tokio::test]
     async fn stats_cannot_switch_active_multifile_file() {
         let (enginefs, _counters) = test_enginefs_with_file_count(3);
 
-        enginefs.refresh_hls_playback(TEST_HASH, 1, "test").await;
+        enginefs.on_stream_start(TEST_HASH, 1).await;
+        insert_active_lease(&enginefs, 1).await;
         let refreshed = enginefs
             .refresh_existing_hls_playback(TEST_HASH, 2, "stats-json")
             .await;
@@ -2023,7 +1911,8 @@ mod tests {
     async fn stats_refreshes_current_multifile_file() {
         let (enginefs, _counters) = test_enginefs_with_file_count(3);
 
-        enginefs.refresh_hls_playback(TEST_HASH, 1, "test").await;
+        enginefs.on_stream_start(TEST_HASH, 1).await;
+        insert_active_lease(&enginefs, 1).await;
         let refreshed = enginefs
             .refresh_existing_hls_playback(TEST_HASH, 1, "stats-json")
             .await;
@@ -2040,11 +1929,11 @@ mod tests {
     async fn old_cleanup_cannot_clear_newer_multifile_active_file() {
         let (enginefs, counters) = test_enginefs_with_file_count(3);
 
-        enginefs.refresh_hls_playback(TEST_HASH, 1, "test").await;
+        enginefs.on_stream_start(TEST_HASH, 1).await;
         enginefs
             .schedule_file_cleanup(TEST_HASH.to_string(), 1)
             .await;
-        enginefs.refresh_hls_playback(TEST_HASH, 2, "test").await;
+        enginefs.on_stream_start(TEST_HASH, 2).await;
         tokio::time::sleep(Duration::from_secs(6)).await;
 
         let snapshot = enginefs.stream_activity_snapshot().await;
@@ -2134,7 +2023,7 @@ mod tests {
     async fn active_hls_lease_prevents_delayed_cleanup() {
         let (enginefs, counters) = test_enginefs();
 
-        enginefs.refresh_hls_playback(TEST_HASH, 0, "test").await;
+        insert_active_lease(&enginefs, 0).await;
         let cleanup = enginefs
             .schedule_file_cleanup_after(TEST_HASH.to_string(), 0, Duration::from_millis(10))
             .await
@@ -2148,7 +2037,7 @@ mod tests {
     async fn expired_hls_lease_allows_delayed_cleanup() {
         let (enginefs, counters) = test_enginefs();
 
-        enginefs.refresh_hls_playback(TEST_HASH, 0, "test").await;
+        insert_active_lease(&enginefs, 0).await;
         {
             let mut leases = enginefs.active_playback_leases.write().await;
             leases
