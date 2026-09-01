@@ -4,11 +4,7 @@ use tokio::io::{AsyncRead, AsyncSeek};
 
 use priorities::PlaybackIntent;
 
-#[cfg(feature = "librqbit")]
 pub mod librqbit;
-
-#[cfg(feature = "libtorrent")]
-pub mod libtorrent;
 
 pub mod metadata;
 pub mod priorities;
@@ -317,16 +313,6 @@ pub enum TorrentEncryptionMode {
     Disable,
 }
 
-impl TorrentEncryptionMode {
-    pub fn as_libtorrent_code(self) -> i32 {
-        match self {
-            Self::Allow => 0,
-            Self::Require => 1,
-            Self::Disable => 2,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[derive(Default)]
@@ -338,19 +324,6 @@ pub enum TorrentProxyType {
     Socks5Password,
     Http,
     HttpPassword,
-}
-
-impl TorrentProxyType {
-    pub fn as_libtorrent_code(self) -> i32 {
-        match self {
-            Self::None => 0,
-            Self::Socks4 => 1,
-            Self::Socks5 => 2,
-            Self::Socks5Password => 3,
-            Self::Http => 4,
-            Self::HttpPassword => 5,
-        }
-    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

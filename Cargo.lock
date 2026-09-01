@@ -1268,7 +1268,6 @@ dependencies = [
  "futures",
  "hex 0.4.3",
  "librqbit",
- "libtorrent-sys",
  "memmap2",
  "moka",
  "parking_lot",
