@@ -6,7 +6,6 @@ use axum::{
 use regex::RegexBuilder;
 use serde_json::json;
 
-pub const LOCAL_BASE_URL: &str = "http://127.0.0.1:11470";
 pub const DLNA_TRANSFER_MODE: &str = "Streaming";
 pub const DLNA_CONTENT_FEATURES: &str =
     "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000";
@@ -193,48 +192,6 @@ fn parse_regex_filter(filter: &str) -> Option<(&str, &str)> {
     (last_slash > 0).then(|| (&filter[1..last_slash], &filter[last_slash + 1..]))
 }
 
-pub fn parse_media_url(media_url: &str) -> Result<(String, String), String> {
-    let normalized = if media_url.starts_with('/') {
-        format!("{}{}", LOCAL_BASE_URL, media_url)
-    } else {
-        media_url.to_string()
-    };
-
-    let parsed = url::Url::parse(normalized.trim_end_matches('?'))
-        .map_err(|err| format!("Invalid media URL: {err}"))?;
-    let segments = parsed
-        .path_segments()
-        .map(|segments| segments.collect::<Vec<_>>())
-        .unwrap_or_default();
-
-    let info_pos = segments
-        .iter()
-        .position(|segment| is_info_hash(segment))
-        .ok_or_else(|| "No info hash found in media URL".to_string())?;
-    let file_idx = segments
-        .get(info_pos + 1)
-        .ok_or_else(|| "No file index found in media URL".to_string())?;
-
-    Ok((
-        segments[info_pos].to_ascii_lowercase(),
-        (*file_idx).to_string(),
-    ))
-}
-
-pub fn is_info_hash(value: &str) -> bool {
-    value.len() == 40 && value.chars().all(|ch| ch.is_ascii_hexdigit())
-}
-
-pub fn parse_hls_id(id: &str) -> Option<(String, usize)> {
-    let decoded = urlencoding::decode(id).ok()?.into_owned();
-    let (info_hash, file_idx) = decoded.rsplit_once('-')?;
-    if !is_info_hash(info_hash) {
-        return None;
-    }
-    let file_idx = file_idx.parse().ok()?;
-    Some((info_hash.to_ascii_lowercase(), file_idx))
-}
-
 pub fn unsupported(feature: &str) -> Response {
     tracing::warn!(feature, "Stremio compatibility feature is not implemented");
     (
@@ -243,13 +200,6 @@ pub fn unsupported(feature: &str) -> Response {
         Body::from(json!({ "error": format!("{feature} is not implemented") }).to_string()),
     )
         .into_response()
-}
-
-pub fn empty_ok() -> Response {
-    Response::builder()
-        .status(StatusCode::OK)
-        .body(Body::empty())
-        .unwrap()
 }
 
 #[cfg(test)]

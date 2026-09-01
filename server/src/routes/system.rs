@@ -209,8 +209,6 @@ pub struct ServerSettings {
     pub bt_ssrf_mitigation: bool,
     #[serde(rename = "remoteHttps")]
     pub remote_https: Option<String>,
-    #[serde(rename = "transcodeProfile")]
-    pub transcode_profile: Option<String>,
     #[serde(rename = "autoUpdateEnabled", default = "default_auto_update_enabled")]
     pub auto_update_enabled: bool,
     #[serde(rename = "updateChannel", default)]
@@ -479,7 +477,6 @@ impl Default for ServerSettings {
             bt_validate_https_trackers: default_bt_validate_https_trackers(),
             bt_ssrf_mitigation: default_bt_ssrf_mitigation(),
             remote_https: None,
-            transcode_profile: None,
             auto_update_enabled: default_auto_update_enabled(),
             update_channel: UpdateChannel::default(),
             update_check_interval_hours: default_update_check_interval_hours(),
@@ -510,13 +507,6 @@ pub async fn update_settings(state: &AppState, payload: &Value) -> anyhow::Resul
 
     if let Some(obj) = payload.as_object() {
         // Update fields that are present in the payload
-        if let Some(v) = obj.get("transcodeProfile") {
-            if v.is_null() {
-                settings.transcode_profile = None;
-            } else if let Some(s) = v.as_str() {
-                settings.transcode_profile = Some(s.to_string());
-            }
-        }
         if let Some(v) = obj.get("cacheSize")
             && let Some(resolved) = resolve_cache_size(v)
         {
@@ -741,117 +731,6 @@ pub async fn set_settings(
             tracing::error!("Failed to save settings: {}", e);
             Json(json!({ "success": false, "error": e.to_string() }))
         }
-    }
-}
-static HWACCEL_PROFILES: tokio::sync::OnceCell<Vec<String>> = tokio::sync::OnceCell::const_new();
-
-pub async fn probe_hwaccel() -> Vec<String> {
-    HWACCEL_PROFILES
-        .get_or_init(probe_hwaccel_uncached)
-        .await
-        .clone()
-}
-
-async fn probe_hwaccel_uncached() -> Vec<String> {
-    let mut profiles = Vec::new();
-    let output = match tokio::process::Command::new("ffmpeg")
-        .args(["-hide_banner", "-encoders"])
-        .output()
-        .await
-    {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
-        Err(_) => return profiles,
-    };
-
-    if output.contains("h264_nvenc") {
-        profiles.push("nvenc".to_string());
-        if verify_h264_encoder("h264_nvenc").await {
-            profiles.push("nvenc:verified".to_string());
-        }
-    }
-    if output.contains("h264_vaapi") {
-        profiles.push("vaapi".to_string());
-        if verify_h264_encoder("h264_vaapi").await {
-            profiles.push("vaapi:verified".to_string());
-        }
-    }
-    if output.contains("h264_vdpau") {
-        profiles.push("vdpau".to_string());
-    }
-    if output.contains("h264_qsv") {
-        profiles.push("qsv".to_string());
-        if verify_h264_encoder("h264_qsv").await {
-            profiles.push("qsv:verified".to_string());
-        }
-    }
-    if output.contains("h264_omx") {
-        profiles.push("omx".to_string());
-    }
-    if output.contains("h264_v4l2m2m") {
-        profiles.push("v4l2m2m".to_string());
-        if verify_h264_encoder("h264_v4l2m2m").await {
-            profiles.push("v4l2m2m:verified".to_string());
-        }
-    }
-    if output.contains("h264_videotoolbox") {
-        profiles.push("videotoolbox".to_string());
-        if verify_h264_encoder("h264_videotoolbox").await {
-            profiles.push("videotoolbox:verified".to_string());
-        }
-    }
-    if output.contains("h264_mediacodec") {
-        profiles.push("mediacodec".to_string());
-    }
-
-    profiles
-}
-
-async fn verify_h264_encoder(encoder: &str) -> bool {
-    let mut cmd = tokio::process::Command::new("ffmpeg");
-    cmd.args([
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-f",
-        "lavfi",
-        "-i",
-        "testsrc2=size=64x64:rate=1:duration=1",
-        "-frames:v",
-        "1",
-        "-an",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:v",
-        encoder,
-        "-f",
-        "null",
-        "-",
-    ]);
-
-    let output = match tokio::time::timeout(std::time::Duration::from_secs(5), cmd.output()).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(err)) => {
-            tracing::debug!(encoder, error = %err, "hardware encoder verification failed to spawn");
-            return false;
-        }
-        Err(_) => {
-            tracing::debug!(encoder, "hardware encoder verification timed out");
-            return false;
-        }
-    };
-
-    if output.status.success() {
-        tracing::info!(encoder, "hardware encoder verified");
-        true
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        tracing::debug!(
-            encoder,
-            status = ?output.status.code(),
-            stderr = %stderr.trim(),
-            "hardware encoder listed by FFmpeg but failed verification"
-        );
-        false
     }
 }
 

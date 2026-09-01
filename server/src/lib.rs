@@ -717,38 +717,6 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/proxy", routes::proxy::router())
         .nest("/ftp", routes::ftp::router())
         .route("/samples/{filename}", get(routes::system::get_samples))
-        .route("/hlsv2/status", get(routes::hls::hls_status))
-        .route("/hlsv2/{id}/destroy", get(routes::hls::hls_destroy))
-        .route("/hlsv2/{id}/burn", get(routes::hls::hls_burn))
-        .route(
-            "/hlsv2/{hash}/master.m3u8",
-            get(routes::hls::master_playlist_by_url),
-        )
-        .route("/hlsv2/{id}/{resource}", get(routes::hls::hls_v2_resource))
-        .route(
-            "/hlsv2/{infoHash}/{fileIdx}/master.m3u8",
-            get(routes::hls::get_master_playlist),
-        )
-        .route(
-            "/hlsv2/{infoHash}/{fileIdx}/{resource}",
-            get(routes::hls::handle_hls_resource),
-        )
-        .route(
-            "/hlsv2/{infoHash}/{fileIdx}/{track}/{segment}",
-            get(routes::hls::handle_hls_fmp4_segment),
-        )
-        .route("/hlsv2/probe", get(routes::hls::probe_by_url))
-        .route("/probe", get(routes::hls::probe_by_url))
-        .route("/probe/{infoHash}/{fileIdx}", get(routes::hls::get_probe))
-        .route("/tracks/{*url}", get(routes::hls::get_tracks_by_url))
-        .route(
-            "/{first}/{second}/{resource}",
-            get(routes::hls::legacy_hls_resource),
-        )
-        .route(
-            "/{first}/{second}/{variant}/{seg}",
-            get(routes::hls::legacy_hls_segment),
-        )
         .route("/thumb.jpg", get(|| async { StatusCode::NOT_FOUND }))
         .nest("/casting", routes::casting::router())
         .route("/favicon.ico", get(|| async { StatusCode::NOT_FOUND }))
