@@ -33,7 +33,7 @@ pub struct GitHubAsset {
 
 pub async fn fetch_releases(client: &reqwest::Client) -> Result<Vec<GitHubRelease>, UpdateError> {
     let releases = client
-        .get("https://api.github.com/repos/perpetus/stream-server/releases")
+        .get("https://api.github.com/repos/zond/stream-server/releases")
         .send()
         .await?
         .error_for_status()?

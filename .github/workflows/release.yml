@@ -186,10 +186,10 @@ jobs:
           pkgname=stream-server
           pkgver=0.1.0
           pkgrel=1
-          pkgdesc="High-performance torrent streaming server with HLS transcoding"
+          pkgdesc="Pure-Rust headless torrent streaming server"
           arch=('x86_64')
-          url="https://github.com/perpetus/stream-server"
-          license=('MIT')
+          url="https://github.com/zond/stream-server"
+          license=('GPL3')
           depends=('openssl')
           source=("stream-server")
           sha256sums=('SKIP')
