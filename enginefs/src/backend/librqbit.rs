@@ -535,8 +535,8 @@ impl TorrentHandle for LibrqbitHandle {
     /// Select `file_idx` as the only wanted file (exclusive downloading, per
     /// the trait contract) on multi-file torrents. Best-effort: selection
     /// failures (e.g. "can't update initializing torrent" during hash-check)
-    /// are logged and swallowed because run_probe propagates this error with
-    /// `?` and playback still works with the selection unchanged. Err is
+    /// are logged and swallowed because streaming callers propagate this error
+    /// with `?` and playback still works with the selection unchanged. Err is
     /// returned only for a provably-bad file index, matching libtorrent.
     ///
     /// librqbit persists only_files across restarts; the next prepare or
@@ -731,8 +731,8 @@ impl LibrqbitHandle {
 
     /// Run the pure planner against the live `only_files` selection and apply
     /// the result via `Session::update_only_files`. Best-effort: librqbit
-    /// bails while the torrent is Initializing (hash-check), and callers like
-    /// run_probe propagate prepare errors with `?`, so an apply failure is
+    /// bails while the torrent is Initializing (hash-check), and streaming
+    /// callers propagate prepare errors with `?`, so an apply failure is
     /// logged and swallowed -- with the selection unchanged librqbit still
     /// downloads and playback works through the blocking reader.
     async fn apply_selection(
