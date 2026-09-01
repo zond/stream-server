@@ -73,6 +73,10 @@ Do NOT pass `--workspace` to bare check/test/clippy — that pulls in the exclud
 - **Versions**: all crates share one version (bump in lockstep across every Cargo.toml).
 - **Commits**: conventional style — `feat(scope):`, `fix(scope):`, `build:`, `ci:`, `docs:`, `chore:`.
 
+### Agent model economy
+
+Use the cheapest model adequate for the task at hand. Small/fast models are fine for mechanical edits, docs updates, renames, and enumeration; reserve strong models for architecture decisions, concurrency-sensitive code, and adversarial review. This is a standing instruction from the repo owner to conserve tokens/quota.
+
 ## Gotchas & do-not-touch
 
 - **Do not casually edit**: the `.github/workflows/release.yml` matrix (vcpkg caching keys hash `vcpkg.json`, `triplets/**`, `vcpkg-overlays/**`); `triplets/*.cmake` (the x86-64-v3 `/arch:AVX2` static-md triplet must match released binaries); `vcpkg-overlays/libtorrent/` (pinned libtorrent 2.1.1 port + patches); `vcpkg.json` baseline; vendored C++ in `bindings/async-rar/vendor/unrar`.
