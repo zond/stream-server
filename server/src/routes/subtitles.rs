@@ -132,42 +132,9 @@ pub async fn get_subtitles_vtt(
     Path((info_hash, file_idx)): Path<(String, usize)>,
 ) -> Response {
     if let Some(engine) = state.stream_engine().get_engine(&info_hash).await {
-        // Check if this is an embedded subtitle track ID (>= 1000)
-        // For embedded subs, file_idx is actually the ID from find_subtitle_tracks
-        // We need to find the main video file index for extraction
-        if file_idx >= 1000 {
-            // Find the main video file (largest file)
-            let files = engine.handle.get_files().await;
-            if let Some((main_file_idx, _)) = files.iter().enumerate().max_by_key(|(_, f)| f.length)
-            {
-                // Determine track ID (offset by 1000)
-                let track_id = file_idx;
-
-                match engine
-                    .extract_embedded_subtitle(main_file_idx, track_id)
-                    .await
-                {
-                    Ok(content) => {
-                        // FFmpeg output is already VTT, but let's run it through our parser
-                        // to ensure consistent styling if needed, or just return as is.
-                        // For now, return as is since ffmpeg does a decent job.
-                        return Response::builder()
-                            .header("content-type", "text/vtt")
-                            .header("access-control-allow-origin", "*")
-                            .body(axum::body::Body::from(content))
-                            .unwrap();
-                    }
-                    Err(e) => {
-                        return Response::builder()
-                            .status(500)
-                            .body(axum::body::Body::from(format!("Extraction failed: {}", e)))
-                            .unwrap();
-                    }
-                }
-            }
-        }
-
-        // Regular external file handling
+        // External subtitle file handling. Embedded-track extraction (which
+        // used ffmpeg) has been removed; the client selects embedded tracks
+        // from the video itself.
         if let Some(mut file) = engine.get_file(file_idx, 0, 0).await {
             let mut content = String::new();
             if file.read_to_string(&mut content).await.is_ok() {
