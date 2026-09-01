@@ -155,6 +155,31 @@ pub fn disk_backed_forward_window_pieces_for(intent: PlaybackIntent, piece_lengt
     cap_pieces_by_bytes(pieces, piece_length, byte_cap)
 }
 
+/// Per-stream lookahead window (in bytes) for librqbit's `FileStreamOptions`,
+/// sized by playback intent instead of librqbit's fixed 32 MiB default. Reuses
+/// the same `MAX_*_WINDOW_BYTES` caps `disk_backed_forward_window_pieces_for`
+/// maps each intent onto, so the librqbit and libtorrent backends read ahead by
+/// the same byte budget. `stream_with_options` rejects a zero window, so the
+/// result is clamped to at least 1 (all constants are already > 0).
+pub fn librqbit_stream_lookahead_bytes(intent: PlaybackIntent) -> u64 {
+    match intent {
+        // First-frame latency: narrow the startup want-set (4 MiB) so the head
+        // pieces verify faster than under librqbit's 32 MiB default.
+        PlaybackIntent::DirectInitial | PlaybackIntent::HlsInitial => MAX_STARTUP_WINDOW_BYTES,
+        // Hot read-ahead once playing / after a seek.
+        PlaybackIntent::DirectSeek
+        | PlaybackIntent::HlsSeek
+        | PlaybackIntent::DirectSequential
+        | PlaybackIntent::HlsSequential => MAX_SEEK_HOT_WINDOW_BYTES,
+        PlaybackIntent::DownloadFull => MAX_WARM_WINDOW_BYTES,
+        PlaybackIntent::DownloadRange => MAX_DOWNLOAD_RANGE_WINDOW_BYTES,
+        PlaybackIntent::ContainerMetadata
+        | PlaybackIntent::InternalProbe
+        | PlaybackIntent::Background => MAX_CONTAINER_METADATA_WINDOW_BYTES,
+    }
+    .max(1)
+}
+
 pub fn playback_deadline_step_ms(
     piece_length: u64,
     bitrate_bytes_per_sec: Option<u64>,
@@ -904,6 +929,71 @@ mod tests {
         assert_eq!(decision.assignments[0].piece_idx, 100);
         assert_eq!(decision.assignments[0].piece_priority, 7);
         assert!(decision.reason.contains("first-piece-only"));
+    }
+
+    #[test]
+    fn librqbit_lookahead_maps_each_intent_to_its_window_cap() {
+        assert_eq!(
+            librqbit_stream_lookahead_bytes(PlaybackIntent::DirectInitial),
+            MAX_STARTUP_WINDOW_BYTES
+        );
+        assert_eq!(
+            librqbit_stream_lookahead_bytes(PlaybackIntent::HlsInitial),
+            MAX_STARTUP_WINDOW_BYTES
+        );
+        assert_eq!(
+            librqbit_stream_lookahead_bytes(PlaybackIntent::DirectSeek),
+            MAX_SEEK_HOT_WINDOW_BYTES
+        );
+        assert_eq!(
+            librqbit_stream_lookahead_bytes(PlaybackIntent::HlsSeek),
+            MAX_SEEK_HOT_WINDOW_BYTES
+        );
+        assert_eq!(
+            librqbit_stream_lookahead_bytes(PlaybackIntent::DirectSequential),
+            MAX_SEEK_HOT_WINDOW_BYTES
+        );
+        assert_eq!(
+            librqbit_stream_lookahead_bytes(PlaybackIntent::HlsSequential),
+            MAX_SEEK_HOT_WINDOW_BYTES
+        );
+        assert_eq!(
+            librqbit_stream_lookahead_bytes(PlaybackIntent::DownloadFull),
+            MAX_WARM_WINDOW_BYTES
+        );
+        assert_eq!(
+            librqbit_stream_lookahead_bytes(PlaybackIntent::DownloadRange),
+            MAX_DOWNLOAD_RANGE_WINDOW_BYTES
+        );
+        assert_eq!(
+            librqbit_stream_lookahead_bytes(PlaybackIntent::ContainerMetadata),
+            MAX_CONTAINER_METADATA_WINDOW_BYTES
+        );
+        assert_eq!(
+            librqbit_stream_lookahead_bytes(PlaybackIntent::InternalProbe),
+            MAX_CONTAINER_METADATA_WINDOW_BYTES
+        );
+        assert_eq!(
+            librqbit_stream_lookahead_bytes(PlaybackIntent::Background),
+            MAX_CONTAINER_METADATA_WINDOW_BYTES
+        );
+        // Every intent must produce a positive window (stream_with_options
+        // rejects 0).
+        for intent in [
+            PlaybackIntent::DirectInitial,
+            PlaybackIntent::DirectSeek,
+            PlaybackIntent::DirectSequential,
+            PlaybackIntent::HlsInitial,
+            PlaybackIntent::HlsSeek,
+            PlaybackIntent::HlsSequential,
+            PlaybackIntent::DownloadFull,
+            PlaybackIntent::DownloadRange,
+            PlaybackIntent::ContainerMetadata,
+            PlaybackIntent::InternalProbe,
+            PlaybackIntent::Background,
+        ] {
+            assert!(librqbit_stream_lookahead_bytes(intent) > 0);
+        }
     }
 
     #[test]

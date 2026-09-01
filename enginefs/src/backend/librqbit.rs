@@ -493,13 +493,18 @@ impl TorrentHandle for LibrqbitHandle {
         _start_offset: u64,
         _priority: u8,
         _bitrate: Option<u64>,
-        _intent: crate::backend::priorities::PlaybackIntent,
+        intent: crate::backend::priorities::PlaybackIntent,
     ) -> Result<Box<dyn FileStreamTrait>> {
-        // BREAK 2: ManagedTorrent::stream is async in librqbit 9.0.1.
+        // Size the per-stream lookahead window by playback intent instead of
+        // librqbit's fixed 32 MiB default: a narrow startup window verifies the
+        // head pieces faster, while seeks/sequential get generous read-ahead.
+        let opts = librqbit::FileStreamOptions {
+            lookahead_bytes: crate::backend::priorities::librqbit_stream_lookahead_bytes(intent),
+        };
         let stream = self
             .handle
             .clone()
-            .stream(file_idx)
+            .stream_with_options(file_idx, opts)
             .await
             .context("Failed to stream from librqbit")?;
         Ok(Box::new(stream))
@@ -605,7 +610,9 @@ impl TorrentHandle for LibrqbitHandle {
     ///
     /// Mechanism: open a short-lived librqbit FileStream and seek to `offset`.
     /// Registering the stream moves librqbit's per-stream lookahead window
-    /// (32MiB by default) to that offset and reconnects not-needed peers --
+    /// (sized by `intent` via `librqbit_stream_lookahead_bytes`, matching the
+    /// window the real read will request) to that offset and reconnects
+    /// not-needed peers --
     /// the deadline-equivalent priority yank -- and the subsequent 1-byte read
     /// parks on the piece waker until the piece covering `offset` verifies.
     /// The temporary stream drops at function exit, deregistering its window.
@@ -658,8 +665,18 @@ impl TorrentHandle for LibrqbitHandle {
 
         // Phase 2: open the stream, retrying while the torrent is still
         // initializing/checking (FileStream requires Paused or Live state).
+        // Use the same intent-sized window as the real read so the priority
+        // yank moves the lookahead exactly where playback will request it.
+        let lookahead = librqbit::FileStreamOptions {
+            lookahead_bytes: crate::backend::priorities::librqbit_stream_lookahead_bytes(intent),
+        };
         let mut stream = loop {
-            match self.handle.clone().stream(file_idx).await {
+            match self
+                .handle
+                .clone()
+                .stream_with_options(file_idx, lookahead)
+                .await
+            {
                 Ok(s) => break s,
                 Err(e) => {
                     if start.elapsed() >= timeout {
@@ -983,6 +1000,42 @@ mod tests {
             .unwrap();
         assert!(r.ready, "mid-file offset must be ready: {}", r.reason);
         assert_eq!(r.piece, (offset / 16384) as i32);
+    }
+
+    // Exercises the get_file_reader -> stream_with_options wiring: every intent
+    // must produce a positive lookahead window (stream_with_options asserts
+    // lookahead_bytes > 0), so a successful open+read confirms the intent-sized
+    // window is applied rather than rejected.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_file_reader_applies_intent_sized_lookahead() {
+        use crate::backend::TorrentHandle;
+        use crate::backend::priorities::PlaybackIntent;
+        use tokio::io::AsyncReadExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let payload = dir.join("payload.bin");
+        write_payload(&payload, 96 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+        let (_backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
+        handle.handle.wait_until_initialized().await.unwrap();
+
+        // A narrow-window intent (4 MiB) and a wide-window intent (128 MiB)
+        // both yield a readable stream.
+        for intent in [PlaybackIntent::DirectInitial, PlaybackIntent::DirectSeek] {
+            // Sanity: the helper the reader uses is positive for this intent.
+            assert!(
+                crate::backend::priorities::librqbit_stream_lookahead_bytes(intent) > 0,
+                "lookahead must be positive for {intent:?}"
+            );
+            let mut reader = handle
+                .get_file_reader(0, 0, 100, None, intent)
+                .await
+                .unwrap_or_else(|e| panic!("get_file_reader failed for {intent:?}: {e:#}"));
+            let mut buf = [0u8; 1];
+            let n = reader.read(&mut buf).await.expect("read first byte");
+            assert_eq!(n, 1, "seeded file must yield a byte for {intent:?}");
+            assert_eq!(buf[0], 0, "first payload byte is (0 % 251) == 0");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
