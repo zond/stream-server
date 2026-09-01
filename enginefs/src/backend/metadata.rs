@@ -772,21 +772,25 @@ impl MetadataInspector {
 
         let mut chunk = 1u32;
         let mut sample = 1u32;
-        let mut samples_per_chunk = stsc[0].1;
+        // A crafted stsc can declare samples_per_chunk == 0, which would never
+        // advance `sample` and spin until `chunk` overflows; clamp to 1.
+        let mut samples_per_chunk = stsc[0].1.max(1);
         let mut stsc_idx = 0;
 
         while sample < sample_number {
             if stsc_idx + 1 < stsc.len() && chunk >= stsc[stsc_idx + 1].0 {
                 stsc_idx += 1;
-                samples_per_chunk = stsc[stsc_idx].1;
+                samples_per_chunk = stsc[stsc_idx].1.max(1);
             }
 
-            if sample + samples_per_chunk > sample_number {
+            // Overflow-safe form of `sample + samples_per_chunk > sample_number`
+            // (the loop condition guarantees sample < sample_number here).
+            if samples_per_chunk > sample_number - sample {
                 break;
             }
 
             sample += samples_per_chunk;
-            chunk += 1;
+            chunk = chunk.saturating_add(1);
         }
 
         chunk as usize
@@ -861,6 +865,31 @@ mod tests {
         let keyframes =
             MetadataInspector::find_keyframe_offsets(&mut cursor, total as u64, "movie.mkv").await;
         assert!(keyframes.is_empty());
+    }
+
+    #[test]
+    fn stsc_zero_samples_per_chunk_terminates() {
+        // A crafted stsc with samples_per_chunk == 0 must not spin forever /
+        // overflow the chunk counter; it is treated as 1 sample per chunk.
+        assert_eq!(MetadataInspector::sample_to_chunk(5_000, &[(1, 0)]), 5_000);
+        // Zero in a later entry as well
+        assert_eq!(MetadataInspector::sample_to_chunk(10, &[(1, 2), (3, 0)]), 8);
+    }
+
+    #[test]
+    fn stsc_huge_samples_per_chunk_no_overflow() {
+        // sample + samples_per_chunk must not overflow u32
+        assert_eq!(
+            MetadataInspector::sample_to_chunk(u32::MAX, &[(1, u32::MAX)]),
+            1
+        );
+    }
+
+    #[test]
+    fn stsc_normal_mapping_unchanged() {
+        // 2 samples per chunk: samples 1-2 -> chunk 1, 3-4 -> chunk 2, 5 -> chunk 3
+        assert_eq!(MetadataInspector::sample_to_chunk(5, &[(1, 2)]), 3);
+        assert_eq!(MetadataInspector::sample_to_chunk(1, &[(1, 2)]), 1);
     }
 
     #[tokio::test]
