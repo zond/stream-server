@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [ "master", "main" ]
+  pull_request:
+    branches: [ "master", "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 10
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      # Reads the toolchain from rust-toolchain.toml (pinned to 1.98.0).
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  test:
+    name: Clippy and Tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      # Reads the toolchain from rust-toolchain.toml (pinned to 1.98.0).
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          components: clippy
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      # No apt installs here on purpose: the default feature set must build
+      # on a machine with no libclang, fontconfig/gtk headers, or libtorrent.
+      #
+      # The tree currently carries pre-existing non-correctness clippy
+      # warnings (e.g. collapsible_if in enginefs), so gate hard only on the
+      # correctness and suspicious groups; everything else stays a warning.
+      - name: Clippy
+        run: >-
+          cargo clippy --workspace --exclude settings-gui --all-targets --
+          -D clippy::correctness -D clippy::suspicious -W clippy::all
+
+      - name: Test
+        run: cargo test
+
+  features:
+    name: Optional Features
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      # Opt-in feature paths need native toolchains/headers:
+      #   rar          -> libclang (autocxx bindings for unrar)
+      #   gui          -> fontconfig, gtk3, ayatana-appindicator
+      #   settings-gui -> fontconfig, gtk3
+      # The libtorrent feature is intentionally NOT checked here; it needs a
+      # multi-minute source build and is already covered by the check job in
+      # release.yml.
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev libfontconfig1-dev libgtk-3-dev libayatana-appindicator3-dev
+
+      # Reads the toolchain from rust-toolchain.toml (pinned to 1.98.0).
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Check rar feature
+        run: cargo check -p server --features rar
+
+      - name: Check gui feature
+        run: cargo check -p server --features gui
+
+      - name: Check settings-gui
+        run: cargo check -p settings-gui
