@@ -9,14 +9,15 @@ members = [
     "updater-helper",
     "settings-gui",
 ]
-# settings-gui (Slint) needs fontconfig/gtk dev headers; keep it out of bare
-# `cargo build`/`cargo test` so headless machines build cleanly. It remains a
-# workspace member and is built explicitly with `-p settings-gui`.
+# settings-gui (Slint) needs fontconfig/gtk dev headers, async-rar needs
+# libclang and a C++ toolchain (autocxx), and libtorrent-sys needs the
+# libtorrent system library; keep them out of bare `cargo build`/`cargo test`
+# so headless machines build cleanly. They remain workspace members and are
+# built explicitly with `-p <crate>` or via the opt-in `rar`/`libtorrent`
+# features.
 default-members = [
     "enginefs",
     "server",
-    "bindings/async-rar",
-    "bindings/libtorrent-sys",
     "stremio-runtime-stub",
     "updater-helper",
 ]
