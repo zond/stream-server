@@ -11,6 +11,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
 
+/// Ports tried in order for librqbit's incoming BitTorrent listener. Mirrors
+/// the pre-9.0.1 `listen_port_range: 42000..42010` fallback (ListenerOptions
+/// now binds a single address, so the fallback is done in `new()`).
+const LISTEN_PORT_RANGE: std::ops::Range<u16> = 42000..42010;
+
 pub struct LibrqbitBackend {
     pub session: Arc<Session>,
     download_dir: PathBuf,
@@ -21,21 +26,54 @@ impl LibrqbitBackend {
         tokio::fs::create_dir_all(&download_dir).await?;
         debug!(path = ?download_dir, "Storing downloads");
 
-        let session_opts = librqbit::SessionOptions {
-            listen_port_range: Some(42000..42010),
-            enable_upnp_port_forwarding: true,
-            persistence: Some(librqbit::SessionPersistenceConfig::Json {
-                folder: Some(download_dir.clone()),
-            }),
-            peer_opts: Some(librqbit::PeerConnectionOptions {
-                connect_timeout: Some(Duration::from_secs(10)),
-                read_write_timeout: Some(Duration::from_secs(30)),
-                ..Default::default()
-            }),
-            ..Default::default()
+        // librqbit 9.0.1's ListenerOptions binds a single address instead of
+        // the old `listen_port_range: 42000..42010`, so preserve the previous
+        // port-fallback ourselves: try each port in the range and keep the
+        // first that binds. This matters when several sessions coexist (e.g.
+        // concurrent embed tests, or a second local instance).
+        let session = {
+            let mut last_err = None;
+            let mut session = None;
+            for port in LISTEN_PORT_RANGE {
+                let session_opts = librqbit::SessionOptions {
+                    listen: Some(librqbit::ListenerOptions {
+                        listen_addr: (std::net::Ipv6Addr::UNSPECIFIED, port).into(),
+                        enable_upnp_port_forwarding: true,
+                        ..Default::default()
+                    }),
+                    persistence: Some(librqbit::SessionPersistenceConfig::Json {
+                        folder: Some(download_dir.clone()),
+                    }),
+                    connect: Some(librqbit::ConnectionOptions {
+                        peer_opts: Some(librqbit::PeerConnectionOptions {
+                            connect_timeout: Some(Duration::from_secs(10)),
+                            read_write_timeout: Some(Duration::from_secs(30)),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                match Session::new_with_opts(download_dir.clone(), session_opts).await {
+                    Ok(s) => {
+                        session = Some(s);
+                        break;
+                    }
+                    Err(e) => {
+                        debug!(port, error = %e, "librqbit listen port unavailable; trying next");
+                        last_err = Some(e);
+                    }
+                }
+            }
+            match session {
+                Some(s) => s,
+                None => {
+                    return Err(last_err.unwrap_or_else(|| {
+                        anyhow::anyhow!("no librqbit listen port available in range")
+                    }));
+                }
+            }
         };
-
-        let session = Session::new_with_opts(download_dir.clone(), session_opts).await?;
         // Restore from session
         let mut restored_handles = session.with_torrents(|iter| {
             let mut map = HashMap::new();
@@ -106,10 +144,10 @@ impl LibrqbitBackend {
     pub async fn new_for_tests(download_dir: PathBuf) -> Result<Self> {
         tokio::fs::create_dir_all(&download_dir).await?;
         let session_opts = librqbit::SessionOptions {
-            disable_dht: true,
-            disable_dht_persistence: true,
-            listen_port_range: None,
-            enable_upnp_port_forwarding: false,
+            // dht: None disables DHT and its persistence together; listen: None
+            // never binds a port; persistence: None keeps the session hermetic.
+            dht: None,
+            listen: None,
             persistence: None,
             ..Default::default()
         };
@@ -310,7 +348,7 @@ impl TorrentHandle for LibrqbitHandle {
         self.handle
             .metadata
             .load_full()
-            .and_then(|m| m.info.name.as_ref().map(|n| n.to_string()))
+            .and_then(|m| m.info.name().map(|n| n.to_string()))
     }
 
     async fn stats(&self) -> EngineStats {
@@ -349,11 +387,9 @@ impl TorrentHandle for LibrqbitHandle {
         let mut files = Vec::new();
         let mut total_size = 0u64;
         let mut offset = 0u64;
-        if let Some(m) = self.handle.metadata.load_full()
-            && let Ok(iter) = m.info.iter_file_details()
-        {
-            for (i, f) in iter.enumerate() {
-                let filename = f.filename.to_string().unwrap_or_default();
+        if let Some(m) = self.handle.metadata.load_full() {
+            for (i, f) in m.info.iter_file_details().enumerate() {
+                let filename = f.filename.to_string();
                 // file_progress is empty while the torrent is Initializing.
                 let have = stats.file_progress.get(i).copied().unwrap_or(0);
                 let (file_downloaded, file_progress) = file_progress_fields(f.len, have);
@@ -459,22 +495,22 @@ impl TorrentHandle for LibrqbitHandle {
         _bitrate: Option<u64>,
         _intent: crate::backend::priorities::PlaybackIntent,
     ) -> Result<Box<dyn FileStreamTrait>> {
+        // BREAK 2: ManagedTorrent::stream is async in librqbit 9.0.1.
         let stream = self
             .handle
             .clone()
             .stream(file_idx)
+            .await
             .context("Failed to stream from librqbit")?;
         Ok(Box::new(stream))
     }
 
     async fn get_files(&self) -> Vec<BackendFileInfo> {
         let mut files = Vec::new();
-        if let Some(m) = self.handle.metadata.load_full()
-            && let Ok(iter) = m.info.iter_file_details()
-        {
-            for f in iter {
+        if let Some(m) = self.handle.metadata.load_full() {
+            for f in m.info.iter_file_details() {
                 files.push(BackendFileInfo {
-                    name: f.filename.to_string().unwrap_or_default(),
+                    name: f.filename.to_string(),
                     length: f.len,
                 });
             }
@@ -607,7 +643,7 @@ impl TorrentHandle for LibrqbitHandle {
             .file_infos
             .get(file_idx)
             .with_context(|| format!("File index {file_idx} out of range"))?;
-        let piece_length = metadata.lengths.default_piece_length() as u64;
+        let piece_length = metadata.lengths().default_piece_length() as u64;
         let piece = ((fi.offset_in_torrent + offset) / piece_length) as i32;
         if fi.len > 0 && offset >= fi.len {
             return Ok(self.readiness(
@@ -623,7 +659,7 @@ impl TorrentHandle for LibrqbitHandle {
         // Phase 2: open the stream, retrying while the torrent is still
         // initializing/checking (FileStream requires Paused or Live state).
         let mut stream = loop {
-            match self.handle.clone().stream(file_idx) {
+            match self.handle.clone().stream(file_idx).await {
                 Ok(s) => break s,
                 Err(e) => {
                     if start.elapsed() >= timeout {
@@ -771,16 +807,17 @@ mod tests {
     }
 
     /// Create a .torrent for `path` with small pieces so tests stay fast.
-    /// Returns (serialized torrent bytes, info hash as hex). librqbit 8.1.1
-    /// does not export `CreateTorrentResult`, so the value cannot be named
-    /// outside the crate — extract what we need immediately.
+    /// Returns (serialized torrent bytes, info hash as hex). We extract what we
+    /// need immediately rather than holding the borrowing result.
     pub(super) async fn make_torrent(path: &std::path::Path) -> (Vec<u8>, String) {
         let t = librqbit::create_torrent(
             path,
             librqbit::CreateTorrentOptions {
                 name: None,
+                trackers: Vec::new(),
                 piece_length: Some(16384),
             },
+            &librqbit::spawn_utils::BlockingSpawner::new(1),
         )
         .await
         .expect("create torrent");

@@ -4,7 +4,7 @@ version = "0.1.8"
 edition = "2024"
 
 [dependencies]
-librqbit = { version = "8.1.1", optional = true }
+librqbit = { git = "https://github.com/zond/rqbit", branch = "feat/configurable-stream-lookahead", optional = true }
 libtorrent-sys = { path = "../bindings/libtorrent-sys", optional = true }
 tokio = { version = "1.42.0", features = [
     "rt-multi-thread",
