@@ -194,74 +194,179 @@ async fn handle_stream(
         // Filter by S:E if present
         let target_season = parts.get(2).and_then(|s| s.parse::<i32>().ok());
         let target_episode = parts.get(3).and_then(|s| s.parse::<i32>().ok());
-
-        let matched_item = items.iter().find(|it| {
-            if target_season.is_some() {
-                it.metadata.season == target_season
-                    && it
-                        .metadata
-                        .episode
-                        .as_ref()
-                        .map(|e| e.contains(&target_episode.unwrap_or(1)))
-                        .unwrap_or(false)
-            } else {
-                true // Movie match
-            }
-        });
-
-        if let Some(item) = matched_item {
-            if let (Some(info_hash), Some(file_idx)) = (&item.info_hash, item.file_idx) {
-                // Torrent Stream
-                return Json(json!({
-                    "streams": [{
-                        "title": item.metadata.name.clone().unwrap_or("Torrent File".to_string()),
-                        "infoHash": info_hash,
-                        "fileIdx": file_idx,
-                        "behaviorHints": {
-                            "notWebReady": false // Can stream via enginefs
-                        }
-                    }]
-                }));
-            } else {
-                // Check for archive path
-                if item.path.starts_with("archive:") {
-                    // path format: archive:{abs_path}|{internal_path}
-                    let content = item.path.strip_prefix("archive:").unwrap_or(&item.path);
-                    if let Some((archive_path, internal_path)) = content.split_once('|') {
-                        // Use /zip/stream generic endpoint (works for all supported types via factory)
-                        let url = format!(
-                            "{}/zip/stream?archive={}&file={}",
-                            state.base_url,
-                            urlencoding::encode(archive_path),
-                            urlencoding::encode(internal_path)
-                        );
-
-                        return Json(json!({
-                            "streams": [{
-                                "title": item.metadata.name.clone().unwrap_or("Archive File".to_string()),
-                                "url": url,
-                                "behaviorHints": {
-                                    "notWebReady": false, // It IS web ready via our HTTP proxy
-                                    "bingeGroup": format!("archive:{}", archive_path)
-                                }
-                            }]
-                        }));
-                    }
-                }
-
-                // Local File Stream
-                return Json(json!({
-                    "streams": [{
-                        "title": "Local File",
-                        "url": format!("file://{}", item.path),
-                        "behaviorHints": {
-                            "notWebReady": true
-                        }
-                    }]
-                }));
-            }
-        }
+        return Json(resolve_local_stream(
+            items,
+            target_season,
+            target_episode,
+            &state.base_url,
+        ));
     }
 
     Json(json!({ "streams": [] }))
+}
+
+/// Resolve a `local:` stream request against the indexed files for one id.
+/// When a season is requested, the file must match both season and (contained)
+/// episode; otherwise the first item is taken (movie). The chosen item becomes
+/// a torrent stream (infoHash+fileIdx), an `/zip/stream` archive proxy URL
+/// (from the `archive:{abs}|{internal}` path, percent-encoding both parts), or
+/// a `file://` local stream. Returns `{"streams":[]}` when nothing matches.
+fn resolve_local_stream(
+    items: &[index::IndexItem],
+    target_season: Option<i32>,
+    target_episode: Option<i32>,
+    base_url: &str,
+) -> Value {
+    let matched_item = items.iter().find(|it| {
+        if target_season.is_some() {
+            it.metadata.season == target_season
+                && it
+                    .metadata
+                    .episode
+                    .as_ref()
+                    .map(|e| e.contains(&target_episode.unwrap_or(1)))
+                    .unwrap_or(false)
+        } else {
+            true // Movie match
+        }
+    });
+
+    if let Some(item) = matched_item {
+        if let (Some(info_hash), Some(file_idx)) = (&item.info_hash, item.file_idx) {
+            // Torrent Stream
+            return json!({
+                "streams": [{
+                    "title": item.metadata.name.clone().unwrap_or("Torrent File".to_string()),
+                    "infoHash": info_hash,
+                    "fileIdx": file_idx,
+                    "behaviorHints": {
+                        "notWebReady": false // Can stream via enginefs
+                    }
+                }]
+            });
+        } else {
+            // Check for archive path
+            if item.path.starts_with("archive:") {
+                // path format: archive:{abs_path}|{internal_path}
+                let content = item.path.strip_prefix("archive:").unwrap_or(&item.path);
+                if let Some((archive_path, internal_path)) = content.split_once('|') {
+                    // Use /zip/stream generic endpoint (works for all supported types via factory)
+                    let url = format!(
+                        "{}/zip/stream?archive={}&file={}",
+                        base_url,
+                        urlencoding::encode(archive_path),
+                        urlencoding::encode(internal_path)
+                    );
+
+                    return json!({
+                        "streams": [{
+                            "title": item.metadata.name.clone().unwrap_or("Archive File".to_string()),
+                            "url": url,
+                            "behaviorHints": {
+                                "notWebReady": false, // It IS web ready via our HTTP proxy
+                                "bingeGroup": format!("archive:{}", archive_path)
+                            }
+                        }]
+                    });
+                }
+            }
+
+            // Local File Stream
+            return json!({
+                "streams": [{
+                    "title": "Local File",
+                    "url": format!("file://{}", item.path),
+                    "behaviorHints": {
+                        "notWebReady": true
+                    }
+                }]
+            });
+        }
+    }
+
+    json!({ "streams": [] })
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::index::IndexItem;
+    use super::parser::VideoMetadata;
+    use super::resolve_local_stream;
+
+    fn item(
+        season: Option<i32>,
+        episode: Option<Vec<i32>>,
+        info_hash: Option<&str>,
+        file_idx: Option<usize>,
+        path: &str,
+        name: &str,
+    ) -> IndexItem {
+        IndexItem {
+            id: "local:tt1".to_string(),
+            imdb_id: Some("tt1".to_string()),
+            metadata: VideoMetadata {
+                name: Some(name.to_string()),
+                season,
+                episode,
+                ..VideoMetadata::default()
+            },
+            path: path.to_string(),
+            info_hash: info_hash.map(|s| s.to_string()),
+            file_idx,
+        }
+    }
+
+    #[test]
+    fn series_request_selects_the_matching_episode() {
+        let items = vec![
+            item(Some(1), Some(vec![1]), Some("hashA"), Some(0), "", "S1E1"),
+            item(Some(2), Some(vec![3]), Some("hashB"), Some(5), "", "S2E3"),
+        ];
+        let out = resolve_local_stream(&items, Some(2), Some(3), "http://host");
+        let stream = &out["streams"][0];
+        assert_eq!(stream["infoHash"], "hashB");
+        assert_eq!(stream["fileIdx"], 5);
+    }
+
+    #[test]
+    fn request_without_season_takes_the_movie_item() {
+        let items = vec![item(None, None, None, None, "/movies/Film.mkv", "Film")];
+        let out = resolve_local_stream(&items, None, None, "http://host");
+        assert_eq!(out["streams"][0]["url"], "file:///movies/Film.mkv");
+    }
+
+    #[test]
+    fn archive_item_builds_percent_encoded_zip_stream_url() {
+        let items = vec![item(
+            None,
+            None,
+            None,
+            None,
+            "archive:a b.zip|d/e.mkv",
+            "Archived",
+        )];
+        let out = resolve_local_stream(&items, None, None, "http://host");
+        // Space -> %20, path separator -> %2F in both query params.
+        assert_eq!(
+            out["streams"][0]["url"],
+            "http://host/zip/stream?archive=a%20b.zip&file=d%2Fe.mkv"
+        );
+        assert_eq!(
+            out["streams"][0]["behaviorHints"]["bingeGroup"],
+            "archive:a b.zip"
+        );
+    }
+
+    #[test]
+    fn no_match_yields_empty_streams() {
+        // Empty index for the id.
+        let empty: Vec<IndexItem> = Vec::new();
+        let out = resolve_local_stream(&empty, None, None, "http://host");
+        assert!(out["streams"].as_array().unwrap().is_empty());
+
+        // Season requested but no episode matches.
+        let items = vec![item(Some(1), Some(vec![1]), Some("h"), Some(0), "", "S1E1")];
+        let out = resolve_local_stream(&items, Some(9), Some(9), "http://host");
+        assert!(out["streams"].as_array().unwrap().is_empty());
+    }
 }
