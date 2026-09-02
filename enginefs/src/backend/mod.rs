@@ -209,6 +209,59 @@ pub struct StatsFile {
     pub downloaded: u64,
     /// Progress 0.0 to 1.0 (from C++ file_progress)
     pub progress: f64,
+    /// Bytes of this file's initial priority window (the head of the file a
+    /// fresh stream fetches first, see
+    /// `priorities::librqbit_stream_lookahead_bytes(DirectInitial)`) that are
+    /// already verified on disk. Omitted while the torrent has no piece map
+    /// (resolving metadata / hash-checking / error).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_window_ready_bytes: Option<u64>,
+    /// Size of that initial window: `min(startup window, file length)`.
+    /// Omitted together with `initial_window_ready_bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_window_bytes: Option<u64>,
+}
+
+/// Coarse torrent startup phase for pre-playback progress UIs (the official
+/// Stremio UI polls `stats.json` for its loading overlay). Purely additive to
+/// the server.js-compatible fields; derived from the backend's torrent state
+/// plus, once a stream file is chosen (`EngineStats::focus_stream_file`),
+/// that file's initial-window readiness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum StartupPhase {
+    /// No torrent metadata yet (magnet still resolving its info dictionary).
+    #[default]
+    ResolvingMetadata,
+    /// Metadata known; the backend is hash-checking existing data on disk
+    /// (librqbit `Initializing`). `checked_bytes`/`check_total_bytes` track it.
+    Checking,
+    /// Live (or paused) but the focused file's initial priority window is not
+    /// fully on disk yet. `initial_window_ready_bytes`/`initial_window_bytes`
+    /// track it.
+    Buffering,
+    /// The focused file's initial window is fully on disk (or the whole
+    /// torrent is finished): playback can start without stalling on the head.
+    Ready,
+    /// The backend put the torrent into an error state; it will not progress
+    /// without intervention.
+    Error,
+}
+
+/// Peer-discovery breakdown straight from the backend's per-torrent peer
+/// counters, so a client can tell "nobody found yet" from "found but not
+/// connected" while `Buffering`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerDiscovery {
+    /// Distinct peer addresses learned from DHT/trackers/PEX so far.
+    pub seen: u64,
+    /// Known peers waiting for a connection slot.
+    pub queued: u64,
+    /// Outgoing connections currently being established.
+    pub connecting: u64,
+    /// Peers with a completed handshake we exchange data with.
+    pub live: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -449,4 +502,55 @@ pub struct EngineStats {
     /// Torrent metadata is available (false for a freshly added magnet that is
     /// still resolving its info dictionary).
     pub has_metadata: bool,
+    /// Startup phase, see [`StartupPhase`]. Torrent-level from the backend
+    /// (`resolvingMetadata`/`checking`/`error`, or `buffering`/`ready` by
+    /// whole-torrent completion), refined per stream file by
+    /// [`EngineStats::focus_stream_file`].
+    #[serde(default)]
+    pub phase: StartupPhase,
+    /// Bytes hash-checked so far; `Some` only while `phase == checking`.
+    #[serde(default)]
+    pub checked_bytes: Option<u64>,
+    /// Bytes the hash check covers (torrent total); `Some` only while
+    /// `phase == checking`.
+    #[serde(default)]
+    pub check_total_bytes: Option<u64>,
+    /// The focused stream file's `StatsFile::initial_window_ready_bytes`;
+    /// `Some` only in `buffering`/`ready` once a stream file is focused.
+    #[serde(default)]
+    pub initial_window_ready_bytes: Option<u64>,
+    /// The focused stream file's `StatsFile::initial_window_bytes`.
+    #[serde(default)]
+    pub initial_window_bytes: Option<u64>,
+    /// Peer-discovery counters, see [`PeerDiscovery`].
+    #[serde(default)]
+    pub peer_discovery: PeerDiscovery,
+}
+
+impl EngineStats {
+    /// Refine `phase` for the file the client is about to play: in
+    /// `buffering`/`ready` copy that file's initial-window progress to the
+    /// top level and flip the phase on whether the window is fully on disk.
+    /// Other phases (and files without a window, e.g. no piece map) are left
+    /// untouched. Out-of-range indices are a no-op.
+    pub fn focus_stream_file(&mut self, file_idx: usize) {
+        if !matches!(self.phase, StartupPhase::Buffering | StartupPhase::Ready) {
+            return;
+        }
+        let Some(file) = self.files.get(file_idx) else {
+            return;
+        };
+        let (Some(ready), Some(total)) =
+            (file.initial_window_ready_bytes, file.initial_window_bytes)
+        else {
+            return;
+        };
+        self.initial_window_ready_bytes = Some(ready);
+        self.initial_window_bytes = Some(total);
+        self.phase = if ready >= total {
+            StartupPhase::Ready
+        } else {
+            StartupPhase::Buffering
+        };
+    }
 }

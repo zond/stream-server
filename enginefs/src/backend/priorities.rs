@@ -160,6 +160,39 @@ pub fn librqbit_stream_lookahead_bytes(intent: PlaybackIntent) -> u64 {
     .max(1)
 }
 
+/// Progress of a file's initial priority window: how many of the first
+/// `window_bytes` bytes of the file (clamped to the file length) are covered
+/// by verified pieces. `have_piece` answers for absolute torrent piece
+/// indices. Returns `(ready_bytes, window_bytes)`; a zero-length file yields
+/// `(0, 0)`, which callers treat as ready. Pieces straddling the window edge
+/// only count the bytes inside the window, so `ready == window` means the
+/// whole head is servable.
+pub fn initial_window_progress(
+    file_offset: u64,
+    file_len: u64,
+    piece_length: u64,
+    window_bytes: u64,
+    have_piece: impl Fn(u64) -> bool,
+) -> (u64, u64) {
+    let window = window_bytes.min(file_len);
+    if window == 0 || piece_length == 0 {
+        return (0, window);
+    }
+    let window_end = file_offset + window;
+    let first_piece = file_offset / piece_length;
+    let last_piece = (window_end - 1) / piece_length;
+    let mut ready = 0u64;
+    for piece in first_piece..=last_piece {
+        if !have_piece(piece) {
+            continue;
+        }
+        let piece_start = piece * piece_length;
+        let piece_end = piece_start + piece_length;
+        ready += piece_end.min(window_end) - piece_start.max(file_offset);
+    }
+    (ready, window)
+}
+
 pub fn playback_deadline_step_ms(
     piece_length: u64,
     bitrate_bytes_per_sec: Option<u64>,
@@ -933,5 +966,54 @@ mod tests {
         assert_eq!(deadline_step, 2_000);
         assert_eq!(decision.assignments[0].deadline, 0);
         assert_eq!(decision.assignments[1].deadline, 2_000);
+    }
+
+    #[test]
+    fn initial_window_progress_counts_only_bytes_inside_the_window() {
+        // File at torrent offset 100, length 1000, pieces of 256 bytes, 512
+        // byte window -> window covers [100, 612): pieces 0 (156 bytes),
+        // 1 (256 bytes), 2 (100 bytes).
+        let have_all = |_: u64| true;
+        assert_eq!(
+            initial_window_progress(100, 1000, 256, 512, have_all),
+            (512, 512)
+        );
+        let have_first_two = |p: u64| p < 2;
+        assert_eq!(
+            initial_window_progress(100, 1000, 256, 512, have_first_two),
+            (412, 512)
+        );
+        let have_none = |_: u64| false;
+        assert_eq!(
+            initial_window_progress(100, 1000, 256, 512, have_none),
+            (0, 512)
+        );
+    }
+
+    #[test]
+    fn initial_window_progress_clamps_window_to_file_length() {
+        // A 300-byte file with a 4 MiB window: the window is the whole file.
+        let have_all = |_: u64| true;
+        assert_eq!(
+            initial_window_progress(0, 300, 256, MAX_STARTUP_WINDOW_BYTES, have_all),
+            (300, 300)
+        );
+        // Only the second piece (bytes 256..300 of the file) is present.
+        let have_second = |p: u64| p == 1;
+        assert_eq!(
+            initial_window_progress(0, 300, 256, MAX_STARTUP_WINDOW_BYTES, have_second),
+            (44, 300)
+        );
+    }
+
+    #[test]
+    fn initial_window_progress_handles_degenerate_inputs() {
+        let have_all = |_: u64| true;
+        // Zero-length file: nothing to fetch, (0, 0) reads as ready.
+        assert_eq!(initial_window_progress(0, 0, 256, 1024, have_all), (0, 0));
+        // Zero window: never ready-by-bytes but never panics.
+        assert_eq!(initial_window_progress(0, 100, 256, 0, have_all), (0, 0));
+        // Zero piece length is impossible in a valid torrent; report nothing ready.
+        assert_eq!(initial_window_progress(0, 100, 0, 1024, have_all), (0, 100));
     }
 }

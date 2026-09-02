@@ -959,6 +959,8 @@ pub async fn get_file_stats(
     } else {
         0.0
     };
+    // Startup phase / initial-window readiness for this exact file too.
+    stats.focus_stream_file(idx);
     Json(serde_json::to_value(stats).unwrap()).into_response()
 }
 

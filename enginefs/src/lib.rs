@@ -1425,8 +1425,8 @@ mod tests {
     use super::*;
     use crate::backend::librqbit::{DeferredSelection, await_initialized};
     use crate::backend::{
-        BackendFileInfo, EngineStats, FileStreamTrait, Growler, PeerSearch, PieceReadiness,
-        StatsFile, StatsOptions, SwarmCap, TorrentFilePriorityPlan,
+        BackendFileInfo, EngineStats, FileStreamTrait, Growler, PeerDiscovery, PeerSearch,
+        PieceReadiness, StartupPhase, StatsFile, StatsOptions, SwarmCap, TorrentFilePriorityPlan,
     };
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -1447,6 +1447,9 @@ mod tests {
         applied_while_initializing: AtomicUsize,
         last_active_file: Mutex<Option<usize>>,
         last_generation: AtomicU64,
+        /// Test knob: report every file as fully on disk (seeded torrent)
+        /// instead of the default half-downloaded state.
+        seeded: AtomicBool,
     }
 
     /// Simulates librqbit's `Initializing` state for the fake torrent: the
@@ -1578,18 +1581,44 @@ mod tests {
         }
 
         async fn stats(&self) -> EngineStats {
+            // Mirror the real backend's phase derivation: no files stands in
+            // for missing metadata, a not-yet-ready FakeInit for librqbit's
+            // Initializing hash check, and the seeded knob for a finished
+            // torrent. The piece map (initial windows) only exists once
+            // initialized.
+            let initialized = self.init.is_ready();
+            let seeded = self.counters.seeded.load(Ordering::SeqCst);
+            let phase = if self.files.is_empty() {
+                StartupPhase::ResolvingMetadata
+            } else if !initialized {
+                StartupPhase::Checking
+            } else if seeded {
+                StartupPhase::Ready
+            } else {
+                StartupPhase::Buffering
+            };
+            let total_len: u64 = self.files.iter().map(|f| f.length).sum();
             let mut offset = 0u64;
             let files = self
                 .files
                 .iter()
                 .map(|file| {
+                    let downloaded = if seeded { file.length } else { file.length / 2 };
+                    let window = initialized.then(|| {
+                        let total = file
+                            .length
+                            .min(crate::backend::priorities::MAX_STARTUP_WINDOW_BYTES);
+                        (downloaded.min(total), total)
+                    });
                     let stats_file = StatsFile {
                         name: file.name.clone(),
                         path: file.name.clone(),
                         length: file.length,
                         offset,
-                        downloaded: file.length / 2,
-                        progress: 0.5,
+                        downloaded,
+                        progress: if seeded { 1.0 } else { 0.5 },
+                        initial_window_ready_bytes: window.map(|(ready, _)| ready),
+                        initial_window_bytes: window.map(|(_, total)| total),
                     };
                     offset += file.length;
                     stats_file
@@ -1628,8 +1657,14 @@ mod tests {
                 swarm_connections: 0,
                 swarm_paused: false,
                 swarm_size: 0,
-                is_finished: false,
+                is_finished: seeded,
                 has_metadata: !self.files.is_empty(),
+                phase,
+                checked_bytes: (phase == StartupPhase::Checking).then_some(0),
+                check_total_bytes: (phase == StartupPhase::Checking).then_some(total_len),
+                initial_window_ready_bytes: None,
+                initial_window_bytes: None,
+                peer_discovery: PeerDiscovery::default(),
             }
         }
 
@@ -2056,6 +2091,211 @@ mod tests {
                 .all(|stream| stream.file_idx == 2)
         );
         assert_eq!(counters.reconcile_file_priorities.load(Ordering::SeqCst), 2);
+    }
+
+    /// Startup phase: no files stands in for unresolved metadata, so the
+    /// engine-level stats must say so and carry no check/window numbers.
+    #[tokio::test]
+    async fn stats_phase_is_resolving_metadata_without_metadata() {
+        let (enginefs, _counters) = test_enginefs_with_files(vec![]);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+
+        let stats = engine.get_statistics().await;
+        assert_eq!(stats.phase, StartupPhase::ResolvingMetadata);
+        assert!(!stats.has_metadata);
+        assert_eq!(stats.checked_bytes, None);
+        assert_eq!(stats.check_total_bytes, None);
+        assert_eq!(stats.initial_window_ready_bytes, None);
+        assert_eq!(stats.initial_window_bytes, None);
+    }
+
+    /// Startup phase: while the fake torrent is initializing (librqbit's
+    /// hash check) the phase is `checking` with check progress exposed and no
+    /// initial-window numbers (there is no piece map yet). Once initialized
+    /// it moves on to `buffering` with the window numbers filled in.
+    #[tokio::test]
+    async fn stats_phase_is_checking_until_initialized() {
+        let (enginefs, _counters, init) = test_enginefs_initializing(1, Duration::from_secs(5));
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+
+        let stats = engine.get_statistics().await;
+        assert_eq!(stats.phase, StartupPhase::Checking);
+        assert_eq!(stats.checked_bytes, Some(0));
+        assert_eq!(stats.check_total_bytes, Some(100));
+        assert_eq!(stats.initial_window_ready_bytes, None);
+        assert_eq!(stats.initial_window_bytes, None);
+        assert_eq!(stats.files[0].initial_window_bytes, None);
+
+        init.mark_ready();
+        let stats = engine.get_statistics().await;
+        assert_eq!(stats.phase, StartupPhase::Buffering);
+        assert_eq!(stats.checked_bytes, None);
+        assert_eq!(stats.check_total_bytes, None);
+        assert_eq!(stats.initial_window_ready_bytes, Some(50));
+        assert_eq!(stats.initial_window_bytes, Some(100));
+    }
+
+    /// Startup phase: `buffering` until the stream file's initial window is
+    /// fully on disk, then `ready`. The window is the head of the *guessed*
+    /// stream file, mirrored to the top level from `files[]`.
+    #[tokio::test]
+    async fn stats_phase_flips_to_ready_when_initial_window_is_on_disk() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![
+            ("video-0.mkv".to_string(), 100),
+            ("video-1.mkv".to_string(), 60),
+        ]);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+
+        let stats = engine.get_statistics().await;
+        assert_eq!(stats.phase, StartupPhase::Buffering);
+        assert_eq!(stats.stream_name, "video-0.mkv", "largest file is guessed");
+        assert_eq!(stats.initial_window_ready_bytes, Some(50));
+        assert_eq!(stats.initial_window_bytes, Some(100));
+        assert_eq!(stats.files[1].initial_window_ready_bytes, Some(30));
+        assert_eq!(stats.files[1].initial_window_bytes, Some(60));
+
+        counters.seeded.store(true, Ordering::SeqCst);
+        let stats = engine.get_statistics().await;
+        assert_eq!(stats.phase, StartupPhase::Ready);
+        assert_eq!(stats.initial_window_ready_bytes, Some(100));
+        assert_eq!(stats.initial_window_bytes, Some(100));
+        assert!(stats.is_finished);
+    }
+
+    /// `focus_stream_file` re-judges the phase for the exact file a client
+    /// asked about (`/{infoHash}/{fileIdx}/stats.json`), only in the
+    /// buffering/ready phases, and ignores out-of-range indices.
+    #[test]
+    fn focus_stream_file_refines_phase_per_file() {
+        let file = |ready: u64, total: u64| StatsFile {
+            name: "f".into(),
+            path: "f".into(),
+            length: total,
+            offset: 0,
+            downloaded: ready,
+            progress: 0.0,
+            initial_window_ready_bytes: Some(ready),
+            initial_window_bytes: Some(total),
+        };
+        let base = EngineStats {
+            name: "t".into(),
+            info_hash: TEST_HASH.into(),
+            files: vec![file(10, 100), file(60, 60)],
+            sources: vec![],
+            opts: StatsOptions {
+                connections: None,
+                dht: true,
+                growler: Growler::default(),
+                handshake_timeout: None,
+                path: String::new(),
+                peer_search: PeerSearch::default(),
+                swarm_cap: SwarmCap::default(),
+                timeout: None,
+                tracker: true,
+                r#virtual: false,
+            },
+            download_speed: 0.0,
+            upload_speed: 0.0,
+            downloaded: 0,
+            uploaded: 0,
+            unchoked: 0,
+            peers: 0,
+            queued: 0,
+            unique: 0,
+            connection_tries: 0,
+            peer_search_running: false,
+            stream_len: 0,
+            stream_name: String::new(),
+            stream_progress: 0.0,
+            swarm_connections: 0,
+            swarm_paused: false,
+            swarm_size: 0,
+            is_finished: false,
+            has_metadata: true,
+            phase: StartupPhase::Buffering,
+            checked_bytes: None,
+            check_total_bytes: None,
+            initial_window_ready_bytes: None,
+            initial_window_bytes: None,
+            peer_discovery: PeerDiscovery::default(),
+        };
+
+        let mut stats = base.clone();
+        stats.focus_stream_file(0);
+        assert_eq!(stats.phase, StartupPhase::Buffering);
+        assert_eq!(stats.initial_window_ready_bytes, Some(10));
+        assert_eq!(stats.initial_window_bytes, Some(100));
+
+        let mut stats = base.clone();
+        stats.focus_stream_file(1);
+        assert_eq!(stats.phase, StartupPhase::Ready);
+        assert_eq!(stats.initial_window_ready_bytes, Some(60));
+
+        // Out of range: untouched.
+        let mut stats = base.clone();
+        stats.focus_stream_file(7);
+        assert_eq!(stats.phase, StartupPhase::Buffering);
+        assert_eq!(stats.initial_window_bytes, None);
+
+        // Not a piece-map phase: untouched even though the file is complete.
+        let mut stats = base.clone();
+        stats.phase = StartupPhase::Checking;
+        stats.focus_stream_file(1);
+        assert_eq!(stats.phase, StartupPhase::Checking);
+        assert_eq!(stats.initial_window_bytes, None);
+    }
+
+    /// Wire contract: the new fields serialize camelCase and additively; the
+    /// server.js-compatible keys stremio-core parses are all still present.
+    #[tokio::test]
+    async fn stats_json_keeps_legacy_fields_and_adds_phase_fields() {
+        let (enginefs, _counters) = test_enginefs();
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        let value = serde_json::to_value(engine.get_statistics().await).unwrap();
+        let obj = value.as_object().unwrap();
+
+        for key in [
+            "name",
+            "infoHash",
+            "files",
+            "sources",
+            "opts",
+            "downloadSpeed",
+            "uploadSpeed",
+            "downloaded",
+            "uploaded",
+            "unchoked",
+            "peers",
+            "queued",
+            "unique",
+            "connectionTries",
+            "peerSearchRunning",
+            "streamLen",
+            "streamName",
+            "streamProgress",
+            "swarmConnections",
+            "swarmPaused",
+            "swarmSize",
+            "isFinished",
+            "hasMetadata",
+        ] {
+            assert!(obj.contains_key(key), "legacy key {key} missing: {value}");
+        }
+        assert_eq!(value["phase"], "buffering");
+        assert_eq!(value["checkedBytes"], serde_json::Value::Null);
+        assert_eq!(value["checkTotalBytes"], serde_json::Value::Null);
+        assert_eq!(value["initialWindowReadyBytes"], 50);
+        assert_eq!(value["initialWindowBytes"], 100);
+        assert_eq!(
+            value["peerDiscovery"],
+            serde_json::json!({ "seen": 0, "queued": 0, "connecting": 0, "live": 0 })
+        );
+        assert_eq!(value["files"][0]["initialWindowReadyBytes"], 50);
+        assert_eq!(value["files"][0]["initialWindowBytes"], 100);
+        let file_keys = value["files"][0].as_object().unwrap();
+        for key in ["name", "path", "length", "offset", "downloaded", "progress"] {
+            assert!(file_keys.contains_key(key), "legacy file key {key} missing");
+        }
     }
 
     #[tokio::test]

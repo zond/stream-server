@@ -106,6 +106,19 @@ cargo run --release -p server
 
 The server starts on `http://localhost:11470` by default (compatible with standard streaming server port).
 
+### Startup phases in `stats.json`
+
+`/{infoHash}/stats.json` and `/{infoHash}/{fileIdx}/stats.json` keep the server.js-compatible shape stremio-core parses and add these camelCase fields so a client can show honest pre-playback progress:
+
+| Field | Meaning |
+|---|---|
+| `phase` | `resolvingMetadata` (no metadata yet), `checking` (hash-checking data already on disk), `buffering` (live, but the stream file's initial priority window is not fully on disk), `ready` (initial window on disk — playback can start), `error` |
+| `checkedBytes`, `checkTotalBytes` | Hash-check progress; non-null only while `checking` |
+| `initialWindowReadyBytes`, `initialWindowBytes` | Bytes of the stream file's head window (`min(4 MiB, file length)`) already verified on disk; non-null only in `buffering`/`ready`. Also present per entry in `files[]` |
+| `peerDiscovery` | `{ seen, queued, connecting, live }` peer counters (`peers`/`unique`/`queued` remain as before) |
+
+The top-level window/phase describe the guessed stream file for `/{infoHash}/stats.json` and the requested file for `/{infoHash}/{fileIdx}/stats.json`.
+
 ---
 
 ## 🔧 Build Instructions

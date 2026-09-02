@@ -328,3 +328,116 @@ fn starts_without_home_env() -> anyhow::Result<()> {
     handle.join()?;
     Ok(())
 }
+
+/// `/{infoHash}/stats.json` contract for the startup-phase fields: they are
+/// additive (every server.js-compatible key stremio-core's `Statistics`
+/// parses is still there), camelCase, and describe the guessed stream file;
+/// `/{infoHash}/{fileIdx}/stats.json` describes the requested file instead.
+/// The torrent has a dummy piece hash and no peers, so after the (instant)
+/// hash check it must sit in `buffering` with nothing of the window on disk.
+#[test]
+fn stats_json_exposes_startup_phase_fields_additively() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_dir.path().join("cache")),
+        ..stream_server::ServerConfig::default()
+    })?;
+    let base = format!("http://{}", handle.http_addr());
+    let client = reqwest::blocking::Client::new();
+
+    let created: serde_json::Value = client
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": hex::encode(season_pack_torrent_bytes()) }))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    let info_hash = created["infoHash"]
+        .as_str()
+        .expect("create returns infoHash")
+        .to_string();
+
+    // Poll past the hash check (bounded); `checking` is legal in between.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let stats = loop {
+        let stats: serde_json::Value = client
+            .get(format!("{base}/{info_hash}/stats.json"))
+            .send()?
+            .error_for_status()?
+            .json()?;
+        match stats["phase"].as_str() {
+            Some("checking") if std::time::Instant::now() < deadline => {
+                assert!(
+                    stats["checkedBytes"].is_u64(),
+                    "checking exposes checkedBytes: {stats}"
+                );
+                assert_eq!(stats["checkTotalBytes"], 1700, "{stats}");
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            _ => break stats,
+        }
+    };
+
+    // Legacy keys untouched.
+    let obj = stats.as_object().unwrap();
+    for key in [
+        "name",
+        "infoHash",
+        "files",
+        "sources",
+        "opts",
+        "downloadSpeed",
+        "uploadSpeed",
+        "downloaded",
+        "uploaded",
+        "unchoked",
+        "peers",
+        "queued",
+        "unique",
+        "connectionTries",
+        "peerSearchRunning",
+        "streamLen",
+        "streamName",
+        "streamProgress",
+        "swarmConnections",
+        "swarmPaused",
+        "swarmSize",
+    ] {
+        assert!(obj.contains_key(key), "legacy key {key} missing: {stats}");
+    }
+    assert_eq!(stats["infoHash"], info_hash);
+    assert_eq!(stats["streamName"], "Show.S01E01.1080p.mkv");
+
+    // New fields, describing the guessed stream file (900 bytes < window).
+    assert_eq!(stats["phase"], "buffering", "{stats}");
+    assert_eq!(stats["checkedBytes"], serde_json::Value::Null);
+    assert_eq!(stats["checkTotalBytes"], serde_json::Value::Null);
+    assert_eq!(stats["initialWindowBytes"], 900, "{stats}");
+    assert_eq!(stats["initialWindowReadyBytes"], 0, "{stats}");
+    let discovery = stats["peerDiscovery"]
+        .as_object()
+        .expect("peerDiscovery object");
+    for key in ["seen", "queued", "connecting", "live"] {
+        assert!(discovery[key].is_u64(), "peerDiscovery.{key}: {stats}");
+    }
+    assert_eq!(stats["files"][1]["initialWindowBytes"], 700);
+    assert_eq!(stats["files"][1]["initialWindowReadyBytes"], 0);
+
+    // Per-file stats focus the requested file.
+    let file_stats: serde_json::Value = client
+        .get(format!("{base}/{info_hash}/1/stats.json"))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    assert_eq!(file_stats["streamName"], "Show.S01E02.1080p.mkv");
+    assert_eq!(file_stats["phase"], "buffering");
+    assert_eq!(file_stats["initialWindowBytes"], 700, "{file_stats}");
+    assert_eq!(file_stats["initialWindowReadyBytes"], 0);
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}

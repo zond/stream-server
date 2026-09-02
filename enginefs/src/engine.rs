@@ -430,6 +430,8 @@ impl<H: TorrentHandle> Engine<H> {
                 stats.downloaded,
                 stats.stream_progress * 100.0
             );
+            // Startup phase / initial-window readiness for the stream file.
+            stats.focus_stream_file(guessed_file_idx);
         } else {
             tracing::debug!(
                 "get_statistics: guessed_file_idx {} >= stats.files.len() {}",

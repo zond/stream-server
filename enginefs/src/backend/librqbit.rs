@@ -1,7 +1,7 @@
 use crate::backend::{
-    BackendFileInfo, BackendMemoryDiagnostics, EngineStats, FileStreamTrait, Growler, PeerSearch,
-    PieceReadiness, StatsFile, StatsOptions, SwarmCap, TorrentBackend, TorrentFilePriorityPlan,
-    TorrentHandle, TorrentSource,
+    BackendFileInfo, BackendMemoryDiagnostics, EngineStats, FileStreamTrait, Growler,
+    PeerDiscovery, PeerSearch, PieceReadiness, StartupPhase, StatsFile, StatsOptions, SwarmCap,
+    TorrentBackend, TorrentFilePriorityPlan, TorrentHandle, TorrentSource,
 };
 use anyhow::{Context, Result};
 use librqbit::{ManagedTorrent, ManagedTorrentState, Session};
@@ -593,29 +593,70 @@ impl TorrentHandle for LibrqbitHandle {
         let downloaded = stats.progress_bytes;
         let uploaded = stats.uploaded_bytes;
 
-        let (peers, queued, unique) = stats
+        let peer_discovery = stats
             .live
             .as_ref()
-            .map(|l| {
-                (
-                    l.snapshot.peer_stats.live as u64,
-                    l.snapshot.peer_stats.queued as u64,
-                    l.snapshot.peer_stats.seen as u64,
-                )
+            .map(|l| PeerDiscovery {
+                seen: l.snapshot.peer_stats.seen as u64,
+                queued: l.snapshot.peer_stats.queued as u64,
+                connecting: l.snapshot.peer_stats.connecting as u64,
+                live: l.snapshot.peer_stats.live as u64,
             })
-            .unwrap_or((0, 0, 0));
+            .unwrap_or_default();
+        let (peers, queued, unique) = (
+            peer_discovery.live,
+            peer_discovery.queued,
+            peer_discovery.seen,
+        );
 
         let has_metadata = self.handle.metadata.load().is_some();
+        let phase = startup_phase(has_metadata, &stats.state, stats.finished);
+        // Hash-check progress straight from the Initializing state (the same
+        // counter librqbit mirrors into `progress_bytes` while initializing).
+        let checked_bytes = match phase {
+            StartupPhase::Checking => self.handle.with_state(|state| match state {
+                ManagedTorrentState::Initializing(init) => Some(init.get_checked_bytes()),
+                _ => None,
+            }),
+            _ => None,
+        };
+        let check_total_bytes = checked_bytes.map(|_| stats.total_bytes);
+        // The verified-piece bitfield only exists once the chunk tracker does
+        // (Paused/Live); `api_dump_haves` is the one public accessor for it.
+        let haves = match phase {
+            StartupPhase::Buffering | StartupPhase::Ready => {
+                librqbit::Api::new(self.session.clone(), None)
+                    .api_dump_haves(librqbit::api::TorrentIdOrHash::Hash(
+                        self.handle.info_hash(),
+                    ))
+                    .ok()
+                    .map(|(bitfield, _pieces)| bitfield)
+            }
+            _ => None,
+        };
+        let startup_window = crate::backend::priorities::librqbit_stream_lookahead_bytes(
+            crate::backend::priorities::PlaybackIntent::DirectInitial,
+        );
 
         let mut files = Vec::new();
         let mut total_size = 0u64;
         let mut offset = 0u64;
         if let Some(m) = self.handle.metadata.load_full() {
+            let piece_length = m.lengths().default_piece_length() as u64;
             for (i, f) in m.info.iter_file_details().enumerate() {
                 let filename = f.filename.to_string();
                 // file_progress is empty while the torrent is Initializing.
                 let have = stats.file_progress.get(i).copied().unwrap_or(0);
                 let (file_downloaded, file_progress) = file_progress_fields(f.len, have);
+                let window = haves.as_ref().map(|bf| {
+                    crate::backend::priorities::initial_window_progress(
+                        offset,
+                        f.len,
+                        piece_length,
+                        startup_window,
+                        |piece| bf.get(piece as usize).is_some_and(|bit| *bit),
+                    )
+                });
                 files.push(StatsFile {
                     name: filename.clone(),
                     path: filename,
@@ -623,6 +664,8 @@ impl TorrentHandle for LibrqbitHandle {
                     offset,
                     downloaded: file_downloaded,
                     progress: file_progress,
+                    initial_window_ready_bytes: window.map(|(ready, _)| ready),
+                    initial_window_bytes: window.map(|(_, total)| total),
                 });
                 total_size += f.len;
                 offset += f.len;
@@ -678,6 +721,12 @@ impl TorrentHandle for LibrqbitHandle {
             swarm_size: peers,
             is_finished: stats.finished,
             has_metadata,
+            phase,
+            checked_bytes,
+            check_total_bytes,
+            initial_window_ready_bytes: None,
+            initial_window_bytes: None,
+            peer_discovery,
         }
     }
 
@@ -961,6 +1010,29 @@ impl TorrentHandle for LibrqbitHandle {
             "wait_for_piece_ready: end"
         );
         Ok(result)
+    }
+}
+
+/// Map librqbit's torrent state onto the client-facing startup phase.
+/// `Initializing` is the on-disk hash check; `Live`/`Paused` both have a piece
+/// map and are `Ready` only when the whole torrent is finished -- otherwise
+/// `Buffering` until [`EngineStats::focus_stream_file`] judges the stream
+/// file's initial window. Missing metadata wins over everything (a resolving
+/// magnet has no pieces to check or buffer).
+fn startup_phase(
+    has_metadata: bool,
+    state: &librqbit::TorrentStatsState,
+    finished: bool,
+) -> StartupPhase {
+    use librqbit::TorrentStatsState as S;
+    if !has_metadata {
+        return StartupPhase::ResolvingMetadata;
+    }
+    match state {
+        S::Initializing { .. } => StartupPhase::Checking,
+        S::Live | S::Paused if finished => StartupPhase::Ready,
+        S::Live | S::Paused => StartupPhase::Buffering,
+        S::Error => StartupPhase::Error,
     }
 }
 
@@ -1297,6 +1369,98 @@ mod tests {
         assert_eq!(file_progress_fields(0, 0), (0, 1.0));
         // Initializing torrents report an empty file_progress vec -> have = 0.
         assert_eq!(file_progress_fields(100, 0), (0, 0.0));
+    }
+
+    #[test]
+    fn startup_phase_maps_librqbit_states() {
+        use librqbit::TorrentStatsState as S;
+        // Missing metadata wins regardless of state.
+        assert_eq!(
+            startup_phase(false, &S::Live, false),
+            StartupPhase::ResolvingMetadata
+        );
+        assert_eq!(
+            startup_phase(false, &S::Initializing { paused: false }, false),
+            StartupPhase::ResolvingMetadata
+        );
+        // Hash check, paused or not.
+        assert_eq!(
+            startup_phase(true, &S::Initializing { paused: false }, false),
+            StartupPhase::Checking
+        );
+        assert_eq!(
+            startup_phase(true, &S::Initializing { paused: true }, false),
+            StartupPhase::Checking
+        );
+        // Piece map exists: ready only when the whole torrent is finished
+        // (per-file refinement happens in EngineStats::focus_stream_file).
+        assert_eq!(
+            startup_phase(true, &S::Live, false),
+            StartupPhase::Buffering
+        );
+        assert_eq!(startup_phase(true, &S::Live, true), StartupPhase::Ready);
+        assert_eq!(
+            startup_phase(true, &S::Paused, false),
+            StartupPhase::Buffering
+        );
+        assert_eq!(startup_phase(true, &S::Paused, true), StartupPhase::Ready);
+        assert_eq!(startup_phase(true, &S::Error, false), StartupPhase::Error);
+    }
+
+    /// A seeded torrent (payload already in the download dir) is `ready`
+    /// with its whole initial window on disk, straight from librqbit's have
+    /// bitfield via `api_dump_haves`.
+    #[tokio::test]
+    async fn stats_phase_ready_with_full_initial_window_for_seeded_torrent() {
+        use crate::backend::TorrentHandle;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let payload = dir.join("payload.bin");
+        let payload_len = 96 * 1024u64;
+        write_payload(&payload, payload_len as usize).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+
+        let (_backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
+        handle.handle.wait_until_initialized().await.unwrap();
+
+        let mut stats = TorrentHandle::stats(&handle).await;
+        assert_eq!(stats.phase, StartupPhase::Ready);
+        assert_eq!(stats.checked_bytes, None);
+        // Window is clamped to the (small) file length.
+        assert_eq!(stats.files[0].initial_window_bytes, Some(payload_len));
+        assert_eq!(stats.files[0].initial_window_ready_bytes, Some(payload_len));
+        stats.focus_stream_file(0);
+        assert_eq!(stats.phase, StartupPhase::Ready);
+        assert_eq!(stats.initial_window_ready_bytes, Some(payload_len));
+        assert_eq!(stats.initial_window_bytes, Some(payload_len));
+    }
+
+    /// An unseeded torrent with no peers sits in `buffering` with an empty
+    /// initial window, and its peer-discovery counters are all zero.
+    #[tokio::test]
+    async fn stats_phase_buffering_with_empty_initial_window_for_unseeded_torrent() {
+        use crate::backend::TorrentHandle;
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        tokio::fs::create_dir_all(&src_dir).await.unwrap();
+        let payload = src_dir.join("payload.bin");
+        let payload_len = 64 * 1024u64;
+        write_payload(&payload, payload_len as usize).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+
+        let download_dir = tmp.path().join("dl");
+        let (_backend, handle) = backend_with_torrent(&download_dir, &torrent_bytes).await;
+        handle.handle.wait_until_initialized().await.unwrap();
+
+        let mut stats = TorrentHandle::stats(&handle).await;
+        assert_eq!(stats.phase, StartupPhase::Buffering);
+        assert_eq!(stats.files[0].initial_window_bytes, Some(payload_len));
+        assert_eq!(stats.files[0].initial_window_ready_bytes, Some(0));
+        assert_eq!(stats.peer_discovery, PeerDiscovery::default());
+        stats.focus_stream_file(0);
+        assert_eq!(stats.phase, StartupPhase::Buffering);
+        assert_eq!(stats.initial_window_ready_bytes, Some(0));
+        assert_eq!(stats.initial_window_bytes, Some(payload_len));
     }
 
     #[tokio::test]
