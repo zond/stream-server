@@ -49,14 +49,13 @@ This is not a drop-in replacement for `server.js` — the API surface it exposes
 
 ### Media & Archives
 - **📦 Archive Streaming**: direct playback from ZIP, 7Z, TAR, NZB, and RAR archives out of the box (all pure Rust). RAR is **on by default** via `unrar-rs`, which is GPL-3.0-or-later, so the default binary is GPL-3.0-or-later — see [License](#-license); build `--no-default-features` for an MIT binary without RAR
-- **📝 Subtitles**: external subtitle-file detection with pure-Rust SRT/ASS→VTT conversion, plus OpenSubtitles hash calculation (embedded-track extraction, which used FFmpeg, has been removed — the client handles embedded tracks itself)
+- Subtitles are the client's job: there is no subtitle conversion, track discovery or OpenSubtitles hashing in the server (see [Removed routes](#removed-routes))
 
-### Addon & Status API
-- **🔌 Local Stremio addon**: serves a Stremio-protocol addon (`manifest.json`, `catalog`, `meta`, `stream`) over scanned local/torrent content
-- **📊 Stats API**: `/stats.json` for server status and torrent info
-- **🌐 Network Info**: `/network-info` for interface discovery
-- **💓 Heartbeat**: `/heartbeat` for health checks
-- **⚙️ Settings**: runtime-configurable via `/settings`
+### Control API
+- **🔐 Per-launch bearer token** on every non-media route; media routes stay open for players. See [API](#-api)
+- **📚 Library API**: an embedder calls `ServerHandle::{settings, update_settings, engine_stats, file_stats}` directly — the same code the HTTP routes run, no HTTP client needed
+- **📊 Stats**: `/stats.json`, `/{infoHash}/stats.json`, `/{infoHash}/{fileIdx}/stats.json` for server status and torrent progress
+- **⚙️ Settings**: runtime-configurable via `/settings`, with the stremio-core-compatible shape
 - **🔒 BitTorrent Privacy Controls**: DHT, PeX, LSD, encryption, interface binding, ports, and proxy settings. See [BitTorrent Settings](docs/bittorrent-settings.md).
 
 ---
@@ -104,7 +103,7 @@ RAR streaming is **on by default** and pure Rust — no libclang or C++ toolchai
 cargo run --release -p server
 ```
 
-The server starts on `http://localhost:11470` by default (compatible with standard streaming server port).
+The server starts on `http://localhost:11470` by default (compatible with standard streaming server port). At startup it logs the bearer token every control route requires this launch (`control API requires \`Authorization: Bearer <token>\``); pass `--no-auth` to run the control API open. See [API](#-api).
 
 ### Startup phases in `stats.json`
 
@@ -129,6 +128,82 @@ Both stats routes accept the same query parameters as `/{infoHash}/{fileIdx}` an
 **During metadata resolution** (a magnet whose info dictionary has not arrived yet) both routes answer immediately with `200` and `phase: "resolvingMetadata"`, `hasMetadata: false`, an empty `files` array, `streamLen: 0` and `sources` listing the trackers in use — the per-file route included, since there is no file list to index into yet. Requests never block on metadata, and concurrent requests for one magnet share a single resolution — the stream routes, both stats routes and stremio-core's `/{infoHash}/create` all join the same in-flight add. Once metadata is known, a `fileIdx` that does not exist returns `404` as before.
 
 **Metadata resolution is bounded**: an add that has not produced metadata after **90 s** (`enginefs::METADATA_RESOLVE_TIMEOUT`) is given up on. Requests that were waiting for it (`/{infoHash}/{fileIdx}`, `HEAD`, `/{infoHash}/create`) get `504 Gateway Timeout` (`502` if librqbit itself refused the add, `500` otherwise; bodies are fixed strings, details go to the log). The failure is remembered: until something retries it, both stats routes answer `200` with `phase: "error"` and an `error` message for that hash, so a poller can stop waiting. Only a request that needs the file list (stream, `HEAD`, `/create`) retries — a fresh play attempt gets a fresh 90 s — while stats polls never restart an add. A failure record nobody has asked about for 5 minutes is dropped by the same inactivity sweep that removes idle torrents; the next request then starts over.
+
+---
+
+## 🔌 API
+
+The HTTP surface is deliberately small and split in two by `build_router()` (`server/src/lib.rs`):
+
+- **Media routes are OPEN.** They hand bytes to a player. Players (mpv, a future Chromecast receiver) fetch the URLs stremio-core builds for them (`types/resource/stream.rs`) and cannot attach headers, so these routes take no token.
+- **Everything else is control API and requires a bearer token**: `Authorization: Bearer <token>`, header only — a token in the query string is never accepted, so it does not end up in access logs or in URLs handed to third parties. A missing or wrong token gets `401` with the fixed body `unauthorized` and `WWW-Authenticate: Bearer`; the compare is constant-time. Control routes are what stremio-core's `StreamingServer` model calls through `Env::fetch` (so the embedding client attaches the header there), plus the app/test status probes.
+
+### Authentication
+
+`ServerConfig.auth: ServerAuth` decides how the token is chosen:
+
+| Variant | Meaning |
+|---|---|
+| `Generated` (**default** for both `ServerConfig::embedded()` and `ServerConfig::binary_default()`) | 32 random bytes, hex-encoded, fresh per launch. The standalone binary logs it at `info` level at startup; an embedder reads `ServerHandle::auth_token()` and never sees it logged |
+| `Token(String)` | Use exactly this token (must not be empty) |
+| `Disabled` | No authentication; every route is open. The binary's `--no-auth` flag selects this |
+
+### Routes
+
+| Method | Path | Access | Consumer |
+|---|---|---|---|
+| GET, HEAD | `/{infoHash}/{fileIdx}` | OPEN | players — the stream URL stremio-core builds (`?tr=…`, `?f=…` as documented under [Startup phases](#startup-phases-in-statsjson)) |
+| GET, HEAD | `/stream/{infoHash}/{fileIdx}` | OPEN | players (alias of the above) |
+| GET, POST | `/{rar\|zip\|7zip\|tar\|tgz}/create`, `/{…}/create/{key}` | OPEN | players — archive session creation via `?lz=` (stremio-core builds these URLs) |
+| GET | `/{rar\|zip\|7zip\|tar\|tgz}/stream`, `/{…}/stream/{key}`, `/{…}/stream/{key}/{*file}` | OPEN | players — archive member bytes |
+| GET, POST | `/nzb/create`, `/nzb/create/{key}` | OPEN | players |
+| GET | `/nzb/stream`, `/nzb/stream/{key}/{*file}` | OPEN | players |
+| GET | `/ftp/{filename}?lz=…` | OPEN | players (HTTP/FTP passthrough) |
+| any | `/proxy/{*rest}` | OPEN | players — proxied HTTP streams with injected headers |
+| GET | `/heartbeat` | TOKEN | app / tests |
+| GET | `/stats.json` (`?sys=1` adds `loadavg`/`cpus`) | TOKEN | app |
+| GET | `/{infoHash}/stats.json`, `/{infoHash}/{fileIdx}/stats.json` | TOKEN | stremio-core `Statistics`; accept `tr=`/`f=` like the stream route |
+| POST | `/create` | TOKEN | stremio-core `CreateTorrent` (torrent blob / URL) |
+| POST | `/{infoHash}/create` | TOKEN | stremio-core `CreateTorrent` (magnet) |
+| GET, POST | `/settings` | TOKEN | stremio-core `StreamingServer` (`{ baseUrl, options, values }` / `{ success }`) |
+| GET | `/network-info`, `/device-info` | TOKEN | stremio-core `StreamingServer` |
+| GET | `/casting/` | TOKEN | stremio-core playback devices (always `[]` — no casting) |
+| POST | `/casting/{devID}/player` | TOKEN | stremio-core `play_on_device`; answers `501` because casting is not implemented |
+| GET | `/get-https?authKey=…&ipAddress=…` | TOKEN | stremio-core remote-HTTPS certificate fetch |
+
+Unknown paths get `404`, a wrong method on a known path `405` (or `401` first, on a control route).
+
+RAR routes return a `501` JSON error in a `--no-default-features` build.
+
+### Library API
+
+An embedder holds a `ServerHandle` (from `stream_server::start`) and never needs an HTTP client for control calls. Every method runs on the server's own runtime and blocks the calling thread until done; all returned types are `serde`-serializable, so they can be passed as JSON over FFI:
+
+| Method | Same as |
+|---|---|
+| `auth_token() -> Option<&str>` | the token control routes require (`None` with `ServerAuth::Disabled`) |
+| `base_url() -> &str` | `settings.baseUrl` |
+| `settings() -> Result<ServerSettings>` | `GET /settings` → `values` |
+| `update_settings(patch: serde_json::Value) -> Result<ServerSettings>` | `POST /settings` (same keys, validation, engine update and persistence); returns the settings afterwards |
+| `engine_stats(info_hash, trackers: &[String]) -> Result<EngineStats>` | `GET /{infoHash}/stats.json?tr=…` — including creating the engine with `trackers` when it is the first request for the hash and answering `resolvingMetadata` at once |
+| `file_stats(info_hash, file_idx: usize, trackers) -> Result<EngineStats>` | `GET /{infoHash}/{fileIdx}/stats.json?tr=…`; the route's `404` is a `FileNotFound` error |
+
+The HTTP handlers and these methods call the same functions (`routes::system::{engine_stats, file_stats, update_settings}`), so they cannot drift; `server/tests/embed.rs` compares them.
+
+### Removed routes
+
+Everything below existed for server.js compatibility and had no consumer in stremio-core, the Flutter client or the tests; it was removed to shrink the attack surface to what is actually used:
+
+- `/` (redirect to web.stremio.com), `/favicon.ico`, `/thumb.jpg`, `/samples/{filename}` — desktop/web-UI leftovers.
+- `/list`, `/removeAll`, `/{infoHash}/remove`, `/{infoHash}/peers`, the `GET` variants of `/create` and `/{infoHash}/create` — engine management nothing called (stremio-core POSTs).
+- `/diagnostics/*` — local debugging endpoints; the memory sampler still logs its snapshot.
+- All subtitles routes (`/subtitles.vtt`, `/subtitles.{ext}`, `/{infoHash}/{fileIdx}/subtitles.vtt`, `/opensubHash`, `/opensubHash/{infoHash}/{fileIdx}`, `/subtitlesTracks`) and the engine code behind them — the client fetches addon subtitles and selects tracks itself.
+- `/update/*` and the self-update manager plus the `stream-server-updater` helper binary — desktop baggage.
+- `/{ipc_key}/downloader/*` — stubs for an HTTP downloader that was never implemented.
+- `/local-addon/*` — the local-files Stremio addon. Note that Stremio's official addon collection lists `http://127.0.0.1:11470/local-addon/manifest.json`; a profile carrying that entry now gets `404`s from this server, which stremio-core tolerates like any unreachable addon.
+- `/casting/transcode`, `/casting/convert`, `GET /casting/{devID}` and the `501` stubs for `/ftp/create*` and `/ftp/stream*`.
+
+**YouTube**: stremio-core builds `/yt/{id}` URLs for `StreamSource::YouTube` when a streaming server is configured; this server has no `/yt` route (that needed yt-dlp/ffmpeg upstream). YouTube-via-server is unsupported — the client opens YouTube streams itself (`404` from the server signals it).
 
 ---
 
@@ -200,13 +275,13 @@ cargo build --release
 
 ```
 stream-server/
-├── server/           # HTTP server, API routes, local Stremio-addon plumbing
+├── server/           # HTTP server (media + token-protected control routers), embeddable library
+│   ├── src/auth.rs   # ServerAuth + the bearer middleware
 │   └── src/archives/ # ZIP/7Z/TAR/NZB (always on) + RAR (default-on "rar" feature), all pure Rust
 ├── enginefs/         # Torrent engine abstraction
 │   └── src/backend/
 │       └── librqbit.rs   # The sole torrent backend (pure Rust)
-├── stremio-runtime-stub/ # Legacy-compatible launcher shim
-└── updater-helper/       # Self-update installer helper
+└── stremio-runtime-stub/ # Legacy-compatible launcher shim
 ```
 
 There is no `bindings/` directory and no vcpkg apparatus: the optional C++ `libtorrent` backend and everything it needed to build (the `libtorrent-sys` FFI crate, `triplets/`, `vcpkg-overlays/`, `vcpkg.json`) have been removed. RAR is handled by the pure-Rust `unrar-rs` crate — a direct `server` dependency behind the default-on `rar` feature — so there is no separate RAR binding crate either.
@@ -241,4 +316,4 @@ MIT is GPL-compatible, so shipping the MIT source alongside GPL default binaries
 
 ## Keywords
 
-`pure rust torrent streaming` `headless torrent server` `librqbit` `rust torrent` `video streaming server` `http range streaming` `torrent to http` `archive streaming` `stremio addon` `enginefs` `no ffmpeg`
+`pure rust torrent streaming` `headless torrent server` `librqbit` `rust torrent` `video streaming server` `http range streaming` `torrent to http` `archive streaming` `enginefs` `no ffmpeg`
