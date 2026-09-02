@@ -364,6 +364,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_handlers_read_the_same_archive_concurrently() {
+        // Two handlers over byte-identical archives, each with its own cache
+        // root, extracting both entries at the same time. Extraction runs on
+        // the blocking pool and the handler drops its `ProgressiveCache` as
+        // soon as `open_file` returns, so a late-starting extraction task must
+        // still find its cache file (it used to be unlinked by then, failing
+        // with "Failed to open cache writer" when the pool was busy).
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let archive_a = write_fixture(dir_a.path());
+        let archive_b = dir_b.path().join("copy.7z");
+        std::fs::copy(&archive_a, &archive_b).expect("copy fixture bytes");
+
+        let handler_a = Arc::new(handler_for(&dir_a, archive_a));
+        let handler_b = Arc::new(handler_for(&dir_b, archive_b));
+
+        let expected_second = second_content();
+        let mut tasks = Vec::new();
+        for _ in 0..4 {
+            for handler in [&handler_a, &handler_b] {
+                let handler = Arc::clone(handler);
+                tasks.push(tokio::spawn(async move {
+                    let mut reader = handler
+                        .open_file("videos/second.bin")
+                        .await
+                        .expect("open second entry");
+                    let mut second = Vec::new();
+                    reader.read_to_end(&mut second).await.expect("read second");
+
+                    let mut reader = handler.open_file("first.txt").await.expect("open first");
+                    let mut first = Vec::new();
+                    reader.read_to_end(&mut first).await.expect("read first");
+                    (first, second)
+                }));
+            }
+        }
+
+        for task in tasks {
+            let (first, second) = task.await.expect("task panicked");
+            assert_eq!(first, FIRST_CONTENT);
+            assert_eq!(second, expected_second);
+        }
+    }
+
+    #[tokio::test]
     async fn missing_entry_errors() {
         let dir = tempfile::tempdir().unwrap();
         let archive = write_fixture(dir.path());
