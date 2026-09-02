@@ -179,7 +179,7 @@ The HTTP surface is deliberately small and split in two by `build_router()` (`se
 | POST | `/{infoHash}/create` | TOKEN | stremio-core `CreateTorrent` (magnet) |
 | GET, POST | `/settings` | TOKEN | stremio-core `StreamingServer` (`{ baseUrl, options, values }` / `{ success }`) |
 | GET | `/network-info`, `/device-info` | TOKEN | stremio-core `StreamingServer` |
-| GET | `/casting/` | TOKEN | stremio-core playback devices (always `[]` — no casting) |
+| GET | `/casting` | TOKEN | stremio-core playback devices (always `[]` — no casting). No trailing slash: `/casting/` is an unknown path (`404`) |
 | POST | `/casting/{devID}/player` | TOKEN | stremio-core `play_on_device`; answers `501` because casting is not implemented |
 | GET | `/get-https?authKey=…&ipAddress=…` | TOKEN | stremio-core remote-HTTPS certificate fetch |
 

@@ -94,6 +94,15 @@ fn starts_and_stops_embedded_server() -> anyhow::Result<()> {
         .send()?;
     assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
 
+    // A nested control router (`/casting`, the path stremio-core requests) is
+    // behind the same middleware; `/casting/` is no route at all, so it falls
+    // through to the (open) 404 fallback like any unknown path.
+    let response = anonymous.get(format!("{base}/casting")).send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(response.text()?, "unauthorized");
+    let response = anonymous.get(format!("{base}/casting/")).send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+
     let response = bearer_client(&handle)?
         .get(format!("{base}/heartbeat"))
         .send()?
