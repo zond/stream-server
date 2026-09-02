@@ -130,7 +130,7 @@ pub async fn network_info() -> impl IntoResponse {
     Json(json!({ "availableInterfaces": interfaces }))
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct ServerSettings {
     #[serde(rename = "appPath")]
     pub app_path: String,
@@ -490,7 +490,12 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
     }))
 }
 
-pub async fn update_settings(state: &AppState, payload: &Value) -> anyhow::Result<()> {
+/// Merge `payload` (the `POST /settings` body: any subset of the camelCase
+/// settings keys; wrong-typed values leave that setting unchanged) into the
+/// live settings, push the torrent-related values into both engines and
+/// persist. Returns the settings as they are afterwards. Shared by the HTTP
+/// handler and `ServerHandle::update_settings`.
+pub async fn update_settings(state: &AppState, payload: &Value) -> anyhow::Result<ServerSettings> {
     tracing::debug!("update_settings: received payload: {:?}", payload);
 
     // Merge with existing settings
@@ -674,6 +679,7 @@ pub async fn update_settings(state: &AppState, payload: &Value) -> anyhow::Resul
     };
 
     // Release the write lock before saving
+    let updated = settings.clone();
     drop(settings);
 
     // Apply updated torrent session settings dynamically.
@@ -692,7 +698,7 @@ pub async fn update_settings(state: &AppState, payload: &Value) -> anyhow::Resul
     // Save to disk
     state.save_settings().await?;
 
-    Ok(())
+    Ok(updated)
 }
 
 pub async fn set_settings(
@@ -821,7 +827,7 @@ pub async fn get_https(
 async fn stats_target(
     state: &AppState,
     info_hash: &str,
-    query_str: Option<&str>,
+    trackers: Vec<String>,
     context: &str,
 ) -> EngineLookup<LibrqbitHandle> {
     let stream_engine = state.stream_engine();
@@ -831,7 +837,7 @@ async fn stats_target(
         }
     }
     let lookup = stream_engine
-        .get_or_begin_add_magnet(info_hash, Some(compat::parse_trackers(query_str)))
+        .get_or_begin_add_magnet(info_hash, Some(trackers))
         .await;
     match &lookup {
         EngineLookup::Adding(pending) => tracing::debug!(
@@ -851,57 +857,74 @@ async fn stats_target(
     lookup
 }
 
-fn resolving_metadata_response(
+fn resolving_metadata_stats(
     info_hash: &str,
     pending: &PendingMagnetAdd<LibrqbitHandle>,
-) -> Response {
-    let stats = EngineStats::resolving_metadata(info_hash, &pending.trackers);
-    Json(serde_json::to_value(stats).unwrap()).into_response()
+) -> EngineStats {
+    EngineStats::resolving_metadata(info_hash, &pending.trackers)
 }
 
-/// 200 with `phase: error` and the reason: the poller asked about a torrent
-/// the engine gave up on, which is an answer, not a missing resource. The
-/// reason is [`enginefs::MagnetAddError::client_message`], not the raw error: a backend
-/// error chain may name absolute download-dir paths, which stay in the server
-/// log (the supervisor warns with the full chain when the add fails).
-fn magnet_add_failed_response(info_hash: &str, failed: &FailedMagnetAdd) -> Response {
-    let stats =
-        EngineStats::magnet_add_failed(info_hash, &failed.trackers, &failed.error.client_message());
-    Json(serde_json::to_value(stats).unwrap()).into_response()
+/// `phase: error` and the reason (still a 200 over HTTP): the poller asked
+/// about a torrent the engine gave up on, which is an answer, not a missing
+/// resource. The reason is [`enginefs::MagnetAddError::client_message`], not
+/// the raw error: a backend error chain may name absolute download-dir paths,
+/// which stay in the server log (the supervisor warns with the full chain when
+/// the add fails).
+fn magnet_add_failed_stats(info_hash: &str, failed: &FailedMagnetAdd) -> EngineStats {
+    EngineStats::magnet_add_failed(info_hash, &failed.trackers, &failed.error.client_message())
 }
 
-pub async fn get_engine_stats(
-    State(state): State<AppState>,
-    axum::extract::Path(info_hash): axum::extract::Path<String>,
-    RawQuery(query_str): RawQuery,
-) -> Response {
+/// Torrent-level stats for `info_hash`, exactly what `GET /{infoHash}/stats.json`
+/// answers: the statistics of an existing engine, else -- this being the first
+/// request for the hash -- the engine is created in the stream engine with
+/// `trackers` (the request's `tr=` values, see `compat::parse_trackers`) and
+/// `resolvingMetadata` stats come back at once; a failed add reports
+/// `phase: error`. Shared by the HTTP handler and `ServerHandle::engine_stats`.
+pub async fn engine_stats(state: &AppState, info_hash: &str, trackers: Vec<String>) -> EngineStats {
     let info_hash = info_hash.to_lowercase();
-
-    let engine = match stats_target(&state, &info_hash, query_str.as_deref(), "stats").await {
-        EngineLookup::Ready(engine) => engine,
-        EngineLookup::Adding(pending) => return resolving_metadata_response(&info_hash, &pending),
-        EngineLookup::Failed(failed) => return magnet_add_failed_response(&info_hash, &failed),
-    };
-
-    let stats = engine.get_statistics().await;
-    Json(serde_json::to_value(stats).unwrap()).into_response()
+    match stats_target(state, &info_hash, trackers, "stats").await {
+        EngineLookup::Ready(engine) => engine.get_statistics().await,
+        EngineLookup::Adding(pending) => resolving_metadata_stats(&info_hash, &pending),
+        EngineLookup::Failed(failed) => magnet_add_failed_stats(&info_hash, &failed),
+    }
 }
 
-pub async fn get_file_stats(
-    State(state): State<AppState>,
-    axum::extract::Path((info_hash, requested_idx)): axum::extract::Path<(String, String)>,
-    RawQuery(query_str): RawQuery,
-) -> Response {
+/// A per-file stats request named a file the torrent does not have: the index
+/// is out of range, or nothing matched `-1` with the given filters. Maps to a
+/// 404 with this message on the HTTP route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileNotFound(pub String);
+
+impl std::fmt::Display for FileNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for FileNotFound {}
+
+/// Per-file stats, exactly what `GET /{infoHash}/{fileIdx}/stats.json` answers.
+/// `requested_idx` is the route's `{fileIdx}` text (`-1` resolves to the best
+/// media file, narrowed by `filters`, the `f=` values); `trackers` are used
+/// only if this request creates the engine, as in [`engine_stats`]. Shared by
+/// the HTTP handler and `ServerHandle::file_stats`.
+pub async fn file_stats(
+    state: &AppState,
+    info_hash: &str,
+    requested_idx: &str,
+    trackers: Vec<String>,
+    filters: &[String],
+) -> Result<EngineStats, FileNotFound> {
     let info_hash = info_hash.to_lowercase();
 
     // While the magnet is still resolving there is no file list to index into:
-    // report the torrent-level resolvingMetadata stats with 200 so a per-file
-    // poller sees the phase instead of a misleading 404. An invalid index once
-    // metadata is known still 404s below.
-    let engine = match stats_target(&state, &info_hash, query_str.as_deref(), "file-stats").await {
+    // report the torrent-level resolvingMetadata stats so a per-file poller
+    // sees the phase instead of a misleading not-found. An invalid index once
+    // metadata is known is still an error below.
+    let engine = match stats_target(state, &info_hash, trackers, "file-stats").await {
         EngineLookup::Ready(engine) => engine,
-        EngineLookup::Adding(pending) => return resolving_metadata_response(&info_hash, &pending),
-        EngineLookup::Failed(failed) => return magnet_add_failed_response(&info_hash, &failed),
+        EngineLookup::Adding(pending) => return Ok(resolving_metadata_stats(&info_hash, &pending)),
+        EngineLookup::Failed(failed) => return Ok(magnet_add_failed_stats(&info_hash, &failed)),
     };
 
     let files = engine.handle.get_files().await;
@@ -909,7 +932,7 @@ pub async fn get_file_stats(
     if files.is_empty() {
         let stats = engine.get_statistics().await;
         if !stats.has_metadata {
-            return Json(serde_json::to_value(stats).unwrap()).into_response();
+            return Ok(stats);
         }
     }
     let candidates = files
@@ -921,13 +944,8 @@ pub async fn get_file_stats(
             length: file.length,
         })
         .collect::<Vec<_>>();
-    let filters = compat::query_values(query_str.as_deref(), "f");
-    let idx = match compat::resolve_file_idx(&requested_idx, &candidates, &filters) {
-        Ok(idx) => idx,
-        Err(err) => {
-            return (axum::http::StatusCode::NOT_FOUND, err).into_response();
-        }
-    };
+    let idx = compat::resolve_file_idx(requested_idx, &candidates, filters)
+        .map_err(|err| FileNotFound(err.to_string()))?;
     state
         .stream_engine()
         .refresh_existing_hls_playback(&info_hash, idx, "stats-json")
@@ -935,11 +953,7 @@ pub async fn get_file_stats(
 
     let mut stats = engine.get_statistics().await;
     if idx >= stats.files.len() {
-        return (
-            axum::http::StatusCode::NOT_FOUND,
-            "File index out of bounds",
-        )
-            .into_response();
+        return Err(FileNotFound("File index out of bounds".to_string()));
     }
     // Report progress for the exact file the client asked about. The guess
     // inside get_statistics can resolve to a different file in a multi-file
@@ -956,7 +970,29 @@ pub async fn get_file_stats(
     };
     // Startup phase / initial-window readiness for this exact file too.
     stats.focus_stream_file(idx);
-    Json(serde_json::to_value(stats).unwrap()).into_response()
+    Ok(stats)
+}
+
+pub async fn get_engine_stats(
+    State(state): State<AppState>,
+    axum::extract::Path(info_hash): axum::extract::Path<String>,
+    RawQuery(query_str): RawQuery,
+) -> Response {
+    let trackers = compat::parse_trackers(query_str.as_deref());
+    Json(engine_stats(&state, &info_hash, trackers).await).into_response()
+}
+
+pub async fn get_file_stats(
+    State(state): State<AppState>,
+    axum::extract::Path((info_hash, requested_idx)): axum::extract::Path<(String, String)>,
+    RawQuery(query_str): RawQuery,
+) -> Response {
+    let trackers = compat::parse_trackers(query_str.as_deref());
+    let filters = compat::query_values(query_str.as_deref(), "f");
+    match file_stats(&state, &info_hash, &requested_idx, trackers, &filters).await {
+        Ok(stats) => Json(stats).into_response(),
+        Err(FileNotFound(message)) => (StatusCode::NOT_FOUND, message).into_response(),
+    }
 }
 
 #[cfg(test)]
@@ -978,12 +1014,7 @@ mod tests {
             trackers: Arc::from(vec!["udp://one.invalid/announce".to_string()]),
         };
 
-        let response = magnet_add_failed_response("abc", &failed);
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: Value = serde_json::from_slice(&body).unwrap();
+        let json = serde_json::to_value(magnet_add_failed_stats("abc", &failed)).unwrap();
         assert_eq!(json["phase"], "error");
         assert_eq!(json["infoHash"], "abc");
         let error = json["error"].as_str().expect("error string");

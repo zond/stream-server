@@ -6,6 +6,8 @@ use axum::{
     routing::{get, post},
 };
 use enginefs::EngineFS;
+pub use enginefs::backend::EngineStats;
+pub use routes::system::{FileNotFound, ServerSettings};
 pub use state::AppState;
 use std::{
     future::{IntoFuture, pending},
@@ -123,12 +125,15 @@ pub enum ShutdownSource {
 pub struct Started {
     pub bound_http_addr: SocketAddr,
     pub state: AppState,
+    /// The server's own tokio runtime; library calls run on it.
+    pub runtime: tokio::runtime::Handle,
 }
 
 pub struct ServerHandle {
     http_addr: SocketAddr,
     bound_http_addr: SocketAddr,
     state: AppState,
+    runtime: tokio::runtime::Handle,
     shutdown_tx: tokio::sync::mpsc::Sender<()>,
     join: std::thread::JoinHandle<anyhow::Result<Option<ShutdownSource>>>,
 }
@@ -147,6 +152,81 @@ impl ServerHandle {
     /// [`ServerAuth::Disabled`] left them open.
     pub fn auth_token(&self) -> Option<&str> {
         self.state.auth_token.as_deref()
+    }
+
+    /// The URL the server advertises (`settings.baseUrl`): `public_base_url`
+    /// if configured, else `http://<connectable bound address>`.
+    pub fn base_url(&self) -> &str {
+        &self.state.base_url
+    }
+
+    /// Current settings -- the `values` of `GET /settings`.
+    pub fn settings(&self) -> anyhow::Result<ServerSettings> {
+        let state = self.state.clone();
+        self.block_on_server(async move { state.settings.read().await.clone() })
+    }
+
+    /// Apply `patch` exactly as `POST /settings` would (same keys, same
+    /// validation and merge semantics, same engine update and persistence)
+    /// and return the resulting settings.
+    pub fn update_settings(&self, patch: serde_json::Value) -> anyhow::Result<ServerSettings> {
+        let state = self.state.clone();
+        self.block_on_server(async move { routes::system::update_settings(&state, &patch).await })?
+    }
+
+    /// Torrent-level stats, exactly what `GET /{infoHash}/stats.json?tr=...`
+    /// answers (see `routes::system::engine_stats`): `trackers` are the
+    /// `tr=` values and are only used when this call is the one that creates
+    /// the engine; a magnet still resolving reports `phase: resolvingMetadata`
+    /// immediately, a failed add `phase: error`.
+    pub fn engine_stats(
+        &self,
+        info_hash: &str,
+        trackers: &[String],
+    ) -> anyhow::Result<EngineStats> {
+        let state = self.state.clone();
+        let info_hash = info_hash.to_string();
+        let trackers = trackers.to_vec();
+        self.block_on_server(async move {
+            routes::system::engine_stats(&state, &info_hash, trackers).await
+        })
+    }
+
+    /// Per-file stats, exactly what `GET /{infoHash}/{fileIdx}/stats.json?tr=...`
+    /// answers for an explicit index (see `routes::system::file_stats`). Fails
+    /// with [`FileNotFound`] (the route's 404) for an index the torrent does
+    /// not have once its metadata is known.
+    pub fn file_stats(
+        &self,
+        info_hash: &str,
+        file_idx: usize,
+        trackers: &[String],
+    ) -> anyhow::Result<EngineStats> {
+        let state = self.state.clone();
+        let info_hash = info_hash.to_string();
+        let trackers = trackers.to_vec();
+        let stats = self.block_on_server(async move {
+            routes::system::file_stats(&state, &info_hash, &file_idx.to_string(), trackers, &[])
+                .await
+        })?;
+        Ok(stats?)
+    }
+
+    /// Run `fut` on the server's runtime and wait for it. The engines spawn
+    /// tasks and expect the server's multi-threaded runtime, so library calls
+    /// never execute on the caller's thread. This blocks the calling thread;
+    /// do not call it from an async task on a runtime with no spare threads.
+    fn block_on_server<F>(&self, fut: F) -> anyhow::Result<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.runtime.spawn(async move {
+            let _ = tx.send(fut.await);
+        });
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("server runtime is gone (has the server stopped?)"))
     }
 
     pub fn shutdown(&self) -> anyhow::Result<()> {
@@ -180,6 +260,7 @@ pub fn start(cfg: ServerConfig) -> anyhow::Result<ServerHandle> {
     let Started {
         bound_http_addr,
         state,
+        runtime,
     } = match ready_rx.blocking_recv() {
         Ok(started) => started,
         Err(_) => {
@@ -199,6 +280,7 @@ pub fn start(cfg: ServerConfig) -> anyhow::Result<ServerHandle> {
         http_addr: connectable_addr(bound_http_addr),
         bound_http_addr,
         state,
+        runtime,
         shutdown_tx,
         join,
     })
@@ -493,6 +575,7 @@ pub async fn run(
         let _ = ready_tx.send(Started {
             bound_http_addr,
             state,
+            runtime: tokio::runtime::Handle::current(),
         });
     }
 

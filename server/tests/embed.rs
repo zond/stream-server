@@ -111,13 +111,20 @@ fn starts_and_stops_embedded_server() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The two status probes clients poll, on one server (each embedded server
+/// takes one of only ten librqbit listen ports, see the top of this file).
+///
 /// stremio-core probes `/device-info` at startup expecting
 /// `{"availableHardwareAccelerations": [...]}`. This fork does no
 /// transcoding, so the honest answer is an empty list — but the route must
 /// exist (200, not 404) or every client boot logs an ERROR-level 404 in
 /// diagnostics::logging.
+///
+/// `GET /stats.json?sys=1` is polled roughly once a second by players.
+/// Confirms the response still carries the `sys.loadavg`/`sys.cpus` shape
+/// after moving the sysinfo sweep to a cached spawn_blocking call.
 #[test]
-fn device_info_reports_no_hardware_accelerations() -> anyhow::Result<()> {
+fn device_info_and_stats_json_sys_probes_keep_their_shapes() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
 
@@ -127,8 +134,9 @@ fn device_info_reports_no_hardware_accelerations() -> anyhow::Result<()> {
         cache_dir: Some(cache_dir.path().join("cache")),
         ..stream_server::ServerConfig::default()
     })?;
+    let client = bearer_client(&handle)?;
 
-    let response = bearer_client(&handle)?
+    let response = client
         .get(format!("http://{}/device-info", handle.http_addr()))
         .send()?
         .error_for_status()?;
@@ -136,6 +144,22 @@ fn device_info_reports_no_hardware_accelerations() -> anyhow::Result<()> {
     assert_eq!(
         body.get("availableHardwareAccelerations"),
         Some(&serde_json::json!([]))
+    );
+
+    let response = client
+        .get(format!("http://{}/stats.json?sys=1", handle.http_addr()))
+        .send()?
+        .error_for_status()?;
+    let body: serde_json::Value = response.json()?;
+    let loadavg = body["sys"]["loadavg"]
+        .as_array()
+        .expect("sys.loadavg array");
+    assert_eq!(loadavg.len(), 3);
+    assert!(
+        body["sys"]["cpus"]
+            .as_array()
+            .is_some_and(|c| !c.is_empty()),
+        "expected at least one reported CPU"
     );
 
     handle.shutdown()?;
@@ -332,11 +356,16 @@ fn create_engine_guesses_episode_from_season_pack() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `GET /stats.json?sys=1` is polled roughly once a second by players.
-/// Confirms the response still carries the `sys.loadavg`/`sys.cpus` shape
-/// after moving the sysinfo sweep to a cached spawn_blocking call.
+/// The library API on `ServerHandle` is the same code the control routes
+/// run, so an embedder (FFI, no HTTP client) sees exactly what a client
+/// polling over HTTP would: `settings()` is `GET /settings`' `values`,
+/// `update_settings` is `POST /settings` (same merge/validation, visible to
+/// the next GET), `engine_stats` is `/{infoHash}/stats.json` -- including
+/// creating the engine with the given trackers on first sight and answering
+/// `resolvingMetadata` at once -- and `file_stats` is
+/// `/{infoHash}/{fileIdx}/stats.json`, with the route's 404 as `FileNotFound`.
 #[test]
-fn stats_json_sys_reports_loadavg_and_cpus() -> anyhow::Result<()> {
+fn library_api_matches_the_http_control_routes() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
 
@@ -346,26 +375,109 @@ fn stats_json_sys_reports_loadavg_and_cpus() -> anyhow::Result<()> {
         cache_dir: Some(cache_dir.path().join("cache")),
         ..stream_server::ServerConfig::default()
     })?;
+    let base = format!("http://{}", handle.http_addr());
+    let client = bearer_client_builder(&handle)
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
+    assert_eq!(handle.base_url(), base);
 
-    let response = bearer_client(&handle)?
-        .get(format!("http://{}/stats.json?sys=1", handle.http_addr()))
+    // settings() == GET /settings values.
+    let http: serde_json::Value = client
+        .get(format!("{base}/settings"))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    assert_eq!(http["baseUrl"], base);
+    assert_eq!(serde_json::to_value(handle.settings()?)?, http["values"]);
+
+    // update_settings() == POST /settings: applied, validated, persisted.
+    let updated = handle.update_settings(serde_json::json!({
+        "btMaxConnections": 77,
+        "seedingEnabled": false,
+        // Wrong type: left unchanged, as the HTTP route leaves it.
+        "btHandshakeTimeout": "not-a-number"
+    }))?;
+    assert_eq!(updated.bt_max_connections, 77);
+    assert!(!updated.seeding_enabled);
+    assert_eq!(updated.bt_handshake_timeout, 20000);
+    let http: serde_json::Value = client
+        .get(format!("{base}/settings"))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    assert_eq!(serde_json::to_value(&updated)?, http["values"]);
+    let persisted: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+        config_dir.path().join("config").join("settings.json"),
+    )?)?;
+    assert_eq!(persisted["btMaxConnections"], 77);
+    // And the other way round: a POST is visible to settings().
+    client
+        .post(format!("{base}/settings"))
+        .json(&serde_json::json!({ "btMaxConnections": 55 }))
         .send()?
         .error_for_status()?;
-    let body: serde_json::Value = response.json()?;
-    let loadavg = body["sys"]["loadavg"]
+    assert_eq!(handle.settings()?.bt_max_connections, 55);
+
+    // engine_stats() creates the engine with the trackers on first sight and
+    // answers resolvingMetadata at once, exactly like the route; a later poll
+    // over HTTP sees that very engine.
+    let unresolved = "8899aabbccddeeff00112233445566778899aabb";
+    let tracker = "udp://library-first.invalid:6969/announce".to_string();
+    let api = handle.engine_stats(unresolved, std::slice::from_ref(&tracker))?;
+    assert_eq!(api.info_hash, unresolved);
+    let api_json = serde_json::to_value(&api)?;
+    assert_eq!(api_json["phase"], "resolvingMetadata", "{api_json}");
+    let sources: Vec<&str> = api_json["sources"]
         .as_array()
-        .expect("sys.loadavg array");
-    assert_eq!(loadavg.len(), 3);
+        .expect("sources array")
+        .iter()
+        .filter_map(|s| s["url"].as_str())
+        .collect();
+    assert!(sources.contains(&tracker.as_str()), "{sources:?}");
+    let http: serde_json::Value = client
+        .get(format!("{base}/{unresolved}/stats.json"))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    assert_eq!(api_json, http);
+
+    // file_stats() == /{infoHash}/{fileIdx}/stats.json for a known torrent.
+    let created: serde_json::Value = client
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": hex::encode(season_pack_torrent_bytes()) }))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    let info_hash = created["infoHash"].as_str().expect("infoHash").to_string();
+    let api = handle.file_stats(&info_hash, 1, &[])?;
+    let http: serde_json::Value = client
+        .get(format!("{base}/{info_hash}/1/stats.json"))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    // The hash check may finish between the two calls, so compare the
+    // fields that do not depend on timing.
+    let api_json = serde_json::to_value(&api)?;
+    for key in ["infoHash", "streamName", "streamLen", "files", "sources"] {
+        assert_eq!(api_json[key], http[key], "{key}");
+    }
+    assert_eq!(api.stream_name, "Show.S01E02.1080p.mkv");
+    let api = handle.engine_stats(&info_hash, &[])?;
+    assert_eq!(api.stream_name, "Show.S01E01.1080p.mkv");
+
+    let missing = handle.file_stats(&info_hash, 99, &[]);
+    let err = missing.expect_err("index 99 does not exist");
     assert!(
-        body["sys"]["cpus"]
-            .as_array()
-            .is_some_and(|c| !c.is_empty()),
-        "expected at least one reported CPU"
+        err.downcast_ref::<stream_server::FileNotFound>().is_some(),
+        "{err:#}"
     );
+    let response = client
+        .get(format!("{base}/{info_hash}/99/stats.json"))
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
 
     handle.shutdown()?;
     handle.join()?;
-
     Ok(())
 }
 
