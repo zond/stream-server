@@ -528,6 +528,66 @@ pub struct EngineStats {
 }
 
 impl EngineStats {
+    /// Stats for a magnet whose metadata is still being resolved, i.e. before
+    /// the backend has a torrent to report on: `phase` is
+    /// `resolvingMetadata`, `has_metadata` is false, there are no files and no
+    /// stream, and `sources` lists the trackers the add was started with.
+    /// Peer counters are 0 -- librqbit consumes the discovery stream
+    /// internally while resolving, so nothing honest can be reported yet.
+    pub fn resolving_metadata(info_hash: &str, trackers: &[String]) -> Self {
+        Self {
+            name: String::new(),
+            info_hash: info_hash.to_string(),
+            files: Vec::new(),
+            sources: trackers
+                .iter()
+                .map(|url| Source {
+                    last_started: String::new(),
+                    num_found: 0,
+                    num_found_uniq: 0,
+                    num_requests: 0,
+                    url: url.clone(),
+                })
+                .collect(),
+            opts: StatsOptions {
+                connections: None,
+                dht: true,
+                growler: Growler::default(),
+                handshake_timeout: None,
+                path: String::new(),
+                peer_search: PeerSearch::default(),
+                swarm_cap: SwarmCap::default(),
+                timeout: None,
+                tracker: true,
+                r#virtual: false,
+            },
+            download_speed: 0.0,
+            upload_speed: 0.0,
+            downloaded: 0,
+            uploaded: 0,
+            unchoked: 0,
+            peers: 0,
+            queued: 0,
+            unique: 0,
+            connection_tries: 0,
+            peer_search_running: true,
+            stream_len: 0,
+            stream_name: String::new(),
+            stream_progress: 0.0,
+            swarm_connections: 0,
+            swarm_paused: false,
+            swarm_size: 0,
+            is_finished: false,
+            has_metadata: false,
+            phase: StartupPhase::ResolvingMetadata,
+            checked_bytes: None,
+            check_total_bytes: None,
+            initial_window_ready_bytes: None,
+            initial_window_bytes: None,
+            peer_discovery: PeerDiscovery::default(),
+        }
+    }
+
     /// Refine `phase` for the file the client is about to play: in
     /// `buffering`/`ready` copy that file's initial-window progress to the
     /// top level and flip the phase on whether the window is fully on disk.

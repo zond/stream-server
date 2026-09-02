@@ -1,5 +1,7 @@
 use crate::engine::Engine;
 use anyhow::Result;
+use futures::FutureExt;
+use futures::future::{BoxFuture, Shared};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -40,6 +42,35 @@ const NATIVE_LIFECYCLE_HLS_PLAYBACK_LEASE_TTL: Duration = Duration::from_secs(15
 static START_TIME: OnceLock<Instant> = OnceLock::new();
 
 type EngineRegistry<H> = Arc<RwLock<HashMap<String, Arc<Engine<H>>>>>;
+
+/// Outcome of a magnet add shared between every waiter: the engine, or the
+/// error the backend produced (`Arc` so the shared future's output is `Clone`).
+pub type MagnetAddResult<H> = Result<Arc<Engine<H>>, Arc<anyhow::Error>>;
+
+/// A magnet add whose backend `add_torrent` has not returned yet.
+///
+/// librqbit resolves a magnet's metadata *inside* `Session::add_torrent`, with
+/// no timeout, and no `ManagedTorrent` exists until it succeeds. During that
+/// window the torrent is in neither the backend nor `engines`, so this entry is
+/// the only way another request can learn the torrent is being set up (and
+/// join the wait instead of starting a duplicate resolution).
+#[derive(Clone)]
+pub struct PendingMagnetAdd<H: TorrentHandle> {
+    /// Completes when the backend add finishes; the task runs detached, so a
+    /// waiter that gives up does not cancel it.
+    pub done: Shared<BoxFuture<'static, MagnetAddResult<H>>>,
+    /// The merged tracker list the torrent is being added with (defaults +
+    /// cached + request-supplied), for reporting while metadata resolves.
+    pub trackers: Arc<[String]>,
+}
+
+/// Non-blocking lookup result of [`BackendEngineFS::get_or_begin_add_magnet`].
+pub enum EngineLookup<H: TorrentHandle> {
+    /// The engine exists (metadata known).
+    Ready(Arc<Engine<H>>),
+    /// A magnet add is in flight; await `done` for the engine.
+    Adding(PendingMagnetAdd<H>),
+}
 
 pub fn now_secs() -> u64 {
     START_TIME.get_or_init(Instant::now).elapsed().as_secs()
@@ -93,6 +124,9 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     disk_cache: Option<Arc<disk_cache::DiskCacheManager>>,
     /// When false, torrents are paused once their download completes.
     seeding_enabled: Arc<AtomicBool>,
+    /// Magnet adds still inside the backend's `add_torrent`, keyed by info
+    /// hash. See [`PendingMagnetAdd`].
+    pending_adds: Arc<RwLock<HashMap<String, PendingMagnetAdd<B::Handle>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -209,6 +243,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             priority_generation: Arc::new(AtomicU64::new(0)),
             disk_cache: None,
             seeding_enabled: Arc::new(AtomicBool::new(true)),
+            pending_adds: Arc::new(RwLock::new(HashMap::new())),
         };
 
         let engines_clone = engines.clone();
@@ -528,39 +563,143 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         efs
     }
 
-    pub async fn add_torrent(
-        &self,
-        source: TorrentSource,
-        extra_trackers: Option<Vec<String>>,
-    ) -> Result<Arc<Engine<B::Handle>>> {
-        // Start with default trackers
+    /// The tracker list a torrent is added with: the built-in defaults, the
+    /// tracker manager's cached list (ranked by RTT), and any request-supplied
+    /// extras, sorted and de-duplicated.
+    async fn merged_trackers(&self, extra_trackers: Option<Vec<String>>) -> Vec<String> {
         let mut trackers: Vec<String> = DEFAULT_TRACKERS.iter().map(|s| s.to_string()).collect();
-
-        // Add cached trackers from tracker manager (already ranked by RTT)
-        let cached_trackers = self.tracker_manager.get_trackers().await;
-        trackers.extend(cached_trackers);
-
-        // Add any extra trackers provided
+        trackers.extend(self.tracker_manager.get_trackers().await);
         if let Some(extra) = extra_trackers {
             trackers.extend(extra);
         }
         trackers.sort();
         trackers.dedup();
+        trackers
+    }
 
-        debug!(count = trackers.len(), "Adding torrent with trackers");
-
-        let handle = self.backend.add_torrent(source, trackers).await?;
+    /// Wrap a backend handle in an `Engine` and publish it, or return the
+    /// engine already registered for the same info hash.
+    async fn register_engine(
+        engines: &EngineRegistry<B::Handle>,
+        handle: B::Handle,
+    ) -> Arc<Engine<B::Handle>> {
         let info_hash = handle.info_hash();
-
-        let mut engines = self.engines.write().await;
+        let mut engines = engines.write().await;
         if let Some(engine) = engines.get(&info_hash) {
             engine.touch();
-            return Ok(engine.clone());
+            return engine.clone();
+        }
+        let engine = Arc::new(Engine::new_with_handle(handle, &info_hash));
+        engines.insert(info_hash, engine.clone());
+        engine
+    }
+
+    pub async fn add_torrent(
+        &self,
+        source: TorrentSource,
+        extra_trackers: Option<Vec<String>>,
+    ) -> Result<Arc<Engine<B::Handle>>> {
+        let trackers = self.merged_trackers(extra_trackers).await;
+        debug!(count = trackers.len(), "Adding torrent with trackers");
+        let handle = self.backend.add_torrent(source, trackers).await?;
+        Ok(Self::register_engine(&self.engines, handle).await)
+    }
+
+    /// Existing engine for `info_hash`, or the in-flight magnet add for it --
+    /// started here from a bare `magnet:?xt=urn:btih:` link with
+    /// `extra_trackers` merged in if neither exists. Never waits for metadata.
+    ///
+    /// Concurrent callers for one info hash share a single backend add: the
+    /// first request's tracker list is the one used (librqbit cannot add
+    /// trackers to a torrent later, see `LibrqbitHandle::add_trackers`), and
+    /// the add runs detached so a poller that disconnects does not cancel the
+    /// resolution a player is waiting on.
+    pub async fn get_or_begin_add_magnet(
+        &self,
+        info_hash: &str,
+        extra_trackers: Option<Vec<String>>,
+    ) -> EngineLookup<B::Handle> {
+        let info_hash = info_hash.to_lowercase();
+        if let Some(engine) = self.get_engine(&info_hash).await {
+            return EngineLookup::Ready(engine);
+        }
+        // Merge before taking the pending lock: the tracker manager may
+        // refresh its list over the network.
+        let trackers = self.merged_trackers(extra_trackers).await;
+
+        let mut pending = self.pending_adds.write().await;
+        // Re-check under the pending lock: an add publishes its engine before
+        // removing itself from `pending_adds`, so one of the two is always
+        // visible here, and a finished add must not be restarted.
+        if let Some(engine) = self.engines.read().await.get(&info_hash).cloned() {
+            engine.touch();
+            return EngineLookup::Ready(engine);
+        }
+        if let Some(pending) = pending.get(&info_hash) {
+            return EngineLookup::Adding(pending.clone());
         }
 
-        let engine = Arc::new(Engine::new_with_handle(handle, &info_hash));
-        engines.insert(info_hash.clone(), engine.clone());
-        Ok(engine)
+        debug!(
+            info_hash,
+            count = trackers.len(),
+            "Adding magnet with trackers"
+        );
+        let backend = self.backend.clone();
+        let engines = self.engines.clone();
+        let pending_adds = self.pending_adds.clone();
+        let hash = info_hash.clone();
+        let add_trackers = trackers.clone();
+        let task = tokio::spawn(async move {
+            let source = TorrentSource::Url(format!("magnet:?xt=urn:btih:{hash}"));
+            let result = match backend.add_torrent(source, add_trackers).await {
+                Ok(handle) => Ok(Self::register_engine(&engines, handle).await),
+                Err(error) => Err(Arc::new(error)),
+            };
+            pending_adds.write().await.remove(&hash);
+            result
+        });
+        let done = task
+            .map(|joined| match joined {
+                Ok(result) => result,
+                Err(join_error) => Err(Arc::new(anyhow::anyhow!(
+                    "magnet add task failed: {join_error}"
+                ))),
+            })
+            .boxed()
+            .shared();
+        let entry = PendingMagnetAdd {
+            done,
+            trackers: trackers.into(),
+        };
+        pending.insert(info_hash, entry.clone());
+        EngineLookup::Adding(entry)
+    }
+
+    /// [`Self::get_or_begin_add_magnet`], waiting for an in-flight add.
+    pub async fn get_or_add_magnet(
+        &self,
+        info_hash: &str,
+        extra_trackers: Option<Vec<String>>,
+    ) -> Result<Arc<Engine<B::Handle>>> {
+        match self
+            .get_or_begin_add_magnet(info_hash, extra_trackers)
+            .await
+        {
+            EngineLookup::Ready(engine) => Ok(engine),
+            EngineLookup::Adding(pending) => pending
+                .done
+                .await
+                .map_err(|error| anyhow::anyhow!("{error:#}")),
+        }
+    }
+
+    /// The in-flight magnet add for `info_hash`, if its engine does not exist yet.
+    pub async fn pending_magnet_add(&self, info_hash: &str) -> Option<PendingMagnetAdd<B::Handle>> {
+        self.pending_adds
+            .read()
+            .await
+            .get(&info_hash.to_lowercase())
+            .cloned()
     }
 
     pub async fn get_engine(&self, info_hash: &str) -> Option<Arc<Engine<B::Handle>>> {
@@ -573,11 +712,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     }
 
     pub async fn get_or_add_engine(&self, info_hash: &str) -> Result<Arc<Engine<B::Handle>>> {
-        if let Some(engine) = self.get_engine(info_hash).await {
-            return Ok(engine);
-        }
-        let magnet = format!("magnet:?xt=urn:btih:{}", info_hash);
-        self.add_torrent(TorrentSource::Url(magnet), None).await
+        self.get_or_add_magnet(info_hash, None).await
     }
 
     pub async fn remove_engine(&self, info_hash: &str) {
@@ -2571,5 +2706,178 @@ mod tests {
             guess_with(&files, Some(crate::engine::SeriesInfo::default())).await,
             Some(1)
         );
+    }
+
+    /// A backend whose `add_torrent` blocks until released, standing in for
+    /// librqbit resolving a magnet's metadata inside `Session::add_torrent`.
+    struct GatedBackend {
+        handle: FakeHandle,
+        release: Arc<tokio::sync::Notify>,
+        adds: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl TorrentBackend for GatedBackend {
+        type Handle = FakeHandle;
+
+        async fn add_torrent(
+            &self,
+            _source: TorrentSource,
+            _trackers: Vec<String>,
+        ) -> Result<Self::Handle> {
+            self.adds.fetch_add(1, Ordering::SeqCst);
+            self.release.notified().await;
+            Ok(self.handle.clone())
+        }
+
+        async fn get_torrent(&self, _info_hash: &str) -> Option<Self::Handle> {
+            None
+        }
+
+        async fn remove_torrent(&self, _info_hash: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn list_torrents(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        async fn memory_diagnostics(&self) -> BackendMemoryDiagnostics {
+            BackendMemoryDiagnostics::default()
+        }
+    }
+
+    fn gated_enginefs() -> (
+        BackendEngineFS<GatedBackend>,
+        Arc<tokio::sync::Notify>,
+        Arc<AtomicUsize>,
+    ) {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let adds = Arc::new(AtomicUsize::new(0));
+        let handle = FakeHandle {
+            info_hash: TEST_HASH.to_string(),
+            counters: Arc::new(FakeCounters::default()),
+            files: vec![BackendFileInfo {
+                name: "video.mkv".to_string(),
+                length: 100,
+            }],
+            init: FakeInit::new(true, Duration::from_secs(1)),
+        };
+        let root = std::env::temp_dir().join("enginefs-pending-add-tests");
+        let enginefs = BackendEngineFS::new_with_backend(
+            GatedBackend {
+                handle,
+                release: release.clone(),
+                adds: adds.clone(),
+            },
+            HashMap::new(),
+            root.join("cache"),
+            root.join("downloads"),
+        );
+        (enginefs, release, adds)
+    }
+
+    /// While the backend is still adding a magnet there is no engine, but the
+    /// add is observable (with its tracker list) and shared: a second request
+    /// for the same hash joins it instead of starting a duplicate resolution.
+    /// Once the backend returns, the engine is published and the pending entry
+    /// is gone.
+    #[tokio::test]
+    async fn magnet_add_is_observable_and_shared_until_the_backend_returns() {
+        let (enginefs, release, adds) = gated_enginefs();
+        let extra = "udp://extra.invalid:6969/announce".to_string();
+
+        let first = enginefs
+            .get_or_begin_add_magnet(&TEST_HASH.to_uppercase(), Some(vec![extra.clone()]))
+            .await;
+        let EngineLookup::Adding(first) = first else {
+            panic!("expected an in-flight add");
+        };
+        assert!(first.trackers.contains(&extra), "{:?}", first.trackers);
+        assert!(enginefs.get_engine(TEST_HASH).await.is_none());
+        let pending = enginefs
+            .pending_magnet_add(TEST_HASH)
+            .await
+            .expect("pending add is visible");
+        assert_eq!(pending.trackers, first.trackers);
+
+        // Another caller (say, the stream route) joins the same add.
+        let second = enginefs
+            .get_or_begin_add_magnet(TEST_HASH, Some(vec!["udp://late.invalid/announce".into()]))
+            .await;
+        let EngineLookup::Adding(second) = second else {
+            panic!("expected to join the in-flight add");
+        };
+        assert!(
+            wait_until(Duration::from_secs(1), || adds.load(Ordering::SeqCst) == 1).await,
+            "backend add started once"
+        );
+
+        release.notify_one();
+        let engine = first.done.await.expect("add succeeds");
+        let joined = second.done.await.expect("shared add succeeds");
+        assert!(Arc::ptr_eq(&engine, &joined));
+        assert_eq!(engine.info_hash, TEST_HASH);
+        assert!(enginefs.get_engine(TEST_HASH).await.is_some());
+        // The task clears its pending entry right after publishing the engine.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while enginefs.pending_magnet_add(TEST_HASH).await.is_some() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "pending entry is removed after the engine is published"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(adds.load(Ordering::SeqCst), 1);
+
+        // Now the engine is simply found.
+        let EngineLookup::Ready(ready) = enginefs.get_or_begin_add_magnet(TEST_HASH, None).await
+        else {
+            panic!("expected the existing engine");
+        };
+        assert!(Arc::ptr_eq(&ready, &engine));
+    }
+
+    /// The blocking variant used by stream routes: two concurrent waiters get
+    /// the same engine from one backend add.
+    #[tokio::test]
+    async fn concurrent_get_or_add_magnet_waiters_share_one_add() {
+        let (enginefs, release, adds) = gated_enginefs();
+        let enginefs = Arc::new(enginefs);
+
+        let a = {
+            let efs = enginefs.clone();
+            tokio::spawn(async move { efs.get_or_add_magnet(TEST_HASH, None).await })
+        };
+        let b = {
+            let efs = enginefs.clone();
+            tokio::spawn(async move { efs.get_or_add_magnet(TEST_HASH, None).await })
+        };
+        assert!(
+            wait_until(Duration::from_secs(1), || adds.load(Ordering::SeqCst) == 1).await,
+            "exactly one backend add is started for both waiters"
+        );
+        release.notify_one();
+
+        let a = a.await.unwrap().expect("first waiter");
+        let b = b.await.unwrap().expect("second waiter");
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(adds.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn resolving_metadata_stats_describe_a_torrent_without_metadata() {
+        let stats =
+            EngineStats::resolving_metadata(TEST_HASH, &["udp://one.invalid/announce".to_string()]);
+        assert_eq!(stats.info_hash, TEST_HASH);
+        assert_eq!(stats.phase, StartupPhase::ResolvingMetadata);
+        assert!(!stats.has_metadata);
+        assert!(stats.files.is_empty());
+        assert_eq!(stats.sources.len(), 1);
+        assert_eq!(stats.sources[0].url, "udp://one.invalid/announce");
+        let json = serde_json::to_value(&stats).unwrap();
+        assert_eq!(json["phase"], "resolvingMetadata");
+        assert_eq!(json["hasMetadata"], false);
+        assert_eq!(json["streamLen"], 0);
     }
 }
