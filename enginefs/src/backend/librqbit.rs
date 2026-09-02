@@ -1358,32 +1358,28 @@ mod tests {
     use super::*;
     use crate::backend::TorrentBackend;
 
-    /// `Ephemeral` sessions never collide -- the OS hands each its own port --
-    /// while a `Fixed` range is exhausted once every port in it is taken.
+    /// `Ephemeral` sessions never collide: the OS hands each its own port.
+    /// (Whether a second bind of an already-taken *fixed* port fails is
+    /// platform-dependent -- Windows lets it through -- so that is not
+    /// asserted here.)
     #[tokio::test(flavor = "multi_thread")]
-    async fn ephemeral_sessions_coexist_where_a_fixed_port_collides() {
-        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    async fn ephemeral_sessions_coexist() {
+        let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
 
-        let (_a, _) =
+        let (a, _) =
             LibrqbitBackend::new(dirs[0].path().to_path_buf(), TorrentListenPort::Ephemeral)
                 .await
                 .expect("first ephemeral session");
-        let (_b, _) =
+        let (b, _) =
             LibrqbitBackend::new(dirs[1].path().to_path_buf(), TorrentListenPort::Ephemeral)
                 .await
                 .expect("second ephemeral session alongside the first");
 
-        // Pin the first session's actual port as the only candidate of a
-        // Fixed range: a third session must fail to bind it.
-        let taken = _a.session.listen_addr().expect("listening").port();
-        let err = LibrqbitBackend::new(
-            dirs[2].path().to_path_buf(),
-            TorrentListenPort::Fixed(taken..taken + 1),
-        )
-        .await
-        .err()
-        .expect("a fixed port already bound must fail");
-        assert!(!format!("{err:#}").is_empty());
+        let pa = a.session.listen_addr().expect("listening").port();
+        let pb = b.session.listen_addr().expect("listening").port();
+        assert_ne!(pa, 0);
+        assert_ne!(pb, 0);
+        assert_ne!(pa, pb, "each ephemeral session gets its own port");
     }
 
     /// Write `len` patterned bytes to `path` (deterministic, non-trivial data
