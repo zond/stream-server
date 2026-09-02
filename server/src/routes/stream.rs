@@ -953,7 +953,11 @@ fn stream_open_failure_response(
     (status, message).into_response()
 }
 
-/// Pure status/message mapping for `stream_open_failure_response`.
+/// Pure status/message mapping for `stream_open_failure_response`. The 502
+/// and 500 bodies are fixed, non-leaky strings on purpose: `reason` (from
+/// librqbit) and `{err:#}` can carry absolute download-dir paths, which must
+/// not be echoed to an HTTP client. The full detail still reaches the logs --
+/// `stream_open_failure_response` logs `err` at `warn` for every branch.
 fn stream_open_failure_status(err: &GetFileError) -> (StatusCode, String) {
     match err {
         GetFileError::FileNotFound { .. } => (StatusCode::NOT_FOUND, "File not found".to_string()),
@@ -962,13 +966,13 @@ fn stream_open_failure_status(err: &GetFileError) -> (StatusCode, String) {
                 StatusCode::GATEWAY_TIMEOUT,
                 format!("Torrent is still initializing after {timeout_secs}s; retry shortly"),
             ),
-            Some(TorrentInitError::Failed { reason, .. }) => (
+            Some(TorrentInitError::Failed { .. }) => (
                 StatusCode::BAD_GATEWAY,
-                format!("Torrent failed to initialize: {reason}"),
+                "Torrent failed to initialize; see server logs for details".to_string(),
             ),
             None => (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to open stream reader: {err:#}"),
+                "Failed to open stream reader; see server logs for details".to_string(),
             ),
         },
     }
@@ -1004,12 +1008,21 @@ mod tests {
         }));
         let (status, msg) = stream_open_failure_status(&failed);
         assert_eq!(status, StatusCode::BAD_GATEWAY);
-        assert!(msg.contains("disk exploded"), "{msg}");
+        // The 502 body must not leak librqbit's `reason` (which can carry an
+        // absolute download-dir path) to the HTTP client.
+        assert!(
+            !msg.contains("disk exploded"),
+            "502 body must not echo the backend error detail: {msg}"
+        );
 
         let other = GetFileError::Backend(anyhow::anyhow!("boom").context("get_file_reader"));
         let (status, msg) = stream_open_failure_status(&other);
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(msg.contains("boom"), "{msg}");
+        // Same for the 500 body and `{err:#}`.
+        assert!(
+            !msg.contains("boom"),
+            "500 body must not echo the backend error detail: {msg}"
+        );
     }
 
     #[test]

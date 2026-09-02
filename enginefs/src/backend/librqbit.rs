@@ -85,9 +85,19 @@ where
 /// still initializing, parked until initialization completes. Latest-wins:
 /// re-deferring replaces the queued op, and a direct apply once the torrent is
 /// ready supersedes anything still queued (`supersede`). One waiter task per
-/// slot drains the queue after the gate opens; ops are re-planned against the
-/// live selection at apply time, so a stale queued op can never clobber a
-/// newer one.
+/// slot drains the queue after the gate opens.
+///
+/// The "never clobber a newer one" guarantee only covers ops parked *before*
+/// the gate opens: `Reconcile`'s planner (`plan_only_files`) ignores the live
+/// selection and just applies the active/hot pair captured when it was
+/// queued, so a parked op is not re-derived from anything that changed while
+/// it waited -- it is latest-wins among what was queued, not a re-plan
+/// against fresh state. There is also a sub-microsecond ordering window
+/// between the waiter draining a parked op and a direct op landing at the
+/// exact moment initialization completes; whichever runs last wins. This is
+/// benign: both derive from the same activation (the same file just started
+/// streaming) and both selections always include the streamed file, so
+/// neither ordering can starve playback.
 pub(crate) struct DeferredSelection<Op> {
     pending: Mutex<Option<Op>>,
     waiter_running: AtomicBool,
@@ -128,30 +138,58 @@ impl<Op: Send + 'static> DeferredSelection<Op> {
         }
         let this = self.clone();
         tokio::spawn(async move {
-            let gate = wait.await;
-            loop {
-                let next = this.pending.lock().take();
-                match next {
-                    Some(op) => match &gate {
-                        Ok(()) => apply(op).await,
-                        Err(e) => warn!(
-                            error = %e,
-                            "dropping deferred file-selection update: torrent never became ready"
-                        ),
-                    },
-                    None => {
-                        this.waiter_running.store(false, Ordering::Release);
-                        // Close the race with a `defer` that queued between our
-                        // `take` and the store above: it saw the waiter running
-                        // and returned, so we must drain it.
-                        if this.has_pending() && !this.waiter_running.swap(true, Ordering::AcqRel) {
-                            continue;
+            match wait.await {
+                Ok(()) => loop {
+                    let next = this.pending.lock().take();
+                    match next {
+                        Some(op) => apply(op).await,
+                        None => {
+                            this.waiter_running.store(false, Ordering::Release);
+                            // Close the race with a `defer` that queued between our
+                            // `take` and the store above: it saw the waiter running
+                            // and returned, so we must drain it. Safe to keep looping
+                            // here because the gate is Ok(()) for every iteration --
+                            // a late arrival re-planned against a successful gate is
+                            // never stale.
+                            if this.has_pending()
+                                && !this.waiter_running.swap(true, Ordering::AcqRel)
+                            {
+                                continue;
+                            }
+                            break;
                         }
-                        break;
                     }
-                }
+                },
+                Err(e) => this.handle_gate_error(&e),
             }
         });
+    }
+
+    /// Handle a gate that resolved to `Err`: drop at most the one op parked
+    /// right now, then release the slot unconditionally -- no
+    /// drain-and-recheck loop against this (now stale) verdict. The gate
+    /// result is a one-shot value, not something ops that show up afterwards
+    /// should be judged against.
+    ///
+    /// A `defer` that races in between our `take` and the `waiter_running`
+    /// release below sees `waiter_running` still true and returns without
+    /// spawning a new waiter -- but because we unconditionally release the
+    /// slot afterwards, the *next* direct call (which is how first-play and
+    /// reconcile keep re-triggering) spawns a fresh waiter with a fresh gate
+    /// instead of that op being silently judged against our stale failure,
+    /// or worse, kept alive indefinitely by a loop that never lets go.
+    ///
+    /// Split out from `defer`'s spawned task so this exact edge -- a `defer`
+    /// landing between the `take` and the release -- has direct unit
+    /// coverage without needing to reproduce a genuine cross-thread race.
+    fn handle_gate_error(&self, e: &TorrentInitError) {
+        if self.pending.lock().take().is_some() {
+            warn!(
+                error = %e,
+                "dropping deferred file-selection update: torrent never became ready"
+            );
+        }
+        self.waiter_running.store(false, Ordering::Release);
     }
 }
 
@@ -921,11 +959,24 @@ impl LibrqbitHandle {
         self.handle.metadata.load_full().map(|m| m.file_infos.len())
     }
 
-    /// True while librqbit is opening/hash-checking the torrent's files. In
-    /// this state `update_only_files` bails and `FileStream` cannot be opened.
+    /// True for any torrent state that must go through the init gate rather
+    /// than take the fast path: literally `Initializing` (opening/hash-
+    /// checking files, where `update_only_files` bails and `FileStream`
+    /// cannot be opened), `Error` (already failed -- routing it through
+    /// `wait_until_initialized` turns librqbit's raw error into
+    /// `TorrentInitError::Failed` instead of letting a `FileStream` open
+    /// attempt fail downstream with a bare 500), and the transient `None`
+    /// state (only visible mid state-swap; librqbit itself treats seeing it
+    /// as a bug, so gating it here is purely defensive, not load-bearing).
     fn is_initializing(&self) -> bool {
-        self.handle
-            .with_state(|s| matches!(s, ManagedTorrentState::Initializing(_)))
+        self.handle.with_state(|s| {
+            matches!(
+                s,
+                ManagedTorrentState::Initializing(_)
+                    | ManagedTorrentState::Error(_)
+                    | ManagedTorrentState::None
+            )
+        })
     }
 
     /// Block until the torrent leaves the Initializing state, bounded by
@@ -968,6 +1019,17 @@ impl LibrqbitHandle {
             .entry(self.info_hash.clone())
             .or_insert_with(DeferredSelection::new)
             .clone()
+    }
+
+    /// Look up this torrent's deferred-selection slot without creating one --
+    /// a torrent that never deferred anything should not get a map entry just
+    /// because a direct apply checked whether there was something to
+    /// supersede.
+    fn deferred_selection_if_present(&self) -> Option<Arc<DeferredSelection<DeferredOp>>> {
+        self.deferred_selections
+            .lock()
+            .get(&self.info_hash)
+            .cloned()
     }
 
     /// Park `op` until the torrent initializes (see `DeferredSelection`).
@@ -1026,9 +1088,13 @@ impl LibrqbitHandle {
         }
         // A direct Prepare/Reconcile sets the whole selection and so supersedes
         // anything still parked from before the torrent became ready. A Clear
-        // only removes one file and must not discard a parked reconcile.
-        if !matches!(op, SelectionOp::Clear(_)) {
-            self.deferred_selection().supersede();
+        // only removes one file and must not discard a parked reconcile. Use
+        // the non-inserting lookup: a torrent that never deferred anything
+        // has no slot, and checking should not create one.
+        if !matches!(op, SelectionOp::Clear(_))
+            && let Some(slot) = self.deferred_selection_if_present()
+        {
+            slot.supersede();
         }
         if !self.apply_selection_now(op, file_count, context).await
             && policy == InitPolicy::Defer
@@ -1571,6 +1637,100 @@ mod tests {
         assert!(!slot.has_pending());
     }
 
+    /// Regression for the lost-update edge in the waiter's Err path: a
+    /// `defer` landing between the waiter's `take` and its
+    /// `waiter_running.store(false, ..)` must not be swallowed by a loop
+    /// that keeps re-checking it against the (now stale) gate result -- the
+    /// waiter must hand the slot back so the *next* `defer` spawns a fresh
+    /// waiter with a fresh gate instead.
+    ///
+    /// The real race is between two OS threads landing on two adjacent,
+    /// non-yielding instructions (a `Mutex::take` and an `AtomicBool::store`),
+    /// which cannot be reproduced deterministically through async task
+    /// scheduling -- nothing yields in between for another task to run. So
+    /// this test reconstructs the exact interleaving by hand, one step at a
+    /// time (this test module is a descendant of the defining module, so
+    /// `DeferredSelection`'s fields are visible): it performs the waiter's
+    /// `take` (finding nothing, as if it had just drained everything), then
+    /// -- standing in for the racing thread -- calls the real `defer` to
+    /// queue a fresh op while `waiter_running` is still true, exactly as
+    /// `defer` itself does when it observes an already-running waiter, and
+    /// only then performs the waiter's release. This is the one ordering
+    /// `handle_gate_error`'s single, non-looping `take` can never itself
+    /// reproduce (it only ever takes once, before it releases), which is
+    /// exactly why the fix is correct: unlike the old drain-and-recheck loop,
+    /// there is no code path left that could re-take and drop this op under
+    /// the stale verdict.
+    #[tokio::test(start_paused = true)]
+    async fn deferred_selection_defer_racing_gate_error_is_not_lost() {
+        let slot: Arc<DeferredSelection<u32>> = DeferredSelection::new();
+        let applied = Arc::new(parking_lot::Mutex::new(Vec::<u32>::new()));
+        let apply = {
+            let applied = applied.clone();
+            move |op: u32| {
+                let applied = applied.clone();
+                async move {
+                    applied.lock().push(op);
+                }
+            }
+        };
+
+        // A waiter is running and has just taken the last op it had (or
+        // started with none) -- `pending` is empty, `waiter_running` is true.
+        slot.waiter_running.store(true, Ordering::Release);
+        assert!(slot.pending.lock().take().is_none());
+
+        // Right here, in the gap before the waiter releases the slot, a real
+        // `defer` call races in with a fresh op. It observes `waiter_running`
+        // still true, so it queues the op and returns without spawning a
+        // second waiter -- trusting the existing one to drain it.
+        let never_used_gate = std::future::pending::<std::result::Result<(), TorrentInitError>>();
+        slot.defer(7, never_used_gate, apply.clone());
+        assert!(
+            slot.has_pending(),
+            "the racing defer must have queued its op"
+        );
+
+        // The waiter concludes its Err verdict and releases the slot -- the
+        // exact tail `handle_gate_error` performs after taking whatever was
+        // pending *at the time it ran* (nothing, in this interleaving).
+        slot.waiter_running.store(false, Ordering::Release);
+
+        // Op 7 must have survived: nothing re-took it under the stale Err,
+        // and the slot must be free so the next trigger spawns a fresh
+        // waiter with a fresh gate.
+        assert!(
+            slot.has_pending(),
+            "op queued during the error handoff must not be dropped"
+        );
+        assert!(
+            !slot.waiter_running.load(Ordering::Acquire),
+            "the slot must be free for the next defer to spawn a fresh waiter"
+        );
+
+        // The next trigger (as a subsequent reconcile/prepare call would
+        // issue) must pick it up and apply it -- proving the op is not
+        // permanently stranded, only deferred to that next trigger.
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let gate = {
+            let notify = notify.clone();
+            async move {
+                notify.notified().await;
+                Ok(())
+            }
+        };
+        slot.defer(7, gate, apply);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        notify.notify_waiters();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            *applied.lock(),
+            vec![7],
+            "op queued during the error handoff must still be applied by the next waiter"
+        );
+        assert!(!slot.has_pending());
+    }
+
     /// Regression for the first-play readiness race: prepare/reconcile and the
     /// reader are called the instant the torrent is added, without the test
     /// waiting for `wait_until_initialized` first. The gate must make the
@@ -1624,7 +1784,11 @@ mod tests {
         }
         assert!(!slot.has_pending(), "deferred op must drain after init");
         assert_eq!(handle.handle.only_files(), Some(vec![1]));
-        eprintln!("torrent was initializing at first call: {was_initializing}");
+        assert!(
+            was_initializing,
+            "test must actually exercise the initializing-torrent gate, not degrade into a \
+             happy-path test where the torrent was already ready by the first call"
+        );
     }
 
     /// A reconcile deferred during initialization is applied afterwards even
