@@ -183,3 +183,111 @@ fn decode_yenc(input: &[u8]) -> anyhow::Result<Vec<u8>> {
 
     Ok(output)
 }
+
+#[cfg(test)]
+mod yenc_tests {
+    use super::decode_yenc;
+
+    /// Reference yEnc encoder (OSDb/yEnc spec): each output byte is
+    /// `(input + 42) mod 256`; the four critical bytes NUL/LF/CR/'=' are
+    /// escaped as '=' followed by `(output + 64) mod 256`.
+    fn encode_body(data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for &b in data {
+            let e = b.wrapping_add(42);
+            if e == 0x00 || e == 0x0A || e == 0x0D || e == 0x3D {
+                out.push(0x3D);
+                out.push(e.wrapping_add(64));
+            } else {
+                out.push(e);
+            }
+        }
+        out
+    }
+
+    fn wrap(body: &[u8]) -> Vec<u8> {
+        let mut article = Vec::new();
+        article.extend_from_slice(b"=ybegin line=128 size=999 name=video.mkv\n");
+        article.extend_from_slice(body);
+        article.extend_from_slice(b"\n=yend size=999 crc32=deadbeef\n");
+        article
+    }
+
+    #[test]
+    fn round_trips_plain_ascii() {
+        let plain = b"Hello, World! The quick brown fox.";
+        let article = wrap(&encode_body(plain));
+        assert_eq!(decode_yenc(&article).unwrap(), plain);
+    }
+
+    #[test]
+    fn round_trips_every_byte_value() {
+        // Exercises all escapes and all wrapping_sub boundaries at once: any
+        // off-by-one in the escape offset or the raw-byte subtraction shows up
+        // as a mismatch somewhere in the 0..=255 sweep.
+        let plain: Vec<u8> = (0u16..=255).map(|b| b as u8).collect();
+        let article = wrap(&encode_body(&plain));
+        assert_eq!(decode_yenc(&article).unwrap(), plain);
+    }
+
+    #[test]
+    fn decodes_escaped_equals_sign_in_middle() {
+        // input 0x13 encodes to (0x13+42)=0x3D '=' => must be escaped, and the
+        // decoder must apply the -64 -42 offset, not treat it as a raw byte.
+        let plain = [0xAAu8, 0x13, 0xBB];
+        let body = encode_body(&plain);
+        assert!(body.windows(2).any(|w| w[0] == 0x3D), "0x13 must escape");
+        let article = wrap(&body);
+        assert_eq!(decode_yenc(&article).unwrap(), plain);
+    }
+
+    #[test]
+    fn raw_byte_near_42_boundary_wraps_not_saturates() {
+        // output byte 6 decodes to 6.wrapping_sub(42) == 220 (wrapping), not 0
+        // (saturating). Input 220 => (220+42) mod 256 == 6, emitted raw.
+        let plain = [220u8, 221, 255, 0, 41, 42, 43];
+        let article = wrap(&encode_body(&plain));
+        assert_eq!(decode_yenc(&article).unwrap(), plain);
+    }
+
+    #[test]
+    fn skips_ypart_second_header_line() {
+        let plain = b"payload bytes after two headers";
+        let body = encode_body(plain);
+        let mut article = Vec::new();
+        article.extend_from_slice(b"=ybegin part=1 line=128 size=999 name=video.mkv\n");
+        article.extend_from_slice(b"=ypart begin=1 end=31\n");
+        article.extend_from_slice(&body);
+        article.extend_from_slice(b"\n=yend size=31\n");
+        assert_eq!(decode_yenc(&article).unwrap(), plain);
+    }
+
+    #[test]
+    fn strips_crlf_line_breaks_inside_body() {
+        // yEnc wraps long lines with CR/LF that are NOT data; the decoder must
+        // drop them rather than decode them into output bytes.
+        let part1 = b"first half of the payload";
+        let part2 = b"second half of the payload";
+        let mut body = encode_body(part1);
+        body.extend_from_slice(b"\r\n"); // line wrap, not data
+        body.extend_from_slice(&encode_body(part2));
+        let article = wrap(&body);
+
+        let mut expected = part1.to_vec();
+        expected.extend_from_slice(part2);
+        assert_eq!(decode_yenc(&article).unwrap(), expected);
+    }
+
+    #[test]
+    fn data_bytes_that_are_newline_values_survive() {
+        // Data values 0x0A/0x0D/0x00 encode to non-critical raw bytes
+        // (0x34/0x37/0x2A), so they must come through decoding, unlike literal
+        // CR/LF in the stream which are stripped.
+        let plain = [0x0Au8, 0x0D, 0x00, 0x0A];
+        let body = encode_body(&plain);
+        // None of these produced a literal newline in the encoded stream.
+        assert!(!body.contains(&b'\n') && !body.contains(&b'\r'));
+        let article = wrap(&body);
+        assert_eq!(decode_yenc(&article).unwrap(), plain);
+    }
+}
