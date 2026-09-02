@@ -353,6 +353,8 @@ impl GetFileError {
 pub struct Engine<H: TorrentHandle> {
     pub info_hash: String,
     pub handle: H,
+    /// Epoch of `last_accessed`, shared with the owning `BackendEngineFS`.
+    clock: crate::Clock,
     pub last_accessed: AtomicU64,
     pub active_streams: Arc<AtomicUsize>,
     opensub_hash_cache: Mutex<HashMap<usize, String>>,
@@ -364,11 +366,12 @@ pub struct Engine<H: TorrentHandle> {
 }
 
 impl<H: TorrentHandle> Engine<H> {
-    pub fn new_with_handle(handle: H, info_hash: &str) -> Self {
+    pub fn new_with_handle(handle: H, info_hash: &str, clock: crate::Clock) -> Self {
         Self {
             info_hash: info_hash.to_string(),
             handle,
-            last_accessed: AtomicU64::new(crate::now_secs()),
+            clock,
+            last_accessed: AtomicU64::new(clock.now_secs()),
             active_streams: Arc::new(AtomicUsize::new(0)),
             opensub_hash_cache: Mutex::new(HashMap::new()),
             opensub_hash_inflight: Mutex::new(HashMap::new()),
@@ -382,7 +385,7 @@ impl<H: TorrentHandle> Engine<H> {
 
     pub fn touch(&self) {
         self.last_accessed
-            .store(crate::now_secs(), Ordering::SeqCst);
+            .store(self.clock.now_secs(), Ordering::SeqCst);
     }
 
     pub fn find_file_by_regex(&self, regex_str: &str) -> Option<usize> {

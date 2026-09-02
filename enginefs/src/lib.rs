@@ -4,7 +4,6 @@ use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -54,10 +53,30 @@ const INACTIVE_TORRENT_PAUSE_GRACE: Duration = Duration::from_secs(15);
 const HLS_PLAYBACK_LEASE_TTL: Duration = Duration::from_secs(300);
 const NATIVE_LIFECYCLE_HLS_PLAYBACK_LEASE_TTL: Duration = Duration::from_secs(15);
 
-/// Process-relative clock for the idle bookkeeping. A `tokio::time::Instant`
-/// so that `now_secs()` follows paused/advanced time under
-/// `#[tokio::test(start_paused = true)]` (it is the std clock otherwise).
-static START_TIME: OnceLock<tokio::time::Instant> = OnceLock::new();
+/// Instance-relative clock for the idle bookkeeping (engine `last_accessed`,
+/// playback leases, magnet-add polls). Seconds since the owning
+/// [`BackendEngineFS`] was created, measured with a `tokio::time::Instant` so
+/// it follows paused/advanced time under `#[tokio::test(start_paused = true)]`
+/// (it is the std clock otherwise). One epoch per instance rather than a
+/// process-global one: every test runtime has its own paused clock, and a
+/// global `Instant` captured under one of them would be meaningless under the
+/// next.
+#[derive(Clone, Copy, Debug)]
+pub struct Clock {
+    epoch: tokio::time::Instant,
+}
+
+impl Clock {
+    fn start() -> Self {
+        Self {
+            epoch: tokio::time::Instant::now(),
+        }
+    }
+
+    pub fn now_secs(&self) -> u64 {
+        self.epoch.elapsed().as_secs()
+    }
+}
 
 type EngineRegistry<H> = Arc<RwLock<HashMap<String, Arc<Engine<H>>>>>;
 
@@ -162,7 +181,7 @@ enum MagnetAddState<H: TorrentHandle> {
 
 struct MagnetAddEntry<H: TorrentHandle> {
     state: MagnetAddState<H>,
-    /// `now_secs()` of the last lookup that returned this entry; the eviction
+    /// `Clock::now_secs()` of the last lookup that returned this entry; the eviction
     /// loop drops (and aborts) entries nobody has asked about for
     /// `INACTIVE_TORRENT_REMOVE_TIMEOUT`.
     last_polled_secs: AtomicU64,
@@ -179,13 +198,6 @@ impl<H: TorrentHandle> MagnetAddEntry<H> {
 }
 
 type MagnetAddRegistry<H> = Arc<RwLock<HashMap<String, MagnetAddEntry<H>>>>;
-
-pub fn now_secs() -> u64 {
-    START_TIME
-        .get_or_init(tokio::time::Instant::now)
-        .elapsed()
-        .as_secs()
-}
 
 fn hls_playback_lease_ttl_secs() -> u64 {
     HLS_PLAYBACK_LEASE_TTL.as_secs()
@@ -239,6 +251,8 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     /// records of ones that ended without an engine, keyed by info hash. See
     /// [`PendingMagnetAdd`] and [`FailedMagnetAdd`].
     magnet_adds: MagnetAddRegistry<B::Handle>,
+    /// Epoch of every `*_secs` timestamp this instance and its engines keep.
+    clock: Clock,
 }
 
 #[derive(Debug, Clone)]
@@ -325,11 +339,12 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         download_dir: std::path::PathBuf,
         tracker_storage: Option<Arc<dyn crate::trackers::TrackerStorage>>,
     ) -> Self {
+        let clock = Clock::start();
         let mut engines_map = HashMap::new();
         for (hash, handle) in restored_handles {
             engines_map.insert(
                 hash.clone(),
-                Arc::new(Engine::new_with_handle(handle, &hash)),
+                Arc::new(Engine::new_with_handle(handle, &hash, clock)),
             );
         }
 
@@ -356,6 +371,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             disk_cache: None,
             seeding_enabled: Arc::new(AtomicBool::new(true)),
             magnet_adds: Arc::new(RwLock::new(HashMap::new())),
+            clock,
         };
 
         let engines_clone = engines.clone();
@@ -367,6 +383,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let active_multifile_files_clone = efs.active_multifile_files.clone();
         let seeding_flag = efs.seeding_enabled.clone();
         let magnet_adds_clone = efs.magnet_adds.clone();
+        let clock = efs.clock;
         tokio::spawn(async move {
             loop {
                 // Run fairly frequently so seeding stops promptly after the
@@ -375,7 +392,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 // quickly the seeding-disabled pause reacts.
                 tokio::time::sleep(Duration::from_secs(15)).await;
                 let mut to_remove = Vec::new();
-                let now = now_secs();
+                let now = clock.now_secs();
 
                 let expired_leases = {
                     let mut leases = active_playback_leases_clone.write().await;
@@ -730,6 +747,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     async fn register_engine(
         engines: &EngineRegistry<B::Handle>,
         handle: B::Handle,
+        clock: Clock,
     ) -> Arc<Engine<B::Handle>> {
         let info_hash = handle.info_hash();
         let mut engines = engines.write().await;
@@ -737,7 +755,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             engine.touch();
             return engine.clone();
         }
-        let engine = Arc::new(Engine::new_with_handle(handle, &info_hash));
+        let engine = Arc::new(Engine::new_with_handle(handle, &info_hash, clock));
         engines.insert(info_hash, engine.clone());
         engine
     }
@@ -750,7 +768,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let trackers = self.merged_trackers(extra_trackers).await;
         debug!(count = trackers.len(), "Adding torrent with trackers");
         let handle = self.backend.add_torrent(source, trackers).await?;
-        Ok(Self::register_engine(&self.engines, handle).await)
+        Ok(Self::register_engine(&self.engines, handle, self.clock).await)
     }
 
     /// Existing engine for `info_hash`, or the in-flight magnet add for it --
@@ -813,7 +831,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             engine.touch();
             return EngineLookup::Ready(engine);
         }
-        let now = now_secs();
+        let now = self.clock.now_secs();
         if let Some(entry) = adds.get(&info_hash) {
             entry.touch(now);
             match &entry.state {
@@ -836,6 +854,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             self.backend.clone(),
             self.engines.clone(),
             self.magnet_adds.clone(),
+            self.clock,
             info_hash.clone(),
             trackers,
         );
@@ -861,6 +880,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         backend: Arc<B>,
         engines: EngineRegistry<B::Handle>,
         adds: MagnetAddRegistry<B::Handle>,
+        clock: Clock,
         info_hash: String,
         trackers: Vec<String>,
     ) -> PendingMagnetAdd<B::Handle> {
@@ -875,7 +895,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 let source = TorrentSource::Url(format!("magnet:?xt=urn:btih:{hash}"));
                 let add = backend.add_torrent(source, trackers.to_vec());
                 match tokio::time::timeout(METADATA_RESOLVE_TIMEOUT, add).await {
-                    Ok(Ok(handle)) => Ok(Self::register_engine(&engines, handle).await),
+                    Ok(Ok(handle)) => Ok(Self::register_engine(&engines, handle, clock).await),
                     Ok(Err(error)) => Err(MagnetAddError::Backend {
                         info_hash: hash,
                         error: Arc::new(error),
@@ -986,7 +1006,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     async fn magnet_add_state(&self, info_hash: &str) -> Option<MagnetAddState<B::Handle>> {
         let adds = self.magnet_adds.read().await;
         let entry = adds.get(&info_hash.to_lowercase())?;
-        entry.touch(now_secs());
+        entry.touch(self.clock.now_secs());
         Some(match &entry.state {
             MagnetAddState::Adding(pending) => MagnetAddState::Adding(pending.clone()),
             MagnetAddState::Failed(failed) => MagnetAddState::Failed(failed.clone()),
@@ -1064,7 +1084,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 info_hash: info_hash.clone(),
                 file_idx: *file_idx,
             });
-        let now = now_secs();
+        let now = self.clock.now_secs();
         let active_playback_leases = self
             .active_playback_leases
             .read()
@@ -1113,7 +1133,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let memory = self.backend.memory_diagnostics().await;
 
         EngineDiagnosticsSnapshot {
-            uptime_secs: now_secs(),
+            uptime_secs: self.clock.now_secs(),
             streams,
             memory,
         }
@@ -1251,7 +1271,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
 
         let generation = self.priority_generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let now = now_secs();
+        let now = self.clock.now_secs();
         let previous_file_idx = {
             let mut selections = self.active_multifile_files.write().await;
             selections
@@ -1352,7 +1372,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         source: &'static str,
     ) -> bool {
         let info_hash = info_hash.to_lowercase();
-        let now = now_secs();
+        let now = self.clock.now_secs();
         let engine = self.get_engine(&info_hash).await;
         let native_lifecycle = engine
             .as_ref()
@@ -1489,6 +1509,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let active_playback_leases = self.active_playback_leases.clone();
         let active_multifile_files = self.active_multifile_files.clone();
         let seeding_enabled = self.seeding_enabled.clone();
+        let clock = self.clock;
 
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
@@ -1508,7 +1529,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     .any(|((hash, _), count)| hash == &info_hash && *count > 0)
             };
             let playback_active = {
-                let now = now_secs();
+                let now = clock.now_secs();
                 let leases = active_playback_leases.read().await;
                 leases.iter().any(|((hash, _), lease)| {
                     hash == &info_hash && playback_lease_is_active(lease, now)
@@ -1596,6 +1617,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let active_file_streams = self.active_file_streams.clone();
         let active_playback_leases = self.active_playback_leases.clone();
         let active_multifile_files = self.active_multifile_files.clone();
+        let clock = self.clock;
         let scheduled_generation = {
             let selections = self.active_multifile_files.read().await;
             selections
@@ -1621,7 +1643,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 return;
             }
             let playback_active = {
-                let now = now_secs();
+                let now = clock.now_secs();
                 let leases = active_playback_leases.read().await;
                 leases
                     .get(&key)
@@ -2457,7 +2479,7 @@ mod tests {
     /// elsewhere now; tests that exercise the generic lease/cleanup machinery
     /// seed a lease this way.
     async fn insert_active_lease(enginefs: &BackendEngineFS<FakeBackend>, file_idx: usize) {
-        let now = now_secs();
+        let now = enginefs.clock.now_secs();
         enginefs.active_playback_leases.write().await.insert(
             (TEST_HASH.to_string(), file_idx),
             PlaybackLease {
@@ -2880,7 +2902,7 @@ mod tests {
             leases
                 .get_mut(&(TEST_HASH.to_string(), 0))
                 .unwrap()
-                .expires_at_secs = now_secs();
+                .expires_at_secs = enginefs.clock.now_secs();
         }
         let cleanup = enginefs
             .schedule_file_cleanup_after(TEST_HASH.to_string(), 0, Duration::from_millis(10))
