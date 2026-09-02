@@ -20,7 +20,6 @@ tokio = { version = "1.42.0", features = [
     "io-util",
     "sync",
     "process",
-    "test-util",
 ] }
 tokio-util = { version = "0.7.17", features = ["rt"] }
 serde = { version = "1.0.216", features = ["derive"] }
@@ -44,3 +43,6 @@ parking_lot = "0.12.5"
 
 [dev-dependencies]
 tempfile = "3.23.0"
+# Paused-clock machinery for `#[tokio::test(start_paused = true)]`; nothing in
+# the library itself pauses or advances time, so it must not ship in release.
+tokio = { version = "1.42.0", features = ["test-util"] }
