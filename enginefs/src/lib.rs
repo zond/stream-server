@@ -3348,6 +3348,69 @@ mod tests {
         );
     }
 
+    /// A superseded add's supervisor must not touch its successor's registry
+    /// entry. When the idle sweep aborts an in-flight add (abort + entry
+    /// removed under the registry lock), a new lookup for the same hash can
+    /// register a fresh add before the old supervisor observes the
+    /// cancellation; its `pending.id == id` check is what keeps it from
+    /// marking that fresh add failed. Current-thread runtime: neither the
+    /// aborted task nor its supervisor runs until this test yields, and the
+    /// uncontended lock acquisitions in between do not.
+    #[tokio::test(start_paused = true)]
+    async fn superseded_add_supervisor_leaves_the_new_entry_alone() {
+        let gated = gated_enginefs();
+        let enginefs = &gated.enginefs;
+
+        let EngineLookup::Adding(old) = enginefs.get_or_begin_add_magnet(TEST_HASH, None).await
+        else {
+            panic!("expected an in-flight add");
+        };
+        assert!(wait_until(Duration::from_secs(1), || gated.adds() == 1).await);
+
+        // What the sweep does to an idle in-flight add.
+        old.abort.abort();
+        enginefs.magnet_adds.write().await.remove(TEST_HASH);
+
+        // Re-issued before the old supervisor has settled: a new add.
+        let EngineLookup::Adding(new) = enginefs.get_or_begin_add_magnet(TEST_HASH, None).await
+        else {
+            panic!("expected a fresh in-flight add");
+        };
+        assert_ne!(new.id, old.id);
+
+        // Now let the old supervisor run to completion.
+        let error = expect_add_error(old.done.clone().await, "the old add was aborted");
+        assert!(
+            matches!(&error, MagnetAddError::Cancelled { info_hash } if info_hash == TEST_HASH),
+            "{error:?}"
+        );
+
+        // The new entry is untouched by it...
+        let pending = enginefs
+            .pending_magnet_add(TEST_HASH)
+            .await
+            .expect("the new add is still in flight");
+        assert_eq!(pending.id, new.id);
+        assert!(enginefs.failed_magnet_add(TEST_HASH).await.is_none());
+        assert!(wait_until(Duration::from_secs(1), || gated.adds() == 2).await);
+
+        // ...and completes normally.
+        gated.release.notify_one();
+        let engine = new.done.clone().await.expect("the new add succeeds");
+        assert_eq!(engine.info_hash, TEST_HASH);
+        assert!(enginefs.get_engine(TEST_HASH).await.is_some());
+        assert!(
+            wait_until(Duration::from_secs(1), || {
+                enginefs
+                    .magnet_adds
+                    .try_read()
+                    .is_ok_and(|adds| adds.is_empty())
+            })
+            .await,
+            "the successful add leaves no registry entry behind"
+        );
+    }
+
     /// librqbit's `add_torrent` is not cancel-safe: the torrent can be sitting
     /// in the session, inserted but never started, when the timeout drops the
     /// add future. The timed-out add must therefore ask the backend to remove
