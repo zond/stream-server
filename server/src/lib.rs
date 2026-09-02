@@ -771,7 +771,10 @@ pub fn build_router(state: AppState) -> Router {
 
 /// Routes that hand media bytes to a player. They are OPEN (no bearer token):
 /// players fetch the URLs stremio-core builds for them
-/// (types/resource/stream.rs) and cannot attach headers.
+/// (types/resource/stream.rs) and cannot attach headers. The one non-media
+/// exception is the `/local-addon` stub (see `routes::local_addon`): default
+/// profiles -- legacy clients included -- call it as an addon, and it exposes
+/// nothing.
 fn media_router() -> Router<AppState> {
     Router::new()
         .route(
@@ -790,6 +793,7 @@ fn media_router() -> Router<AppState> {
         .nest("/nzb", routes::nzb::router())
         .nest("/proxy", routes::proxy::router())
         .nest("/ftp", routes::ftp::router())
+        .nest("/local-addon", routes::local_addon::router())
 }
 
 /// Everything that is not media bytes: what stremio-core's StreamingServer

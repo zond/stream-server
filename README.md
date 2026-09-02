@@ -169,6 +169,9 @@ The HTTP surface is deliberately small and split in two by `build_router()` (`se
 | GET | `/nzb/stream`, `/nzb/stream/{key}/{*file}` | OPEN | players |
 | GET | `/ftp/{filename}?lz=…` | OPEN | players (HTTP/FTP passthrough) |
 | any | `/proxy/{*rest}` | OPEN | players — proxied HTTP streams with injected headers |
+| GET | `/local-addon/manifest.json` | OPEN | stremio-core default profile — **stub**: a valid manifest (`org.stremio.local`, "Local Files") declaring no types, resources or catalogs |
+| GET | `/local-addon/stream/{type}/{id}`, `/local-addon/stream/{type}/{id}.json` | OPEN | stremio-core default profile — **stub**: always `{"streams": []}` |
+| GET | `/local-addon/meta/{type}/{id}` | OPEN | stremio-core default profile — **stub**: `404`, logged at debug level only |
 | GET | `/heartbeat` | TOKEN | app / tests |
 | GET | `/stats.json` (`?sys=1` adds `loadavg`/`cpus`) | TOKEN | app |
 | GET | `/{infoHash}/stats.json`, `/{infoHash}/{fileIdx}/stats.json` | TOKEN | stremio-core `Statistics`; accept `tr=`/`f=` like the stream route |
@@ -209,7 +212,7 @@ Everything below existed for server.js compatibility and had no consumer in stre
 - All subtitles routes (`/subtitles.vtt`, `/subtitles.{ext}`, `/{infoHash}/{fileIdx}/subtitles.vtt`, `/opensubHash`, `/opensubHash/{infoHash}/{fileIdx}`, `/subtitlesTracks`) and the engine code behind them — the client fetches addon subtitles and selects tracks itself.
 - `/update/*` and the self-update manager plus the `stream-server-updater` helper binary — desktop baggage.
 - `/{ipc_key}/downloader/*` — stubs for an HTTP downloader that was never implemented.
-- `/local-addon/*` — the local-files Stremio addon. Note that Stremio's official addon collection lists `http://127.0.0.1:11470/local-addon/manifest.json`; a profile carrying that entry now gets `404`s from this server, which stremio-core tolerates like any unreachable addon.
+- `/local-addon/*` — the local-files Stremio addon (scanned `localFiles/` directory, catalogs, `bt:`/`local:` metas). **Three stub routes remain** (see the table above), because stremio-core's `OFFICIAL_ADDONS` carries a *protected* descriptor for `http://127.0.0.1:11470/local-addon/manifest.json` with a `stream` resource for `tt` movies/series: a stock profile requests `/local-addon/stream/{type}/{id}.json` on every details page, and a `404` there shows up as an error group in the client and an ERROR-level unhandled-request log line each time. The stub answers an empty manifest and `{"streams": []}` instead and serves no local files; `meta` (only ever asked for `local:`/`bt:` ids) is a quiet `404`.
 - `/casting/transcode`, `/casting/convert`, `GET /casting/{devID}` and the `501` stubs for `/ftp/create*` and `/ftp/stream*`.
 
 **YouTube**: stremio-core builds `/yt/{id}` URLs for `StreamSource::YouTube` when a streaming server is configured; this server has no `/yt` route (that needed yt-dlp/ffmpeg upstream). YouTube-via-server is unsupported — the client opens YouTube streams itself (`404` from the server signals it).

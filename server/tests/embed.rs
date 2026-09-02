@@ -44,6 +44,12 @@ fn stock_configs_default_to_a_generated_token() {
 /// routes 401 without it or with a wrong one (fixed body, no hint), accept
 /// it in `Authorization: Bearer`, and media routes stay open -- `/ftp/...`
 /// without a token gets its ordinary 400 for a missing `lz`, never a 401.
+///
+/// Also open: the `/local-addon` stub. stremio-core's default profile carries
+/// the protected `http://127.0.0.1:11470/local-addon/manifest.json` addon and
+/// requests `/local-addon/stream/{type}/{id}.json` on every details page, so
+/// the stub must answer the manifest and an empty stream list without a token
+/// (legacy clients call it too); `meta` stays a 404.
 #[test]
 fn starts_and_stops_embedded_server() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -101,6 +107,32 @@ fn starts_and_stops_embedded_server() -> anyhow::Result<()> {
         reqwest::StatusCode::BAD_REQUEST,
         "media routes are open (400 = missing lz parameter, not 401)"
     );
+
+    let manifest: serde_json::Value = anonymous
+        .get(format!("{base}/local-addon/manifest.json"))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    assert_eq!(manifest["id"], "org.stremio.local");
+    assert_eq!(manifest["name"], "Local Files");
+    assert_eq!(manifest["resources"], serde_json::json!([]));
+    assert_eq!(manifest["types"], serde_json::json!([]));
+    assert_eq!(manifest["catalogs"], serde_json::json!([]));
+    assert!(manifest["version"].is_string());
+    for path in [
+        "/local-addon/stream/movie/tt0111161.json",
+        "/local-addon/stream/series/tt0903747:1:1.json",
+        "/local-addon/stream/movie/tt0111161",
+    ] {
+        let response = anonymous.get(format!("{base}{path}")).send()?;
+        assert_eq!(response.status(), reqwest::StatusCode::OK, "{path}");
+        let body: serde_json::Value = response.json()?;
+        assert_eq!(body, serde_json::json!({ "streams": [] }), "{path}");
+    }
+    let response = anonymous
+        .get(format!("{base}/local-addon/meta/movie/local:abc.json"))
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
 
     handle.shutdown()?;
     assert_eq!(
