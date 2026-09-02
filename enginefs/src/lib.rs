@@ -30,7 +30,7 @@ use crate::backend::priorities::EngineCacheConfig;
 
 use crate::backend::{
     BackendMemoryDiagnostics, HotFilePriorityPlan, TorrentBackend, TorrentFilePriorityPlan,
-    TorrentHandle, TorrentSource,
+    TorrentHandle, TorrentListenPort, TorrentSource,
 };
 
 const INACTIVE_TORRENT_REMOVE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
@@ -1768,7 +1768,8 @@ impl BackendEngineFS<LibrqbitBackend> {
         _cache_config: EngineCacheConfig,
     ) -> Result<Self> {
         let download_dir = root_dir.join("rqbit-downloads");
-        let (backend, restored) = LibrqbitBackend::new(download_dir.clone()).await?;
+        let (backend, restored) =
+            LibrqbitBackend::new(download_dir.clone(), TorrentListenPort::default()).await?;
         Ok(Self::new_with_backend(
             backend,
             restored,
@@ -1777,13 +1778,16 @@ impl BackendEngineFS<LibrqbitBackend> {
         ))
     }
 
+    /// Only `config.listen_port` is consumed here: librqbit takes the rest of
+    /// its settings from the session defaults (see `update_torrent_settings`).
     pub async fn new_with_storage(
         root_dir: std::path::PathBuf,
-        _config: crate::backend::BackendConfig,
+        config: crate::backend::BackendConfig,
         tracker_storage: Option<Arc<dyn crate::trackers::TrackerStorage>>,
     ) -> Result<Self> {
         let download_dir = root_dir.join("rqbit-downloads");
-        let (backend, restored) = LibrqbitBackend::new(download_dir.clone()).await?;
+        let (backend, restored) =
+            LibrqbitBackend::new(download_dir.clone(), config.listen_port).await?;
         Ok(Self::new_with_backend_and_storage(
             backend,
             restored,

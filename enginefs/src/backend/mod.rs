@@ -418,8 +418,45 @@ impl Default for TorrentPrivacyConfig {
     }
 }
 
+/// Ports the standalone binary tries, in order, for librqbit's incoming
+/// BitTorrent listener ([`TorrentListenPort::Fixed`] default). Mirrors the
+/// pre-9.0.1 librqbit `listen_port_range: 42000..42010` fallback.
+pub const DEFAULT_LISTEN_PORT_RANGE: std::ops::Range<u16> = 42000..42010;
+
+/// Which port librqbit's incoming BitTorrent (TCP) listener binds.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TorrentListenPort {
+    /// Try each port of the range in order and keep the first that binds;
+    /// fail if none does. A stable, forwardable port for a long-running
+    /// desktop instance (`ServerConfig::binary_default`).
+    Fixed(std::ops::Range<u16>),
+    /// Port 0: the OS picks a free port (librqbit reads the bound address
+    /// back and announces that port). For embedded servers and tests, so any
+    /// number of sessions coexist on one machine
+    /// (`ServerConfig::embedded`).
+    Ephemeral,
+}
+
+impl Default for TorrentListenPort {
+    fn default() -> Self {
+        Self::Fixed(DEFAULT_LISTEN_PORT_RANGE)
+    }
+}
+
+impl TorrentListenPort {
+    /// The ports to try, in order.
+    pub fn candidates(&self) -> Vec<u16> {
+        match self {
+            Self::Fixed(range) => range.clone().collect(),
+            Self::Ephemeral => vec![0],
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct BackendConfig {
+    /// Where librqbit listens for incoming peers; read once at session start.
+    pub listen_port: TorrentListenPort,
     pub cache: priorities::EngineCacheConfig,
     pub growler: Growler,
     pub peer_search: PeerSearch,

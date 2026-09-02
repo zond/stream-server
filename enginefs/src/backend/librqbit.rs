@@ -1,7 +1,8 @@
 use crate::backend::{
     BackendFileInfo, BackendMemoryDiagnostics, EngineStats, FileStreamTrait, Growler,
     PeerDiscovery, PeerSearch, PieceReadiness, Source, StartupPhase, StatsFile, StatsOptions,
-    SwarmCap, TorrentBackend, TorrentFilePriorityPlan, TorrentHandle, TorrentSource,
+    SwarmCap, TorrentBackend, TorrentFilePriorityPlan, TorrentHandle, TorrentListenPort,
+    TorrentSource,
 };
 use anyhow::{Context, Result};
 use librqbit::{ManagedTorrent, ManagedTorrentState, Session};
@@ -13,11 +14,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
-
-/// Ports tried in order for librqbit's incoming BitTorrent listener. Mirrors
-/// the pre-9.0.1 `listen_port_range: 42000..42010` fallback (ListenerOptions
-/// now binds a single address, so the fallback is done in `new()`).
-const LISTEN_PORT_RANGE: std::ops::Range<u16> = 42000..42010;
 
 /// Upper bound on how long a stream request blocks waiting for librqbit to
 /// leave its `Initializing` state (opening/hash-checking files; for a magnet
@@ -224,19 +220,24 @@ pub struct LibrqbitBackend {
 }
 
 impl LibrqbitBackend {
-    pub async fn new(download_dir: PathBuf) -> Result<(Self, HashMap<String, LibrqbitHandle>)> {
+    /// Open a session storing downloads under `download_dir`, listening for
+    /// incoming peers on `listen_port` (see [`TorrentListenPort`]).
+    pub async fn new(
+        download_dir: PathBuf,
+        listen_port: TorrentListenPort,
+    ) -> Result<(Self, HashMap<String, LibrqbitHandle>)> {
         tokio::fs::create_dir_all(&download_dir).await?;
         debug!(path = ?download_dir, "Storing downloads");
 
         // librqbit 9.0.1's ListenerOptions binds a single address instead of
-        // the old `listen_port_range: 42000..42010`, so preserve the previous
-        // port-fallback ourselves: try each port in the range and keep the
-        // first that binds. This matters when several sessions coexist (e.g.
-        // concurrent embed tests, or a second local instance).
+        // the old `listen_port_range: 42000..42010`, so a `Fixed` range's
+        // port-fallback is done here: try each port in order and keep the
+        // first that binds. `Ephemeral` is the single candidate 0, which
+        // librqbit itself defaults to and resolves to the bound port.
         let session = {
             let mut last_err = None;
             let mut session = None;
-            for port in LISTEN_PORT_RANGE {
+            for port in listen_port.candidates() {
                 let session_opts = librqbit::SessionOptions {
                     listen: Some(librqbit::ListenerOptions {
                         listen_addr: (std::net::Ipv6Addr::UNSPECIFIED, port).into(),
@@ -282,7 +283,7 @@ impl LibrqbitBackend {
                 Some(s) => s,
                 None => {
                     return Err(last_err.unwrap_or_else(|| {
-                        anyhow::anyhow!("no librqbit listen port available in range")
+                        anyhow::anyhow!("no librqbit listen port available in {listen_port:?}")
                     }));
                 }
             }
@@ -1357,6 +1358,34 @@ mod tests {
     use super::*;
     use crate::backend::TorrentBackend;
 
+    /// `Ephemeral` sessions never collide -- the OS hands each its own port --
+    /// while a `Fixed` range is exhausted once every port in it is taken.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ephemeral_sessions_coexist_where_a_fixed_port_collides() {
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+
+        let (_a, _) =
+            LibrqbitBackend::new(dirs[0].path().to_path_buf(), TorrentListenPort::Ephemeral)
+                .await
+                .expect("first ephemeral session");
+        let (_b, _) =
+            LibrqbitBackend::new(dirs[1].path().to_path_buf(), TorrentListenPort::Ephemeral)
+                .await
+                .expect("second ephemeral session alongside the first");
+
+        // Pin the first session's actual port as the only candidate of a
+        // Fixed range: a third session must fail to bind it.
+        let taken = _a.session.listen_addr().expect("listening").port();
+        let err = LibrqbitBackend::new(
+            dirs[2].path().to_path_buf(),
+            TorrentListenPort::Fixed(taken..taken + 1),
+        )
+        .await
+        .err()
+        .expect("a fixed port already bound must fail");
+        assert!(!format!("{err:#}").is_empty());
+    }
+
     /// Write `len` patterned bytes to `path` (deterministic, non-trivial data
     /// so piece hashes are meaningful).
     pub(super) async fn write_payload(path: &std::path::Path, len: usize) {
@@ -1520,9 +1549,10 @@ mod tests {
         let magnet = std::env::var("STREAM_SERVER_TEST_MAGNET")
             .expect("set STREAM_SERVER_TEST_MAGNET to a magnet link");
         let tmp = tempfile::tempdir().unwrap();
-        let (backend, _restored) = LibrqbitBackend::new(tmp.path().to_path_buf())
-            .await
-            .expect("network session");
+        let (backend, _restored) =
+            LibrqbitBackend::new(tmp.path().to_path_buf(), TorrentListenPort::Ephemeral)
+                .await
+                .expect("network session");
         let custom = "udp://custom-tracker.invalid:6969/announce".to_string();
         let handle = backend
             .add_torrent(TorrentSource::Url(magnet), vec![custom.clone()])
@@ -1879,9 +1909,10 @@ mod tests {
         let magnet = std::env::var("STREAM_SERVER_TEST_MAGNET")
             .expect("set STREAM_SERVER_TEST_MAGNET to a magnet link");
         let tmp = tempfile::tempdir().unwrap();
-        let (backend, _restored) = LibrqbitBackend::new(tmp.path().to_path_buf())
-            .await
-            .expect("network session");
+        let (backend, _restored) =
+            LibrqbitBackend::new(tmp.path().to_path_buf(), TorrentListenPort::Ephemeral)
+                .await
+                .expect("network session");
         let handle = backend
             .add_torrent(TorrentSource::Url(magnet), vec![])
             .await

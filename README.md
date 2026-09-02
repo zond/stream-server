@@ -202,6 +202,8 @@ An embedder holds a `ServerHandle` (from `stream_server::start`) and never needs
 
 The HTTP handlers and these methods call the same functions (`routes::system::{engine_stats, file_stats, update_settings}`), so they cannot drift; `server/tests/embed.rs` compares them.
 
+`ServerConfig::embedded()` (the `Default`) is tuned for a host process: loopback HTTP on 11470, no logging/TUI/SSDP, a generated token, and `torrent_listen_port: TorrentListenPort::Ephemeral` — librqbit's incoming BitTorrent listener takes an OS-assigned port, so any number of embedded servers (and the tests) coexist with a desktop instance. `ServerConfig::binary_default()` keeps `TorrentListenPort::Fixed(42000..42010)`: the first free port of the range, stable and forwardable. Set the field explicitly if an embedder needs a fixed port.
+
 ### Removed routes
 
 Everything below existed for server.js compatibility and had no consumer in stremio-core, the Flutter client or the tests; it was removed to shrink the attack surface to what is actually used:

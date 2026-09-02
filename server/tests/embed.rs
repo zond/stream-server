@@ -1,17 +1,11 @@
-// Every test in this file starts a full embedded server. The HTTP port is
-// ephemeral (`http_addr` port 0), but the server's librqbit session binds one
-// of the 10 fixed BitTorrent listen ports 42000..42009 (`LISTEN_PORT_RANGE`
-// in enginefs/src/backend/librqbit.rs, tried in order) -- so at most 10
-// embedded servers can coexist, 9 if a desktop instance is running on the
-// same machine. `cargo test` runs the tests of one binary in parallel, so
-// keep the number of server-spawning tests here at 9 or below (or restrict
-// parallelism) until that bound is lifted.
-//
-// TODO: let an embedded server ask for an ephemeral torrent listen port
-// (a `ServerConfig` option mapping to port 0 in `LibrqbitBackend::new`) so
-// tests are not limited by the fixed range at all.
+// Every test in this file starts a full embedded server. Both of its ports
+// are ephemeral: the HTTP port (`http_addr` port 0) and, through
+// `ServerConfig::embedded`'s `TorrentListenPort::Ephemeral`, librqbit's
+// BitTorrent listener -- so any number of these servers coexist with each
+// other and with a desktop instance on its fixed 42000..42010 range, and
+// `cargo test`'s parallelism needs no limiting.
 
-use stream_server::{ServerAuth, ServerConfig, ServerHandle};
+use stream_server::{ServerAuth, ServerConfig, ServerHandle, TorrentListenPort};
 
 /// Client builder that sends the server's bearer token (if it has one) on
 /// every request -- every control route requires it.
@@ -37,6 +31,54 @@ fn stock_configs_default_to_a_generated_token() {
     assert_eq!(ServerConfig::embedded().auth, ServerAuth::Generated);
     assert_eq!(ServerConfig::binary_default().auth, ServerAuth::Generated);
     assert_eq!(ServerConfig::default().auth, ServerAuth::Generated);
+}
+
+/// An embedded server takes an OS-assigned BitTorrent listen port; only the
+/// desktop binary keeps the fixed, forwardable range.
+#[test]
+fn embedded_config_uses_an_ephemeral_torrent_port_the_binary_a_fixed_range() {
+    assert_eq!(
+        ServerConfig::embedded().torrent_listen_port,
+        TorrentListenPort::Ephemeral
+    );
+    assert_eq!(
+        ServerConfig::binary_default().torrent_listen_port,
+        TorrentListenPort::Fixed(42000..42010)
+    );
+}
+
+/// Two embedded servers started at the same time both come up: neither the
+/// HTTP listener nor the librqbit session competes for a fixed port.
+#[test]
+fn two_embedded_servers_start_concurrently() -> anyhow::Result<()> {
+    let dirs: Vec<_> = (0..2)
+        .map(|_| Ok((tempfile::tempdir()?, tempfile::tempdir()?)))
+        .collect::<anyhow::Result<_>>()?;
+    let handles = dirs
+        .iter()
+        .map(|(config_dir, cache_dir)| {
+            stream_server::start(stream_server::ServerConfig {
+                http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+                config_dir: Some(config_dir.path().join("config")),
+                cache_dir: Some(cache_dir.path().join("cache")),
+                ..stream_server::ServerConfig::default()
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    assert_ne!(handles[0].http_addr(), handles[1].http_addr());
+    for handle in &handles {
+        let heartbeat: serde_json::Value = bearer_client(handle)?
+            .get(format!("http://{}/heartbeat", handle.http_addr()))
+            .send()?
+            .error_for_status()?
+            .json()?;
+        assert_eq!(heartbeat["success"], true);
+    }
+    for handle in handles {
+        handle.shutdown()?;
+        handle.join()?;
+    }
+    Ok(())
 }
 
 /// Start/stop round trip, plus the auth contract of the default
@@ -152,8 +194,7 @@ fn starts_and_stops_embedded_server() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The two status probes clients poll, on one server (each embedded server
-/// takes one of only ten librqbit listen ports, see the top of this file).
+/// The two status probes clients poll, on one server.
 ///
 /// stremio-core probes `/device-info` at startup expecting
 /// `{"availableHardwareAccelerations": [...]}`. This fork does no
@@ -731,9 +772,7 @@ fn stats_json_exposes_startup_phase_fields_additively() -> anyhow::Result<()> {
 /// `/{infoHash}/create` (POST, with the stream's `peerSearch.sources`) must
 /// join the shared magnet add rather than start a private one with
 /// `EngineFS::add_torrent`, so a stats poll arriving while the create is
-/// still resolving sees that very add, with the create's trackers. (One
-/// server instance for both flows: each embedded server takes one of only
-/// ten librqbit listen ports, and the embed tests run in parallel.)
+/// still resolving sees that very add, with the create's trackers.
 #[test]
 fn stats_json_reports_resolving_metadata_with_the_requests_trackers() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;

@@ -6,7 +6,7 @@ use axum::{
     routing::{get, post},
 };
 use enginefs::EngineFS;
-pub use enginefs::backend::EngineStats;
+pub use enginefs::backend::{EngineStats, TorrentListenPort};
 pub use routes::system::{FileNotFound, ServerSettings};
 pub use state::AppState;
 use std::{
@@ -61,6 +61,11 @@ pub struct ServerConfig {
     /// How the control API authenticates (media routes are always open).
     /// Defaults to a per-launch generated token; see [`ServerAuth`].
     pub auth: ServerAuth,
+    /// The port librqbit's incoming BitTorrent listener binds:
+    /// [`TorrentListenPort::Ephemeral`] for [`Self::embedded`] (any number of
+    /// embedded servers coexist), the fixed `42000..42010` range for
+    /// [`Self::binary_default`].
+    pub torrent_listen_port: TorrentListenPort,
 }
 
 impl Default for ServerConfig {
@@ -88,6 +93,7 @@ impl ServerConfig {
             enable_ssdp_discovery: false,
             graceful_shutdown_timeout: Duration::from_secs(3),
             auth: ServerAuth::Generated,
+            torrent_listen_port: TorrentListenPort::Ephemeral,
         }
     }
 
@@ -109,6 +115,7 @@ impl ServerConfig {
             enable_ssdp_discovery: true,
             graceful_shutdown_timeout: Duration::from_secs(3),
             auth: ServerAuth::Generated,
+            torrent_listen_port: TorrentListenPort::default(),
         }
     }
 }
@@ -447,6 +454,7 @@ pub async fn run(
     ));
 
     let backend_config = enginefs::backend::BackendConfig {
+        listen_port: cfg.torrent_listen_port.clone(),
         cache: enginefs::backend::priorities::EngineCacheConfig {
             size: routes::system::cache_size_bytes(settings.cache_size),
             enabled: true,
