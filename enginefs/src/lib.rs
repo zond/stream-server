@@ -3141,28 +3141,40 @@ mod tests {
     }
 
     /// The blocking variant used by stream routes: two concurrent waiters get
-    /// the same engine from one backend add.
-    #[tokio::test]
+    /// the same engine from one backend add. Bounded so a regression (say, a
+    /// second add started for the second waiter) fails instead of hanging:
+    /// `notify_waiters` releases every parked add at once, and the awaits
+    /// are under (virtual-time) timeouts.
+    #[tokio::test(start_paused = true)]
     async fn concurrent_get_or_add_magnet_waiters_share_one_add() {
         let gated = gated_enginefs();
         let enginefs = gated.enginefs.clone();
 
-        let a = {
-            let efs = enginefs.clone();
-            tokio::spawn(async move { efs.get_or_add_magnet(TEST_HASH, None).await })
-        };
-        let b = {
-            let efs = enginefs.clone();
-            tokio::spawn(async move { efs.get_or_add_magnet(TEST_HASH, None).await })
-        };
+        let a = spawn_get_or_add(&enginefs, None);
+        let b = spawn_get_or_add(&enginefs, None);
         assert!(
             wait_until(Duration::from_secs(1), || gated.adds() == 1).await,
             "exactly one backend add is started for both waiters"
         );
-        gated.release.notify_one();
+        // Both waiters are parked on that one add (current-thread runtime:
+        // the add task registered its `notified()` in the same poll that
+        // bumped the counter, so `notify_waiters` below reaches it).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!a.is_finished() && !b.is_finished());
+        assert_eq!(gated.adds(), 1);
+        gated.release.notify_waiters();
 
-        let a = a.await.unwrap().expect("first waiter");
-        let b = b.await.unwrap().expect("second waiter");
+        let bound = Duration::from_secs(5);
+        let a = tokio::time::timeout(bound, a)
+            .await
+            .expect("first waiter finishes")
+            .unwrap()
+            .expect("first waiter");
+        let b = tokio::time::timeout(bound, b)
+            .await
+            .expect("second waiter finishes")
+            .unwrap()
+            .expect("second waiter");
         assert!(Arc::ptr_eq(&a, &b));
         assert_eq!(gated.adds(), 1);
     }
