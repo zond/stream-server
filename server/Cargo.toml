@@ -75,8 +75,11 @@ flate2 = "1.1.5"
 uuid = "1.19.0"
 quick-xml = { version = "0.40.1", features = ["serialize"] }
 yenc = "0.2.2"
-tokio-native-tls = "0.3.1"
-native-tls = "0.2.14"
+# NNTP(S) for NZB downloads uses rustls (aws-lc-rs) directly — see
+# archives/nzb/nntp.rs. This keeps the workspace on a single TLS/crypto backend
+# (rustls + aws-lc-rs) with no openssl-sys/native-tls.
+tokio-rustls = "0.26.4"
+webpki-roots = "1"
 async-channel = "2.5.0"
 bytes = "1.11.0"
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }

@@ -4,7 +4,15 @@ version = "0.1.8"
 edition = "2024"
 
 [dependencies]
-librqbit = { git = "https://github.com/zond/rqbit", branch = "feat/configurable-stream-lookahead" }
+# default-features=false + rust-tls keeps the whole crypto stack on rustls +
+# aws-lc-rs: librqbit's `rust-tls` feature switches its SHA1 piece-hasher from
+# `sha1-crypto-hash` (openssl-backed) to `sha1-ring` (aws-lc-rs-backed) and keeps
+# reqwest on rustls, so nothing here pulls in openssl-sys. `http-api-client` is
+# kept because backend/librqbit.rs uses librqbit::api::TorrentIdOrHash.
+librqbit = { git = "https://github.com/zond/rqbit", branch = "feat/configurable-stream-lookahead", default-features = false, features = [
+    "rust-tls",
+    "http-api-client",
+] }
 tokio = { version = "1.42.0", features = [
     "rt-multi-thread",
     "macros",

@@ -1,7 +1,11 @@
 use anyhow::{Result, anyhow};
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio_native_tls::{TlsConnector, TlsStream};
+use tokio_rustls::TlsConnector;
+use tokio_rustls::client::TlsStream;
+use tokio_rustls::rustls::pki_types::ServerName;
+use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
 #[allow(dead_code)]
 pub struct NntpClient {
@@ -81,11 +85,20 @@ impl Client {
         let tcp = TcpStream::connect(&addr).await?;
 
         let stream = if ssl {
-            let connector = native_tls::TlsConnector::builder().build()?;
-            let connector = TlsConnector::from(connector);
-            // Verify domain? usually yes, but legacy app might not strict check.
-            // Using host as domain.
-            let tls_stream = connector.connect(host, tcp).await?;
+            // rustls + aws-lc-rs (explicit provider) with the Mozilla webpki root
+            // store; verifies the server certificate against `host`.
+            let mut root_store = RootCertStore::empty();
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            let config = ClientConfig::builder_with_provider(Arc::new(
+                tokio_rustls::rustls::crypto::aws_lc_rs::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()?
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+            let connector = TlsConnector::from(Arc::new(config));
+            let domain = ServerName::try_from(host.to_string())
+                .map_err(|_| anyhow!("Invalid DNS name for NNTP TLS: {}", host))?;
+            let tls_stream = connector.connect(domain, tcp).await?;
             NntpStream {
                 inner: StreamType::Tls(Box::new(tls_stream)),
             }
