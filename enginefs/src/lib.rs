@@ -95,7 +95,9 @@ pub enum MagnetAddError {
     /// The add task was aborted (its registry entry was swept as idle).
     #[error("magnet add for {info_hash} was cancelled")]
     Cancelled { info_hash: String },
-    /// The add task ended abnormally (panicked) before the backend answered.
+    /// The add task ended abnormally before the backend answered: it panicked
+    /// (debug builds only -- the release profile's `panic = "abort"` takes the
+    /// whole process down instead of unwinding).
     #[error("magnet add task for {info_hash} failed: {reason}")]
     TaskFailed { info_hash: String, reason: String },
     /// The backend's `add_torrent` itself failed.
@@ -165,7 +167,7 @@ pub enum EngineLookup<H: TorrentHandle> {
     /// A magnet add is in flight; await `done` for the engine.
     Adding(PendingMagnetAdd<H>),
     /// The last add for this hash failed (timed out, backend error, task
-    /// panic) and nothing has retried it since. Only the blocking
+    /// panic in debug builds) and nothing has retried it since. Only the blocking
     /// [`BackendEngineFS::get_or_add_magnet`] retries -- a fresh play request
     /// gets a fresh attempt, while pollers keep seeing the failure -- and the
     /// record is dropped once nothing has asked about the hash for
@@ -873,8 +875,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     ///
     /// The supervisor awaits the add task's `JoinHandle`, so the entry is
     /// settled however the add ends -- engine published (entry removed),
-    /// backend error or timeout (entry becomes its failure record), panic or
-    /// abort (likewise) -- without depending on any waiter polling `done`.
+    /// backend error or timeout (entry becomes its failure record), abort or a
+    /// panic (likewise; a panic only gets that far in debug builds -- the
+    /// release profile's `panic = "abort"` kills the process) -- without
+    /// depending on any waiter polling `done`.
     /// A stats poller that never awaits therefore still sees the failure.
     fn spawn_magnet_add(
         backend: Arc<B>,
@@ -3369,8 +3373,9 @@ mod tests {
         ));
     }
 
-    /// A backend add that panics must not leave the hash stuck in
-    /// `resolvingMetadata` forever: the waiter gets a typed error, the
+    /// A backend add that panics (debug builds; release aborts the process)
+    /// must not leave the hash stuck in `resolvingMetadata` forever: the
+    /// waiter gets a typed error, the
     /// registry holds a failure record, and the next blocking attempt starts
     /// a fresh add.
     #[tokio::test]
