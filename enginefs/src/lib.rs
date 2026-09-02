@@ -880,10 +880,27 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                         info_hash: hash,
                         error: Arc::new(error),
                     }),
-                    Err(_elapsed) => Err(MagnetAddError::MetadataTimeout {
-                        info_hash: hash,
-                        timeout: METADATA_RESOLVE_TIMEOUT,
-                    }),
+                    Err(_elapsed) => {
+                        // librqbit's `add_torrent` is not cancel-safe: dropping
+                        // it mid-way can leave the torrent inserted in the
+                        // session but never `start()`ed, so a retry would get
+                        // `AlreadyManaged` for a torrent that will never
+                        // resolve and the hash would be stuck. Best-effort
+                        // removal; the torrent usually does not exist yet, so
+                        // an error here is the normal case and is not
+                        // reported.
+                        if let Err(error) = backend.remove_torrent(&hash).await {
+                            debug!(
+                                info_hash = %hash,
+                                %error,
+                                "nothing to remove from the backend after metadata timeout"
+                            );
+                        }
+                        Err(MagnetAddError::MetadataTimeout {
+                            info_hash: hash,
+                            timeout: METADATA_RESOLVE_TIMEOUT,
+                        })
+                    }
                 }
             })
         };
@@ -3003,6 +3020,8 @@ mod tests {
         release: Arc<tokio::sync::Notify>,
         adds: Arc<AtomicUsize>,
         behaviour: Arc<Mutex<AddBehaviour>>,
+        /// Info hashes `remove_torrent` was asked to drop.
+        removed: Arc<Mutex<Vec<String>>>,
     }
 
     #[async_trait::async_trait]
@@ -3030,8 +3049,12 @@ mod tests {
             None
         }
 
-        async fn remove_torrent(&self, _info_hash: &str) -> Result<()> {
-            Ok(())
+        /// Records the request and answers like librqbit does for a torrent
+        /// it never got to insert -- the usual case after a timeout, which
+        /// the caller must tolerate.
+        async fn remove_torrent(&self, info_hash: &str) -> Result<()> {
+            self.removed.lock().unwrap().push(info_hash.to_string());
+            Err(anyhow::anyhow!("torrent {info_hash} not found"))
         }
 
         async fn list_torrents(&self) -> Vec<String> {
@@ -3048,12 +3071,17 @@ mod tests {
         release: Arc<tokio::sync::Notify>,
         adds: Arc<AtomicUsize>,
         behaviour: Arc<Mutex<AddBehaviour>>,
+        removed: Arc<Mutex<Vec<String>>>,
         _root: tempfile::TempDir,
     }
 
     impl Gated {
         fn adds(&self) -> usize {
             self.adds.load(Ordering::SeqCst)
+        }
+
+        fn removed(&self) -> Vec<String> {
+            self.removed.lock().unwrap().clone()
         }
 
         fn set_behaviour(&self, behaviour: AddBehaviour) {
@@ -3065,6 +3093,7 @@ mod tests {
         let release = Arc::new(tokio::sync::Notify::new());
         let adds = Arc::new(AtomicUsize::new(0));
         let behaviour = Arc::new(Mutex::new(AddBehaviour::WaitForRelease));
+        let removed = Arc::new(Mutex::new(Vec::new()));
         let handle = FakeHandle {
             info_hash: TEST_HASH.to_string(),
             counters: Arc::new(FakeCounters::default()),
@@ -3081,6 +3110,7 @@ mod tests {
                 release: release.clone(),
                 adds: adds.clone(),
                 behaviour: behaviour.clone(),
+                removed: removed.clone(),
             },
             HashMap::new(),
             root.path().join("cache"),
@@ -3091,6 +3121,7 @@ mod tests {
             release,
             adds,
             behaviour,
+            removed,
             _root: root,
         }
     }
@@ -3148,6 +3179,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert_eq!(gated.adds(), 1);
+        assert!(gated.removed().is_empty(), "{:?}", gated.removed());
 
         // Now the engine is simply found.
         let EngineLookup::Ready(ready) = enginefs.get_or_begin_add_magnet(TEST_HASH, None).await
@@ -3288,6 +3320,31 @@ mod tests {
             .await,
             "a successful add leaves no registry entry behind"
         );
+    }
+
+    /// librqbit's `add_torrent` is not cancel-safe: the torrent can be sitting
+    /// in the session, inserted but never started, when the timeout drops the
+    /// add future. The timed-out add must therefore ask the backend to remove
+    /// the hash (tolerating "not found", the usual answer) so a retry does not
+    /// hit `AlreadyManaged` on a torrent that will never resolve.
+    #[tokio::test(start_paused = true)]
+    async fn metadata_timeout_removes_the_half_added_torrent_from_the_backend() {
+        let gated = gated_enginefs();
+        let enginefs = &gated.enginefs;
+
+        let error = expect_add_error(
+            enginefs.get_or_add_magnet(TEST_HASH, None).await,
+            "the backend never answers",
+        );
+        assert!(
+            matches!(&error, MagnetAddError::MetadataTimeout { .. }),
+            "{error:?}"
+        );
+        assert_eq!(gated.removed(), [TEST_HASH.to_string()]);
+        assert!(matches!(
+            enginefs.get_or_begin_add_magnet(TEST_HASH, None).await,
+            EngineLookup::Failed(_)
+        ));
     }
 
     /// A backend add that panics must not leave the hash stuck in
