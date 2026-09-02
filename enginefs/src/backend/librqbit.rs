@@ -1,7 +1,7 @@
 use crate::backend::{
     BackendFileInfo, BackendMemoryDiagnostics, EngineStats, FileStreamTrait, Growler,
-    PeerDiscovery, PeerSearch, PieceReadiness, StartupPhase, StatsFile, StatsOptions, SwarmCap,
-    TorrentBackend, TorrentFilePriorityPlan, TorrentHandle, TorrentSource,
+    PeerDiscovery, PeerSearch, PieceReadiness, Source, StartupPhase, StatsFile, StatsOptions,
+    SwarmCap, TorrentBackend, TorrentFilePriorityPlan, TorrentHandle, TorrentSource,
 };
 use anyhow::{Context, Result};
 use librqbit::{ManagedTorrent, ManagedTorrentState, Session};
@@ -672,11 +672,31 @@ impl TorrentHandle for LibrqbitHandle {
             }
         }
 
+        // server.js lists the torrent's peer sources here; we report the
+        // tracker set the torrent was added with (fixed for its lifetime, see
+        // `add_trackers`) so clients can verify which trackers reached the
+        // engine. librqbit exposes no per-tracker announce bookkeeping, so the
+        // counters stay 0 and `lastStarted` empty.
+        let mut sources: Vec<Source> = self
+            .handle
+            .shared()
+            .trackers
+            .iter()
+            .map(|url| Source {
+                last_started: String::new(),
+                num_found: 0,
+                num_found_uniq: 0,
+                num_requests: 0,
+                url: url.to_string(),
+            })
+            .collect();
+        sources.sort_by(|a, b| a.url.cmp(&b.url));
+
         EngineStats {
             name: self.name().unwrap_or_else(|| "Unknown".to_string()),
             info_hash: self.info_hash(),
             files,
-            sources: vec![],
+            sources,
             opts: StatsOptions {
                 dht: true,
                 tracker: true,
@@ -755,6 +775,17 @@ impl TorrentHandle for LibrqbitHandle {
         have >= len
     }
 
+    /// Deliberate no-op: librqbit (zond/rqbit `feat/configurable-stream-lookahead`)
+    /// has no API to add trackers to a torrent that is already managed. The
+    /// tracker set lives in `ManagedTorrentShared::trackers`, a plain
+    /// `HashSet<Url>` with no interior mutability, and `Session::make_peer_rx`
+    /// hands `TrackerComms::start` a one-shot snapshot of it when the torrent
+    /// goes live; `TrackerComms::add_tracker` is private startup plumbing. The
+    /// only way to change a torrent's trackers is to remove and re-add it,
+    /// which would drop its peers and piece state mid-stream. So trackers must
+    /// be supplied to `add_torrent` by whichever request creates the engine
+    /// (see `routes::compat::get_or_create_engine` in the server crate), and
+    /// `stats().sources` reports the set that was actually used.
     async fn add_trackers(&self, _trackers: Vec<String>) -> Result<()> {
         Ok(())
     }
@@ -1322,6 +1353,44 @@ mod tests {
             .await
             .expect("add torrent");
         (backend, handle)
+    }
+
+    /// `stats().sources` must list the trackers the torrent was added with:
+    /// it is the only place a client can confirm its `tr=` trackers reached
+    /// the engine, since librqbit cannot add trackers after the fact.
+    #[tokio::test]
+    async fn stats_sources_list_the_trackers_the_torrent_was_added_with() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let payload = dir.join("payload.bin");
+        write_payload(&payload, 16 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+
+        let backend = LibrqbitBackend::new_for_tests(dir.clone())
+            .await
+            .expect("hermetic session");
+        let handle = backend
+            .add_torrent(
+                TorrentSource::Bytes(torrent_bytes),
+                vec![
+                    "udp://two.invalid:6969/announce".to_string(),
+                    "https://one.invalid/announce".to_string(),
+                ],
+            )
+            .await
+            .expect("add torrent");
+
+        let stats = TorrentHandle::stats(&handle).await;
+        let urls: Vec<&str> = stats.sources.iter().map(|s| s.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            [
+                "https://one.invalid/announce",
+                "udp://two.invalid:6969/announce"
+            ],
+            "sorted tracker URLs, got {urls:?}"
+        );
+        assert!(stats.sources.iter().all(|s| s.num_requests == 0));
     }
 
     #[tokio::test]
