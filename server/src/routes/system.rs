@@ -909,10 +909,13 @@ fn resolving_metadata_response(
 }
 
 /// 200 with `phase: error` and the reason: the poller asked about a torrent
-/// the engine gave up on, which is an answer, not a missing resource.
+/// the engine gave up on, which is an answer, not a missing resource. The
+/// reason is [`enginefs::MagnetAddError::client_message`], not the raw error: a backend
+/// error chain may name absolute download-dir paths, which stay in the server
+/// log (the supervisor warns with the full chain when the add fails).
 fn magnet_add_failed_response(info_hash: &str, failed: &FailedMagnetAdd) -> Response {
     let stats =
-        EngineStats::magnet_add_failed(info_hash, &failed.trackers, &failed.error.to_string());
+        EngineStats::magnet_add_failed(info_hash, &failed.trackers, &failed.error.client_message());
     Json(serde_json::to_value(stats).unwrap()).into_response()
 }
 
@@ -1008,6 +1011,34 @@ pub async fn get_file_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use enginefs::MagnetAddError;
+    use std::sync::Arc;
+
+    /// Mirrors `compat::engine_creation_failure`'s non-leak test: the stats
+    /// `error` field must not echo a backend error chain (which can name
+    /// absolute download-dir paths) any more than the stream route's body does.
+    #[tokio::test]
+    async fn magnet_add_failed_stats_do_not_leak_backend_error_details() {
+        let failed = FailedMagnetAdd {
+            error: MagnetAddError::Backend {
+                info_hash: "abc".into(),
+                error: Arc::new(anyhow::anyhow!("cannot open /home/user/downloads/x")),
+            },
+            trackers: Arc::from(vec!["udp://one.invalid/announce".to_string()]),
+        };
+
+        let response = magnet_add_failed_response("abc", &failed);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["phase"], "error");
+        assert_eq!(json["infoHash"], "abc");
+        let error = json["error"].as_str().expect("error string");
+        assert!(!error.is_empty());
+        assert!(!error.contains("/home/user"), "{error}");
+    }
 
     #[test]
     fn sys_info_uncached_has_the_shape_stats_json_needs() {

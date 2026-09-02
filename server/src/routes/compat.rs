@@ -87,27 +87,20 @@ pub async fn get_or_create_engine(
 
 /// Status and body for a failed [`get_or_create_engine`]: a metadata timeout
 /// is 504 (the swarm did not answer in time; retrying may well succeed), a
-/// backend refusal 502, anything else 500. The bodies are fixed strings: a
-/// librqbit error can carry absolute download-dir paths, which must not be
-/// echoed to an HTTP client (log the error at the call site instead).
+/// backend refusal 502, anything else 500. The body is
+/// [`MagnetAddError::client_message`] -- the same non-leaking text the stats
+/// route reports -- because a librqbit error can carry absolute download-dir
+/// paths, which must not be echoed to an HTTP client (log the error at the
+/// call site instead).
 pub fn engine_creation_failure(error: &MagnetAddError) -> (StatusCode, String) {
-    match error {
-        MagnetAddError::MetadataTimeout { timeout, .. } => (
-            StatusCode::GATEWAY_TIMEOUT,
-            format!(
-                "Torrent metadata did not resolve within {}s; retry shortly",
-                timeout.as_secs()
-            ),
-        ),
-        MagnetAddError::Backend { .. } => (
-            StatusCode::BAD_GATEWAY,
-            "Failed to create engine; see server logs for details".to_string(),
-        ),
-        MagnetAddError::Cancelled { .. } | MagnetAddError::TaskFailed { .. } => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to create engine; see server logs for details".to_string(),
-        ),
-    }
+    let status = match error {
+        MagnetAddError::MetadataTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
+        MagnetAddError::Backend { .. } => StatusCode::BAD_GATEWAY,
+        MagnetAddError::Cancelled { .. } | MagnetAddError::TaskFailed { .. } => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    };
+    (status, error.client_message())
 }
 
 pub fn basename(path: &str) -> &str {
@@ -291,15 +284,14 @@ mod tests {
 
     #[test]
     fn engine_creation_failure_maps_metadata_timeout_to_504_without_leaking() {
-        let (status, body) = engine_creation_failure(&MagnetAddError::MetadataTimeout {
+        let timeout = MagnetAddError::MetadataTimeout {
             info_hash: "abc".into(),
             timeout: std::time::Duration::from_secs(90),
-        });
+        };
+        let (status, body) = engine_creation_failure(&timeout);
         assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
-        assert_eq!(
-            body,
-            "Torrent metadata did not resolve within 90s; retry shortly"
-        );
+        assert_eq!(body, timeout.to_string());
+        assert!(body.contains("90s"), "{body}");
 
         let (status, body) = engine_creation_failure(&MagnetAddError::Backend {
             info_hash: "abc".into(),
@@ -308,11 +300,12 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert!(!body.contains("/home/user"), "{body}");
 
-        let (status, _) = engine_creation_failure(&MagnetAddError::TaskFailed {
+        let (status, body) = engine_creation_failure(&MagnetAddError::TaskFailed {
             info_hash: "abc".into(),
-            reason: "panicked".into(),
+            reason: "panicked at /home/user/src/lib.rs".into(),
         });
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!body.contains("/home/user"), "{body}");
     }
 
     /// `query_values` already percent-decodes `tr=`; decoding a second time

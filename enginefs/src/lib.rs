@@ -87,6 +87,23 @@ pub enum MagnetAddError {
     },
 }
 
+impl MagnetAddError {
+    /// What an HTTP client may be told about this failure. The timeout
+    /// message is its own `Display` (it names only the info hash and the
+    /// bound); every other variant collapses to a fixed string, because the
+    /// backend error chain can carry absolute download-dir paths and a task
+    /// failure the panic payload. Those belong in the server log -- log the
+    /// error itself (`%error`) at the call site -- never in a response body.
+    pub fn client_message(&self) -> String {
+        match self {
+            Self::MetadataTimeout { .. } => self.to_string(),
+            Self::Backend { .. } | Self::TaskFailed { .. } | Self::Cancelled { .. } => {
+                "backend refused the torrent; see server logs".to_string()
+            }
+        }
+    }
+}
+
 /// Outcome of a magnet add shared between every waiter.
 pub type MagnetAddResult<H> = Result<Arc<Engine<H>>, MagnetAddError>;
 
