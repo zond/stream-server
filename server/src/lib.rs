@@ -649,12 +649,6 @@ pub fn build_router(state: AppState) -> Router {
         .route("/network-info", get(routes::system::network_info))
         .route("/device-info", get(routes::system::device_info))
         .nest("/update", routes::update::router())
-        .route("/diagnostics/memory", get(diagnostics::memory))
-        .route("/diagnostics/streams", get(diagnostics::streams))
-        .route("/diagnostics/crashes", get(diagnostics::crashes))
-        .route("/diagnostics/logs", get(diagnostics::logs))
-        .route("/diagnostics/logs/current", get(diagnostics::current_log))
-        .route("/diagnostics/export", get(diagnostics::export))
         .route(
             "/settings",
             get(routes::system::get_settings).post(routes::system::set_settings),
