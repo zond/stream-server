@@ -677,24 +677,6 @@ pub fn build_router(state: AppState) -> Router {
             "/{infoHash}/{fileIdx}",
             get(routes::stream::stream_video).head(routes::stream::head_stream_video),
         )
-        .route(
-            "/subtitles.vtt",
-            get(routes::subtitles::proxy_subtitles_vtt),
-        )
-        .route(
-            "/subtitles.{ext}",
-            get(routes::subtitles::proxy_subtitles_ext),
-        )
-        .route(
-            "/{infoHash}/{fileIdx}/subtitles.vtt",
-            get(routes::subtitles::get_subtitles_vtt),
-        )
-        .route("/opensubHash", get(routes::subtitles::opensub_hash))
-        .route(
-            "/opensubHash/{infoHash}/{fileIdx}",
-            get(routes::subtitles::opensub_hash_path),
-        )
-        .route("/subtitlesTracks", get(routes::subtitles::subtitles_tracks))
         .route("/get-https", get(routes::system::get_https))
         .nest("/rar", routes::archive::router())
         .nest("/zip", routes::archive::router())

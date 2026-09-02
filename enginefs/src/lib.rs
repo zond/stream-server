@@ -19,7 +19,6 @@ pub mod metadata_cache;
 pub mod metadata_pins;
 pub mod piece_cache;
 pub mod piece_waiter;
-pub mod subtitles;
 pub mod tracker_prober;
 pub mod trackers;
 
@@ -2404,14 +2403,6 @@ mod tests {
         );
         assert_eq!(counters.get_file_reader.load(Ordering::SeqCst), 0);
         assert_eq!(engine.active_streams.load(Ordering::SeqCst), 0);
-
-        // The Option-returning wrapper degrades to None (and logs), no panic.
-        assert!(
-            engine
-                .get_file_with_intent(1, 0, 1, PlaybackIntent::DirectInitial)
-                .await
-                .is_none()
-        );
     }
 
     // (c) A file-selection reconcile issued while the torrent is Initializing

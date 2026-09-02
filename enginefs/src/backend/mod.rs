@@ -183,21 +183,6 @@ pub struct BackendFileInfo {
     pub length: u64,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct PeerStat {
-    pub ip: String,
-    pub down_speed: f64,
-    pub up_speed: f64,
-    pub rank_score: f64,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct SubtitleTrack {
-    pub id: usize,
-    pub name: String,
-    pub size: u64,
-}
-
 // Stremio-compatible stats structures
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]

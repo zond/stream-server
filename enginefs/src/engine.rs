@@ -1,20 +1,12 @@
-use crate::backend::{
-    EngineStats, PeerStat, SubtitleTrack, TorrentHandle, priorities::PlaybackIntent,
-};
+use crate::backend::{EngineStats, TorrentHandle, priorities::PlaybackIntent};
 use crate::cache::DataCache;
 use anyhow::Context;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
-use tokio::io::AsyncSeekExt;
-use tokio::sync::{Mutex, OnceCell};
 
 use crate::files::FileHandle;
 use regex::Regex;
-
-type OpensubHashCell = Arc<OnceCell<Result<String, String>>>;
-type OpensubHashInflight = HashMap<usize, OpensubHashCell>;
 
 /// Season/episode hints sent by stremio-video's createTorrent.js as
 /// `guessFileIdx: {season, episode}` (stremio-core: `CreatedTorrent.guess_file_idx`).
@@ -226,107 +218,6 @@ mod guess_tests {
     }
 }
 
-/// Pure core of the OpenSubtitles filehash (OSDb spec): the file size, seeded,
-/// plus little-endian u64 sums (wrapping) over the first and last 64 KiB of the
-/// file. `head`/`tail` are those two chunks (they overlap and are identical for
-/// files smaller than 64 KiB, so their bytes get summed twice). A trailing
-/// chunk shorter than 8 bytes is zero-padded on the high side. The result is
-/// the 16-hex-digit hash OpenSubtitles matches against. Kept separate from the
-/// async I/O so the byte arithmetic — the part that must match the spec exactly
-/// — is testable without a torrent handle.
-fn opensub_hash_from_parts(head: &[u8], tail: &[u8], file_len: u64) -> String {
-    let mut hash = file_len;
-
-    for chunk in head.chunks(8) {
-        let mut buf = [0u8; 8];
-        let len = chunk.len();
-        buf[..len].copy_from_slice(chunk);
-        hash = hash.wrapping_add(u64::from_le_bytes(buf));
-    }
-
-    for chunk in tail.chunks(8) {
-        let mut buf = [0u8; 8];
-        let len = chunk.len();
-        buf[..len].copy_from_slice(chunk);
-        hash = hash.wrapping_add(u64::from_le_bytes(buf));
-    }
-
-    format!("{:016x}", hash)
-}
-
-#[cfg(test)]
-mod opensub_hash_tests {
-    use super::opensub_hash_from_parts;
-
-    #[test]
-    fn little_endian_seed_and_both_chunks_counted() {
-        // head low byte 1, tail low byte 2, seeded by file_len=100 => 103.
-        // Little-endian: byte 0 is the low byte, so a leading 1 contributes 1
-        // (big-endian would contribute 0x0100000000000000 and change the hash).
-        let head = [1u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let tail = [2u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        assert_eq!(
-            opensub_hash_from_parts(&head, &tail, 100),
-            "0000000000000067"
-        );
-    }
-
-    #[test]
-    fn trailing_partial_chunk_is_zero_padded() {
-        // 3 bytes 0xFF => 0x0000000000FFFFFF via the copy_from_slice(len) path.
-        let head = [0xFFu8, 0xFF, 0xFF];
-        assert_eq!(opensub_hash_from_parts(&head, &[], 0), "0000000000ffffff");
-    }
-
-    #[test]
-    fn small_file_head_equals_tail_summed_twice() {
-        // File shorter than 64 KiB: head and tail are the same bytes and both
-        // are summed. 10 + 10 + file_len(5) = 25.
-        let bytes = [10u8, 0, 0, 0, 0, 0, 0, 0];
-        assert_eq!(
-            opensub_hash_from_parts(&bytes, &bytes, 5),
-            "0000000000000019"
-        );
-    }
-
-    #[test]
-    fn matches_independent_reference_over_distinct_head_tail() {
-        // >128 KiB file: distinct 64 KiB head and tail. Compare against an
-        // independent reference computed here to pin the exact accumulation.
-        let file_len: u64 = 200_000;
-        let head: Vec<u8> = (0..65_536).map(|i| (i * 7 + 1) as u8).collect();
-        let tail: Vec<u8> = (0..65_536).map(|i| (i * 13 + 3) as u8).collect();
-
-        let reference = {
-            let mut acc = file_len;
-            for part in [&head, &tail] {
-                for c in part.chunks(8) {
-                    let mut b = [0u8; 8];
-                    b[..c.len()].copy_from_slice(c);
-                    acc = acc.wrapping_add(u64::from_le_bytes(b));
-                }
-            }
-            format!("{:016x}", acc)
-        };
-
-        let got = opensub_hash_from_parts(&head, &tail, file_len);
-        assert_eq!(got, reference);
-        assert_eq!(got.len(), 16);
-    }
-
-    #[test]
-    fn wrapping_add_does_not_panic_on_overflow() {
-        // Values that overflow u64 must wrap, not panic (release builds abort
-        // on overflow only in debug; wrapping_add keeps both correct).
-        let head = [0xFFu8; 8];
-        let tail = [0xFFu8; 8];
-        let got = opensub_hash_from_parts(&head, &tail, u64::MAX);
-        // u64::MAX + 0xFFFFFFFFFFFFFFFF + 0xFFFFFFFFFFFFFFFF (wrapping).
-        let expected = u64::MAX.wrapping_add(u64::MAX).wrapping_add(u64::MAX);
-        assert_eq!(got, format!("{:016x}", expected));
-    }
-}
-
 /// Why `Engine::try_get_file_with_intent` could not hand out a reader.
 /// `Backend` wraps the backend's error unchanged so callers can downcast it
 /// (e.g. to `crate::backend::librqbit::TorrentInitError`) for a precise
@@ -357,8 +248,6 @@ pub struct Engine<H: TorrentHandle> {
     clock: crate::Clock,
     pub last_accessed: AtomicU64,
     pub active_streams: Arc<AtomicUsize>,
-    opensub_hash_cache: Mutex<HashMap<usize, String>>,
-    opensub_hash_inflight: Mutex<OpensubHashInflight>,
     pub data_cache: DataCache,
     /// Whether this torrent was paused by the idle seeding-disabled policy.
     /// A new playback request resumes it before making a file wanted.
@@ -373,8 +262,6 @@ impl<H: TorrentHandle> Engine<H> {
             clock,
             last_accessed: AtomicU64::new(clock.now_secs()),
             active_streams: Arc::new(AtomicUsize::new(0)),
-            opensub_hash_cache: Mutex::new(HashMap::new()),
-            opensub_hash_inflight: Mutex::new(HashMap::new()),
             data_cache: moka::future::Cache::builder()
                 .weigher(|_key, value: &Arc<Vec<u8>>| value.len() as u32)
                 .max_capacity(64 * 1024 * 1024) // 64MB cache per engine
@@ -444,54 +331,6 @@ impl<H: TorrentHandle> Engine<H> {
         }
 
         stats
-    }
-
-    pub async fn get_file(
-        self: &Arc<Self>,
-        file_idx: usize,
-        start_offset: u64,
-        priority: u8,
-    ) -> Option<FileHandle<H>> {
-        let intent = if priority == 255 {
-            PlaybackIntent::InternalProbe
-        } else if priority == 0 {
-            PlaybackIntent::Background
-        } else if start_offset == 0 {
-            PlaybackIntent::DirectInitial
-        } else {
-            PlaybackIntent::DirectSeek
-        };
-        self.get_file_with_intent(file_idx, start_offset, priority, intent)
-            .await
-    }
-
-    /// Option-returning wrapper over `try_get_file_with_intent` for callers
-    /// that only care about success (subtitles, opensub hashing). The error is
-    /// logged here so it is not lost.
-    pub async fn get_file_with_intent(
-        self: &Arc<Self>,
-        file_idx: usize,
-        start_offset: u64,
-        priority: u8,
-        intent: PlaybackIntent,
-    ) -> Option<FileHandle<H>> {
-        match self
-            .try_get_file_with_intent(file_idx, start_offset, priority, intent)
-            .await
-        {
-            Ok(file) => Some(file),
-            Err(e) => {
-                tracing::warn!(
-                    info_hash = %self.info_hash,
-                    file_idx,
-                    start_offset,
-                    ?intent,
-                    error = %e,
-                    "get_file: could not open file reader"
-                );
-                None
-            }
-        }
     }
 
     /// Open a reader for `file_idx` at `start_offset`. Blocks while the
@@ -582,118 +421,5 @@ impl<H: TorrentHandle> Engine<H> {
         // Use raw reader directly for better performance
         // The torrent backend reads from local files, caching adds overhead
         Ok(FileHandle::new(length, name, reader, self.clone()))
-    }
-
-    pub async fn get_opensub_hash(self: &Arc<Self>, file_idx: usize) -> anyhow::Result<String> {
-        if !self.handle.manages_playback_lifecycle() {
-            return self.calculate_opensub_hash(file_idx).await;
-        }
-        if let Some(hash) = self.opensub_hash_cache.lock().await.get(&file_idx).cloned() {
-            return Ok(hash);
-        }
-
-        let inflight = {
-            let mut hashes = self.opensub_hash_inflight.lock().await;
-            hashes
-                .entry(file_idx)
-                .or_insert_with(|| Arc::new(OnceCell::new()))
-                .clone()
-        };
-        let result = inflight
-            .get_or_init(|| async {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(15),
-                    self.calculate_opensub_hash(file_idx),
-                )
-                .await
-                .map_err(|_| "OpenSub hash reader timed out after 15 seconds".to_string())?
-                .map_err(|error| format!("{error:#}"))
-            })
-            .await
-            .clone();
-        {
-            let mut hashes = self.opensub_hash_inflight.lock().await;
-            if hashes
-                .get(&file_idx)
-                .is_some_and(|current| Arc::ptr_eq(current, &inflight))
-            {
-                hashes.remove(&file_idx);
-            }
-        }
-        match result {
-            Ok(hash) => {
-                self.opensub_hash_cache
-                    .lock()
-                    .await
-                    .insert(file_idx, hash.clone());
-                Ok(hash)
-            }
-            Err(error) => Err(anyhow::anyhow!(error)),
-        }
-    }
-
-    async fn calculate_opensub_hash(self: &Arc<Self>, file_idx: usize) -> anyhow::Result<String> {
-        let files = self.handle.get_files().await;
-        if file_idx >= files.len() {
-            return Err(anyhow::anyhow!("File not found"));
-        }
-        let file_len = files[file_idx].length;
-
-        let file_opt = self.get_file(file_idx, 0, 255).await;
-        let mut file = file_opt.context("failed to get file handle")?;
-
-        let chunk_size = 65536u64;
-        let head_size = std::cmp::min(file_len, chunk_size);
-        let tail_size = std::cmp::min(file_len, chunk_size);
-
-        let mut head = vec![0u8; head_size as usize];
-        use tokio::io::AsyncReadExt;
-        file.seek(std::io::SeekFrom::Start(0)).await?;
-        file.read_exact(&mut head).await?;
-
-        let mut tail = vec![0u8; tail_size as usize];
-        let start_pos = file_len.saturating_sub(chunk_size);
-        file.seek(std::io::SeekFrom::Start(start_pos)).await?;
-        file.read_exact(&mut tail).await?;
-
-        Ok(opensub_hash_from_parts(&head, &tail, file_len))
-    }
-
-    pub async fn find_subtitle_tracks(&self) -> Vec<SubtitleTrack> {
-        tracing::info!(
-            "[SUBTITLES] find_subtitle_tracks called for info_hash={}",
-            self.info_hash
-        );
-        let mut tracks = Vec::new();
-        let files = self.handle.get_files().await;
-
-        // 1. Find external subtitle files in the torrent
-        for (idx, file) in files.iter().enumerate() {
-            let filename = file.name.clone();
-            let path = std::path::PathBuf::from(&filename);
-            if let Some(ext) = path.extension()
-                && let Some(ext_str) = ext.to_str()
-            {
-                let ext_lower = ext_str.to_lowercase();
-                if ["srt", "vtt", "sub", "idx", "txt", "ssa", "ass"].contains(&ext_lower.as_str()) {
-                    tracing::info!("[SUBTITLES] Found external subtitle: {}", filename);
-                    tracks.push(SubtitleTrack {
-                        id: idx,
-                        name: filename,
-                        size: file.length,
-                    });
-                }
-            }
-        }
-
-        // Embedded-subtitle demuxing (ffmpeg/ffprobe) has been removed: the
-        // client opens the video directly and selects embedded tracks itself.
-        // Only external subtitle files are reported here.
-        tracks
-    }
-
-    pub async fn get_peer_stats(&self) -> Vec<PeerStat> {
-        // Placeholder for now, handle stats() returns EngineStats which has peers count but not per-peer stats yet
-        Vec::new()
     }
 }
