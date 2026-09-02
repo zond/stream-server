@@ -61,34 +61,6 @@ impl Default for CacheConfig {
     }
 }
 
-/// Helper to identify if a path is a supported archive
-pub fn is_archive(path: &Path) -> bool {
-    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-        let ext = ext.to_lowercase();
-        // Check compound extension for .tar.gz
-        if ext == "gz"
-            && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
-            && stem.to_lowercase().ends_with(".tar")
-        {
-            return true;
-        }
-        return matches!(ext.as_str(), "zip" | "rar" | "7z" | "tar" | "tgz" | "nzb");
-    }
-    false
-}
-
-/// Helper to identify if a path is a split archive part (e.g. .part01.rar)
-/// Returns (base_name, part_number) if it is.
-#[allow(dead_code)]
-pub fn is_split_archive_part(path: &Path) -> Option<(String, u32)> {
-    if let Some(_file_name) = path.file_stem().and_then(|s| s.to_str()) {
-        // Regex-like check for .partXXX or .rXX
-        // Simple heuristic: ends with .part\d+
-        // TODO: Implement robust split detection
-    }
-    None
-}
-
 /// Trait combining AsyncRead, AsyncSeek, Send, Sync, and Unpin for trait objects
 pub trait AsyncSeekableReader: AsyncRead + AsyncSeek + Unpin + Send {}
 impl<T: AsyncRead + AsyncSeek + Unpin + Send> AsyncSeekableReader for T {}
@@ -101,10 +73,6 @@ pub trait ArchiveReader: Send + Sync {
 
     /// Open a stream for a specific file inside the archive
     async fn open_file(&self, path: &str) -> Result<Box<dyn AsyncSeekableReader>>;
-}
-
-pub async fn get_archive_reader(path: &Path) -> Result<Box<dyn ArchiveReader>> {
-    get_archive_reader_with_config(path, CacheConfig::default()).await
 }
 
 /// Create an archive reader with custom cache configuration

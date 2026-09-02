@@ -25,7 +25,6 @@ pub mod jni;
 mod archives;
 mod cache_cleaner;
 mod diagnostics;
-mod local_addon;
 mod routes;
 mod ssdp;
 mod state;
@@ -36,7 +35,7 @@ pub struct ServerConfig {
     pub http_addr: SocketAddr,
     pub https_addr: Option<SocketAddr>,
     pub public_base_url: Option<String>,
-    /// Settings, logs, certificates and the local-addon scan root. `None`
+    /// Settings, logs and certificates. `None`
     /// uses the platform config dir (needs `HOME`/`XDG_*`); embedders must
     /// set it explicitly.
     pub config_dir: Option<PathBuf>,
@@ -54,7 +53,6 @@ pub struct ServerConfig {
     pub enable_cache_cleaner: bool,
     pub enable_memory_sampler: bool,
     pub enable_ssdp_discovery: bool,
-    pub enable_local_addon_scan: bool,
     pub graceful_shutdown_timeout: Duration,
 }
 
@@ -81,7 +79,6 @@ impl ServerConfig {
             enable_cache_cleaner: true,
             enable_memory_sampler: false,
             enable_ssdp_discovery: false,
-            enable_local_addon_scan: false,
             graceful_shutdown_timeout: Duration::from_secs(3),
         }
     }
@@ -102,7 +99,6 @@ impl ServerConfig {
             enable_cache_cleaner: true,
             enable_memory_sampler: true,
             enable_ssdp_discovery: true,
-            enable_local_addon_scan: true,
             graceful_shutdown_timeout: Duration::from_secs(3),
         }
     }
@@ -439,15 +435,6 @@ pub async fn run(
         ));
     }
 
-    let local_files_dir = config_dir.join("localFiles");
-    tokio::fs::create_dir_all(&local_files_dir).await?;
-    if cfg.enable_local_addon_scan {
-        background_tasks.push(local_addon::scan_background(
-            local_files_dir.to_string_lossy().to_string(),
-            state.local_index.clone(),
-        ));
-    }
-
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel(1);
     if cfg.use_tui
         && let Some(rx) = tui_rx
@@ -661,7 +648,6 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/tar", routes::archive::router())
         .nest("/tgz", routes::archive::router())
         .nest("/nzb", routes::nzb::router())
-        .nest("/local-addon", local_addon::get_router())
         .nest("/proxy", routes::proxy::router())
         .nest("/ftp", routes::ftp::router())
         .nest("/casting", routes::casting::router())
