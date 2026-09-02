@@ -246,6 +246,17 @@ impl LibrqbitBackend {
                     persistence: Some(librqbit::SessionPersistenceConfig::Json {
                         folder: Some(download_dir.clone()),
                     }),
+                    // Pin the DHT routing-table dump next to the session
+                    // state. librqbit's default resolves through
+                    // `directories::ProjectDirs` (HOME/XDG), which has no
+                    // answer on Android and would fail `Session::new`.
+                    dht: Some(librqbit::DhtSessionConfig {
+                        persistence: Some(librqbit::dht::DhtPersistenceConfig {
+                            config_filename: Some(download_dir.join("dht.json")),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
                     connect: Some(librqbit::ConnectionOptions {
                         peer_opts: Some(librqbit::PeerConnectionOptions {
                             connect_timeout: Some(Duration::from_secs(10)),

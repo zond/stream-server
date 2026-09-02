@@ -267,3 +267,64 @@ fn stats_json_sys_reports_loadavg_and_cpus() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// On Android the embedding process has no usable home directory: `HOME` is
+/// unset and there is no passwd fallback, so every `dirs`/`directories`
+/// lookup fails. The embedded server must derive every path from the
+/// `ServerConfig` it is given and come up regardless.
+///
+/// Env vars are process-global, so the assertion runs in a re-exec of this
+/// test binary with a cleared environment (the parent only checks the exit
+/// status). On Linux `dirs` silently falls back to the passwd entry when
+/// `HOME` is unset, which would hide the bug, so the child gets a `HOME`
+/// under `/proc` instead: it resolves, but nothing can be created there,
+/// which is exactly what a `directories`-derived default path hits on
+/// Android.
+#[test]
+fn starts_without_home_env() -> anyhow::Result<()> {
+    const CHILD_MARKER: &str = "STREAM_SERVER_TEST_NO_HOME_CHILD";
+    const UNUSABLE_HOME: &str = "/proc/stream-server-no-such-home";
+
+    if std::env::var_os(CHILD_MARKER).is_none() {
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", "starts_without_home_env", "--nocapture"])
+            .env_clear()
+            .env(CHILD_MARKER, "1")
+            .env("HOME", UNUSABLE_HOME)
+            .status()?;
+        assert!(
+            status.success(),
+            "embedded server failed to start without a usable HOME: {status}"
+        );
+        return Ok(());
+    }
+
+    assert_eq!(
+        std::env::var_os("HOME").as_deref(),
+        Some(std::ffi::OsStr::new(UNUSABLE_HOME)),
+        "child must run with the unusable HOME"
+    );
+    assert!(std::env::var_os("XDG_CACHE_HOME").is_none());
+
+    let config_dir = tempfile::tempdir()?;
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        // No cache_dir: it must fall back to a location inside config_dir.
+        cache_dir: None,
+        ..stream_server::ServerConfig::default()
+    })?;
+
+    let response = reqwest::blocking::get(format!("http://{}/heartbeat", handle.http_addr()))?
+        .error_for_status()?;
+    let body: serde_json::Value = response.json()?;
+    assert_eq!(body["success"], true);
+    assert!(
+        config_dir.path().join("config").join("cache").is_dir(),
+        "cache dir must be created inside config_dir when unset"
+    );
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}

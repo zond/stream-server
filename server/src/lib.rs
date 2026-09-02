@@ -33,7 +33,14 @@ pub struct ServerConfig {
     pub http_addr: SocketAddr,
     pub https_addr: Option<SocketAddr>,
     pub public_base_url: Option<String>,
+    /// Settings, logs, certificates and the local-addon scan root. `None`
+    /// uses the platform config dir (needs `HOME`/`XDG_*`); embedders must
+    /// set it explicitly.
     pub config_dir: Option<PathBuf>,
+    /// Torrent downloads, session/DHT state and archive caches. `None`
+    /// means `config_dir/cache` when `config_dir` is set, otherwise the
+    /// platform cache dir. No environment variable is consulted once
+    /// `config_dir` is given.
     pub cache_dir: Option<PathBuf>,
     pub use_tui: bool,
     pub init_logging: bool,
@@ -178,6 +185,34 @@ pub fn start(cfg: ServerConfig) -> anyhow::Result<ServerHandle> {
     })
 }
 
+/// Resolve the config and cache directories from `cfg` alone whenever it names
+/// a `config_dir`: an unset `cache_dir` then lands *inside* the config dir
+/// instead of consulting the OS user directories. Embedders (Android in
+/// particular) run without `HOME`/`XDG_*` and no passwd fallback, so nothing
+/// on the startup path may depend on an environment-derived location. Only
+/// when neither directory is given (the desktop binary) do we fall back to the
+/// platform defaults.
+fn resolve_dirs(cfg: &ServerConfig) -> anyhow::Result<(PathBuf, PathBuf)> {
+    let config_dir = match cfg.config_dir.clone() {
+        Some(path) => path,
+        None => dirs::config_dir()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Could not find config directory; set ServerConfig::config_dir explicitly"
+                )
+            })?
+            .join("stremio-server"),
+    };
+    let cache_dir = match cfg.cache_dir.clone() {
+        Some(path) => path,
+        None if cfg.config_dir.is_some() => config_dir.join("cache"),
+        None => dirs::cache_dir()
+            .map(|dir| dir.join("stremio-server"))
+            .unwrap_or_else(|| config_dir.join("cache")),
+    };
+    Ok((config_dir, cache_dir))
+}
+
 pub async fn run(
     cfg: ServerConfig,
     mut external_shutdown_rx: tokio::sync::mpsc::Receiver<()>,
@@ -200,18 +235,7 @@ pub async fn run(
         (None, None)
     };
 
-    let config_dir = match cfg.config_dir.clone() {
-        Some(path) => path,
-        None => dirs::config_dir()
-            .ok_or_else(|| anyhow::anyhow!("Could not find config directory"))?
-            .join("stremio-server"),
-    };
-    let cache_dir = match cfg.cache_dir.clone() {
-        Some(path) => path,
-        None => dirs::cache_dir()
-            .ok_or_else(|| anyhow::anyhow!("Could not find cache directory"))?
-            .join("stremio-server"),
-    };
+    let (config_dir, cache_dir) = resolve_dirs(&cfg)?;
     let log_dir = config_dir.join("logs");
 
     tokio::fs::create_dir_all(&config_dir).await?;
