@@ -394,8 +394,9 @@ mod tests {
     async fn reads_all_written_bytes_in_order() {
         // Writer produces the whole stream (flushed so it is physically on disk)
         // and finishes; the reader must return every byte in order and then hit
-        // EOF. Driven sequentially in one task to keep it free of the poll_read
-        // finish-before-flush race (see the KNOWN RACE note).
+        // EOF. Driven sequentially in one task for a simple, deterministic check
+        // (finish() flushes before publishing completion, so no explicit flush is
+        // required for correctness here).
         let (cache, mut writer) = ProgressiveCache::new(None).await.unwrap();
         let mut reader = cache.reader().await.unwrap();
 
@@ -467,9 +468,9 @@ mod tests {
         // The reader drains all currently-written bytes (reaching the file's
         // physical end), then the writer appends more and finishes. The reader
         // must go on to read the appended tail rather than stopping at the
-        // earlier end. Guards the grow-after-EOF continuation. The writer
-        // flushes before finish() so the appended tail is visible; without the
-        // flush this hits the KNOWN RACE in poll_read and truncates.
+        // earlier end. Guards the grow-after-EOF continuation. (The dedicated
+        // finish_right_after_buffered_write_reads_full_tail test covers the
+        // finish-without-explicit-flush path that the truncation fix resolved.)
         let (cache, mut writer) = ProgressiveCache::new(None).await.unwrap();
         let mut reader = cache.reader().await.unwrap();
 
