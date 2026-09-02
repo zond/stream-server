@@ -288,7 +288,14 @@ fn starts_without_home_env() -> anyhow::Result<()> {
     if std::env::var_os(CHILD_MARKER).is_none() {
         let status = std::process::Command::new(std::env::current_exe()?)
             .args(["--exact", "starts_without_home_env", "--nocapture"])
-            .env_clear()
+            // Scrub only the home-related variables. Clearing the whole
+            // environment breaks Winsock on Windows (it needs SYSTEMROOT),
+            // which made this test fail there with os error 10106.
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_CACHE_HOME")
+            .env_remove("XDG_DATA_HOME")
+            .env_remove("XDG_STATE_HOME")
+            .env("USERPROFILE", UNUSABLE_HOME)
             .env(CHILD_MARKER, "1")
             .env("HOME", UNUSABLE_HOME)
             .status()?;
