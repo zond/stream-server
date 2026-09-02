@@ -50,7 +50,6 @@ This is not a drop-in replacement for `server.js` — the API surface it exposes
 ### Media & Archives
 - **📦 Archive Streaming**: direct playback from ZIP, 7Z, TAR, NZB, and RAR archives out of the box (all pure Rust). RAR is **on by default** via `unrar-rs`, which is GPL-3.0-or-later, so the default binary is GPL-3.0-or-later — see [License](#-license); build `--no-default-features` for an MIT binary without RAR
 - **📝 Subtitles**: external subtitle-file detection with pure-Rust SRT/ASS→VTT conversion, plus OpenSubtitles hash calculation (embedded-track extraction, which used FFmpeg, has been removed — the client handles embedded tracks itself)
-- **🎬 YouTube resolution**: resolves YouTube URLs to a direct playable stream via a managed `yt-dlp` (auto-downloaded and refreshed at runtime, not a build dependency)
 
 ### Addon & Status API
 - **🔌 Local Stremio addon**: serves a Stremio-protocol addon (`manifest.json`, `catalog`, `meta`, `stream`) over scanned local/torrent content

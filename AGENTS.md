@@ -4,7 +4,7 @@ Guidance for AI coding agents working on this repository.
 
 ## What this repo is
 
-Stream Server is a hard fork of an open-source Rust replacement for Stremio's closed-source `server.js`: a local HTTP torrent-streaming engine with archive streaming (RAR/ZIP/7Z/TAR/NZB), external subtitle detection/conversion, YouTube-URL resolution, and a small set of Stremio-adjacent status/API endpoints (`/stats.json`, `/heartbeat`, `/network-info`, `/settings`, the local addon under `/local-addon`, ...). Serves HTTP on **11470** and HTTPS on **12470** by default. **Source is MIT; default binaries are GPL-3.0-or-later** — see [Licensing](#licensing). Consumed by stremio-native (desktop) and stremio-android (JNI) today, and targeted at a new in-development Flutter + libmpv/media_kit client going forward.
+Stream Server is a hard fork of an open-source Rust replacement for Stremio's closed-source `server.js`: a local HTTP torrent-streaming engine with archive streaming (RAR/ZIP/7Z/TAR/NZB), external subtitle detection/conversion, and a small set of Stremio-adjacent status/API endpoints (`/stats.json`, `/heartbeat`, `/network-info`, `/settings`, the local addon under `/local-addon`, ...). Serves HTTP on **11470** and HTTPS on **12470** by default. **Source is MIT; default binaries are GPL-3.0-or-later** — see [Licensing](#licensing). Consumed by stremio-native (desktop) and stremio-android (JNI) today, and targeted at a new in-development Flutter + libmpv/media_kit client going forward.
 
 This fork has deliberately dropped Stremio server.js API compatibility for transcoding: there is **no HLS transcoding and no FFmpeg/FFprobe integration** (no `hlsv2` route, no probe/hwaccel endpoints, no embedded-subtitle-track extraction) — that logic, and the `ffmpeg`/`ffprobe` runtime dependency it needed, has been removed. Clients are expected to direct-play and handle codecs/subtitles themselves.
 
@@ -47,7 +47,7 @@ RAR is on by default (`unrar-rs`, `crypto-rust`) and is covered by the plain `ca
 
 ### Runtime deps
 
-None required to start the server. `yt-dlp` is auto-downloaded and refreshed at runtime by `server/src/ytdlp.rs` for YouTube-URL resolution — it is not a build dependency and its absence only affects that one feature.
+None. There is no runtime external-binary dependency at all.
 
 ## CI
 

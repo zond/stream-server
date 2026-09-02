@@ -27,7 +27,6 @@ mod ssdp;
 mod state;
 mod tui;
 mod updater;
-pub mod ytdlp;
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -303,19 +302,6 @@ pub async fn run(
             &archive_log_path,
             &json_log_path,
         );
-    }
-
-    // yt-dlp is only needed for YouTube trailers, but downloading it while a
-    // hover preview waits is very visible. Warming it here off the startup path
-    // means the first trailer usually finds it already installed, and a failure
-    // only costs the trailer rather than the server.
-    {
-        let config_dir = config_dir.clone();
-        tokio::spawn(async move {
-            if let Err(error) = ytdlp::resolve(&config_dir).await {
-                tracing::warn!(%error, "could not prepare yt-dlp; YouTube trailers will be unavailable");
-            }
-        });
     }
 
     let default_settings = routes::system::ServerSettings {
@@ -693,7 +679,6 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/subtitlesTracks", get(routes::subtitles::subtitles_tracks))
         .route("/get-https", get(routes::system::get_https))
-        .nest("/yt", routes::youtube::router())
         .nest("/rar", routes::archive::router())
         .nest("/zip", routes::archive::router())
         .nest("/7zip", routes::archive::router())
