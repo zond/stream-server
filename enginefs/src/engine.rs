@@ -249,10 +249,7 @@ impl<H: TorrentHandle> Engine<H> {
         if !self.handle.manages_playback_lifecycle()
             && priority != 255
             && start_offset == 0
-            && matches!(
-                intent,
-                PlaybackIntent::DirectInitial | PlaybackIntent::HlsInitial
-            )
+            && matches!(intent, PlaybackIntent::DirectInitial)
         {
             let prepare_start = Instant::now();
             if let Err(e) = self.handle.prepare_file_for_streaming(file_idx).await {

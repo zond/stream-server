@@ -56,9 +56,6 @@ pub enum PlaybackIntent {
     DirectInitial,
     DirectSeek,
     DirectSequential,
-    HlsInitial,
-    HlsSeek,
-    HlsSequential,
     DownloadFull,
     DownloadRange,
     ContainerMetadata,
@@ -67,25 +64,18 @@ pub enum PlaybackIntent {
 }
 
 impl PlaybackIntent {
-    pub fn is_hls(self) -> bool {
-        matches!(self, Self::HlsInitial | Self::HlsSeek | Self::HlsSequential)
-    }
-
     pub fn sequential_after_first_byte(self) -> Self {
         match self {
             Self::DirectInitial | Self::DirectSeek | Self::DirectSequential => {
                 Self::DirectSequential
             }
-            Self::HlsInitial | Self::HlsSeek | Self::HlsSequential => Self::HlsSequential,
             Self::DownloadFull | Self::DownloadRange => self,
             other => other,
         }
     }
 
     pub fn seek_for_same_family(self) -> Self {
-        if self.is_hls() {
-            Self::HlsSeek
-        } else if matches!(self, Self::DownloadFull | Self::DownloadRange) {
+        if matches!(self, Self::DownloadFull | Self::DownloadRange) {
             Self::DownloadRange
         } else {
             Self::DirectSeek
@@ -110,11 +100,8 @@ pub fn disk_backed_file_baseline_priority(intent: PlaybackIntent) -> i32 {
         // bandwidth on the requested region, so seek/startup stay fast.
         PlaybackIntent::DirectInitial
         | PlaybackIntent::DirectSeek
-        | PlaybackIntent::HlsInitial
-        | PlaybackIntent::HlsSeek
         | PlaybackIntent::ContainerMetadata
         | PlaybackIntent::DirectSequential
-        | PlaybackIntent::HlsSequential
         | PlaybackIntent::InternalProbe
         | PlaybackIntent::Background => 1,
     }
@@ -124,9 +111,8 @@ pub fn disk_backed_forward_window_pieces(intent: PlaybackIntent) -> i32 {
     match intent {
         PlaybackIntent::DownloadFull => 64,
         PlaybackIntent::DownloadRange => 8,
-        PlaybackIntent::DirectInitial | PlaybackIntent::HlsInitial => MAX_STARTUP_PIECES,
+        PlaybackIntent::DirectInitial => MAX_STARTUP_PIECES,
         PlaybackIntent::DirectSeek | PlaybackIntent::DirectSequential => 32,
-        PlaybackIntent::HlsSeek | PlaybackIntent::HlsSequential => 16,
         // The container seek index (MKV Cues / MP4 moov) spans several pieces;
         // 16 lets the 16 MB MAX_CONTAINER_METADATA_WINDOW_BYTES cap govern (via
         // cap_pieces_by_bytes) so the whole region downloads in parallel instead
@@ -142,11 +128,8 @@ pub fn disk_backed_forward_window_pieces_for(intent: PlaybackIntent, piece_lengt
     let byte_cap = match intent {
         PlaybackIntent::DownloadFull => MAX_WARM_WINDOW_BYTES,
         PlaybackIntent::DownloadRange => MAX_DOWNLOAD_RANGE_WINDOW_BYTES,
-        PlaybackIntent::DirectInitial | PlaybackIntent::HlsInitial => MAX_STARTUP_WINDOW_BYTES,
-        PlaybackIntent::DirectSeek
-        | PlaybackIntent::HlsSeek
-        | PlaybackIntent::DirectSequential
-        | PlaybackIntent::HlsSequential => MAX_SEEK_HOT_WINDOW_BYTES,
+        PlaybackIntent::DirectInitial => MAX_STARTUP_WINDOW_BYTES,
+        PlaybackIntent::DirectSeek | PlaybackIntent::DirectSequential => MAX_SEEK_HOT_WINDOW_BYTES,
         PlaybackIntent::ContainerMetadata | PlaybackIntent::InternalProbe => {
             MAX_CONTAINER_METADATA_WINDOW_BYTES
         }
@@ -165,12 +148,9 @@ pub fn librqbit_stream_lookahead_bytes(intent: PlaybackIntent) -> u64 {
     match intent {
         // First-frame latency: narrow the startup want-set (4 MiB) so the head
         // pieces verify faster than under librqbit's 32 MiB default.
-        PlaybackIntent::DirectInitial | PlaybackIntent::HlsInitial => MAX_STARTUP_WINDOW_BYTES,
+        PlaybackIntent::DirectInitial => MAX_STARTUP_WINDOW_BYTES,
         // Hot read-ahead once playing / after a seek.
-        PlaybackIntent::DirectSeek
-        | PlaybackIntent::HlsSeek
-        | PlaybackIntent::DirectSequential
-        | PlaybackIntent::HlsSequential => MAX_SEEK_HOT_WINDOW_BYTES,
+        PlaybackIntent::DirectSeek | PlaybackIntent::DirectSequential => MAX_SEEK_HOT_WINDOW_BYTES,
         PlaybackIntent::DownloadFull => MAX_WARM_WINDOW_BYTES,
         PlaybackIntent::DownloadRange => MAX_DOWNLOAD_RANGE_WINDOW_BYTES,
         PlaybackIntent::ContainerMetadata
@@ -304,11 +284,9 @@ impl PlaybackPriorityPolicy {
             .map(|bitrate| ctx.download_rate_bytes_per_sec as f64 / bitrate as f64);
 
         let mut reason = match ctx.intent {
-            PlaybackIntent::DirectInitial | PlaybackIntent::HlsInitial => "initial".to_string(),
-            PlaybackIntent::DirectSeek | PlaybackIntent::HlsSeek => "seek".to_string(),
-            PlaybackIntent::DirectSequential | PlaybackIntent::HlsSequential => {
-                "sequential".to_string()
-            }
+            PlaybackIntent::DirectInitial => "initial".to_string(),
+            PlaybackIntent::DirectSeek => "seek".to_string(),
+            PlaybackIntent::DirectSequential => "sequential".to_string(),
             PlaybackIntent::DownloadFull => "download-full".to_string(),
             PlaybackIntent::DownloadRange => "download-range".to_string(),
             PlaybackIntent::ContainerMetadata => "container-metadata".to_string(),
@@ -317,7 +295,7 @@ impl PlaybackPriorityPolicy {
         };
 
         let (mut immediate, mut hot, mut warm) = match ctx.intent {
-            PlaybackIntent::DirectInitial | PlaybackIntent::HlsInitial if !ctx.first_byte_sent => {
+            PlaybackIntent::DirectInitial if !ctx.first_byte_sent => {
                 let target_bytes = match ctx.bitrate_bytes_per_sec {
                     Some(bitrate) => bitrate.saturating_mul(10).max(MIN_STARTUP_BYTES),
                     None if ctx.file_size > 0 && ctx.file_size <= SMALL_FILE_BYTES => {
@@ -346,34 +324,23 @@ impl PlaybackPriorityPolicy {
                 // rest of the startup window rides in the hot band behind it.
                 (pieces.min(MAX_STARTUP_PIECES), pieces, 0)
             }
-            PlaybackIntent::DirectInitial
-            | PlaybackIntent::DirectSequential
-            | PlaybackIntent::HlsInitial
-            | PlaybackIntent::HlsSequential => {
-                let mut hot = dynamic_hot_window(&ctx, bitrate_ratio);
-                if ctx.intent.is_hls() {
-                    hot = hot.min(48);
-                    reason.push_str("-hls-cap");
-                }
+            PlaybackIntent::DirectInitial | PlaybackIntent::DirectSequential => {
+                let hot = dynamic_hot_window(&ctx, bitrate_ratio);
                 (2, hot, 32)
             }
             PlaybackIntent::DownloadFull => (2, 16, 0),
             PlaybackIntent::DownloadRange => (1, 4, 0),
-            PlaybackIntent::DirectSeek | PlaybackIntent::HlsSeek if !ctx.first_byte_sent => {
+            PlaybackIntent::DirectSeek if !ctx.first_byte_sent => {
                 reason.push_str("-first-piece-only");
                 (1, 1, 0)
             }
-            PlaybackIntent::DirectSeek | PlaybackIntent::HlsSeek => {
+            PlaybackIntent::DirectSeek => {
                 let mut hot = dynamic_hot_window(&ctx, bitrate_ratio).max(MIN_SEEK_HOT_PIECES);
                 let mut immediate = SEEK_IMMEDIATE_PIECES;
                 if ctx.consecutive_waits >= 3 {
                     hot = (hot * 2).min(MAX_HOT_PIECES);
                     immediate = (immediate * 2).min(hot);
                     reason.push_str("-blocked-expand");
-                }
-                if ctx.intent.is_hls() && ctx.consecutive_waits < 3 {
-                    hot = hot.min(48);
-                    reason.push_str("-hls-cap");
                 }
                 (immediate, hot, 32)
             }
@@ -383,11 +350,7 @@ impl PlaybackPriorityPolicy {
         };
 
         if matches!(ctx.memory_pressure, MemoryPressure::High) {
-            hot = hot.min(if ctx.intent.is_hls() {
-                16
-            } else {
-                MIN_SEEK_HOT_PIECES
-            });
+            hot = hot.min(MIN_SEEK_HOT_PIECES);
             warm = 0;
             reason.push_str("-memory-clamp");
         }
@@ -467,14 +430,9 @@ fn cap_pieces_by_bytes(pieces: i32, piece_length: u64, max_bytes: u64) -> i32 {
 
 fn hot_byte_cap(ctx: &PriorityContext) -> u64 {
     match ctx.intent {
-        PlaybackIntent::DirectInitial | PlaybackIntent::HlsInitial if !ctx.first_byte_sent => {
-            MAX_STARTUP_WINDOW_BYTES
-        }
-        PlaybackIntent::DirectInitial | PlaybackIntent::HlsInitial => MAX_SEEK_HOT_WINDOW_BYTES,
-        PlaybackIntent::DirectSeek
-        | PlaybackIntent::HlsSeek
-        | PlaybackIntent::DirectSequential
-        | PlaybackIntent::HlsSequential => MAX_SEEK_HOT_WINDOW_BYTES,
+        PlaybackIntent::DirectInitial if !ctx.first_byte_sent => MAX_STARTUP_WINDOW_BYTES,
+        PlaybackIntent::DirectInitial => MAX_SEEK_HOT_WINDOW_BYTES,
+        PlaybackIntent::DirectSeek | PlaybackIntent::DirectSequential => MAX_SEEK_HOT_WINDOW_BYTES,
         PlaybackIntent::DownloadFull => MAX_WARM_WINDOW_BYTES,
         PlaybackIntent::DownloadRange => MAX_DOWNLOAD_RANGE_WINDOW_BYTES,
         PlaybackIntent::ContainerMetadata | PlaybackIntent::InternalProbe => {
@@ -489,9 +447,6 @@ fn warm_byte_cap(intent: PlaybackIntent) -> u64 {
         PlaybackIntent::DirectInitial
         | PlaybackIntent::DirectSeek
         | PlaybackIntent::DirectSequential
-        | PlaybackIntent::HlsInitial
-        | PlaybackIntent::HlsSeek
-        | PlaybackIntent::HlsSequential
         | PlaybackIntent::DownloadFull => MAX_WARM_WINDOW_BYTES,
         PlaybackIntent::DownloadRange
         | PlaybackIntent::ContainerMetadata
@@ -707,25 +662,6 @@ mod tests {
     }
 
     #[test]
-    fn hls_window_is_capped_before_blocking() {
-        let mut ctx = base_context(PlaybackIntent::HlsSeek);
-        ctx.download_rate_bytes_per_sec = 12 * 1024 * 1024;
-        let decision = PlaybackPriorityPolicy::decide(ctx);
-
-        assert_eq!(decision.hot_window_pieces, 48);
-    }
-
-    #[test]
-    fn hls_blocking_can_expand_to_aggressive_window() {
-        let mut ctx = base_context(PlaybackIntent::HlsSeek);
-        ctx.download_rate_bytes_per_sec = 12 * 1024 * 1024;
-        ctx.consecutive_waits = 3;
-        let decision = PlaybackPriorityPolicy::decide(ctx);
-
-        assert!(decision.hot_window_pieces > 48);
-    }
-
-    #[test]
     fn memory_pressure_clamps_window() {
         let mut ctx = base_context(PlaybackIntent::DirectSeek);
         ctx.download_rate_bytes_per_sec = 12 * 1024 * 1024;
@@ -938,23 +874,11 @@ mod tests {
             MAX_STARTUP_WINDOW_BYTES
         );
         assert_eq!(
-            librqbit_stream_lookahead_bytes(PlaybackIntent::HlsInitial),
-            MAX_STARTUP_WINDOW_BYTES
-        );
-        assert_eq!(
             librqbit_stream_lookahead_bytes(PlaybackIntent::DirectSeek),
             MAX_SEEK_HOT_WINDOW_BYTES
         );
         assert_eq!(
-            librqbit_stream_lookahead_bytes(PlaybackIntent::HlsSeek),
-            MAX_SEEK_HOT_WINDOW_BYTES
-        );
-        assert_eq!(
             librqbit_stream_lookahead_bytes(PlaybackIntent::DirectSequential),
-            MAX_SEEK_HOT_WINDOW_BYTES
-        );
-        assert_eq!(
-            librqbit_stream_lookahead_bytes(PlaybackIntent::HlsSequential),
             MAX_SEEK_HOT_WINDOW_BYTES
         );
         assert_eq!(
@@ -983,9 +907,6 @@ mod tests {
             PlaybackIntent::DirectInitial,
             PlaybackIntent::DirectSeek,
             PlaybackIntent::DirectSequential,
-            PlaybackIntent::HlsInitial,
-            PlaybackIntent::HlsSeek,
-            PlaybackIntent::HlsSequential,
             PlaybackIntent::DownloadFull,
             PlaybackIntent::DownloadRange,
             PlaybackIntent::ContainerMetadata,

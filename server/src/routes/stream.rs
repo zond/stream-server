@@ -177,7 +177,6 @@ fn query_value_is_true(value: &str) -> bool {
 }
 
 fn playback_intent_for_request(
-    is_hls: bool,
     priority: u8,
     start: u64,
     requested_len: u64,
@@ -202,11 +201,10 @@ fn playback_intent_for_request(
         return PlaybackIntent::ContainerMetadata;
     }
 
-    match (is_hls, start == 0) {
-        (true, true) => PlaybackIntent::HlsInitial,
-        (true, false) => PlaybackIntent::HlsSeek,
-        (false, true) => PlaybackIntent::DirectInitial,
-        (false, false) => PlaybackIntent::DirectSeek,
+    if start == 0 {
+        PlaybackIntent::DirectInitial
+    } else {
+        PlaybackIntent::DirectSeek
     }
 }
 
@@ -714,7 +712,6 @@ pub async fn stream_video(
         1
     };
     let playback_intent = playback_intent_for_request(
-        false,
         priority,
         start,
         requested_content_length,
@@ -961,7 +958,7 @@ mod tests {
     #[test]
     fn full_download_uses_download_full_intent() {
         assert_eq!(
-            playback_intent_for_request(false, 1, 0, 10_000, 10_000, true, false),
+            playback_intent_for_request(1, 0, 10_000, 10_000, true, false),
             PlaybackIntent::DownloadFull
         );
     }
@@ -969,7 +966,7 @@ mod tests {
     #[test]
     fn ranged_download_uses_download_range_intent() {
         assert_eq!(
-            playback_intent_for_request(false, 1, 500, 1, 10_000, true, true),
+            playback_intent_for_request(1, 500, 1, 10_000, true, true),
             PlaybackIntent::DownloadRange
         );
     }
@@ -977,7 +974,7 @@ mod tests {
     #[test]
     fn full_file_range_download_uses_download_full_intent() {
         assert_eq!(
-            playback_intent_for_request(false, 1, 0, 10_000, 10_000, true, true),
+            playback_intent_for_request(1, 0, 10_000, 10_000, true, true),
             PlaybackIntent::DownloadFull
         );
     }
@@ -985,7 +982,7 @@ mod tests {
     #[test]
     fn resumed_full_remaining_download_uses_download_full_intent() {
         assert_eq!(
-            playback_intent_for_request(false, 1, 5_000, 5_000, 10_000, true, true),
+            playback_intent_for_request(1, 5_000, 5_000, 10_000, true, true),
             PlaybackIntent::DownloadFull
         );
     }
@@ -993,7 +990,7 @@ mod tests {
     #[test]
     fn playback_without_range_is_direct_initial_not_download() {
         assert_eq!(
-            playback_intent_for_request(false, 1, 0, 10_000, 10_000, false, false),
+            playback_intent_for_request(1, 0, 10_000, 10_000, false, false),
             PlaybackIntent::DirectInitial
         );
     }
@@ -1003,7 +1000,7 @@ mod tests {
         let file_size = 100 * 1024 * 1024;
         let tail = enginefs::backend::priorities::container_metadata_start(file_size);
         assert_eq!(
-            playback_intent_for_request(false, 1, tail, 1024, file_size, false, true),
+            playback_intent_for_request(1, tail, 1024, file_size, false, true),
             PlaybackIntent::ContainerMetadata
         );
     }
@@ -1014,7 +1011,6 @@ mod tests {
         let tail = enginefs::backend::priorities::container_metadata_start(file_size);
         assert_eq!(
             playback_intent_for_request(
-                false,
                 1,
                 tail,
                 enginefs::backend::priorities::MAX_CONTAINER_METADATA_WINDOW_BYTES + 1,
@@ -1030,7 +1026,7 @@ mod tests {
     fn small_file_non_tail_range_stays_direct_seek() {
         let file_size = 8 * 1024 * 1024;
         assert_eq!(
-            playback_intent_for_request(false, 1, 1024 * 1024, 1024, file_size, false, true),
+            playback_intent_for_request(1, 1024 * 1024, 1024, file_size, false, true),
             PlaybackIntent::DirectSeek
         );
     }
