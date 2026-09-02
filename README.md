@@ -202,6 +202,12 @@ There is no `bindings/` directory and no vcpkg apparatus: the optional C++ `libt
 
 ---
 
+## Upgrade notes
+
+- Existing desktop installs: the librqbit DHT routing table is now stored at `<cache dir>/dht.json` (it previously lived under the XDG/`directories` project dir, which does not exist on Android). The old file is simply ignored and the DHT re-bootstraps once on the first start after upgrading — a one-time, self-healing cost.
+
+---
+
 ## 📄 License
 
 **The source in this repository is MIT** — see [LICENSE](LICENSE). It contains no GPL code; the `LICENSE` file is unchanged and stays MIT.
