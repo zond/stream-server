@@ -175,4 +175,56 @@ mod tests {
 
         assert_eq!(meta.episode, None);
     }
+
+    #[test]
+    fn parses_multi_episode_file() {
+        let meta = parse_filename(Path::new("Show.S01E01E02.mkv")).unwrap();
+
+        assert_eq!(meta.season, Some(1));
+        assert_eq!(meta.episode, Some(vec![1, 2]));
+        assert_eq!(meta.type_, "series");
+    }
+
+    #[test]
+    fn episode_marker_glued_to_letters_is_not_an_episode() {
+        // The E-marker only counts when preceded by a non-alphanumeric or a
+        // digit; a letter prefix (codec/resolution noise) must not register.
+        let meta = parse_filename(Path::new("CoreE05.mkv")).unwrap();
+
+        assert_eq!(meta.episode, None);
+        assert_ne!(meta.type_, "series");
+    }
+
+    #[test]
+    fn classifies_series_movie_and_other() {
+        let series = parse_filename(Path::new("Show.S02E03.mkv")).unwrap();
+        assert_eq!(series.type_, "series");
+
+        let movie_by_year = parse_filename(Path::new("Some.Movie.2019.mkv")).unwrap();
+        assert_eq!(movie_by_year.type_, "movie");
+        assert_eq!(movie_by_year.year, Some(2019));
+
+        let movie_by_keyword = parse_filename(Path::new("Some.Movie.1080p.mkv")).unwrap();
+        assert_eq!(movie_by_keyword.type_, "movie");
+        assert_eq!(movie_by_keyword.year, None);
+
+        let other = parse_filename(Path::new("randomclip.mkv")).unwrap();
+        assert_eq!(other.type_, "other");
+    }
+
+    #[test]
+    fn truncates_name_before_first_tag_token_and_collects_tags() {
+        let meta = parse_filename(Path::new("Some.Show.2019.1080p.mkv")).unwrap();
+
+        assert_eq!(meta.name.as_deref(), Some("Some Show"));
+        assert_eq!(meta.year, Some(2019));
+        assert!(meta.tags.contains(&"1080p".to_string()));
+        assert!(meta.tags.contains(&"hd".to_string()));
+    }
+
+    #[test]
+    fn non_media_extension_returns_none() {
+        assert!(parse_filename(Path::new("movie.txt")).is_none());
+        assert!(parse_filename(Path::new("archive.zip")).is_none());
+    }
 }
