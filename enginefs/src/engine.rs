@@ -111,6 +111,121 @@ pub fn guess_file_index_in(
         .map(|(idx, _, _)| idx)
 }
 
+#[cfg(test)]
+mod guess_tests {
+    use super::{SeriesInfo, guess_file_index_in};
+    use crate::backend::BackendFileInfo;
+
+    fn f(name: &str, length: u64) -> BackendFileInfo {
+        BackendFileInfo {
+            name: name.to_string(),
+            length,
+        }
+    }
+
+    fn si(season: Option<usize>, episode: Option<usize>) -> SeriesInfo {
+        SeriesInfo { season, episode }
+    }
+
+    #[test]
+    fn sxe_tag_matches_requested_season_episode() {
+        let files = [
+            f("Show.S01E01.mkv", 100),
+            f("Show.S02E05.mkv", 200),
+            f("Show.S02E06.mkv", 150),
+        ];
+        let info = si(Some(2), Some(5));
+        assert_eq!(guess_file_index_in(&files, Some(&info)), Some(1));
+    }
+
+    #[test]
+    fn nxm_tag_matches_requested_season_episode() {
+        let files = [
+            f("Ep.2x07.mkv", 100),
+            f("Ep.3x07.mkv", 120),
+            f("Ep.3x08.mkv", 110),
+        ];
+        let info = si(Some(3), Some(7));
+        assert_eq!(guess_file_index_in(&files, Some(&info)), Some(1));
+    }
+
+    #[test]
+    fn season_only_hint_picks_largest_matching_season() {
+        let files = [
+            f("A.S01E01.mkv", 100),
+            f("B.S02E01.mkv", 100),
+            f("C.S02E05.mkv", 300),
+        ];
+        let info = si(Some(2), None);
+        assert_eq!(guess_file_index_in(&files, Some(&info)), Some(2));
+    }
+
+    #[test]
+    fn episode_only_hint_picks_largest_matching_episode() {
+        let files = [
+            f("A.S01E05.mkv", 100),
+            f("B.S02E05.mkv", 200),
+            f("C.S03E01.mkv", 100),
+        ];
+        let info = si(None, Some(5));
+        assert_eq!(guess_file_index_in(&files, Some(&info)), Some(1));
+    }
+
+    #[test]
+    fn size_tie_resolves_to_lowest_index() {
+        let files = [f("A.S01E01.mkv", 100), f("B.S01E01.mkv", 100)];
+        let info = si(Some(1), Some(1));
+        assert_eq!(guess_file_index_in(&files, Some(&info)), Some(0));
+    }
+
+    #[test]
+    fn non_media_files_never_chosen_even_when_largest() {
+        let files = [
+            f("big.nfo", 999_999),
+            f("movie.mkv", 100),
+            f("subs.srt", 5_000),
+            f("installer.exe", 8_000),
+        ];
+        // Movie case: no hints, must fall back to the only media file.
+        assert_eq!(guess_file_index_in(&files, None), Some(1));
+    }
+
+    #[test]
+    fn non_media_with_matching_tag_still_excluded() {
+        // A .nfo carrying the requested SxxEyy tag must not win over the media file.
+        let files = [f("Show.S01E01.nfo", 999_999), f("Show.S01E01.mkv", 100)];
+        let info = si(Some(1), Some(1));
+        assert_eq!(guess_file_index_in(&files, Some(&info)), Some(1));
+    }
+
+    #[test]
+    fn empty_series_info_does_not_read_resolution_as_tag() {
+        // guessFileIdx:{} (movie) => has_hints()==false: a "1920x1080" filename
+        // must NOT be treated as season 1920 episode 1080; falls back to largest.
+        let files = [f("Movie.1920x1080.mkv", 100), f("Movie.Extras.mkv", 200)];
+        let info = SeriesInfo::default();
+        assert!(!info.has_hints());
+        assert_eq!(guess_file_index_in(&files, Some(&info)), Some(1));
+    }
+
+    #[test]
+    fn no_episode_match_falls_back_to_largest_media() {
+        let files = [f("A.S01E01.mkv", 100), f("B.S02E02.mkv", 300)];
+        let info = si(Some(9), Some(9));
+        assert_eq!(guess_file_index_in(&files, Some(&info)), Some(1));
+    }
+
+    #[test]
+    fn zero_media_files_returns_none() {
+        let files = [f("a.txt", 100), f("b.nfo", 200)];
+        assert_eq!(
+            guess_file_index_in(&files, Some(&si(Some(1), Some(1)))),
+            None
+        );
+        assert_eq!(guess_file_index_in(&[], None), None);
+    }
+}
+
 pub struct Engine<H: TorrentHandle> {
     pub info_hash: String,
     pub handle: H,
