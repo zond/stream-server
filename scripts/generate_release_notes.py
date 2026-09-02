@@ -20,7 +20,6 @@ ASSET_LABELS = {
     "stream-server-windows-amd64.exe": "Windows portable",
     "stream-server-windows-amd64.msi": "Windows installer",
     "stremio-runtime-windows-amd64.exe": "Windows Stremio runtime",
-    "stream-server-updater-windows-amd64.exe": "Windows updater",
     "stream-server-linux-amd64.deb": "Debian / Ubuntu",
     "stream-server-linux-amd64": "Linux portable",
     "stream-server-linux-amd64.AppImage": "Linux AppImage",

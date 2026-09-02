@@ -18,8 +18,6 @@ pub struct AppState {
     pub log_dir: PathBuf,
     pub base_url: String,
     pub http_addr: SocketAddr,
-    pub update_install_exit_enabled: bool,
-    pub updater: Arc<crate::updater::UpdateManager>,
     pub local_index: LocalIndex,
     pub archive_cache: Arc<dashmap::DashMap<String, crate::archives::ArchiveSession>>,
     pub nzb_sessions: Arc<dashmap::DashMap<String, crate::archives::nzb::session::NzbSession>>,
@@ -85,7 +83,6 @@ impl AppState {
         log_dir: PathBuf,
     ) -> Self {
         let settings_path = config_dir.join("settings.json");
-        let updater = Arc::new(crate::updater::UpdateManager::new(config_dir.clone()));
 
         Self {
             engine,
@@ -97,8 +94,6 @@ impl AppState {
             log_dir,
             base_url: "http://127.0.0.1:11470".to_string(),
             http_addr: SocketAddr::from(([127, 0, 0, 1], 11470)),
-            update_install_exit_enabled: true,
-            updater,
             local_index: LocalIndex::new(),
             archive_cache: Arc::new(dashmap::DashMap::new()),
             nzb_sessions: Arc::new(dashmap::DashMap::new()),

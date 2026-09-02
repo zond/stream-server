@@ -43,7 +43,6 @@ jobs:
         run: |
           cargo build --release --target x86_64-pc-windows-msvc
           cargo build --release --target x86_64-pc-windows-msvc -p stremio-runtime-stub
-          cargo build --release --target x86_64-pc-windows-msvc -p updater-helper
 
       - name: Upload EXE
         uses: actions/upload-artifact@v7
@@ -52,7 +51,6 @@ jobs:
           path: |
             target/x86_64-pc-windows-msvc/release/server.exe
             target/x86_64-pc-windows-msvc/release/stremio-runtime.exe
-            target/x86_64-pc-windows-msvc/release/stream-server-updater.exe
 
       - name: Build MSI Installer
         run: cargo wix --package server --no-build --nocapture --target x86_64-pc-windows-msvc
@@ -253,7 +251,6 @@ jobs:
           # Windows
           copy_file artifacts/server-windows-amd64/server.exe stream-server-windows-amd64.exe
           copy_file artifacts/server-windows-amd64/stremio-runtime.exe stremio-runtime-windows-amd64.exe
-          copy_file artifacts/server-windows-amd64/stream-server-updater.exe stream-server-updater-windows-amd64.exe
           copy_latest artifacts/server-windows-msi "*.msi" stream-server-windows-amd64.msi
           # Linux
           copy_file artifacts/server-linux-amd64/server stream-server-linux-amd64

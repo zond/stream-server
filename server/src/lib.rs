@@ -30,7 +30,6 @@ mod routes;
 mod ssdp;
 mod state;
 mod tui;
-mod updater;
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -52,11 +51,9 @@ pub struct ServerConfig {
     pub listen_for_ctrl_c: bool,
     pub print_startup: bool,
     pub exit_process_on_shutdown_timeout: bool,
-    pub enable_update_exit: bool,
     pub enable_cache_cleaner: bool,
     pub enable_memory_sampler: bool,
     pub enable_ssdp_discovery: bool,
-    pub enable_background_update_checker: bool,
     pub enable_local_addon_scan: bool,
     pub graceful_shutdown_timeout: Duration,
 }
@@ -81,11 +78,9 @@ impl ServerConfig {
             listen_for_ctrl_c: false,
             print_startup: false,
             exit_process_on_shutdown_timeout: false,
-            enable_update_exit: false,
             enable_cache_cleaner: true,
             enable_memory_sampler: false,
             enable_ssdp_discovery: false,
-            enable_background_update_checker: false,
             enable_local_addon_scan: false,
             graceful_shutdown_timeout: Duration::from_secs(3),
         }
@@ -104,11 +99,9 @@ impl ServerConfig {
             listen_for_ctrl_c: true,
             print_startup: true,
             exit_process_on_shutdown_timeout: true,
-            enable_update_exit: true,
             enable_cache_cleaner: true,
             enable_memory_sampler: true,
             enable_ssdp_discovery: true,
-            enable_background_update_checker: true,
             enable_local_addon_scan: true,
             graceful_shutdown_timeout: Duration::from_secs(3),
         }
@@ -423,7 +416,6 @@ pub async fn run(
     );
     state.base_url = base_url.clone();
     state.http_addr = public_http_addr;
-    state.update_install_exit_enabled = cfg.enable_update_exit;
 
     {
         let settings = settings_arc.read().await;
@@ -439,14 +431,6 @@ pub async fn run(
     }
     if cfg.enable_memory_sampler {
         background_tasks.push(diagnostics::start_memory_sampler(state.clone()));
-    }
-    if cfg.enable_background_update_checker {
-        background_tasks.push(
-            state
-                .updater
-                .clone()
-                .spawn_background_checker(state.clone()),
-        );
     }
     if cfg.enable_ssdp_discovery {
         background_tasks.push(diagnostics::logging::spawn_logged(
@@ -648,7 +632,6 @@ pub fn build_router(state: AppState) -> Router {
         .route("/stats.json", get(routes::system::get_stats))
         .route("/network-info", get(routes::system::network_info))
         .route("/device-info", get(routes::system::device_info))
-        .nest("/update", routes::update::router())
         .route(
             "/settings",
             get(routes::system::get_settings).post(routes::system::set_settings),

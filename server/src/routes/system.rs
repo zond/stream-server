@@ -1,6 +1,5 @@
 use crate::routes::compat;
 use crate::state::AppState;
-use crate::updater::version::UpdateChannel;
 use axum::{
     Json,
     extract::{Query, RawQuery, State},
@@ -221,15 +220,6 @@ pub struct ServerSettings {
     pub bt_ssrf_mitigation: bool,
     #[serde(rename = "remoteHttps")]
     pub remote_https: Option<String>,
-    #[serde(rename = "autoUpdateEnabled", default = "default_auto_update_enabled")]
-    pub auto_update_enabled: bool,
-    #[serde(rename = "updateChannel", default)]
-    pub update_channel: UpdateChannel,
-    #[serde(
-        rename = "updateCheckIntervalHours",
-        default = "default_update_check_interval_hours"
-    )]
-    pub update_check_interval_hours: u64,
 
     /// Cached list of fastest trackers (ranked by RTT)
     #[serde(rename = "cachedTrackers", default)]
@@ -285,14 +275,6 @@ pub fn default_trackers_url() -> String {
 
 pub fn default_seeding_enabled() -> bool {
     true
-}
-
-pub fn default_auto_update_enabled() -> bool {
-    true
-}
-
-pub fn default_update_check_interval_hours() -> u64 {
-    6
 }
 
 pub fn default_bt_enable_dht() -> bool {
@@ -489,9 +471,6 @@ impl Default for ServerSettings {
             bt_validate_https_trackers: default_bt_validate_https_trackers(),
             bt_ssrf_mitigation: default_bt_ssrf_mitigation(),
             remote_https: None,
-            auto_update_enabled: default_auto_update_enabled(),
-            update_channel: UpdateChannel::default(),
-            update_check_interval_hours: default_update_check_interval_hours(),
             cached_trackers: Vec::new(),
             trackers_last_updated: 0,
             trackers_source_url: default_trackers_url(),
@@ -651,23 +630,6 @@ pub async fn update_settings(state: &AppState, payload: &Value) -> anyhow::Resul
             } else if let Some(s) = v.as_str() {
                 settings.remote_https = Some(s.to_string());
             }
-        }
-        if let Some(v) = obj.get("autoUpdateEnabled")
-            && let Some(enabled) = v.as_bool()
-        {
-            settings.auto_update_enabled = enabled;
-        }
-        if let Some(v) = obj.get("updateChannel").and_then(|v| v.as_str()) {
-            settings.update_channel = if v.eq_ignore_ascii_case("prerelease") {
-                UpdateChannel::Prerelease
-            } else {
-                UpdateChannel::Stable
-            };
-        }
-        if let Some(v) = obj.get("updateCheckIntervalHours")
-            && let Some(hours) = v.as_u64()
-        {
-            settings.update_check_interval_hours = hours.max(1);
         }
         if let Some(v) = obj.get("seedingEnabled")
             && let Some(enabled) = v.as_bool()
