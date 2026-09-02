@@ -1,4 +1,4 @@
-use crate::{ServerConfig, ServerHandle};
+use crate::{ServerAuth, ServerConfig, ServerHandle};
 use jni::Env;
 use jni::EnvUnowned;
 use jni::objects::{JClass, JObject, JString};
@@ -18,6 +18,26 @@ fn init_android_tls_verifier(env: &mut Env, context: JObject) -> jni::errors::Re
 #[cfg(not(target_os = "android"))]
 fn init_android_tls_verifier(_env: &mut Env, _context: JObject) -> jni::errors::Result<()> {
     Ok(())
+}
+
+/// The configuration `startServerNative` runs with: [`ServerConfig::embedded`]
+/// bound to loopback on `port`, logging to `config_dir`.
+///
+/// The control API runs with [`ServerAuth::Disabled`] here. The JNI surface
+/// returns only the base URL, so the Kotlin side -- and the stremio-core it
+/// drives -- has no way to receive a per-launch token; with a generated one
+/// every control call would get a 401. The listener is loopback-only, so the
+/// threat model is exactly what it was before the bearer token existed: any
+/// process on the device could already reach the port. Keep this in step with
+/// `stremio-android`; the JNI symbols must stay stable.
+fn jni_config(config_dir: PathBuf, cache_dir: PathBuf, port: u16) -> ServerConfig {
+    let mut cfg = ServerConfig::embedded();
+    cfg.config_dir = Some(config_dir);
+    cfg.cache_dir = Some(cache_dir);
+    cfg.http_addr = SocketAddr::from(([127, 0, 0, 1], port));
+    cfg.init_logging = true;
+    cfg.auth = ServerAuth::Disabled;
+    cfg
 }
 
 #[unsafe(no_mangle)]
@@ -67,11 +87,11 @@ pub unsafe extern "C" fn Java_com_stremio_mobile_server_JniStreamingServerContro
             return Ok(env.new_string(url)?.into_raw());
         }
 
-        let mut cfg = ServerConfig::embedded();
-        cfg.config_dir = Some(PathBuf::from(config_dir_str));
-        cfg.cache_dir = Some(PathBuf::from(cache_dir_str));
-        cfg.http_addr = SocketAddr::from(([127, 0, 0, 1], port as u16));
-        cfg.init_logging = true;
+        let cfg = jni_config(
+            PathBuf::from(config_dir_str),
+            PathBuf::from(cache_dir_str),
+            port as u16,
+        );
 
         match crate::start(cfg) {
             Ok(handle) => {
@@ -131,4 +151,38 @@ pub unsafe extern "C" fn Java_com_stremio_mobile_server_JniStreamingServerContro
         }
     })
     .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The JNI embedder cannot receive a token (the native call returns only
+    /// the URL), so its server must run the control API open; everything else
+    /// is the embedded default plus the two directories and the loopback port.
+    #[test]
+    fn jni_config_disables_auth_on_a_loopback_listener() {
+        let cfg = jni_config(
+            PathBuf::from("/data/config"),
+            PathBuf::from("/data/cache"),
+            11470,
+        );
+        assert_eq!(cfg.auth, ServerAuth::Disabled);
+        assert_eq!(cfg.http_addr, SocketAddr::from(([127, 0, 0, 1], 11470)));
+        assert!(cfg.http_addr.ip().is_loopback());
+        assert_eq!(
+            cfg.config_dir.as_deref(),
+            Some(std::path::Path::new("/data/config"))
+        );
+        assert_eq!(
+            cfg.cache_dir.as_deref(),
+            Some(std::path::Path::new("/data/cache"))
+        );
+        assert!(cfg.init_logging);
+        assert_eq!(
+            ServerConfig::embedded().auth,
+            ServerAuth::Generated,
+            "the JNI path opts out; the embedded default keeps its token"
+        );
+    }
 }
