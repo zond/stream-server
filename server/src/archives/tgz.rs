@@ -63,17 +63,25 @@ impl ArchiveReader for TgzHandler {
         let (cache, writer) = ProgressiveCache::new(None).await?;
 
         std::thread::spawn(move || {
+            // Extraction runs on a plain OS thread, so it cannot await the async
+            // writer's `finish()`. Finalize through the synchronous writer
+            // instead: it writes to an unbuffered `std::fs::File`, so its bytes
+            // are already visible to the reader's file handle and no async flush
+            // is owed. (The async `writer` is never written to on this path.)
+            let mut sync_writer = match writer.try_clone_sync() {
+                Ok(w) => w,
+                Err(e) => {
+                    writer.set_error(format!("Failed to clone writer: {}", e));
+                    return;
+                }
+            };
+
             let res = (|| -> Result<()> {
                 let file = std::fs::File::open(&path_clone)?;
                 let tar = GzDecoder::new(file);
                 let mut archive = tar::Archive::new(tar);
 
                 let mut found = false;
-
-                // Clone sync writer
-                let mut sync_writer = writer
-                    .try_clone_sync()
-                    .map_err(|e| anyhow!("Failed to clone writer: {}", e))?;
 
                 // We iterate. This is slow for large TGZ but it's the only way.
                 for entry in archive.entries()? {
@@ -93,9 +101,9 @@ impl ArchiveReader for TgzHandler {
             })();
 
             if let Err(e) = res {
-                writer.set_error(e.to_string());
+                sync_writer.set_error(e.to_string());
             } else {
-                writer.finish();
+                sync_writer.finish();
             }
         });
 

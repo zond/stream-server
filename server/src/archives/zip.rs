@@ -122,7 +122,7 @@ impl ArchiveReader for ZipHandler {
                 if let Err(e) = copy_res {
                     writer.set_error(e.to_string());
                 } else {
-                    writer.finish();
+                    writer.finish().await;
                 }
             } else {
                 writer.set_error("Failed to open entry".to_string());

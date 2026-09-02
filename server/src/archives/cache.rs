@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tempfile::NamedTempFile;
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{self, AsyncRead, AsyncSeek, AsyncWrite};
+use tokio::io::{self, AsyncRead, AsyncSeek, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Notify, watch};
 
 #[derive(Clone, Debug)]
@@ -142,7 +142,26 @@ impl AsyncWrite for CacheWriter {
 }
 
 impl CacheWriter {
-    pub fn finish(&self) {
+    /// Mark the stream complete.
+    ///
+    /// This flushes the writer's tokio `File` FIRST, then publishes
+    /// `is_complete`. The flush is load-bearing: `poll_write` bumps
+    /// `written_bytes` as soon as tokio *accepts* (buffers) a write, before the
+    /// data has been handed to the OS and made visible to the reader's separate
+    /// `File` handle. If we set `is_complete` while the tail was still buffered,
+    /// a reader that observed `is_complete` with `pos < written_bytes` would hit
+    /// EOF on bytes it cannot yet see and silently truncate the stream. Flushing
+    /// before completion guarantees every counted byte is physically visible by
+    /// the time `is_complete` is published.
+    pub async fn finish(&mut self) {
+        if let Err(e) = self.file.flush().await {
+            self.state_tx.send_modify(|state| {
+                state.error = Some(format!("flush on finish failed: {e}"));
+                state.is_complete = true;
+            });
+            self.notify.notify_waiters();
+            return;
+        }
         self.state_tx.send_modify(|state| {
             state.is_complete = true;
         });
@@ -297,17 +316,20 @@ impl AsyncRead for ProgressiveReader {
                 }
             }
 
-            // No data or read returned 0 despite claiming data availability
+            // We reach here with no readable bytes: either `pos >=
+            // written_bytes` (nothing produced beyond what we've read) or `pos <
+            // written_bytes` but the file read returned 0 (the writer counted
+            // bytes into `written_bytes` before they became visible on our File
+            // handle).
             //
-            // KNOWN RACE (pinned by tests, not fixed here): reaching this point
-            // with `pos < written_bytes` means the state advertises bytes the
-            // reader's File handle cannot yet see (the async CacheWriter updates
-            // `written_bytes` when tokio buffers the write, before it reaches
-            // disk). If `is_complete` is already set — e.g. finish() lands right
-            // after the last buffered write — this returns EOF and truncates the
-            // still-unflushed tail instead of waiting for it to become visible.
-            // See tests::reader_reads_appended_bytes_after_catching_up_to_eof.
-            if current_state.is_complete {
+            // EOF is only correct once the reader has consumed EVERY byte the
+            // writer has produced. Signal it only when `pos >= written_bytes`
+            // AND the writer is complete. While `pos < written_bytes`, the tail
+            // exists but isn't visible yet; `finish()` flushes before marking
+            // the stream complete, so those bytes are guaranteed to appear —
+            // wait for the writer's next notification and retry instead of
+            // returning a premature EOF that truncates the still-invisible tail.
+            if self.pos >= current_state.written_bytes && current_state.is_complete {
                 return Poll::Ready(Ok(()));
             }
 
@@ -380,11 +402,64 @@ mod tests {
         writer.write_all(b"hello ").await.unwrap();
         writer.write_all(b"world").await.unwrap();
         writer.flush().await.unwrap();
-        writer.finish();
+        writer.finish().await;
 
         let mut out = Vec::new();
         reader.read_to_end(&mut out).await.unwrap();
         assert_eq!(out, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn finish_right_after_buffered_write_reads_full_tail() {
+        // Regression for the tail-truncation race: the async writer bumps
+        // `written_bytes` when tokio *buffers* a write, before those bytes are
+        // flushed to disk. When `finish()` lands right after such a buffered
+        // write and a reader is racing to catch up, the reader could observe
+        // `is_complete` while `pos < written_bytes`, hit EOF on the not-yet-
+        // visible tail, and silently drop the ending of the stream.
+        //
+        // This test deliberately does NOT flush before finish() — finish() must
+        // make the buffered tail visible — and runs the writer and reader
+        // concurrently across many iterations to reliably surface the ~1-in-N
+        // interleaving. It must read back the FULL payload with no truncation
+        // and no UnexpectedEof.
+        const PAYLOAD_LEN: usize = 512 * 1024;
+        let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i % 251) as u8).collect();
+
+        for iter in 0..250 {
+            let (cache, mut writer) = ProgressiveCache::new(Some(PAYLOAD_LEN as u64))
+                .await
+                .unwrap();
+            let mut reader = cache.reader().await.unwrap();
+
+            let payload_for_writer = payload.clone();
+            let writer_task = tokio::spawn(async move {
+                writer.write_all(&payload_for_writer).await.unwrap();
+                // No explicit flush here on purpose: finish() is responsible for
+                // making every counted byte visible before completing.
+                writer.finish().await;
+            });
+
+            let mut out = Vec::new();
+            let read_res = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                reader.read_to_end(&mut out),
+            )
+            .await;
+
+            writer_task.await.unwrap();
+            read_res
+                .unwrap_or_else(|_| panic!("iteration {iter}: reader timed out"))
+                .unwrap_or_else(|e| panic!("iteration {iter}: read failed: {e}"));
+
+            assert_eq!(
+                out.len(),
+                PAYLOAD_LEN,
+                "iteration {iter}: tail truncated ({} of {PAYLOAD_LEN} bytes)",
+                out.len(),
+            );
+            assert_eq!(out, payload, "iteration {iter}: content mismatch");
+        }
     }
 
     #[tokio::test]
@@ -406,7 +481,7 @@ mod tests {
 
         writer.write_all(b"67890").await.unwrap();
         writer.flush().await.unwrap();
-        writer.finish();
+        writer.finish().await;
 
         let mut second = [0u8; 5];
         reader.read_exact(&mut second).await.unwrap();
@@ -433,7 +508,7 @@ mod tests {
 
         writer.write_all(b"0123456789").await.unwrap();
         writer.flush().await.unwrap();
-        writer.finish();
+        writer.finish().await;
 
         let pos = reader.seek(SeekFrom::End(-4)).await.unwrap();
         assert_eq!(pos, 6, "SeekFrom::End(-4) with total 10 lands at 6");
