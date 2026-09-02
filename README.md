@@ -119,6 +119,14 @@ The server starts on `http://localhost:11470` by default (compatible with standa
 
 The top-level window/phase describe the guessed stream file for `/{infoHash}/stats.json` and the requested file for `/{infoHash}/{fileIdx}/stats.json`.
 
+Both stats routes accept the same query parameters as `/{infoHash}/{fileIdx}` and behave like it when they are the first request for a torrent:
+
+- **`tr=`** (repeatable, `tracker:`-prefixed values accepted, `dht:` ignored) — trackers merged into the engine when the stats request is the one that creates it. Poll stats before the first stream request freely: the engine is created exactly as the stream route would create it, so the addon's trackers are kept for the session. Trackers can only be set by the request that creates the engine — librqbit has no API to add trackers to a torrent later (`add_trackers` is a documented no-op), so a later request carrying extra trackers does not extend the set.
+- **`f=`** (per-file route, repeatable) — file filters for resolving `fileIdx=-1`, as on the stream route.
+- **`sources`** lists the trackers the torrent was added with (`url` only; librqbit exposes no per-tracker announce counters, so `numRequests`/`numFound`/`lastStarted` are `0`/empty).
+
+**During metadata resolution** (a magnet whose info dictionary has not arrived yet) both routes answer immediately with `200` and `phase: "resolvingMetadata"`, `hasMetadata: false`, an empty `files` array, `streamLen: 0` and `sources` listing the trackers in use — the per-file route included, since there is no file list to index into yet. Requests never block on metadata, and concurrent requests for one magnet share a single resolution. Once metadata is known, a `fileIdx` that does not exist returns `404` as before.
+
 ---
 
 ## 🔧 Build Instructions
