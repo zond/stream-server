@@ -103,7 +103,13 @@ pub async fn remove_all_engines(State(state): State<AppState>) -> impl IntoRespo
     Json(json!({}))
 }
 
-/// Stremio-core /{infoHash}/create endpoint for magnet links
+/// Stremio-core /{infoHash}/create endpoint for magnet links.
+///
+/// Both variants go through `EngineFS::get_or_add_magnet`, never
+/// `add_torrent`: the hash may already be resolving for a stats poll or a
+/// stream request (and vice versa), and only one add per hash may exist or
+/// the second one's trackers are silently lost (see
+/// `routes::compat::get_or_create_engine`).
 #[derive(Deserialize)]
 pub struct CreateMagnetRequest {
     pub stream: Option<CreateMagnetStream>,
@@ -134,17 +140,13 @@ pub async fn create_magnet(
         .map(|s| s.as_str())
         .unwrap_or(&info_hash);
 
-    // Create magnet URL from info hash
-    let magnet = format!("magnet:?xt=urn:btih:{}", ih);
-    let source = enginefs::backend::TorrentSource::Url(magnet);
-
     let trackers = merged_trackers(None, payload.peer_search);
     let file_must_include = payload.file_must_include;
     let guess = parse_guess_file_idx(payload.guess_file_idx.as_ref());
 
     match state
         .stream_engine()
-        .add_torrent(source, Some(trackers))
+        .get_or_add_magnet(ih, Some(trackers))
         .await
     {
         Ok(engine) => {
@@ -153,10 +155,7 @@ pub async fn create_magnet(
         }
         // See the matching comment in create_engine: stremio-video's
         // createTorrent.js requires a non-2xx status to detect failure.
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        ),
+        Err(e) => magnet_create_failure(ih, &e),
     }
 }
 
@@ -164,19 +163,28 @@ pub async fn create_magnet_get(
     State(state): State<AppState>,
     axum::extract::Path(info_hash): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    let magnet = format!("magnet:?xt=urn:btih:{}", info_hash);
-    let source = enginefs::backend::TorrentSource::Url(magnet);
-
-    match state.stream_engine().add_torrent(source, None).await {
+    match state
+        .stream_engine()
+        .get_or_add_magnet(&info_hash, None)
+        .await
+    {
         Ok(engine) => {
             let stats = stats_with_guess(&engine, &[], None).await;
             (StatusCode::OK, Json(stats))
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        ),
+        Err(e) => magnet_create_failure(&info_hash, &e),
     }
+}
+
+/// Non-2xx JSON error for a failed `/{infoHash}/create`, with the same status
+/// mapping (504 on metadata timeout) and non-leaky message as the stream route.
+fn magnet_create_failure(
+    info_hash: &str,
+    error: &enginefs::MagnetAddError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    tracing::error!(info_hash, %error, "create_magnet failed to create engine");
+    let (status, message) = compat::engine_creation_failure(error);
+    (status, Json(json!({ "error": message })))
 }
 
 fn merged_trackers(

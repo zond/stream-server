@@ -458,6 +458,14 @@ fn stats_json_exposes_startup_phase_fields_additively() -> anyhow::Result<()> {
 /// torrent-level `resolvingMetadata` phase rather than blocking on metadata
 /// or 404ing the per-file route. A 404 is reserved for an index that does
 /// not exist once metadata is known.
+///
+/// The same holds with the roles reversed: stremio-core's
+/// `/{infoHash}/create` (POST, with the stream's `peerSearch.sources`) must
+/// join the shared magnet add rather than start a private one with
+/// `EngineFS::add_torrent`, so a stats poll arriving while the create is
+/// still resolving sees that very add, with the create's trackers. (One
+/// server instance for both flows: each embedded server takes one of only
+/// ten librqbit listen ports, and the embed tests run in parallel.)
 #[test]
 fn stats_json_reports_resolving_metadata_with_the_requests_trackers() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -505,6 +513,40 @@ fn stats_json_reports_resolving_metadata_with_the_requests_trackers() -> anyhow:
             "{path}: tr= tracker missing from sources {sources:?}"
         );
     }
+
+    // Create-first: this magnet never resolves either, so the create request
+    // blocks past the client timeout while its add lives on in the registry.
+    let create_first = "445566778899aabbccddeeff0011223344556677";
+    let create_tracker = "udp://create-first.invalid:6969/announce";
+    let created = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()?
+        .post(format!("{base}/{create_first}/create"))
+        .json(&serde_json::json!({
+            "peerSearch": { "sources": [format!("tracker:{create_tracker}")] },
+            "guessFileIdx": {}
+        }))
+        .send();
+    assert!(
+        created.is_err(),
+        "create must wait for metadata, got {created:?}"
+    );
+    let stats: serde_json::Value = client
+        .get(format!("{base}/{create_first}/stats.json"))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    assert_eq!(stats["phase"], "resolvingMetadata", "{stats}");
+    let sources: Vec<&str> = stats["sources"]
+        .as_array()
+        .expect("sources array")
+        .iter()
+        .filter_map(|s| s["url"].as_str())
+        .collect();
+    assert!(
+        sources.contains(&create_tracker),
+        "stats must report the add started by /create, with its trackers; got {sources:?}"
+    );
 
     // Once metadata is known, a file index that does not exist is still 404.
     let created: serde_json::Value = client
