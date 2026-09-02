@@ -78,34 +78,10 @@ pub async fn create_engine(
         ),
     }
 }
-pub async fn list_engines(State(state): State<AppState>) -> impl IntoResponse {
-    let engines = state.stream_engine().list_engines().await;
-    Json(json!(engines))
-}
-
-pub async fn remove_engine(
-    State(state): State<AppState>,
-    axum::extract::Path(info_hash): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    state
-        .stream_engine()
-        .remove_engine(&info_hash.to_lowercase())
-        .await;
-    Json(json!({}))
-}
-
-pub async fn remove_all_engines(State(state): State<AppState>) -> impl IntoResponse {
-    let engine_fs = state.stream_engine();
-    let engines = engine_fs.list_engines().await;
-    for ih in engines {
-        engine_fs.remove_engine(&ih).await;
-    }
-    Json(json!({}))
-}
 
 /// Stremio-core /{infoHash}/create endpoint for magnet links.
 ///
-/// Both variants go through `EngineFS::get_or_add_magnet`, never
+/// It goes through `EngineFS::get_or_add_magnet`, never
 /// `add_torrent`: the hash may already be resolving for a stats poll or a
 /// stream request (and vice versa), and only one add per hash may exist or
 /// the second one's trackers are silently lost (see
@@ -156,23 +132,6 @@ pub async fn create_magnet(
         // See the matching comment in create_engine: stremio-video's
         // createTorrent.js requires a non-2xx status to detect failure.
         Err(e) => magnet_create_failure(ih, &e),
-    }
-}
-
-pub async fn create_magnet_get(
-    State(state): State<AppState>,
-    axum::extract::Path(info_hash): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    match state
-        .stream_engine()
-        .get_or_add_magnet(&info_hash, None)
-        .await
-    {
-        Ok(engine) => {
-            let stats = stats_with_guess(&engine, &[], None).await;
-            (StatusCode::OK, Json(stats))
-        }
-        Err(e) => magnet_create_failure(&info_hash, &e),
     }
 }
 

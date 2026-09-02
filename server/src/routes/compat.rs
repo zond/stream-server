@@ -1,13 +1,8 @@
-use axum::{
-    body::Body,
-    http::{HeaderMap, HeaderValue, StatusCode, header},
-    response::{IntoResponse, Response},
-};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use enginefs::backend::librqbit::LibrqbitHandle;
 use enginefs::engine::Engine;
 use enginefs::{EngineFS, MagnetAddError};
 use regex::RegexBuilder;
-use serde_json::json;
 use std::sync::Arc;
 
 pub const DLNA_TRANSFER_MODE: &str = "Streaming";
@@ -242,16 +237,6 @@ fn parse_regex_filter(filter: &str) -> Option<(&str, &str)> {
     }
     let last_slash = filter.rfind('/')?;
     (last_slash > 0).then(|| (&filter[1..last_slash], &filter[last_slash + 1..]))
-}
-
-pub fn unsupported(feature: &str) -> Response {
-    tracing::warn!(feature, "Stremio compatibility feature is not implemented");
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        [(header::CONTENT_TYPE, "application/json")],
-        Body::from(json!({ "error": format!("{feature} is not implemented") }).to_string()),
-    )
-        .into_response()
 }
 
 #[cfg(test)]

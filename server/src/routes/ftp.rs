@@ -23,16 +23,7 @@ pub struct FtpStreamBody {
 }
 
 pub fn router() -> Router<AppState> {
-    Router::new()
-        .route("/create", get(ftp_unsupported).post(ftp_unsupported))
-        .route("/create/{key}", get(ftp_unsupported).post(ftp_unsupported))
-        .route("/stream", get(ftp_unsupported))
-        .route("/stream/{key}/{*file}", get(ftp_unsupported))
-        .route("/{filename}", get(stream_ftp))
-}
-
-async fn ftp_unsupported() -> Response {
-    compat::unsupported("FTP create/session compatibility routes")
+    Router::new().route("/{filename}", get(stream_ftp))
 }
 
 async fn stream_ftp(Path(filename): Path<String>, Query(params): Query<FtpQuery>) -> Response {

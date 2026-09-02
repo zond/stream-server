@@ -846,17 +846,6 @@ pub async fn get_https(
     .into_response()
 }
 
-pub async fn get_samples(
-    axum::extract::Path(filename): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    // Parity with /samples/:filename
-    (
-        StatusCode::NOT_FOUND,
-        format!("Sample {} not found", filename),
-    )
-        .into_response()
-}
-
 /// What a `stats.json` route reports on: an existing engine from either
 /// EngineFS (the stream route may have fallen back to the memory-only engine),
 /// else the in-flight magnet add for the hash -- started here, in the stream

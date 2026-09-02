@@ -1,15 +1,15 @@
 use crate::state::AppState;
 use axum::{
     Json, Router,
-    extract::{Path, Query},
+    extract::Path,
     http::StatusCode,
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
 };
 use serde::Deserialize;
 use serde_json::json;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct PlayerParams {
     pub source: Option<String>,
     pub paused: Option<String>,
@@ -20,13 +20,12 @@ pub struct PlayerParams {
     pub audio_track: Option<usize>,
 }
 
+/// The two casting calls stremio-core makes (models/streaming_server.rs):
+/// `GET casting` for the device list and `POST casting/{device}/player`.
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_devices))
-        .route("/transcode", get(transcode))
-        .route("/convert", get(transcode))
-        .route("/{devID}", get(get_device))
-        .route("/{devID}/player", get(player_control).post(player_control))
+        .route("/{devID}/player", post(player_control))
 }
 
 pub async fn list_devices(
@@ -36,38 +35,11 @@ pub async fn list_devices(
     Json(devices.clone())
 }
 
-pub async fn get_device(Path(dev_id): Path<String>) -> impl IntoResponse {
-    (
-        StatusCode::NOT_FOUND,
-        format!("Device {} not found", dev_id),
-    )
-        .into_response()
-}
-
-// On-the-fly DLNA transcoding used to shell out to ffmpeg. Transcoding has been
-// removed (the server is pure-Rust, direct-play only), so this reports
-// not-implemented rather than pretending to serve a transcoded stream.
-pub async fn transcode() -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({
-            "status": "not_implemented",
-            "error": { "message": "Transcoding is not supported" }
-        })),
-    )
-}
-
 pub async fn player_control(
-    method: axum::http::Method,
     Path(dev_id): Path<String>,
-    Query(query_params): Query<PlayerParams>,
     body: Option<Json<PlayerParams>>,
 ) -> impl IntoResponse {
-    let params = if method == axum::http::Method::POST {
-        body.map(|Json(b)| b).unwrap_or(query_params)
-    } else {
-        query_params
-    };
+    let params = body.map(|Json(b)| b).unwrap_or_default();
 
     // stremio-core's play_on_device (models/streaming_server.rs:716-744) POSTs
     // here and treats a successful (2xx) response as `PlayingOnDevice` — a

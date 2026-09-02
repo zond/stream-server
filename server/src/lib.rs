@@ -1,5 +1,9 @@
 use anyhow::Context;
-use axum::{Router, extract::State, http::StatusCode, response::Redirect, routing::get};
+use axum::{
+    Router,
+    http::StatusCode,
+    routing::{get, post},
+};
 use enginefs::EngineFS;
 pub use state::AppState;
 use std::{
@@ -640,7 +644,6 @@ pub fn build_router(state: AppState) -> Router {
     }
 
     Router::new()
-        .route("/", get(root_redirect))
         .route("/heartbeat", get(routes::system::heartbeat))
         .route("/stats.json", get(routes::system::get_stats))
         .route("/network-info", get(routes::system::network_info))
@@ -656,18 +659,8 @@ pub fn build_router(state: AppState) -> Router {
             "/settings",
             get(routes::system::get_settings).post(routes::system::set_settings),
         )
-        .route("/list", get(routes::engine::list_engines))
-        .route("/removeAll", get(routes::engine::remove_all_engines))
-        .route(
-            "/create",
-            get(routes::engine::create_engine).post(routes::engine::create_engine),
-        )
-        .route(
-            "/{infoHash}/create",
-            get(routes::engine::create_magnet_get).post(routes::engine::create_magnet),
-        )
-        .nest("/{ipc_key}/downloader", routes::downloader::router())
-        .route("/{infoHash}/remove", get(routes::engine::remove_engine))
+        .route("/create", post(routes::engine::create_engine))
+        .route("/{infoHash}/create", post(routes::engine::create_magnet))
         .route(
             "/{infoHash}/stats.json",
             get(routes::system::get_engine_stats),
@@ -676,7 +669,6 @@ pub fn build_router(state: AppState) -> Router {
             "/{infoHash}/{idx}/stats.json",
             get(routes::system::get_file_stats),
         )
-        .route("/{infoHash}/peers", get(routes::peers::get_peers))
         .route(
             "/stream/{infoHash}/{fileIdx}",
             get(routes::stream::stream_video).head(routes::stream::head_stream_video),
@@ -713,10 +705,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/local-addon", local_addon::get_router())
         .nest("/proxy", routes::proxy::router())
         .nest("/ftp", routes::ftp::router())
-        .route("/samples/{filename}", get(routes::system::get_samples))
-        .route("/thumb.jpg", get(|| async { StatusCode::NOT_FOUND }))
         .nest("/casting", routes::casting::router())
-        .route("/favicon.ico", get(|| async { StatusCode::NOT_FOUND }))
         .fallback(fallback_handler)
         .method_not_allowed_fallback(method_not_allowed_handler)
         .layer(
@@ -730,12 +719,4 @@ pub fn build_router(state: AppState) -> Router {
         )
         .layer(CorsLayer::permissive())
         .with_state(state)
-}
-
-async fn root_redirect(State(state): State<AppState>) -> Redirect {
-    let encoded_url = urlencoding::encode(&state.base_url);
-    Redirect::temporary(&format!(
-        "https://web.stremio.com/#/?streamingServer={}",
-        encoded_url
-    ))
 }
