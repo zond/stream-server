@@ -3,9 +3,9 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use enginefs::EngineFS;
 use enginefs::backend::librqbit::LibrqbitHandle;
 use enginefs::engine::Engine;
+use enginefs::{EngineFS, MagnetAddError};
 use regex::RegexBuilder;
 use serde_json::json;
 use std::sync::Arc;
@@ -71,14 +71,42 @@ pub fn parse_trackers(query_str: Option<&str>) -> Vec<String> {
 /// so whichever request arrives first fixes the tracker set for the whole
 /// session. A stats poll racing the first stream request must therefore not
 /// create a tracker-less engine that the stream request then silently reuses.
+///
+/// Waits at most `enginefs::METADATA_RESOLVE_TIMEOUT` for metadata; map the
+/// error with [`engine_creation_failure`].
 pub async fn get_or_create_engine(
     engine_fs: &EngineFS,
     info_hash: &str,
     query_str: Option<&str>,
-) -> anyhow::Result<Arc<Engine<LibrqbitHandle>>> {
+) -> Result<Arc<Engine<LibrqbitHandle>>, MagnetAddError> {
     engine_fs
         .get_or_add_magnet(info_hash, Some(parse_trackers(query_str)))
         .await
+}
+
+/// Status and body for a failed [`get_or_create_engine`]: a metadata timeout
+/// is 504 (the swarm did not answer in time; retrying may well succeed), a
+/// backend refusal 502, anything else 500. The bodies are fixed strings: a
+/// librqbit error can carry absolute download-dir paths, which must not be
+/// echoed to an HTTP client (log the error at the call site instead).
+pub fn engine_creation_failure(error: &MagnetAddError) -> (StatusCode, String) {
+    match error {
+        MagnetAddError::MetadataTimeout { timeout, .. } => (
+            StatusCode::GATEWAY_TIMEOUT,
+            format!(
+                "Torrent metadata did not resolve within {}s; retry shortly",
+                timeout.as_secs()
+            ),
+        ),
+        MagnetAddError::Backend { .. } => (
+            StatusCode::BAD_GATEWAY,
+            "Failed to create engine; see server logs for details".to_string(),
+        ),
+        MagnetAddError::Cancelled { .. } | MagnetAddError::TaskFailed { .. } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to create engine; see server logs for details".to_string(),
+        ),
+    }
 }
 
 pub fn basename(path: &str) -> &str {
@@ -258,6 +286,32 @@ mod tests {
             ["udp://one:6969/announce", "https://two/announce"]
         );
         assert!(parse_trackers(None).is_empty());
+    }
+
+    #[test]
+    fn engine_creation_failure_maps_metadata_timeout_to_504_without_leaking() {
+        let (status, body) = engine_creation_failure(&MagnetAddError::MetadataTimeout {
+            info_hash: "abc".into(),
+            timeout: std::time::Duration::from_secs(90),
+        });
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            body,
+            "Torrent metadata did not resolve within 90s; retry shortly"
+        );
+
+        let (status, body) = engine_creation_failure(&MagnetAddError::Backend {
+            info_hash: "abc".into(),
+            error: Arc::new(anyhow::anyhow!("cannot open /home/user/downloads/x")),
+        });
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(!body.contains("/home/user"), "{body}");
+
+        let (status, _) = engine_creation_failure(&MagnetAddError::TaskFailed {
+            info_hash: "abc".into(),
+            reason: "panicked".into(),
+        });
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]

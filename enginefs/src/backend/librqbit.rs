@@ -792,6 +792,7 @@ impl TorrentHandle for LibrqbitHandle {
             initial_window_ready_bytes: None,
             initial_window_bytes: None,
             peer_discovery,
+            error: None,
         }
     }
 

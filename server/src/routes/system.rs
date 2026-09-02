@@ -11,7 +11,7 @@ use enginefs::backend::librqbit::LibrqbitHandle;
 use enginefs::backend::{
     EngineStats, TorrentEncryptionMode, TorrentHandle, TorrentPrivacyConfig, TorrentProxyType,
 };
-use enginefs::{EngineLookup, PendingMagnetAdd};
+use enginefs::{EngineLookup, FailedMagnetAdd, PendingMagnetAdd};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -864,7 +864,9 @@ pub async fn get_samples(
 /// `tr=` trackers. Clients commonly poll stats before their first stream
 /// request, so this path must not differ from the stream route's or the
 /// session's torrent ends up tracker-less. It never waits for metadata: while
-/// the add is in flight the routes report `resolvingMetadata` stats instead.
+/// the add is in flight the routes report `resolvingMetadata` stats instead,
+/// and once an add has failed (metadata timeout, backend error) they report
+/// `phase: error` with the reason until a stream request retries it.
 async fn stats_target(
     state: &AppState,
     info_hash: &str,
@@ -880,13 +882,20 @@ async fn stats_target(
     let lookup = stream_engine
         .get_or_begin_add_magnet(info_hash, Some(compat::parse_trackers(query_str)))
         .await;
-    if let EngineLookup::Adding(pending) = &lookup {
-        tracing::debug!(
+    match &lookup {
+        EngineLookup::Adding(pending) => tracing::debug!(
             info_hash,
             context,
             trackers = pending.trackers.len(),
             "stats request while magnet metadata is resolving"
-        );
+        ),
+        EngineLookup::Failed(failed) => tracing::debug!(
+            info_hash,
+            context,
+            error = %failed.error,
+            "stats request for a failed magnet add"
+        ),
+        EngineLookup::Ready(_) => {}
     }
     lookup
 }
@@ -896,6 +905,14 @@ fn resolving_metadata_response(
     pending: &PendingMagnetAdd<LibrqbitHandle>,
 ) -> Response {
     let stats = EngineStats::resolving_metadata(info_hash, &pending.trackers);
+    Json(serde_json::to_value(stats).unwrap()).into_response()
+}
+
+/// 200 with `phase: error` and the reason: the poller asked about a torrent
+/// the engine gave up on, which is an answer, not a missing resource.
+fn magnet_add_failed_response(info_hash: &str, failed: &FailedMagnetAdd) -> Response {
+    let stats =
+        EngineStats::magnet_add_failed(info_hash, &failed.trackers, &failed.error.to_string());
     Json(serde_json::to_value(stats).unwrap()).into_response()
 }
 
@@ -909,6 +926,7 @@ pub async fn get_engine_stats(
     let engine = match stats_target(&state, &info_hash, query_str.as_deref(), "stats").await {
         EngineLookup::Ready(engine) => engine,
         EngineLookup::Adding(pending) => return resolving_metadata_response(&info_hash, &pending),
+        EngineLookup::Failed(failed) => return magnet_add_failed_response(&info_hash, &failed),
     };
 
     let stats = engine.get_statistics().await;
@@ -929,6 +947,7 @@ pub async fn get_file_stats(
     let engine = match stats_target(&state, &info_hash, query_str.as_deref(), "file-stats").await {
         EngineLookup::Ready(engine) => engine,
         EngineLookup::Adding(pending) => return resolving_metadata_response(&info_hash, &pending),
+        EngineLookup::Failed(failed) => return magnet_add_failed_response(&info_hash, &failed),
     };
 
     let files = engine.handle.get_files().await;

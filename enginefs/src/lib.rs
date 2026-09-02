@@ -6,8 +6,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::RwLock;
+use tokio::task::AbortHandle;
 use tracing::debug;
 
 pub mod backend;
@@ -35,17 +36,59 @@ use crate::backend::{
 };
 
 const INACTIVE_TORRENT_REMOVE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
+/// How long a magnet add may spend resolving metadata inside the backend
+/// before it is given up on. librqbit's `Session::add_torrent` has no timeout
+/// of its own, so without this an unresolvable magnet (no peers, dead
+/// trackers) would keep its add task and registry entry forever and every
+/// waiter would hang. 90 s is well past what a peer-less swarm needs to prove
+/// itself and short enough that a player still gets an answer. Must stay below
+/// `INACTIVE_TORRENT_REMOVE_TIMEOUT`: a `get_or_add_magnet` waiter polls the
+/// registry once and then waits at most this long, so its entry can never be
+/// swept as idle while it is still waiting.
+pub const METADATA_RESOLVE_TIMEOUT: Duration = Duration::from_secs(90);
+const _: () = assert!(
+    METADATA_RESOLVE_TIMEOUT.as_secs() < INACTIVE_TORRENT_REMOVE_TIMEOUT.as_secs(),
+    "a waiting magnet add must time out before it can be swept as idle"
+);
 const INACTIVE_TORRENT_PAUSE_GRACE: Duration = Duration::from_secs(15);
 const HLS_PLAYBACK_LEASE_TTL: Duration = Duration::from_secs(300);
 const NATIVE_LIFECYCLE_HLS_PLAYBACK_LEASE_TTL: Duration = Duration::from_secs(15);
 
-static START_TIME: OnceLock<Instant> = OnceLock::new();
+/// Process-relative clock for the idle bookkeeping. A `tokio::time::Instant`
+/// so that `now_secs()` follows paused/advanced time under
+/// `#[tokio::test(start_paused = true)]` (it is the std clock otherwise).
+static START_TIME: OnceLock<tokio::time::Instant> = OnceLock::new();
 
 type EngineRegistry<H> = Arc<RwLock<HashMap<String, Arc<Engine<H>>>>>;
 
-/// Outcome of a magnet add shared between every waiter: the engine, or the
-/// error the backend produced (`Arc` so the shared future's output is `Clone`).
-pub type MagnetAddResult<H> = Result<Arc<Engine<H>>, Arc<anyhow::Error>>;
+/// Why a shared magnet add ended without an engine. `Clone` (the backend
+/// error is `Arc`-wrapped) so it can be handed to every waiter of the shared
+/// add and kept as the add's failure record.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum MagnetAddError {
+    /// The backend did not return within [`METADATA_RESOLVE_TIMEOUT`]: no
+    /// peer supplied the info dictionary in time. Routes map this to 504.
+    #[error("metadata for {info_hash} did not resolve within {}s", .timeout.as_secs())]
+    MetadataTimeout {
+        info_hash: String,
+        timeout: Duration,
+    },
+    /// The add task was aborted (its registry entry was swept as idle).
+    #[error("magnet add for {info_hash} was cancelled")]
+    Cancelled { info_hash: String },
+    /// The add task ended abnormally (panicked) before the backend answered.
+    #[error("magnet add task for {info_hash} failed: {reason}")]
+    TaskFailed { info_hash: String, reason: String },
+    /// The backend's `add_torrent` itself failed.
+    #[error("{error:#}")]
+    Backend {
+        info_hash: String,
+        error: Arc<anyhow::Error>,
+    },
+}
+
+/// Outcome of a magnet add shared between every waiter.
+pub type MagnetAddResult<H> = Result<Arc<Engine<H>>, MagnetAddError>;
 
 /// A magnet add whose backend `add_torrent` has not returned yet.
 ///
@@ -56,11 +99,26 @@ pub type MagnetAddResult<H> = Result<Arc<Engine<H>>, Arc<anyhow::Error>>;
 /// join the wait instead of starting a duplicate resolution).
 #[derive(Clone)]
 pub struct PendingMagnetAdd<H: TorrentHandle> {
-    /// Completes when the backend add finishes; the task runs detached, so a
-    /// waiter that gives up does not cancel it.
+    /// Completes when the add finishes -- with the engine, or with the
+    /// [`MagnetAddError`] that ended it (timeout included). The add runs
+    /// detached, so a waiter that gives up does not cancel it.
     pub done: Shared<BoxFuture<'static, MagnetAddResult<H>>>,
     /// The merged tracker list the torrent is being added with (defaults +
     /// cached + request-supplied), for reporting while metadata resolves.
+    pub trackers: Arc<[String]>,
+    /// Identifies this add in the registry, so a late finish of a superseded
+    /// add cannot touch its successor's entry.
+    id: u64,
+    /// Aborts the add task; used when the registry sweeps the entry as idle.
+    abort: AbortHandle,
+}
+
+/// The failure record a magnet add leaves behind: the error that ended it and
+/// the trackers it ran with, so a non-blocking poller can report `phase:
+/// error` with a reason instead of an eternal `resolvingMetadata`.
+#[derive(Debug, Clone)]
+pub struct FailedMagnetAdd {
+    pub error: MagnetAddError,
     pub trackers: Arc<[String]>,
 }
 
@@ -70,10 +128,46 @@ pub enum EngineLookup<H: TorrentHandle> {
     Ready(Arc<Engine<H>>),
     /// A magnet add is in flight; await `done` for the engine.
     Adding(PendingMagnetAdd<H>),
+    /// The last add for this hash failed (timed out, backend error, task
+    /// panic) and nothing has retried it since. Only the blocking
+    /// [`BackendEngineFS::get_or_add_magnet`] retries -- a fresh play request
+    /// gets a fresh attempt, while pollers keep seeing the failure -- and the
+    /// record is dropped once nothing has asked about the hash for
+    /// `INACTIVE_TORRENT_REMOVE_TIMEOUT`.
+    Failed(FailedMagnetAdd),
 }
 
+/// What the registry knows about a magnet add that has no engine yet.
+enum MagnetAddState<H: TorrentHandle> {
+    Adding(PendingMagnetAdd<H>),
+    Failed(FailedMagnetAdd),
+}
+
+struct MagnetAddEntry<H: TorrentHandle> {
+    state: MagnetAddState<H>,
+    /// `now_secs()` of the last lookup that returned this entry; the eviction
+    /// loop drops (and aborts) entries nobody has asked about for
+    /// `INACTIVE_TORRENT_REMOVE_TIMEOUT`.
+    last_polled_secs: AtomicU64,
+}
+
+impl<H: TorrentHandle> MagnetAddEntry<H> {
+    fn touch(&self, now: u64) {
+        self.last_polled_secs.store(now, Ordering::SeqCst);
+    }
+
+    fn idle_for(&self, now: u64) -> Duration {
+        Duration::from_secs(now.saturating_sub(self.last_polled_secs.load(Ordering::SeqCst)))
+    }
+}
+
+type MagnetAddRegistry<H> = Arc<RwLock<HashMap<String, MagnetAddEntry<H>>>>;
+
 pub fn now_secs() -> u64 {
-    START_TIME.get_or_init(Instant::now).elapsed().as_secs()
+    START_TIME
+        .get_or_init(tokio::time::Instant::now)
+        .elapsed()
+        .as_secs()
 }
 
 fn hls_playback_lease_ttl_secs() -> u64 {
@@ -124,9 +218,10 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     disk_cache: Option<Arc<disk_cache::DiskCacheManager>>,
     /// When false, torrents are paused once their download completes.
     seeding_enabled: Arc<AtomicBool>,
-    /// Magnet adds still inside the backend's `add_torrent`, keyed by info
-    /// hash. See [`PendingMagnetAdd`].
-    pending_adds: Arc<RwLock<HashMap<String, PendingMagnetAdd<B::Handle>>>>,
+    /// Magnet adds still inside the backend's `add_torrent`, plus the failure
+    /// records of ones that ended without an engine, keyed by info hash. See
+    /// [`PendingMagnetAdd`] and [`FailedMagnetAdd`].
+    magnet_adds: MagnetAddRegistry<B::Handle>,
 }
 
 #[derive(Debug, Clone)]
@@ -243,7 +338,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             priority_generation: Arc::new(AtomicU64::new(0)),
             disk_cache: None,
             seeding_enabled: Arc::new(AtomicBool::new(true)),
-            pending_adds: Arc::new(RwLock::new(HashMap::new())),
+            magnet_adds: Arc::new(RwLock::new(HashMap::new())),
         };
 
         let engines_clone = engines.clone();
@@ -254,6 +349,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let active_playback_leases_clone = efs.active_playback_leases.clone();
         let active_multifile_files_clone = efs.active_multifile_files.clone();
         let seeding_flag = efs.seeding_enabled.clone();
+        let magnet_adds_clone = efs.magnet_adds.clone();
         tokio::spawn(async move {
             loop {
                 // Run fairly frequently so seeding stops promptly after the
@@ -276,6 +372,41 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     }
                     expired
                 };
+
+                // Magnet adds nobody has asked about for the inactivity window:
+                // a failure record that was never retried, or (should the add
+                // somehow outlive its own timeout) an add still in flight,
+                // whose task is aborted. Bounds the registry the way the
+                // engine sweep below bounds `engines`.
+                {
+                    let mut adds = magnet_adds_clone.write().await;
+                    adds.retain(|info_hash, entry| {
+                        let idle = entry.idle_for(now);
+                        if idle <= INACTIVE_TORRENT_REMOVE_TIMEOUT {
+                            return true;
+                        }
+                        match &entry.state {
+                            MagnetAddState::Adding(pending) => {
+                                pending.abort.abort();
+                                tracing::info!(
+                                    info_hash = %info_hash,
+                                    idle_secs = idle.as_secs(),
+                                    "Aborted idle magnet add"
+                                );
+                            }
+                            MagnetAddState::Failed(failed) => {
+                                debug!(
+                                    info_hash = %info_hash,
+                                    idle_secs = idle.as_secs(),
+                                    error = %failed.error,
+                                    "Dropped idle magnet add failure record"
+                                );
+                            }
+                        }
+                        false
+                    });
+                }
+
                 for (info_hash, file_idx) in expired_leases {
                     tracing::info!(
                         info_hash = %info_hash,
@@ -607,36 +738,76 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
 
     /// Existing engine for `info_hash`, or the in-flight magnet add for it --
     /// started here from a bare `magnet:?xt=urn:btih:` link with
-    /// `extra_trackers` merged in if neither exists. Never waits for metadata.
+    /// `extra_trackers` merged in if neither exists -- or the failure record
+    /// of the last add if it ended without an engine. Never waits for metadata
+    /// and never retries a failed add (see [`EngineLookup::Failed`]).
     ///
     /// Concurrent callers for one info hash share a single backend add: the
     /// first request's tracker list is the one used (librqbit cannot add
     /// trackers to a torrent later, see `LibrqbitHandle::add_trackers`), and
     /// the add runs detached so a poller that disconnects does not cancel the
-    /// resolution a player is waiting on.
+    /// resolution a player is waiting on. Each add is bounded by
+    /// [`METADATA_RESOLVE_TIMEOUT`].
     pub async fn get_or_begin_add_magnet(
         &self,
         info_hash: &str,
         extra_trackers: Option<Vec<String>>,
     ) -> EngineLookup<B::Handle> {
+        self.lookup_or_begin_add_magnet(info_hash, extra_trackers, false)
+            .await
+    }
+
+    /// [`Self::get_or_begin_add_magnet`], waiting for an in-flight add and
+    /// retrying a failed one.
+    pub async fn get_or_add_magnet(
+        &self,
+        info_hash: &str,
+        extra_trackers: Option<Vec<String>>,
+    ) -> Result<Arc<Engine<B::Handle>>, MagnetAddError> {
+        match self
+            .lookup_or_begin_add_magnet(info_hash, extra_trackers, true)
+            .await
+        {
+            EngineLookup::Ready(engine) => Ok(engine),
+            EngineLookup::Adding(pending) => pending.done.await,
+            EngineLookup::Failed(failed) => Err(failed.error),
+        }
+    }
+
+    async fn lookup_or_begin_add_magnet(
+        &self,
+        info_hash: &str,
+        extra_trackers: Option<Vec<String>>,
+        retry_failed: bool,
+    ) -> EngineLookup<B::Handle> {
         let info_hash = info_hash.to_lowercase();
         if let Some(engine) = self.get_engine(&info_hash).await {
             return EngineLookup::Ready(engine);
         }
-        // Merge before taking the pending lock: the tracker manager may
+        // Merge before taking the registry lock: the tracker manager may
         // refresh its list over the network.
         let trackers = self.merged_trackers(extra_trackers).await;
 
-        let mut pending = self.pending_adds.write().await;
-        // Re-check under the pending lock: an add publishes its engine before
-        // removing itself from `pending_adds`, so one of the two is always
+        let mut adds = self.magnet_adds.write().await;
+        // Re-check under the registry lock: an add publishes its engine before
+        // removing itself from the registry, so one of the two is always
         // visible here, and a finished add must not be restarted.
         if let Some(engine) = self.engines.read().await.get(&info_hash).cloned() {
             engine.touch();
             return EngineLookup::Ready(engine);
         }
-        if let Some(pending) = pending.get(&info_hash) {
-            return EngineLookup::Adding(pending.clone());
+        let now = now_secs();
+        if let Some(entry) = adds.get(&info_hash) {
+            entry.touch(now);
+            match &entry.state {
+                MagnetAddState::Adding(pending) => return EngineLookup::Adding(pending.clone()),
+                MagnetAddState::Failed(failed) if !retry_failed => {
+                    return EngineLookup::Failed(failed.clone());
+                }
+                MagnetAddState::Failed(failed) => {
+                    debug!(info_hash, error = %failed.error, "Retrying failed magnet add");
+                }
+            }
         }
 
         debug!(
@@ -644,62 +815,148 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             count = trackers.len(),
             "Adding magnet with trackers"
         );
-        let backend = self.backend.clone();
-        let engines = self.engines.clone();
-        let pending_adds = self.pending_adds.clone();
-        let hash = info_hash.clone();
-        let add_trackers = trackers.clone();
-        let task = tokio::spawn(async move {
-            let source = TorrentSource::Url(format!("magnet:?xt=urn:btih:{hash}"));
-            let result = match backend.add_torrent(source, add_trackers).await {
-                Ok(handle) => Ok(Self::register_engine(&engines, handle).await),
-                Err(error) => Err(Arc::new(error)),
-            };
-            pending_adds.write().await.remove(&hash);
-            result
-        });
-        let done = task
-            .map(|joined| match joined {
+        let pending = Self::spawn_magnet_add(
+            self.backend.clone(),
+            self.engines.clone(),
+            self.magnet_adds.clone(),
+            info_hash.clone(),
+            trackers,
+        );
+        adds.insert(
+            info_hash,
+            MagnetAddEntry {
+                state: MagnetAddState::Adding(pending.clone()),
+                last_polled_secs: AtomicU64::new(now),
+            },
+        );
+        EngineLookup::Adding(pending)
+    }
+
+    /// Start the detached, time-bounded backend add for `info_hash` and the
+    /// supervisor that settles its registry entry.
+    ///
+    /// The supervisor awaits the add task's `JoinHandle`, so the entry is
+    /// settled however the add ends -- engine published (entry removed),
+    /// backend error or timeout (entry becomes its failure record), panic or
+    /// abort (likewise) -- without depending on any waiter polling `done`.
+    /// A stats poller that never awaits therefore still sees the failure.
+    fn spawn_magnet_add(
+        backend: Arc<B>,
+        engines: EngineRegistry<B::Handle>,
+        adds: MagnetAddRegistry<B::Handle>,
+        info_hash: String,
+        trackers: Vec<String>,
+    ) -> PendingMagnetAdd<B::Handle> {
+        static NEXT_ADD_ID: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT_ADD_ID.fetch_add(1, Ordering::Relaxed);
+        let trackers: Arc<[String]> = trackers.into();
+
+        let add = {
+            let hash = info_hash.clone();
+            let trackers = trackers.clone();
+            tokio::spawn(async move {
+                let source = TorrentSource::Url(format!("magnet:?xt=urn:btih:{hash}"));
+                let add = backend.add_torrent(source, trackers.to_vec());
+                match tokio::time::timeout(METADATA_RESOLVE_TIMEOUT, add).await {
+                    Ok(Ok(handle)) => Ok(Self::register_engine(&engines, handle).await),
+                    Ok(Err(error)) => Err(MagnetAddError::Backend {
+                        info_hash: hash,
+                        error: Arc::new(error),
+                    }),
+                    Err(_elapsed) => Err(MagnetAddError::MetadataTimeout {
+                        info_hash: hash,
+                        timeout: METADATA_RESOLVE_TIMEOUT,
+                    }),
+                }
+            })
+        };
+        let abort = add.abort_handle();
+
+        let supervisor = {
+            let hash = info_hash.clone();
+            let trackers = trackers.clone();
+            tokio::spawn(async move {
+                let result = match add.await {
+                    Ok(result) => result,
+                    Err(join_error) if join_error.is_cancelled() => {
+                        Err(MagnetAddError::Cancelled {
+                            info_hash: hash.clone(),
+                        })
+                    }
+                    Err(join_error) => Err(MagnetAddError::TaskFailed {
+                        info_hash: hash.clone(),
+                        reason: join_error.to_string(),
+                    }),
+                };
+                let mut adds = adds.write().await;
+                let ours = matches!(
+                    adds.get(&hash).map(|entry| &entry.state),
+                    Some(MagnetAddState::Adding(pending)) if pending.id == id
+                );
+                if ours {
+                    match &result {
+                        Ok(_) => {
+                            adds.remove(&hash);
+                        }
+                        Err(error) => {
+                            tracing::warn!(info_hash = %hash, %error, "Magnet add failed");
+                            if let Some(entry) = adds.get_mut(&hash) {
+                                entry.state = MagnetAddState::Failed(FailedMagnetAdd {
+                                    error: error.clone(),
+                                    trackers,
+                                });
+                            }
+                        }
+                    }
+                }
+                result
+            })
+        };
+        let done = supervisor
+            .map(move |joined| match joined {
                 Ok(result) => result,
-                Err(join_error) => Err(Arc::new(anyhow::anyhow!(
-                    "magnet add task failed: {join_error}"
-                ))),
+                Err(join_error) => Err(MagnetAddError::TaskFailed {
+                    info_hash,
+                    reason: format!("supervisor: {join_error}"),
+                }),
             })
             .boxed()
             .shared();
-        let entry = PendingMagnetAdd {
-            done,
-            trackers: trackers.into(),
-        };
-        pending.insert(info_hash, entry.clone());
-        EngineLookup::Adding(entry)
-    }
 
-    /// [`Self::get_or_begin_add_magnet`], waiting for an in-flight add.
-    pub async fn get_or_add_magnet(
-        &self,
-        info_hash: &str,
-        extra_trackers: Option<Vec<String>>,
-    ) -> Result<Arc<Engine<B::Handle>>> {
-        match self
-            .get_or_begin_add_magnet(info_hash, extra_trackers)
-            .await
-        {
-            EngineLookup::Ready(engine) => Ok(engine),
-            EngineLookup::Adding(pending) => pending
-                .done
-                .await
-                .map_err(|error| anyhow::anyhow!("{error:#}")),
+        PendingMagnetAdd {
+            done,
+            trackers,
+            id,
+            abort,
         }
     }
 
     /// The in-flight magnet add for `info_hash`, if its engine does not exist yet.
     pub async fn pending_magnet_add(&self, info_hash: &str) -> Option<PendingMagnetAdd<B::Handle>> {
-        self.pending_adds
-            .read()
-            .await
-            .get(&info_hash.to_lowercase())
-            .cloned()
+        match self.magnet_add_state(info_hash).await? {
+            MagnetAddState::Adding(pending) => Some(pending),
+            MagnetAddState::Failed(_) => None,
+        }
+    }
+
+    /// The failure record of the last magnet add for `info_hash`, if it ended
+    /// without an engine and has not been retried or swept since.
+    pub async fn failed_magnet_add(&self, info_hash: &str) -> Option<FailedMagnetAdd> {
+        match self.magnet_add_state(info_hash).await? {
+            MagnetAddState::Adding(_) => None,
+            MagnetAddState::Failed(failed) => Some(failed),
+        }
+    }
+
+    /// Counts as a poll of the entry for idle eviction.
+    async fn magnet_add_state(&self, info_hash: &str) -> Option<MagnetAddState<B::Handle>> {
+        let adds = self.magnet_adds.read().await;
+        let entry = adds.get(&info_hash.to_lowercase())?;
+        entry.touch(now_secs());
+        Some(match &entry.state {
+            MagnetAddState::Adding(pending) => MagnetAddState::Adding(pending.clone()),
+            MagnetAddState::Failed(failed) => MagnetAddState::Failed(failed.clone()),
+        })
     }
 
     pub async fn get_engine(&self, info_hash: &str) -> Option<Arc<Engine<B::Handle>>> {
@@ -712,7 +969,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     }
 
     pub async fn get_or_add_engine(&self, info_hash: &str) -> Result<Arc<Engine<B::Handle>>> {
-        self.get_or_add_magnet(info_hash, None).await
+        Ok(self.get_or_add_magnet(info_hash, None).await?)
     }
 
     pub async fn remove_engine(&self, info_hash: &str) {
@@ -1800,6 +2057,7 @@ mod tests {
                 initial_window_ready_bytes: None,
                 initial_window_bytes: None,
                 peer_discovery: PeerDiscovery::default(),
+                error: None,
             }
         }
 
@@ -2353,6 +2611,7 @@ mod tests {
             initial_window_ready_bytes: None,
             initial_window_bytes: None,
             peer_discovery: PeerDiscovery::default(),
+            error: None,
         };
 
         let mut stats = base.clone();
@@ -2708,12 +2967,25 @@ mod tests {
         );
     }
 
+    /// What `GatedBackend::add_torrent` does with the next add.
+    #[derive(Clone, Copy)]
+    enum AddBehaviour {
+        /// Block until `release` is notified, then hand out the fake handle.
+        WaitForRelease,
+        /// Fail immediately with this message.
+        Fail(&'static str),
+        /// Panic inside the add task.
+        Panic,
+    }
+
     /// A backend whose `add_torrent` blocks until released, standing in for
-    /// librqbit resolving a magnet's metadata inside `Session::add_torrent`.
+    /// librqbit resolving a magnet's metadata inside `Session::add_torrent`;
+    /// it can also be told to fail or panic instead.
     struct GatedBackend {
         handle: FakeHandle,
         release: Arc<tokio::sync::Notify>,
         adds: Arc<AtomicUsize>,
+        behaviour: Arc<Mutex<AddBehaviour>>,
     }
 
     #[async_trait::async_trait]
@@ -2726,8 +2998,15 @@ mod tests {
             _trackers: Vec<String>,
         ) -> Result<Self::Handle> {
             self.adds.fetch_add(1, Ordering::SeqCst);
-            self.release.notified().await;
-            Ok(self.handle.clone())
+            let behaviour = *self.behaviour.lock().unwrap();
+            match behaviour {
+                AddBehaviour::WaitForRelease => {
+                    self.release.notified().await;
+                    Ok(self.handle.clone())
+                }
+                AddBehaviour::Fail(message) => Err(anyhow::anyhow!(message)),
+                AddBehaviour::Panic => panic!("fake backend add panicked"),
+            }
         }
 
         async fn get_torrent(&self, _info_hash: &str) -> Option<Self::Handle> {
@@ -2747,13 +3026,28 @@ mod tests {
         }
     }
 
-    fn gated_enginefs() -> (
-        BackendEngineFS<GatedBackend>,
-        Arc<tokio::sync::Notify>,
-        Arc<AtomicUsize>,
-    ) {
+    struct Gated {
+        enginefs: Arc<BackendEngineFS<GatedBackend>>,
+        release: Arc<tokio::sync::Notify>,
+        adds: Arc<AtomicUsize>,
+        behaviour: Arc<Mutex<AddBehaviour>>,
+        _root: tempfile::TempDir,
+    }
+
+    impl Gated {
+        fn adds(&self) -> usize {
+            self.adds.load(Ordering::SeqCst)
+        }
+
+        fn set_behaviour(&self, behaviour: AddBehaviour) {
+            *self.behaviour.lock().unwrap() = behaviour;
+        }
+    }
+
+    fn gated_enginefs() -> Gated {
         let release = Arc::new(tokio::sync::Notify::new());
         let adds = Arc::new(AtomicUsize::new(0));
+        let behaviour = Arc::new(Mutex::new(AddBehaviour::WaitForRelease));
         let handle = FakeHandle {
             info_hash: TEST_HASH.to_string(),
             counters: Arc::new(FakeCounters::default()),
@@ -2763,18 +3057,25 @@ mod tests {
             }],
             init: FakeInit::new(true, Duration::from_secs(1)),
         };
-        let root = std::env::temp_dir().join("enginefs-pending-add-tests");
+        let root = tempfile::tempdir().unwrap();
         let enginefs = BackendEngineFS::new_with_backend(
             GatedBackend {
                 handle,
                 release: release.clone(),
                 adds: adds.clone(),
+                behaviour: behaviour.clone(),
             },
             HashMap::new(),
-            root.join("cache"),
-            root.join("downloads"),
+            root.path().join("cache"),
+            root.path().join("downloads"),
         );
-        (enginefs, release, adds)
+        Gated {
+            enginefs: Arc::new(enginefs),
+            release,
+            adds,
+            behaviour,
+            _root: root,
+        }
     }
 
     /// While the backend is still adding a magnet there is no engine, but the
@@ -2784,7 +3085,8 @@ mod tests {
     /// is gone.
     #[tokio::test]
     async fn magnet_add_is_observable_and_shared_until_the_backend_returns() {
-        let (enginefs, release, adds) = gated_enginefs();
+        let gated = gated_enginefs();
+        let enginefs = &gated.enginefs;
         let extra = "udp://extra.invalid:6969/announce".to_string();
 
         let first = enginefs
@@ -2809,11 +3111,11 @@ mod tests {
             panic!("expected to join the in-flight add");
         };
         assert!(
-            wait_until(Duration::from_secs(1), || adds.load(Ordering::SeqCst) == 1).await,
+            wait_until(Duration::from_secs(1), || gated.adds() == 1).await,
             "backend add started once"
         );
 
-        release.notify_one();
+        gated.release.notify_one();
         let engine = first.done.await.expect("add succeeds");
         let joined = second.done.await.expect("shared add succeeds");
         assert!(Arc::ptr_eq(&engine, &joined));
@@ -2828,7 +3130,7 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        assert_eq!(adds.load(Ordering::SeqCst), 1);
+        assert_eq!(gated.adds(), 1);
 
         // Now the engine is simply found.
         let EngineLookup::Ready(ready) = enginefs.get_or_begin_add_magnet(TEST_HASH, None).await
@@ -2842,8 +3144,8 @@ mod tests {
     /// the same engine from one backend add.
     #[tokio::test]
     async fn concurrent_get_or_add_magnet_waiters_share_one_add() {
-        let (enginefs, release, adds) = gated_enginefs();
-        let enginefs = Arc::new(enginefs);
+        let gated = gated_enginefs();
+        let enginefs = gated.enginefs.clone();
 
         let a = {
             let efs = enginefs.clone();
@@ -2854,15 +3156,191 @@ mod tests {
             tokio::spawn(async move { efs.get_or_add_magnet(TEST_HASH, None).await })
         };
         assert!(
-            wait_until(Duration::from_secs(1), || adds.load(Ordering::SeqCst) == 1).await,
+            wait_until(Duration::from_secs(1), || gated.adds() == 1).await,
             "exactly one backend add is started for both waiters"
         );
-        release.notify_one();
+        gated.release.notify_one();
 
         let a = a.await.unwrap().expect("first waiter");
         let b = b.await.unwrap().expect("second waiter");
         assert!(Arc::ptr_eq(&a, &b));
-        assert_eq!(adds.load(Ordering::SeqCst), 1);
+        assert_eq!(gated.adds(), 1);
+    }
+
+    /// `Result::expect_err` without `Engine: Debug`.
+    fn expect_add_error(
+        result: Result<Arc<Engine<FakeHandle>>, MagnetAddError>,
+        why: &str,
+    ) -> MagnetAddError {
+        match result {
+            Err(error) => error,
+            Ok(engine) => panic!("{why}: unexpectedly got engine {}", engine.info_hash),
+        }
+    }
+
+    fn spawn_get_or_add(
+        enginefs: &Arc<BackendEngineFS<GatedBackend>>,
+        trackers: Option<Vec<String>>,
+    ) -> tokio::task::JoinHandle<Result<Arc<Engine<FakeHandle>>, MagnetAddError>> {
+        let efs = enginefs.clone();
+        tokio::spawn(async move { efs.get_or_add_magnet(TEST_HASH, trackers).await })
+    }
+
+    /// An add the backend never answers is given up on after
+    /// `METADATA_RESOLVE_TIMEOUT`: waiters get the typed timeout error,
+    /// non-blocking lookups a failure record (with the trackers the add ran
+    /// with) rather than an eternal in-flight add, and only a blocking caller
+    /// starts a fresh attempt.
+    #[tokio::test(start_paused = true)]
+    async fn magnet_add_times_out_and_leaves_a_retryable_failure_record() {
+        let gated = gated_enginefs();
+        let enginefs = &gated.enginefs;
+        let extra = "udp://extra.invalid:6969/announce".to_string();
+
+        let started = tokio::time::Instant::now();
+        let waiter = spawn_get_or_add(enginefs, Some(vec![extra.clone()]));
+        assert!(wait_until(Duration::from_secs(1), || gated.adds() == 1).await);
+
+        let error = expect_add_error(waiter.await.unwrap(), "the backend never answers");
+        assert!(
+            matches!(
+                &error,
+                MagnetAddError::MetadataTimeout { info_hash, timeout }
+                    if info_hash == TEST_HASH && *timeout == METADATA_RESOLVE_TIMEOUT
+            ),
+            "{error:?}"
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited >= METADATA_RESOLVE_TIMEOUT && waited < METADATA_RESOLVE_TIMEOUT * 2,
+            "waited {waited:?}"
+        );
+        assert_eq!(gated.adds(), 1);
+
+        // Pollers see the failure, not a stuck add, and do not retry.
+        assert!(enginefs.pending_magnet_add(TEST_HASH).await.is_none());
+        let EngineLookup::Failed(failed) = enginefs.get_or_begin_add_magnet(TEST_HASH, None).await
+        else {
+            panic!("expected the failure record");
+        };
+        assert!(matches!(
+            failed.error,
+            MagnetAddError::MetadataTimeout { .. }
+        ));
+        assert!(failed.trackers.contains(&extra), "{:?}", failed.trackers);
+        assert_eq!(
+            enginefs
+                .failed_magnet_add(TEST_HASH)
+                .await
+                .map(|f| f.error.to_string()),
+            Some(failed.error.to_string())
+        );
+        assert_eq!(gated.adds(), 1);
+
+        // A blocking caller retries with a fresh backend add, which is shared
+        // and observable like the first one.
+        let retry = spawn_get_or_add(enginefs, None);
+        assert!(wait_until(Duration::from_secs(1), || gated.adds() == 2).await);
+        assert!(matches!(
+            enginefs.get_or_begin_add_magnet(TEST_HASH, None).await,
+            EngineLookup::Adding(_)
+        ));
+        assert!(enginefs.failed_magnet_add(TEST_HASH).await.is_none());
+        gated.release.notify_one();
+        let engine = retry.await.unwrap().expect("retry succeeds");
+        assert_eq!(engine.info_hash, TEST_HASH);
+        assert!(
+            wait_until(Duration::from_secs(1), || {
+                enginefs
+                    .magnet_adds
+                    .try_read()
+                    .is_ok_and(|adds| adds.is_empty())
+            })
+            .await,
+            "a successful add leaves no registry entry behind"
+        );
+    }
+
+    /// A backend add that panics must not leave the hash stuck in
+    /// `resolvingMetadata` forever: the waiter gets a typed error, the
+    /// registry holds a failure record, and the next blocking attempt starts
+    /// a fresh add.
+    #[tokio::test]
+    async fn panicking_magnet_add_leaves_a_failure_record_instead_of_a_stuck_add() {
+        let gated = gated_enginefs();
+        let enginefs = &gated.enginefs;
+        gated.set_behaviour(AddBehaviour::Panic);
+
+        let error = expect_add_error(
+            enginefs.get_or_add_magnet(TEST_HASH, None).await,
+            "the add task panicked",
+        );
+        assert!(
+            matches!(&error, MagnetAddError::TaskFailed { info_hash, reason }
+                if info_hash == TEST_HASH && reason.contains("panicked")),
+            "{error:?}"
+        );
+        assert!(enginefs.pending_magnet_add(TEST_HASH).await.is_none());
+        assert!(matches!(
+            enginefs.get_or_begin_add_magnet(TEST_HASH, None).await,
+            EngineLookup::Failed(_)
+        ));
+        assert_eq!(gated.adds(), 1);
+
+        gated.set_behaviour(AddBehaviour::WaitForRelease);
+        gated.release.notify_one(); // stored as a permit for the next add
+        let engine = enginefs
+            .get_or_add_magnet(TEST_HASH, None)
+            .await
+            .expect("a fresh add is started");
+        assert_eq!(engine.info_hash, TEST_HASH);
+        assert_eq!(gated.adds(), 2);
+    }
+
+    /// Failure records are kept while something keeps asking about the hash
+    /// and swept by the eviction loop once nothing has for the inactivity
+    /// window, after which a lookup starts over instead of reporting the
+    /// stale failure.
+    #[tokio::test(start_paused = true)]
+    async fn idle_magnet_add_failure_records_are_swept() {
+        let gated = gated_enginefs();
+        let enginefs = &gated.enginefs;
+        gated.set_behaviour(AddBehaviour::Fail("no peers"));
+
+        let error = expect_add_error(
+            enginefs.get_or_add_magnet(TEST_HASH, None).await,
+            "the backend refuses",
+        );
+        assert!(
+            matches!(&error, MagnetAddError::Backend { .. })
+                && error.to_string().contains("no peers"),
+            "{error:?}"
+        );
+        gated.set_behaviour(AddBehaviour::WaitForRelease);
+
+        // Polled again before the window elapses: still the same record.
+        tokio::time::sleep(INACTIVE_TORRENT_REMOVE_TIMEOUT - Duration::from_secs(30)).await;
+        assert!(matches!(
+            enginefs.get_or_begin_add_magnet(TEST_HASH, None).await,
+            EngineLookup::Failed(_)
+        ));
+        assert_eq!(gated.adds(), 1);
+
+        // The poll above refreshed it, so it survives another near-window.
+        tokio::time::sleep(INACTIVE_TORRENT_REMOVE_TIMEOUT - Duration::from_secs(30)).await;
+        assert!(enginefs.failed_magnet_add(TEST_HASH).await.is_some());
+
+        // Nobody asks for a full window: swept, and the next lookup starts over.
+        tokio::time::sleep(INACTIVE_TORRENT_REMOVE_TIMEOUT + Duration::from_secs(30)).await;
+        assert!(
+            enginefs.magnet_adds.read().await.is_empty(),
+            "idle failure record was not swept"
+        );
+        assert!(matches!(
+            enginefs.get_or_begin_add_magnet(TEST_HASH, None).await,
+            EngineLookup::Adding(_)
+        ));
+        assert!(wait_until(Duration::from_secs(1), || gated.adds() == 2).await);
     }
 
     #[test]

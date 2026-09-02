@@ -373,11 +373,7 @@ pub async fn head_stream_video(
             Ok(e) => e,
             Err(e) => {
                 tracing::error!("head_stream_video: Failed to create engine: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to create engine: {}", e),
-                )
-                    .into_response();
+                return compat::engine_creation_failure(&e).into_response();
             }
         };
 
@@ -502,11 +498,7 @@ pub async fn stream_video(
             }
             Err(e) => {
                 tracing::error!(stream_id, error = %e, "stream_video failed to create engine");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to create engine: {}", e),
-                )
-                    .into_response();
+                return compat::engine_creation_failure(&e).into_response();
             }
         };
 
@@ -619,11 +611,7 @@ pub async fn stream_video(
                     error = %e,
                     "stream_video failed to create fallback memory engine"
                 );
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to create fallback memory engine: {}", e),
-                )
-                    .into_response();
+                return compat::engine_creation_failure(&e).into_response();
             }
         };
 

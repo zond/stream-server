@@ -525,6 +525,11 @@ pub struct EngineStats {
     /// Peer-discovery counters, see [`PeerDiscovery`].
     #[serde(default)]
     pub peer_discovery: PeerDiscovery,
+    /// Why `phase` is `error`, when the engine layer knows: set for a magnet
+    /// whose add ended without an engine (see
+    /// [`EngineStats::magnet_add_failed`]); absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 impl EngineStats {
@@ -585,6 +590,18 @@ impl EngineStats {
             initial_window_ready_bytes: None,
             initial_window_bytes: None,
             peer_discovery: PeerDiscovery::default(),
+            error: None,
+        }
+    }
+
+    /// Stats for a magnet whose add failed (metadata timeout, backend error)
+    /// and has not been retried: the `resolving_metadata` shape with `phase`
+    /// `error` and `error` carrying the reason, so a poller can stop waiting.
+    pub fn magnet_add_failed(info_hash: &str, trackers: &[String], error: &str) -> Self {
+        Self {
+            phase: StartupPhase::Error,
+            error: Some(error.to_string()),
+            ..Self::resolving_metadata(info_hash, trackers)
         }
     }
 
