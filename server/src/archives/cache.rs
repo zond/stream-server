@@ -16,11 +16,19 @@ struct StateSnapshot {
 }
 
 /// The core cache controller
+///
+/// The backing file is a [`NamedTempFile`] that is deleted when its last
+/// owner drops. Ownership is shared between the cache and its [`CacheWriter`]
+/// (see the `temp_file` fields), so the file outlives whichever of the two
+/// goes first. Callers routinely drop the cache as soon as they have a
+/// reader (`open_file` in the archive handlers returns only the reader), while
+/// the writer is moved into a background extraction task that may not start
+/// until later.
 #[derive(Clone)]
 pub struct ProgressiveCache {
     state_rx: watch::Receiver<StateSnapshot>,
     temp_path: PathBuf,
-    // Keep the temp file struct alive
+    // Keep the temp file alive while the cache exists
     _temp_file_handle: Arc<NamedTempFile>,
     total_size: Option<u64>,
     notify: Arc<Notify>,
@@ -78,7 +86,7 @@ impl ProgressiveCache {
             file: writer_file,
             _video_file_size: total_size,
             notify: notify.clone(),
-            path: temp_path.clone(),
+            temp_file: handle.clone(),
         };
 
         Ok((
@@ -111,7 +119,12 @@ pub struct CacheWriter {
     file: File,
     _video_file_size: Option<u64>,
     notify: Arc<Notify>,
-    path: PathBuf, // kept for sync writer creation
+    /// Co-owns the temp file with the [`ProgressiveCache`]: the writer is
+    /// typically moved into a background task that starts after the cache
+    /// (and often the reader) has been dropped, and it must not find its own
+    /// file already deleted. Also the source of handle dups for
+    /// [`Self::try_clone_sync`].
+    temp_file: Arc<NamedTempFile>,
 }
 
 impl AsyncWrite for CacheWriter {
@@ -178,8 +191,18 @@ impl CacheWriter {
 
     /// Create a synchronous writer that shares the same state.
     /// Useful for legacy/sync libraries like 7z or unrar.
+    ///
+    /// The file handle is duplicated from the temp file this writer co-owns
+    /// rather than re-opened by path. Re-opening by path raced the cache's
+    /// drop: a blocking extraction task that started after `open_file` had
+    /// returned (and dropped the `ProgressiveCache`) found the temp file
+    /// already unlinked — `No such file or directory` on Linux, `Access is
+    /// denied` on Windows where the delete is pending on the open handles.
+    /// A dup cannot fail that way, and the writer's shared ownership keeps the
+    /// file on disk regardless. (The dup shares its file offset with the
+    /// underlying temp file handle, which nothing else writes through.)
     pub fn try_clone_sync(&self) -> io::Result<SyncCacheWriter> {
-        let file = std::fs::OpenOptions::new().write(true).open(&self.path)?;
+        let file = self.temp_file.as_file().try_clone()?;
 
         Ok(SyncCacheWriter {
             state_tx: self.state_tx.clone(),
@@ -487,6 +510,29 @@ mod tests {
         let mut second = [0u8; 5];
         reader.read_exact(&mut second).await.unwrap();
         assert_eq!(&second, b"67890");
+    }
+
+    #[tokio::test]
+    async fn sync_writer_outlives_dropped_cache() {
+        // Regression for the "Failed to open cache writer: No such file or
+        // directory / Access is denied" flake: archive handlers return only the
+        // reader from `open_file` and drop the `ProgressiveCache` immediately,
+        // while the writer is moved into a blocking extraction task that may
+        // start later. The writer must still be able to produce a sync clone
+        // and stream into the file after the cache is gone.
+        let (cache, writer) = ProgressiveCache::new(Some(5)).await.unwrap();
+        let mut reader = cache.reader().await.unwrap();
+        drop(cache);
+
+        let mut sync = writer
+            .try_clone_sync()
+            .expect("sync writer clone after the cache was dropped");
+        std::io::Write::write_all(&mut sync, b"hello").unwrap();
+        sync.finish();
+
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"hello");
     }
 
     #[tokio::test]
