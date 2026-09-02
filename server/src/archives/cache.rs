@@ -352,3 +352,107 @@ impl AsyncSeek for ProgressiveReader {
         poll
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ProgressiveCache;
+    use std::io::SeekFrom;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn reads_all_written_bytes_in_order_after_finish() {
+        let (cache, mut writer) = ProgressiveCache::new(None).await.unwrap();
+        let mut reader = cache.reader().await.unwrap();
+
+        let handle = tokio::spawn(async move {
+            let mut out = Vec::new();
+            reader.read_to_end(&mut out).await.unwrap();
+            out
+        });
+
+        writer.write_all(b"hello ").await.unwrap();
+        tokio::task::yield_now().await;
+        writer.write_all(b"world").await.unwrap();
+        writer.finish();
+
+        assert_eq!(handle.await.unwrap(), b"hello world");
+    }
+
+    #[tokio::test]
+    async fn blocks_until_enough_written_without_premature_eof() {
+        let (cache, mut writer) = ProgressiveCache::new(None).await.unwrap();
+        let mut reader = cache.reader().await.unwrap();
+
+        writer.write_all(b"12345").await.unwrap();
+
+        let handle = tokio::spawn(async move {
+            let mut buf = [0u8; 10];
+            // Errors with UnexpectedEof if the reader returns EOF early.
+            reader.read_exact(&mut buf).await.unwrap();
+            buf
+        });
+
+        // Let the reader consume the 5 available bytes and park for more.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !handle.is_finished(),
+            "reader must block while the writer is behind, not return EOF"
+        );
+
+        writer.write_all(b"67890").await.unwrap();
+        writer.finish();
+
+        assert_eq!(&handle.await.unwrap(), b"1234567890");
+    }
+
+    #[tokio::test]
+    async fn set_error_propagates_to_reader() {
+        let (cache, writer) = ProgressiveCache::new(None).await.unwrap();
+        let mut reader = cache.reader().await.unwrap();
+
+        writer.set_error("boom".into());
+
+        let mut buf = [0u8; 4];
+        let err = reader.read(&mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(err.to_string().contains("boom"));
+    }
+
+    #[tokio::test]
+    async fn seek_from_end_lands_and_reads_from_offset() {
+        let (cache, mut writer) = ProgressiveCache::new(Some(10)).await.unwrap();
+        let mut reader = cache.reader().await.unwrap();
+
+        writer.write_all(b"0123456789").await.unwrap();
+        writer.finish();
+
+        let pos = reader.seek(SeekFrom::End(-4)).await.unwrap();
+        assert_eq!(pos, 6, "SeekFrom::End(-4) with total 10 lands at 6");
+
+        let mut buf = [0u8; 4];
+        reader.read_exact(&mut buf).await.unwrap();
+        assert_eq!(
+            &buf, b"6789",
+            "pos tracked so the read starts at the sought offset"
+        );
+    }
+
+    #[tokio::test]
+    async fn seek_from_end_without_total_size_errors() {
+        let (cache, _writer) = ProgressiveCache::new(None).await.unwrap();
+        let mut reader = cache.reader().await.unwrap();
+
+        let err = reader.seek(SeekFrom::End(-1)).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn seek_current_negative_past_zero_errors() {
+        let (cache, _writer) = ProgressiveCache::new(None).await.unwrap();
+        let mut reader = cache.reader().await.unwrap();
+
+        let err = reader.seek(SeekFrom::Current(-5)).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+}
