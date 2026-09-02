@@ -4,11 +4,14 @@ use crate::backend::{
     TorrentHandle, TorrentSource,
 };
 use anyhow::{Context, Result};
-use librqbit::{ManagedTorrent, Session};
+use librqbit::{ManagedTorrent, ManagedTorrentState, Session};
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
 /// Ports tried in order for librqbit's incoming BitTorrent listener. Mirrors
@@ -16,9 +19,170 @@ use tracing::{debug, warn};
 /// now binds a single address, so the fallback is done in `new()`).
 const LISTEN_PORT_RANGE: std::ops::Range<u16> = 42000..42010;
 
+/// Upper bound on how long a stream request blocks waiting for librqbit to
+/// leave its `Initializing` state (opening/hash-checking files; for a magnet
+/// the metadata has already been resolved by `Session::add_torrent`). A fresh
+/// or cached torrent initializes in well under a second; a large partially
+/// downloaded torrent on slow storage can take tens of seconds. Requests
+/// blocked on this gate mirror Stremio's server.js, which holds the HTTP
+/// request until data exists -- but they never hang forever.
+pub const TORRENT_INIT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Why a torrent could not be waited into a streamable state. Surfaced through
+/// `anyhow` so `routes/stream.rs` can downcast it into a proper non-2xx.
+#[derive(Debug, thiserror::Error)]
+pub enum TorrentInitError {
+    #[error("torrent {info_hash} is still initializing after {timeout_secs}s")]
+    TimedOut {
+        info_hash: String,
+        timeout_secs: u64,
+    },
+    #[error("torrent {info_hash} failed to initialize: {reason}")]
+    Failed { info_hash: String, reason: String },
+}
+
+/// Initialization gate shared by the real backend and the test fakes: await
+/// `wait` (librqbit's `ManagedTorrent::wait_until_initialized`, or a fake
+/// standing in for it) bounded by `timeout`. Blocks -- it never returns early
+/// with an empty result -- and maps the two failure modes to `TorrentInitError`.
+pub(crate) async fn await_initialized<F>(
+    info_hash: &str,
+    timeout: Duration,
+    wait: F,
+) -> std::result::Result<(), TorrentInitError>
+where
+    F: Future<Output = anyhow::Result<()>>,
+{
+    let start = Instant::now();
+    let result = match tokio::time::timeout(timeout, wait).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(TorrentInitError::Failed {
+            info_hash: info_hash.to_string(),
+            reason: format!("{e:#}"),
+        }),
+        Err(_elapsed) => Err(TorrentInitError::TimedOut {
+            info_hash: info_hash.to_string(),
+            timeout_secs: timeout.as_secs(),
+        }),
+    };
+    match &result {
+        Ok(()) => debug!(
+            info_hash,
+            waited_ms = start.elapsed().as_millis() as u64,
+            "torrent left the initializing state"
+        ),
+        Err(e) => warn!(
+            info_hash,
+            waited_ms = start.elapsed().as_millis() as u64,
+            error = %e,
+            "torrent did not become ready"
+        ),
+    }
+    result
+}
+
+/// A file-selection update that could not be applied because the torrent was
+/// still initializing, parked until initialization completes. Latest-wins:
+/// re-deferring replaces the queued op, and a direct apply once the torrent is
+/// ready supersedes anything still queued (`supersede`). One waiter task per
+/// slot drains the queue after the gate opens; ops are re-planned against the
+/// live selection at apply time, so a stale queued op can never clobber a
+/// newer one.
+pub(crate) struct DeferredSelection<Op> {
+    pending: Mutex<Option<Op>>,
+    waiter_running: AtomicBool,
+}
+
+impl<Op: Send + 'static> DeferredSelection<Op> {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            pending: Mutex::new(None),
+            waiter_running: AtomicBool::new(false),
+        })
+    }
+
+    /// Whether an op is queued waiting for initialization.
+    pub(crate) fn has_pending(&self) -> bool {
+        self.pending.lock().is_some()
+    }
+
+    /// Drop whatever is queued: the caller is about to apply a newer op
+    /// directly, which supersedes it.
+    pub(crate) fn supersede(&self) -> Option<Op> {
+        self.pending.lock().take()
+    }
+
+    /// Queue `op` and make sure a waiter is running. `wait` is only awaited by
+    /// a newly spawned waiter; `apply` runs for each queued op once the gate
+    /// opens. If the gate fails (timeout / init error) the queued op is dropped
+    /// with a warning -- the next direct call retries the whole cycle.
+    pub(crate) fn defer<W, A, AF>(self: &Arc<Self>, op: Op, wait: W, apply: A)
+    where
+        W: Future<Output = std::result::Result<(), TorrentInitError>> + Send + 'static,
+        A: Fn(Op) -> AF + Send + 'static,
+        AF: Future<Output = ()> + Send,
+    {
+        *self.pending.lock() = Some(op);
+        if self.waiter_running.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            let gate = wait.await;
+            loop {
+                let next = this.pending.lock().take();
+                match next {
+                    Some(op) => match &gate {
+                        Ok(()) => apply(op).await,
+                        Err(e) => warn!(
+                            error = %e,
+                            "dropping deferred file-selection update: torrent never became ready"
+                        ),
+                    },
+                    None => {
+                        this.waiter_running.store(false, Ordering::Release);
+                        // Close the race with a `defer` that queued between our
+                        // `take` and the store above: it saw the waiter running
+                        // and returned, so we must drain it.
+                        if this.has_pending() && !this.waiter_running.swap(true, Ordering::AcqRel) {
+                            continue;
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Per-torrent deferred selection slots, keyed by info hash and shared by
+/// every `LibrqbitHandle` clone (handles are re-created by `get_torrent`).
+type DeferredSelections = Arc<Mutex<HashMap<String, Arc<DeferredSelection<DeferredOp>>>>>;
+
+/// A selection op parked until the torrent initializes.
+#[derive(Debug, Clone, Copy)]
+struct DeferredOp {
+    op: SelectionOp,
+    context: &'static str,
+}
+
+/// What `apply_selection` does when the torrent is still initializing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitPolicy {
+    /// Block (bounded by `TORRENT_INIT_TIMEOUT`) and then apply. Used on the
+    /// request path right before a reader is opened, which waits anyway.
+    Wait,
+    /// Return immediately and apply once initialized. Used for reconcile,
+    /// which is also driven from background cleanup loops that must not stall.
+    Defer,
+    /// Skip: a deselect while nothing has started downloading is moot.
+    Skip,
+}
+
 pub struct LibrqbitBackend {
     pub session: Arc<Session>,
     download_dir: PathBuf,
+    deferred_selections: DeferredSelections,
 }
 
 impl LibrqbitBackend {
@@ -74,6 +238,7 @@ impl LibrqbitBackend {
                 }
             }
         };
+        let deferred_selections: DeferredSelections = Default::default();
         // Restore from session
         let mut restored_handles = session.with_torrents(|iter| {
             let mut map = HashMap::new();
@@ -85,6 +250,7 @@ impl LibrqbitBackend {
                         handle: handle.clone(),
                         info_hash,
                         session: session.clone(),
+                        deferred_selections: deferred_selections.clone(),
                     },
                 );
             }
@@ -117,6 +283,7 @@ impl LibrqbitBackend {
                                             handle,
                                             info_hash,
                                             session: session.clone(),
+                                            deferred_selections: deferred_selections.clone(),
                                         },
                                     );
                                 }
@@ -132,6 +299,7 @@ impl LibrqbitBackend {
             Self {
                 session,
                 download_dir,
+                deferred_selections,
             },
             restored_handles,
         ))
@@ -155,6 +323,7 @@ impl LibrqbitBackend {
         Ok(Self {
             session,
             download_dir,
+            deferred_selections: Default::default(),
         })
     }
 }
@@ -248,6 +417,8 @@ pub struct LibrqbitHandle {
     /// `Session::update_only_files` (librqbit persists file selection on the
     /// session, not the torrent handle).
     session: Arc<Session>,
+    /// Backend-wide deferred-selection slots (see `DeferredSelection`).
+    deferred_selections: DeferredSelections,
 }
 
 #[async_trait::async_trait]
@@ -289,6 +460,7 @@ impl TorrentBackend for LibrqbitBackend {
             handle,
             info_hash,
             session: self.session.clone(),
+            deferred_selections: self.deferred_selections.clone(),
         })
     }
 
@@ -300,6 +472,7 @@ impl TorrentBackend for LibrqbitBackend {
             handle,
             info_hash,
             session: self.session.clone(),
+            deferred_selections: self.deferred_selections.clone(),
         })
     }
 
@@ -312,6 +485,7 @@ impl TorrentBackend for LibrqbitBackend {
             .delete(id, false)
             .await
             .with_context(|| format!("failed to remove torrent {info_hash}"))?;
+        self.deferred_selections.lock().remove(info_hash);
         // Best-effort: drop the cached .torrent file so the restore path in
         // `new()` does not resurrect the torrent on the next startup.
         let cached = self
@@ -495,6 +669,10 @@ impl TorrentHandle for LibrqbitHandle {
         _bitrate: Option<u64>,
         intent: crate::backend::priorities::PlaybackIntent,
     ) -> Result<Box<dyn FileStreamTrait>> {
+        // librqbit's FileStream requires the Paused or Live state; opening it
+        // while the torrent is still Initializing fails immediately, which the
+        // HTTP route would turn into a failed first play. Block here instead.
+        self.await_initialized().await?;
         // Size the per-stream lookahead window by playback intent instead of
         // librqbit's fixed 32 MiB default: a narrow startup window verifies the
         // head pieces faster, while seeks/sequential get generous read-ahead.
@@ -533,11 +711,13 @@ impl TorrentHandle for LibrqbitHandle {
     }
 
     /// Select `file_idx` as the only wanted file (exclusive downloading, per
-    /// the trait contract) on multi-file torrents. Best-effort: selection
-    /// failures (e.g. "can't update initializing torrent" during hash-check)
-    /// are logged and swallowed because streaming callers propagate this error
-    /// with `?` and playback still works with the selection unchanged. Err is
-    /// returned only for a provably-bad file index, matching libtorrent.
+    /// the trait contract) on multi-file torrents. Blocks (bounded) while the
+    /// torrent is still Initializing -- librqbit refuses selection updates in
+    /// that state, and this runs right before the reader is opened, which has
+    /// to wait anyway. Other selection failures are best-effort: logged and
+    /// swallowed, since playback still works with the selection unchanged.
+    /// Err is returned for a provably-bad file index or when the torrent never
+    /// becomes ready (`TorrentInitError`).
     ///
     /// librqbit persists only_files across restarts; the next prepare or
     /// reconcile simply rewrites it.
@@ -557,6 +737,7 @@ impl TorrentHandle for LibrqbitHandle {
             SelectionOp::Prepare(file_idx),
             file_count,
             "prepare_file_for_streaming",
+            InitPolicy::Wait,
         )
         .await
     }
@@ -581,13 +762,18 @@ impl TorrentHandle for LibrqbitHandle {
             SelectionOp::Clear(file_idx),
             file_count,
             "clear_file_streaming",
+            InitPolicy::Skip,
         )
         .await
     }
 
     /// The engine's primary multi-file switching hook
     /// (reconcile_multifile_engine in lib.rs): want exactly the union of the
-    /// active and hot files.
+    /// active and hot files. While the torrent is Initializing the update is
+    /// deferred (latest wins) and applied as soon as librqbit accepts it, so
+    /// first-play gating takes effect instead of being silently dropped; the
+    /// call itself returns immediately because it is also driven from
+    /// background cleanup loops.
     async fn reconcile_file_priorities(&self, plan: TorrentFilePriorityPlan) -> Result<()> {
         let Some(file_count) = self.file_count_from_metadata() else {
             return Ok(());
@@ -599,6 +785,7 @@ impl TorrentHandle for LibrqbitHandle {
             },
             file_count,
             "reconcile_file_priorities",
+            InitPolicy::Defer,
         )
         .await
     }
@@ -635,15 +822,26 @@ impl TorrentHandle for LibrqbitHandle {
             "wait_for_piece_ready: begin"
         );
 
-        // Phase 1: wait for metadata (a magnet may still be resolving).
-        let metadata = loop {
-            if let Some(m) = self.handle.metadata.load_full() {
-                break m;
-            }
-            if start.elapsed() >= timeout {
-                return Ok(self.readiness(start, false, -1, 0, 1, "no-metadata".to_string()));
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        // Phase 1: wait for the torrent to leave Initializing (FileStream
+        // requires Paused or Live). Bounded by the caller's timeout and the
+        // global gate; a soft failure keeps the libtorrent-style contract.
+        if let Err(e) = await_initialized(
+            &self.info_hash,
+            timeout.min(TORRENT_INIT_TIMEOUT),
+            self.handle.wait_until_initialized(),
+        )
+        .await
+        {
+            let reason = match e {
+                TorrentInitError::TimedOut { .. } => "initializing-timeout".to_string(),
+                TorrentInitError::Failed { reason, .. } => format!("init-failed: {reason}"),
+            };
+            return Ok(self.readiness(start, false, -1, 0, 1, reason));
+        }
+        // Metadata is resolved before librqbit creates the ManagedTorrent, so
+        // this is purely defensive.
+        let Some(metadata) = self.handle.metadata.load_full() else {
+            return Ok(self.readiness(start, false, -1, 0, 1, "no-metadata".to_string()));
         };
 
         let fi = metadata
@@ -663,34 +861,28 @@ impl TorrentHandle for LibrqbitHandle {
             ));
         }
 
-        // Phase 2: open the stream, retrying while the torrent is still
-        // initializing/checking (FileStream requires Paused or Live state).
-        // Use the same intent-sized window as the real read so the priority
-        // yank moves the lookahead exactly where playback will request it.
+        // Phase 2: open the stream. Use the same intent-sized window as the
+        // real read so the priority yank moves the lookahead exactly where
+        // playback will request it.
         let lookahead = librqbit::FileStreamOptions {
             lookahead_bytes: crate::backend::priorities::librqbit_stream_lookahead_bytes(intent),
         };
-        let mut stream = loop {
-            match self
-                .handle
-                .clone()
-                .stream_with_options(file_idx, lookahead)
-                .await
-            {
-                Ok(s) => break s,
-                Err(e) => {
-                    if start.elapsed() >= timeout {
-                        return Ok(self.readiness(
-                            start,
-                            false,
-                            piece,
-                            0,
-                            1,
-                            format!("stream-unavailable: {e:#}"),
-                        ));
-                    }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
+        let mut stream = match self
+            .handle
+            .clone()
+            .stream_with_options(file_idx, lookahead)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                return Ok(self.readiness(
+                    start,
+                    false,
+                    piece,
+                    0,
+                    1,
+                    format!("stream-unavailable: {e:#}"),
+                ));
             }
         };
 
@@ -729,40 +921,162 @@ impl LibrqbitHandle {
         self.handle.metadata.load_full().map(|m| m.file_infos.len())
     }
 
-    /// Run the pure planner against the live `only_files` selection and apply
-    /// the result via `Session::update_only_files`. Best-effort: librqbit
-    /// bails while the torrent is Initializing (hash-check), and streaming
-    /// callers propagate prepare errors with `?`, so an apply failure is
-    /// logged and swallowed -- with the selection unchanged librqbit still
-    /// downloads and playback works through the blocking reader.
+    /// True while librqbit is opening/hash-checking the torrent's files. In
+    /// this state `update_only_files` bails and `FileStream` cannot be opened.
+    fn is_initializing(&self) -> bool {
+        self.handle
+            .with_state(|s| matches!(s, ManagedTorrentState::Initializing(_)))
+    }
+
+    /// Block until the torrent leaves the Initializing state, bounded by
+    /// `TORRENT_INIT_TIMEOUT`. Cheap fast path when already initialized.
+    async fn await_initialized(&self) -> std::result::Result<(), TorrentInitError> {
+        if !self.is_initializing() {
+            return Ok(());
+        }
+        debug!(
+            info_hash = %self.info_hash,
+            "torrent is initializing; holding the request until it is ready"
+        );
+        await_initialized(
+            &self.info_hash,
+            TORRENT_INIT_TIMEOUT,
+            self.handle.wait_until_initialized(),
+        )
+        .await
+    }
+
+    /// Owned `'static` gate future for a spawned deferred-selection waiter.
+    fn init_gate_future(
+        &self,
+    ) -> impl Future<Output = std::result::Result<(), TorrentInitError>> + Send + 'static {
+        let handle = self.handle.clone();
+        let info_hash = self.info_hash.clone();
+        async move {
+            await_initialized(
+                &info_hash,
+                TORRENT_INIT_TIMEOUT,
+                handle.wait_until_initialized(),
+            )
+            .await
+        }
+    }
+
+    fn deferred_selection(&self) -> Arc<DeferredSelection<DeferredOp>> {
+        self.deferred_selections
+            .lock()
+            .entry(self.info_hash.clone())
+            .or_insert_with(DeferredSelection::new)
+            .clone()
+    }
+
+    /// Park `op` until the torrent initializes (see `DeferredSelection`).
+    fn defer_selection(&self, op: SelectionOp, context: &'static str) {
+        debug!(
+            info_hash = %self.info_hash,
+            ?op,
+            context,
+            "torrent is initializing; deferring file selection until it is ready"
+        );
+        let applier = self.clone();
+        self.deferred_selection().defer(
+            DeferredOp { op, context },
+            self.init_gate_future(),
+            move |deferred: DeferredOp| {
+                let handle = applier.clone();
+                async move {
+                    let Some(file_count) = handle.file_count_from_metadata() else {
+                        return;
+                    };
+                    handle
+                        .apply_selection_now(deferred.op, file_count, deferred.context)
+                        .await;
+                }
+            },
+        );
+    }
+
+    /// Apply a selection op, handling the Initializing state per `policy`
+    /// (see `InitPolicy`). Err only for a failed/timed-out `Wait`; everything
+    /// else is best-effort and logged.
     async fn apply_selection(
         &self,
         op: SelectionOp,
         file_count: usize,
         context: &'static str,
+        policy: InitPolicy,
     ) -> Result<()> {
-        let current = self.handle.only_files();
-        let Some(set) = plan_only_files(current.as_deref(), file_count, op) else {
-            return Ok(());
-        };
-        if let Err(e) = self.session.update_only_files(&self.handle, &set).await {
-            warn!(
-                info_hash = %self.info_hash,
-                ?op,
-                context,
-                error = %e,
-                "Failed to update librqbit file selection (best-effort; selection unchanged)"
-            );
-        } else {
-            debug!(
-                info_hash = %self.info_hash,
-                ?op,
-                context,
-                selection = ?set,
-                "Updated librqbit file selection"
-            );
+        if self.is_initializing() {
+            match policy {
+                InitPolicy::Wait => self.await_initialized().await?,
+                InitPolicy::Defer => {
+                    self.defer_selection(op, context);
+                    return Ok(());
+                }
+                InitPolicy::Skip => {
+                    debug!(
+                        info_hash = %self.info_hash,
+                        ?op,
+                        context,
+                        "torrent is initializing; skipping file selection update"
+                    );
+                    return Ok(());
+                }
+            }
+        }
+        // A direct Prepare/Reconcile sets the whole selection and so supersedes
+        // anything still parked from before the torrent became ready. A Clear
+        // only removes one file and must not discard a parked reconcile.
+        if !matches!(op, SelectionOp::Clear(_)) {
+            self.deferred_selection().supersede();
+        }
+        if !self.apply_selection_now(op, file_count, context).await
+            && policy == InitPolicy::Defer
+            && self.is_initializing()
+        {
+            // Lost the race with a (re-)initialization: park it after all.
+            self.defer_selection(op, context);
         }
         Ok(())
+    }
+
+    /// Run the pure planner against the live `only_files` selection and apply
+    /// the result via `Session::update_only_files`. Returns whether librqbit
+    /// accepted the update (a no-op plan counts as accepted). Failures are
+    /// logged, not propagated: with the selection unchanged librqbit still
+    /// downloads and playback works through the blocking reader.
+    async fn apply_selection_now(
+        &self,
+        op: SelectionOp,
+        file_count: usize,
+        context: &'static str,
+    ) -> bool {
+        let current = self.handle.only_files();
+        let Some(set) = plan_only_files(current.as_deref(), file_count, op) else {
+            return true;
+        };
+        match self.session.update_only_files(&self.handle, &set).await {
+            Ok(()) => {
+                debug!(
+                    info_hash = %self.info_hash,
+                    ?op,
+                    context,
+                    selection = ?set,
+                    "Updated librqbit file selection"
+                );
+                true
+            }
+            Err(e) => {
+                warn!(
+                    info_hash = %self.info_hash,
+                    ?op,
+                    context,
+                    error = %e,
+                    "Failed to update librqbit file selection (best-effort; selection unchanged)"
+                );
+                false
+            }
+        }
     }
 
     /// Build a PieceReadiness with live peer count and download rate filled
@@ -807,6 +1121,7 @@ impl Clone for LibrqbitHandle {
             handle: self.handle.clone(),
             info_hash: self.info_hash.clone(),
             session: self.session.clone(),
+            deferred_selections: self.deferred_selections.clone(),
         }
     }
 }
@@ -1133,6 +1448,214 @@ mod tests {
         eprintln!("readiness: {r:?}");
         assert!(r.ready, "first piece did not arrive: {}", r.reason);
         assert_eq!(r.reason, "stream-read");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn await_initialized_blocks_until_ready_then_succeeds() {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let wait = {
+            let notify = notify.clone();
+            async move {
+                notify.notified().await;
+                Ok(())
+            }
+        };
+        let gate = tokio::spawn(await_initialized("abc", Duration::from_secs(60), wait));
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(!gate.is_finished(), "gate must block while initializing");
+        notify.notify_one();
+        gate.await.unwrap().expect("gate opens once initialized");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn await_initialized_times_out_and_reports_failures() {
+        let never = std::future::pending::<anyhow::Result<()>>();
+        let started = tokio::time::Instant::now();
+        let err = await_initialized("abc", Duration::from_secs(5), never)
+            .await
+            .expect_err("must time out");
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+        match err {
+            TorrentInitError::TimedOut {
+                info_hash,
+                timeout_secs,
+            } => {
+                assert_eq!(info_hash, "abc");
+                assert_eq!(timeout_secs, 5);
+            }
+            other => panic!("expected TimedOut, got {other:?}"),
+        }
+
+        let failed = async { Err(anyhow::anyhow!("disk exploded")) };
+        let err = await_initialized("abc", Duration::from_secs(5), failed)
+            .await
+            .expect_err("init failure must propagate");
+        match err {
+            TorrentInitError::Failed { info_hash, reason } => {
+                assert_eq!(info_hash, "abc");
+                assert_eq!(reason, "disk exploded");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deferred_selection_coalesces_and_applies_after_gate() {
+        use std::sync::atomic::AtomicUsize;
+        let applied = Arc::new(parking_lot::Mutex::new(Vec::<u32>::new()));
+        let applies = Arc::new(AtomicUsize::new(0));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let slot: Arc<DeferredSelection<u32>> = DeferredSelection::new();
+
+        let gate = |notify: &Arc<tokio::sync::Notify>| {
+            let notify = notify.clone();
+            async move {
+                notify.notified().await;
+                Ok(())
+            }
+        };
+        let apply = |applied: &Arc<parking_lot::Mutex<Vec<u32>>>, applies: &Arc<AtomicUsize>| {
+            let applied = applied.clone();
+            let applies = applies.clone();
+            move |op: u32| {
+                let applied = applied.clone();
+                let applies = applies.clone();
+                async move {
+                    applies.fetch_add(1, Ordering::SeqCst);
+                    applied.lock().push(op);
+                }
+            }
+        };
+
+        slot.defer(1, gate(&notify), apply(&applied, &applies));
+        slot.defer(2, gate(&notify), apply(&applied, &applies));
+        slot.defer(3, gate(&notify), apply(&applied, &applies));
+        assert!(slot.has_pending());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            applies.load(Ordering::SeqCst),
+            0,
+            "nothing applies before the gate"
+        );
+
+        notify.notify_waiters();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            *applied.lock(),
+            vec![3],
+            "latest op wins, older ones coalesce away"
+        );
+        assert!(!slot.has_pending());
+
+        // A direct apply supersedes a parked op.
+        slot.defer(4, gate(&notify), apply(&applied, &applies));
+        assert_eq!(slot.supersede(), Some(4));
+        assert!(!slot.has_pending());
+        // Let the spawned waiter register on the Notify before waking it
+        // (notify_waiters only reaches already-registered waiters).
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        notify.notify_waiters();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(*applied.lock(), vec![3]);
+
+        // A failed gate drops the parked op with a warning instead of applying.
+        let failing = async {
+            Err(TorrentInitError::TimedOut {
+                info_hash: "x".into(),
+                timeout_secs: 1,
+            })
+        };
+        slot.defer(5, failing, apply(&applied, &applies));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(*applied.lock(), vec![3]);
+        assert!(!slot.has_pending());
+    }
+
+    /// Regression for the first-play readiness race: prepare/reconcile and the
+    /// reader are called the instant the torrent is added, without the test
+    /// waiting for `wait_until_initialized` first. The gate must make the
+    /// selection stick and the reader open regardless of whether librqbit is
+    /// still hash-checking (8 MiB of payload widens that window).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn selection_and_reader_wait_for_initializing_torrent() {
+        use crate::backend::priorities::PlaybackIntent;
+        use crate::backend::{TorrentFilePriorityPlan, TorrentHandle};
+        use tokio::io::AsyncReadExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let content_dir = dir.join("multi");
+        tokio::fs::create_dir_all(&content_dir).await.unwrap();
+        write_payload(&content_dir.join("a.bin"), 4 * 1024 * 1024).await;
+        write_payload(&content_dir.join("b.bin"), 4 * 1024 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&content_dir).await;
+
+        let (_backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
+        let was_initializing = handle.is_initializing();
+
+        // Reconcile (request-path activation) defers while initializing ...
+        handle
+            .reconcile_file_priorities(TorrentFilePriorityPlan {
+                active_file: Some(1),
+                hot_file: None,
+                generation: 1,
+                reason: "test",
+            })
+            .await
+            .unwrap();
+        // ... and prepare blocks until the torrent is ready, then applies.
+        handle.prepare_file_for_streaming(1).await.unwrap();
+        assert!(!handle.is_initializing());
+        assert_eq!(handle.handle.only_files(), Some(vec![1]));
+
+        let mut reader = handle
+            .get_file_reader(1, 0, 1, None, PlaybackIntent::DirectInitial)
+            .await
+            .expect("reader opens after initialization");
+        let mut buf = [0u8; 1];
+        assert_eq!(reader.read(&mut buf).await.unwrap(), 1);
+        assert_eq!(buf[0], 0);
+
+        // A deferred reconcile that raced initialization must settle to the
+        // latest selection state, never leave a stale parked op behind.
+        let slot = handle.deferred_selection();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while slot.has_pending() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!slot.has_pending(), "deferred op must drain after init");
+        assert_eq!(handle.handle.only_files(), Some(vec![1]));
+        eprintln!("torrent was initializing at first call: {was_initializing}");
+    }
+
+    /// A reconcile deferred during initialization is applied afterwards even
+    /// when no request-path prepare follows it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deferred_reconcile_applies_on_real_torrent() {
+        use crate::backend::{TorrentFilePriorityPlan, TorrentHandle};
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let content_dir = dir.join("multi");
+        tokio::fs::create_dir_all(&content_dir).await.unwrap();
+        write_payload(&content_dir.join("a.bin"), 4 * 1024 * 1024).await;
+        write_payload(&content_dir.join("b.bin"), 4 * 1024 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&content_dir).await;
+        let (_backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
+
+        handle
+            .reconcile_file_priorities(TorrentFilePriorityPlan {
+                active_file: Some(0),
+                hot_file: None,
+                generation: 1,
+                reason: "test",
+            })
+            .await
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while handle.handle.only_files() != Some(vec![0]) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(handle.handle.only_files(), Some(vec![0]));
+        assert!(!handle.deferred_selection().has_pending());
     }
 
     #[test]

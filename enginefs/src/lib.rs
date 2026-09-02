@@ -1423,6 +1423,7 @@ impl BackendEngineFS<LibrqbitBackend> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::librqbit::{DeferredSelection, await_initialized};
     use crate::backend::{
         BackendFileInfo, EngineStats, FileStreamTrait, Growler, PeerSearch, PieceReadiness,
         StatsFile, StatsOptions, SwarmCap, TorrentFilePriorityPlan,
@@ -1439,8 +1440,63 @@ mod tests {
         resume_torrent: AtomicUsize,
         pause_torrent: AtomicUsize,
         reconcile_file_priorities: AtomicUsize,
+        prepare_file_for_streaming: AtomicUsize,
+        get_file_reader: AtomicUsize,
+        /// Selection updates / reader opens that went through while the fake
+        /// torrent was still initializing. The gate must keep this at zero.
+        applied_while_initializing: AtomicUsize,
         last_active_file: Mutex<Option<usize>>,
         last_generation: AtomicU64,
+    }
+
+    /// Simulates librqbit's `Initializing` state for the fake torrent: the
+    /// fake handle's reader/selection paths go through the same
+    /// `await_initialized` gate and `DeferredSelection` machinery as the real
+    /// backend, with `wait_future` standing in for
+    /// `ManagedTorrent::wait_until_initialized`.
+    struct FakeInit {
+        ready: AtomicBool,
+        notify: tokio::sync::Notify,
+        timeout: Duration,
+        deferred: Arc<DeferredSelection<TorrentFilePriorityPlan>>,
+    }
+
+    impl FakeInit {
+        fn new(ready: bool, timeout: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                ready: AtomicBool::new(ready),
+                notify: tokio::sync::Notify::new(),
+                timeout,
+                deferred: DeferredSelection::new(),
+            })
+        }
+
+        fn is_ready(&self) -> bool {
+            self.ready.load(Ordering::SeqCst)
+        }
+
+        fn mark_ready(&self) {
+            self.ready.store(true, Ordering::SeqCst);
+            self.notify.notify_waiters();
+        }
+
+        /// Owned future that resolves once `mark_ready` has been called
+        /// (polls like librqbit's implementation so a missed notify is
+        /// harmless).
+        fn wait_future(
+            self: &Arc<Self>,
+        ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static {
+            let me = self.clone();
+            async move {
+                loop {
+                    if me.is_ready() {
+                        return Ok(());
+                    }
+                    let _ = tokio::time::timeout(Duration::from_millis(100), me.notify.notified())
+                        .await;
+                }
+            }
+        }
     }
 
     #[derive(Clone)]
@@ -1448,6 +1504,34 @@ mod tests {
         info_hash: String,
         counters: Arc<FakeCounters>,
         files: Vec<BackendFileInfo>,
+        init: Arc<FakeInit>,
+    }
+
+    impl FakeHandle {
+        async fn gate(&self) -> Result<()> {
+            await_initialized(&self.info_hash, self.init.timeout, self.init.wait_future()).await?;
+            if !self.init.is_ready() {
+                self.counters
+                    .applied_while_initializing
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+
+        fn record_reconcile(&self, plan: &TorrentFilePriorityPlan) {
+            if !self.init.is_ready() {
+                self.counters
+                    .applied_while_initializing
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+            self.counters
+                .reconcile_file_priorities
+                .fetch_add(1, Ordering::SeqCst);
+            *self.counters.last_active_file.lock().unwrap() = plan.active_file;
+            self.counters
+                .last_generation
+                .store(plan.generation, Ordering::SeqCst);
+        }
     }
 
     struct FakeBackend {
@@ -1570,26 +1654,47 @@ mod tests {
             Ok(())
         }
 
+        /// Mirrors the real backend: apply directly when ready, otherwise
+        /// park the plan (latest wins) until the fake initializes.
         async fn reconcile_file_priorities(&self, plan: TorrentFilePriorityPlan) -> Result<()> {
-            self.counters
-                .reconcile_file_priorities
-                .fetch_add(1, Ordering::SeqCst);
-            *self.counters.last_active_file.lock().unwrap() = plan.active_file;
-            self.counters
-                .last_generation
-                .store(plan.generation, Ordering::SeqCst);
+            if self.init.is_ready() {
+                self.init.deferred.supersede();
+                self.record_reconcile(&plan);
+                return Ok(());
+            }
+            let applier = self.clone();
+            self.init.deferred.defer(
+                plan,
+                {
+                    let info_hash = self.info_hash.clone();
+                    let timeout = self.init.timeout;
+                    let wait = self.init.wait_future();
+                    async move { await_initialized(&info_hash, timeout, wait).await }
+                },
+                move |plan: TorrentFilePriorityPlan| {
+                    let handle = applier.clone();
+                    async move { handle.record_reconcile(&plan) }
+                },
+            );
             Ok(())
         }
 
         async fn get_file_reader(
             &self,
-            _file_idx: usize,
+            file_idx: usize,
             _start_offset: u64,
             _priority: u8,
             _bitrate: Option<u64>,
             _intent: crate::backend::priorities::PlaybackIntent,
         ) -> Result<Box<dyn FileStreamTrait>> {
-            anyhow::bail!("not implemented")
+            self.gate().await?;
+            self.counters.get_file_reader.fetch_add(1, Ordering::SeqCst);
+            let len = self
+                .files
+                .get(file_idx)
+                .map(|f| f.length as usize)
+                .unwrap_or(0);
+            Ok(Box::new(std::io::Cursor::new(vec![0xAB; len])))
         }
 
         async fn get_files(&self) -> Vec<BackendFileInfo> {
@@ -1601,6 +1706,10 @@ mod tests {
         }
 
         async fn prepare_file_for_streaming(&self, _file_idx: usize) -> Result<()> {
+            self.gate().await?;
+            self.counters
+                .prepare_file_for_streaming
+                .fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
@@ -1648,6 +1757,37 @@ mod tests {
     fn test_enginefs_with_files(
         files: Vec<(String, u64)>,
     ) -> (BackendEngineFS<FakeBackend>, Arc<FakeCounters>) {
+        let (enginefs, counters, _init) =
+            test_enginefs_with_init(files, FakeInit::new(true, Duration::from_secs(60)));
+        (enginefs, counters)
+    }
+
+    /// Engine over a fake torrent that is still initializing (`ready: false`)
+    /// with a caller-chosen initialization timeout.
+    fn test_enginefs_initializing(
+        file_count: usize,
+        timeout: Duration,
+    ) -> (
+        BackendEngineFS<FakeBackend>,
+        Arc<FakeCounters>,
+        Arc<FakeInit>,
+    ) {
+        test_enginefs_with_init(
+            (0..file_count)
+                .map(|idx| (format!("video-{idx}.mkv"), 100))
+                .collect(),
+            FakeInit::new(false, timeout),
+        )
+    }
+
+    fn test_enginefs_with_init(
+        files: Vec<(String, u64)>,
+        init: Arc<FakeInit>,
+    ) -> (
+        BackendEngineFS<FakeBackend>,
+        Arc<FakeCounters>,
+        Arc<FakeInit>,
+    ) {
         let counters = Arc::new(FakeCounters::default());
         let handle = FakeHandle {
             info_hash: TEST_HASH.to_string(),
@@ -1656,6 +1796,7 @@ mod tests {
                 .into_iter()
                 .map(|(name, length)| BackendFileInfo { name, length })
                 .collect(),
+            init: init.clone(),
         };
         let mut restored = HashMap::new();
         restored.insert(TEST_HASH.to_string(), handle.clone());
@@ -1666,7 +1807,188 @@ mod tests {
             root.join("cache"),
             root.join("downloads"),
         );
-        (enginefs, counters)
+        (enginefs, counters, init)
+    }
+
+    /// Poll `cond` until it holds or `bound` of (virtual) time elapses.
+    async fn wait_until(bound: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + bound;
+        while !cond() {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        true
+    }
+
+    // (a) A torrent that is Initializing when the request arrives: the request
+    // blocks (no error, no empty body) and succeeds once the torrent is ready.
+    #[tokio::test(start_paused = true)]
+    async fn get_file_waits_for_initializing_torrent_then_succeeds() {
+        use crate::backend::priorities::PlaybackIntent;
+        use tokio::io::AsyncReadExt;
+        let (enginefs, counters, init) =
+            test_enginefs_initializing(2, crate::backend::librqbit::TORRENT_INIT_TIMEOUT);
+        let engine = enginefs.get_engine(TEST_HASH).await.expect("engine");
+
+        let init_delay = Duration::from_secs(2);
+        let flipper = {
+            let init = init.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(init_delay).await;
+                init.mark_ready();
+            })
+        };
+
+        let started = tokio::time::Instant::now();
+        let mut file = engine
+            .try_get_file_with_intent(1, 0, 1, PlaybackIntent::DirectInitial)
+            .await
+            .expect("get_file must succeed once the torrent initializes");
+        flipper.await.unwrap();
+
+        assert!(
+            started.elapsed() >= init_delay,
+            "request must block through the initializing window, returned after {:?}",
+            started.elapsed()
+        );
+        assert!(init.is_ready());
+        assert_eq!(
+            counters.applied_while_initializing.load(Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            counters.prepare_file_for_streaming.load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(counters.get_file_reader.load(Ordering::SeqCst), 1);
+        assert_eq!(engine.active_streams.load(Ordering::SeqCst), 1);
+
+        // The reader handed back is a real, readable stream.
+        let mut buf = [0u8; 4];
+        file.read_exact(&mut buf).await.expect("read from reader");
+        assert_eq!(buf, [0xAB; 4]);
+    }
+
+    // (b) A torrent that never initializes: a clean error within the timeout
+    // bound, never a hang, and no stream accounted as started.
+    #[tokio::test(start_paused = true)]
+    async fn get_file_fails_cleanly_when_torrent_never_initializes() {
+        use crate::backend::librqbit::TorrentInitError;
+        use crate::backend::priorities::PlaybackIntent;
+        let init_timeout = Duration::from_secs(3);
+        let (enginefs, counters, init) = test_enginefs_initializing(2, init_timeout);
+        let engine = enginefs.get_engine(TEST_HASH).await.expect("engine");
+
+        let started = tokio::time::Instant::now();
+        // Outer bound is the "no hang" assertion (virtual time auto-advances).
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            engine.try_get_file_with_intent(1, 0, 1, PlaybackIntent::DirectInitial),
+        )
+        .await
+        .expect("get_file must not hang past the initialization timeout");
+        let err = result.err().expect("never-initializing torrent must fail");
+        assert!(
+            started.elapsed() >= init_timeout && started.elapsed() < init_timeout * 2,
+            "must fail after exactly one init timeout, took {:?}",
+            started.elapsed()
+        );
+        match err.torrent_init_error() {
+            Some(TorrentInitError::TimedOut {
+                info_hash,
+                timeout_secs,
+            }) => {
+                assert_eq!(info_hash, TEST_HASH);
+                assert_eq!(*timeout_secs, init_timeout.as_secs());
+            }
+            other => panic!("expected TimedOut, got {other:?} ({err})"),
+        }
+        assert!(!init.is_ready());
+        assert_eq!(
+            counters.applied_while_initializing.load(Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            counters.prepare_file_for_streaming.load(Ordering::SeqCst),
+            0
+        );
+        assert_eq!(counters.get_file_reader.load(Ordering::SeqCst), 0);
+        assert_eq!(engine.active_streams.load(Ordering::SeqCst), 0);
+
+        // The Option-returning wrapper degrades to None (and logs), no panic.
+        assert!(
+            engine
+                .get_file_with_intent(1, 0, 1, PlaybackIntent::DirectInitial)
+                .await
+                .is_none()
+        );
+    }
+
+    // (c) A file-selection reconcile issued while the torrent is Initializing
+    // is not dropped: it is parked and applied once the torrent is ready, with
+    // the latest plan winning when several were issued in the window.
+    #[tokio::test(start_paused = true)]
+    async fn deferred_reconcile_is_applied_once_initialized() {
+        use crate::backend::priorities::PlaybackIntent;
+        let (enginefs, counters, init) =
+            test_enginefs_initializing(3, crate::backend::librqbit::TORRENT_INIT_TIMEOUT);
+
+        let hot = |file_idx: usize| {
+            Some(HotFilePriorityPlan {
+                file_idx,
+                start_offset: 0,
+                priority: 1,
+                intent: PlaybackIntent::DirectInitial,
+                bitrate_bytes_per_sec: None,
+            })
+        };
+        // Both activations return immediately: reconcile defers, it must not
+        // block the caller (background cleanup loops also drive it).
+        let started = tokio::time::Instant::now();
+        enginefs
+            .activate_multifile_file_for_playback(TEST_HASH, 1, hot(1), "test-first")
+            .await;
+        enginefs
+            .activate_multifile_file_for_playback(TEST_HASH, 2, hot(2), "test-second")
+            .await;
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert!(init.deferred.has_pending(), "plan must be parked");
+        assert_eq!(counters.reconcile_file_priorities.load(Ordering::SeqCst), 0);
+        assert_eq!(*counters.last_active_file.lock().unwrap(), None);
+
+        // Nothing is applied while still initializing, however long it takes.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(counters.reconcile_file_priorities.load(Ordering::SeqCst), 0);
+
+        init.mark_ready();
+        assert!(
+            wait_until(Duration::from_secs(5), || counters
+                .reconcile_file_priorities
+                .load(Ordering::SeqCst)
+                == 1)
+            .await,
+            "deferred reconcile must be applied after initialization"
+        );
+        // Coalesced: only the latest plan (file 2, generation 2) was applied.
+        assert_eq!(*counters.last_active_file.lock().unwrap(), Some(2));
+        assert_eq!(counters.last_generation.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            counters.applied_while_initializing.load(Ordering::SeqCst),
+            0
+        );
+        assert!(!init.deferred.has_pending());
+        // Give the waiter a chance to misbehave (double apply) -- it must not.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(counters.reconcile_file_priorities.load(Ordering::SeqCst), 1);
+
+        // Once ready, reconciles apply directly (and supersede nothing).
+        enginefs
+            .activate_multifile_file_for_playback(TEST_HASH, 0, hot(0), "test-live")
+            .await;
+        assert_eq!(counters.reconcile_file_priorities.load(Ordering::SeqCst), 2);
+        assert_eq!(*counters.last_active_file.lock().unwrap(), Some(0));
     }
 
     /// Insert an active playback lease directly. Production leases are created

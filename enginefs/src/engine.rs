@@ -327,6 +327,29 @@ mod opensub_hash_tests {
     }
 }
 
+/// Why `Engine::try_get_file_with_intent` could not hand out a reader.
+/// `Backend` wraps the backend's error unchanged so callers can downcast it
+/// (e.g. to `crate::backend::librqbit::TorrentInitError`) for a precise
+/// HTTP status.
+#[derive(Debug, thiserror::Error)]
+pub enum GetFileError {
+    #[error("file index {file_idx} out of range ({file_count} files)")]
+    FileNotFound { file_idx: usize, file_count: usize },
+    #[error(transparent)]
+    Backend(#[from] anyhow::Error),
+}
+
+impl GetFileError {
+    /// The torrent never left its initializing state (timeout or init
+    /// failure), if that is what failed.
+    pub fn torrent_init_error(&self) -> Option<&crate::backend::librqbit::TorrentInitError> {
+        match self {
+            GetFileError::Backend(e) => e.downcast_ref(),
+            GetFileError::FileNotFound { .. } => None,
+        }
+    }
+}
+
 pub struct Engine<H: TorrentHandle> {
     pub info_hash: String,
     pub handle: H,
@@ -437,6 +460,9 @@ impl<H: TorrentHandle> Engine<H> {
             .await
     }
 
+    /// Option-returning wrapper over `try_get_file_with_intent` for callers
+    /// that only care about success (subtitles, opensub hashing). The error is
+    /// logged here so it is not lost.
     pub async fn get_file_with_intent(
         self: &Arc<Self>,
         file_idx: usize,
@@ -444,6 +470,37 @@ impl<H: TorrentHandle> Engine<H> {
         priority: u8,
         intent: PlaybackIntent,
     ) -> Option<FileHandle<H>> {
+        match self
+            .try_get_file_with_intent(file_idx, start_offset, priority, intent)
+            .await
+        {
+            Ok(file) => Some(file),
+            Err(e) => {
+                tracing::warn!(
+                    info_hash = %self.info_hash,
+                    file_idx,
+                    start_offset,
+                    ?intent,
+                    error = %e,
+                    "get_file: could not open file reader"
+                );
+                None
+            }
+        }
+    }
+
+    /// Open a reader for `file_idx` at `start_offset`. Blocks while the
+    /// backend waits for the torrent to become streamable (bounded by the
+    /// backend's initialization timeout) rather than failing a first play; a
+    /// torrent that never becomes ready yields `GetFileError::Backend` carrying
+    /// a `TorrentInitError`.
+    pub async fn try_get_file_with_intent(
+        self: &Arc<Self>,
+        file_idx: usize,
+        start_offset: u64,
+        priority: u8,
+        intent: PlaybackIntent,
+    ) -> Result<FileHandle<H>, GetFileError> {
         let startup = Instant::now();
         tracing::debug!(
             "[STREAMING] Preparing file {} for playback (offset={}, intent={:?})",
@@ -456,7 +513,10 @@ impl<H: TorrentHandle> Engine<H> {
 
         let files = self.handle.get_files().await;
         if file_idx >= files.len() {
-            return None;
+            return Err(GetFileError::FileNotFound {
+                file_idx,
+                file_count: files.len(),
+            });
         }
 
         let length = files[file_idx].length;
@@ -468,15 +528,26 @@ impl<H: TorrentHandle> Engine<H> {
             && matches!(intent, PlaybackIntent::DirectInitial)
         {
             let prepare_start = Instant::now();
-            if let Err(e) = self.handle.prepare_file_for_streaming(file_idx).await {
-                tracing::warn!("get_file: prepare_file_for_streaming failed: {}", e);
-                // Continue anyway - the file reader will block on pieces as needed
-            } else {
-                tracing::info!(
+            match self.handle.prepare_file_for_streaming(file_idx).await {
+                Ok(()) => tracing::info!(
                     "startup: direct prepare_file_for_streaming completed in {:?} for file {}",
                     prepare_start.elapsed(),
                     file_idx
-                );
+                ),
+                Err(e)
+                    if e.downcast_ref::<crate::backend::librqbit::TorrentInitError>()
+                        .is_some() =>
+                {
+                    // The torrent never became ready; opening the reader would
+                    // only wait out the same timeout again.
+                    return Err(GetFileError::Backend(
+                        e.context("prepare_file_for_streaming"),
+                    ));
+                }
+                Err(e) => {
+                    tracing::warn!("get_file: prepare_file_for_streaming failed: {}", e);
+                    // Continue anyway - the file reader will block on pieces as needed
+                }
             }
         } else {
             tracing::debug!(
@@ -492,7 +563,7 @@ impl<H: TorrentHandle> Engine<H> {
             .handle
             .get_file_reader(file_idx, start_offset, priority, None, intent)
             .await
-            .ok()?;
+            .context("get_file_reader")?;
         tracing::debug!(
             "startup: get_file_reader returned in {:?} for file {} offset {} (total={:?})",
             reader_start.elapsed(),
@@ -505,7 +576,7 @@ impl<H: TorrentHandle> Engine<H> {
 
         // Use raw reader directly for better performance
         // The torrent backend reads from local files, caching adds overhead
-        Some(FileHandle::new(length, name, reader, self.clone()))
+        Ok(FileHandle::new(length, name, reader, self.clone()))
     }
 
     pub async fn get_opensub_hash(self: &Arc<Self>, file_idx: usize) -> anyhow::Result<String> {

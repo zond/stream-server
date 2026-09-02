@@ -9,7 +9,9 @@ use axum::{
 };
 
 use axum::http::HeaderMap;
+use enginefs::backend::librqbit::TorrentInitError;
 use enginefs::backend::{HotFilePriorityPlan, TorrentHandle, priorities::PlaybackIntent};
+use enginefs::engine::GetFileError;
 use futures_util::Stream;
 use std::path::Path as FsPath;
 use std::pin::Pin;
@@ -779,169 +781,236 @@ pub async fn stream_video(
         intent = ?playback_intent,
         "stream_video calling get_file"
     );
-    if let Some(mut file) = engine
-        .get_file_with_intent(idx, start_offset_hint, priority, playback_intent)
+    let mut file = match engine
+        .try_get_file_with_intent(idx, start_offset_hint, priority, playback_intent)
         .await
     {
-        tracing::debug!(
-            stream_id,
-            info_hash = %info_hash,
-            file_idx = idx,
-            size = file.size,
-            "stream_video get_file returned success"
-        );
-        let size = file.size;
-        let name = if file.name.is_empty() {
-            name
-        } else {
-            file.name.clone()
-        };
-
-        tracing::debug!(
-            stream_id,
-            info_hash = %info_hash,
-            file_idx = idx,
-            "stream_video range request: {}-{} (total {})",
-            start,
-            end,
-            size
-        );
-
-        if start >= size {
-            tracing::warn!(
-                stream_id,
-                info_hash = %info_hash,
-                file_idx = idx,
-                start,
-                size,
-                "stream_video range not satisfiable"
-            );
-            return (StatusCode::RANGE_NOT_SATISFIABLE, "Range Not Satisfiable").into_response();
-        }
-
-        // Seek to the start position
-        if start > 0 {
-            tracing::debug!(
-                stream_id,
-                info_hash = %info_hash,
-                file_idx = idx,
-                start,
-                "stream_video seeking"
-            );
-            if let Err(e) = file.seek(std::io::SeekFrom::Start(start)).await {
-                tracing::warn!(
-                    stream_id,
-                    info_hash = %info_hash,
-                    file_idx = idx,
-                    error = %e,
-                    "stream_video seek error"
-                );
-                return (StatusCode::INTERNAL_SERVER_ERROR, "Seek failed").into_response();
-            }
-            tracing::debug!(stream_id, "stream_video seek complete");
-        }
-
-        let content_length = requested_content_length;
-        let mut res_headers = header::HeaderMap::new();
-
-        let mime = content_type_for_name(&name);
-
-        // Log detected file type
-        tracing::debug!(
-            stream_id,
-            info_hash = %info_hash,
-            file_idx = idx,
-            content_type = mime,
-            file_name = %name,
-            "media file detected"
-        );
-
-        res_headers.insert(header::CONTENT_TYPE, mime.parse().unwrap());
-
-        res_headers.insert(header::CONTENT_LENGTH, content_length.into());
-        res_headers.insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
-        if is_partial {
-            res_headers.insert(
-                header::CONTENT_RANGE,
-                format!("bytes {}-{}/{}", start, end, size).parse().unwrap(),
-            );
-        }
-        if is_download {
-            res_headers.insert(
-                header::CONTENT_DISPOSITION,
-                compat::content_disposition_attachment(&name),
-            );
-        }
-        compat::add_dlna_headers(&mut res_headers);
-
-        // Limit the body to the requested range while the reader waits asynchronously
-        // for torrent pieces that have not arrived yet.
-        let reader = file.take(content_length);
-
-        // Use ReaderStream to convert AsyncRead to Stream for Axum Body
-        // OPTIMIZATION: Use 256KB buffer for improved throughput with large pieces
-        // Larger buffer = fewer poll_read calls = less priority calculation overhead
-        let base_stream = tokio_util::io::ReaderStream::with_capacity(reader, 262144);
-
-        // Wrap with StreamGuard to notify when stream ends
-        let guarded_stream = StreamGuard {
-            inner: base_stream,
-            _lifecycle: lifecycle,
-        };
-        let body = Body::from_stream(guarded_stream);
-
-        let response_elapsed_ms = request_start.elapsed().as_millis() as u64;
-        if response_elapsed_ms >= 100 {
-            tracing::info!(
-                stream_id,
-                info_hash = %info_hash,
-                file_idx = idx,
-                elapsed_ms = response_elapsed_ms,
-                range_start = start,
-                range_end = end,
-                partial = is_partial,
-                download_storage_mode,
-                stage = "http_response_ready",
-                "startup: direct stream response ready"
-            );
-        } else {
-            tracing::debug!(
-                stream_id,
-                info_hash = %info_hash,
-                file_idx = idx,
-                elapsed_ms = response_elapsed_ms,
-                range_start = start,
-                range_end = end,
-                partial = is_partial,
-                download_storage_mode,
-                stage = "http_response_ready",
-                "startup: direct stream response ready"
-            );
-        }
-
-        if is_partial {
-            (StatusCode::PARTIAL_CONTENT, res_headers, body).into_response()
-        } else {
-            (StatusCode::OK, res_headers, body).into_response()
-        }
+        Ok(file) => file,
+        Err(err) => return stream_open_failure_response(stream_id, &info_hash, idx, err),
+    };
+    tracing::debug!(
+        stream_id,
+        info_hash = %info_hash,
+        file_idx = idx,
+        size = file.size,
+        "stream_video get_file returned success"
+    );
+    let size = file.size;
+    let name = if file.name.is_empty() {
+        name
     } else {
+        file.name.clone()
+    };
+
+    tracing::debug!(
+        stream_id,
+        info_hash = %info_hash,
+        file_idx = idx,
+        "stream_video range request: {}-{} (total {})",
+        start,
+        end,
+        size
+    );
+
+    if start >= size {
         tracing::warn!(
             stream_id,
             info_hash = %info_hash,
             file_idx = idx,
-            "stream_video get_file returned none after stream start"
+            start,
+            size,
+            "stream_video range not satisfiable"
         );
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to open stream reader",
-        )
-            .into_response()
+        return (StatusCode::RANGE_NOT_SATISFIABLE, "Range Not Satisfiable").into_response();
+    }
+
+    // Seek to the start position
+    if start > 0 {
+        tracing::debug!(
+            stream_id,
+            info_hash = %info_hash,
+            file_idx = idx,
+            start,
+            "stream_video seeking"
+        );
+        if let Err(e) = file.seek(std::io::SeekFrom::Start(start)).await {
+            tracing::warn!(
+                stream_id,
+                info_hash = %info_hash,
+                file_idx = idx,
+                error = %e,
+                "stream_video seek error"
+            );
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Seek failed").into_response();
+        }
+        tracing::debug!(stream_id, "stream_video seek complete");
+    }
+
+    let content_length = requested_content_length;
+    let mut res_headers = header::HeaderMap::new();
+
+    let mime = content_type_for_name(&name);
+
+    // Log detected file type
+    tracing::debug!(
+        stream_id,
+        info_hash = %info_hash,
+        file_idx = idx,
+        content_type = mime,
+        file_name = %name,
+        "media file detected"
+    );
+
+    res_headers.insert(header::CONTENT_TYPE, mime.parse().unwrap());
+
+    res_headers.insert(header::CONTENT_LENGTH, content_length.into());
+    res_headers.insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
+    if is_partial {
+        res_headers.insert(
+            header::CONTENT_RANGE,
+            format!("bytes {}-{}/{}", start, end, size).parse().unwrap(),
+        );
+    }
+    if is_download {
+        res_headers.insert(
+            header::CONTENT_DISPOSITION,
+            compat::content_disposition_attachment(&name),
+        );
+    }
+    compat::add_dlna_headers(&mut res_headers);
+
+    // Limit the body to the requested range while the reader waits asynchronously
+    // for torrent pieces that have not arrived yet.
+    let reader = file.take(content_length);
+
+    // Use ReaderStream to convert AsyncRead to Stream for Axum Body
+    // OPTIMIZATION: Use 256KB buffer for improved throughput with large pieces
+    // Larger buffer = fewer poll_read calls = less priority calculation overhead
+    let base_stream = tokio_util::io::ReaderStream::with_capacity(reader, 262144);
+
+    // Wrap with StreamGuard to notify when stream ends
+    let guarded_stream = StreamGuard {
+        inner: base_stream,
+        _lifecycle: lifecycle,
+    };
+    let body = Body::from_stream(guarded_stream);
+
+    let response_elapsed_ms = request_start.elapsed().as_millis() as u64;
+    if response_elapsed_ms >= 100 {
+        tracing::info!(
+            stream_id,
+            info_hash = %info_hash,
+            file_idx = idx,
+            elapsed_ms = response_elapsed_ms,
+            range_start = start,
+            range_end = end,
+            partial = is_partial,
+            download_storage_mode,
+            stage = "http_response_ready",
+            "startup: direct stream response ready"
+        );
+    } else {
+        tracing::debug!(
+            stream_id,
+            info_hash = %info_hash,
+            file_idx = idx,
+            elapsed_ms = response_elapsed_ms,
+            range_start = start,
+            range_end = end,
+            partial = is_partial,
+            download_storage_mode,
+            stage = "http_response_ready",
+            "startup: direct stream response ready"
+        );
+    }
+
+    if is_partial {
+        (StatusCode::PARTIAL_CONTENT, res_headers, body).into_response()
+    } else {
+        (StatusCode::OK, res_headers, body).into_response()
+    }
+}
+
+/// Map a failed `try_get_file_with_intent` to the HTTP response for a stream
+/// request. The backend already blocked (bounded) for the torrent to become
+/// streamable, so reaching this means either a bad file index, a torrent that
+/// never left its initializing state, or a genuine reader failure.
+fn stream_open_failure_response(
+    stream_id: u64,
+    info_hash: &str,
+    file_idx: usize,
+    err: GetFileError,
+) -> Response {
+    let (status, message) = stream_open_failure_status(&err);
+    tracing::warn!(
+        stream_id,
+        info_hash = %info_hash,
+        file_idx,
+        status = status.as_u16(),
+        error = %err,
+        "stream_video could not open the file reader after stream start"
+    );
+    (status, message).into_response()
+}
+
+/// Pure status/message mapping for `stream_open_failure_response`.
+fn stream_open_failure_status(err: &GetFileError) -> (StatusCode, String) {
+    match err {
+        GetFileError::FileNotFound { .. } => (StatusCode::NOT_FOUND, "File not found".to_string()),
+        GetFileError::Backend(_) => match err.torrent_init_error() {
+            Some(TorrentInitError::TimedOut { timeout_secs, .. }) => (
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("Torrent is still initializing after {timeout_secs}s; retry shortly"),
+            ),
+            Some(TorrentInitError::Failed { reason, .. }) => (
+                StatusCode::BAD_GATEWAY,
+                format!("Torrent failed to initialize: {reason}"),
+            ),
+            None => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to open stream reader: {err:#}"),
+            ),
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_open_failure_maps_to_clear_non_2xx_statuses() {
+        let (status, msg) = stream_open_failure_status(&GetFileError::FileNotFound {
+            file_idx: 3,
+            file_count: 2,
+        });
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(msg, "File not found");
+
+        let timed_out = GetFileError::Backend(
+            anyhow::Error::new(TorrentInitError::TimedOut {
+                info_hash: "abc".into(),
+                timeout_secs: 60,
+            })
+            .context("prepare_file_for_streaming"),
+        );
+        let (status, msg) = stream_open_failure_status(&timed_out);
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert!(msg.contains("still initializing after 60s"), "{msg}");
+
+        let failed = GetFileError::Backend(anyhow::Error::new(TorrentInitError::Failed {
+            info_hash: "abc".into(),
+            reason: "disk exploded".into(),
+        }));
+        let (status, msg) = stream_open_failure_status(&failed);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(msg.contains("disk exploded"), "{msg}");
+
+        let other = GetFileError::Backend(anyhow::anyhow!("boom").context("get_file_reader"));
+        let (status, msg) = stream_open_failure_status(&other);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(msg.contains("boom"), "{msg}");
+    }
 
     #[test]
     fn metadata_resolution_guard_balances_the_active_reader_count() {
