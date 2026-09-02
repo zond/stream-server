@@ -176,9 +176,12 @@ impl ServerHandle {
 
     /// Torrent-level stats, exactly what `GET /{infoHash}/stats.json?tr=...`
     /// answers (see `routes::system::engine_stats`): `trackers` are the
-    /// `tr=` values and are only used when this call is the one that creates
-    /// the engine; a magnet still resolving reports `phase: resolvingMetadata`
-    /// immediately, a failed add `phase: error`.
+    /// `tr=` values -- normalised exactly as the route normalises them
+    /// (`tracker:` prefixes stripped, `dht:` entries dropped, trimmed), so a
+    /// stream's `sources` list can be passed as is -- and are only used when
+    /// this call is the one that creates the engine; a magnet still resolving
+    /// reports `phase: resolvingMetadata` immediately, a failed add
+    /// `phase: error`.
     pub fn engine_stats(
         &self,
         info_hash: &str,
@@ -193,7 +196,8 @@ impl ServerHandle {
     }
 
     /// Per-file stats, exactly what `GET /{infoHash}/{fileIdx}/stats.json?tr=...`
-    /// answers for an explicit index (see `routes::system::file_stats`). Fails
+    /// answers for an explicit index (see `routes::system::file_stats`;
+    /// `trackers` as in [`Self::engine_stats`]). Fails
     /// with [`FileNotFound`] (the route's 404) for an index the torrent does
     /// not have once its metadata is known.
     pub fn file_stats(

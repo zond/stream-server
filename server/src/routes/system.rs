@@ -877,11 +877,15 @@ fn magnet_add_failed_stats(info_hash: &str, failed: &FailedMagnetAdd) -> EngineS
 /// Torrent-level stats for `info_hash`, exactly what `GET /{infoHash}/stats.json`
 /// answers: the statistics of an existing engine, else -- this being the first
 /// request for the hash -- the engine is created in the stream engine with
-/// `trackers` (the request's `tr=` values, see `compat::parse_trackers`) and
-/// `resolvingMetadata` stats come back at once; a failed add reports
-/// `phase: error`. Shared by the HTTP handler and `ServerHandle::engine_stats`.
+/// `trackers` and `resolvingMetadata` stats come back at once; a failed add
+/// reports `phase: error`. `trackers` are the raw tracker sources (the
+/// request's `tr=` values, or whatever the library caller passes) and are
+/// normalised here (`compat::normalize_tracker_sources`: `tracker:` prefixes
+/// stripped, `dht:` entries dropped, whitespace trimmed) so the HTTP route and
+/// `ServerHandle::engine_stats` cannot disagree. Shared by both.
 pub async fn engine_stats(state: &AppState, info_hash: &str, trackers: Vec<String>) -> EngineStats {
     let info_hash = info_hash.to_lowercase();
+    let trackers = compat::normalize_tracker_sources(trackers);
     match stats_target(state, &info_hash, trackers, "stats").await {
         EngineLookup::Ready(engine) => engine.get_statistics().await,
         EngineLookup::Adding(pending) => resolving_metadata_stats(&info_hash, &pending),
@@ -905,9 +909,10 @@ impl std::error::Error for FileNotFound {}
 
 /// Per-file stats, exactly what `GET /{infoHash}/{fileIdx}/stats.json` answers.
 /// `requested_idx` is the route's `{fileIdx}` text (`-1` resolves to the best
-/// media file, narrowed by `filters`, the `f=` values); `trackers` are used
-/// only if this request creates the engine, as in [`engine_stats`]. Shared by
-/// the HTTP handler and `ServerHandle::file_stats`.
+/// media file, narrowed by `filters`, the `f=` values); `trackers` are raw
+/// sources normalised here and used only if this request creates the engine,
+/// as in [`engine_stats`]. Shared by the HTTP handler and
+/// `ServerHandle::file_stats`.
 pub async fn file_stats(
     state: &AppState,
     info_hash: &str,
@@ -916,6 +921,7 @@ pub async fn file_stats(
     filters: &[String],
 ) -> Result<EngineStats, FileNotFound> {
     let info_hash = info_hash.to_lowercase();
+    let trackers = compat::normalize_tracker_sources(trackers);
 
     // While the magnet is still resolving there is no file list to index into:
     // report the torrent-level resolvingMetadata stats so a per-file poller
@@ -978,7 +984,8 @@ pub async fn get_engine_stats(
     axum::extract::Path(info_hash): axum::extract::Path<String>,
     RawQuery(query_str): RawQuery,
 ) -> Response {
-    let trackers = compat::parse_trackers(query_str.as_deref());
+    // Raw `tr=` values: `engine_stats` normalises them.
+    let trackers = compat::query_values(query_str.as_deref(), "tr");
     Json(engine_stats(&state, &info_hash, trackers).await).into_response()
 }
 
@@ -987,7 +994,8 @@ pub async fn get_file_stats(
     axum::extract::Path((info_hash, requested_idx)): axum::extract::Path<(String, String)>,
     RawQuery(query_str): RawQuery,
 ) -> Response {
-    let trackers = compat::parse_trackers(query_str.as_deref());
+    // Raw `tr=` values: `file_stats` normalises them.
+    let trackers = compat::query_values(query_str.as_deref(), "tr");
     let filters = compat::query_values(query_str.as_deref(), "f");
     match file_stats(&state, &info_hash, &requested_idx, trackers, &filters).await {
         Ok(stats) => Json(stats).into_response(),

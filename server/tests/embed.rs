@@ -361,8 +361,9 @@ fn create_engine_guesses_episode_from_season_pack() -> anyhow::Result<()> {
 /// polling over HTTP would: `settings()` is `GET /settings`' `values`,
 /// `update_settings` is `POST /settings` (same merge/validation, visible to
 /// the next GET), `engine_stats` is `/{infoHash}/stats.json` -- including
-/// creating the engine with the given trackers on first sight and answering
-/// `resolvingMetadata` at once -- and `file_stats` is
+/// creating the engine with the given trackers on first sight -- normalised
+/// like the route's `tr=` values: `tracker:` stripped, `dht:` dropped -- and
+/// answering `resolvingMetadata` at once -- and `file_stats` is
 /// `/{infoHash}/{fileIdx}/stats.json`, with the route's 404 as `FileNotFound`.
 #[test]
 fn library_api_matches_the_http_control_routes() -> anyhow::Result<()> {
@@ -422,8 +423,11 @@ fn library_api_matches_the_http_control_routes() -> anyhow::Result<()> {
     // answers resolvingMetadata at once, exactly like the route; a later poll
     // over HTTP sees that very engine.
     let unresolved = "8899aabbccddeeff00112233445566778899aabb";
-    let tracker = "udp://library-first.invalid:6969/announce".to_string();
-    let api = handle.engine_stats(unresolved, std::slice::from_ref(&tracker))?;
+    let tracker = "udp://library-first.invalid:6969/announce";
+    // The sources exactly as a stream's `sources` array carries them: the
+    // library normalises them the way the route normalises `tr=`.
+    let raw_sources = [format!(" tracker:{tracker}"), format!("dht:{unresolved}")];
+    let api = handle.engine_stats(unresolved, &raw_sources)?;
     assert_eq!(api.info_hash, unresolved);
     let api_json = serde_json::to_value(&api)?;
     assert_eq!(api_json["phase"], "resolvingMetadata", "{api_json}");
@@ -433,7 +437,15 @@ fn library_api_matches_the_http_control_routes() -> anyhow::Result<()> {
         .iter()
         .filter_map(|s| s["url"].as_str())
         .collect();
-    assert!(sources.contains(&tracker.as_str()), "{sources:?}");
+    // (The engine merges its default tracker list in as well, so check for
+    // the normalised entry and the absence of the raw ones.)
+    assert!(sources.contains(&tracker), "{sources:?}");
+    assert!(
+        sources
+            .iter()
+            .all(|s| !s.starts_with("tracker:") && !s.starts_with("dht:") && *s == s.trim()),
+        "raw sources must not reach the engine: {sources:?}"
+    );
     let http: serde_json::Value = client
         .get(format!("{base}/{unresolved}/stats.json"))
         .send()?

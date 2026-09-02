@@ -194,7 +194,7 @@ An embedder holds a `ServerHandle` (from `stream_server::start`) and never needs
 | `base_url() -> &str` | `settings.baseUrl` |
 | `settings() -> Result<ServerSettings>` | `GET /settings` → `values` |
 | `update_settings(patch: serde_json::Value) -> Result<ServerSettings>` | `POST /settings` (same keys, validation, engine update and persistence); returns the settings afterwards |
-| `engine_stats(info_hash, trackers: &[String]) -> Result<EngineStats>` | `GET /{infoHash}/stats.json?tr=…` — including creating the engine with `trackers` when it is the first request for the hash and answering `resolvingMetadata` at once |
+| `engine_stats(info_hash, trackers: &[String]) -> Result<EngineStats>` | `GET /{infoHash}/stats.json?tr=…` — including creating the engine with `trackers` when it is the first request for the hash and answering `resolvingMetadata` at once. `trackers` are normalised inside the shared function exactly like `tr=` (`tracker:` prefix stripped, `dht:` dropped, trimmed), so a stream's `sources` array can be passed as is |
 | `file_stats(info_hash, file_idx: usize, trackers) -> Result<EngineStats>` | `GET /{infoHash}/{fileIdx}/stats.json?tr=…`; the route's `404` is a `FileNotFound` error |
 
 The HTTP handlers and these methods call the same functions (`routes::system::{engine_stats, file_stats, update_settings}`), so they cannot drift; `server/tests/embed.rs` compares them.
