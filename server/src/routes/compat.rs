@@ -36,14 +36,15 @@ pub fn query_values(query: Option<&str>, name: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Normalise server.js-style peer sources (`tracker:` prefix stripped, `dht:`
+/// dropped, blanks removed). Takes the values as they are: `tr=` query values
+/// arrive already percent-decoded from `query_values`, and JSON
+/// `peerSearch.sources` are never percent-encoded.
 pub fn normalize_tracker_sources(sources: Vec<String>) -> Vec<String> {
     sources
         .into_iter()
         .filter_map(|source| {
-            let decoded = urlencoding::decode(&source)
-                .map(|cow| cow.into_owned())
-                .unwrap_or(source);
-            let trimmed = decoded.trim();
+            let trimmed = source.trim();
             if trimmed.is_empty() || trimmed.starts_with("dht:") {
                 None
             } else if let Some(tracker) = trimmed.strip_prefix("tracker:") {
@@ -312,6 +313,21 @@ mod tests {
             reason: "panicked".into(),
         });
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// `query_values` already percent-decodes `tr=`; decoding a second time
+    /// would corrupt trackers whose URL legitimately contains `%25` (and JSON
+    /// `peerSearch.sources` are never percent-encoded to begin with).
+    #[test]
+    fn parse_trackers_decodes_exactly_once() {
+        let trackers = parse_trackers(Some(
+            "tr=udp%3A%2F%2Fone.invalid%2Fannounce%3Fkey%3D100%2525",
+        ));
+        assert_eq!(trackers, ["udp://one.invalid/announce?key=100%25"]);
+        assert_eq!(
+            normalize_tracker_sources(vec!["tracker:https://two.invalid/a%20b".to_string()]),
+            ["https://two.invalid/a%20b"]
+        );
     }
 
     #[test]
