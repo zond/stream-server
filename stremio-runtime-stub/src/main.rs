@@ -19,6 +19,10 @@ const ENDPOINT_LABEL: &str = "127.0.0.1:11470";
 const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const EXISTING_SERVER_POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// The stub is the compatibility shim for legacy clients that speak plain
+/// HTTP to server.js and know nothing of the bearer token the server now
+/// requires on its control API, so the server it spawns runs that API open.
+const REAL_SERVER_ARGS: &[&str] = &["--no-auth"];
 
 #[derive(Debug)]
 struct StubError {
@@ -143,6 +147,7 @@ fn real_server_path(exe_dir: &Path) -> PathBuf {
 fn spawn_real_server(real_server: &Path, exe_dir: &Path) -> Result<Child, StubError> {
     let mut command = Command::new(real_server);
     command
+        .args(REAL_SERVER_ARGS)
         .current_dir(exe_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -220,4 +225,19 @@ fn terminate_child(child: &mut Child) {
 
 fn status_code(status: ExitStatus) -> i32 {
     status.code().unwrap_or(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Legacy clients cannot send a bearer token, so the spawned server must
+    /// be told to run its control API open.
+    #[test]
+    fn spawned_server_runs_without_auth() {
+        let mut command = Command::new("stream-server");
+        command.args(REAL_SERVER_ARGS);
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args, ["--no-auth"]);
+    }
 }

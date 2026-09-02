@@ -522,16 +522,18 @@ pub async fn run(
     state.http_addr = public_http_addr;
     state.auth_token = cfg.auth.resolve()?.map(Arc::from);
     match state.auth_token.as_deref() {
-        // The standalone binary has no other way to hand its token to a
-        // client, so it goes to the log; an embedder reads
-        // `ServerHandle::auth_token` instead and never sees it logged.
-        Some(token) if cfg.print_startup => {
-            tracing::info!(
-                token,
-                "control API requires `Authorization: Bearer <token>`"
-            );
+        Some(token) => {
+            tracing::info!("control API requires `Authorization: Bearer <token>`");
+            // The token is a secret and must never reach `tracing`: the log
+            // files (the append-only archive included) would keep it. A
+            // generated token has no other way to reach the operator of the
+            // standalone binary, so it goes to stdout once; a `--token` /
+            // `STREAM_SERVER_TOKEN` token is already known to whoever set it,
+            // and an embedder reads `ServerHandle::auth_token`.
+            if cfg.print_startup && cfg.auth == ServerAuth::Generated {
+                println!("control API token: {token}");
+            }
         }
-        Some(_) => tracing::info!("control API requires a bearer token"),
         None => tracing::warn!("control API authentication is disabled; every route is open"),
     }
 

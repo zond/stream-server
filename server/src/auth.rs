@@ -25,7 +25,8 @@ pub enum ServerAuth {
     /// A fresh random token for this launch (32 random bytes, hex). The
     /// default for both [`crate::ServerConfig::embedded`] and
     /// [`crate::ServerConfig::binary_default`]; embedders read it from
-    /// [`crate::ServerHandle::auth_token`], the binary logs it at startup.
+    /// [`crate::ServerHandle::auth_token`], the binary prints it to stdout at
+    /// startup (never to the log).
     #[default]
     Generated,
     /// Exactly this token (must not be empty).

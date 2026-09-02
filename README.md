@@ -103,7 +103,16 @@ RAR streaming is **on by default** and pure Rust — no libclang or C++ toolchai
 cargo run --release -p server
 ```
 
-The server starts on `http://localhost:11470` by default (compatible with standard streaming server port). At startup it logs the bearer token every control route requires this launch (`control API requires \`Authorization: Bearer <token>\``); pass `--no-auth` to run the control API open. See [API](#-api).
+The server starts on `http://localhost:11470` by default (compatible with standard streaming server port). Every control route requires a bearer token for this launch; the binary chooses it from its command line:
+
+| Flag / variable | Effect |
+|---|---|
+| *(nothing)* | A fresh random token is generated and printed **to stdout** as `control API token: <token>` — it is never written to the log files. (With `--tui` the alternate screen hides that line; use one of the options below instead.) |
+| `--token <t>` / `--token=<t>` | Use exactly this token (headless use: the operator already knows it, nothing is printed) |
+| `STREAM_SERVER_TOKEN=<t>` | Same as `--token`, from the environment; `--token` wins if both are given, a blank value counts as unset |
+| `--no-auth` | Run the control API open (every route answers without a token). Wins over `STREAM_SERVER_TOKEN`; contradicts an explicit `--token` and is rejected together with it |
+
+The `stremio-runtime` stub spawns the server with `--no-auth`: it is the compatibility shim for legacy clients that speak plain HTTP and cannot send the header. See [API](#-api).
 
 ### Startup phases in `stats.json`
 
@@ -144,9 +153,9 @@ The HTTP surface is deliberately small and split in two by `build_router()` (`se
 
 | Variant | Meaning |
 |---|---|
-| `Generated` (**default** for both `ServerConfig::embedded()` and `ServerConfig::binary_default()`) | 32 random bytes, hex-encoded, fresh per launch. The standalone binary logs it at `info` level at startup; an embedder reads `ServerHandle::auth_token()` and never sees it logged |
-| `Token(String)` | Use exactly this token (must not be empty) |
-| `Disabled` | No authentication; every route is open. The binary's `--no-auth` flag selects this |
+| `Generated` (**default** for both `ServerConfig::embedded()` and `ServerConfig::binary_default()`) | 32 random bytes, hex-encoded, fresh per launch. The standalone binary prints it once to stdout at startup (`control API token: <token>`) and never passes it to `tracing`, so it is in no log file; an embedder reads `ServerHandle::auth_token()` |
+| `Token(String)` | Use exactly this token (must not be empty). The binary's `--token <t>` flag and `STREAM_SERVER_TOKEN` variable select this |
+| `Disabled` | No authentication; every route is open. The binary's `--no-auth` flag selects this, and the `stremio-runtime` stub always passes it. The Android JNI entry point (`server/src/jni.rs`) also runs this way: it can return only a URL to the Kotlin side, and its listener is loopback-only |
 
 ### Routes
 
