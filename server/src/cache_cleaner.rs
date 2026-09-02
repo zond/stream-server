@@ -172,8 +172,7 @@ async fn clean_cache(state: &Arc<AppState>) -> anyhow::Result<()> {
                             continue;
                         }
                         // Is protected?
-                        let is_protected = protected_paths.contains(&path)
-                            || protected_paths.iter().any(|p| path.starts_with(p));
+                        let is_protected = is_path_protected(&path, &protected_paths);
 
                         if let Ok(metadata) = entry.metadata() {
                             let size = metadata.len();
@@ -274,6 +273,14 @@ async fn clean_cache(state: &Arc<AppState>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A file is protected from eviction when its full path is in `protected` or
+/// when it lives under a protected directory. Uses `Path::starts_with`, which
+/// matches whole path components — so `/dl/Movie2/x.mkv` is NOT shielded by a
+/// protected `/dl/Movie` entry, only a true `/dl/Movie/...` descendant is.
+fn is_path_protected(path: &std::path::Path, protected: &HashSet<std::path::PathBuf>) -> bool {
+    protected.contains(path) || protected.iter().any(|p| path.starts_with(p))
+}
+
 async fn remove_empty_parents(mut dir: &std::path::Path, root: &std::path::Path) {
     while dir != root {
         if tokio::fs::remove_dir(dir).await.is_err() {
@@ -283,5 +290,73 @@ async fn remove_empty_parents(mut dir: &std::path::Path, root: &std::path::Path)
             break;
         };
         dir = parent;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_path_protected, remove_empty_parents};
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+
+    #[tokio::test]
+    async fn remove_empty_parents_prunes_up_to_but_not_including_root() {
+        let root = tempfile::tempdir().unwrap();
+        let a = root.path().join("a");
+        let b = a.join("b");
+        let c = b.join("c");
+        std::fs::create_dir_all(&c).unwrap();
+
+        remove_empty_parents(&c, root.path()).await;
+
+        assert!(!c.exists(), "empty leaf removed");
+        assert!(!b.exists(), "empty parent removed");
+        assert!(!a.exists(), "empty grandparent removed");
+        assert!(root.path().exists(), "download root never removed");
+    }
+
+    #[tokio::test]
+    async fn remove_empty_parents_stops_at_non_empty_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let b = root.path().join("a").join("b");
+        let c = b.join("c");
+        std::fs::create_dir_all(&c).unwrap();
+        let keep = b.join("keep.txt");
+        std::fs::write(&keep, b"x").unwrap();
+
+        remove_empty_parents(&c, root.path()).await;
+
+        assert!(!c.exists(), "empty leaf removed");
+        assert!(b.exists(), "non-empty sibling dir kept");
+        assert!(keep.exists(), "unrelated file untouched");
+    }
+
+    #[tokio::test]
+    async fn remove_empty_parents_never_removes_root_even_when_empty() {
+        let root = tempfile::tempdir().unwrap();
+        let a = root.path().join("a");
+        std::fs::create_dir_all(&a).unwrap();
+
+        // Climbing from `a` empties the root, but the loop must stop at it.
+        remove_empty_parents(&a, root.path()).await;
+
+        assert!(!a.exists());
+        assert!(root.path().exists(), "root preserved even when empty");
+    }
+
+    #[test]
+    fn is_path_protected_uses_component_wise_prefix() {
+        let mut set = HashSet::new();
+        set.insert(PathBuf::from("/dl/Movie/video.mkv"));
+        set.insert(PathBuf::from("/dl/Series"));
+
+        // Exact protected path.
+        assert!(is_path_protected(Path::new("/dl/Movie/video.mkv"), &set));
+        // A descendant of a protected directory.
+        assert!(is_path_protected(Path::new("/dl/Series/S01/ep1.mkv"), &set));
+        // Component-wise prefix: /dl/Series2 is NOT under /dl/Series.
+        assert!(!is_path_protected(Path::new("/dl/Series2/ep.mkv"), &set));
+        // Wholly unrelated file.
+        assert!(!is_path_protected(Path::new("/dl/Other/x.mkv"), &set));
     }
 }
