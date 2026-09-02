@@ -7,9 +7,11 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use enginefs::backend::librqbit::LibrqbitHandle;
 use enginefs::backend::{
-    TorrentEncryptionMode, TorrentHandle, TorrentPrivacyConfig, TorrentProxyType,
+    EngineStats, TorrentEncryptionMode, TorrentHandle, TorrentPrivacyConfig, TorrentProxyType,
 };
+use enginefs::{EngineLookup, PendingMagnetAdd};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -855,32 +857,58 @@ pub async fn get_samples(
         .into_response()
 }
 
+/// What a `stats.json` route reports on: an existing engine from either
+/// EngineFS (the stream route may have fallen back to the memory-only engine),
+/// else the in-flight magnet add for the hash -- started here, in the stream
+/// engine, exactly as `routes::stream` would start it, honouring the request's
+/// `tr=` trackers. Clients commonly poll stats before their first stream
+/// request, so this path must not differ from the stream route's or the
+/// session's torrent ends up tracker-less. It never waits for metadata: while
+/// the add is in flight the routes report `resolvingMetadata` stats instead.
+async fn stats_target(
+    state: &AppState,
+    info_hash: &str,
+    query_str: Option<&str>,
+    context: &str,
+) -> EngineLookup<LibrqbitHandle> {
+    let stream_engine = state.stream_engine();
+    for engine_fs in [&state.engine, &state.download_engine] {
+        if let Some(engine) = engine_fs.get_engine(info_hash).await {
+            return EngineLookup::Ready(engine);
+        }
+    }
+    let lookup = stream_engine
+        .get_or_begin_add_magnet(info_hash, Some(compat::parse_trackers(query_str)))
+        .await;
+    if let EngineLookup::Adding(pending) = &lookup {
+        tracing::debug!(
+            info_hash,
+            context,
+            trackers = pending.trackers.len(),
+            "stats request while magnet metadata is resolving"
+        );
+    }
+    lookup
+}
+
+fn resolving_metadata_response(
+    info_hash: &str,
+    pending: &PendingMagnetAdd<LibrqbitHandle>,
+) -> Response {
+    let stats = EngineStats::resolving_metadata(info_hash, &pending.trackers);
+    Json(serde_json::to_value(stats).unwrap()).into_response()
+}
+
 pub async fn get_engine_stats(
     State(state): State<AppState>,
     axum::extract::Path(info_hash): axum::extract::Path<String>,
+    RawQuery(query_str): RawQuery,
 ) -> Response {
     let info_hash = info_hash.to_lowercase();
 
-    // Try to get existing engine, or auto-create from info hash
-    let engine = if let Some(e) = state.download_engine.get_engine(&info_hash).await {
-        e
-    } else if let Some(e) = state.engine.get_engine(&info_hash).await {
-        e
-    } else {
-        tracing::info!("Auto-creating engine for stats request: {}", info_hash);
-        let magnet = format!("magnet:?xt=urn:btih:{}", info_hash);
-        let source = enginefs::backend::TorrentSource::Url(magnet);
-        match state.download_engine.add_torrent(source, None).await {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::error!("Failed to create engine: {}", e);
-                return (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to create engine: {}", e),
-                )
-                    .into_response();
-            }
-        }
+    let engine = match stats_target(&state, &info_hash, query_str.as_deref(), "stats").await {
+        EngineLookup::Ready(engine) => engine,
+        EngineLookup::Adding(pending) => return resolving_metadata_response(&info_hash, &pending),
     };
 
     let stats = engine.get_statistics().await;
@@ -894,29 +922,23 @@ pub async fn get_file_stats(
 ) -> Response {
     let info_hash = info_hash.to_lowercase();
 
-    // Try to get existing engine, or auto-create from info hash
-    let engine = if let Some(e) = state.download_engine.get_engine(&info_hash).await {
-        e
-    } else if let Some(e) = state.engine.get_engine(&info_hash).await {
-        e
-    } else {
-        tracing::info!("Auto-creating engine for file stats request: {}", info_hash);
-        let magnet = format!("magnet:?xt=urn:btih:{}", info_hash);
-        let source = enginefs::backend::TorrentSource::Url(magnet);
-        match state.download_engine.add_torrent(source, None).await {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::error!("Failed to create engine: {}", e);
-                return (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to create engine: {}", e),
-                )
-                    .into_response();
-            }
-        }
+    // While the magnet is still resolving there is no file list to index into:
+    // report the torrent-level resolvingMetadata stats with 200 so a per-file
+    // poller sees the phase instead of a misleading 404. An invalid index once
+    // metadata is known still 404s below.
+    let engine = match stats_target(&state, &info_hash, query_str.as_deref(), "file-stats").await {
+        EngineLookup::Ready(engine) => engine,
+        EngineLookup::Adding(pending) => return resolving_metadata_response(&info_hash, &pending),
     };
 
     let files = engine.handle.get_files().await;
+    // Same for a backend that hands out a handle before its metadata arrives.
+    if files.is_empty() {
+        let stats = engine.get_statistics().await;
+        if !stats.has_metadata {
+            return Json(serde_json::to_value(stats).unwrap()).into_response();
+        }
+    }
     let candidates = files
         .iter()
         .enumerate()

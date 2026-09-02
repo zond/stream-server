@@ -448,3 +448,81 @@ fn stats_json_exposes_startup_phase_fields_additively() -> anyhow::Result<()> {
     handle.join()?;
     Ok(())
 }
+
+/// A progress overlay polls `stats.json` from the moment playback is
+/// requested -- typically before the first stream request, and while the
+/// magnet is still resolving its metadata. Both stats routes must then (a)
+/// start the engine the way the stream route does, with the addon's `tr=`
+/// trackers (librqbit cannot add trackers later, and the stream request will
+/// reuse this engine), and (b) answer immediately with 200 and the
+/// torrent-level `resolvingMetadata` phase rather than blocking on metadata
+/// or 404ing the per-file route. A 404 is reserved for an index that does
+/// not exist once metadata is known.
+#[test]
+fn stats_json_reports_resolving_metadata_with_the_requests_trackers() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_dir.path().join("cache")),
+        ..stream_server::ServerConfig::default()
+    })?;
+    let base = format!("http://{}", handle.http_addr());
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
+
+    // No peers and an unreachable tracker: this magnet never resolves.
+    let unresolved = "00112233445566778899aabbccddeeff00112233";
+    let tracker = "udp://stats-first.invalid:6969/announce";
+    let tr = format!("tr=tracker%3A{}", urlencoding::encode(tracker));
+    // The per-file route is polled first here, so it is the one creating the engine.
+    for path in [
+        format!("{unresolved}/0/stats.json?{tr}"),
+        format!("{unresolved}/-1/stats.json?{tr}"),
+        format!("{unresolved}/stats.json?{tr}"),
+        // Later polls without trackers still see the tracker set used.
+        format!("{unresolved}/stats.json"),
+    ] {
+        let response = client.get(format!("{base}/{path}")).send()?;
+        assert_eq!(response.status(), reqwest::StatusCode::OK, "{path}");
+        let stats: serde_json::Value = response.json()?;
+        assert_eq!(stats["phase"], "resolvingMetadata", "{path}: {stats}");
+        assert_eq!(stats["hasMetadata"], false, "{path}: {stats}");
+        assert_eq!(stats["infoHash"], unresolved, "{path}: {stats}");
+        assert_eq!(stats["files"], serde_json::json!([]), "{path}: {stats}");
+        assert!(stats["peerDiscovery"].is_object(), "{path}: {stats}");
+        let sources: Vec<&str> = stats["sources"]
+            .as_array()
+            .expect("sources array")
+            .iter()
+            .filter_map(|s| s["url"].as_str())
+            .collect();
+        assert!(
+            sources.contains(&tracker),
+            "{path}: tr= tracker missing from sources {sources:?}"
+        );
+    }
+
+    // Once metadata is known, a file index that does not exist is still 404.
+    let created: serde_json::Value = client
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": hex::encode(season_pack_torrent_bytes()) }))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    let known = created["infoHash"]
+        .as_str()
+        .expect("create returns infoHash");
+    let response = client.get(format!("{base}/{known}/99/stats.json")).send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    let response = client.get(format!("{base}/{known}/1/stats.json")).send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    handle.shutdown()?;
+    handle.join()?;
+
+    Ok(())
+}
