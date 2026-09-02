@@ -105,6 +105,16 @@ pub async fn heartbeat() -> impl IntoResponse {
     Json(json!({ "success": true }))
 }
 
+// stremio-core probes this at startup (models/streaming_server.rs) expecting
+// `{"availableHardwareAccelerations": [...]}`. This fork does no transcoding
+// and has no hwaccel profiles, so an empty list is the honest answer — the
+// alternative, leaving the route absent, makes every client boot log an
+// ERROR-level 404 in diagnostics::logging for a request the core already
+// tolerates failing.
+pub async fn device_info() -> impl IntoResponse {
+    Json(json!({ "availableHardwareAccelerations": Vec::<String>::new() }))
+}
+
 pub async fn network_info() -> impl IntoResponse {
     let mut interfaces = Vec::new();
     if let Ok(if_addrs) = if_addrs::get_if_addrs() {

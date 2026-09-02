@@ -26,6 +26,37 @@ fn starts_and_stops_embedded_server() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// stremio-core probes `/device-info` at startup expecting
+/// `{"availableHardwareAccelerations": [...]}`. This fork does no
+/// transcoding, so the honest answer is an empty list — but the route must
+/// exist (200, not 404) or every client boot logs an ERROR-level 404 in
+/// diagnostics::logging.
+#[test]
+fn device_info_reports_no_hardware_accelerations() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_dir.path().join("cache")),
+        ..stream_server::ServerConfig::default()
+    })?;
+
+    let response = reqwest::blocking::get(format!("http://{}/device-info", handle.http_addr()))?
+        .error_for_status()?;
+    let body: serde_json::Value = response.json()?;
+    assert_eq!(
+        body.get("availableHardwareAccelerations"),
+        Some(&serde_json::json!([]))
+    );
+
+    handle.shutdown()?;
+    handle.join()?;
+
+    Ok(())
+}
+
 /// stremio-core's play_on_device (models/streaming_server.rs:716-744) POSTs
 /// to `casting/{device}/player` and treats any 2xx response as
 /// `PlayingOnDevice`. Casting isn't implemented, so the endpoint must fail

@@ -620,6 +620,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/heartbeat", get(routes::system::heartbeat))
         .route("/stats.json", get(routes::system::get_stats))
         .route("/network-info", get(routes::system::network_info))
+        .route("/device-info", get(routes::system::device_info))
         .nest("/update", routes::update::router())
         .route("/diagnostics/memory", get(diagnostics::memory))
         .route("/diagnostics/streams", get(diagnostics::streams))
