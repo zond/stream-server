@@ -139,10 +139,6 @@ impl Drop for MetadataResolutionGuard {
     }
 }
 
-fn parse_trackers(query_str: Option<&str>) -> Vec<String> {
-    compat::normalize_tracker_sources(compat::query_values(query_str, "tr"))
-}
-
 #[derive(Default)]
 struct PlaybackQuery {
     download: bool,
@@ -372,13 +368,8 @@ pub async fn head_stream_video(
         state.engine.clone()
     };
 
-    let engine = if let Some(e) = engine_fs.get_engine(&info_hash).await {
-        e
-    } else {
-        let trackers = parse_trackers(query_str.as_deref());
-        let magnet = format!("magnet:?xt=urn:btih:{}", info_hash);
-        let source = enginefs::backend::TorrentSource::Url(magnet);
-        match engine_fs.add_torrent(source, Some(trackers.clone())).await {
+    let engine =
+        match compat::get_or_create_engine(&engine_fs, &info_hash, query_str.as_deref()).await {
             Ok(e) => e,
             Err(e) => {
                 tracing::error!("head_stream_video: Failed to create engine: {}", e);
@@ -388,8 +379,7 @@ pub async fn head_stream_video(
                 )
                     .into_response();
             }
-        }
-    };
+        };
 
     let _metadata_resolution = MetadataResolutionGuard::acquire(&engine).await;
     let files = engine.handle.get_files().await;
@@ -502,25 +492,12 @@ pub async fn stream_video(
         "stream_video request"
     );
 
-    // Try to get existing engine, or auto-create from info hash
-    let mut engine = if let Some(e) = engine_fs.get_engine(&info_hash).await {
-        tracing::debug!(stream_id, "stream_video engine found in cache");
-        e
-    } else {
-        // Auto-create engine from magnet link
-        tracing::debug!(
-            stream_id,
-            info_hash = %info_hash,
-            "stream_video auto-creating engine"
-        );
-        let trackers = parse_trackers(query_str.as_deref());
-        let magnet = format!("magnet:?xt=urn:btih:{}", info_hash);
-        // Note: usage of enginefs::backend::TorrentSource requires enginefs dependency or import
-        let source = enginefs::backend::TorrentSource::Url(magnet);
-
-        match engine_fs.add_torrent(source, Some(trackers.clone())).await {
+    // Existing engine, or one auto-created from the info hash with the
+    // request's trackers.
+    let mut engine =
+        match compat::get_or_create_engine(&engine_fs, &info_hash, query_str.as_deref()).await {
             Ok(e) => {
-                tracing::debug!(stream_id, "stream_video engine created successfully");
+                tracing::debug!(stream_id, "stream_video engine ready");
                 e
             }
             Err(e) => {
@@ -531,8 +508,7 @@ pub async fn stream_video(
                 )
                     .into_response();
             }
-        }
-    };
+        };
 
     let mut _metadata_resolution = MetadataResolutionGuard::acquire(&engine).await;
     let mut files = engine.handle.get_files().await;
@@ -630,36 +606,24 @@ pub async fn stream_video(
         engine_fs = state.engine.clone();
         download_storage_mode = "memoryOnlyLowDiskFallback";
 
-        engine = if let Some(e) = engine_fs.get_engine(&info_hash).await {
-            tracing::debug!(
-                stream_id,
-                "stream_video fallback memory engine found in cache"
-            );
-            e
-        } else {
-            let trackers = parse_trackers(query_str.as_deref());
-            let magnet = format!("magnet:?xt=urn:btih:{}", info_hash);
-            let source = enginefs::backend::TorrentSource::Url(magnet);
-            match engine_fs.add_torrent(source, Some(trackers.clone())).await {
-                Ok(e) => {
-                    tracing::debug!(
-                        stream_id,
-                        "stream_video fallback memory engine created successfully"
-                    );
-                    e
-                }
-                Err(e) => {
-                    tracing::error!(
-                        stream_id,
-                        error = %e,
-                        "stream_video failed to create fallback memory engine"
-                    );
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to create fallback memory engine: {}", e),
-                    )
-                        .into_response();
-                }
+        engine = match compat::get_or_create_engine(&engine_fs, &info_hash, query_str.as_deref())
+            .await
+        {
+            Ok(e) => {
+                tracing::debug!(stream_id, "stream_video fallback memory engine ready");
+                e
+            }
+            Err(e) => {
+                tracing::error!(
+                    stream_id,
+                    error = %e,
+                    "stream_video failed to create fallback memory engine"
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to create fallback memory engine: {}", e),
+                )
+                    .into_response();
             }
         };
 

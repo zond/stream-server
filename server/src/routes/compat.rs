@@ -3,8 +3,12 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use enginefs::EngineFS;
+use enginefs::backend::librqbit::LibrqbitHandle;
+use enginefs::engine::Engine;
 use regex::RegexBuilder;
 use serde_json::json;
+use std::sync::Arc;
 
 pub const DLNA_TRANSFER_MODE: &str = "Streaming";
 pub const DLNA_CONTENT_FEATURES: &str =
@@ -49,6 +53,32 @@ pub fn normalize_tracker_sources(sources: Vec<String>) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// The addon-supplied trackers of a playback-shaped request: every `tr=` query
+/// value, percent-decoded and normalised (`tracker:` prefixes stripped, `dht:`
+/// sources dropped) exactly as server.js's `/{infoHash}/{fileIdx}` does.
+pub fn parse_trackers(query_str: Option<&str>) -> Vec<String> {
+    normalize_tracker_sources(query_values(query_str, "tr"))
+}
+
+/// Look `info_hash` up in `engine_fs`, or create it from a bare magnet with
+/// the request's `tr=` trackers merged in, waiting for metadata. Every route
+/// that may be the first to touch a torrent (stream, HEAD, both `stats.json`
+/// variants) must create the engine through this or
+/// `EngineFS::get_or_begin_add_magnet`: the librqbit backend cannot add
+/// trackers to a torrent after the fact (see `LibrqbitHandle::add_trackers`),
+/// so whichever request arrives first fixes the tracker set for the whole
+/// session. A stats poll racing the first stream request must therefore not
+/// create a tracker-less engine that the stream request then silently reuses.
+pub async fn get_or_create_engine(
+    engine_fs: &EngineFS,
+    info_hash: &str,
+    query_str: Option<&str>,
+) -> anyhow::Result<Arc<Engine<LibrqbitHandle>>> {
+    engine_fs
+        .get_or_add_magnet(info_hash, Some(parse_trackers(query_str)))
+        .await
 }
 
 pub fn basename(path: &str) -> &str {
@@ -215,6 +245,19 @@ mod tests {
         assert!(value.contains(r#"filename="Movie Final.mkv""#));
         assert!(value.contains("filename*=UTF-8''Movie%20Final.mkv"));
         assert!(!value.contains(".."));
+    }
+
+    #[test]
+    fn parse_trackers_decodes_and_normalises_tr_values() {
+        let trackers = parse_trackers(Some(
+            "tr=tracker%3Audp%3A%2F%2Fone%3A6969%2Fannounce&f=movie&tr=dht%3Aabc&tr=https%3A%2F%2Ftwo%2Fannounce",
+        ));
+
+        assert_eq!(
+            trackers,
+            ["udp://one:6969/announce", "https://two/announce"]
+        );
+        assert!(parse_trackers(None).is_empty());
     }
 
     #[test]
