@@ -1,4 +1,5 @@
 use anyhow::Context;
+pub use auth::ServerAuth;
 use axum::{
     Router,
     http::StatusCode,
@@ -23,6 +24,7 @@ pub const DEFAULT_HTTPS_PORT: u16 = 12470;
 pub mod jni;
 
 mod archives;
+mod auth;
 mod cache_cleaner;
 mod diagnostics;
 mod routes;
@@ -54,6 +56,9 @@ pub struct ServerConfig {
     pub enable_memory_sampler: bool,
     pub enable_ssdp_discovery: bool,
     pub graceful_shutdown_timeout: Duration,
+    /// How the control API authenticates (media routes are always open).
+    /// Defaults to a per-launch generated token; see [`ServerAuth`].
+    pub auth: ServerAuth,
 }
 
 impl Default for ServerConfig {
@@ -80,6 +85,7 @@ impl ServerConfig {
             enable_memory_sampler: false,
             enable_ssdp_discovery: false,
             graceful_shutdown_timeout: Duration::from_secs(3),
+            auth: ServerAuth::Generated,
         }
     }
 
@@ -100,6 +106,7 @@ impl ServerConfig {
             enable_memory_sampler: true,
             enable_ssdp_discovery: true,
             graceful_shutdown_timeout: Duration::from_secs(3),
+            auth: ServerAuth::Generated,
         }
     }
 }
@@ -111,9 +118,17 @@ pub enum ShutdownSource {
     External,
 }
 
+/// What [`run`] reports once its HTTP listener is bound and the server is
+/// ready to answer requests.
+pub struct Started {
+    pub bound_http_addr: SocketAddr,
+    pub state: AppState,
+}
+
 pub struct ServerHandle {
     http_addr: SocketAddr,
     bound_http_addr: SocketAddr,
+    state: AppState,
     shutdown_tx: tokio::sync::mpsc::Sender<()>,
     join: std::thread::JoinHandle<anyhow::Result<Option<ShutdownSource>>>,
 }
@@ -125,6 +140,13 @@ impl ServerHandle {
 
     pub fn bound_http_addr(&self) -> SocketAddr {
         self.bound_http_addr
+    }
+
+    /// The bearer token the control routes require this launch
+    /// (`Authorization: Bearer <token>`), or `None` when
+    /// [`ServerAuth::Disabled`] left them open.
+    pub fn auth_token(&self) -> Option<&str> {
+        self.state.auth_token.as_deref()
     }
 
     pub fn shutdown(&self) -> anyhow::Result<()> {
@@ -155,8 +177,11 @@ pub fn start(cfg: ServerConfig) -> anyhow::Result<ServerHandle> {
             rt.block_on(run(thread_cfg, shutdown_rx, Some(ready_tx)))
         })?;
 
-    let bound_http_addr = match ready_rx.blocking_recv() {
-        Ok(addr) => addr,
+    let Started {
+        bound_http_addr,
+        state,
+    } = match ready_rx.blocking_recv() {
+        Ok(started) => started,
         Err(_) => {
             return match join.join() {
                 Ok(result) => match result {
@@ -173,6 +198,7 @@ pub fn start(cfg: ServerConfig) -> anyhow::Result<ServerHandle> {
     Ok(ServerHandle {
         http_addr: connectable_addr(bound_http_addr),
         bound_http_addr,
+        state,
         shutdown_tx,
         join,
     })
@@ -209,7 +235,7 @@ fn resolve_dirs(cfg: &ServerConfig) -> anyhow::Result<(PathBuf, PathBuf)> {
 pub async fn run(
     cfg: ServerConfig,
     mut external_shutdown_rx: tokio::sync::mpsc::Receiver<()>,
-    ready_tx: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
+    ready_tx: Option<tokio::sync::oneshot::Sender<Started>>,
 ) -> anyhow::Result<Option<ShutdownSource>> {
     let listener = tokio::net::TcpListener::bind(cfg.http_addr)
         .await
@@ -412,6 +438,20 @@ pub async fn run(
     );
     state.base_url = base_url.clone();
     state.http_addr = public_http_addr;
+    state.auth_token = cfg.auth.resolve()?.map(Arc::from);
+    match state.auth_token.as_deref() {
+        // The standalone binary has no other way to hand its token to a
+        // client, so it goes to the log; an embedder reads
+        // `ServerHandle::auth_token` instead and never sees it logged.
+        Some(token) if cfg.print_startup => {
+            tracing::info!(
+                token,
+                "control API requires `Authorization: Bearer <token>`"
+            );
+        }
+        Some(_) => tracing::info!("control API requires a bearer token"),
+        None => tracing::warn!("control API authentication is disabled; every route is open"),
+    }
 
     {
         let settings = settings_arc.read().await;
@@ -442,7 +482,7 @@ pub async fn run(
         tui::start_tui(Arc::new(state.clone()), rx, shutdown_tx);
     }
 
-    let app = build_router(state);
+    let app = build_router(state.clone());
 
     tracing::info!("listening on {}", bound_http_addr);
     if cfg.print_startup {
@@ -450,7 +490,10 @@ pub async fn run(
         println!("EngineFS server started at {}", base_url);
     }
     if let Some(ready_tx) = ready_tx {
-        let _ = ready_tx.send(bound_http_addr);
+        let _ = ready_tx.send(Started {
+            bound_http_addr,
+            state,
+        });
     }
 
     let (shutdown_started_tx, mut shutdown_started_rx) =
@@ -614,6 +657,57 @@ pub fn build_router(state: AppState) -> Router {
         StatusCode::METHOD_NOT_ALLOWED
     }
 
+    let control = control_router().route_layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        auth::require_bearer,
+    ));
+
+    Router::new()
+        .merge(media_router())
+        .merge(control)
+        .fallback(fallback_handler)
+        .method_not_allowed_fallback(method_not_allowed_handler)
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
+                tracing::info_span!(
+                    "request",
+                    method = %request.method(),
+                    path = request.uri().path(),
+                )
+            }),
+        )
+        .layer(CorsLayer::permissive())
+        .with_state(state)
+}
+
+/// Routes that hand media bytes to a player. They are OPEN (no bearer token):
+/// players fetch the URLs stremio-core builds for them
+/// (types/resource/stream.rs) and cannot attach headers.
+fn media_router() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/stream/{infoHash}/{fileIdx}",
+            get(routes::stream::stream_video).head(routes::stream::head_stream_video),
+        )
+        .route(
+            "/{infoHash}/{fileIdx}",
+            get(routes::stream::stream_video).head(routes::stream::head_stream_video),
+        )
+        .nest("/rar", routes::archive::router())
+        .nest("/zip", routes::archive::router())
+        .nest("/7zip", routes::archive::router())
+        .nest("/tar", routes::archive::router())
+        .nest("/tgz", routes::archive::router())
+        .nest("/nzb", routes::nzb::router())
+        .nest("/proxy", routes::proxy::router())
+        .nest("/ftp", routes::ftp::router())
+}
+
+/// Everything that is not media bytes: what stremio-core's StreamingServer
+/// model calls through `Env::fetch`, plus the app/test status routes. Every
+/// route here requires `Authorization: Bearer <token>` (see `auth`); a new
+/// route goes here unless it serves media bytes to a player.
+fn control_router() -> Router<AppState> {
     Router::new()
         .route("/heartbeat", get(routes::system::heartbeat))
         .route("/stats.json", get(routes::system::get_stats))
@@ -633,35 +727,6 @@ pub fn build_router(state: AppState) -> Router {
             "/{infoHash}/{idx}/stats.json",
             get(routes::system::get_file_stats),
         )
-        .route(
-            "/stream/{infoHash}/{fileIdx}",
-            get(routes::stream::stream_video).head(routes::stream::head_stream_video),
-        )
-        .route(
-            "/{infoHash}/{fileIdx}",
-            get(routes::stream::stream_video).head(routes::stream::head_stream_video),
-        )
         .route("/get-https", get(routes::system::get_https))
-        .nest("/rar", routes::archive::router())
-        .nest("/zip", routes::archive::router())
-        .nest("/7zip", routes::archive::router())
-        .nest("/tar", routes::archive::router())
-        .nest("/tgz", routes::archive::router())
-        .nest("/nzb", routes::nzb::router())
-        .nest("/proxy", routes::proxy::router())
-        .nest("/ftp", routes::ftp::router())
         .nest("/casting", routes::casting::router())
-        .fallback(fallback_handler)
-        .method_not_allowed_fallback(method_not_allowed_handler)
-        .layer(
-            TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
-                tracing::info_span!(
-                    "request",
-                    method = %request.method(),
-                    path = request.uri().path(),
-                )
-            }),
-        )
-        .layer(CorsLayer::permissive())
-        .with_state(state)
 }

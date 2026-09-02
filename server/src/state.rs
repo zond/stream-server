@@ -16,6 +16,8 @@ pub struct AppState {
     pub log_dir: PathBuf,
     pub base_url: String,
     pub http_addr: SocketAddr,
+    /// Bearer token the control routes require; `None` leaves them open.
+    pub auth_token: Option<Arc<str>>,
     pub archive_cache: Arc<dashmap::DashMap<String, crate::archives::ArchiveSession>>,
     pub nzb_sessions: Arc<dashmap::DashMap<String, crate::archives::nzb::session::NzbSession>>,
     pub devices: Arc<RwLock<Vec<crate::ssdp::Device>>>,
@@ -91,6 +93,7 @@ impl AppState {
             log_dir,
             base_url: "http://127.0.0.1:11470".to_string(),
             http_addr: SocketAddr::from(([127, 0, 0, 1], 11470)),
+            auth_token: None,
             archive_cache: Arc::new(dashmap::DashMap::new()),
             nzb_sessions: Arc::new(dashmap::DashMap::new()),
             devices: Arc::new(RwLock::new(Vec::new())),

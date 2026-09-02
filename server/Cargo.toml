@@ -30,6 +30,9 @@ serde_json = "1.0.133"
 anyhow = "1.0"
 tokio-util = { version = "0.7.17", features = ["io", "compat"] }
 hex = "0.4"
+# Per-launch control-API bearer token: random bytes + constant-time compare.
+getrandom = "0.4"
+subtle = "2.6"
 if-addrs = "0.15.0"
 urlencoding = "2.1"
 regex = "1.11"

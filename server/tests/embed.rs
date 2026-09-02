@@ -10,6 +10,40 @@
 // TODO: let an embedded server ask for an ephemeral torrent listen port
 // (a `ServerConfig` option mapping to port 0 in `LibrqbitBackend::new`) so
 // tests are not limited by the fixed range at all.
+
+use stream_server::{ServerAuth, ServerConfig, ServerHandle};
+
+/// Client builder that sends the server's bearer token (if it has one) on
+/// every request -- every control route requires it.
+fn bearer_client_builder(handle: &ServerHandle) -> reqwest::blocking::ClientBuilder {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(token) = handle.auth_token() {
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().expect("valid header"),
+        );
+    }
+    reqwest::blocking::Client::builder().default_headers(headers)
+}
+
+fn bearer_client(handle: &ServerHandle) -> anyhow::Result<reqwest::blocking::Client> {
+    Ok(bearer_client_builder(handle).build()?)
+}
+
+/// Both stock configurations generate a per-launch token; opening the
+/// control API is an explicit opt-out (`ServerAuth::Disabled`, `--no-auth`).
+#[test]
+fn stock_configs_default_to_a_generated_token() {
+    assert_eq!(ServerConfig::embedded().auth, ServerAuth::Generated);
+    assert_eq!(ServerConfig::binary_default().auth, ServerAuth::Generated);
+    assert_eq!(ServerConfig::default().auth, ServerAuth::Generated);
+}
+
+/// Start/stop round trip, plus the auth contract of the default
+/// (`ServerAuth::Generated`) server: the handle exposes the token, control
+/// routes 401 without it or with a wrong one (fixed body, no hint), accept
+/// it in `Authorization: Bearer`, and media routes stay open -- `/ftp/...`
+/// without a token gets its ordinary 400 for a missing `lz`, never a 401.
 #[test]
 fn starts_and_stops_embedded_server() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -23,11 +57,50 @@ fn starts_and_stops_embedded_server() -> anyhow::Result<()> {
         cache_dir: Some(cache_dir.path().join("cache")),
         ..stream_server::ServerConfig::default()
     })?;
+    let base = format!("http://{}", handle.http_addr());
 
-    let response = reqwest::blocking::get(format!("http://{}/heartbeat", handle.http_addr()))?
+    let token = handle.auth_token().expect("generated token").to_string();
+    assert_eq!(token.len(), 64, "32 random bytes as hex");
+    assert!(token.bytes().all(|c| c.is_ascii_hexdigit()));
+
+    let anonymous = reqwest::blocking::Client::new();
+    let response = anonymous.get(format!("{base}/heartbeat")).send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok()),
+        Some("Bearer")
+    );
+    assert_eq!(response.text()?, "unauthorized");
+
+    let response = anonymous
+        .get(format!("{base}/heartbeat"))
+        .bearer_auth(format!("{}0", &token[1..]))
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(response.text()?, "unauthorized");
+
+    // Token in the query string is not accepted: header only.
+    let response = anonymous
+        .get(format!("{base}/heartbeat?token={token}"))
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let response = bearer_client(&handle)?
+        .get(format!("{base}/heartbeat"))
+        .send()?
         .error_for_status()?;
     let body: serde_json::Value = response.json()?;
     assert_eq!(body["success"], true);
+
+    let response = anonymous.get(format!("{base}/ftp/movie.mkv")).send()?;
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "media routes are open (400 = missing lz parameter, not 401)"
+    );
 
     handle.shutdown()?;
     assert_eq!(
@@ -55,7 +128,9 @@ fn device_info_reports_no_hardware_accelerations() -> anyhow::Result<()> {
         ..stream_server::ServerConfig::default()
     })?;
 
-    let response = reqwest::blocking::get(format!("http://{}/device-info", handle.http_addr()))?
+    let response = bearer_client(&handle)?
+        .get(format!("http://{}/device-info", handle.http_addr()))
+        .send()?
         .error_for_status()?;
     let body: serde_json::Value = response.json()?;
     assert_eq!(
@@ -74,6 +149,9 @@ fn device_info_reports_no_hardware_accelerations() -> anyhow::Result<()> {
 /// `PlayingOnDevice`. Casting isn't implemented, so the endpoint must fail
 /// visibly (non-2xx) instead of the official client silently believing
 /// playback started on the device.
+///
+/// This server runs with `ServerAuth::Disabled` (the binary's `--no-auth`):
+/// the handle has no token and control routes answer without a header.
 #[test]
 fn casting_player_reports_failure_since_casting_is_not_implemented() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -83,10 +161,20 @@ fn casting_player_reports_failure_since_casting_is_not_implemented() -> anyhow::
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         config_dir: Some(config_dir.path().join("config")),
         cache_dir: Some(cache_dir.path().join("cache")),
+        auth: ServerAuth::Disabled,
         ..stream_server::ServerConfig::default()
     })?;
+    assert_eq!(handle.auth_token(), None);
 
+    // No Authorization header anywhere in this test.
     let client = reqwest::blocking::Client::new();
+    let heartbeat: serde_json::Value = client
+        .get(format!("http://{}/heartbeat", handle.http_addr()))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    assert_eq!(heartbeat["success"], true);
+
     let response = client
         .post(format!(
             "http://{}/casting/some-device/player",
@@ -127,7 +215,7 @@ fn create_engine_reports_failure_with_non_2xx_status() -> anyhow::Result<()> {
         ..stream_server::ServerConfig::default()
     })?;
 
-    let client = reqwest::blocking::Client::new();
+    let client = bearer_client(&handle)?;
     let base = format!("http://{}", handle.http_addr());
 
     // Neither `from` nor `torrent` given.
@@ -208,7 +296,7 @@ fn create_engine_guesses_episode_from_season_pack() -> anyhow::Result<()> {
         ..stream_server::ServerConfig::default()
     })?;
 
-    let client = reqwest::blocking::Client::new();
+    let client = bearer_client(&handle)?;
     let blob = hex::encode(season_pack_torrent_bytes());
 
     // Episode hints pick S01E02 (file 1) even though S01E01 (file 0) is larger.
@@ -259,9 +347,10 @@ fn stats_json_sys_reports_loadavg_and_cpus() -> anyhow::Result<()> {
         ..stream_server::ServerConfig::default()
     })?;
 
-    let response =
-        reqwest::blocking::get(format!("http://{}/stats.json?sys=1", handle.http_addr()))?
-            .error_for_status()?;
+    let response = bearer_client(&handle)?
+        .get(format!("http://{}/stats.json?sys=1", handle.http_addr()))
+        .send()?
+        .error_for_status()?;
     let body: serde_json::Value = response.json()?;
     let loadavg = body["sys"]["loadavg"]
         .as_array()
@@ -334,7 +423,9 @@ fn starts_without_home_env() -> anyhow::Result<()> {
         ..stream_server::ServerConfig::default()
     })?;
 
-    let response = reqwest::blocking::get(format!("http://{}/heartbeat", handle.http_addr()))?
+    let response = bearer_client(&handle)?
+        .get(format!("http://{}/heartbeat", handle.http_addr()))
+        .send()?
         .error_for_status()?;
     let body: serde_json::Value = response.json()?;
     assert_eq!(body["success"], true);
@@ -366,7 +457,7 @@ fn stats_json_exposes_startup_phase_fields_additively() -> anyhow::Result<()> {
         ..stream_server::ServerConfig::default()
     })?;
     let base = format!("http://{}", handle.http_addr());
-    let client = reqwest::blocking::Client::new();
+    let client = bearer_client(&handle)?;
 
     let created: serde_json::Value = client
         .post(format!("{base}/create"))
@@ -490,7 +581,7 @@ fn stats_json_reports_resolving_metadata_with_the_requests_trackers() -> anyhow:
         ..stream_server::ServerConfig::default()
     })?;
     let base = format!("http://{}", handle.http_addr());
-    let client = reqwest::blocking::Client::builder()
+    let client = bearer_client_builder(&handle)
         .timeout(std::time::Duration::from_secs(5))
         .build()?;
 
@@ -530,7 +621,7 @@ fn stats_json_reports_resolving_metadata_with_the_requests_trackers() -> anyhow:
     // blocks past the client timeout while its add lives on in the registry.
     let create_first = "445566778899aabbccddeeff0011223344556677";
     let create_tracker = "udp://create-first.invalid:6969/announce";
-    let created = reqwest::blocking::Client::builder()
+    let created = bearer_client_builder(&handle)
         .timeout(std::time::Duration::from_secs(2))
         .build()?
         .post(format!("{base}/{create_first}/create"))

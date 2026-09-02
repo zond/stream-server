@@ -16,17 +16,23 @@ mod app {
 
         let args: Vec<String> = std::env::args().collect();
         let use_tui = args.iter().any(|a| a == "--tui");
+        // `--no-auth` opens the control API to anyone who can reach the port;
+        // by default a per-launch bearer token is generated and logged.
+        let no_auth = args.iter().any(|a| a == "--no-auth");
 
-        run(use_tui)?;
+        run(use_tui, no_auth)?;
 
         Ok(())
     }
 
-    fn run(use_tui: bool) -> anyhow::Result<()> {
+    fn run(use_tui: bool, no_auth: bool) -> anyhow::Result<()> {
         let rt = tokio::runtime::Runtime::new()?;
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         let mut cfg = stream_server::ServerConfig::binary_default();
         cfg.use_tui = use_tui;
+        if no_auth {
+            cfg.auth = stream_server::ServerAuth::Disabled;
+        }
         let _ = rt.block_on(stream_server::run(cfg, rx, None))?;
         Ok(())
     }
