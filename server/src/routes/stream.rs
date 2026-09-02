@@ -593,15 +593,31 @@ pub async fn stream_video(
     } else {
         end.saturating_sub(start) + 1
     };
-    if prefer_disk_stream
-        && let Err(err) = ensure_download_disk_ready(
-            &engine_fs.download_dir,
-            &name,
-            size,
-            requested_content_length,
-            disk_space_check_treats_as_partial(is_download, is_partial),
-        )
-    {
+    // The readiness check performs blocking std::fs syscalls (create_dir_all, a
+    // write probe, and a metadata stat) that are re-run on every request and every
+    // seek. Run them on the blocking pool so they never stall an async worker
+    // thread inline — which would also block any other stream/API task scheduled on
+    // that same worker — e.g. when the cache lives on a spun-down HDD or a slow
+    // network/SMB mount.
+    let disk_ready = if prefer_disk_stream {
+        let download_dir = engine_fs.download_dir.clone();
+        let file_name = name.clone();
+        let treat_as_partial = disk_space_check_treats_as_partial(is_download, is_partial);
+        tokio::task::spawn_blocking(move || {
+            ensure_download_disk_ready(
+                &download_dir,
+                &file_name,
+                size,
+                requested_content_length,
+                treat_as_partial,
+            )
+        })
+        .await
+        .unwrap_or_else(|join_err| Err(format!("disk readiness check task failed: {join_err}")))
+    } else {
+        Ok(())
+    };
+    if prefer_disk_stream && let Err(err) = disk_ready {
         tracing::warn!(
             stream_id,
             info_hash = %info_hash,
@@ -945,6 +961,23 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         ensure_download_disk_ready(temp.path(), "movie.mkv", 10 * 1024 * 1024, 1, true)
             .expect("writable temp dir should pass partial request safety check");
+    }
+
+    #[tokio::test]
+    async fn readiness_check_runs_off_the_async_worker_via_spawn_blocking() {
+        // stream_video now dispatches the blocking fs probes onto the blocking
+        // pool rather than running them inline on a runtime worker. Exercise that
+        // exact path: the closure must be Send + 'static and produce the same
+        // result it would when called directly.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().to_path_buf();
+        let name = "movie.mkv".to_string();
+        let readiness = tokio::task::spawn_blocking(move || {
+            ensure_download_disk_ready(&root, &name, 10 * 1024 * 1024, 1, true)
+        })
+        .await
+        .expect("spawn_blocking join should succeed");
+        readiness.expect("writable temp dir should pass partial request safety check");
     }
 
     #[test]
