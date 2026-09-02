@@ -470,6 +470,47 @@ pub struct LibrqbitHandle {
     deferred_selections: DeferredSelections,
 }
 
+/// Put `trackers` into a magnet link as `tr=` params.
+///
+/// librqbit's `Session::add_torrent` takes a magnet's trackers from the magnet
+/// URL's own `tr=` params only; `AddTorrentOptions::trackers` is merged in the
+/// torrent-file branch alone (session.rs: the `AddTorrent::Url` magnet arm
+/// builds `InternalAddResult.trackers` from `Magnet::trackers`, the `other`
+/// arm extends the metainfo's announce list with `opts.trackers`). So the
+/// merged tracker list has to travel inside the URL, or a magnet add reaches
+/// librqbit tracker-less (DHT-only) and `stats().sources` comes back empty.
+///
+/// Appends one percent-encoded `tr=` per tracker not already in the URL
+/// (`Magnet::parse` collects every `tr` via `Url::query_pairs`, which
+/// decodes them again). A bare 40-hex info hash, which librqbit also accepts,
+/// becomes a full magnet link first. Anything else is returned unchanged.
+pub fn magnet_with_trackers(url: &str, trackers: &[String]) -> String {
+    let magnet = if url.len() == 40 && url.bytes().all(|b| b.is_ascii_hexdigit()) {
+        format!("magnet:?xt=urn:btih:{url}")
+    } else {
+        url.to_string()
+    };
+    if !magnet.starts_with("magnet:") {
+        return magnet;
+    }
+    let Ok(mut parsed) = url::Url::parse(&magnet) else {
+        return magnet;
+    };
+    let existing: Vec<String> = parsed
+        .query_pairs()
+        .filter(|(key, _)| key == "tr")
+        .map(|(_, value)| value.into_owned())
+        .collect();
+    let mut pairs = parsed.query_pairs_mut();
+    for tracker in trackers {
+        if !existing.contains(tracker) {
+            pairs.append_pair("tr", tracker);
+        }
+    }
+    drop(pairs);
+    parsed.to_string()
+}
+
 #[async_trait::async_trait]
 impl TorrentBackend for LibrqbitBackend {
     type Handle = LibrqbitHandle;
@@ -480,7 +521,11 @@ impl TorrentBackend for LibrqbitBackend {
         trackers: Vec<String>,
     ) -> Result<Self::Handle> {
         let add_torrent = match source {
-            TorrentSource::Url(url) => librqbit::AddTorrent::Url(url.into()),
+            // See `magnet_with_trackers`: for a magnet only the URL's own
+            // `tr=` params count; `opts.trackers` below covers .torrent adds.
+            TorrentSource::Url(url) => {
+                librqbit::AddTorrent::Url(magnet_with_trackers(&url, &trackers).into())
+            }
             TorrentSource::Bytes(bytes) => {
                 librqbit::AddTorrent::from_bytes(bytes::Bytes::from(bytes))
             }
@@ -1391,6 +1436,100 @@ mod tests {
             "sorted tracker URLs, got {urls:?}"
         );
         assert!(stats.sources.iter().all(|s| s.num_requests == 0));
+    }
+
+    /// The magnet branch of librqbit's `Session::add_torrent` ignores
+    /// `AddTorrentOptions::trackers`, so the trackers have to be `tr=` params
+    /// of the URL it is given -- percent-encoded, one per tracker, exactly as
+    /// its `Magnet::parse` reads them back.
+    #[test]
+    fn magnet_with_trackers_encodes_each_tracker_as_a_tr_param() {
+        let trackers = vec![
+            "udp://one.invalid:6969/announce".to_string(),
+            "https://two.invalid/announce?x=100%25".to_string(),
+        ];
+        let magnet = magnet_with_trackers(
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+            &trackers,
+        );
+        assert_eq!(
+            magnet,
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567\
+             &tr=udp%3A%2F%2Fone.invalid%3A6969%2Fannounce\
+             &tr=https%3A%2F%2Ftwo.invalid%2Fannounce%3Fx%3D100%2525"
+        );
+        // What librqbit will actually see: `Magnet::parse` collects `tr`.
+        let parsed = librqbit::Magnet::parse(&magnet).expect("valid magnet");
+        assert_eq!(parsed.trackers, trackers);
+        assert_eq!(
+            parsed.as_id20().unwrap().as_string(),
+            "0123456789abcdef0123456789abcdef01234567"
+        );
+    }
+
+    #[test]
+    fn magnet_with_trackers_keeps_existing_trs_and_skips_duplicates() {
+        let magnet = magnet_with_trackers(
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=x&tr=udp%3A%2F%2Fone.invalid%2Fannounce",
+            &[
+                "udp://one.invalid/announce".to_string(),
+                "udp://two.invalid/announce".to_string(),
+            ],
+        );
+        let parsed = librqbit::Magnet::parse(&magnet).expect("valid magnet");
+        assert_eq!(
+            parsed.trackers,
+            ["udp://one.invalid/announce", "udp://two.invalid/announce"]
+        );
+        assert_eq!(parsed.name.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn magnet_with_trackers_upgrades_bare_hashes_and_leaves_other_urls_alone() {
+        let trackers = vec!["udp://one.invalid/announce".to_string()];
+        let magnet = magnet_with_trackers("0123456789abcdef0123456789abcdef01234567", &trackers);
+        assert_eq!(
+            magnet,
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&tr=udp%3A%2F%2Fone.invalid%2Fannounce"
+        );
+        assert_eq!(
+            magnet_with_trackers("https://example.invalid/a.torrent", &trackers),
+            "https://example.invalid/a.torrent"
+        );
+        assert_eq!(
+            magnet_with_trackers(
+                "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+                &[]
+            ),
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"
+        );
+    }
+
+    /// End-to-end check of the same thing against a real session: a magnet
+    /// added with a custom tracker must list it in `stats().sources` once
+    /// metadata has resolved. Needs peers, so it runs manually:
+    ///
+    /// ```sh
+    /// STREAM_SERVER_TEST_MAGNET='magnet:?xt=urn:btih:...' \
+    ///     cargo test -p enginefs --release magnet_add_keeps_custom_trackers_live_swarm -- --ignored --nocapture
+    /// ```
+    #[ignore = "requires network and STREAM_SERVER_TEST_MAGNET; see doc comment"]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn magnet_add_keeps_custom_trackers_live_swarm() {
+        let magnet = std::env::var("STREAM_SERVER_TEST_MAGNET")
+            .expect("set STREAM_SERVER_TEST_MAGNET to a magnet link");
+        let tmp = tempfile::tempdir().unwrap();
+        let (backend, _restored) = LibrqbitBackend::new(tmp.path().to_path_buf())
+            .await
+            .expect("network session");
+        let custom = "udp://custom-tracker.invalid:6969/announce".to_string();
+        let handle = backend
+            .add_torrent(TorrentSource::Url(magnet), vec![custom.clone()])
+            .await
+            .expect("add magnet");
+        let stats = TorrentHandle::stats(&handle).await;
+        let urls: Vec<&str> = stats.sources.iter().map(|s| s.url.as_str()).collect();
+        assert!(urls.contains(&custom.as_str()), "sources: {urls:?}");
     }
 
     #[tokio::test]
