@@ -1,3 +1,15 @@
+// Every test in this file starts a full embedded server. The HTTP port is
+// ephemeral (`http_addr` port 0), but the server's librqbit session binds one
+// of the 10 fixed BitTorrent listen ports 42000..42009 (`LISTEN_PORT_RANGE`
+// in enginefs/src/backend/librqbit.rs, tried in order) -- so at most 10
+// embedded servers can coexist, 9 if a desktop instance is running on the
+// same machine. `cargo test` runs the tests of one binary in parallel, so
+// keep the number of server-spawning tests here at 9 or below (or restrict
+// parallelism) until that bound is lifted.
+//
+// TODO: let an embedded server ask for an ephemeral torrent listen port
+// (a `ServerConfig` option mapping to port 0 in `LibrqbitBackend::new`) so
+// tests are not limited by the fixed range at all.
 #[test]
 fn starts_and_stops_embedded_server() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
