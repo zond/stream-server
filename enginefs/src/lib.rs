@@ -1879,13 +1879,26 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// Forget the pin on `file_idx` of `info_hash`. Returns whether it was
     /// pinned (false for an unknown torrent or an unpinned file; true for a
     /// dormant pin of a torrent the backend does not have, which is then
-    /// dropped from the persisted set). Only the
-    /// pin goes: the data stays, the engine becomes an ordinary one again
-    /// (idle removal applies), and the want-set is reconciled against the
-    /// current playback selection -- with nothing playing that is a no-op,
-    /// so the file keeps downloading until the engine is swept or another
-    /// file is prepared.
-    pub async fn unpin_download(&self, info_hash: &str, file_idx: usize) -> Result<bool> {
+    /// dropped from the persisted set).
+    ///
+    /// Without `delete_files` only the pin goes: the data stays, the engine
+    /// becomes an ordinary one again (idle removal applies), and the
+    /// want-set is reconciled against the current playback selection --
+    /// with nothing playing that is a no-op, so the file keeps downloading
+    /// until the engine is swept or another file is prepared.
+    ///
+    /// With `delete_files` the data goes too, whether or not the file was
+    /// pinned (the caller wants the download gone; a pin lost to a crash
+    /// must not leave the bytes behind), see
+    /// [`Self::delete_download_data`]: the whole torrent when this was its
+    /// last pin, only this file while other pins hold. A dormant pin has no
+    /// torrent to delete anything of.
+    pub async fn unpin_download(
+        &self,
+        info_hash: &str,
+        file_idx: usize,
+        delete_files: bool,
+    ) -> Result<bool> {
         let info_hash = info_hash.to_lowercase();
         let Some(engine) = self.get_engine(&info_hash).await else {
             // No torrent, but maybe a dormant pin waiting for it.
@@ -1906,22 +1919,98 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 self.persist_pinned_downloads().await;
                 tracing::info!(info_hash, file_idx, "dormant_download_unpinned");
             }
+            if delete_files {
+                tracing::info!(
+                    info_hash,
+                    file_idx,
+                    "no torrent to delete the data of; only the pin was dropped"
+                );
+            }
             return Ok(was_dormant);
         };
         let was_pinned = engine.pinned_files.write().remove(&file_idx);
         engine.handle.unpin_file(file_idx).await?;
+        let torrent_dropped = if delete_files {
+            self.delete_download_data(&engine, file_idx).await
+        } else {
+            false
+        };
         if was_pinned {
-            self.reconcile_with_active_selection(engine.clone(), "unpin_download")
-                .await;
+            // A dropped torrent has no handle to reconcile against any more
+            // (and nothing left to want).
+            if !torrent_dropped {
+                self.reconcile_with_active_selection(engine.clone(), "unpin_download")
+                    .await;
+            }
             self.persist_pinned_downloads().await;
             tracing::info!(
                 info_hash = %engine.info_hash,
                 file_idx,
                 pinned = ?engine.pinned_file_indices(),
+                deleted = delete_files,
                 "download_unpinned"
             );
         }
         Ok(was_pinned)
+    }
+
+    /// Delete what `file_idx` of `engine` occupies on disk, for an unpin
+    /// that was asked to take the data with it. With no pin left on the
+    /// torrent that is the whole torrent: dropped from the registry and
+    /// from the backend with its files and its (then empty) per-torrent
+    /// folder ([`TorrentBackend::remove_torrent_and_files`]). While other
+    /// files of it stay pinned the torrent must keep running, so only this
+    /// file is unlinked -- the unpin's reconcile drops it from the want-set
+    /// right after, so the backend does not write it again. Returns whether
+    /// the torrent was dropped. Best effort: a failure is logged, the unpin
+    /// stands.
+    async fn delete_download_data(&self, engine: &Arc<Engine<B::Handle>>, file_idx: usize) -> bool {
+        if engine.is_pinned() {
+            let Some(path) = engine.handle.file_path(file_idx).await else {
+                tracing::warn!(
+                    info_hash = %engine.info_hash,
+                    file_idx,
+                    "backend knows no path for the file; its data stays on disk"
+                );
+                return false;
+            };
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => tracing::info!(
+                    info_hash = %engine.info_hash,
+                    file_idx,
+                    path = %path.display(),
+                    "download_file_deleted"
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    info_hash = %engine.info_hash,
+                    file_idx,
+                    path = %path.display(),
+                    %error,
+                    "could not delete the download's file"
+                ),
+            }
+            return false;
+        }
+        self.remove_engine_if_current(engine).await;
+        match self
+            .backend
+            .remove_torrent_and_files(&engine.info_hash)
+            .await
+        {
+            Ok(()) => tracing::info!(
+                info_hash = %engine.info_hash,
+                file_idx,
+                "download_deleted"
+            ),
+            Err(error) => tracing::warn!(
+                info_hash = %engine.info_hash,
+                file_idx,
+                %error,
+                "could not delete the download's torrent"
+            ),
+        }
+        true
     }
 
     /// `pinned-downloads.json` in the download dir: `{ "<info hash>": [file
@@ -3384,6 +3473,14 @@ mod tests {
 
     fn test_enginefs() -> (BackendEngineFS<FakeBackend>, Arc<FakeCounters>) {
         test_enginefs_with_file_count(1)
+    }
+
+    /// The persisted pin set as JSON (`{}` when the file is not there yet).
+    fn read_pinned_downloads(path: &std::path::Path) -> serde_json::Value {
+        match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap(),
+            Err(_) => serde_json::json!({}),
+        }
     }
 
     fn test_enginefs_with_file_count(
@@ -5310,7 +5407,7 @@ mod tests {
         first.pin_download(TEST_HASH, 2, None).await.unwrap();
         first.pin_download(TEST_HASH, 1, None).await.unwrap();
         assert_eq!(read_pins(&path), serde_json::json!({ TEST_HASH: [1, 2] }));
-        assert!(first.unpin_download(TEST_HASH, 2).await.unwrap());
+        assert!(first.unpin_download(TEST_HASH, 2, false).await.unwrap());
         assert_eq!(read_pins(&path), serde_json::json!({ TEST_HASH: [1] }));
         drop(first);
 
@@ -5416,8 +5513,8 @@ mod tests {
             serde_json::json!({ OTHER_HASH: [0], TEST_HASH: [1] })
         );
         // An unpin reaches a dormant pin too.
-        assert!(second.unpin_download(TEST_HASH, 1).await.unwrap());
-        assert!(!second.unpin_download(TEST_HASH, 1).await.unwrap());
+        assert!(second.unpin_download(TEST_HASH, 1, false).await.unwrap());
+        assert!(!second.unpin_download(TEST_HASH, 1, false).await.unwrap());
         assert_eq!(read_pins(&path), serde_json::json!({ OTHER_HASH: [0] }));
         drop(second);
 
@@ -5554,7 +5651,7 @@ mod tests {
         assert_eq!(*counters.last_active_file.lock().unwrap(), Some(2));
 
         // Unpin forgets the pin and reconciles again around the selection.
-        assert!(enginefs.unpin_download(TEST_HASH, 1).await.unwrap());
+        assert!(enginefs.unpin_download(TEST_HASH, 1, false).await.unwrap());
         assert_eq!(counters.unpin_file.load(Ordering::SeqCst), 1);
         assert_eq!(engine.pinned_file_indices(), vec![0]);
         assert_eq!(
@@ -5564,15 +5661,137 @@ mod tests {
         assert_eq!(*counters.last_active_file.lock().unwrap(), Some(2));
         assert!(!engine.get_statistics().await.files[1].pinned);
         // Not pinned (any more) / unknown torrent: false, no reconcile.
-        assert!(!enginefs.unpin_download(TEST_HASH, 1).await.unwrap());
-        assert!(!enginefs.unpin_download(&"f".repeat(40), 0).await.unwrap());
+        assert!(!enginefs.unpin_download(TEST_HASH, 1, false).await.unwrap());
+        assert!(
+            !enginefs
+                .unpin_download(&"f".repeat(40), 0, false)
+                .await
+                .unwrap()
+        );
         assert_eq!(
             counters.reconcile_file_priorities.load(Ordering::SeqCst),
             before + 2
         );
-        assert!(enginefs.unpin_download(TEST_HASH, 0).await.unwrap());
+        assert!(enginefs.unpin_download(TEST_HASH, 0, false).await.unwrap());
         assert!(!engine.is_pinned());
         assert!(enginefs.pinned_downloads().await.is_empty());
+    }
+
+    /// `unpin_download(.., delete_files = true)` takes the data with the
+    /// pin: only the one file while the torrent has other pins (it keeps
+    /// running for them), the whole torrent -- registry entry, backend
+    /// record, files and folder -- once the last pin goes. Asking for a
+    /// file that is not pinned at all still deletes, and still reports that
+    /// no pin was cleared.
+    #[tokio::test]
+    async fn unpin_download_deletes_the_data_when_asked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("Show");
+        std::fs::create_dir_all(&folder).unwrap();
+        let file = |idx: usize| folder.join(format!("video-{idx}.mkv"));
+        let (enginefs, counters) = test_enginefs_with_file_count(3);
+        for idx in 0..3 {
+            std::fs::write(file(idx), b"payload").unwrap();
+        }
+        *counters.output_folder.lock().unwrap() = Some(folder.clone());
+
+        enginefs.pin_download(TEST_HASH, 1, None).await.unwrap();
+        enginefs.pin_download(TEST_HASH, 2, None).await.unwrap();
+
+        // One pin of two: that file's bytes go, the torrent stays.
+        assert!(enginefs.unpin_download(TEST_HASH, 1, true).await.unwrap());
+        assert!(!file(1).exists(), "the unpinned file's data is deleted");
+        assert!(file(2).is_file(), "the other pin's data stays");
+        assert!(enginefs.get_engine(TEST_HASH).await.is_some());
+        assert!(
+            enginefs
+                .get_backend()
+                .removed_with_files
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "a torrent with pins left is never dropped"
+        );
+        assert_eq!(
+            enginefs.pinned_downloads().await,
+            vec![PinnedDownload {
+                info_hash: TEST_HASH.to_string(),
+                file_idx: 2
+            }]
+        );
+
+        // The last pin: the torrent goes with its files.
+        assert!(enginefs.unpin_download(TEST_HASH, 2, true).await.unwrap());
+        assert_eq!(
+            *enginefs.get_backend().removed_with_files.lock().unwrap(),
+            vec![TEST_HASH.to_string()]
+        );
+        assert!(enginefs.get_engine(TEST_HASH).await.is_none());
+        assert!(enginefs.pinned_downloads().await.is_empty());
+        assert_eq!(
+            read_pinned_downloads(&enginefs.pinned_downloads_path()),
+            serde_json::json!({}),
+            "the persisted pin set is empty again"
+        );
+    }
+
+    /// A delete of a file nothing pinned (a pin lost to a crash, or a plain
+    /// "remove this download" for a torrent that was only streamed) still
+    /// drops the torrent and its data, and reports `false`: no pin cleared.
+    #[tokio::test]
+    async fn unpin_download_deletes_an_unpinned_file_too() {
+        let (enginefs, _counters) = test_enginefs_with_file_count(2);
+        assert!(!enginefs.unpin_download(TEST_HASH, 0, true).await.unwrap());
+        assert_eq!(
+            *enginefs.get_backend().removed_with_files.lock().unwrap(),
+            vec![TEST_HASH.to_string()]
+        );
+        assert!(enginefs.get_engine(TEST_HASH).await.is_none());
+    }
+
+    /// A dormant pin (no torrent in the backend) has nothing on disk this
+    /// layer can name: the pin is dropped, nothing is deleted, nothing
+    /// fails.
+    #[tokio::test]
+    async fn unpin_download_of_a_dormant_pin_deletes_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let counters = Arc::new(FakeCounters::default());
+        let handle = FakeHandle {
+            info_hash: OTHER_HASH.to_string(),
+            counters,
+            files: vec![BackendFileInfo {
+                name: "video-0.mkv".to_string(),
+                length: 100,
+            }],
+            init: FakeInit::new(true, Duration::from_secs(60)),
+        };
+        let enginefs = BackendEngineFS::new_with_backend(
+            FakeBackend::new(vec![handle]),
+            HashMap::new(),
+            root.path().join("cache"),
+            root.path().join("downloads"),
+        );
+        std::fs::create_dir_all(root.path().join("downloads")).unwrap();
+        std::fs::write(
+            enginefs.pinned_downloads_path(),
+            serde_json::to_vec(&serde_json::json!({ TEST_HASH: [1] })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(enginefs.restore_pinned_downloads().await, 0);
+
+        assert!(enginefs.unpin_download(TEST_HASH, 1, true).await.unwrap());
+        assert!(
+            enginefs
+                .get_backend()
+                .removed_with_files
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            read_pinned_downloads(&enginefs.pinned_downloads_path()),
+            serde_json::json!({})
+        );
     }
 
     #[tokio::test]
@@ -5654,7 +5873,7 @@ mod tests {
         assert!(present(TEST_HASH).await);
 
         // Unpinned: swept on the next idle window like any other engine.
-        assert!(enginefs.unpin_download(TEST_HASH, 1).await.unwrap());
+        assert!(enginefs.unpin_download(TEST_HASH, 1, false).await.unwrap());
         tokio::time::sleep(INACTIVE_TORRENT_REMOVE_TIMEOUT + Duration::from_secs(30)).await;
         assert!(!present(TEST_HASH).await, "unpinned engine is removed");
         assert_eq!(
