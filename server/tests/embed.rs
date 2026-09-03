@@ -636,7 +636,15 @@ fn library_api_matches_the_http_control_routes() -> anyhow::Result<()> {
         .json()?;
     // Compare the fields that do not depend on timing (peer counts move).
     let api_json = serde_json::to_value(&api)?;
-    for key in ["infoHash", "streamName", "streamLen", "files", "sources"] {
+    for key in [
+        "infoHash",
+        "streamName",
+        "streamLen",
+        "files",
+        "sources",
+        "pieceLength",
+        "inFlightPiece",
+    ] {
         assert_eq!(api_json[key], http[key], "{key}");
     }
     assert_eq!(api.stream_name, "Show.S01E02.1080p.mkv");
@@ -835,6 +843,19 @@ fn stats_json_exposes_startup_phase_fields_additively() -> anyhow::Result<()> {
     }
     assert_eq!(stats["files"][1]["initialWindowBytes"], 700);
     assert_eq!(stats["files"][1]["initialWindowReadyBytes"], 0);
+    // Sub-piece progress. Nothing has opened a stream on this torrent, so
+    // there is no piece anybody is waiting on: `null` at the top level and
+    // the key omitted per file -- absence, never a zeroed piece a client
+    // would draw as an empty bar.
+    assert!(obj.contains_key("inFlightPiece"), "{stats}");
+    assert_eq!(stats["inFlightPiece"], serde_json::Value::Null, "{stats}");
+    assert!(
+        !stats["files"][1]
+            .as_object()
+            .unwrap()
+            .contains_key("inFlightPiece"),
+        "{stats}"
+    );
 
     // Per-file stats focus the requested file.
     let file_stats: serde_json::Value = client
@@ -847,6 +868,11 @@ fn stats_json_exposes_startup_phase_fields_additively() -> anyhow::Result<()> {
     assert_eq!(file_stats["connectedSeeders"], 0, "{file_stats}");
     assert_eq!(file_stats["initialWindowBytes"], 700, "{file_stats}");
     assert_eq!(file_stats["initialWindowReadyBytes"], 0);
+    assert_eq!(
+        file_stats["inFlightPiece"],
+        serde_json::Value::Null,
+        "{file_stats}"
+    );
 
     handle.shutdown()?;
     handle.join()?;
@@ -1903,6 +1929,75 @@ fn lan_media_server(
     anyhow::ensure!(stats["files"][idx]["complete"] == true, "{stats}");
 
     Ok((handle, base, info_hash, idx, payload))
+}
+
+/// `stats.json` reports the piece the open reader is waiting on, in bytes.
+///
+/// Whole verified pieces are all the have-bitfield can show, and a piece on
+/// a real torrent is 8-16 MiB -- bigger than the startup window -- so a
+/// player waiting on its first piece could only ever be shown 0% or 100%.
+/// `inFlightPiece` is the sub-piece view: `downloadedBytes` of
+/// `totalBytes`, plus `verified`, which is the only field that means the
+/// piece can actually be served.
+///
+/// Absence is a state of its own: before anything opens the file there is
+/// no reader and so no piece anybody waits on, and that must read as `null`
+/// rather than as a piece with nothing downloaded. The library API sees
+/// exactly what the route serves.
+#[test]
+fn stats_json_reports_the_piece_the_open_reader_waits_for() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    let (handle, base, info_hash, idx, payload) =
+        lan_media_server(config_dir.path(), cache_dir.path(), src.path(), None)?;
+    let client = bearer_client(&handle)?;
+
+    // Polling stats is not opening a stream: nothing is in flight yet.
+    let stats = file_stats_after_check(&client, &base, &info_hash, idx)?;
+    assert_eq!(stats["inFlightPiece"], serde_json::Value::Null, "{stats}");
+    let piece_length = stats["pieceLength"].as_u64().expect("metadata resolved");
+    // The file's own offset decides which torrent piece its head is in, and
+    // the fixture does not control the torrent's file order.
+    let file_offset = stats["files"][idx]["offset"].as_u64().expect("file offset");
+    assert_eq!(
+        serde_json::to_value(handle.file_stats(&info_hash, idx, &[])?)?["inFlightPiece"],
+        serde_json::Value::Null,
+        "the library API reports the same absence"
+    );
+
+    // A `Range` request opens a reader at the file's head, which is what
+    // makes a piece the one being waited for.
+    let anonymous = reqwest::blocking::Client::new();
+    let response = anonymous
+        .get(format!("{base}/{info_hash}/{idx}"))
+        .header(reqwest::header::RANGE, "bytes=0-15")
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.bytes()?.as_ref(), &payload[0..16]);
+
+    let stats = file_stats_after_check(&client, &base, &info_hash, idx)?;
+    let piece = stats["inFlightPiece"]
+        .as_object()
+        .unwrap_or_else(|| panic!("a reader is open: {stats}"));
+    assert_eq!(piece["index"], file_offset / piece_length, "{stats}");
+    assert_eq!(piece["totalBytes"], piece_length, "{stats}");
+    // The fixture is pre-seeded, so the piece is on disk and hash-checked:
+    // the one state in which a client may treat it as ready.
+    assert_eq!(piece["downloadedBytes"], piece_length, "{stats}");
+    assert_eq!(piece["verified"], true, "{stats}");
+    // Per file as well as at the top level, for the same file.
+    assert_eq!(stats["files"][idx]["inFlightPiece"], stats["inFlightPiece"]);
+
+    // Library API == route, for the field and the whole file list.
+    let api = serde_json::to_value(handle.file_stats(&info_hash, idx, &[])?)?;
+    for key in ["inFlightPiece", "pieceLength", "files"] {
+        assert_eq!(api[key], stats[key], "{key}");
+    }
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
 }
 
 /// The LAN media listener hands out media bytes and nothing else.
