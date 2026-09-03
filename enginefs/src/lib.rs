@@ -273,7 +273,45 @@ pub struct PendingMagnetAdd<H: TorrentHandle> {
     /// add cannot touch its successor's entry.
     id: u64,
     /// Aborts the add task; used when the registry sweeps the entry as idle.
-    abort: AbortHandle,
+    /// `None` for an entry that stands for a relocation in progress
+    /// (`BackendEngineFS::relocate_engine`): it ends with the move, not
+    /// with its pollers, so the sweep leaves it alone.
+    abort: Option<AbortHandle>,
+}
+
+/// Registry-wide id source for [`PendingMagnetAdd::id`].
+static NEXT_ADD_ID: AtomicU64 = AtomicU64::new(1);
+
+impl<H: TorrentHandle + 'static> PendingMagnetAdd<H> {
+    /// An entry settled by hand -- the returned sender resolves `done` --
+    /// for a torrent that is briefly without an engine while it is moved
+    /// (see `BackendEngineFS::relocate_engine`). A sender dropped without
+    /// sending fails every waiter with [`MagnetAddError::TaskFailed`].
+    fn settled_later(
+        info_hash: String,
+        trackers: Arc<[String]>,
+    ) -> (tokio::sync::oneshot::Sender<MagnetAddResult<H>>, Self) {
+        let (settle, settled) = tokio::sync::oneshot::channel();
+        let done = settled
+            .map(move |received| match received {
+                Ok(result) => result,
+                Err(_dropped) => Err(MagnetAddError::TaskFailed {
+                    info_hash,
+                    reason: "relocation ended without settling its waiters".to_string(),
+                }),
+            })
+            .boxed()
+            .shared();
+        (
+            settle,
+            Self {
+                done,
+                trackers,
+                id: NEXT_ADD_ID.fetch_add(1, Ordering::Relaxed),
+                abort: None,
+            },
+        )
+    }
 }
 
 /// The failure record a magnet add leaves behind: the error that ended it and
@@ -566,7 +604,12 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                         }
                         match &entry.state {
                             MagnetAddState::Adding(pending) => {
-                                pending.abort.abort();
+                                // A relocation in progress has no task to
+                                // abort and ends on its own.
+                                let Some(abort) = &pending.abort else {
+                                    return true;
+                                };
+                                abort.abort();
                                 tracing::info!(
                                     info_hash = %info_hash,
                                     idle_secs = idle.as_secs(),
@@ -1066,7 +1109,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         trackers: Vec<String>,
         placement: TorrentPlacement,
     ) -> PendingMagnetAdd<B::Handle> {
-        static NEXT_ADD_ID: AtomicU64 = AtomicU64::new(1);
         let id = NEXT_ADD_ID.fetch_add(1, Ordering::Relaxed);
         let trackers: Arc<[String]> = trackers.into();
 
@@ -1163,7 +1205,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             done,
             trackers,
             id,
-            abort,
+            abort: Some(abort),
         }
     }
 
@@ -1610,8 +1652,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// the backend keeping its files, files moved, re-added in place
     /// (`TorrentBackend::relocate_torrent`), which re-checks whatever was
     /// downloaded (`checking` phase) and replaces the registry's engine;
-    /// readers still open on the old one end, new requests find the new
-    /// one. Without a downloads dir everything stays in the backend's root.
+    /// readers still open on the old one end, and for the length of the
+    /// move the hash is looked up as an in-flight add (see
+    /// [`Self::relocate_engine`]), so requests wait for the new engine
+    /// rather than reaching the dropped torrent. Without a downloads dir
+    /// everything stays in the backend's root.
     ///
     /// Persisted: the pin set is written to `pinned-downloads.json` in the
     /// download dir on every change and re-applied by
@@ -2056,12 +2101,26 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// Move `engine`'s torrent into `folder` (see [`Self::pin_download`]),
     /// wanting its pinned files (the caller has already recorded the pin
     /// being made), and publish the backend's new handle as the registry's
-    /// engine for the hash with the pins carried over. On failure the
-    /// backend may or may not still manage the torrent: the registry entry
-    /// is rebuilt from `get_torrent` when it does and dropped otherwise --
-    /// but only if it is still `engine`; an entry published by someone else
-    /// meanwhile is theirs to keep -- so the next request re-adds through
-    /// the registry instead of using a handle to a torrent that is gone.
+    /// engine for the hash with the pins carried over.
+    ///
+    /// For the length of the move the hash has no live torrent: the backend
+    /// drops it before moving the files, and a handle to the dropped
+    /// torrent answers every stream or stats call with an error. So the old
+    /// engine leaves the registry first and a [`PendingMagnetAdd`] takes
+    /// its place -- requests meanwhile find `EngineLookup::Adding` (stats
+    /// report `resolvingMetadata`, a stream waits) exactly as for a magnet
+    /// whose metadata is resolving, and nobody starts a second add for the
+    /// hash. The entry is settled with the new engine once it is published
+    /// (a cross-device copy can take minutes; the sweep leaves the entry
+    /// alone).
+    ///
+    /// On failure the backend may or may not still manage the torrent: the
+    /// registry entry is rebuilt from `get_torrent` when it does (and the
+    /// waiters get that engine); otherwise there is no engine, the waiters
+    /// get the error, and no failure record is left -- the next request
+    /// re-adds through the registry instead of using a handle to a torrent
+    /// that is gone. An engine somebody else published for the hash
+    /// meanwhile is theirs to keep.
     async fn relocate_engine(
         &self,
         engine: Arc<Engine<B::Handle>>,
@@ -2080,32 +2139,88 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             to = ?folder,
             "download_relocating"
         );
-        match self
+        let (settle, pending) =
+            PendingMagnetAdd::settled_later(engine.info_hash.clone(), trackers.clone().into());
+        self.begin_relocation(&engine, pending.clone()).await;
+        let relocated = self
             .backend
             .relocate_torrent(&engine.info_hash, placement, trackers)
-            .await
-        {
-            Ok(handle) => Ok(self.replace_engine(&engine, handle).await),
+            .await;
+        let (result, settled) = match relocated {
+            Ok(handle) => {
+                let engine = self.replace_engine(&engine, handle).await;
+                (Ok(engine.clone()), Ok(engine))
+            }
             Err(error) => {
                 tracing::warn!(
                     info_hash = %engine.info_hash,
                     error = %format!("{error:#}"),
                     "download_relocate_failed"
                 );
-                match self.backend.get_torrent(&engine.info_hash).await {
-                    Some(handle) => {
-                        self.replace_engine(&engine, handle).await;
-                    }
-                    None => {
-                        self.remove_engine_if_current(&engine).await;
-                    }
-                }
-                Err(PinDownloadError::Backend(error.context(format!(
+                let settled = match self.backend.get_torrent(&engine.info_hash).await {
+                    Some(handle) => Ok(self.replace_engine(&engine, handle).await),
+                    None => match self.get_engine(&engine.info_hash).await {
+                        Some(other) => Ok(other),
+                        None => Err(MagnetAddError::Backend {
+                            info_hash: engine.info_hash.clone(),
+                            error: Arc::new(anyhow::anyhow!(
+                                "relocation failed and the torrent is no longer managed: {error:#}"
+                            )),
+                        }),
+                    },
+                };
+                let error = PinDownloadError::Backend(error.context(format!(
                     "relocating {} into {}",
                     engine.info_hash,
                     folder.display()
-                ))))
+                )));
+                (Err(error), settled)
             }
+        };
+        self.end_relocation(&engine.info_hash, &pending).await;
+        // Whoever awaited the entry: the engine is published (or the hash is
+        // free for a fresh add) by now.
+        let _ = settle.send(settled);
+        result
+    }
+
+    /// Take `engine` out of the registry (only while it still is the
+    /// registry's engine) and put `pending` in its place in the magnet-add
+    /// registry, atomically for lookups: `lookup_or_begin_add_magnet` takes
+    /// the add registry before the engines, as this does.
+    async fn begin_relocation(
+        &self,
+        engine: &Arc<Engine<B::Handle>>,
+        pending: PendingMagnetAdd<B::Handle>,
+    ) {
+        let now = self.clock.now_secs();
+        let mut adds = self.magnet_adds.write().await;
+        let mut engines = self.engines.write().await;
+        if engines
+            .get(&engine.info_hash)
+            .is_some_and(|current| Arc::ptr_eq(current, engine))
+        {
+            engines.remove(&engine.info_hash);
+        }
+        adds.insert(
+            engine.info_hash.clone(),
+            MagnetAddEntry {
+                state: MagnetAddState::Adding(pending),
+                last_polled_secs: AtomicU64::new(now),
+            },
+        );
+    }
+
+    /// Drop the relocation's registry entry, if it still is `pending`. The
+    /// engine (if any) is published before this, so a lookup between the
+    /// two always finds one or the other.
+    async fn end_relocation(&self, info_hash: &str, pending: &PendingMagnetAdd<B::Handle>) {
+        let mut adds = self.magnet_adds.write().await;
+        if matches!(
+            adds.get(info_hash).map(|entry| &entry.state),
+            Some(MagnetAddState::Adding(current)) if current.id == pending.id
+        ) {
+            adds.remove(info_hash);
         }
     }
 
@@ -4148,8 +4263,8 @@ mod tests {
     /// Two pins of one torrent issued together (two episodes of a season
     /// pack, the client's re-pin loop) relocate it once: the second waits
     /// for the first, then finds the torrent in place. The pin is recorded
-    /// on the engine before the relocation starts, so the idle sweeper's
-    /// `is_pinned()` exemption covers the whole move.
+    /// on the engine before the relocation starts and carried to the new
+    /// one.
     #[tokio::test]
     async fn concurrent_pins_of_one_torrent_relocate_it_once() {
         let (enginefs, counters) = test_enginefs_with_file_count(3);
@@ -4166,10 +4281,12 @@ mod tests {
                 1,
                 "the second pin waits instead of relocating too"
             );
-            let held = enginefs.get_engine(TEST_HASH).await.unwrap();
-            assert!(Arc::ptr_eq(&held, &before), "not published yet");
-            assert!(held.is_pinned(), "pinned before the move, sweeper-exempt");
-            assert_eq!(held.pinned_file_indices(), vec![0]);
+            assert!(
+                enginefs.get_engine(TEST_HASH).await.is_none(),
+                "the old engine is out of the lookup path for the move"
+            );
+            assert!(before.is_pinned(), "pinned before the move");
+            assert_eq!(before.pinned_file_indices(), vec![0]);
             enginefs.backend.relocate_hold.add_permits(1);
         };
         let (a, b, ()) = tokio::join!(
@@ -4238,6 +4355,128 @@ mod tests {
             "relocation still fails"
         );
         assert!(enginefs.get_engine(TEST_HASH).await.is_none());
+    }
+
+    /// While a torrent is being moved it has no live handle (the backend
+    /// dropped it before moving the files), so the hash is looked up as an
+    /// in-flight add: `get_engine` finds nothing, the non-blocking lookup
+    /// reports `Adding` (no second add is started), and a blocking lookup
+    /// waits and gets the relocated engine -- never the dropped one. The
+    /// entry is gone once the new engine is published, and a relocation
+    /// outlasting the idle window is not swept as an idle add.
+    #[tokio::test(start_paused = true)]
+    async fn requests_during_a_relocation_wait_for_the_new_engine() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        *counters.output_folder.lock().unwrap() = Some("/cache/rqbit-downloads/show".into());
+        let dir = std::path::PathBuf::from("/offline");
+        enginefs.set_downloads_dir(Some(dir.clone()));
+        enginefs.backend.hold_relocate.store(true, Ordering::SeqCst);
+        let old = enginefs.get_engine(TEST_HASH).await.unwrap();
+
+        let observe = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(enginefs.get_engine(TEST_HASH).await.is_none());
+            let EngineLookup::Adding(pending) =
+                enginefs.get_or_begin_add_magnet(TEST_HASH, None).await
+            else {
+                panic!("a relocating torrent looks like an in-flight add");
+            };
+            assert!(pending.abort.is_none(), "nothing to abort");
+            assert!(enginefs.pending_magnet_add(TEST_HASH).await.is_some());
+            assert!(
+                enginefs.backend.placements.lock().unwrap().is_empty(),
+                "no second add for the hash"
+            );
+            // Nobody polls for a full idle window: the entry stays.
+            tokio::time::sleep(INACTIVE_TORRENT_REMOVE_TIMEOUT * 2).await;
+            assert!(
+                enginefs.pending_magnet_add(TEST_HASH).await.is_some(),
+                "a relocation is not swept as an idle add"
+            );
+            enginefs.backend.relocate_hold.add_permits(1);
+            pending.done.await
+        };
+        let waiter = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            enginefs.get_or_add_magnet(TEST_HASH, None).await
+        };
+        let (pinned, observed, waited) =
+            tokio::join!(enginefs.pin_download(TEST_HASH, 0, None), observe, waiter);
+        let pinned = pinned.expect("pin");
+        let observed = observed.expect("the pending add resolves to the new engine");
+        let waited = waited.expect("the blocking lookup resolves to the new engine");
+        assert!(!Arc::ptr_eq(&pinned, &old));
+        assert!(Arc::ptr_eq(&observed, &pinned));
+        assert!(Arc::ptr_eq(&waited, &pinned));
+        assert_eq!(pinned.handle.output_folder(), Some(dir.join(TEST_HASH)));
+        assert!(Arc::ptr_eq(
+            &enginefs.get_engine(TEST_HASH).await.unwrap(),
+            &pinned
+        ));
+        assert!(enginefs.pending_magnet_add(TEST_HASH).await.is_none());
+        assert!(enginefs.failed_magnet_add(TEST_HASH).await.is_none());
+        assert!(enginefs.magnet_adds.read().await.is_empty());
+    }
+
+    /// A failed relocation settles the waiters like the registry does: with
+    /// the rebuilt engine when the backend still manages the torrent, with
+    /// an error -- and no lingering entry or failure record, so the next
+    /// request re-adds -- when it does not.
+    #[tokio::test]
+    async fn failed_relocation_settles_the_waiters() {
+        async fn waited_pin(
+            enginefs: &BackendEngineFS<FakeBackend>,
+        ) -> Result<Arc<Engine<FakeHandle>>, MagnetAddError> {
+            let release = async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert!(enginefs.pending_magnet_add(TEST_HASH).await.is_some());
+                enginefs.backend.relocate_hold.add_permits(1);
+            };
+            let waiter = async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                enginefs.get_or_add_magnet(TEST_HASH, None).await
+            };
+            let (pinned, (), waited) =
+                tokio::join!(enginefs.pin_download(TEST_HASH, 0, None), release, waiter);
+            assert!(matches!(pinned, Err(PinDownloadError::Backend(_))));
+            waited
+        }
+
+        // Still managed: the waiter gets the rebuilt engine.
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        *counters.output_folder.lock().unwrap() = Some("/cache/rqbit-downloads/show".into());
+        enginefs.set_downloads_dir(Some("/offline".into()));
+        enginefs.backend.hold_relocate.store(true, Ordering::SeqCst);
+        enginefs.backend.fail_relocate.store(true, Ordering::SeqCst);
+        let old = enginefs.get_engine(TEST_HASH).await.unwrap();
+        let waited = waited_pin(&enginefs).await.expect("rebuilt engine");
+        assert!(!Arc::ptr_eq(&waited, &old));
+        assert!(Arc::ptr_eq(
+            &waited,
+            &enginefs.get_engine(TEST_HASH).await.unwrap()
+        ));
+        assert!(enginefs.magnet_adds.read().await.is_empty());
+
+        // Gone from the backend: the waiter gets an error and the hash is
+        // free for a fresh add.
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        *counters.output_folder.lock().unwrap() = Some("/cache/rqbit-downloads/show".into());
+        enginefs.set_downloads_dir(Some("/offline".into()));
+        enginefs.backend.hold_relocate.store(true, Ordering::SeqCst);
+        enginefs.backend.fail_relocate.store(true, Ordering::SeqCst);
+        enginefs.backend.hide_torrents.store(true, Ordering::SeqCst);
+        let waited = waited_pin(&enginefs).await;
+        assert!(
+            matches!(waited, Err(MagnetAddError::Backend { .. })),
+            "{:?}",
+            waited.as_ref().err()
+        );
+        assert!(enginefs.get_engine(TEST_HASH).await.is_none());
+        assert!(enginefs.magnet_adds.read().await.is_empty());
+        assert!(matches!(
+            enginefs.get_or_begin_add_magnet(TEST_HASH, None).await,
+            EngineLookup::Adding(_)
+        ));
     }
 
     /// The cleaner's protected paths are where the files really are: the
@@ -5596,7 +5835,7 @@ mod tests {
         assert!(wait_until(Duration::from_secs(1), || gated.adds() == 1).await);
 
         // What the sweep does to an idle in-flight add.
-        old.abort.abort();
+        old.abort.as_ref().expect("a spawned add").abort();
         enginefs.magnet_adds.write().await.remove(TEST_HASH);
 
         // Re-issued before the old supervisor has settled: a new add.
