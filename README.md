@@ -57,6 +57,7 @@ This is not a drop-in replacement for `server.js` — the API surface it exposes
 - **📊 Stats**: `/stats.json`, `/{infoHash}/stats.json`, `/{infoHash}/{fileIdx}/stats.json` for server status and torrent progress
 - **⚙️ Settings**: runtime-configurable via `/settings`, with the stremio-core-compatible shape
 - **🔒 BitTorrent Privacy Controls**: DHT, PeX, LSD, encryption, interface binding, ports, and proxy settings. See [BitTorrent Settings](docs/bittorrent-settings.md).
+- **📺 LAN media listener**: an optional second listener that serves *media bytes only* to the local network, so a Chromecast can fetch a stream while the control API stays on loopback. Off by default and session-scoped. See [LAN media listener](#lan-media-listener)
 
 ---
 
@@ -232,6 +233,9 @@ An embedder holds a `ServerHandle` (from `stream_server::start`) and never needs
 | `unpin_download(info_hash, file_idx: usize, delete_files: bool) -> Result<UnpinOutcome>` | `DELETE /{infoHash}/{fileIdx}/download?deleteFiles=1`; `unpinned: false` when nothing was pinned, `deletedFiles` what actually left the disk |
 | `downloads() -> Result<Vec<DownloadInfo>>` | `GET /downloads.json` |
 | `download_path(info_hash, file_idx: usize) -> Result<Option<String>>` | the `path` of that file's `downloads()` entry on its own — where to hand a finished download to a local player. Never creates an engine |
+| `set_lan_media(enabled: bool) -> Result<Option<SocketAddr>>` | start/stop the [LAN media listener](#lan-media-listener); returns its bound address afterwards. Refused while the `lanMediaEnabled` setting is false or `ServerConfig::lan_media_addr` is unset |
+| `lan_media_addr() -> Option<SocketAddr>` / `lan_media_running() -> bool` | where that listener is bound right now, and whether it is running at all |
+| `lan_media_base_url(for_peer: IpAddr) -> Option<Url>` | the base URL to hand a receiver at `for_peer` — host = the local interface on its subnet. `None` while the listener is off |
 
 The HTTP handlers and these methods call the same functions (`routes::system::{engine_stats, file_stats, update_settings}`, `routes::downloads::{pin_download, unpin_download, downloads, download_path}`), so they cannot drift; `server/tests/embed.rs` compares them.
 
@@ -248,6 +252,58 @@ A **pinned** file stays wanted no matter which file of the torrent is being play
 - **Restarts**: librqbit persists each torrent's place and want-set and, with fastresume, its verified pieces (`<cacheRoot>/rqbit-downloads/<infoHash>.bitv`), so a pinned download resumes where it was without a full re-hash; the pin set itself is persisted in `<cacheRoot>/rqbit-downloads/pinned-downloads.json` and restored at startup. A pin whose torrent the session did not bring back (librqbit skips, but keeps the record of, a torrent whose output folder is on a volume that is not mounted at boot) stays in that file, dormant, until the torrent returns — on a later boot, or with the next pin of the same torrent, which applies the dormant pins alongside its own — or until it is unpinned.
 
 `ServerConfig::embedded()` (the `Default`) is tuned for a host process: loopback HTTP on 11470, no logging/TUI/SSDP, a generated token, and `torrent_listen_port: TorrentListenPort::Ephemeral` — librqbit's incoming BitTorrent listener takes an OS-assigned port, so any number of embedded servers (and the tests) coexist with a desktop instance. `ServerConfig::binary_default()` keeps `TorrentListenPort::Fixed(42000..42010)`: the first free port of the range, stable and forwardable. Set the field explicitly if an embedder needs a fixed port.
+
+### LAN media listener
+
+A cast receiver is not on loopback. `ServerConfig::embedded()` binds
+`127.0.0.1` only, so a Chromecast cannot fetch a byte from it — casting is
+blocked before the media is even prepared. Widening that bind is not the fix:
+it would put `/settings`, `/downloads.json`, the stats routes and `/create` on
+the local network behind nothing but a bearer token.
+
+So there is a **second listener** instead, and it serves media routes only.
+
+| | |
+|---|---|
+| **What it exposes** | Exactly [`media_router()`](server/src/lib.rs) — `/{infoHash}/{fileIdx}`, `/stream/…`, the archive/NZB/FTP/proxy media routes and the `/local-addon` stub. That is the whole surface |
+| **What it does not** | The control router is **not mounted on it at all**, not even behind the bearer middleware. A control path there is an unknown path: `404`, never the `401` that would confirm the route exists and only a token is missing. There is no token on that listener to guess, leak or brute-force |
+| **Where it binds** | `ServerConfig::lan_media_addr: Option<SocketAddr>` — `None` by default for **both** `embedded()` and `binary_default()`, so nothing changes unless an embedder asks for it. `Some(0.0.0.0:0)` lets the OS pick the port |
+| **When it runs** | `ServerHandle::set_lan_media(true)` starts it, `set_lan_media(false)` stops it — meant to bracket a cast session, so the LAN surface exists only while something is casting. A configured address is also bound at startup |
+| **How it is switched off entirely** | The `lanMediaEnabled` setting (`POST /settings`, **`false` by default**). While it is false, `set_lan_media(true)` is refused; setting it back to false also stops a listener that is already running |
+
+`ServerHandle::lan_media_base_url(peer_ip)` builds the URL to hand a receiver:
+the host is the local interface that shares `peer_ip`'s subnet, taken from the
+same interface enumeration `GET /network-info` answers from — on a host with a
+VPN or a container bridge the first interface in the list is regularly one the
+receiver cannot route back to. A listener bound to one specific address
+reports that address as is. It is `None` whenever the listener is not running,
+which is also the signal that no cast URL can be built yet.
+
+**Shutdown is an abort, not a drain.** `set_lan_media(false)` aborts the
+serving task and awaits it, so by the time the call returns the socket is
+closed, the port is free and any response still streaming over the LAN has
+been dropped mid-body. That is the intent: the call marks the end of a cast
+session, and a receiver still pulling bytes is exactly what should stop —
+draining would mean waiting out a movie-length response before the LAN surface
+actually closed. The loopback listener owns a different socket and a different
+serve future; it and every request in flight on it are untouched.
+
+**The trade-off, stated plainly.** While the listener is up, *anyone* on the
+same network can fetch media from this server: the media routes are open by
+design (players cannot attach headers), so there is no authentication on that
+port at all. Anyone who can guess or observe an info hash can pull that file
+out of the piece cache, and the `/proxy` route travels with the media router,
+which means the LAN can also make the server fetch arbitrary HTTP URLs on its
+behalf. That is why it is off by default, why it is meant to be held open only
+for the length of a cast session, and why `lanMediaEnabled` exists as an
+operator veto that no embedder call can override.
+
+CORS is set up for what a receiver needs: `Content-Type`, `Accept-Encoding`
+and `Range` are named allowed request headers (Google's Web Receiver CORS
+requirements ask for exactly those, and even a plain MP4 needs CORS once
+tracks are involved), and `Accept-Ranges`, `Content-Range` and
+`Content-Length` are exposed to script so a player can seek. Byte-range
+requests and `HEAD` work on this listener exactly as they do on loopback.
 
 ### Removed routes
 
