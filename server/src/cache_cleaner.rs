@@ -8,6 +8,44 @@ use tracing::{debug, error, info, warn};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
+/// How long after the first filesystem event the cleaner waits before it
+/// walks the cache.
+const CLEAN_DEBOUNCE: Duration = Duration::from_secs(60);
+
+/// Fallback sweep for a cache nothing is writing to. Long on purpose: with
+/// the debounce bounded, anything that touches the cache schedules a clean
+/// within [`CLEAN_DEBOUNCE`], so this only has to catch a server that has
+/// been idle since startup and one whose watch could not be established.
+const CLEAN_FALLBACK_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// Whether a debounced clean is already due.
+///
+/// The first event after a quiet period arms the timer; later events do
+/// **not** push it back. Re-arming on every event meant a torrent that
+/// keeps writing -- which is what a torrent does for as long as anyone is
+/// watching -- deferred the clean indefinitely, leaving only the hourly
+/// fallback, so the cache limit went unenforced for exactly as long as the
+/// device was in use. Bounding the wait at one debounce interval is what
+/// makes the limit hold on a phone.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CleanSchedule {
+    armed: bool,
+}
+
+impl CleanSchedule {
+    /// Records a filesystem event. `true` when it armed the timer, i.e. the
+    /// caller should start a [`CLEAN_DEBOUNCE`] sleep; `false` when a clean
+    /// is already due and the deadline must be left where it is.
+    fn on_event(&mut self) -> bool {
+        !std::mem::replace(&mut self.armed, true)
+    }
+
+    /// The debounced clean has fired; the next event arms a fresh one.
+    fn on_clean(&mut self) {
+        self.armed = false;
+    }
+}
+
 pub fn start(state: Arc<AppState>) -> JoinHandle<()> {
     tokio::spawn(async move {
         debug!("Cache cleaner started");
@@ -59,11 +97,11 @@ pub fn start(state: Arc<AppState>) -> JoinHandle<()> {
             }
         }
 
-        // Timer for fallback polling (1 hour)
-        let mut poll_interval = tokio::time::interval(Duration::from_secs(3600));
+        // Fallback poll for a cache nothing is writing to (the first tick
+        // fires immediately, so startup always gets a sweep).
+        let mut poll_interval = tokio::time::interval(CLEAN_FALLBACK_INTERVAL);
 
-        // State for debouncing
-        let debounce_duration = Duration::from_secs(60); // Wait 60s after last activity to clean
+        let mut schedule = CleanSchedule::default();
         let mut active_cleaning_timer = Box::pin(tokio::time::sleep(Duration::MAX)); // Inactive initially
 
         loop {
@@ -84,13 +122,17 @@ pub fn start(state: Arc<AppState>) -> JoinHandle<()> {
 
                 // 2. File System Event
                 Some(_) = rx.recv() => {
-                    // Reset debounce timer
-                    active_cleaning_timer = Box::pin(tokio::time::sleep(debounce_duration));
+                    // Arm the debounce, but never push an armed one back:
+                    // see `CleanSchedule`.
+                    if schedule.on_event() {
+                        active_cleaning_timer = Box::pin(tokio::time::sleep(CLEAN_DEBOUNCE));
+                    }
                 }
 
                 // 3. Debounce Timer Fired
                 _ = &mut active_cleaning_timer => {
                     debug!("Debounced cache clean trigger");
+                    schedule.on_clean();
                     if let Err(e) = clean_cache(&state).await {
                         error!("Cache cleaner error: {}", e);
                     }
@@ -466,8 +508,8 @@ async fn remove_empty_parents(mut dir: &std::path::Path, root: &std::path::Path)
 #[cfg(test)]
 mod tests {
     use super::{
-        EvictionReport, evict, is_path_protected, is_session_artifact, occupied_bytes,
-        remove_empty_parents,
+        CleanSchedule, EvictionReport, evict, is_path_protected, is_session_artifact,
+        occupied_bytes, remove_empty_parents,
     };
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
@@ -927,6 +969,24 @@ mod tests {
             message.contains(&format!("{protected_bytes} bytes in 2 files are protected")),
             "{message}"
         );
+    }
+
+    /// A torrent writes continuously while it is being watched. Re-arming
+    /// the debounce on every write pushed the clean past the end of
+    /// playback, so the size limit was only ever enforced by the hourly
+    /// fallback. Only the first event after a clean may arm the timer.
+    #[test]
+    fn a_stream_of_events_does_not_defer_the_debounced_clean() {
+        let mut schedule = CleanSchedule::default();
+        assert!(schedule.on_event(), "the first event arms the timer");
+        for _ in 0..1_000 {
+            assert!(
+                !schedule.on_event(),
+                "a clean is already due; the deadline stays put"
+            );
+        }
+        schedule.on_clean();
+        assert!(schedule.on_event(), "and the next event arms a fresh one");
     }
 
     #[test]
