@@ -30,7 +30,7 @@ use crate::backend::priorities::EngineCacheConfig;
 
 use crate::backend::{
     BackendMemoryDiagnostics, HotFilePriorityPlan, TorrentBackend, TorrentFilePriorityPlan,
-    TorrentHandle, TorrentListenPort, TorrentSource,
+    TorrentHandle, TorrentListenPort, TorrentPlacement, TorrentSource,
 };
 
 const INACTIVE_TORRENT_REMOVE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
@@ -823,8 +823,13 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         info_hash: &str,
         extra_trackers: Option<Vec<String>>,
     ) -> EngineLookup<B::Handle> {
-        self.lookup_or_begin_add_magnet(info_hash, extra_trackers, false)
-            .await
+        self.lookup_or_begin_add_magnet(
+            info_hash,
+            extra_trackers,
+            false,
+            TorrentPlacement::default(),
+        )
+        .await
     }
 
     /// [`Self::get_or_begin_add_magnet`], waiting for an in-flight add and
@@ -834,8 +839,23 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         info_hash: &str,
         extra_trackers: Option<Vec<String>>,
     ) -> Result<Arc<Engine<B::Handle>>, MagnetAddError> {
+        self.get_or_add_magnet_placed(info_hash, extra_trackers, TorrentPlacement::default())
+            .await
+    }
+
+    /// [`Self::get_or_add_magnet`] with a [`TorrentPlacement`] for the add
+    /// this call starts. Like the trackers, the placement only counts when
+    /// this call is the one that adds the torrent: an existing engine or an
+    /// in-flight add is joined as is, wherever it lives -- the caller checks
+    /// `TorrentHandle::output_folder` (see `pin_download`, which relocates).
+    pub async fn get_or_add_magnet_placed(
+        &self,
+        info_hash: &str,
+        extra_trackers: Option<Vec<String>>,
+        placement: TorrentPlacement,
+    ) -> Result<Arc<Engine<B::Handle>>, MagnetAddError> {
         match self
-            .lookup_or_begin_add_magnet(info_hash, extra_trackers, true)
+            .lookup_or_begin_add_magnet(info_hash, extra_trackers, true, placement)
             .await
         {
             EngineLookup::Ready(engine) => Ok(engine),
@@ -849,6 +869,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         info_hash: &str,
         extra_trackers: Option<Vec<String>>,
         retry_failed: bool,
+        placement: TorrentPlacement,
     ) -> EngineLookup<B::Handle> {
         let info_hash = info_hash.to_lowercase();
         if let Some(engine) = self.get_engine(&info_hash).await {
@@ -892,6 +913,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             self.clock,
             info_hash.clone(),
             trackers,
+            placement,
         );
         adds.insert(
             info_hash,
@@ -920,6 +942,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         clock: Clock,
         info_hash: String,
         trackers: Vec<String>,
+        placement: TorrentPlacement,
     ) -> PendingMagnetAdd<B::Handle> {
         static NEXT_ADD_ID: AtomicU64 = AtomicU64::new(1);
         let id = NEXT_ADD_ID.fetch_add(1, Ordering::Relaxed);
@@ -930,7 +953,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             let trackers = trackers.clone();
             tokio::spawn(async move {
                 let source = TorrentSource::Url(format!("magnet:?xt=urn:btih:{hash}"));
-                let add = backend.add_torrent(source, trackers.to_vec());
+                let add = backend.add_torrent_placed(source, trackers.to_vec(), placement);
                 match tokio::time::timeout(METADATA_RESOLVE_TIMEOUT, add).await {
                     Ok(Ok(handle)) => Ok(Self::register_engine(&engines, handle, clock).await),
                     Ok(Err(error)) => Err(MagnetAddError::Backend {
@@ -2171,6 +2194,8 @@ mod tests {
         handles: Vec<FakeHandle>,
         /// Info hashes `remove_torrent` was asked to drop, in order.
         removed: Arc<Mutex<Vec<String>>>,
+        /// The placement of every `add_torrent_placed`, in order.
+        placements: Arc<Mutex<Vec<TorrentPlacement>>>,
     }
 
     #[async_trait::async_trait]
@@ -2182,6 +2207,16 @@ mod tests {
             _source: TorrentSource,
             _trackers: Vec<String>,
         ) -> Result<Self::Handle> {
+            Ok(self.handles[0].clone())
+        }
+
+        async fn add_torrent_placed(
+            &self,
+            _source: TorrentSource,
+            _trackers: Vec<String>,
+            placement: TorrentPlacement,
+        ) -> Result<Self::Handle> {
+            self.placements.lock().unwrap().push(placement);
             Ok(self.handles[0].clone())
         }
 
@@ -2493,6 +2528,7 @@ mod tests {
             FakeBackend {
                 handles: vec![handle],
                 removed: Arc::new(Mutex::new(Vec::new())),
+                placements: Arc::new(Mutex::new(Vec::new())),
             },
             restored,
             root.join("cache"),
@@ -2540,6 +2576,7 @@ mod tests {
             FakeBackend {
                 handles: vec![a, b],
                 removed: removed.clone(),
+                placements: Arc::new(Mutex::new(Vec::new())),
             },
             restored,
             root.join("cache"),
@@ -3185,6 +3222,74 @@ mod tests {
         cleanup.await.expect("cleanup task completed");
 
         assert_eq!(counters.clear_file_streaming.load(Ordering::SeqCst), 1);
+    }
+
+    // --- torrent placement through the magnet registry ---
+
+    /// The placement given to `get_or_add_magnet_placed` reaches the
+    /// backend add the registry starts; an existing engine is returned as
+    /// is, and the plain `get_or_add_magnet` adds with the default
+    /// placement.
+    #[tokio::test]
+    async fn magnet_registry_passes_the_placement_to_the_backend_add() {
+        let counters = Arc::new(FakeCounters::default());
+        let handle = FakeHandle {
+            info_hash: TEST_HASH.to_string(),
+            counters,
+            files: vec![BackendFileInfo {
+                name: "video.mkv".into(),
+                length: 100,
+            }],
+            init: FakeInit::new(true, Duration::from_secs(60)),
+        };
+        let placements = Arc::new(Mutex::new(Vec::new()));
+        let root = std::env::temp_dir().join("enginefs-placement-tests");
+        let enginefs = BackendEngineFS::new_with_backend(
+            FakeBackend {
+                handles: vec![handle],
+                removed: Arc::new(Mutex::new(Vec::new())),
+                placements: placements.clone(),
+            },
+            HashMap::new(),
+            root.join("cache"),
+            root.join("downloads"),
+        );
+
+        let placement = TorrentPlacement {
+            output_folder: Some(root.join("offline").join(TEST_HASH)),
+            only_files: Some(vec![0]),
+        };
+        let engine = enginefs
+            .get_or_add_magnet_placed(TEST_HASH, None, placement.clone())
+            .await
+            .expect("added");
+        assert_eq!(engine.info_hash, TEST_HASH);
+        assert_eq!(placements.lock().unwrap().as_slice(), &[placement]);
+
+        // Already managed: no second add, whatever the placement.
+        enginefs
+            .get_or_add_magnet_placed(
+                TEST_HASH,
+                None,
+                TorrentPlacement {
+                    output_folder: Some(root.join("elsewhere")),
+                    only_files: None,
+                },
+            )
+            .await
+            .expect("joined");
+        assert_eq!(placements.lock().unwrap().len(), 1);
+
+        enginefs.remove_engine(TEST_HASH).await;
+        enginefs
+            .get_or_add_magnet(TEST_HASH, None)
+            .await
+            .expect("re-added");
+        assert_eq!(
+            placements.lock().unwrap().last(),
+            Some(&TorrentPlacement::default()),
+            "the plain add uses the backend's default placement"
+        );
     }
 
     // --- pinned offline downloads ---

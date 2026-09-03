@@ -18,6 +18,19 @@ pub enum TorrentSource {
     Bytes(Vec<u8>),
 }
 
+/// Where a backend puts a torrent's data and what it wants at first. The
+/// default is the backend's own placement (its session root, everything
+/// wanted); an offline download (`BackendEngineFS::pin_download`) names a
+/// per-torrent folder and the pinned file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TorrentPlacement {
+    /// Directory the torrent's files are written to (the torrent's own
+    /// folder, not a parent of it); `None` = the backend's default.
+    pub output_folder: Option<std::path::PathBuf>,
+    /// Initial want-set; `None` = everything.
+    pub only_files: Option<Vec<usize>>,
+}
+
 #[async_trait::async_trait]
 pub trait TorrentBackend: Send + Sync {
     type Handle: TorrentHandle;
@@ -27,6 +40,20 @@ pub trait TorrentBackend: Send + Sync {
         source: TorrentSource,
         trackers: Vec<String>,
     ) -> Result<Self::Handle>;
+
+    /// [`Self::add_torrent`] with an explicit [`TorrentPlacement`]. The
+    /// default ignores the placement -- the only possible answer for a
+    /// backend with one root and no per-file selection -- so callers that
+    /// care check [`TorrentHandle::output_folder`] afterwards instead of
+    /// assuming.
+    async fn add_torrent_placed(
+        &self,
+        source: TorrentSource,
+        trackers: Vec<String>,
+        _placement: TorrentPlacement,
+    ) -> Result<Self::Handle> {
+        self.add_torrent(source, trackers).await
+    }
 
     async fn get_torrent(&self, info_hash: &str) -> Option<Self::Handle>;
     async fn remove_torrent(&self, info_hash: &str) -> Result<()>;
@@ -120,6 +147,12 @@ pub trait TorrentHandle: Send + Sync + Clone {
     /// index, or a backend without a per-file path). Reads still go through
     /// `get_file_reader`, which blocks on pieces a sparse file would not.
     async fn file_path(&self, _file_idx: usize) -> Option<std::path::PathBuf> {
+        None
+    }
+    /// The directory the torrent's files are written to (what
+    /// [`TorrentPlacement::output_folder`] resolved to, or the backend's
+    /// default). `None` when the backend does not know.
+    fn output_folder(&self) -> Option<std::path::PathBuf> {
         None
     }
     async fn get_file_reader(

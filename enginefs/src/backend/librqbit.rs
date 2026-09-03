@@ -2,7 +2,7 @@ use crate::backend::{
     BackendFileInfo, BackendMemoryDiagnostics, EngineStats, FileStreamTrait, Growler,
     PeerDiscovery, PeerSearch, PieceReadiness, Source, StartupPhase, StatsFile, StatsOptions,
     SwarmCap, TorrentBackend, TorrentFilePriorityPlan, TorrentHandle, TorrentListenPort,
-    TorrentSource,
+    TorrentPlacement, TorrentSource,
 };
 use anyhow::{Context, Result};
 use librqbit::{ManagedTorrent, ManagedTorrentState, Session};
@@ -558,6 +558,22 @@ impl TorrentBackend for LibrqbitBackend {
         source: TorrentSource,
         trackers: Vec<String>,
     ) -> Result<Self::Handle> {
+        self.add_torrent_placed(source, trackers, TorrentPlacement::default())
+            .await
+    }
+
+    /// `placement.output_folder` becomes librqbit's per-torrent
+    /// `output_folder` (persisted with the torrent, so a restart restores
+    /// the place) and `placement.only_files` its initial want-set; librqbit
+    /// rejects an out-of-range index at add time. `overwrite: true` always:
+    /// resuming on top of existing files is the normal case here (a restart,
+    /// a relocated torrent).
+    async fn add_torrent_placed(
+        &self,
+        source: TorrentSource,
+        trackers: Vec<String>,
+        placement: TorrentPlacement,
+    ) -> Result<Self::Handle> {
         let add_torrent = match source {
             // See `magnet_with_trackers`: for a magnet only the URL's own
             // `tr=` params count; `opts.trackers` below covers .torrent adds.
@@ -575,6 +591,10 @@ impl TorrentBackend for LibrqbitBackend {
                 Some(librqbit::AddTorrentOptions {
                     overwrite: true,
                     trackers: Some(trackers),
+                    output_folder: placement
+                        .output_folder
+                        .map(|folder| folder.to_string_lossy().into_owned()),
+                    only_files: placement.only_files,
                     ..Default::default()
                 }),
             )
@@ -957,6 +977,13 @@ impl TorrentHandle for LibrqbitHandle {
         let metadata = self.handle.metadata.load_full()?;
         let file = metadata.file_infos.get(file_idx)?;
         Some(self.handle.output_folder().join(&file.relative_filename))
+    }
+
+    /// librqbit's resolved `output_folder` for the torrent: the placement's
+    /// folder when one was given, else the session root (single-file
+    /// torrents) or `<root>/<torrent name>` (multi-file).
+    fn output_folder(&self) -> Option<PathBuf> {
+        Some(self.handle.output_folder().to_path_buf())
     }
 
     /// Select `file_idx` as the only wanted file (exclusive downloading, per
@@ -2864,6 +2891,80 @@ mod tests {
             16 * 1024
         );
         assert_eq!(multi.file_path(2).await, None);
+    }
+
+    /// `add_torrent_placed` hands librqbit the placement: the torrent's
+    /// files live in exactly `output_folder` (no name sub-folder), only the
+    /// listed files are wanted, `output_folder()` reports the folder, and
+    /// data already present there is picked up by the hash check
+    /// (`overwrite: true`). An out-of-range `only_files` index is refused
+    /// at add time.
+    #[tokio::test]
+    async fn add_torrent_placed_uses_the_folder_and_want_set() {
+        use crate::backend::TorrentHandle;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        tokio::fs::create_dir_all(&src).await.unwrap();
+        write_payload(&src.join("a.bin"), 32 * 1024).await;
+        write_payload(&src.join("b.bin"), 48 * 1024).await;
+        let (bytes, hash) = make_torrent(&src).await;
+
+        let dl = tmp.path().join("dl");
+        let backend = LibrqbitBackend::new_for_tests(dl.clone())
+            .await
+            .expect("hermetic session");
+        let folder = tmp.path().join("offline").join(&hash);
+        tokio::fs::create_dir_all(&folder).await.unwrap();
+        // Pre-seed the wanted file where the placement points.
+        tokio::fs::copy(src.join("b.bin"), folder.join("b.bin"))
+            .await
+            .unwrap();
+
+        let handle = backend
+            .add_torrent_placed(
+                TorrentSource::Bytes(bytes.clone()),
+                vec![],
+                TorrentPlacement {
+                    output_folder: Some(folder.clone()),
+                    only_files: Some(vec![1]),
+                },
+            )
+            .await
+            .expect("add with placement");
+        assert_eq!(handle.output_folder(), Some(folder.clone()));
+        assert_eq!(handle.handle.only_files(), Some(vec![1]));
+        assert_eq!(
+            handle.file_path(1).await.as_deref(),
+            Some(folder.join("b.bin").as_path())
+        );
+        handle.handle.wait_until_initialized().await.unwrap();
+        let stats = handle.stats().await;
+        assert!(
+            stats.files[1].complete,
+            "pre-seeded file verified: {stats:?}"
+        );
+        assert!(!stats.files[0].complete);
+        assert!(
+            !dl.join("src").exists(),
+            "nothing lands in the session root"
+        );
+
+        backend.remove_torrent(&hash).await.unwrap();
+        let err = match backend
+            .add_torrent_placed(
+                TorrentSource::Bytes(bytes),
+                vec![],
+                TorrentPlacement {
+                    output_folder: Some(folder),
+                    only_files: Some(vec![2]),
+                },
+            )
+            .await
+        {
+            Ok(_) => panic!("out-of-range only_files must be refused"),
+            Err(err) => err,
+        };
+        assert!(format!("{err:#}").contains("out of range"), "{err:#}");
     }
 
     #[tokio::test]
