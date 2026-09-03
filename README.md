@@ -125,13 +125,38 @@ The `stremio-runtime` stub spawns the server with `--no-auth`: it is the compati
 | `error` | Present only with `phase: "error"` when anything knows why: the message of a failed magnet add (metadata timeout, backend error), see below, or a fixed message for a torrent the backend put in an error state (broken download folder, full disk) — the backend's own text names server paths and stays in the log |
 | `checkedBytes`, `checkTotalBytes` | Hash-check progress; non-null only while `checking` |
 | `initialWindowReadyBytes`, `initialWindowBytes` | Bytes of the window the stream is waiting on that are already verified on disk; non-null only in `buffering`/`ready`. Also present per entry in `files[]`. The window **follows the reader** (a `Range` request, a seek or a re-open moves it) and is expanded to the whole pieces it touches, because a piece is the unit that becomes readable. `ready == window` still means exactly "servable" |
-| `pieceLength` | The torrent's piece length; `null` until metadata resolves. On a multi-gigabyte torrent this is 8-16 MiB — bigger than the startup window — so `initialWindowReadyBytes` can only read 0 or all of it and a percentage built from the pair sits at 0% for tens of seconds while the download runs perfectly. **Render the wait in pieces** ("waiting for the first piece (16 MiB)", optionally with an ETA from `downloadSpeed`), not as a percentage. librqbit exposes no sub-piece byte progress, so finer numbers are not available to the server either |
+| `pieceLength` | The torrent's piece length; `null` until metadata resolves. On a multi-gigabyte torrent this is 8-16 MiB — bigger than the startup window — so `initialWindowReadyBytes` can only read 0 or all of it and a percentage built from the pair sits at 0% for tens of seconds while the download runs perfectly. Render the wait **in pieces**, and use `inFlightPiece` (below) to show the progress inside the one the stream is waiting on |
+| `inFlightPiece` | Byte progress of the single piece the open reader is sitting on: `{ index, downloadedBytes, totalBytes, verified }`, or `null`. This is what lets a client say "waiting for the first piece, 6.2 of 16 MB" and draw a bar that moves. `null` — **never a zeroed object** — whenever we do not know: no reader open on that file, no metadata yet, or a torrent with no chunk map (`resolvingMetadata`/`checking`/`error`). Also present per entry in `files[]`, where it is omitted rather than null. See [The in-flight piece](#the-in-flight-piece) |
 | `peerDiscovery` | `{ seen, queued, connecting, live }` peer counters (`peers`/`unique`/`queued` remain as before) |
 | `connectedSeeders` | How many of the peers we are **connected to** hold the complete torrent, i.e. can serve any piece. Not the swarm's seeder count — it only ever counts our own connections and is always bounded by `peers`; for the swarm read `swarmSeeders`. 0 while `resolvingMetadata` — a magnet with no metadata yet has no peers. (`swarmSize` is not this either: it is a server.js-compatible alias of `peers`, kept for wire compatibility.) |
 | `swarmSeeders`, `swarmLeechers` | Seeders and leechers in the **whole swarm**, as the torrent's trackers report them — see [Swarm counts](#swarm-counts-from-tracker-scrapes) below. `null` when unknown, **never** `0` |
 | `swarmScrapeAgeSecs` | How many seconds ago the freshest scrape behind those two numbers came back. `null` exactly when they are |
 
 The top-level window/phase describe the guessed stream file for `/{infoHash}/stats.json` and the requested file for `/{infoHash}/{fileIdx}/stats.json`.
+
+#### The in-flight piece
+
+A piece is the unit that becomes readable — none of a 16 MiB piece can be served until all 16 MiB of it verifies — so whole verified pieces, all the have-bitfield can show, are too coarse to show a waiting player: it could only ever be told 0% or 100%. `inFlightPiece` is the finer view of the one piece that matters, the piece the open reader sits on:
+
+```json
+"pieceLength": 16777216,
+"inFlightPiece": {
+  "index": 137,
+  "downloadedBytes": 6553600,
+  "totalBytes": 16777216,
+  "verified": false
+}
+```
+
+- `index` is the piece's index **in the torrent**, not in the file.
+- `totalBytes` is that piece's real length. Every piece is `pieceLength` except the torrent's last, which is short — the server converts librqbit's 16 KiB chunk counts to bytes and clamps them to the piece's own length, so a complete short last piece reports exactly its length rather than a rounded-up one. Render `downloadedBytes` of `totalBytes`; do not multiply anything yourself.
+- The piece follows the reader: a `Range` request, a seek or a re-open moves it, the same way `initialWindowBytes` does. It appears once something opens the file and is `null` before that.
+
+**`downloadedBytes` can go backwards, and `verified` is the only field that means "ready".** A chunk counts as downloaded the moment it is written to disk, *not* when it is checked: the piece's hash is only verified once every chunk is in, and a piece that fails the check is discarded, dropping the count **back to zero**. So:
+
+- Never present a full `downloadedBytes` as playable on its own — it only means "complete enough to be hashed". `verified: true` (and only that) means the piece is in the have-bitfield and can be served.
+- **Hold at nearly-complete until `verified`.** Cap the bar somewhere short of 100% while `verified` is false, and let `verified` be what fills it.
+- **Do not animate backwards.** A decrease is a failed hash check, not progress being undone in a way a user can act on. Keep the bar where it was (or reset it without a transition) rather than running it down.
 
 #### Swarm counts from tracker scrapes
 
