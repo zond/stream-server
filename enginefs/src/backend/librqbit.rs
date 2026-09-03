@@ -1,5 +1,5 @@
 use crate::backend::{
-    BackendFileInfo, BackendMemoryDiagnostics, EngineStats, FileStreamTrait, Growler,
+    BackendFileInfo, BackendMemoryDiagnostics, DhtStatus, EngineStats, FileStreamTrait, Growler,
     PeerDiscovery, PeerSearch, PieceReadiness, Source, StartupPhase, StatsFile, StatsOptions,
     SwarmCap, TorrentBackend, TorrentFilePriorityPlan, TorrentHandle, TorrentListenPort,
     TorrentPlacement, TorrentSource,
@@ -322,6 +322,13 @@ pub fn resolve_dht_bootstrap_nodes(configured: &[String]) -> Vec<String> {
 
 pub struct LibrqbitBackend {
     pub session: Arc<Session>,
+    /// Sticky "the DHT routing table has been non-empty at least once this
+    /// session", latched by [`LibrqbitBackend::dht_status`]. librqbit keeps
+    /// no such flag -- `DhtStats` is instantaneous sizes only -- and the
+    /// difference between "idle right now" and "never worked on this
+    /// network" is exactly what a client needs to say "DHT unavailable,
+    /// using trackers only".
+    dht_ever_bootstrapped: AtomicBool,
     download_dir: PathBuf,
     deferred_selections: DeferredSelections,
     pinned_files: PinnedFiles,
@@ -497,6 +504,7 @@ impl LibrqbitBackend {
         Ok((
             Self {
                 session,
+                dht_ever_bootstrapped: AtomicBool::new(false),
                 download_dir,
                 deferred_selections,
                 pinned_files,
@@ -525,6 +533,7 @@ impl LibrqbitBackend {
         let session = Session::new_with_opts(download_dir.clone(), session_opts).await?;
         Ok(Self {
             session,
+            dht_ever_bootstrapped: AtomicBool::new(false),
             download_dir,
             deferred_selections: Default::default(),
             pinned_files: Default::default(),
@@ -1052,6 +1061,29 @@ impl TorrentBackend for LibrqbitBackend {
 
     async fn memory_diagnostics(&self) -> BackendMemoryDiagnostics {
         BackendMemoryDiagnostics::default()
+    }
+
+    /// librqbit's `DhtStats` is instantaneous (`routing_table_size`,
+    /// `routing_table_size_v6`) and has no "did bootstrap ever succeed"
+    /// flag, so the sticky bit is latched here: any observation of a
+    /// non-empty routing table sets it for the rest of the session. Cheap --
+    /// two routing-table length reads -- so a poller may call it freely.
+    fn dht_status(&self) -> DhtStatus {
+        let Some(dht) = self.session.get_dht() else {
+            return DhtStatus::default();
+        };
+        let stats = dht.stats();
+        let nodes = stats.routing_table_size as u64;
+        let nodes_v6 = stats.routing_table_size_v6 as u64;
+        if nodes + nodes_v6 > 0 {
+            self.dht_ever_bootstrapped.store(true, Ordering::Relaxed);
+        }
+        DhtStatus {
+            enabled: true,
+            nodes,
+            nodes_v6,
+            ever_bootstrapped: self.dht_ever_bootstrapped.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -2091,6 +2123,22 @@ mod tests {
         assert!(TorrentListenPort::default().wants_upnp_forwarding());
         assert!(TorrentListenPort::Fixed(DEFAULT_LISTEN_PORT_RANGE).wants_upnp_forwarding());
         assert!(!TorrentListenPort::Ephemeral.wants_upnp_forwarding());
+    }
+
+    /// A backend built without a DHT says so rather than looking like one
+    /// that failed to bootstrap: `enabled: false` is a configuration, and
+    /// `diagnostics::dht_health` must not warn about it.
+    #[tokio::test]
+    async fn a_session_without_a_dht_reports_it_as_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = LibrqbitBackend::new_for_tests(tmp.path().to_path_buf())
+            .await
+            .expect("hermetic backend");
+        let status = backend.dht_status();
+        assert_eq!(status, crate::backend::DhtStatus::default());
+        assert!(!status.enabled);
+        assert!(!status.is_usable());
+        assert!(!status.ever_bootstrapped);
     }
 
     #[test]

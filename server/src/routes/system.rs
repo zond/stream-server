@@ -83,6 +83,14 @@ fn sys_info_uncached() -> Value {
     })
 }
 
+/// Whether the mainline DHT works on this host -- see
+/// [`enginefs::backend::DhtStatus`] and `crate::diagnostics::dht_health`.
+/// Shared by `GET /stats.json`'s `dht` key and
+/// [`crate::ServerHandle::dht_status`], per the library-parity rule.
+pub fn dht_status(state: &AppState) -> enginefs::backend::DhtStatus {
+    state.stream_engine().dht_status()
+}
+
 pub async fn get_stats(
     State(state): State<AppState>,
     Query(params): Query<StatsParams>,
@@ -95,6 +103,16 @@ pub async fn get_stats(
     for (hash, stats) in engines {
         root.insert(hash, serde_json::to_value(stats).unwrap_or(Value::Null));
     }
+
+    // Alongside the per-torrent entries (keyed by 40-hex info hash) and the
+    // optional `sys` probe, so a client can say "DHT unavailable, using
+    // trackers only" without a route of its own. Always present: a client
+    // that finds no `dht` key is talking to an older server, which is a
+    // different thing from a DHT that never came up.
+    root.insert(
+        "dht".to_string(),
+        serde_json::to_value(dht_status(&state)).unwrap_or(Value::Null),
+    );
 
     if params.sys.as_deref() == Some("1") {
         root.insert("sys".to_string(), cached_sys_info().await);

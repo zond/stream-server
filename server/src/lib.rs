@@ -45,8 +45,23 @@ pub use url::Url;
 /// something polls the torrent's statistics, so it cannot be relied on to
 /// notice a disk problem by itself. WARN, not INFO: librqbit is chatty
 /// per-peer at INFO and would drown the log.
-pub(crate) const DEFAULT_LOG_FILTER: &str =
-    "server=info,stream_server=info,tower_http=info,enginefs=info,librqbit=warn";
+/// `librqbit_dht::dht` and `librqbit_upnp` are turned back down to ERROR on
+/// top of that, because both retry a network operation forever and WARN on
+/// every single attempt. `librqbit_dht::dht`'s only WARN is the bootstrap
+/// retry notifier (`dht.rs`'s `bootstrap_hostname_with_backoff`), which on a
+/// network that drops the DHT's UDP fires for every host, forever -- a real
+/// 28-minute Android session was hundreds of identical lines and no
+/// conclusion. `librqbit_upnp`'s are the SSDP-discovery and port-forward
+/// loops, which retry on a fixed interval whatever happens. Neither is
+/// actionable per attempt, and the *state* both of them are trying to
+/// describe is now reported once, properly, by
+/// `diagnostics::dht_health` (DHT) or is simply not a problem (UPnP is
+/// only enabled for a fixed listen port at all -- see
+/// `TorrentListenPort::wants_upnp_forwarding`). ERROR rather than OFF so a
+/// genuinely fatal DHT error still lands: `librqbit_dht`'s persistence
+/// warnings are on a different target and keep their level.
+pub(crate) const DEFAULT_LOG_FILTER: &str = "server=info,stream_server=info,tower_http=info,\
+     enginefs=info,librqbit=warn,librqbit_dht::dht=error,librqbit_upnp=error";
 
 pub const DEFAULT_HTTP_PORT: u16 = 11470;
 pub const DEFAULT_HTTPS_PORT: u16 = 12470;
@@ -223,6 +238,19 @@ impl ServerHandle {
     pub fn update_settings(&self, patch: serde_json::Value) -> anyhow::Result<ServerSettings> {
         let state = self.state.clone();
         self.block_on_server(async move { routes::system::update_settings(&state, &patch).await })?
+    }
+
+    /// Whether the mainline DHT works on this host, exactly what the `dht`
+    /// key of `GET /stats.json` answers (see `routes::system::dht_status`).
+    ///
+    /// The DHT is a peer *source*, not a requirement: a torrent with working
+    /// trackers downloads fine without one. A network that drops the DHT's
+    /// UDP -- carrier-grade NAT, a firewalled mobile APN, a captive portal --
+    /// leaves `ever_bootstrapped` false forever, which is what a client
+    /// should surface as "DHT unavailable, using trackers only" rather than
+    /// as an error. Cheap: two routing-table length reads.
+    pub fn dht_status(&self) -> enginefs::backend::DhtStatus {
+        routes::system::dht_status(&self.state)
     }
 
     /// Torrent-level stats, exactly what `GET /{infoHash}/stats.json?tr=...`
@@ -815,6 +843,10 @@ pub async fn run(
             crate::ssdp::start_discovery(state.devices.clone()),
         ));
     }
+    // Unconditional and unconfigurable: two routing-table length reads on a
+    // timer, and the only thing that ever states whether the DHT works here.
+    // See `diagnostics::dht_health`.
+    background_tasks.push(diagnostics::dht_health::start(state.stream_engine()));
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel(1);
     if cfg.use_tui
@@ -1274,5 +1306,60 @@ mod default_log_filter_tests {
         }
         // Parses as directives at all.
         tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER);
+    }
+
+    /// The two chronically-noisy librqbit targets are silenced at WARN while
+    /// the rest of `librqbit` keeps it -- the piece-write failure that makes
+    /// a full cache volume visible is a `librqbit::` WARN and must survive.
+    ///
+    /// Asserted through a real subscriber rather than by reading the string,
+    /// because it depends on `EnvFilter` preferring the more specific
+    /// directive (`librqbit_dht::dht=error`) over the prefix one
+    /// (`librqbit=warn`) for the same event -- which is the whole mechanism.
+    #[test]
+    fn the_repeating_dht_and_upnp_warnings_are_filtered_out_but_librqbit_warn_is_not() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default)]
+        struct Collect(Arc<Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Collect {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(event.metadata().target().to_string());
+            }
+        }
+
+        let collected = Collect::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER))
+            .with(collected.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            // The two the field log drowned in.
+            tracing::warn!(target: "librqbit_dht::dht", "error in bootstrap");
+            tracing::warn!(target: "librqbit_upnp", "failed to run SSDP/UPNP discovery");
+            // Must still get through.
+            tracing::error!(target: "librqbit_dht::dht", "dht: error in get_peers_root()");
+            tracing::warn!(target: "librqbit_dht::persistence", "cannot deserialize routing table");
+            tracing::warn!(target: "librqbit::torrent_state", "error writing piece");
+            tracing::info!(target: "stream_server::lib", "listening");
+        });
+
+        let targets = collected.0.lock().unwrap().clone();
+        assert_eq!(
+            targets,
+            vec![
+                "librqbit_dht::dht",
+                "librqbit_dht::persistence",
+                "librqbit::torrent_state",
+                "stream_server::lib",
+            ]
+        );
     }
 }

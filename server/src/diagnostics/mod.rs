@@ -1,3 +1,4 @@
+pub mod dht_health;
 pub mod logging;
 
 use std::{collections::HashSet, time::Instant};

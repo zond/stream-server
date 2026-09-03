@@ -358,6 +358,27 @@ fn device_info_and_stats_json_sys_probes_keep_their_shapes() -> anyhow::Result<(
         "expected at least one reported CPU"
     );
 
+    // The DHT state a client needs to say "DHT unavailable, using trackers
+    // only" instead of pretending peer discovery is healthy. Always present,
+    // `sys=1` or not: a missing `dht` key means an older server, which is a
+    // different thing from a DHT that never came up.
+    let response = client
+        .get(format!("http://{}/stats.json", handle.http_addr()))
+        .send()?
+        .error_for_status()?;
+    let body: serde_json::Value = response.json()?;
+    let dht = &body["dht"];
+    assert!(dht["enabled"].is_boolean(), "dht.enabled: {dht}");
+    assert!(dht["nodes"].is_u64(), "dht.nodes: {dht}");
+    assert!(dht["nodesV6"].is_u64(), "dht.nodesV6: {dht}");
+    assert!(
+        dht["everBootstrapped"].is_boolean(),
+        "dht.everBootstrapped: {dht}"
+    );
+    // The library API is the same call (`routes::system::dht_status`).
+    let status = handle.dht_status();
+    assert_eq!(dht["enabled"], serde_json::json!(status.enabled));
+
     handle.shutdown()?;
     handle.join()?;
 

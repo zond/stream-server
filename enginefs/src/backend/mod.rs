@@ -84,6 +84,11 @@ pub trait TorrentBackend: Send + Sync {
     }
     async fn list_torrents(&self) -> Vec<String>;
     async fn memory_diagnostics(&self) -> BackendMemoryDiagnostics;
+    /// The backend's view of the DHT (see [`DhtStatus`]). The default is "no
+    /// DHT", the right answer for a backend that has none.
+    fn dht_status(&self) -> DhtStatus {
+        DhtStatus::default()
+    }
     fn set_seeding_enabled(&self, _enabled: bool) {}
 }
 
@@ -266,6 +271,40 @@ pub struct BackendMemoryDiagnostics {
     pub waiter_keys: u64,
     pub waiter_wakers: u64,
     pub torrents: Vec<TorrentMemoryDiagnostics>,
+}
+
+/// What the mainline DHT looks like from this host, as the backend sees it.
+///
+/// The DHT is a *peer source*, not a requirement: a torrent with working
+/// trackers downloads fine without one. On a network that drops the UDP the
+/// DHT needs -- carrier-grade NAT, a captive portal, a firewalled mobile APN
+/// -- bootstrap simply never completes, and librqbit retries forever. This is
+/// the one place that state is observable, so a client can say "DHT
+/// unavailable, using trackers only" instead of the server logging a warning
+/// per retry for the length of the session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DhtStatus {
+    /// Whether a DHT is running at all (`false` when the backend was built
+    /// without one -- the hermetic test session, for instance).
+    pub enabled: bool,
+    /// Nodes in the IPv4 routing table right now.
+    pub nodes: u64,
+    /// Nodes in the IPv6 routing table right now.
+    pub nodes_v6: u64,
+    /// Whether either routing table has *ever* been non-empty this session.
+    /// Sticky: a table that empties out again (peers aged out, the network
+    /// changed) still counts as having bootstrapped once, which is the
+    /// difference between "the DHT is idle" and "the DHT never worked here".
+    pub ever_bootstrapped: bool,
+}
+
+impl DhtStatus {
+    /// A DHT that can answer a `get_peers` right now: running, with at least
+    /// one node to ask.
+    pub fn is_usable(&self) -> bool {
+        self.enabled && (self.nodes + self.nodes_v6) > 0
+    }
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]

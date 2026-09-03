@@ -1369,6 +1369,13 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         paths
     }
 
+    /// The backend's view of the DHT -- see [`crate::backend::DhtStatus`].
+    /// Cheap enough to call per request; the sticky `ever_bootstrapped` bit
+    /// is latched by the backend on every observation.
+    pub fn dht_status(&self) -> crate::backend::DhtStatus {
+        self.backend.dht_status()
+    }
+
     pub async fn get_all_statistics(&self) -> HashMap<String, crate::backend::EngineStats> {
         let engines = self.engines.read().await;
         let mut stats = HashMap::new();

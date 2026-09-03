@@ -181,6 +181,22 @@ Because they are a **tracker snapshot rather than a live measurement**, they com
 
 Multiple trackers are aggregated with **`max`, not `sum`**, computed separately for seeders and leechers. Each tracker only ever sees the peers that registered with *it*, so no tracker's number is a share of a total; and several trackers in the shipped list share a backend and answer with byte-identical counts, so summing would report the same swarm several times over. The largest number a single tracker vouches for is the honest floor. Trackers that failed or do not know the hash contribute nothing at all (they are not folded in as zeroes), and an implausible count (above 100000) is logged and ignored. Per-tracker figures are in `sources[]`, so a client can see the disagreement for itself.
 
+#### DHT health: the `dht` key on `/stats.json`
+
+`GET /stats.json` always carries a `dht` object alongside the per-torrent entries (and `ServerHandle::dht_status()` is the same call):
+
+| Field | Meaning |
+|---|---|
+| `enabled` | Whether a DHT is running at all |
+| `nodes` / `nodesV6` | Nodes in the IPv4 / IPv6 routing table right now |
+| `everBootstrapped` | Whether either routing table has been non-empty at any point this session. **Sticky** — this is what tells "idle right now" apart from "never worked on this network" |
+
+**The DHT is a peer *source*, not a requirement.** A torrent with working trackers downloads at full speed without one; only a trackerless magnet actually depends on it. Some networks — carrier-grade NAT, a firewalled mobile APN, a captive portal — simply drop the UDP the DHT needs, and then bootstrap never completes no matter how long it runs. A real Android session showed exactly that: every bootstrap host failing for 28 minutes while torrents pulled 30+ MB/s from trackers.
+
+So a client should treat `enabled && !everBootstrapped` as an **informational state, not an error**: something like *"DHT unavailable — using trackers only"* in a diagnostics or connection panel, and, where a magnet has no `tr=` trackers, a warning that this particular link may not find peers. Do not surface it as a failure while playback is fine, and do not poll for it as though it will change quickly — the server reports the conclusion once, in the log, after a 90-second grace window, and never repeats it.
+
+The server no longer logs librqbit's own per-attempt DHT and UPnP warnings (`librqbit_dht::dht` and `librqbit_upnp` are pinned to `error` in the default log directives): both retry forever and warn on every attempt, which produced hundreds of identical lines and no conclusion. The single conclusion from `diagnostics::dht_health` replaces them. UPnP port forwarding is now only requested for a **fixed** torrent listen port (the desktop binary's `42000..42010`), since an ephemeral one — what embedders and the Android build use — asks the router for a mapping that never comes back.
+
 Both stats routes accept the same query parameters as `/{infoHash}/{fileIdx}` and behave like it when they are the first request for a torrent:
 
 - **`tr=`** (repeatable, `tracker:`-prefixed values accepted, `dht:` ignored) — trackers merged into the engine when the stats request is the one that creates it. Poll stats before the first stream request freely: the engine is created exactly as the stream route would create it, so the addon's trackers are kept for the session (the engine passes them to librqbit as `tr=` params of the magnet link it adds — librqbit reads a magnet's trackers from the link alone, so `sources` lists them once metadata arrives). Trackers can only be set by the request that creates the engine — librqbit has no API to add trackers to a torrent later (`add_trackers` is a documented no-op), so a later request carrying extra trackers does not extend the set.
@@ -228,7 +244,7 @@ The HTTP surface is deliberately small and split in two by `build_router()` (`se
 | GET | `/local-addon/meta/{type}/{id}` | OPEN | stremio-core default profile — **stub**: `404`, logged at debug level only |
 | any | anything else under `/local-addon/` | OPEN | **stub**: deliberate `404`, logged at debug level only (never the ERROR-level unhandled-request line) |
 | GET | `/heartbeat` | TOKEN | app / tests |
-| GET | `/stats.json` (`?sys=1` adds `loadavg`/`cpus`) | TOKEN | app |
+| GET | `/stats.json` (always carries `dht`; `?sys=1` adds `loadavg`/`cpus`) | TOKEN | app |
 | GET | `/{infoHash}/stats.json`, `/{infoHash}/{fileIdx}/stats.json` | TOKEN | stremio-core `Statistics`; accept `tr=`/`f=` like the stream route |
 | POST | `/create` | TOKEN | stremio-core `CreateTorrent` (torrent blob / URL) |
 | POST | `/{infoHash}/create` | TOKEN | stremio-core `CreateTorrent` (magnet) |
