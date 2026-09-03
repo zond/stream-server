@@ -1763,6 +1763,14 @@ fn lan_media_server(
 /// route exists and only a token is missing. The loopback listener keeps
 /// serving both, and range and HEAD requests -- what a receiver actually
 /// issues -- work through the LAN listener too.
+///
+/// It must also NOT expose `/proxy` (and, for the same reason, `/ftp`):
+/// both fetch an arbitrary caller-supplied remote URL rather than media
+/// bytes from this server, so mounting them on the LAN would turn the
+/// listener into an open proxy for the whole network. They 404 on the LAN
+/// listener and keep working on loopback. The archive (rar/zip/7zip/tar/
+/// tgz), NZB and `/local-addon` routes are real media routes and work
+/// identically on both.
 #[test]
 fn lan_media_listener_serves_media_but_no_control_route() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -1845,6 +1853,62 @@ fn lan_media_listener_serves_media_but_no_control_route() -> anyhow::Result<()> 
             .status(),
         reqwest::StatusCode::METHOD_NOT_ALLOWED
     );
+
+    // `/proxy` and `/ftp` are open on the loopback listener too -- players
+    // cannot attach headers, same as every other media route -- but neither
+    // serves bytes *from this server*: each fetches an arbitrary
+    // caller-supplied remote URL (`/proxy` with
+    // `danger_accept_invalid_certs`, `/ftp` via `reqwest` or a spawned
+    // `curl`), which makes it an open proxy rather than "media bytes". The
+    // LAN listener's allow-list (`lan_media_routes`) excludes both. The
+    // requests below are malformed just enough to prove the routing
+    // decision (an invalid target URL, a missing `lz` parameter) without
+    // either handler ever reaching out over the network.
+    for path in ["/proxy/not-a-url", "/ftp/movie.mkv"] {
+        let response = anonymous.get(format!("{lan}{path}")).send()?;
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "{path} must not exist on the LAN listener -- it is an open proxy, not media bytes"
+        );
+        let response = anonymous.get(format!("{base}{path}")).send()?;
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "{path} is a real route on the loopback listener"
+        );
+    }
+
+    // The archive and NZB session-create routes are on the LAN allow-list
+    // and answer identically -- here, both refuse the same missing payload
+    // -- on both listeners.
+    for path in [
+        "/rar/create",
+        "/zip/create",
+        "/7zip/create",
+        "/tar/create",
+        "/tgz/create",
+        "/nzb/create",
+    ] {
+        for origin in [&lan, &base] {
+            let response = anonymous.get(format!("{origin}{path}")).send()?;
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "{origin}{path}"
+            );
+        }
+    }
+    // Likewise the `/local-addon` stub: also on the allow-list, also
+    // identical on both.
+    for origin in [&lan, &base] {
+        let manifest: serde_json::Value = anonymous
+            .get(format!("{origin}/local-addon/manifest.json"))
+            .send()?
+            .error_for_status()?
+            .json()?;
+        assert_eq!(manifest["id"], "org.stremio.local", "{origin}");
+    }
 
     // Media bytes, on both listeners, from the same engine.
     for origin in [&lan, &base] {

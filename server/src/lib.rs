@@ -1030,8 +1030,8 @@ fn cors_layer() -> CorsLayer {
 }
 
 /// The router the LAN media listener serves (see [`crate::lan_media`]):
-/// [`media_router`] and the two unhandled-request fallbacks, with the same
-/// tracing and CORS layers the loopback router carries.
+/// [`lan_media_routes`] and the two unhandled-request fallbacks, with the
+/// same tracing and CORS layers the loopback router carries.
 ///
 /// [`control_router`] is deliberately absent -- not merged and left behind the
 /// bearer middleware, but *not mounted at all*. A control path on this
@@ -1042,9 +1042,22 @@ fn cors_layer() -> CorsLayer {
 /// shape only: they collide with the two-segment media route's pattern, so
 /// they answer as that route would -- `405` for the POST, a file-index error
 /// for the stats path -- and still never reach a control handler.)
+///
+/// `/proxy/...` and `/ftp/...` get the same shape collision -- axum has no
+/// route registered for either prefix here, and `GET /proxy/x` or
+/// `GET /ftp/x` has exactly the two segments `/{infoHash}/{fileIdx}` matches,
+/// so without [`lan_closed_hazard_routes`] each would be swallowed by the
+/// stream route (treating `"proxy"`/`"ftp"` as an info hash) and answer
+/// whatever a doomed magnet-add attempt returns instead of a clean, cheap
+/// `404`. [`lan_closed_hazard_routes`] shadows both prefixes explicitly so
+/// the LAN listener never even attempts that lookup.
+///
+/// This is deliberately *not* [`media_router`] minus a couple of routes --
+/// see [`lan_media_routes`] for why.
 fn build_lan_media_router(state: AppState) -> Router {
     Router::new()
-        .merge(media_router())
+        .merge(lan_media_routes())
+        .merge(lan_closed_hazard_routes())
         .fallback(fallback_handler)
         .method_not_allowed_fallback(method_not_allowed_handler)
         .layer(
@@ -1060,13 +1073,9 @@ fn build_lan_media_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Routes that hand media bytes to a player. They are OPEN (no bearer token):
-/// players fetch the URLs stremio-core builds for them
-/// (types/resource/stream.rs) and cannot attach headers. The one non-media
-/// exception is the `/local-addon` stub (see `routes::local_addon`): default
-/// profiles -- legacy clients included -- call it as an addon, and it exposes
-/// nothing.
-fn media_router() -> Router<AppState> {
+/// The two byte-serving routes a player fetches directly: a torrent file's
+/// bytes, plain or under the `/stream` alias stremio-core also builds.
+fn stream_routes() -> Router<AppState> {
     Router::new()
         .route(
             "/stream/{infoHash}/{fileIdx}",
@@ -1076,15 +1085,91 @@ fn media_router() -> Router<AppState> {
             "/{infoHash}/{fileIdx}",
             get(routes::stream::stream_video).head(routes::stream::head_stream_video),
         )
+}
+
+/// The archive-format byte-serving routes: a file read out of a RAR/ZIP/7Z/
+/// TAR/TGZ archive whose members are themselves torrent files, each format
+/// sharing the same handlers (`routes::archive::router`).
+fn archive_routes() -> Router<AppState> {
+    Router::new()
         .nest("/rar", routes::archive::router())
         .nest("/zip", routes::archive::router())
         .nest("/7zip", routes::archive::router())
         .nest("/tar", routes::archive::router())
         .nest("/tgz", routes::archive::router())
-        .nest("/nzb", routes::nzb::router())
+}
+
+/// The NZB byte-serving route: a file read out of a Usenet download the same
+/// way the archive routes read one out of a torrent-delivered archive.
+fn nzb_routes() -> Router<AppState> {
+    Router::new().nest("/nzb", routes::nzb::router())
+}
+
+/// The `/local-addon` stub (see `routes::local_addon`): not media bytes, but
+/// harmless and open for the same reason it lives in [`media_router`] at all
+/// -- default profiles, legacy clients included, call it as an addon, and it
+/// exposes nothing.
+fn local_addon_routes() -> Router<AppState> {
+    Router::new().nest("/local-addon", routes::local_addon::router())
+}
+
+/// Routes that hand media bytes to a player. They are OPEN (no bearer token):
+/// players fetch the URLs stremio-core builds for them
+/// (types/resource/stream.rs) and cannot attach headers. The one non-media
+/// exception is the `/local-addon` stub: default profiles -- legacy clients
+/// included -- call it as an addon, and it exposes nothing.
+///
+/// `/proxy` and `/ftp` are also here, and are also open for the same
+/// header-less-caller reason -- but neither serves media bytes *from this
+/// server*: both fetch an arbitrary caller-supplied remote URL (`/proxy` over
+/// HTTP(S) with `danger_accept_invalid_certs`, `/ftp` over HTTP(S) or via a
+/// spawned `curl` for FTP/FTPS) and stream back whatever answers. That makes
+/// each an open proxy, which is fine on the loopback listener -- only this
+/// host's own stremio-core can reach it -- but not on the LAN one. See
+/// [`lan_media_routes`], which is the allow-list that keeps them off it.
+fn media_router() -> Router<AppState> {
+    Router::new()
+        .merge(stream_routes())
+        .merge(archive_routes())
+        .merge(nzb_routes())
         .nest("/proxy", routes::proxy::router())
         .nest("/ftp", routes::ftp::router())
-        .nest("/local-addon", routes::local_addon::router())
+        .merge(local_addon_routes())
+}
+
+/// The LAN media listener's route allow-list (see [`crate::lan_media`]).
+///
+/// Deliberately spelled as *what is safe*, not as [`media_router`] minus the
+/// hazardous routes: a plain `media_router() - proxy - ftp` reads correctly
+/// today, but it means a route added to [`media_router`] for some other
+/// reason is on the LAN by default, and an author who never touches this
+/// function has no reason to notice. Building the LAN set from the same named
+/// groups [`media_router`] merges (minus `/proxy` and `/ftp`) means a new
+/// group must be added *here* by name before the LAN listener serves it --
+/// the silent default is exclusion, not inclusion. Keep it this way; see the
+/// `AGENTS.md` "Routes" entry for the same rule stated for `media_router`
+/// vs. `control_router`.
+fn lan_media_routes() -> Router<AppState> {
+    Router::new()
+        .merge(stream_routes())
+        .merge(archive_routes())
+        .merge(nzb_routes())
+        .merge(local_addon_routes())
+}
+
+/// Explicit `404`s for the `/proxy` and `/ftp` prefixes on the LAN listener,
+/// so a request there is answered by a route that says "no", not silently
+/// reinterpreted as `/{infoHash}/{fileIdx}` -- see the collision note on
+/// [`build_lan_media_router`]. `any` covers every method the same way the
+/// ordinary fallback does; the wildcard segment matches whatever shape a
+/// real `/proxy/...` or `/ftp/...` request would have used.
+fn lan_closed_hazard_routes() -> Router<AppState> {
+    async fn closed() -> StatusCode {
+        StatusCode::NOT_FOUND
+    }
+    Router::new()
+        .route("/proxy/{*rest}", axum::routing::any(closed))
+        .route("/ftp/{*rest}", axum::routing::any(closed))
 }
 
 /// Everything that is not media bytes: what stremio-core's StreamingServer
