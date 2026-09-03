@@ -31,8 +31,10 @@ pub struct DownloadInfo {
     pub phase: StartupPhase,
     /// Why the download is not progressing, when anything knows: the
     /// engine's error for a failed magnet add or a torrent the backend put
-    /// in an error state, [`DORMANT_DOWNLOAD_ERROR`] for a pin whose
-    /// torrent the backend does not have. `null` for a healthy download.
+    /// in an error state (a client-safe message either way -- the
+    /// backend's own text names server paths and stays in the log),
+    /// [`DORMANT_DOWNLOAD_ERROR`] for a pin whose torrent the backend does
+    /// not have. `null` for a healthy download.
     pub error: Option<String>,
 }
 

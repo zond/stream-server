@@ -121,7 +121,7 @@ The `stremio-runtime` stub spawns the server with `--no-auth`: it is the compati
 | Field | Meaning |
 |---|---|
 | `phase` | `resolvingMetadata` (no metadata yet), `checking` (hash-checking data already on disk), `buffering` (live, but the stream file's initial priority window is not fully on disk), `ready` (initial window on disk — playback can start), `error` |
-| `error` | Present only with `phase: "error"` when the engine layer knows why: the message of a failed magnet add (metadata timeout, backend error), see below |
+| `error` | Present only with `phase: "error"` when anything knows why: the message of a failed magnet add (metadata timeout, backend error), see below, or a fixed message for a torrent the backend put in an error state (broken download folder, full disk) — the backend's own text names server paths and stays in the log |
 | `checkedBytes`, `checkTotalBytes` | Hash-check progress; non-null only while `checking` |
 | `initialWindowReadyBytes`, `initialWindowBytes` | Bytes of the stream file's head window (`min(4 MiB, file length)`) already verified on disk; non-null only in `buffering`/`ready`. Also present per entry in `files[]` |
 | `peerDiscovery` | `{ seen, queued, connecting, live }` peer counters (`peers`/`unique`/`queued` remain as before) |

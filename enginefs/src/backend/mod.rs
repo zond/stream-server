@@ -643,9 +643,12 @@ pub struct EngineStats {
     /// Peer-discovery counters, see [`PeerDiscovery`].
     #[serde(default)]
     pub peer_discovery: PeerDiscovery,
-    /// Why `phase` is `error`, when the engine layer knows: set for a magnet
-    /// whose add ended without an engine (see
-    /// [`EngineStats::magnet_add_failed`]); absent otherwise.
+    /// Why `phase` is `error`, when anything knows: a magnet whose add
+    /// ended without an engine (see [`EngineStats::magnet_add_failed`]),
+    /// or a torrent the backend put in an error state -- a broken
+    /// download folder, a full disk. Always a client-safe message; the
+    /// backend's own error text names server paths and stays in the log
+    /// (`librqbit::TORRENT_ERROR_MESSAGE`). Absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Indices of the files pinned as offline downloads (ascending); the

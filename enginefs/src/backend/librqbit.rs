@@ -203,6 +203,20 @@ type DeferredSelections = Arc<Mutex<HashMap<String, Arc<DeferredSelection<Deferr
 /// `pin_file` again for every restored torrent.
 type PinnedFiles = Arc<Mutex<HashMap<String, BTreeSet<usize>>>>;
 
+/// The last error text reported to the log for a torrent, keyed by info
+/// hash and shared by every handle clone like [`PinnedFiles`]. Statistics
+/// are polled while a broken download is on screen, so the full librqbit
+/// error chain goes to the log once per distinct error rather than once
+/// per poll (see `LibrqbitHandle::client_torrent_error`).
+type ReportedErrors = Arc<Mutex<HashMap<String, String>>>;
+
+/// What a client is told about a torrent librqbit put in an error state.
+/// librqbit's `TorrentStats.error` is the `{e:?}` of an anyhow chain
+/// naming absolute cache and download paths, so only this fixed message
+/// crosses the boundary -- like `MagnetAddError::client_message` and
+/// `PinDownloadError::client_message`, the chain itself is for the log.
+pub const TORRENT_ERROR_MESSAGE: &str = "the torrent is in an error state (its download folder may be unwritable, full or gone); see server logs";
+
 /// A selection op parked until the torrent initializes.
 #[derive(Debug, Clone, Copy)]
 struct DeferredOp {
@@ -228,6 +242,7 @@ pub struct LibrqbitBackend {
     download_dir: PathBuf,
     deferred_selections: DeferredSelections,
     pinned_files: PinnedFiles,
+    reported_errors: ReportedErrors,
 }
 
 impl LibrqbitBackend {
@@ -308,6 +323,7 @@ impl LibrqbitBackend {
         };
         let deferred_selections: DeferredSelections = Default::default();
         let pinned_files: PinnedFiles = Default::default();
+        let reported_errors: ReportedErrors = Default::default();
         // Restore from session
         let mut restored_handles = session.with_torrents(|iter| {
             let mut map = HashMap::new();
@@ -321,6 +337,7 @@ impl LibrqbitBackend {
                         session: session.clone(),
                         deferred_selections: deferred_selections.clone(),
                         pinned_files: pinned_files.clone(),
+                        reported_errors: reported_errors.clone(),
                     },
                 );
             }
@@ -355,6 +372,7 @@ impl LibrqbitBackend {
                                             session: session.clone(),
                                             deferred_selections: deferred_selections.clone(),
                                             pinned_files: pinned_files.clone(),
+                                            reported_errors: reported_errors.clone(),
                                         },
                                     );
                                 }
@@ -372,6 +390,7 @@ impl LibrqbitBackend {
                 download_dir,
                 deferred_selections,
                 pinned_files,
+                reported_errors,
             },
             restored_handles,
         ))
@@ -397,6 +416,7 @@ impl LibrqbitBackend {
             download_dir,
             deferred_selections: Default::default(),
             pinned_files: Default::default(),
+            reported_errors: Default::default(),
         })
     }
 }
@@ -515,6 +535,8 @@ pub struct LibrqbitHandle {
     deferred_selections: DeferredSelections,
     /// Backend-wide pinned file sets (see `PinnedFiles`).
     pinned_files: PinnedFiles,
+    /// Backend-wide last-reported error texts (see [`ReportedErrors`]).
+    reported_errors: ReportedErrors,
 }
 
 /// Put `trackers` into a magnet link as `tr=` params.
@@ -611,6 +633,7 @@ impl LibrqbitBackend {
             session: self.session.clone(),
             deferred_selections: self.deferred_selections.clone(),
             pinned_files: self.pinned_files.clone(),
+            reported_errors: self.reported_errors.clone(),
         }
     }
 
@@ -630,6 +653,7 @@ impl LibrqbitBackend {
             .with_context(|| format!("failed to remove torrent {info_hash}"))?;
         self.deferred_selections.lock().remove(info_hash);
         self.pinned_files.lock().remove(info_hash);
+        self.reported_errors.lock().remove(info_hash);
         // `Session::delete(_, false)` only removes empty directories on the
         // delete_files=true branch, so a torrent that never wrote anything
         // (or whose files were cleaned out) would leave its output folder
@@ -726,6 +750,7 @@ impl TorrentBackend for LibrqbitBackend {
             session: self.session.clone(),
             deferred_selections: self.deferred_selections.clone(),
             pinned_files: self.pinned_files.clone(),
+            reported_errors: self.reported_errors.clone(),
         })
     }
 
@@ -880,6 +905,7 @@ impl TorrentBackend for LibrqbitBackend {
             session: self.session.clone(),
             deferred_selections: self.deferred_selections.clone(),
             pinned_files: self.pinned_files.clone(),
+            reported_errors: self.reported_errors.clone(),
         })
     }
 
@@ -1099,7 +1125,7 @@ impl TorrentHandle for LibrqbitHandle {
             initial_window_ready_bytes: None,
             initial_window_bytes: None,
             peer_discovery,
-            error: None,
+            error: self.client_torrent_error(stats.error.as_deref()),
             pinned_files: pinned.into_iter().collect(),
         }
     }
@@ -1484,6 +1510,27 @@ impl LibrqbitHandle {
         self.handle.metadata.load_full().map(|m| m.file_infos.len())
     }
 
+    /// What a client may be told about librqbit's `TorrentStats.error`:
+    /// the fixed [`TORRENT_ERROR_MESSAGE`], never the error itself, which
+    /// is the `{e:?}` of an anyhow chain naming absolute cache and
+    /// download paths (`PinDownloadError::client_message` draws the same
+    /// line). The chain goes to the log instead -- once per distinct
+    /// error, since statistics are polled for as long as a broken download
+    /// is on screen. `None` in, `None` out, and the record is dropped so a
+    /// torrent that recovers reports its next error again.
+    fn client_torrent_error(&self, error: Option<&str>) -> Option<String> {
+        let mut reported = self.reported_errors.lock();
+        let Some(error) = error else {
+            reported.remove(&self.info_hash);
+            return None;
+        };
+        if reported.get(&self.info_hash).map(String::as_str) != Some(error) {
+            warn!(info_hash = %self.info_hash, error, "torrent_error_state");
+            reported.insert(self.info_hash.clone(), error.to_string());
+        }
+        Some(TORRENT_ERROR_MESSAGE.to_string())
+    }
+
     /// Snapshot of this torrent's pinned file indices.
     fn pinned_set(&self) -> BTreeSet<usize> {
         self.pinned_files
@@ -1724,6 +1771,7 @@ impl Clone for LibrqbitHandle {
             session: self.session.clone(),
             deferred_selections: self.deferred_selections.clone(),
             pinned_files: self.pinned_files.clone(),
+            reported_errors: self.reported_errors.clone(),
         }
     }
 }
@@ -3117,6 +3165,139 @@ mod tests {
     /// data already present there is picked up by the hash check
     /// (`overwrite: true`). An out-of-range `only_files` index is refused
     /// at add time.
+    /// Storage that opens without complaint and then fails the initial
+    /// check -- how librqbit actually reaches its Error state, since a
+    /// storage that cannot be opened at all fails the add itself instead.
+    struct BrokenStorage(String);
+
+    impl librqbit::storage::TorrentStorage for BrokenStorage {
+        fn init(
+            &mut self,
+            _shared: &librqbit::ManagedTorrentShared,
+            _metadata: &librqbit::TorrentMetadata,
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn pread_exact(&self, _file_id: usize, _offset: u64, _buf: &mut [u8]) -> Result<()> {
+            anyhow::bail!("{}", self.0)
+        }
+        fn pwrite_all(&self, _file_id: usize, _offset: u64, _buf: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        fn remove_file(&self, _file_id: usize, _filename: &std::path::Path) -> Result<()> {
+            Ok(())
+        }
+        fn remove_directory_if_empty(&self, _path: &std::path::Path) -> Result<()> {
+            Ok(())
+        }
+        fn ensure_file_length(&self, _file_id: usize, _length: u64) -> Result<()> {
+            Ok(())
+        }
+        fn take(&self) -> Result<Box<dyn librqbit::storage::TorrentStorage>> {
+            anyhow::bail!("{}", self.0)
+        }
+    }
+
+    #[derive(Clone)]
+    struct BrokenStorageFactory(String);
+
+    impl librqbit::storage::StorageFactory for BrokenStorageFactory {
+        type Storage = BrokenStorage;
+        fn create(
+            &self,
+            _shared: &librqbit::ManagedTorrentShared,
+            _metadata: &librqbit::TorrentMetadata,
+        ) -> Result<Self::Storage> {
+            Ok(BrokenStorage(self.0.clone()))
+        }
+        fn clone_box(&self) -> librqbit::storage::BoxStorageFactory {
+            use librqbit::storage::StorageFactoryExt;
+            self.clone().boxed()
+        }
+    }
+
+    /// librqbit says WHY a torrent it put in the Error state is stuck
+    /// (`TorrentStats.error`), and that reason is the `{e:?}` of an anyhow
+    /// chain naming absolute cache and download paths. The client gets a
+    /// fixed message instead -- non-empty, so the download screen can say
+    /// more than "error", and path-free; the chain goes to the log alone,
+    /// and only once per distinct error, since statistics are polled for
+    /// as long as the broken download is on screen.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_torrent_error_reaches_the_client_without_the_server_paths() {
+        use crate::backend::TorrentHandle;
+        use librqbit::storage::StorageFactoryExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        tokio::fs::create_dir_all(&src).await.unwrap();
+        write_payload(&src.join("a.bin"), 32 * 1024).await;
+        let (bytes, hash) = make_torrent(&src).await;
+
+        let backend = LibrqbitBackend::new_for_tests(tmp.path().join("dl"))
+            .await
+            .expect("hermetic session");
+        // The shape of a real librqbit storage failure: an anyhow chain
+        // naming the absolute path it could not use.
+        let librqbit_error = format!(
+            "error opening {:?} in read/write mode",
+            tmp.path().join("dl").join("src").join("a.bin")
+        );
+        let response = backend
+            .session
+            .add_torrent(
+                librqbit::AddTorrent::from_bytes(bytes),
+                Some(librqbit::AddTorrentOptions {
+                    storage_factory: Some(BrokenStorageFactory(librqbit_error.clone()).boxed()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("the add succeeds; the check is what fails");
+        let (librqbit::AddTorrentResponse::Added(_, managed)
+        | librqbit::AddTorrentResponse::AlreadyManaged(_, managed)) = response
+        else {
+            panic!("torrent not added");
+        };
+        let handle = LibrqbitHandle {
+            handle: managed,
+            info_hash: hash.clone(),
+            session: backend.session.clone(),
+            deferred_selections: backend.deferred_selections.clone(),
+            pinned_files: backend.pinned_files.clone(),
+            reported_errors: backend.reported_errors.clone(),
+        };
+
+        let mut stats = handle.stats().await;
+        for _ in 0..100 {
+            if stats.phase == StartupPhase::Error {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            stats = handle.stats().await;
+        }
+        assert_eq!(stats.phase, StartupPhase::Error, "{:?}", stats.phase);
+        let reported = stats.error.expect("the reason reaches the client");
+        assert!(!reported.is_empty());
+        assert!(
+            !reported.contains(tmp.path().to_str().unwrap())
+                && !reported.contains("a.bin")
+                && !reported.contains(&hash),
+            "no server path leaks into the response: {reported}"
+        );
+        assert!(
+            handle
+                .reported_errors
+                .lock()
+                .get(&hash)
+                .is_some_and(|logged| logged.contains(tmp.path().to_str().unwrap())),
+            "the full chain is kept for the log, and logged once"
+        );
+
+        // Recovered: the record goes, so the next error is logged again.
+        assert_eq!(handle.client_torrent_error(None), None);
+        assert!(handle.reported_errors.lock().is_empty());
+    }
+
     #[tokio::test]
     async fn add_torrent_placed_uses_the_folder_and_want_set() {
         use crate::backend::TorrentHandle;
