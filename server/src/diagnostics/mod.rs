@@ -147,7 +147,11 @@ fn disk_tree_stats(root: &std::path::Path) -> (u64, u64) {
             continue;
         }
         if let Ok(metadata) = entry.metadata() {
-            bytes = bytes.saturating_add(metadata.len());
+            // Occupancy, not apparent length -- librqbit pre-allocates
+            // wanted files at full size, so `len()` here reported a phone's
+            // cache at four times what was on the disk. See
+            // `cache_cleaner::occupied_bytes`.
+            bytes = bytes.saturating_add(crate::cache_cleaner::occupied_bytes(&metadata));
             files = files.saturating_add(1);
         }
     }

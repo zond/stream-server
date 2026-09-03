@@ -142,30 +142,106 @@ async fn clean_cache(state: &Arc<AppState>) -> anyhow::Result<()> {
     downloads_dirs.sort();
     downloads_dirs.dedup();
 
-    evict(&download_dirs, &protected_paths, limit, &downloads_dirs).await
+    evict(&download_dirs, &protected_paths, limit, &downloads_dirs)
+        .await
+        .map(|_report| ())
+}
+
+/// What a cache root costs on disk, as the cleaner must count it.
+///
+/// librqbit pre-allocates every file it wants at its **full** length, so a
+/// part-streamed film is a multi-gigabyte apparent length over a handful of
+/// allocated blocks -- `Metadata::len` on such a file describes the movie,
+/// not the phone. A device reporting 17 GB of cache had 3.85 GB on it, and
+/// the cleaner spent every run trying to evict its way under a limit the
+/// disk was never over. (enginefs learned the same lesson about progress:
+/// count what the backend allocated, never `metadata().len()`.)
+///
+/// On Unix `st_blocks` is the allocated block count in 512-byte units *by
+/// definition* -- the unit is POSIX, not the filesystem's block size -- so
+/// `blocks() * 512` is the occupancy including any tail slack. Windows has
+/// no equivalent through `std` (it needs `GetCompressedFileSize` or
+/// `FSCTL_QUERY_ALLOCATED_RANGES` through the Win32 API), so there the
+/// apparent length stands in, exactly as it did everywhere before: it is an
+/// over-estimate for a sparse file, which errs towards cleaning too eagerly
+/// rather than letting a disk fill.
+pub(crate) fn occupied_bytes(metadata: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.blocks().saturating_mul(512)
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.len()
+    }
+}
+
+/// What one [`evict`] run found and did, in occupancy bytes
+/// ([`occupied_bytes`]) throughout.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct EvictionReport {
+    /// Occupancy of the walked roots once eviction finished.
+    pub total: u64,
+    /// How much of `total` eviction may never touch: files a live engine
+    /// reports (a pinned download's engine is never swept, so its files are
+    /// in here for as long as the pin holds).
+    pub protected: u64,
+    /// How many files that is.
+    pub protected_files: usize,
+    /// Occupancy reclaimed by the size rule.
+    pub freed: u64,
+    /// How many files that took.
+    pub deleted: usize,
+    /// The limit this run was given (0 = none).
+    pub limit: u64,
+}
+
+impl EvictionReport {
+    /// The line to log when the run ended still over the limit, naming what
+    /// protection kept -- "cleaned up 0 files, freed 0 bytes" on a phone
+    /// that is filling up says nothing about *why*, and the why is always
+    /// that the rest of the cache belongs to a live or pinned torrent.
+    /// `None` when the run got under the limit (or had none).
+    pub fn shortfall_message(&self) -> Option<String> {
+        if self.limit == 0 || self.total <= self.limit {
+            return None;
+        }
+        Some(format!(
+            "Cache size {} still exceeds limit {} after freeing {} bytes from {} files: \
+             {} bytes in {} files are protected (a live torrent is writing them, or a pinned \
+             download keeps them) and cannot be evicted",
+            self.total, self.limit, self.freed, self.deleted, self.protected, self.protected_files,
+        ))
+    }
 }
 
 /// Walk `download_dirs` and evict what is neither protected nor a session
 /// artefact: first every file older than 30 days, then -- while the rest
 /// exceeds `limit` (0 = no limit) -- the least recently modified files.
+/// Sizes are occupancy, not apparent length (see [`occupied_bytes`]).
 /// Nothing under `downloads_dirs` is walked at all: those files are
 /// offline downloads, not cache, so they are neither evicted nor counted
 /// towards `limit`. Only strict descendants of a walked root are pruned
 /// that way -- a `downloads_dirs` entry that is a root or above it is
 /// warned about and ignored, since pruning it would leave nothing walked
-/// and stop every eviction rule for that root.
+/// and stop every eviction rule for that root. That is also why an unset
+/// `downloadsDir` cannot switch the cleaner off: it leaves `downloads_dirs`
+/// empty rather than defaulting to the cache root the engines write in.
 async fn evict(
     download_dirs: &[std::path::PathBuf],
     protected_paths: &HashSet<std::path::PathBuf>,
     limit: u64,
     downloads_dirs: &[std::path::PathBuf],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<EvictionReport> {
     // 2. Scan and Evict immediately based on age (30 days)
     let thirty_days = Duration::from_secs(30 * 24 * 60 * 60);
     let now = std::time::SystemTime::now();
 
     let mut files = Vec::new();
     let mut total_size = 0u64;
+    let mut protected_size = 0u64;
+    let mut protected_files = 0usize;
 
     for download_dir in download_dirs {
         if !download_dir.exists() {
@@ -211,10 +287,14 @@ async fn evict(
                         let is_protected = is_path_protected(&path, protected_paths);
 
                         if let Ok(metadata) = entry.metadata() {
-                            let size = metadata.len();
+                            // Occupancy, not apparent length: librqbit
+                            // pre-allocates wanted files at full size.
+                            let size = occupied_bytes(&metadata);
 
                             if is_protected {
                                 total_size += size;
+                                protected_size += size;
+                                protected_files += 1;
                                 continue;
                             }
 
@@ -259,6 +339,8 @@ async fn evict(
     }
 
     // 3. Size-based Eviction
+    let mut deleted_count = 0usize;
+    let mut freed_space = 0u64;
     if limit > 0 && total_size > limit {
         info!(
             "Cache size {} exceeds limit {}. Cleaning up...",
@@ -267,9 +349,6 @@ async fn evict(
 
         // Sort by modification time (oldest first)
         files.sort_by_key(|a| a.2);
-
-        let mut deleted_count = 0;
-        let mut freed_space = 0;
 
         for (path, size, _) in files {
             if total_size <= limit {
@@ -306,7 +385,19 @@ async fn evict(
         );
     }
 
-    Ok(())
+    let report = EvictionReport {
+        total: total_size,
+        protected: protected_size,
+        protected_files,
+        freed: freed_space,
+        deleted: deleted_count,
+        limit,
+    };
+    if let Some(message) = report.shortfall_message() {
+        warn!("{message}");
+    }
+
+    Ok(report)
 }
 
 /// Whether `path` (under the session root `root`) is state the torrent
@@ -374,7 +465,10 @@ async fn remove_empty_parents(mut dir: &std::path::Path, root: &std::path::Path)
 
 #[cfg(test)]
 mod tests {
-    use super::{evict, is_path_protected, is_session_artifact, remove_empty_parents};
+    use super::{
+        EvictionReport, evict, is_path_protected, is_session_artifact, occupied_bytes,
+        remove_empty_parents,
+    };
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};
@@ -426,6 +520,20 @@ mod tests {
             .unwrap();
     }
 
+    /// What `evict` will count this file as. Derived, never hardcoded: a
+    /// 4 KiB payload occupies one block on ext4 and rather more on a
+    /// filesystem with a bigger allocation unit, so a limit written as a
+    /// literal would be a filesystem assumption, not an assertion.
+    fn occupancy(path: &Path) -> u64 {
+        occupied_bytes(&std::fs::metadata(path).unwrap())
+    }
+
+    /// A limit that `keep` fits under and `keep` + `evictable` does not, so
+    /// the size rule has to take exactly the evictable file.
+    fn limit_between(keep: &Path, evictable: &Path) -> u64 {
+        occupancy(keep) + occupancy(evictable) / 2
+    }
+
     /// The session's own records live in the walked root but are not cache:
     /// neither the 30-day rule nor the size limit touches them, while stale
     /// payload beside them still goes.
@@ -466,7 +574,8 @@ mod tests {
         // casualties, and they do not count towards the size either.
         let newer = root.join("newer.mkv");
         write_aged(&newer, &[0u8; 4096], Duration::from_secs(1));
-        evict(std::slice::from_ref(&root), &HashSet::new(), 4096, &[])
+        let limit = limit_between(&newer, &recent);
+        evict(std::slice::from_ref(&root), &HashSet::new(), limit, &[])
             .await
             .unwrap();
         for record in &records {
@@ -575,11 +684,12 @@ mod tests {
 
         // Size rule: the download is the biggest and oldest file there is,
         // and neither is evicted nor counted -- the cache below it is
-        // already under the limit.
+        // already under the limit. The limit is exactly what the surviving
+        // cache occupies, so counting the download would push it over.
         evict(
             std::slice::from_ref(&root),
             &HashSet::new(),
-            4096,
+            occupancy(&fresh),
             &downloads_dirs,
         )
         .await
@@ -632,7 +742,7 @@ mod tests {
             evict(
                 std::slice::from_ref(&root),
                 &HashSet::new(),
-                4096,
+                limit_between(&fresh, &older),
                 &downloads_dirs,
             )
             .await
@@ -670,5 +780,177 @@ mod tests {
             .await
             .unwrap();
         assert!(pinned.is_file(), "and the size rule");
+    }
+
+    /// librqbit pre-allocates each file it wants at its full length, so the
+    /// cache root is full of sparse files whose `len()` is the whole film
+    /// and whose allocated blocks are a fraction of it. A phone reported
+    /// 17 GB of cache and gave back 3.85 GB when it was cleared, and the
+    /// cleaner evicted real files trying to get under a limit the disk had
+    /// never crossed. Occupancy is what counts.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn evict_counts_allocated_blocks_not_the_pre_allocated_length() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("rqbit-downloads");
+        std::fs::create_dir_all(&root).unwrap();
+
+        // A 4 GiB file with one block of it actually written -- what a
+        // just-started stream of a big film looks like on disk.
+        let apparent = 4u64 << 30;
+        let sparse = root.join("film.mkv");
+        let mut file = std::fs::File::create(&sparse).unwrap();
+        file.set_len(apparent).unwrap();
+        file.seek(SeekFrom::Start(apparent - 1)).unwrap();
+        file.write_all(&[1]).unwrap();
+        file.set_modified(SystemTime::now() - Duration::from_secs(7200))
+            .unwrap();
+        drop(file);
+        // Measured straight from `st_blocks`, not through the helper under
+        // test: this guard only skips filesystems that materialised the
+        // hole, and it must not be able to skip because the helper is
+        // wrong.
+        let allocated = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&sparse).unwrap().blocks() * 512
+        };
+        if allocated >= apparent {
+            // No sparse-file support on this filesystem; there is nothing
+            // to assert about occupancy that would not be a tautology.
+            return;
+        }
+
+        let neighbour = root.join("subtitles.srt");
+        write_aged(&neighbour, &[0u8; 4096], Duration::from_secs(60));
+
+        // Between the real occupancy and the apparent one. Counting `len()`
+        // put the cache 4 GiB over this: the sparse film is then skipped by
+        // the single-file-larger-than-the-limit rule, so the eviction fell
+        // on the only other candidate and freed nothing that mattered.
+        let limit = 1u64 << 30;
+        let report = evict(std::slice::from_ref(&root), &HashSet::new(), limit, &[])
+            .await
+            .unwrap();
+
+        assert!(
+            report.total < 1 << 20,
+            "4 GiB of apparent length counted as {} bytes",
+            report.total
+        );
+        assert_eq!(report.deleted, 0, "nothing needed evicting");
+        assert_eq!(report.freed, 0);
+        assert!(neighbour.is_file(), "no innocent file was evicted");
+        assert!(sparse.is_file());
+        assert_eq!(report.shortfall_message(), None, "the cache is not over");
+    }
+
+    /// The field condition: no `downloadsDir` is configured, so downloads
+    /// would land in the very root the engines stream into -- and because
+    /// an unset setting leaves `downloads_dirs` empty rather than pointing
+    /// at that root, the walk still covers it. Ordinary streamed cache
+    /// there is reclaimable; a pinned download and the file a live engine
+    /// is writing are not.
+    #[tokio::test]
+    async fn evict_reclaims_unpinned_cache_sharing_the_root_with_downloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("rqbit-downloads");
+        let cold = root.join("Cold").join("e1.mkv");
+        write_aged(&cold, &[0u8; 4096], Duration::from_secs(7200));
+        let warm = root.join("Warm").join("e1.mkv");
+        write_aged(&warm, &[0u8; 4096], Duration::from_secs(60));
+        let pinned = root.join("Pinned").join("movie.mkv");
+        write_aged(&pinned, &[0u8; 8192], Duration::from_secs(9000));
+        let live = root.join("Live").join("movie.mkv");
+        write_aged(&live, &[0u8; 8192], Duration::from_secs(9000));
+        let protected: HashSet<PathBuf> = HashSet::from([pinned.clone(), live.clone()]);
+
+        let protected_bytes = occupancy(&pinned) + occupancy(&live);
+        let cold_bytes = occupancy(&cold);
+        let limit = protected_bytes + limit_between(&warm, &cold);
+
+        let report = evict(std::slice::from_ref(&root), &protected, limit, &[])
+            .await
+            .unwrap();
+
+        assert!(
+            !cold.exists(),
+            "the coldest ordinary cache in the shared root is reclaimable"
+        );
+        assert!(warm.is_file(), "and only as much of it as the limit needed");
+        assert!(pinned.is_file(), "a pinned download is never cache");
+        assert!(live.is_file(), "nor is what a live engine is writing");
+        assert_eq!(report.deleted, 1);
+        assert_eq!(report.freed, cold_bytes);
+        assert_eq!(report.protected, protected_bytes);
+        assert_eq!(report.protected_files, 2);
+        assert!(report.total <= limit, "back under the limit");
+        assert_eq!(report.shortfall_message(), None);
+    }
+
+    /// When the whole overage is protected there is nothing to evict, and
+    /// "Cleaned up 0 files, freed 0 bytes" on a phone that is filling up
+    /// explains none of it. The run says how many bytes protection holds.
+    #[tokio::test]
+    async fn evict_says_when_everything_over_the_limit_is_protected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("rqbit-downloads");
+        let pinned = root.join("Pinned").join("movie.mkv");
+        write_aged(&pinned, &[0u8; 8192], Duration::from_secs(600));
+        let live = root.join("Live").join("movie.mkv");
+        write_aged(&live, &[0u8; 8192], Duration::from_secs(600));
+        let protected: HashSet<PathBuf> = HashSet::from([pinned.clone(), live.clone()]);
+        let protected_bytes = occupancy(&pinned) + occupancy(&live);
+        let limit = protected_bytes / 2;
+
+        let report = evict(std::slice::from_ref(&root), &protected, limit, &[])
+            .await
+            .unwrap();
+
+        assert!(pinned.is_file());
+        assert!(live.is_file());
+        assert_eq!(report.deleted, 0);
+        assert_eq!(report.freed, 0);
+        assert_eq!(report.protected, protected_bytes);
+        assert_eq!(report.protected_files, 2);
+        assert_eq!(report.total, protected_bytes);
+
+        let message = report.shortfall_message().expect("still over the limit");
+        assert!(
+            message.contains(&format!(
+                "Cache size {protected_bytes} still exceeds limit {limit}"
+            )),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("{protected_bytes} bytes in 2 files are protected")),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn shortfall_message_is_only_for_a_run_that_stayed_over_the_limit() {
+        let under = EvictionReport {
+            total: 10,
+            limit: 20,
+            ..EvictionReport::default()
+        };
+        assert_eq!(under.shortfall_message(), None);
+        let unlimited = EvictionReport {
+            total: u64::MAX,
+            limit: 0,
+            ..EvictionReport::default()
+        };
+        assert_eq!(unlimited.shortfall_message(), None, "0 = no limit");
+        let over = EvictionReport {
+            total: 30,
+            limit: 20,
+            protected: 25,
+            protected_files: 3,
+            freed: 5,
+            deleted: 1,
+        };
+        assert!(over.shortfall_message().is_some());
     }
 }
