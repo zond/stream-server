@@ -155,7 +155,7 @@ impl PlaybackQuery {
         for field in query.split('&') {
             let (key, raw_value) = field.split_once('=').unwrap_or((field, ""));
             match key {
-                "download" => parsed.download = query_value_is_true(raw_value),
+                "download" => parsed.download = compat::query_value_is_true(raw_value),
                 "f" => {
                     if let Some((_, value)) = url::form_urlencoded::parse(field.as_bytes()).next() {
                         parsed.filters.push(value.into_owned());
@@ -168,10 +168,6 @@ impl PlaybackQuery {
         }
         parsed
     }
-}
-
-fn query_value_is_true(value: &str) -> bool {
-    value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
 }
 
 fn playback_intent_for_request(

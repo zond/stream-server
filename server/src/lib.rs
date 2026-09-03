@@ -247,6 +247,50 @@ impl ServerHandle {
         Ok(info?)
     }
 
+    /// Drop the pin on `file_idx` of `info_hash` (see
+    /// `routes::downloads::unpin_download`, which
+    /// `DELETE /{infoHash}/{fileIdx}/download?deleteFiles=1` shares).
+    /// Returns whether a pin was cleared -- false for an unknown torrent or
+    /// an unpinned file. With `delete_files` the data goes too: the whole
+    /// torrent when this was its last pin, only that file while other pins
+    /// hold. Without it only the pin goes and the engine becomes an
+    /// ordinary, evictable one again.
+    pub fn unpin_download(
+        &self,
+        info_hash: &str,
+        file_idx: usize,
+        delete_files: bool,
+    ) -> anyhow::Result<bool> {
+        let state = self.state.clone();
+        let info_hash = info_hash.to_string();
+        self.block_on_server(async move {
+            routes::downloads::unpin_download(&state, &info_hash, file_idx, delete_files).await
+        })?
+    }
+
+    /// Every pinned download, exactly what `GET /downloads.json` answers
+    /// (see `routes::downloads::downloads`).
+    pub fn downloads(&self) -> anyhow::Result<Vec<DownloadInfo>> {
+        let state = self.state.clone();
+        self.block_on_server(async move { routes::downloads::downloads(&state).await })
+    }
+
+    /// Where `file_idx` of `info_hash` is on disk (the `path` of its
+    /// [`Self::downloads`] entry), for handing a finished download to a
+    /// local player. `None` when the torrent is not managed right now or
+    /// the backend does not know the path yet; never creates an engine.
+    pub fn download_path(
+        &self,
+        info_hash: &str,
+        file_idx: usize,
+    ) -> anyhow::Result<Option<String>> {
+        let state = self.state.clone();
+        let info_hash = info_hash.to_string();
+        self.block_on_server(async move {
+            routes::downloads::download_path(&state, &info_hash, file_idx).await
+        })
+    }
+
     /// Run `fut` on the server's runtime and wait for it. The engines spawn
     /// tasks and expect the server's multi-threaded runtime, so library calls
     /// never execute on the caller's thread. This blocks the calling thread;
@@ -883,5 +927,10 @@ fn control_router() -> Router<AppState> {
             get(routes::system::get_file_stats),
         )
         .route("/get-https", get(routes::system::get_https))
+        .route("/downloads.json", get(routes::downloads::get_downloads))
+        .route(
+            "/{infoHash}/{fileIdx}/download",
+            post(routes::downloads::post_download).delete(routes::downloads::delete_download),
+        )
         .nest("/casting", routes::casting::router())
 }

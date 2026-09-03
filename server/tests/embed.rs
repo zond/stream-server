@@ -1282,3 +1282,212 @@ fn fastresume_persists_piece_bitfields_on_both_roots() -> anyhow::Result<()> {
     handle.join()?;
     Ok(())
 }
+
+/// The download control routes and the `ServerHandle` methods behind them
+/// are one implementation: `POST /{infoHash}/{fileIdx}/download` (optional
+/// `{"trackers":[..]}` body), `DELETE` of the same path (`?deleteFiles=1`)
+/// and `GET /downloads.json` answer exactly what `pin_download`,
+/// `unpin_download`, `downloads` and `download_path` return. They are
+/// control routes, so they need the bearer token.
+#[test]
+fn download_routes_match_the_library_api() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let downloads_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+
+    let content = src.path().join("Show Season 2");
+    std::fs::create_dir_all(&content)?;
+    write_payload(&content.join("e1.bin"), 40 * 1024);
+    write_payload(&content.join("e2.bin"), 24 * 1024);
+    let (torrent, info_hash) = real_torrent(&content);
+
+    // The data is already in the cache root, as after streaming it.
+    let cache_root = cache_dir.path().join("cache");
+    let root_folder = cache_root.join("rqbit-downloads").join("Show Season 2");
+    std::fs::create_dir_all(&root_folder)?;
+    std::fs::copy(content.join("e1.bin"), root_folder.join("e1.bin"))?;
+    std::fs::copy(content.join("e2.bin"), root_folder.join("e2.bin"))?;
+
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_root.clone()),
+        ..stream_server::ServerConfig::default()
+    })?;
+    let base = format!("http://{}", handle.http_addr());
+    let client = bearer_client(&handle)?;
+
+    let created: serde_json::Value = client
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    assert_eq!(created["infoHash"], info_hash);
+    let stats = stats_after_check(&client, &base, &info_hash)?;
+    let first = file_index(&stats, "e1.bin");
+    let second = file_index(&stats, "e2.bin");
+
+    let downloads = downloads_dir.path().join("offline");
+    handle.update_settings(serde_json::json!({ "downloadsDir": downloads.to_str().unwrap() }))?;
+    let target = downloads.join(&info_hash);
+
+    // The routes are token-protected, like every other control route.
+    let anonymous = reqwest::blocking::Client::new();
+    for response in [
+        anonymous
+            .post(format!("{base}/{info_hash}/{first}/download"))
+            .json(&serde_json::json!({ "trackers": [] }))
+            .send()?,
+        anonymous
+            .delete(format!("{base}/{info_hash}/{first}/download"))
+            .send()?,
+        anonymous.get(format!("{base}/downloads.json")).send()?,
+    ] {
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+    assert!(
+        handle.downloads()?.is_empty(),
+        "nothing pinned by an unauthorized call"
+    );
+
+    // POST == pin_download: the file is pinned, the torrent relocated into
+    // <downloadsDir>/<infoHash>, and the answer is a DownloadInfo.
+    let pinned: serde_json::Value = client
+        .post(format!("{base}/{info_hash}/{first}/download"))
+        .json(&serde_json::json!({ "trackers": ["udp://pin.invalid:6969/announce"] }))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    assert_eq!(pinned["infoHash"], info_hash);
+    assert_eq!(pinned["fileIdx"], first);
+    assert_eq!(pinned["name"], "e1.bin");
+    assert_eq!(pinned["length"], 40 * 1024);
+    assert_eq!(pinned["error"], serde_json::Value::Null);
+    // `complete` is whatever the re-check of the moved data has reached by
+    // now (the relocation puts the torrent back into `checking`); the
+    // listing below asserts it once the check is done.
+    assert_eq!(
+        pinned["path"],
+        target.join("e1.bin").to_str().unwrap(),
+        "{pinned}"
+    );
+    assert!(target.join("e1.bin").is_file());
+
+    // An empty body is a pin with no extra trackers, not a 400.
+    let again = client
+        .post(format!("{base}/{info_hash}/{first}/download"))
+        .send()?;
+    assert!(again.status().is_success(), "{:?}", again.status());
+    let again: serde_json::Value = again.json()?;
+    for key in ["infoHash", "fileIdx", "name", "length", "path", "error"] {
+        assert_eq!(again[key], pinned[key], "{key}");
+    }
+
+    // The library pins the second file; both are listed, by HTTP and API
+    // alike.
+    let api = handle.pin_download(&info_hash, second, &[])?;
+    assert_eq!(api.name, "e2.bin");
+    stats_after_check(&client, &base, &info_hash)?;
+    let listed: serde_json::Value = client
+        .get(format!("{base}/downloads.json"))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    assert_eq!(listed, serde_json::to_value(handle.downloads()?)?);
+    let indices: Vec<u64> = listed
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|item| item["fileIdx"].as_u64().expect("fileIdx"))
+        .collect();
+    assert_eq!(indices.len(), 2, "{listed}");
+    assert!(indices.contains(&(first as u64)) && indices.contains(&(second as u64)));
+    assert!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["infoHash"] == info_hash.as_str() && item["complete"] == true),
+        "{listed}"
+    );
+
+    // download_path is the same path the listing reports.
+    assert_eq!(
+        handle.download_path(&info_hash, second)?.as_deref(),
+        Some(target.join("e2.bin").to_str().unwrap())
+    );
+    assert_eq!(handle.download_path(&info_hash, 99)?, None);
+    assert_eq!(handle.download_path(&"a".repeat(40), 0)?, None);
+
+    // A file the torrent does not have is a 404 on both sides.
+    let missing = client
+        .post(format!("{base}/{info_hash}/9/download"))
+        .send()?;
+    assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+    let body: serde_json::Value = missing.json()?;
+    assert!(
+        body["error"].as_str().unwrap_or_default().contains("range"),
+        "{body}"
+    );
+    assert_eq!(
+        client
+            .post(format!("{base}/{info_hash}/nope/download"))
+            .send()?
+            .status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+    assert!(handle.pin_download(&info_hash, 9, &[]).is_err());
+
+    // DELETE without deleteFiles: the pin goes, the data stays.
+    let removed: serde_json::Value = client
+        .delete(format!("{base}/{info_hash}/{first}/download"))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    assert_eq!(
+        removed,
+        serde_json::json!({
+            "infoHash": info_hash,
+            "fileIdx": first,
+            "unpinned": true,
+            "deletedFiles": false,
+        })
+    );
+    assert!(target.join("e1.bin").is_file(), "the bytes stay");
+    let listed: serde_json::Value = client
+        .get(format!("{base}/downloads.json"))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    assert_eq!(listed, serde_json::to_value(handle.downloads()?)?);
+    assert_eq!(listed.as_array().expect("array").len(), 1, "{listed}");
+    assert_eq!(listed[0]["fileIdx"], second);
+    // Nothing to unpin twice, over either surface.
+    assert_eq!(
+        client
+            .delete(format!("{base}/{info_hash}/{first}/download"))
+            .send()?
+            .error_for_status()?
+            .json::<serde_json::Value>()?["unpinned"],
+        false
+    );
+    assert!(!handle.unpin_download(&info_hash, first, false)?);
+
+    // The last pin, with the files: the torrent's folder goes with it.
+    assert!(handle.unpin_download(&info_hash.to_uppercase(), second, true)?);
+    assert!(!target.exists(), "the whole placed torrent folder is gone");
+    assert!(handle.downloads()?.is_empty());
+    assert_eq!(handle.download_path(&info_hash, second)?, None);
+    let listed: serde_json::Value = client
+        .get(format!("{base}/downloads.json"))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    assert_eq!(listed, serde_json::json!([]));
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
