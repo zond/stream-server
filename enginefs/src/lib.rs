@@ -3550,6 +3550,7 @@ mod tests {
             EngineStats {
                 name: "fake".to_string(),
                 info_hash: self.info_hash.clone(),
+                piece_length: None,
                 files,
                 sources: vec![],
                 opts: StatsOptions {
@@ -4243,6 +4244,7 @@ mod tests {
         let base = EngineStats {
             name: "t".into(),
             info_hash: TEST_HASH.into(),
+            piece_length: None,
             files: vec![file(10, 100), file(60, 60)],
             sources: vec![],
             opts: StatsOptions {

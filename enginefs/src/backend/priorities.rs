@@ -249,37 +249,60 @@ pub fn librqbit_stream_lookahead_bytes(intent: PlaybackIntent, buffer: BufferPro
     .max(1)
 }
 
-/// Progress of a file's initial priority window: how many of the first
-/// `window_bytes` bytes of the file (clamped to the file length) are covered
-/// by verified pieces. `have_piece` answers for absolute torrent piece
-/// indices. Returns `(ready_bytes, window_bytes)`; a zero-length file yields
-/// `(0, 0)`, which callers treat as ready. Pieces straddling the window edge
-/// only count the bytes inside the window, so `ready == window` means the
-/// whole head is servable.
+/// Progress of the priority window a stream is waiting on: how much of it is
+/// covered by verified pieces. `have_piece` answers for absolute torrent
+/// piece indices. Returns `(ready_bytes, window_bytes)`; an empty window
+/// yields `(0, 0)`, which callers treat as ready, and `ready == window`
+/// means every byte the reader is about to ask for is servable.
+///
+/// `read_from` is the offset **inside the file** the reader is positioned
+/// at, not always 0: the window follows the reader. Anchoring it at the
+/// file head meant that after a seek the number described bytes nobody was
+/// fetching and sat at 0% while the seek region streamed perfectly.
+///
+/// The window is then **expanded to whole pieces**, because a piece is the
+/// unit that becomes readable: none of an 8 MiB piece can be served until
+/// all 8 MiB of it verifies. Reporting a 4 MiB window inside a 16 MiB piece
+/// described a quantity that did not exist -- the client could only ever
+/// see 0% or 100% of it, and on a 7.5 GB torrent (16 MiB pieces) at
+/// 300 kB/s that is 55 seconds of literal "0%" while the download runs
+/// perfectly. The denominator is now what actually has to arrive, and
+/// `EngineStats::piece_length` says how big the steps are, so a client can
+/// say "waiting for the first piece (16 MiB)" instead of showing a stalled
+/// percentage. `ready == window` is unchanged either way: it still means
+/// exactly "every piece the window touches is verified".
 pub fn initial_window_progress(
     file_offset: u64,
     file_len: u64,
     piece_length: u64,
     window_bytes: u64,
+    read_from: u64,
     have_piece: impl Fn(u64) -> bool,
 ) -> (u64, u64) {
-    let window = window_bytes.min(file_len);
+    let read_from = read_from.min(file_len);
+    let window = window_bytes.min(file_len - read_from);
     if window == 0 || piece_length == 0 {
         return (0, window);
     }
-    let window_end = file_offset + window;
-    let first_piece = file_offset / piece_length;
+    let window_start = file_offset + read_from;
+    let window_end = window_start + window;
+    let first_piece = window_start / piece_length;
     let last_piece = (window_end - 1) / piece_length;
+    // Whole pieces, clipped to the file: bytes of a straddling piece that
+    // belong to a neighbouring file are that file's business, and the
+    // reader can be served as soon as the piece verifies either way.
+    let span_start = (first_piece * piece_length).max(file_offset);
+    let span_end = ((last_piece + 1) * piece_length).min(file_offset + file_len);
     let mut ready = 0u64;
     for piece in first_piece..=last_piece {
         if !have_piece(piece) {
             continue;
         }
-        let piece_start = piece * piece_length;
-        let piece_end = piece_start + piece_length;
-        ready += piece_end.min(window_end) - piece_start.max(file_offset);
+        let piece_start = (piece * piece_length).max(span_start);
+        let piece_end = ((piece + 1) * piece_length).min(span_end);
+        ready += piece_end.saturating_sub(piece_start);
     }
-    (ready, window)
+    (ready, span_end - span_start)
 }
 
 pub fn playback_deadline_step_ms(
@@ -1093,39 +1116,85 @@ mod tests {
     }
 
     #[test]
-    fn initial_window_progress_counts_only_bytes_inside_the_window() {
+    fn initial_window_progress_counts_whole_pieces_the_window_touches() {
         // File at torrent offset 100, length 1000, pieces of 256 bytes, 512
-        // byte window -> window covers [100, 612): pieces 0 (156 bytes),
-        // 1 (256 bytes), 2 (100 bytes).
+        // byte window from the head -> the window covers [100, 612), which
+        // touches pieces 0, 1 and 2, i.e. [100, 768) of the torrent once
+        // expanded to whole pieces and clipped to the file's start.
         let have_all = |_: u64| true;
         assert_eq!(
-            initial_window_progress(100, 1000, 256, 512, have_all),
-            (512, 512)
+            initial_window_progress(100, 1000, 256, 512, 0, have_all),
+            (668, 668)
         );
         let have_first_two = |p: u64| p < 2;
         assert_eq!(
-            initial_window_progress(100, 1000, 256, 512, have_first_two),
-            (412, 512)
+            initial_window_progress(100, 1000, 256, 512, 0, have_first_two),
+            (412, 668)
         );
         let have_none = |_: u64| false;
         assert_eq!(
-            initial_window_progress(100, 1000, 256, 512, have_none),
-            (0, 512)
+            initial_window_progress(100, 1000, 256, 512, 0, have_none),
+            (0, 668)
+        );
+    }
+
+    /// A 4 MiB window inside a 16 MiB piece described a quantity that could
+    /// only read 0% or 100%: on a 7.5 GB torrent at 300 kB/s that is 55
+    /// seconds of "0%" while the download is perfectly healthy. The
+    /// denominator has to be what actually must arrive.
+    #[test]
+    fn initial_window_progress_reports_the_piece_that_must_arrive() {
+        let piece = 16 * 1024 * 1024u64;
+        let file_len = 8 * 1024 * 1024 * 1024u64;
+        let have_none = |_: u64| false;
+        assert_eq!(
+            initial_window_progress(0, file_len, piece, MAX_STARTUP_WINDOW_BYTES, 0, have_none),
+            (0, piece),
+            "the window is the piece, not the 4 MiB inside it"
+        );
+        let have_first = |p: u64| p == 0;
+        assert_eq!(
+            initial_window_progress(0, file_len, piece, MAX_STARTUP_WINDOW_BYTES, 0, have_first),
+            (piece, piece),
+            "and one piece is the whole of it"
+        );
+    }
+
+    /// The window follows the reader. Anchored at the file head it
+    /// described bytes nobody was fetching after a seek, and read 0%
+    /// forever while the seek region streamed fine.
+    #[test]
+    fn initial_window_progress_follows_the_read_position() {
+        let piece = 256u64;
+        // Seek to byte 1000 of a file at torrent offset 0: that is piece 3
+        // ([768, 1024)) and piece 4, not piece 0.
+        let have_head = |p: u64| p == 0;
+        assert_eq!(
+            initial_window_progress(0, 4096, piece, 100, 1000, have_head),
+            (0, 512),
+            "a verified head says nothing about where the reader is"
+        );
+        let have_seek_region = |p: u64| p == 3 || p == 4;
+        assert_eq!(
+            initial_window_progress(0, 4096, piece, 100, 1000, have_seek_region),
+            (512, 512),
+            "and the pieces under the reader are what count"
         );
     }
 
     #[test]
     fn initial_window_progress_clamps_window_to_file_length() {
-        // A 300-byte file with a 4 MiB window: the window is the whole file.
+        // A 300-byte file with a 4 MiB window: the window is the whole file,
+        // and the tail piece is clipped to the file's end.
         let have_all = |_: u64| true;
         assert_eq!(
-            initial_window_progress(0, 300, 256, MAX_STARTUP_WINDOW_BYTES, have_all),
+            initial_window_progress(0, 300, 256, MAX_STARTUP_WINDOW_BYTES, 0, have_all),
             (300, 300)
         );
         // Only the second piece (bytes 256..300 of the file) is present.
         let have_second = |p: u64| p == 1;
         assert_eq!(
-            initial_window_progress(0, 300, 256, MAX_STARTUP_WINDOW_BYTES, have_second),
+            initial_window_progress(0, 300, 256, MAX_STARTUP_WINDOW_BYTES, 0, have_second),
             (44, 300)
         );
     }
@@ -1134,11 +1203,26 @@ mod tests {
     fn initial_window_progress_handles_degenerate_inputs() {
         let have_all = |_: u64| true;
         // Zero-length file: nothing to fetch, (0, 0) reads as ready.
-        assert_eq!(initial_window_progress(0, 0, 256, 1024, have_all), (0, 0));
+        assert_eq!(
+            initial_window_progress(0, 0, 256, 1024, 0, have_all),
+            (0, 0)
+        );
         // Zero window: never ready-by-bytes but never panics.
-        assert_eq!(initial_window_progress(0, 100, 256, 0, have_all), (0, 0));
+        assert_eq!(initial_window_progress(0, 100, 256, 0, 0, have_all), (0, 0));
         // Zero piece length is impossible in a valid torrent; report nothing ready.
-        assert_eq!(initial_window_progress(0, 100, 0, 1024, have_all), (0, 100));
+        assert_eq!(
+            initial_window_progress(0, 100, 0, 1024, 0, have_all),
+            (0, 100)
+        );
+        // A reader at (or past) EOF has nothing left to wait for.
+        assert_eq!(
+            initial_window_progress(0, 100, 256, 1024, 100, have_all),
+            (0, 0)
+        );
+        assert_eq!(
+            initial_window_progress(0, 100, 256, 1024, 5_000, have_all),
+            (0, 0)
+        );
     }
 
     #[test]

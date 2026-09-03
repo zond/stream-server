@@ -211,6 +211,17 @@ type PinnedFiles = Arc<Mutex<HashMap<String, BTreeSet<usize>>>>;
 /// per poll (see `LibrqbitHandle::client_torrent_error`).
 type ReportedErrors = Arc<Mutex<HashMap<String, String>>>;
 
+/// Where each open reader is positioned, keyed by `(info hash, file index)`
+/// and shared by every handle clone like [`PinnedFiles`].
+///
+/// The startup-window progress a client renders has to describe the bytes
+/// somebody is actually waiting for. Computed from the file head it
+/// described, after a seek, a region nobody was fetching -- so it sat at 0%
+/// while the seek region streamed perfectly. `get_file_reader` records the
+/// offset it was opened at (a `Range` request, a seek and a re-open all
+/// arrive as a fresh reader at the new offset), and `stats` reads it back.
+type StreamPositions = Arc<Mutex<HashMap<(String, usize), u64>>>;
+
 /// What a client is told about a torrent librqbit put in an error state.
 /// librqbit's `TorrentStats.error` is the `{e:?}` of an anyhow chain
 /// naming absolute cache and download paths, so only this fixed message
@@ -315,6 +326,8 @@ pub struct LibrqbitBackend {
     deferred_selections: DeferredSelections,
     pinned_files: PinnedFiles,
     reported_errors: ReportedErrors,
+    /// Backend-wide reader positions (see [`StreamPositions`]).
+    stream_positions: StreamPositions,
     /// Backend-wide tracker-scrape cache, shared by every handle so one
     /// torrent is scraped once however many handles report on it.
     swarm_scraper: Arc<SwarmScraper>,
@@ -408,6 +421,7 @@ impl LibrqbitBackend {
         let deferred_selections: DeferredSelections = Default::default();
         let pinned_files: PinnedFiles = Default::default();
         let reported_errors: ReportedErrors = Default::default();
+        let stream_positions: StreamPositions = Default::default();
         let swarm_scraper = SwarmScraper::network();
         // Restore from session
         let mut restored_handles = session.with_torrents(|iter| {
@@ -423,6 +437,7 @@ impl LibrqbitBackend {
                         deferred_selections: deferred_selections.clone(),
                         pinned_files: pinned_files.clone(),
                         reported_errors: reported_errors.clone(),
+                        stream_positions: stream_positions.clone(),
                         swarm_scraper: swarm_scraper.clone(),
                     },
                 );
@@ -459,6 +474,7 @@ impl LibrqbitBackend {
                                             deferred_selections: deferred_selections.clone(),
                                             pinned_files: pinned_files.clone(),
                                             reported_errors: reported_errors.clone(),
+                                            stream_positions: stream_positions.clone(),
                                             swarm_scraper: swarm_scraper.clone(),
                                         },
                                     );
@@ -478,6 +494,7 @@ impl LibrqbitBackend {
                 deferred_selections,
                 pinned_files,
                 reported_errors,
+                stream_positions,
                 swarm_scraper,
             },
             restored_handles,
@@ -504,6 +521,7 @@ impl LibrqbitBackend {
             download_dir,
             deferred_selections: Default::default(),
             pinned_files: Default::default(),
+            stream_positions: Default::default(),
             reported_errors: Default::default(),
             swarm_scraper: SwarmScraper::disabled(),
         })
@@ -626,6 +644,8 @@ pub struct LibrqbitHandle {
     pinned_files: PinnedFiles,
     /// Backend-wide last-reported error texts (see [`ReportedErrors`]).
     reported_errors: ReportedErrors,
+    /// Backend-wide reader positions (see [`StreamPositions`]).
+    stream_positions: StreamPositions,
     /// Backend-wide swarm-scrape cache (see [`SwarmScraper`]).
     swarm_scraper: Arc<SwarmScraper>,
 }
@@ -725,6 +745,7 @@ impl LibrqbitBackend {
             deferred_selections: self.deferred_selections.clone(),
             pinned_files: self.pinned_files.clone(),
             reported_errors: self.reported_errors.clone(),
+            stream_positions: self.stream_positions.clone(),
             swarm_scraper: self.swarm_scraper.clone(),
         }
     }
@@ -843,6 +864,7 @@ impl TorrentBackend for LibrqbitBackend {
             deferred_selections: self.deferred_selections.clone(),
             pinned_files: self.pinned_files.clone(),
             reported_errors: self.reported_errors.clone(),
+            stream_positions: self.stream_positions.clone(),
             swarm_scraper: self.swarm_scraper.clone(),
         })
     }
@@ -999,6 +1021,7 @@ impl TorrentBackend for LibrqbitBackend {
             deferred_selections: self.deferred_selections.clone(),
             pinned_files: self.pinned_files.clone(),
             reported_errors: self.reported_errors.clone(),
+            stream_positions: self.stream_positions.clone(),
             swarm_scraper: self.swarm_scraper.clone(),
         })
     }
@@ -1117,11 +1140,14 @@ impl TorrentHandle for LibrqbitHandle {
         );
 
         let pinned = self.pinned_set();
+        let positions = self.stream_positions.lock().clone();
+        let mut torrent_piece_length = None;
         let mut files = Vec::new();
         let mut total_size = 0u64;
         let mut offset = 0u64;
         if let Some(m) = self.handle.metadata.load_full() {
             let piece_length = m.lengths().default_piece_length() as u64;
+            torrent_piece_length = Some(piece_length);
             for (i, f) in m.info.iter_file_details().enumerate() {
                 let filename = f.filename.to_string();
                 // file_progress is empty while the torrent is Initializing.
@@ -1132,12 +1158,14 @@ impl TorrentHandle for LibrqbitHandle {
                 // without a piece map yet (empty file_progress) reports 0
                 // and so never claims completion of a non-empty file.
                 let complete = file_downloaded == f.len;
+                let read_from = positions.get(&(self.info_hash.clone(), i)).copied();
                 let window = haves.as_ref().map(|bf| {
                     crate::backend::priorities::initial_window_progress(
                         offset,
                         f.len,
                         piece_length,
                         startup_window,
+                        read_from.unwrap_or(0),
                         |piece| bf.get(piece as usize).is_some_and(|bit| *bit),
                     )
                 });
@@ -1206,6 +1234,7 @@ impl TorrentHandle for LibrqbitHandle {
         EngineStats {
             name: self.name().unwrap_or_else(|| "Unknown".to_string()),
             info_hash: self.info_hash(),
+            piece_length: torrent_piece_length,
             files,
             sources,
             opts: StatsOptions {
@@ -1310,12 +1339,19 @@ impl TorrentHandle for LibrqbitHandle {
     async fn get_file_reader(
         &self,
         file_idx: usize,
-        _start_offset: u64,
+        start_offset: u64,
         _priority: u8,
         _bitrate: Option<u64>,
         intent: crate::backend::priorities::PlaybackIntent,
         buffer: crate::backend::priorities::BufferProfile,
     ) -> Result<Box<dyn FileStreamTrait>> {
+        // Where the startup window is measured from now on. A `Range`
+        // request, a seek and a re-open all reach the backend as a fresh
+        // reader at the new offset, so this is the whole of "follow the
+        // reader" (see [`StreamPositions`]).
+        self.stream_positions
+            .lock()
+            .insert((self.info_hash.clone(), file_idx), start_offset);
         // librqbit's FileStream requires the Paused or Live state; opening it
         // while the torrent is still Initializing fails immediately, which the
         // HTTP route would turn into a failed first play. Block here instead.
@@ -1916,6 +1952,7 @@ impl Clone for LibrqbitHandle {
             deferred_selections: self.deferred_selections.clone(),
             pinned_files: self.pinned_files.clone(),
             reported_errors: self.reported_errors.clone(),
+            stream_positions: self.stream_positions.clone(),
             swarm_scraper: self.swarm_scraper.clone(),
         }
     }
@@ -2297,6 +2334,7 @@ mod tests {
             session: backend.session.clone(),
             deferred_selections: Default::default(),
             pinned_files: Default::default(),
+            stream_positions: Default::default(),
             reported_errors: Default::default(),
             swarm_scraper: SwarmScraper::disabled(),
         };
@@ -2541,6 +2579,59 @@ mod tests {
         assert_eq!(stats.phase, StartupPhase::Ready);
         assert_eq!(stats.initial_window_ready_bytes, Some(payload_len));
         assert_eq!(stats.initial_window_bytes, Some(payload_len));
+    }
+
+    /// The startup window follows the reader, and the piece length is
+    /// reported alongside it. Anchored at the file head, the window
+    /// described bytes nobody was fetching after a seek -- it sat at 0%
+    /// while the seek region streamed perfectly -- and without the piece
+    /// length a client cannot tell a slow download from a window that is
+    /// simply smaller than one piece and can only read 0% or 100%.
+    #[tokio::test]
+    async fn stats_window_follows_the_reader_and_reports_the_piece_length() {
+        use crate::backend::TorrentHandle;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let payload = dir.join("payload.bin");
+        let payload_len = 96 * 1024u64;
+        write_payload(&payload, payload_len as usize).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+
+        let (_backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
+        handle.handle.wait_until_initialized().await.unwrap();
+
+        let stats = TorrentHandle::stats(&handle).await;
+        let piece_length = stats.piece_length.expect("metadata is resolved");
+        assert!(piece_length > 0);
+        assert_eq!(
+            stats.files[0].initial_window_bytes,
+            Some(payload_len),
+            "a fresh torrent is measured from the head"
+        );
+
+        // Open a reader part-way in, as a `Range` request or a seek does.
+        // Start on a piece boundary so the expected window is exactly the
+        // tail, whatever the fixture's piece length turns out to be.
+        let seek_to = payload_len - piece_length;
+        let _reader = handle
+            .get_file_reader(
+                0,
+                seek_to,
+                0,
+                None,
+                crate::backend::priorities::PlaybackIntent::DirectSeek,
+                crate::backend::priorities::BufferProfile::Normal,
+            )
+            .await
+            .unwrap();
+
+        let stats = TorrentHandle::stats(&handle).await;
+        assert_eq!(
+            stats.files[0].initial_window_bytes,
+            Some(piece_length),
+            "the window is what the reader is waiting for, not the head"
+        );
+        assert_eq!(stats.piece_length, Some(piece_length));
     }
 
     /// An unseeded torrent with no peers sits in `buffering` with an empty
@@ -3770,6 +3861,7 @@ mod tests {
             deferred_selections: backend.deferred_selections.clone(),
             pinned_files: backend.pinned_files.clone(),
             reported_errors: backend.reported_errors.clone(),
+            stream_positions: backend.stream_positions.clone(),
             swarm_scraper: backend.swarm_scraper.clone(),
         };
 

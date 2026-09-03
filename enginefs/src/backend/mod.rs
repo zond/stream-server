@@ -693,6 +693,17 @@ pub struct EngineStats {
     /// The focused stream file's `StatsFile::initial_window_bytes`.
     #[serde(default)]
     pub initial_window_bytes: Option<u64>,
+    /// The torrent's piece length, `None` until metadata resolves.
+    ///
+    /// A piece is the unit that becomes readable, and on a multi-gigabyte
+    /// torrent it is 8-16 MiB -- bigger than the whole startup window, so
+    /// `initial_window_ready_bytes` can only read 0 or "all of it" and a
+    /// percentage built from the pair sits at 0% for tens of seconds while
+    /// the download runs perfectly. A client should render the wait in
+    /// pieces ("waiting for the first piece (16 MiB)"), optionally with an
+    /// ETA from `download_speed`, rather than as a stalled percentage.
+    #[serde(default)]
+    pub piece_length: Option<u64>,
     /// Peer-discovery counters, see [`PeerDiscovery`].
     #[serde(default)]
     pub peer_discovery: PeerDiscovery,
@@ -768,6 +779,7 @@ impl EngineStats {
             check_total_bytes: None,
             initial_window_ready_bytes: None,
             initial_window_bytes: None,
+            piece_length: None,
             peer_discovery: PeerDiscovery::default(),
             error: None,
             pinned_files: Vec::new(),
