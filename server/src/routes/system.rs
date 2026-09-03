@@ -1151,7 +1151,9 @@ pub async fn get_file_stats(
 mod tests {
     /// `downloadsDir` must be absolute and usable: relative, empty and
     /// file-shadowed paths are refused, a missing directory is created,
-    /// and the probe leaves nothing behind.
+    /// the probe leaves nothing behind, and what comes back is the plain
+    /// spelling of the resolved path -- never the `\\?\` verbatim one
+    /// `std::fs::canonicalize` answers with on Windows.
     #[tokio::test]
     async fn prepare_downloads_dir_validates_and_creates() {
         use super::prepare_downloads_dir;
@@ -1172,7 +1174,26 @@ mod tests {
         let prepared = prepare_downloads_dir(&format!("  {}  ", nested.display()), &[])
             .await
             .unwrap();
-        assert_eq!(prepared, nested.canonicalize().unwrap());
+        // On Windows `canonicalize` answers with a `\\?\C:\...` verbatim
+        // path; `prepare_downloads_dir` hands back the plain drive
+        // spelling, because the stored value reaches settings.json and
+        // every client, and because a verbatim path compares unequal to
+        // the plain one -- the cache cleaner would stop recognising the
+        // downloads dir under a walked root. Stripped here independently
+        // of the helper under test; a no-op on unix.
+        let canonical = nested.canonicalize().unwrap();
+        let expected = match canonical.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+            Some(plain) if plain.as_bytes().get(1) == Some(&b':') => {
+                std::path::PathBuf::from(plain)
+            }
+            _ => canonical,
+        };
+        assert_eq!(prepared, expected);
+        assert!(
+            !prepared.to_string_lossy().starts_with(r"\\?\"),
+            "a verbatim prefix would leak into settings.json: {}",
+            prepared.display()
+        );
         assert!(nested.is_dir());
         assert_eq!(
             std::fs::read_dir(&nested).unwrap().count(),
