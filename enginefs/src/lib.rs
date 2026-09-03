@@ -1688,15 +1688,22 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             )
             .await;
         if let Err(error) = checked {
-            if !was_managed && !engine.is_pinned() {
-                // Added only for this pin: do not leave it behind. Under
-                // the downloads dir a folder this add created holds nothing
-                // but the placeholder librqbit pre-sized, so it goes too;
-                // a folder that was there before keeps whatever it holds,
-                // and in the cache root the files stay for the cache
-                // cleaner, like any other streamed data.
+            // Torn down only when demonstrably this pin's: no engine
+            // existed before the call and the torrent sits in the folder
+            // only pins place under. A torrent in the cache root stays for
+            // the idle sweeper -- it may be a stream request's in-flight
+            // add this call joined (dropping it would fail the stream about
+            // to open on it), and without a downloads dir the two cannot be
+            // told apart. A folder this add created holds nothing but the
+            // placeholder librqbit pre-sized, so it goes too; a folder that
+            // was there before keeps whatever it holds.
+            let placed_by_this_pin = !was_managed
+                && !engine.is_pinned()
+                && folder.is_some()
+                && engine.handle.output_folder() == folder;
+            if placed_by_this_pin {
                 self.remove_engine_if_current(&engine).await;
-                let dropped = if folder.is_some() && !folder_existed {
+                let dropped = if !folder_existed {
                     self.backend.remove_torrent_and_files(info_hash).await
                 } else {
                     self.backend.remove_torrent(info_hash).await
@@ -2806,6 +2813,11 @@ mod tests {
         /// Test knob: `get_torrent` finds nothing (the torrent is gone from
         /// the session, as after a relocation that failed to re-add).
         hide_torrents: Arc<AtomicBool>,
+        /// Test knob: while set, `add_torrent_placed` blocks (after
+        /// recording the placement) until the test adds a permit to
+        /// `add_hold`, standing in for metadata still resolving.
+        hold_add: Arc<AtomicBool>,
+        add_hold: Arc<tokio::sync::Semaphore>,
     }
 
     impl FakeBackend {
@@ -2820,6 +2832,8 @@ mod tests {
                 hold_relocate: Arc::new(AtomicBool::new(false)),
                 relocate_hold: Arc::new(tokio::sync::Semaphore::new(0)),
                 hide_torrents: Arc::new(AtomicBool::new(false)),
+                hold_add: Arc::new(AtomicBool::new(false)),
+                add_hold: Arc::new(tokio::sync::Semaphore::new(0)),
             }
         }
     }
@@ -2847,6 +2861,9 @@ mod tests {
                 *handle.counters.output_folder.lock().unwrap() = placement.output_folder.clone();
             }
             self.placements.lock().unwrap().push(placement);
+            if self.hold_add.load(Ordering::SeqCst) {
+                self.add_hold.acquire().await.unwrap().forget();
+            }
             Ok(handle)
         }
 
@@ -4310,9 +4327,9 @@ mod tests {
     }
 
     /// A pin is refused when the volume lacks the file's missing bytes plus
-    /// the margin, a torrent added only for that pin is dropped again, a
-    /// complete file needs no space, and a volume that cannot be probed
-    /// does not block the pin.
+    /// the margin, a torrent the pin placed under the downloads dir is
+    /// dropped again, a complete file needs no space, and a volume that
+    /// cannot be probed does not block the pin.
     #[tokio::test]
     async fn pin_download_refuses_without_the_free_space_margin() {
         let (mut enginefs, _counters) = test_enginefs_unmanaged();
@@ -4366,19 +4383,17 @@ mod tests {
         assert_eq!(enginefs.backend.removed_with_files.lock().unwrap().len(), 1);
         assert!(enginefs.backend.removed.lock().unwrap().is_empty());
 
-        // No downloads dir: the torrent added into the cache root is
-        // dropped but its files are the cache cleaner's, not ours.
+        // No downloads dir: the torrent added into the cache root is an
+        // ordinary streamed one -- left to the idle sweeper, since it
+        // cannot be told from one a stream request started.
         let (mut enginefs, _counters) = test_enginefs_unmanaged();
         enginefs.set_free_space_probe(|_| Ok(0));
         assert!(matches!(
             enginefs.pin_download(TEST_HASH, 0, None).await,
             Err(PinDownloadError::InsufficientSpace { .. })
         ));
-        assert!(enginefs.get_engine(TEST_HASH).await.is_none());
-        assert_eq!(
-            enginefs.backend.removed.lock().unwrap().as_slice(),
-            &[TEST_HASH.to_string()]
-        );
+        assert!(enginefs.get_engine(TEST_HASH).await.is_some());
+        assert!(enginefs.backend.removed.lock().unwrap().is_empty());
         assert!(
             enginefs
                 .backend
@@ -4624,6 +4639,53 @@ mod tests {
             &[TEST_HASH.to_string()]
         );
         assert!(enginefs.backend.removed.lock().unwrap().is_empty());
+    }
+
+    /// A pin that joins a magnet add another request started (a stream's
+    /// stats poll resolving metadata) and is then refused leaves that
+    /// engine alone: the torrent is theirs, in the cache root, and dropping
+    /// it would fail the stream about to open on it.
+    #[tokio::test]
+    async fn refused_pin_leaves_a_joined_stream_add_alone() {
+        let (mut enginefs, _counters) = test_enginefs_unmanaged();
+        enginefs.set_downloads_dir(Some("/offline".into()));
+        enginefs.set_free_space_probe(|_| Ok(0));
+        enginefs.backend.hold_add.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            enginefs.get_or_begin_add_magnet(TEST_HASH, None).await,
+            EngineLookup::Adding(_)
+        ));
+
+        let release = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(
+                enginefs.backend.placements.lock().unwrap().as_slice(),
+                &[TorrentPlacement::default()],
+                "the pin joined the stream's add instead of starting its own"
+            );
+            enginefs.backend.add_hold.add_permits(1);
+        };
+        let (result, ()) = tokio::join!(enginefs.pin_download(TEST_HASH, 0, None), release);
+        assert!(matches!(
+            result,
+            Err(PinDownloadError::InsufficientSpace { .. })
+        ));
+        let engine = enginefs
+            .get_engine(TEST_HASH)
+            .await
+            .expect("the stream's engine stays");
+        assert_eq!(engine.handle.output_folder(), None, "in the cache root");
+        assert!(!engine.is_pinned());
+        assert!(enginefs.backend.removed.lock().unwrap().is_empty());
+        assert!(
+            enginefs
+                .backend
+                .removed_with_files
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(enginefs.backend.placements.lock().unwrap().len(), 1);
     }
 
     /// `LibrqbitBackend` behind a shim that answers a magnet add for a known
