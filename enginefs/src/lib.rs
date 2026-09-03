@@ -19,6 +19,7 @@ pub mod metadata_cache;
 pub mod metadata_pins;
 pub mod piece_cache;
 pub mod piece_waiter;
+pub mod scrape;
 pub mod tracker_prober;
 pub mod trackers;
 
