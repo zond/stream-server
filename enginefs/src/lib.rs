@@ -274,6 +274,9 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     /// records of ones that ended without an engine, keyed by info hash. See
     /// [`PendingMagnetAdd`] and [`FailedMagnetAdd`].
     magnet_adds: MagnetAddRegistry<B::Handle>,
+    /// Where pinned downloads are placed (`<downloads_dir>/<info hash>`),
+    /// see [`Self::set_downloads_dir`]. `None` = the backend's default root.
+    downloads_dir: parking_lot::RwLock<Option<std::path::PathBuf>>,
     /// Epoch of every `*_secs` timestamp this instance and its engines keep.
     clock: Clock,
 }
@@ -394,6 +397,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             disk_cache: None,
             seeding_enabled: Arc::new(AtomicBool::new(true)),
             magnet_adds: Arc::new(RwLock::new(HashMap::new())),
+            downloads_dir: parking_lot::RwLock::new(None),
             clock,
         };
 
@@ -1432,16 +1436,35 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// torrent the idle policy had paused, and reconciles the want-set so the
     /// pin takes effect now. Idempotent.
     ///
+    /// With a downloads dir set ([`Self::set_downloads_dir`]) the torrent
+    /// lives in `<downloads_dir>/<info hash>`: a torrent this call adds is
+    /// placed there wanting only `file_idx`, and one already managed
+    /// elsewhere (streamed first, then pinned) is relocated -- dropped from
+    /// the backend keeping its files, files moved, re-added in place
+    /// (`TorrentBackend::relocate_torrent`), which re-checks whatever was
+    /// downloaded (`checking` phase) and replaces the registry's engine;
+    /// readers still open on the old one end, new requests find the new
+    /// one. Without a downloads dir everything stays in the backend's root.
+    ///
     /// In-memory only: a restart forgets the pin (librqbit keeps the file in
-    /// its persisted `only_files`, so the download itself resumes) -- the
-    /// owner of the download re-issues it.
+    /// its persisted `only_files` and the folder in its `output_folder`, so
+    /// the download itself resumes in place) -- the owner of the download
+    /// re-issues it.
     pub async fn pin_download(
         &self,
         info_hash: &str,
         file_idx: usize,
         extra_trackers: Option<Vec<String>>,
     ) -> Result<Arc<Engine<B::Handle>>, PinDownloadError> {
-        let engine = self.get_or_add_magnet(info_hash, extra_trackers).await?;
+        let info_hash = info_hash.to_lowercase();
+        let folder = self.download_folder(&info_hash);
+        let placement = TorrentPlacement {
+            output_folder: folder.clone(),
+            only_files: Some(vec![file_idx]),
+        };
+        let engine = self
+            .get_or_add_magnet_placed(&info_hash, extra_trackers.clone(), placement)
+            .await?;
         let file_count = engine.handle.file_count().await;
         if file_idx >= file_count {
             return Err(PinDownloadError::FileNotFound {
@@ -1449,6 +1472,18 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 file_count,
             });
         }
+        let engine = match folder {
+            Some(folder)
+                if engine
+                    .handle
+                    .output_folder()
+                    .is_some_and(|current| current != folder) =>
+            {
+                self.relocate_engine(engine, folder, file_idx, extra_trackers)
+                    .await?
+            }
+            _ => engine,
+        };
         engine.pinned_files.write().insert(file_idx);
         if let Err(error) = engine.handle.pin_file(file_idx).await {
             engine.pinned_files.write().remove(&file_idx);
@@ -1522,6 +1557,100 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             .collect();
         pinned.sort_by(|a, b| (&a.info_hash, a.file_idx).cmp(&(&b.info_hash, b.file_idx)));
         pinned
+    }
+
+    /// Where pinned downloads go: `<dir>/<info hash>` per torrent, or the
+    /// backend's default root with `None`. Applies to pins issued from now
+    /// on; torrents already pinned elsewhere are relocated by their next
+    /// `pin_download`, not by this call.
+    pub fn set_downloads_dir(&self, dir: Option<std::path::PathBuf>) {
+        let mut current = self.downloads_dir.write();
+        if *current != dir {
+            tracing::info!(downloads_dir = ?dir, "downloads_dir_updated");
+        }
+        *current = dir;
+    }
+
+    pub fn downloads_dir(&self) -> Option<std::path::PathBuf> {
+        self.downloads_dir.read().clone()
+    }
+
+    /// The folder a pinned `info_hash` is placed in under the downloads
+    /// dir, `None` without one.
+    pub fn download_folder(&self, info_hash: &str) -> Option<std::path::PathBuf> {
+        self.downloads_dir
+            .read()
+            .as_ref()
+            .map(|dir| dir.join(info_hash.to_lowercase()))
+    }
+
+    /// Move `engine`'s torrent into `folder` (see [`Self::pin_download`]),
+    /// wanting its pinned files plus `file_idx`, and publish the backend's
+    /// new handle as the registry's engine for the hash with the pins
+    /// carried over. On failure the backend may or may not still manage the
+    /// torrent: the registry entry is rebuilt from `get_torrent` when it
+    /// does and dropped otherwise, so the next request re-adds through the
+    /// registry instead of using a handle to a torrent that is gone.
+    async fn relocate_engine(
+        &self,
+        engine: Arc<Engine<B::Handle>>,
+        folder: std::path::PathBuf,
+        file_idx: usize,
+        extra_trackers: Option<Vec<String>>,
+    ) -> Result<Arc<Engine<B::Handle>>, PinDownloadError> {
+        let mut wanted = engine.pinned_files.read().clone();
+        wanted.insert(file_idx);
+        let placement = TorrentPlacement {
+            output_folder: Some(folder.clone()),
+            only_files: Some(wanted.into_iter().collect()),
+        };
+        let trackers = self.merged_trackers(extra_trackers).await;
+        tracing::info!(
+            info_hash = %engine.info_hash,
+            from = ?engine.handle.output_folder(),
+            to = ?folder,
+            "download_relocating"
+        );
+        match self
+            .backend
+            .relocate_torrent(&engine.info_hash, placement, trackers)
+            .await
+        {
+            Ok(handle) => Ok(self.replace_engine(&engine, handle).await),
+            Err(error) => {
+                tracing::warn!(
+                    info_hash = %engine.info_hash,
+                    error = %format!("{error:#}"),
+                    "download_relocate_failed"
+                );
+                match self.backend.get_torrent(&engine.info_hash).await {
+                    Some(handle) => {
+                        self.replace_engine(&engine, handle).await;
+                    }
+                    None => self.remove_engine(&engine.info_hash).await,
+                }
+                Err(PinDownloadError::Backend(error.context(format!(
+                    "relocating {} into {}",
+                    engine.info_hash,
+                    folder.display()
+                ))))
+            }
+        }
+    }
+
+    /// Publish `handle` as the engine for `old`'s hash, carrying the pins.
+    async fn replace_engine(
+        &self,
+        old: &Arc<Engine<B::Handle>>,
+        handle: B::Handle,
+    ) -> Arc<Engine<B::Handle>> {
+        let engine = Arc::new(Engine::new_with_handle(handle, &old.info_hash, self.clock));
+        *engine.pinned_files.write() = old.pinned_files.read().clone();
+        self.engines
+            .write()
+            .await
+            .insert(old.info_hash.clone(), engine.clone());
+        engine
     }
 
     /// Re-plan the engine's want-set from whatever multi-file selection is
@@ -2101,6 +2230,9 @@ mod tests {
         /// The fake handle's own pin set (what the real backend keeps in its
         /// `PinnedFiles` map), reported through `stats()`.
         pinned: Mutex<std::collections::BTreeSet<usize>>,
+        /// What `output_folder()` reports; set by the fake backend's
+        /// placed add and relocate.
+        output_folder: Mutex<Option<std::path::PathBuf>>,
     }
 
     /// Simulates librqbit's `Initializing` state for the fake torrent: the
@@ -2196,6 +2328,23 @@ mod tests {
         removed: Arc<Mutex<Vec<String>>>,
         /// The placement of every `add_torrent_placed`, in order.
         placements: Arc<Mutex<Vec<TorrentPlacement>>>,
+        /// Every `relocate_torrent` request (hash, placement), in order.
+        relocations: Arc<Mutex<Vec<(String, TorrentPlacement)>>>,
+        /// Test knob: make `relocate_torrent` fail (the torrent stays
+        /// managed where it was, as the real backend's recovery leaves it).
+        fail_relocate: Arc<AtomicBool>,
+    }
+
+    impl FakeBackend {
+        fn new(handles: Vec<FakeHandle>) -> Self {
+            Self {
+                handles,
+                removed: Arc::new(Mutex::new(Vec::new())),
+                placements: Arc::new(Mutex::new(Vec::new())),
+                relocations: Arc::new(Mutex::new(Vec::new())),
+                fail_relocate: Arc::new(AtomicBool::new(false)),
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -2216,8 +2365,37 @@ mod tests {
             _trackers: Vec<String>,
             placement: TorrentPlacement,
         ) -> Result<Self::Handle> {
+            let handle = self.handles[0].clone();
+            if placement.output_folder.is_some() {
+                *handle.counters.output_folder.lock().unwrap() = placement.output_folder.clone();
+            }
             self.placements.lock().unwrap().push(placement);
-            Ok(self.handles[0].clone())
+            Ok(handle)
+        }
+
+        /// A fresh handle clone reporting the new folder, like the real
+        /// backend's re-added torrent.
+        async fn relocate_torrent(
+            &self,
+            info_hash: &str,
+            placement: TorrentPlacement,
+            _trackers: Vec<String>,
+        ) -> Result<Self::Handle> {
+            self.relocations
+                .lock()
+                .unwrap()
+                .push((info_hash.to_string(), placement.clone()));
+            if self.fail_relocate.load(Ordering::SeqCst) {
+                anyhow::bail!("fake relocation failed");
+            }
+            let handle = self
+                .handles
+                .iter()
+                .find(|h| h.info_hash == info_hash)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("not managed"))?;
+            *handle.counters.output_folder.lock().unwrap() = placement.output_folder;
+            Ok(handle)
         }
 
         async fn get_torrent(&self, info_hash: &str) -> Option<Self::Handle> {
@@ -2362,6 +2540,10 @@ mod tests {
             self.counters.unpin_file.fetch_add(1, Ordering::SeqCst);
             self.counters.pinned.lock().unwrap().remove(&file_idx);
             Ok(())
+        }
+
+        fn output_folder(&self) -> Option<std::path::PathBuf> {
+            self.counters.output_folder.lock().unwrap().clone()
         }
 
         async fn resume_torrent(&self) -> Result<()> {
@@ -2525,11 +2707,7 @@ mod tests {
         restored.insert(TEST_HASH.to_string(), handle.clone());
         let root = std::env::temp_dir().join("enginefs-hls-lease-tests");
         let enginefs = BackendEngineFS::new_with_backend(
-            FakeBackend {
-                handles: vec![handle],
-                removed: Arc::new(Mutex::new(Vec::new())),
-                placements: Arc::new(Mutex::new(Vec::new())),
-            },
+            FakeBackend::new(vec![handle]),
             restored,
             root.join("cache"),
             root.join("downloads"),
@@ -2570,14 +2748,11 @@ mod tests {
             (TEST_HASH.to_string(), a.clone()),
             (OTHER_HASH.to_string(), b.clone()),
         ]);
-        let removed = Arc::new(Mutex::new(Vec::new()));
+        let backend = FakeBackend::new(vec![a, b]);
+        let removed = backend.removed.clone();
         let root = std::env::temp_dir().join("enginefs-two-engine-tests");
         let enginefs = BackendEngineFS::new_with_backend(
-            FakeBackend {
-                handles: vec![a, b],
-                removed: removed.clone(),
-                placements: Arc::new(Mutex::new(Vec::new())),
-            },
+            backend,
             restored,
             root.join("cache"),
             root.join("downloads"),
@@ -3242,14 +3417,11 @@ mod tests {
             }],
             init: FakeInit::new(true, Duration::from_secs(60)),
         };
-        let placements = Arc::new(Mutex::new(Vec::new()));
+        let backend = FakeBackend::new(vec![handle]);
+        let placements = backend.placements.clone();
         let root = std::env::temp_dir().join("enginefs-placement-tests");
         let enginefs = BackendEngineFS::new_with_backend(
-            FakeBackend {
-                handles: vec![handle],
-                removed: Arc::new(Mutex::new(Vec::new())),
-                placements: placements.clone(),
-            },
+            backend,
             HashMap::new(),
             root.join("cache"),
             root.join("downloads"),
@@ -3289,6 +3461,172 @@ mod tests {
             placements.lock().unwrap().last(),
             Some(&TorrentPlacement::default()),
             "the plain add uses the backend's default placement"
+        );
+    }
+
+    // --- downloads dir: placement and relocation of pinned torrents ---
+
+    /// Engine over the fake backend with nothing managed yet: a pin has to
+    /// add the torrent, so the placement it uses is observable.
+    fn test_enginefs_unmanaged() -> (BackendEngineFS<FakeBackend>, Arc<FakeCounters>) {
+        let counters = Arc::new(FakeCounters::default());
+        let handle = FakeHandle {
+            info_hash: TEST_HASH.to_string(),
+            counters: counters.clone(),
+            files: (0..2)
+                .map(|idx| BackendFileInfo {
+                    name: format!("video-{idx}.mkv"),
+                    length: 100,
+                })
+                .collect(),
+            init: FakeInit::new(true, Duration::from_secs(60)),
+        };
+        let root = std::env::temp_dir().join("enginefs-downloads-dir-tests");
+        let enginefs = BackendEngineFS::new_with_backend(
+            FakeBackend::new(vec![handle]),
+            HashMap::new(),
+            root.join("cache"),
+            root.join("downloads"),
+        );
+        (enginefs, counters)
+    }
+
+    /// With a downloads dir, a pin adds an unmanaged torrent straight into
+    /// `<dir>/<hash>` wanting only the pinned file -- no relocation needed
+    /// afterwards -- and without one the add uses the backend's default
+    /// placement plus the want-set.
+    #[tokio::test]
+    async fn pin_download_places_a_new_torrent_under_the_downloads_dir() {
+        let (enginefs, _counters) = test_enginefs_unmanaged();
+        let dir = std::path::PathBuf::from("/offline");
+        enginefs.set_downloads_dir(Some(dir.clone()));
+        assert_eq!(enginefs.downloads_dir(), Some(dir.clone()));
+        assert_eq!(
+            enginefs.download_folder(&TEST_HASH.to_uppercase()),
+            Some(dir.join(TEST_HASH))
+        );
+
+        let engine = enginefs.pin_download(TEST_HASH, 1, None).await.unwrap();
+        assert_eq!(
+            enginefs.backend.placements.lock().unwrap().as_slice(),
+            &[TorrentPlacement {
+                output_folder: Some(dir.join(TEST_HASH)),
+                only_files: Some(vec![1]),
+            }]
+        );
+        assert!(enginefs.backend.relocations.lock().unwrap().is_empty());
+        assert_eq!(engine.handle.output_folder(), Some(dir.join(TEST_HASH)));
+        assert_eq!(engine.pinned_file_indices(), vec![1]);
+
+        let (enginefs, _counters) = test_enginefs_unmanaged();
+        enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
+        assert_eq!(
+            enginefs.backend.placements.lock().unwrap().as_slice(),
+            &[TorrentPlacement {
+                output_folder: None,
+                only_files: Some(vec![0]),
+            }]
+        );
+        assert!(enginefs.backend.relocations.lock().unwrap().is_empty());
+    }
+
+    /// A torrent managed outside `<dir>/<hash>` (streamed first) is
+    /// relocated by the pin: the backend is asked to move it there wanting
+    /// its pins plus the new file, the registry's engine is replaced by one
+    /// over the backend's new handle with the pins carried, and a later pin
+    /// of the same torrent finds it in place. Without a downloads dir, or
+    /// when the backend cannot tell where the torrent is, nothing moves.
+    #[tokio::test]
+    async fn pin_download_relocates_a_torrent_managed_elsewhere() {
+        let (enginefs, counters) = test_enginefs_with_file_count(3);
+        let dir = std::path::PathBuf::from("/offline");
+
+        // No downloads dir: pinned in place, wherever that is.
+        *counters.output_folder.lock().unwrap() = Some("/cache/rqbit-downloads/show".into());
+        enginefs.pin_download(TEST_HASH, 2, None).await.unwrap();
+        assert!(enginefs.backend.relocations.lock().unwrap().is_empty());
+
+        enginefs.set_downloads_dir(Some(dir.clone()));
+        let before = enginefs.get_engine(TEST_HASH).await.unwrap();
+        let engine = enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
+        assert_eq!(
+            enginefs.backend.relocations.lock().unwrap().as_slice(),
+            &[(
+                TEST_HASH.to_string(),
+                TorrentPlacement {
+                    output_folder: Some(dir.join(TEST_HASH)),
+                    only_files: Some(vec![0, 2]),
+                }
+            )]
+        );
+        assert!(
+            !Arc::ptr_eq(&before, &engine),
+            "the registry holds a new engine over the backend's new handle"
+        );
+        assert!(Arc::ptr_eq(
+            &enginefs.get_engine(TEST_HASH).await.unwrap(),
+            &engine
+        ));
+        assert_eq!(engine.pinned_file_indices(), vec![0, 2]);
+        assert_eq!(engine.handle.output_folder(), Some(dir.join(TEST_HASH)));
+        assert_eq!(
+            engine.get_statistics().await.pinned_files,
+            vec![0, 2],
+            "the backend's pin set survived the relocation"
+        );
+        assert!(enginefs.backend.placements.lock().unwrap().is_empty());
+
+        // In place now: another pin relocates nothing.
+        enginefs.pin_download(TEST_HASH, 1, None).await.unwrap();
+        assert_eq!(enginefs.backend.relocations.lock().unwrap().len(), 1);
+        assert_eq!(
+            enginefs
+                .get_engine(TEST_HASH)
+                .await
+                .unwrap()
+                .pinned_file_indices(),
+            vec![0, 1, 2]
+        );
+
+        // Unknown whereabouts (a backend without output_folder): no move.
+        let (enginefs, _counters) = test_enginefs_with_file_count(2);
+        enginefs.set_downloads_dir(Some(dir));
+        enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
+        assert!(enginefs.backend.relocations.lock().unwrap().is_empty());
+    }
+
+    /// A failed relocation is reported, records no pin, and leaves the
+    /// registry consistent with the backend: the engine is rebuilt over
+    /// whatever handle the backend still has (pins carried) rather than
+    /// kept over a handle to a torrent that may be gone.
+    #[tokio::test]
+    async fn pin_download_reports_a_failed_relocation_and_rebuilds_the_engine() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        *counters.output_folder.lock().unwrap() = Some("/cache/rqbit-downloads/show".into());
+        enginefs.pin_download(TEST_HASH, 1, None).await.unwrap();
+        enginefs.set_downloads_dir(Some("/offline".into()));
+        enginefs.backend.fail_relocate.store(true, Ordering::SeqCst);
+
+        let before = enginefs.get_engine(TEST_HASH).await.unwrap();
+        let err = match enginefs.pin_download(TEST_HASH, 0, None).await {
+            Ok(_) => panic!("relocation failure must fail the pin"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, PinDownloadError::Backend(_)), "{err}");
+        assert!(err.to_string().contains("relocating"), "{err}");
+        let after = enginefs.get_engine(TEST_HASH).await.unwrap();
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert_eq!(
+            after.pinned_file_indices(),
+            vec![1],
+            "no pin recorded for 0"
+        );
+        assert_eq!(
+            enginefs.pinned_downloads().await,
+            vec![PinnedDownload {
+                info_hash: TEST_HASH.to_string(),
+                file_idx: 1
+            }]
         );
     }
 

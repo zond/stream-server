@@ -55,6 +55,22 @@ pub trait TorrentBackend: Send + Sync {
         self.add_torrent(source, trackers).await
     }
 
+    /// Move a managed torrent to `placement` (whose `output_folder` is
+    /// required): its files end up under the new folder and the backend
+    /// manages it from there, wanting `placement.only_files`, re-checking
+    /// whatever data was moved. Returns the handle for the torrent in its
+    /// new place; the old handle is dead afterwards. The pin set survives
+    /// (it is why the torrent moves). Backends without per-torrent
+    /// placement refuse.
+    async fn relocate_torrent(
+        &self,
+        info_hash: &str,
+        _placement: TorrentPlacement,
+        _trackers: Vec<String>,
+    ) -> Result<Self::Handle> {
+        anyhow::bail!("backend cannot relocate torrent {info_hash}")
+    }
+
     async fn get_torrent(&self, info_hash: &str) -> Option<Self::Handle>;
     async fn remove_torrent(&self, info_hash: &str) -> Result<()>;
     async fn list_torrents(&self) -> Vec<String>;
