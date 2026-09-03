@@ -1639,9 +1639,18 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             .await;
         if let Err(error) = checked {
             if !was_managed && !engine.is_pinned() {
-                // Added only for this pin: do not leave it behind.
+                // Added only for this pin: do not leave it behind. Under
+                // the downloads dir its folder is ours and holds nothing
+                // but the placeholder librqbit pre-sized, so it goes too;
+                // in the cache root the files stay for the cache cleaner,
+                // like any other streamed data.
                 self.remove_engine_if_current(&engine).await;
-                if let Err(e) = self.backend.remove_torrent(info_hash).await {
+                let dropped = if folder.is_some() {
+                    self.backend.remove_torrent_and_files(info_hash).await
+                } else {
+                    self.backend.remove_torrent(info_hash).await
+                };
+                if let Err(e) = dropped {
                     debug!(info_hash, error = %e, "could not drop the torrent added for a refused pin");
                 }
             }
@@ -2712,6 +2721,8 @@ mod tests {
         handles: Vec<FakeHandle>,
         /// Info hashes `remove_torrent` was asked to drop, in order.
         removed: Arc<Mutex<Vec<String>>>,
+        /// Info hashes `remove_torrent_and_files` was asked to drop.
+        removed_with_files: Arc<Mutex<Vec<String>>>,
         /// The placement of every `add_torrent_placed`, in order.
         placements: Arc<Mutex<Vec<TorrentPlacement>>>,
         /// Every `relocate_torrent` request (hash, placement), in order.
@@ -2734,6 +2745,7 @@ mod tests {
             Self {
                 handles,
                 removed: Arc::new(Mutex::new(Vec::new())),
+                removed_with_files: Arc::new(Mutex::new(Vec::new())),
                 placements: Arc::new(Mutex::new(Vec::new())),
                 relocations: Arc::new(Mutex::new(Vec::new())),
                 fail_relocate: Arc::new(AtomicBool::new(false)),
@@ -2810,6 +2822,14 @@ mod tests {
 
         async fn remove_torrent(&self, info_hash: &str) -> Result<()> {
             self.removed.lock().unwrap().push(info_hash.to_string());
+            Ok(())
+        }
+
+        async fn remove_torrent_and_files(&self, info_hash: &str) -> Result<()> {
+            self.removed_with_files
+                .lock()
+                .unwrap()
+                .push(info_hash.to_string());
             Ok(())
         }
 
@@ -4213,10 +4233,16 @@ mod tests {
         }
         assert!(enginefs.get_engine(TEST_HASH).await.is_none());
         assert_eq!(
-            enginefs.backend.removed.lock().unwrap().as_slice(),
+            enginefs
+                .backend
+                .removed_with_files
+                .lock()
+                .unwrap()
+                .as_slice(),
             &[TEST_HASH.to_string()],
-            "the torrent added for the refused pin is dropped"
+            "the torrent added under the downloads dir for the refused pin is dropped with its placeholder"
         );
+        assert!(enginefs.backend.removed.lock().unwrap().is_empty());
         assert!(enginefs.pinned_downloads().await.is_empty());
 
         available.store(PIN_FREE_SPACE_MARGIN + 50, Ordering::SeqCst);
@@ -4230,7 +4256,30 @@ mod tests {
             Err(PinDownloadError::InsufficientSpace { .. })
         ));
         assert!(enginefs.get_engine(TEST_HASH).await.is_some());
-        assert_eq!(enginefs.backend.removed.lock().unwrap().len(), 1);
+        assert_eq!(enginefs.backend.removed_with_files.lock().unwrap().len(), 1);
+        assert!(enginefs.backend.removed.lock().unwrap().is_empty());
+
+        // No downloads dir: the torrent added into the cache root is
+        // dropped but its files are the cache cleaner's, not ours.
+        let (mut enginefs, _counters) = test_enginefs_unmanaged();
+        enginefs.set_free_space_probe(|_| Ok(0));
+        assert!(matches!(
+            enginefs.pin_download(TEST_HASH, 0, None).await,
+            Err(PinDownloadError::InsufficientSpace { .. })
+        ));
+        assert!(enginefs.get_engine(TEST_HASH).await.is_none());
+        assert_eq!(
+            enginefs.backend.removed.lock().unwrap().as_slice(),
+            &[TEST_HASH.to_string()]
+        );
+        assert!(
+            enginefs
+                .backend
+                .removed_with_files
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
 
         // Complete file: nothing to write, no space needed.
         let (mut enginefs, counters) = test_enginefs_with_file_count(2);

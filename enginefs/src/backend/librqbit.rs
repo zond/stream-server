@@ -613,6 +613,52 @@ impl LibrqbitBackend {
             pinned_files: self.pinned_files.clone(),
         }
     }
+
+    /// Shared body of `remove_torrent` (`delete_files: false`, keeping the
+    /// downloaded data on disk like the libtorrent backend's
+    /// `remove_torrent(handle, false)` did) and `remove_torrent_and_files`.
+    async fn delete_torrent(&self, info_hash: &str, delete_files: bool) -> Result<()> {
+        let id = librqbit::api::TorrentIdOrHash::parse(info_hash)
+            .with_context(|| format!("invalid info hash {info_hash}"))?;
+        let output_folder = self
+            .session
+            .get(id)
+            .map(|handle| handle.output_folder().to_path_buf());
+        self.session
+            .delete(id, delete_files)
+            .await
+            .with_context(|| format!("failed to remove torrent {info_hash}"))?;
+        self.deferred_selections.lock().remove(info_hash);
+        self.pinned_files.lock().remove(info_hash);
+        // `Session::delete(_, false)` only removes empty directories on the
+        // delete_files=true branch, so a torrent that never wrote anything
+        // (or whose files were cleaned out) would leave its output folder
+        // behind on every idle sweep. `remove_dir` fails on a non-empty
+        // directory, so this can only ever drop an empty folder -- and never
+        // the session root, which single-file torrents write straight into.
+        if let Some(folder) = output_folder
+            && folder != self.download_dir
+            && let Err(e) = tokio::fs::remove_dir(&folder).await
+            && !matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            )
+        {
+            debug!(error = %e, path = ?folder, "Left the torrent's output folder in place");
+        }
+        // Best-effort: drop the cached .torrent file so the restore path in
+        // `new()` does not resurrect the torrent on the next startup.
+        let cached = self
+            .download_dir
+            .join(".cache")
+            .join(format!("{info_hash}.torrent"));
+        if let Err(e) = tokio::fs::remove_file(&cached).await
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(error = %e, path = ?cached, "Failed to remove cached torrent file");
+        }
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -838,48 +884,13 @@ impl TorrentBackend for LibrqbitBackend {
     }
 
     async fn remove_torrent(&self, info_hash: &str) -> Result<()> {
-        let id = librqbit::api::TorrentIdOrHash::parse(info_hash)
-            .with_context(|| format!("invalid info hash {info_hash}"))?;
-        let output_folder = self
-            .session
-            .get(id)
-            .map(|handle| handle.output_folder().to_path_buf());
-        // delete_files=false keeps downloaded data on disk, matching the
-        // libtorrent backend's remove_torrent(handle, false).
-        self.session
-            .delete(id, false)
-            .await
-            .with_context(|| format!("failed to remove torrent {info_hash}"))?;
-        self.deferred_selections.lock().remove(info_hash);
-        self.pinned_files.lock().remove(info_hash);
-        // `Session::delete(_, false)` only removes empty directories on the
-        // delete_files=true branch, so a torrent that never wrote anything
-        // (or whose files were cleaned out) would leave its output folder
-        // behind on every idle sweep. `remove_dir` fails on a non-empty
-        // directory, so this can only ever drop an empty folder -- and never
-        // the session root, which single-file torrents write straight into.
-        if let Some(folder) = output_folder
-            && folder != self.download_dir
-            && let Err(e) = tokio::fs::remove_dir(&folder).await
-            && !matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
-            )
-        {
-            debug!(error = %e, path = ?folder, "Left the torrent's output folder in place");
-        }
-        // Best-effort: drop the cached .torrent file so the restore path in
-        // `new()` does not resurrect the torrent on the next startup.
-        let cached = self
-            .download_dir
-            .join(".cache")
-            .join(format!("{info_hash}.torrent"));
-        if let Err(e) = tokio::fs::remove_file(&cached).await
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            warn!(error = %e, path = ?cached, "Failed to remove cached torrent file");
-        }
-        Ok(())
+        self.delete_torrent(info_hash, false).await
+    }
+
+    /// `Session::delete(_, true)`: librqbit removes the files and, for a
+    /// torrent with its own output folder, that folder once empty.
+    async fn remove_torrent_and_files(&self, info_hash: &str) -> Result<()> {
+        self.delete_torrent(info_hash, true).await
     }
 
     async fn list_torrents(&self) -> Vec<String> {
@@ -3444,6 +3455,51 @@ mod tests {
         // Known have-bytes win over the allocation either way.
         assert!(has_data_to_move(Some(1), &sparse_meta));
         assert!(!has_data_to_move(Some(0), &written_meta));
+    }
+
+    /// `remove_torrent_and_files` on a torrent placed in its own folder
+    /// takes the pre-sized files and the folder with it; `remove_torrent`
+    /// keeps them.
+    #[tokio::test]
+    async fn remove_torrent_and_files_takes_the_placed_folder_with_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        tokio::fs::create_dir_all(&src).await.unwrap();
+        write_payload(&src.join("movie.bin"), 20 * 1024).await;
+        let (bytes, hash) = make_torrent(&src.join("movie.bin")).await;
+        let dl = tmp.path().join("dl");
+        let backend = LibrqbitBackend::new_for_tests(dl.clone())
+            .await
+            .expect("hermetic session");
+        let place = |folder: &std::path::Path| TorrentPlacement {
+            output_folder: Some(folder.to_path_buf()),
+            only_files: Some(vec![0]),
+        };
+
+        let kept = tmp.path().join("offline").join("kept");
+        let handle = backend
+            .add_torrent_placed(TorrentSource::Bytes(bytes.clone()), vec![], place(&kept))
+            .await
+            .unwrap();
+        handle.handle.wait_until_initialized().await.unwrap();
+        assert!(kept.join("movie.bin").is_file(), "pre-sized placeholder");
+        backend.remove_torrent(&hash).await.unwrap();
+        assert!(
+            kept.join("movie.bin").is_file(),
+            "remove_torrent keeps files"
+        );
+
+        let gone = tmp.path().join("offline").join("gone");
+        let handle = backend
+            .add_torrent_placed(TorrentSource::Bytes(bytes), vec![], place(&gone))
+            .await
+            .unwrap();
+        handle.handle.wait_until_initialized().await.unwrap();
+        assert!(gone.join("movie.bin").is_file());
+        backend.remove_torrent_and_files(&hash).await.unwrap();
+        assert!(!gone.exists(), "files and folder removed: {gone:?}");
+        assert!(backend.list_torrents().await.is_empty());
+        assert!(dl.is_dir(), "session root untouched");
     }
 
     /// The cross-device fallback of `move_file` copies then removes the

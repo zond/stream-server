@@ -72,7 +72,16 @@ pub trait TorrentBackend: Send + Sync {
     }
 
     async fn get_torrent(&self, info_hash: &str) -> Option<Self::Handle>;
+    /// Stop managing the torrent, keeping whatever it wrote on disk.
     async fn remove_torrent(&self, info_hash: &str) -> Result<()>;
+    /// [`Self::remove_torrent`] that also deletes the torrent's files and
+    /// its (then empty) per-torrent folder -- for a torrent whose data is
+    /// known to be worthless, like one added only for a pin that was then
+    /// refused. The default keeps the files, as for a backend that cannot
+    /// tell them apart from other data.
+    async fn remove_torrent_and_files(&self, info_hash: &str) -> Result<()> {
+        self.remove_torrent(info_hash).await
+    }
     async fn list_torrents(&self) -> Vec<String>;
     async fn memory_diagnostics(&self) -> BackendMemoryDiagnostics;
     fn set_seeding_enabled(&self, _enabled: bool) {}
