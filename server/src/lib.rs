@@ -573,6 +573,7 @@ pub async fn run(
         None => tracing::warn!("control API authentication is disabled; every route is open"),
     }
 
+    let mut cleared_downloads_dir = false;
     {
         let mut settings = settings_arc.write().await;
         state.engine.set_seeding_enabled(settings.seeding_enabled);
@@ -581,8 +582,10 @@ pub async fn run(
             .set_seeding_enabled(settings.seeding_enabled);
         // A persisted downloadsDir that cannot be used any more (unmounted
         // drive, permissions) is cleared rather than kept as a setting the
-        // engines silently ignore: pins fall back to the cache root and
-        // `GET /settings` says so.
+        // engines silently ignore: pins fall back to the cache root,
+        // `GET /settings` says so, and so does the settings file (below,
+        // once the lock is released) -- an embedder reading it sees the
+        // same value, and the next boot does not warn again.
         if let Some(raw) = settings.downloads_dir.clone() {
             match routes::system::prepare_downloads_dir(&raw).await {
                 Ok(path) => {
@@ -596,9 +599,16 @@ pub async fn run(
                         "downloadsDir is unusable; clearing it (downloads go to the cache root)"
                     );
                     settings.downloads_dir = None;
+                    cleared_downloads_dir = true;
                 }
             }
         }
+    }
+    if cleared_downloads_dir && let Err(error) = state.save_settings().await {
+        tracing::warn!(
+            error = %format!("{error:#}"),
+            "could not persist the cleared downloadsDir"
+        );
     }
 
     let mut background_tasks = Vec::new();

@@ -945,6 +945,53 @@ fn stats_after_check(
     }
 }
 
+/// A persisted `downloadsDir` that is unusable at startup (its path is a
+/// file now) is cleared in the settings file, not only in memory: an
+/// embedder reading the file sees what `settings()` says, and the next
+/// boot does not warn about it again.
+#[test]
+fn unusable_persisted_downloads_dir_is_cleared_on_disk() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let downloads_dir = tempfile::tempdir()?;
+    let config = || stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_dir.path().join("cache")),
+        ..stream_server::ServerConfig::default()
+    };
+    let settings_file = config_dir.path().join("config").join("settings.json");
+    let read_persisted = || -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::from_str(&std::fs::read_to_string(
+            &settings_file,
+        )?)?)
+    };
+    let downloads = downloads_dir.path().join("offline");
+
+    let handle = stream_server::start(config())?;
+    handle.update_settings(serde_json::json!({ "downloadsDir": downloads.to_str().unwrap() }))?;
+    assert_eq!(
+        read_persisted()?["downloadsDir"],
+        downloads.to_str().unwrap()
+    );
+    handle.shutdown()?;
+    handle.join()?;
+
+    // The directory is a file now: unusable.
+    std::fs::remove_dir_all(&downloads)?;
+    std::fs::write(&downloads, b"in the way")?;
+    let handle = stream_server::start(config())?;
+    assert_eq!(handle.settings()?.downloads_dir, None);
+    assert_eq!(
+        read_persisted()?["downloadsDir"],
+        serde_json::Value::Null,
+        "cleared in the settings file too"
+    );
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
 /// Offline downloads with a `downloadsDir`: a torrent that was streamed
 /// first (managed in the cache root, data verified there) is relocated by
 /// the pin into `<downloadsDir>/<infoHash>` -- files moved, cache-root
