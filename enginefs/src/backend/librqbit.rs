@@ -978,6 +978,17 @@ impl TorrentHandle for LibrqbitHandle {
             peer_discovery.queued,
             peer_discovery.seen,
         );
+        // Connected peers whose bitfield covers the whole torrent. librqbit
+        // maintains this as a transition counter next to the live/live_tcp/
+        // live_utp/live_socks aggregates, so reading it is O(1) and needs no
+        // walk over per-peer bitfields. It is bounded by `peers`: only live
+        // peers are counted, never ones we merely know an address for, and
+        // never a tracker's seeder count (we do not scrape).
+        let connected_seeders = stats
+            .live
+            .as_ref()
+            .map(|l| l.snapshot.peer_stats.live_seeders as u64)
+            .unwrap_or(0);
 
         let has_metadata = self.handle.metadata.load().is_some();
         let phase = startup_phase(has_metadata, &stats.state, stats.finished);
@@ -1117,6 +1128,7 @@ impl TorrentHandle for LibrqbitHandle {
             swarm_connections: peers,
             swarm_paused: false,
             swarm_size: peers,
+            connected_seeders,
             is_finished: stats.finished,
             has_metadata,
             phase,
@@ -1944,6 +1956,94 @@ mod tests {
             "sorted tracker URLs, got {urls:?}"
         );
         assert!(stats.sources.iter().all(|s| s.num_requests == 0));
+    }
+
+    /// `connected_seeders` is librqbit's `live_seeders` aggregate -- connected
+    /// peers whose bitfield covers the whole torrent -- and not one of the
+    /// discovery counters that sit beside it in the same struct.
+    ///
+    /// No peer can ever go live in a hermetic session (`new_for_tests` binds
+    /// no port and runs no DHT), so the count itself stays 0 here; the live
+    /// case is `wait_for_piece_ready_live_swarm`, which needs a real swarm and
+    /// is `#[ignore]`d. What is pinned down is the wiring: `initial_peers`
+    /// hands the torrent one address that will never answer, so `seen` and
+    /// `unique` climb off zero while `live_seeders` does not -- a mapping to
+    /// the wrong counter reports that address as a seeder.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stats_connected_seeders_mirrors_librqbits_live_seeder_count() {
+        let src = tempfile::tempdir().unwrap();
+        let payload = src.path().join("payload.bin");
+        write_payload(&payload, 16 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+
+        // A download dir of its own, so the torrent is a leecher with nothing
+        // on disk rather than an instantly-finished seed.
+        let dl = tempfile::tempdir().unwrap();
+        let backend = LibrqbitBackend::new_for_tests(dl.path().to_path_buf())
+            .await
+            .expect("hermetic session");
+        // Straight to the session: `add_torrent` has no `initial_peers`
+        // parameter, and with no DHT and no trackers that is the only way a
+        // peer address can reach the torrent at all. Loopback port 9 is the
+        // discard port -- nothing listens there, so the peer is seen and then
+        // dies without ever going live.
+        let response = backend
+            .session
+            .add_torrent(
+                librqbit::AddTorrent::from_bytes(bytes::Bytes::from(torrent_bytes)),
+                Some(librqbit::AddTorrentOptions {
+                    overwrite: true,
+                    initial_peers: Some(vec![(std::net::Ipv4Addr::LOCALHOST, 9).into()]),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("add torrent");
+        let (librqbit::AddTorrentResponse::Added(_, inner)
+        | librqbit::AddTorrentResponse::AlreadyManaged(_, inner)) = response
+        else {
+            panic!("expected the torrent to be added");
+        };
+        let handle = LibrqbitHandle {
+            info_hash: inner.info_hash().as_string(),
+            handle: inner,
+            session: backend.session.clone(),
+            deferred_selections: Default::default(),
+            pinned_files: Default::default(),
+            reported_errors: Default::default(),
+        };
+
+        // Bounded poll: the initial peer reaches the peer list once the
+        // torrent has finished initializing and gone live. The bound only
+        // keeps a regression from hanging.
+        let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
+        let live_seeders = loop {
+            let peer_stats = handle.handle.stats().live.map(|l| l.snapshot.peer_stats);
+            match peer_stats {
+                Some(p) if p.seen > 0 => break p.live_seeders,
+                _ => assert!(
+                    std::time::Instant::now() < deadline,
+                    "the torrent never saw its initial peer"
+                ),
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(live_seeders, 0, "an address nobody answers is not a seeder");
+
+        let stats = TorrentHandle::stats(&handle).await;
+        assert_eq!(
+            stats.connected_seeders, live_seeders as u64,
+            "connected_seeders must be librqbit's live_seeders"
+        );
+        assert!(
+            stats.unique > 0,
+            "the initial peer must have been seen, or the counters are all \
+             trivially equal and this proves nothing"
+        );
+        assert_ne!(
+            stats.connected_seeders, stats.unique,
+            "connected_seeders is the seeder count, not the seen-peer count"
+        );
     }
 
     /// The magnet branch of librqbit's `Session::add_torrent` ignores

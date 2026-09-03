@@ -613,6 +613,11 @@ pub struct EngineStats {
     pub swarm_connections: u64,
     pub swarm_paused: bool,
     pub swarm_size: u64,
+    /// Connected peers whose bitfield covers the whole torrent, i.e. peers we
+    /// can get any piece from. Not the swarm's seeder count: we do not scrape
+    /// trackers, so this only ever counts peers of our own connections.
+    #[serde(default)]
+    pub connected_seeders: u64,
     /// All wanted pieces are downloaded (libtorrent `is_finished`). A finished
     /// torrent is only seeding and can be paused; an unfinished one still needs
     /// the swarm to download data or fetch metadata.
@@ -707,6 +712,7 @@ impl EngineStats {
             swarm_connections: 0,
             swarm_paused: false,
             swarm_size: 0,
+            connected_seeders: 0,
             is_finished: false,
             has_metadata: false,
             phase: StartupPhase::ResolvingMetadata,

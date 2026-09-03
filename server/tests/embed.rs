@@ -741,6 +741,9 @@ fn stats_json_exposes_startup_phase_fields_additively() -> anyhow::Result<()> {
     for key in ["seen", "queued", "connecting", "live"] {
         assert!(discovery[key].is_u64(), "peerDiscovery.{key}: {stats}");
     }
+    // Nobody is seeding this fixture torrent and the embedded session has no
+    // peer to connect to, so the honest answer is 0 -- but the field is there.
+    assert_eq!(stats["connectedSeeders"], 0, "{stats}");
     assert_eq!(stats["files"][1]["initialWindowBytes"], 700);
     assert_eq!(stats["files"][1]["initialWindowReadyBytes"], 0);
 
@@ -752,6 +755,7 @@ fn stats_json_exposes_startup_phase_fields_additively() -> anyhow::Result<()> {
         .json()?;
     assert_eq!(file_stats["streamName"], "Show.S01E02.1080p.mkv");
     assert_eq!(file_stats["phase"], "buffering");
+    assert_eq!(file_stats["connectedSeeders"], 0, "{file_stats}");
     assert_eq!(file_stats["initialWindowBytes"], 700, "{file_stats}");
     assert_eq!(file_stats["initialWindowReadyBytes"], 0);
 
@@ -811,6 +815,8 @@ fn stats_json_reports_resolving_metadata_with_the_requests_trackers() -> anyhow:
         assert_eq!(stats["infoHash"], unresolved, "{path}: {stats}");
         assert_eq!(stats["files"], serde_json::json!([]), "{path}: {stats}");
         assert!(stats["peerDiscovery"].is_object(), "{path}: {stats}");
+        // A magnet still resolving has no peers, so 0 -- never a missing field.
+        assert_eq!(stats["connectedSeeders"], 0, "{path}: {stats}");
         let sources: Vec<&str> = stats["sources"]
             .as_array()
             .expect("sources array")

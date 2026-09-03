@@ -3570,6 +3570,7 @@ mod tests {
                 swarm_connections: 0,
                 swarm_paused: false,
                 swarm_size: 0,
+                connected_seeders: 0,
                 is_finished: seeded,
                 has_metadata: !self.files.is_empty(),
                 phase,
@@ -4245,6 +4246,7 @@ mod tests {
             swarm_connections: 0,
             swarm_paused: false,
             swarm_size: 0,
+            connected_seeders: 0,
             is_finished: false,
             has_metadata: true,
             phase: StartupPhase::Buffering,
@@ -4327,6 +4329,7 @@ mod tests {
             value["peerDiscovery"],
             serde_json::json!({ "seen": 0, "queued": 0, "connecting": 0, "live": 0 })
         );
+        assert_eq!(value["connectedSeeders"], 0);
         assert_eq!(value["files"][0]["initialWindowReadyBytes"], 50);
         assert_eq!(value["files"][0]["initialWindowBytes"], 100);
         let file_keys = value["files"][0].as_object().unwrap();
