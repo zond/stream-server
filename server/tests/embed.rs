@@ -679,7 +679,7 @@ fn stats_json_exposes_startup_phase_fields_additively() -> anyhow::Result<()> {
         .to_string();
 
     // Poll past the hash check (bounded); `checking` is legal in between.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
     let stats = loop {
         let stats: serde_json::Value = client
             .get(format!("{base}/{info_hash}/stats.json"))
@@ -933,6 +933,14 @@ fn file_index(stats: &serde_json::Value, name: &str) -> usize {
         .unwrap_or_else(|| panic!("no file {name} in {stats}"))
 }
 
+/// How long a hash check (or a metadata resolve that has the metadata
+/// already) may take before a test gives up on it. Not a timing
+/// assertion -- only there so a regression fails instead of hanging -- so
+/// it is far above anything a correct run needs: the whole suite runs its
+/// servers in parallel, and a loaded two-core runner is an order of
+/// magnitude slower than an idle machine.
+const CHECK_WAIT_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Poll `/{infoHash}/stats.json` until the torrent is out of `checking`
 /// (bounded), returning the last stats.
 fn stats_after_check(
@@ -959,13 +967,21 @@ fn file_stats_after_check(
 }
 
 fn poll_stats(client: &reqwest::blocking::Client, url: &str) -> anyhow::Result<serde_json::Value> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
     loop {
         let stats: serde_json::Value = client.get(url).send()?.error_for_status()?.json()?;
         match stats["phase"].as_str() {
-            Some("checking") | Some("resolvingMetadata")
-                if std::time::Instant::now() < deadline =>
-            {
+            Some("checking") | Some("resolvingMetadata") => {
+                // Say so rather than handing back `checking` stats the
+                // caller will then assert on: every caller needs the check
+                // to be over, so an expired bound is the failure, and a
+                // mystery `complete: false` three lines later is not the
+                // way to report it.
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "{url} was still {} after {CHECK_WAIT_BOUND:?}: {stats}",
+                    stats["phase"]
+                );
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             _ => return Ok(stats),
