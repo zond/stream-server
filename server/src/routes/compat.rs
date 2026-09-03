@@ -54,6 +54,10 @@ pub fn normalize_tracker_sources(sources: Vec<String>) -> Vec<String> {
 /// The addon-supplied trackers of a playback-shaped request: every `tr=` query
 /// value, percent-decoded and normalised (`tracker:` prefixes stripped, `dht:`
 /// sources dropped) exactly as server.js's `/{infoHash}/{fileIdx}` does.
+pub fn parse_trackers(query_str: Option<&str>) -> Vec<String> {
+    normalize_tracker_sources(query_values(query_str, "tr"))
+}
+
 /// server.js-style truthiness for a query value: `1`, `true` or `yes`
 /// (case-insensitively). Anything else -- `0`, empty, absent -- is false.
 pub fn query_value_is_true(value: &str) -> bool {
@@ -66,10 +70,6 @@ pub fn query_flag(query: Option<&str>, name: &str) -> bool {
     query_values(query, name)
         .iter()
         .any(|value| query_value_is_true(value))
-}
-
-pub fn parse_trackers(query_str: Option<&str>) -> Vec<String> {
-    normalize_tracker_sources(query_values(query_str, "tr"))
 }
 
 /// Look `info_hash` up in `engine_fs`, or create it from a bare magnet with
