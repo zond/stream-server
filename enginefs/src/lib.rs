@@ -191,10 +191,11 @@ pub fn free_space_allows(available: u64, remaining: u64, margin: u64) -> bool {
     remaining == 0 || available >= remaining.saturating_add(margin)
 }
 
-/// Available bytes on the volume holding `path`, probed at the nearest
-/// existing ancestor (the torrent's folder may not exist yet). `Err` only
-/// when no ancestor can be probed.
-fn free_space_at(
+/// `probe` applied to `path` or, failing that, its nearest existing ancestor
+/// (the torrent's folder may not exist yet) -- how the free-space and
+/// volume-id probes are asked about a folder. `Err` only when no ancestor
+/// can be probed.
+fn probe_at_existing_ancestor(
     probe: &(dyn Fn(&std::path::Path) -> std::io::Result<u64> + Send + Sync),
     path: &std::path::Path,
 ) -> std::io::Result<u64> {
@@ -212,7 +213,37 @@ fn free_space_at(
     Err(last_error.unwrap_or_else(|| std::io::Error::other("empty path")))
 }
 
-type FreeSpaceProbe = Arc<dyn Fn(&std::path::Path) -> std::io::Result<u64> + Send + Sync>;
+/// `Fn(path) -> u64` probe of the volume holding a path: available bytes
+/// (`fs4::available_space`) or an identity (`volume_id`) telling two
+/// paths on the same volume apart from two on different ones.
+type VolumeProbe = Arc<dyn Fn(&std::path::Path) -> std::io::Result<u64> + Send + Sync>;
+
+/// An identity of the volume holding `path`, equal for two paths on the
+/// same volume: the device id on Unix; the path prefix (drive letter or
+/// UNC share) on Windows, where std exposes no stable volume serial.
+#[cfg(unix)]
+fn volume_id(path: &std::path::Path) -> std::io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).map(|metadata| metadata.dev())
+}
+
+#[cfg(windows)]
+fn volume_id(path: &std::path::Path) -> std::io::Result<u64> {
+    use std::hash::{Hash, Hasher};
+    match path.components().next() {
+        Some(std::path::Component::Prefix(prefix)) => {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            prefix.as_os_str().to_ascii_lowercase().hash(&mut hasher);
+            Ok(hasher.finish())
+        }
+        _ => Err(std::io::Error::other("relative path has no volume")),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn volume_id(_path: &std::path::Path) -> std::io::Result<u64> {
+    Err(std::io::Error::other("volume identity unavailable"))
+}
 
 /// One pinned offline download, see [`BackendEngineFS::pinned_downloads`].
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -356,7 +387,11 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     pin_locks: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Available-bytes probe for the free-space check in `pin_download`
     /// (`fs4::available_space`; tests substitute one).
-    free_space_probe: FreeSpaceProbe,
+    free_space_probe: VolumeProbe,
+    /// Volume-identity probe telling whether a relocation stays on one
+    /// volume (a rename, free) or crosses to another (a copy, which the
+    /// free-space check has to size; `volume_id`, tests substitute one).
+    volume_id_probe: VolumeProbe,
     /// Epoch of every `*_secs` timestamp this instance and its engines keep.
     clock: Clock,
 }
@@ -480,6 +515,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             downloads_dir: parking_lot::RwLock::new(None),
             pin_locks: parking_lot::Mutex::new(HashMap::new()),
             free_space_probe: Arc::new(|path| fs4::available_space(path)),
+            volume_id_probe: Arc::new(volume_id),
             clock,
         };
 
@@ -1793,8 +1829,16 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     }
 
     /// The file exists, and the volume it is (or will be) written to has
-    /// room for its missing bytes plus [`PIN_FREE_SPACE_MARGIN`]. A volume
-    /// that cannot be probed is not held against the pin (logged).
+    /// room for what the pin will write there plus [`PIN_FREE_SPACE_MARGIN`]:
+    /// the file's missing bytes -- or, when the pin relocates the torrent
+    /// onto another volume, the full length of every file the move copies
+    /// (the pinned file, and any other file with verified data; see
+    /// `TorrentBackend::relocate_torrent`), since a copy writes sparse
+    /// files out in full and the pinned file's rest is downloaded there.
+    /// A relocation within one volume is a rename and costs nothing beyond
+    /// the missing bytes. A volume that cannot be probed is not held against
+    /// the pin (logged); volumes whose identity cannot be told apart are
+    /// assumed different (the strict side).
     async fn check_pin_preconditions(
         &self,
         engine: &Arc<Engine<B::Handle>>,
@@ -1809,24 +1853,43 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             });
         }
         let stats = engine.handle.stats().await;
-        let remaining = stats
-            .files
-            .get(file_idx)
-            .map(|file| file.length.saturating_sub(file.downloaded))
-            .unwrap_or(0);
-        if remaining == 0 {
+        let current = engine.handle.output_folder();
+        let relocating_to = match (folder, current.as_deref()) {
+            (Some(folder), Some(current)) if folder != current => Some(folder),
+            _ => None,
+        };
+        let crosses_volumes = match (relocating_to, current.as_deref()) {
+            (Some(to), Some(from)) => !self.same_volume(from, to),
+            _ => false,
+        };
+        let required = if crosses_volumes {
+            stats
+                .files
+                .iter()
+                .enumerate()
+                .filter(|(idx, file)| *idx == file_idx || file.downloaded > 0)
+                .map(|(_, file)| file.length)
+                .fold(0u64, u64::saturating_add)
+        } else {
+            stats
+                .files
+                .get(file_idx)
+                .map(|file| file.length.saturating_sub(file.downloaded))
+                .unwrap_or(0)
+        };
+        if required == 0 {
             return Ok(());
         }
         let volume = folder
             .map(std::path::Path::to_path_buf)
-            .or_else(|| engine.handle.output_folder())
+            .or(current)
             .unwrap_or_else(|| self.download_dir.clone());
-        match free_space_at(&*self.free_space_probe, &volume) {
-            Ok(available) if free_space_allows(available, remaining, PIN_FREE_SPACE_MARGIN) => {
+        match probe_at_existing_ancestor(&*self.free_space_probe, &volume) {
+            Ok(available) if free_space_allows(available, required, PIN_FREE_SPACE_MARGIN) => {
                 Ok(())
             }
             Ok(available) => Err(PinDownloadError::InsufficientSpace {
-                required: remaining.saturating_add(PIN_FREE_SPACE_MARGIN),
+                required: required.saturating_add(PIN_FREE_SPACE_MARGIN),
                 available,
                 margin: PIN_FREE_SPACE_MARGIN,
             }),
@@ -1842,12 +1905,43 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
     }
 
+    /// Whether `from` and `to` (or their nearest existing ancestors) are on
+    /// the same volume. Unknown counts as different: the free-space check
+    /// then sizes a copy rather than a rename.
+    fn same_volume(&self, from: &std::path::Path, to: &std::path::Path) -> bool {
+        let probe = &*self.volume_id_probe;
+        match (
+            probe_at_existing_ancestor(probe, from),
+            probe_at_existing_ancestor(probe, to),
+        ) {
+            (Ok(a), Ok(b)) => a == b,
+            (from_id, to_id) => {
+                debug!(
+                    from = %from.display(),
+                    to = %to.display(),
+                    ?from_id,
+                    ?to_id,
+                    "volume identity unknown; sizing the relocation as a copy"
+                );
+                false
+            }
+        }
+    }
+
     #[cfg(test)]
     fn set_free_space_probe(
         &mut self,
         probe: impl Fn(&std::path::Path) -> std::io::Result<u64> + Send + Sync + 'static,
     ) {
         self.free_space_probe = Arc::new(probe);
+    }
+
+    #[cfg(test)]
+    fn set_volume_id_probe(
+        &mut self,
+        probe: impl Fn(&std::path::Path) -> std::io::Result<u64> + Send + Sync + 'static,
+    ) {
+        self.volume_id_probe = Arc::new(probe);
     }
 
     /// Where pinned downloads go: `<dir>/<info hash>` per torrent, or the
@@ -4053,7 +4147,7 @@ mod tests {
     /// folder does not exist before its first write -- and the default
     /// probe answers for a real directory.
     #[test]
-    fn free_space_at_walks_up_to_an_existing_ancestor() {
+    fn probe_at_existing_ancestor_walks_up_to_an_existing_ancestor() {
         let probed = Mutex::new(Vec::new());
         let probe = |path: &std::path::Path| {
             probed.lock().unwrap().push(path.to_path_buf());
@@ -4064,7 +4158,8 @@ mod tests {
             }
         };
         assert_eq!(
-            free_space_at(&probe, std::path::Path::new("/root/downloads/hash")).unwrap(),
+            probe_at_existing_ancestor(&probe, std::path::Path::new("/root/downloads/hash"))
+                .unwrap(),
             42
         );
         assert_eq!(
@@ -4075,12 +4170,16 @@ mod tests {
                 "/root".into()
             ]
         );
-        assert!(free_space_at(&probe, std::path::Path::new("/nowhere/at/all")).is_err());
+        assert!(
+            probe_at_existing_ancestor(&probe, std::path::Path::new("/nowhere/at/all")).is_err()
+        );
 
         let tmp = tempfile::tempdir().unwrap();
         let real = |path: &std::path::Path| fs4::available_space(path);
-        assert!(free_space_at(&real, tmp.path()).unwrap() > 0);
-        assert!(free_space_at(&real, &tmp.path().join("not").join("yet")).unwrap() > 0);
+        assert!(probe_at_existing_ancestor(&real, tmp.path()).unwrap() > 0);
+        assert!(
+            probe_at_existing_ancestor(&real, &tmp.path().join("not").join("yet")).unwrap() > 0
+        );
     }
 
     /// A pin is refused when the volume lacks the file's missing bytes plus
@@ -4142,6 +4241,73 @@ mod tests {
         // Unprobeable volume: pinned anyway.
         let (mut enginefs, _counters) = test_enginefs_with_file_count(2);
         enginefs.set_free_space_probe(|_| Err(std::io::Error::other("no statvfs here")));
+        enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
+    }
+
+    /// A pin that relocates the torrent onto another volume has to fit what
+    /// the move copies -- the pinned file in full plus every other file with
+    /// verified data (placeholders stay behind) -- not just the pinned
+    /// file's missing bytes; on one volume the move is a rename and only the
+    /// missing bytes count. Volumes that cannot be told apart are sized as
+    /// a copy.
+    #[tokio::test]
+    async fn relocation_across_volumes_needs_room_for_what_it_copies() {
+        // Three 100-byte files, half downloaded each: every file has data,
+        // so a cross-volume move copies all 300 bytes.
+        let cross_volume = |enginefs: &mut BackendEngineFS<FakeBackend>| {
+            enginefs
+                .set_volume_id_probe(|path| Ok(if path.starts_with("/offline") { 2 } else { 1 }));
+        };
+        let (mut enginefs, counters) = test_enginefs_with_file_count(3);
+        *counters.output_folder.lock().unwrap() = Some("/cache/rqbit-downloads/show".into());
+        enginefs.set_downloads_dir(Some("/offline".into()));
+        cross_volume(&mut enginefs);
+        let available = Arc::new(AtomicU64::new(PIN_FREE_SPACE_MARGIN + 299));
+        let probe_available = available.clone();
+        enginefs.set_free_space_probe(move |_| Ok(probe_available.load(Ordering::SeqCst)));
+
+        match enginefs.pin_download(TEST_HASH, 0, None).await {
+            Err(PinDownloadError::InsufficientSpace { required, .. }) => {
+                assert_eq!(required, PIN_FREE_SPACE_MARGIN + 300);
+            }
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("must refuse"),
+        }
+        assert!(enginefs.backend.relocations.lock().unwrap().is_empty());
+        assert!(
+            enginefs.get_engine(TEST_HASH).await.is_some(),
+            "the streamed torrent stays"
+        );
+        available.store(PIN_FREE_SPACE_MARGIN + 300, Ordering::SeqCst);
+        enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
+        assert_eq!(enginefs.backend.relocations.lock().unwrap().len(), 1);
+
+        // Same volume: a rename, only the pinned file's 50 missing bytes.
+        let (mut enginefs, counters) = test_enginefs_with_file_count(3);
+        *counters.output_folder.lock().unwrap() = Some("/cache/rqbit-downloads/show".into());
+        enginefs.set_downloads_dir(Some("/offline".into()));
+        enginefs.set_volume_id_probe(|_| Ok(7));
+        enginefs.set_free_space_probe(|_| Ok(PIN_FREE_SPACE_MARGIN + 50));
+        enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
+        assert_eq!(enginefs.backend.relocations.lock().unwrap().len(), 1);
+
+        // Unknown volumes: sized as a copy.
+        let (mut enginefs, counters) = test_enginefs_with_file_count(3);
+        *counters.output_folder.lock().unwrap() = Some("/cache/rqbit-downloads/show".into());
+        enginefs.set_downloads_dir(Some("/offline".into()));
+        enginefs.set_volume_id_probe(|_| Err(std::io::Error::other("no stat")));
+        enginefs.set_free_space_probe(|_| Ok(PIN_FREE_SPACE_MARGIN + 299));
+        assert!(matches!(
+            enginefs.pin_download(TEST_HASH, 0, None).await,
+            Err(PinDownloadError::InsufficientSpace { .. })
+        ));
+
+        // Not relocating (no downloads dir): missing bytes only, whatever
+        // the volumes.
+        let (mut enginefs, counters) = test_enginefs_with_file_count(3);
+        *counters.output_folder.lock().unwrap() = Some("/cache/rqbit-downloads/show".into());
+        cross_volume(&mut enginefs);
+        enginefs.set_free_space_probe(|_| Ok(PIN_FREE_SPACE_MARGIN + 50));
         enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
     }
 
