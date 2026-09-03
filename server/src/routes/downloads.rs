@@ -10,8 +10,8 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use enginefs::PinDownloadError;
 use enginefs::backend::{EngineStats, StartupPhase, TorrentHandle};
+use enginefs::{PinDownloadError, UnpinOutcome};
 use serde_json::json;
 use std::collections::BTreeMap;
 
@@ -87,13 +87,15 @@ pub async fn pin_download(
 }
 
 /// Drop the pin on `file_idx` of `info_hash`, exactly what
-/// `DELETE /{infoHash}/{fileIdx}/download` answers. Returns whether a pin
-/// was actually cleared (false for an unknown torrent or an unpinned file).
+/// `DELETE /{infoHash}/{fileIdx}/download` answers. [`UnpinOutcome`] says
+/// whether a pin was actually cleared (false for an unknown torrent or an
+/// unpinned file) and whether data actually went -- which is what the
+/// response reports, not the request's own flag.
 /// `delete_files` also deletes the data -- the whole torrent when this was
-/// its last pin, only that file while other pins hold, and nothing at all
-/// for a pin whose torrent the backend does not have (see
-/// `enginefs::BackendEngineFS::unpin_download`); a `file_idx` the torrent
-/// does not have is then refused with [`PinDownloadError::FileNotFound`]
+/// its last pin, only that file while other pins hold, and, for a pin whose
+/// torrent the backend does not have, its `<downloadsDir>/<infoHash>` folder
+/// (see `enginefs::BackendEngineFS::unpin_download`); a `file_idx` the
+/// torrent does not have is refused with [`PinDownloadError::FileNotFound`]
 /// (404), like [`pin_download`]. Without it the bytes stay where they are
 /// and the engine becomes an ordinary, evictable one again.
 pub async fn unpin_download(
@@ -101,7 +103,7 @@ pub async fn unpin_download(
     info_hash: &str,
     file_idx: usize,
     delete_files: bool,
-) -> Result<bool, PinDownloadError> {
+) -> Result<UnpinOutcome, PinDownloadError> {
     state
         .stream_engine()
         .unpin_download(&info_hash.to_lowercase(), file_idx, delete_files)
@@ -252,11 +254,14 @@ pub async fn delete_download(
     };
     let delete_files = compat::query_flag(query.as_deref(), "deleteFiles");
     match unpin_download(&state, &info_hash, file_idx, delete_files).await {
-        Ok(unpinned) => Json(json!({
+        // `deletedFiles` is what happened, not what was asked: a dormant
+        // pin whose torrent lived in the cache root has nothing this layer
+        // can name to delete, and a failed delete is logged, not raised.
+        Ok(outcome) => Json(json!({
             "infoHash": info_hash.to_lowercase(),
             "fileIdx": file_idx,
-            "unpinned": unpinned,
-            "deletedFiles": delete_files,
+            "unpinned": outcome.unpinned,
+            "deletedFiles": outcome.deleted_files,
         }))
         .into_response(),
         Err(error) => {

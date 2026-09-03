@@ -7,7 +7,7 @@ use axum::{
 };
 use enginefs::EngineFS;
 pub use enginefs::backend::{EngineStats, TorrentListenPort};
-pub use enginefs::{PIN_FREE_SPACE_MARGIN, PinDownloadError};
+pub use enginefs::{PIN_FREE_SPACE_MARGIN, PinDownloadError, UnpinOutcome};
 pub use routes::downloads::DownloadInfo;
 pub use routes::system::{FileNotFound, ServerSettings};
 pub use state::AppState;
@@ -250,10 +250,14 @@ impl ServerHandle {
     /// Drop the pin on `file_idx` of `info_hash` (see
     /// `routes::downloads::unpin_download`, which
     /// `DELETE /{infoHash}/{fileIdx}/download?deleteFiles=1` shares).
-    /// Returns whether a pin was cleared -- false for an unknown torrent or
-    /// an unpinned file. With `delete_files` the data goes too: the whole
-    /// torrent when this was its last pin, only that file while other pins
-    /// hold, and a `file_idx` the torrent does not have is refused with
+    /// [`UnpinOutcome::unpinned`] says whether a pin was cleared -- false
+    /// for an unknown torrent or an unpinned file -- and
+    /// [`UnpinOutcome::deleted_files`] whether data actually went, which is
+    /// not simply `delete_files` echoed back. With `delete_files` the data
+    /// goes too: the whole torrent when this was its last pin, only that
+    /// file while other pins hold, the `<downloadsDir>/<infoHash>` folder
+    /// for a pin whose torrent the backend does not have, and a `file_idx`
+    /// the torrent does not have is refused with
     /// [`PinDownloadError::FileNotFound`] rather than taken for the whole
     /// torrent. Without it only the pin goes and the engine becomes an
     /// ordinary, evictable one again.
@@ -262,13 +266,13 @@ impl ServerHandle {
         info_hash: &str,
         file_idx: usize,
         delete_files: bool,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<UnpinOutcome> {
         let state = self.state.clone();
         let info_hash = info_hash.to_string();
-        let unpinned = self.block_on_server(async move {
+        let outcome = self.block_on_server(async move {
             routes::downloads::unpin_download(&state, &info_hash, file_idx, delete_files).await
         })?;
-        Ok(unpinned?)
+        Ok(outcome?)
     }
 
     /// Every pinned download, exactly what `GET /downloads.json` answers

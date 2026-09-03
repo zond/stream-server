@@ -1491,10 +1491,17 @@ fn download_routes_match_the_library_api() -> anyhow::Result<()> {
             .json::<serde_json::Value>()?["unpinned"],
         false
     );
-    assert!(!handle.unpin_download(&info_hash, first, false)?);
+    assert!(!handle.unpin_download(&info_hash, first, false)?.unpinned);
 
-    // The last pin, with the files: the torrent's folder goes with it.
-    assert!(handle.unpin_download(&info_hash.to_uppercase(), second, true)?);
+    // The last pin, with the files: the torrent's folder goes with it, and
+    // the answer says the data really went.
+    assert_eq!(
+        handle.unpin_download(&info_hash.to_uppercase(), second, true)?,
+        stream_server::UnpinOutcome {
+            unpinned: true,
+            deleted_files: true,
+        }
+    );
     assert!(!target.exists(), "the whole placed torrent folder is gone");
     assert!(handle.downloads()?.is_empty());
     assert_eq!(handle.download_path(&info_hash, second)?, None);
@@ -1504,6 +1511,35 @@ fn download_routes_match_the_library_api() -> anyhow::Result<()> {
         .error_for_status()?
         .json()?;
     assert_eq!(listed, serde_json::json!([]));
+
+    // `deletedFiles` reports what happened, not what was asked for. With
+    // no downloadsDir, an unmanaged torrent has no folder this layer named
+    // and could remove -- its bytes, if any, are in the cache root, which
+    // the cleaner does walk -- so the answer says nothing was deleted
+    // instead of echoing the query flag back.
+    handle.update_settings(serde_json::json!({ "downloadsDir": null }))?;
+    let unmanaged = "b".repeat(40);
+    let nothing: serde_json::Value = client
+        .delete(format!("{base}/{unmanaged}/0/download?deleteFiles=1"))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    assert_eq!(
+        nothing,
+        serde_json::json!({
+            "infoHash": unmanaged,
+            "fileIdx": 0,
+            "unpinned": false,
+            "deletedFiles": false,
+        })
+    );
+    assert_eq!(
+        handle.unpin_download(&unmanaged, 0, true)?,
+        stream_server::UnpinOutcome {
+            unpinned: false,
+            deleted_files: false,
+        }
+    );
 
     handle.shutdown()?;
     handle.join()?;
