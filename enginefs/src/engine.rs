@@ -1,4 +1,7 @@
-use crate::backend::{EngineStats, TorrentHandle, priorities::PlaybackIntent};
+use crate::backend::{
+    EngineStats, TorrentHandle,
+    priorities::{BufferProfile, PlaybackIntent},
+};
 use crate::cache::DataCache;
 use anyhow::Context;
 use std::collections::BTreeSet;
@@ -355,12 +358,16 @@ impl<H: TorrentHandle> Engine<H> {
     /// backend's initialization timeout) rather than failing a first play; a
     /// torrent that never becomes ready yields `GetFileError::Backend` carrying
     /// a `TorrentInitError`.
+    ///
+    /// `buffer` is the viewer's read-ahead choice, which sizes the reader's
+    /// playback window (see `priorities::BufferProfile`).
     pub async fn try_get_file_with_intent(
         self: &Arc<Self>,
         file_idx: usize,
         start_offset: u64,
         priority: u8,
         intent: PlaybackIntent,
+        buffer: BufferProfile,
     ) -> Result<FileHandle<H>, GetFileError> {
         let startup = Instant::now();
         tracing::debug!(
@@ -422,7 +429,7 @@ impl<H: TorrentHandle> Engine<H> {
         let reader_start = Instant::now();
         let reader = self
             .handle
-            .get_file_reader(file_idx, start_offset, priority, None, intent)
+            .get_file_reader(file_idx, start_offset, priority, None, intent, buffer)
             .await
             .context("get_file_reader")?;
         tracing::debug!(

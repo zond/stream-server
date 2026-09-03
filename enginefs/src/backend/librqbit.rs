@@ -1109,8 +1109,11 @@ impl TorrentHandle for LibrqbitHandle {
             }
             _ => None,
         };
+        // The startup window is the same for every buffer profile (see
+        // `BufferProfile`), so the reported readiness is too.
         let startup_window = crate::backend::priorities::librqbit_stream_lookahead_bytes(
             crate::backend::priorities::PlaybackIntent::DirectInitial,
+            crate::backend::priorities::BufferProfile::Normal,
         );
 
         let pinned = self.pinned_set();
@@ -1311,6 +1314,7 @@ impl TorrentHandle for LibrqbitHandle {
         _priority: u8,
         _bitrate: Option<u64>,
         intent: crate::backend::priorities::PlaybackIntent,
+        buffer: crate::backend::priorities::BufferProfile,
     ) -> Result<Box<dyn FileStreamTrait>> {
         // librqbit's FileStream requires the Paused or Live state; opening it
         // while the torrent is still Initializing fails immediately, which the
@@ -1320,7 +1324,9 @@ impl TorrentHandle for LibrqbitHandle {
         // librqbit's fixed 32 MiB default: a narrow startup window verifies the
         // head pieces faster, while seeks/sequential get generous read-ahead.
         let opts = librqbit::FileStreamOptions {
-            lookahead_bytes: crate::backend::priorities::librqbit_stream_lookahead_bytes(intent),
+            lookahead_bytes: crate::backend::priorities::librqbit_stream_lookahead_bytes(
+                intent, buffer,
+            ),
         };
         let stream = self
             .handle
@@ -1497,7 +1503,8 @@ impl TorrentHandle for LibrqbitHandle {
     ///
     /// Mechanism: open a short-lived librqbit FileStream and seek to `offset`.
     /// Registering the stream moves librqbit's per-stream lookahead window
-    /// (sized by `intent` via `librqbit_stream_lookahead_bytes`, matching the
+    /// (sized by `intent` and `buffer` via `librqbit_stream_lookahead_bytes`,
+    /// matching the
     /// window the real read will request) to that offset and reconnects
     /// not-needed peers --
     /// the deadline-equivalent priority yank -- and the subsequent 1-byte read
@@ -1509,6 +1516,7 @@ impl TorrentHandle for LibrqbitHandle {
         offset: u64,
         timeout: Duration,
         intent: crate::backend::priorities::PlaybackIntent,
+        buffer: crate::backend::priorities::BufferProfile,
     ) -> Result<PieceReadiness> {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -1565,7 +1573,9 @@ impl TorrentHandle for LibrqbitHandle {
         // real read so the priority yank moves the lookahead exactly where
         // playback will request it.
         let lookahead = librqbit::FileStreamOptions {
-            lookahead_bytes: crate::backend::priorities::librqbit_stream_lookahead_bytes(intent),
+            lookahead_bytes: crate::backend::priorities::librqbit_stream_lookahead_bytes(
+                intent, buffer,
+            ),
         };
         let mut stream = match self
             .handle
@@ -2622,7 +2632,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn wait_for_piece_ready_is_ready_on_seeded_torrent() {
         use crate::backend::TorrentHandle;
-        use crate::backend::priorities::PlaybackIntent;
+        use crate::backend::priorities::{BufferProfile, PlaybackIntent};
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
         let payload = dir.join("payload.bin");
@@ -2632,7 +2642,13 @@ mod tests {
         handle.handle.wait_until_initialized().await.unwrap();
 
         let r = handle
-            .wait_for_piece_ready(0, 0, TEST_WAIT_BOUND, PlaybackIntent::DirectInitial)
+            .wait_for_piece_ready(
+                0,
+                0,
+                TEST_WAIT_BOUND,
+                PlaybackIntent::DirectInitial,
+                BufferProfile::Normal,
+            )
             .await
             .unwrap();
         assert!(r.ready, "seeded torrent must be ready: {}", r.reason);
@@ -2644,7 +2660,13 @@ mod tests {
         // torrent, so the file starts at torrent offset 0).
         let offset = 40_000u64;
         let r = handle
-            .wait_for_piece_ready(0, offset, TEST_WAIT_BOUND, PlaybackIntent::DirectSeek)
+            .wait_for_piece_ready(
+                0,
+                offset,
+                TEST_WAIT_BOUND,
+                PlaybackIntent::DirectSeek,
+                BufferProfile::Normal,
+            )
             .await
             .unwrap();
         assert!(r.ready, "mid-file offset must be ready: {}", r.reason);
@@ -2658,7 +2680,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn get_file_reader_applies_intent_sized_lookahead() {
         use crate::backend::TorrentHandle;
-        use crate::backend::priorities::PlaybackIntent;
+        use crate::backend::priorities::{BufferProfile, PlaybackIntent};
         use tokio::io::AsyncReadExt;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
@@ -2673,11 +2695,14 @@ mod tests {
         for intent in [PlaybackIntent::DirectInitial, PlaybackIntent::DirectSeek] {
             // Sanity: the helper the reader uses is positive for this intent.
             assert!(
-                crate::backend::priorities::librqbit_stream_lookahead_bytes(intent) > 0,
+                crate::backend::priorities::librqbit_stream_lookahead_bytes(
+                    intent,
+                    BufferProfile::Normal
+                ) > 0,
                 "lookahead must be positive for {intent:?}"
             );
             let mut reader = handle
-                .get_file_reader(0, 0, 100, None, intent)
+                .get_file_reader(0, 0, 100, None, intent, BufferProfile::Normal)
                 .await
                 .unwrap_or_else(|e| panic!("get_file_reader failed for {intent:?}: {e:#}"));
             let mut buf = [0u8; 1];
@@ -2690,7 +2715,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn wait_for_piece_ready_times_out_without_peers() {
         use crate::backend::TorrentHandle;
-        use crate::backend::priorities::PlaybackIntent;
+        use crate::backend::priorities::{BufferProfile, PlaybackIntent};
         let tmp = tempfile::tempdir().unwrap();
         let src_dir = tmp.path().join("src");
         tokio::fs::create_dir_all(&src_dir).await.unwrap();
@@ -2702,7 +2727,13 @@ mod tests {
 
         let timeout = Duration::from_millis(300);
         let r = handle
-            .wait_for_piece_ready(0, 0, timeout, PlaybackIntent::DirectInitial)
+            .wait_for_piece_ready(
+                0,
+                0,
+                timeout,
+                PlaybackIntent::DirectInitial,
+                BufferProfile::Normal,
+            )
             .await
             .unwrap();
         assert!(!r.ready);
@@ -2713,7 +2744,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn wait_for_piece_ready_rejects_bad_targets() {
         use crate::backend::TorrentHandle;
-        use crate::backend::priorities::PlaybackIntent;
+        use crate::backend::priorities::{BufferProfile, PlaybackIntent};
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
         let payload = dir.join("payload.bin");
@@ -2729,6 +2760,7 @@ mod tests {
                 1_000_000,
                 Duration::from_secs(1),
                 PlaybackIntent::DirectSeek,
+                BufferProfile::Normal,
             )
             .await
             .unwrap();
@@ -2738,7 +2770,13 @@ mod tests {
         // Bad file index: structural failure -> Err.
         assert!(
             handle
-                .wait_for_piece_ready(7, 0, Duration::from_secs(1), PlaybackIntent::DirectInitial)
+                .wait_for_piece_ready(
+                    7,
+                    0,
+                    Duration::from_secs(1),
+                    PlaybackIntent::DirectInitial,
+                    BufferProfile::Normal,
+                )
                 .await
                 .is_err()
         );
@@ -2759,7 +2797,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn wait_for_piece_ready_live_swarm() {
         use crate::backend::TorrentHandle;
-        use crate::backend::priorities::PlaybackIntent;
+        use crate::backend::priorities::{BufferProfile, PlaybackIntent};
         let magnet = std::env::var("STREAM_SERVER_TEST_MAGNET")
             .expect("set STREAM_SERVER_TEST_MAGNET to a magnet link");
         let tmp = tempfile::tempdir().unwrap();
@@ -2780,6 +2818,7 @@ mod tests {
                 0,
                 Duration::from_secs(120),
                 PlaybackIntent::DirectInitial,
+                BufferProfile::Normal,
             )
             .await
             .expect("structural failure");
@@ -3010,7 +3049,7 @@ mod tests {
     /// still hash-checking (8 MiB of payload widens that window).
     #[tokio::test(flavor = "multi_thread")]
     async fn selection_and_reader_wait_for_initializing_torrent() {
-        use crate::backend::priorities::PlaybackIntent;
+        use crate::backend::priorities::{BufferProfile, PlaybackIntent};
         use crate::backend::{TorrentFilePriorityPlan, TorrentHandle};
         use tokio::io::AsyncReadExt;
         let tmp = tempfile::tempdir().unwrap();
@@ -3040,7 +3079,14 @@ mod tests {
         assert_eq!(handle.handle.only_files(), Some(vec![1]));
 
         let mut reader = handle
-            .get_file_reader(1, 0, 1, None, PlaybackIntent::DirectInitial)
+            .get_file_reader(
+                1,
+                0,
+                1,
+                None,
+                PlaybackIntent::DirectInitial,
+                BufferProfile::Normal,
+            )
             .await
             .expect("reader opens after initialization");
         let mut buf = [0u8; 1];
@@ -3397,7 +3443,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn multifile_selection_lifecycle() {
-        use crate::backend::priorities::PlaybackIntent;
+        use crate::backend::priorities::{BufferProfile, PlaybackIntent};
         use crate::backend::{TorrentFilePriorityPlan, TorrentHandle};
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
@@ -3445,7 +3491,13 @@ mod tests {
 
         // Gating must not starve the selected, streamed file.
         let r = handle
-            .wait_for_piece_ready(0, 0, TEST_WAIT_BOUND, PlaybackIntent::DirectInitial)
+            .wait_for_piece_ready(
+                0,
+                0,
+                TEST_WAIT_BOUND,
+                PlaybackIntent::DirectInitial,
+                BufferProfile::Normal,
+            )
             .await
             .unwrap();
         assert!(r.ready, "selected file must stay readable: {}", r.reason);

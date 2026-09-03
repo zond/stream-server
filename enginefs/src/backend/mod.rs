@@ -180,6 +180,9 @@ pub trait TorrentHandle: Send + Sync + Clone {
     fn output_folder(&self) -> Option<std::path::PathBuf> {
         None
     }
+    /// `buffer` is the viewer's read-ahead choice (the `bufferProfile`
+    /// setting or the stream request's `buffer=` override); it scales the
+    /// playback windows this reader is opened with, never the startup one.
     async fn get_file_reader(
         &self,
         file_idx: usize,
@@ -187,6 +190,7 @@ pub trait TorrentHandle: Send + Sync + Clone {
         priority: u8,
         bitrate: Option<u64>,
         intent: priorities::PlaybackIntent,
+        buffer: priorities::BufferProfile,
     ) -> Result<Box<dyn FileStreamTrait>>;
     async fn get_files(&self) -> Vec<BackendFileInfo>;
     async fn file_count(&self) -> usize {
@@ -212,6 +216,7 @@ pub trait TorrentHandle: Send + Sync + Clone {
         offset: u64,
         timeout: Duration,
         intent: priorities::PlaybackIntent,
+        buffer: priorities::BufferProfile,
     ) -> Result<PieceReadiness>;
 }
 
@@ -283,7 +288,7 @@ pub struct StatsFile {
     pub progress: f64,
     /// Bytes of this file's initial priority window (the head of the file a
     /// fresh stream fetches first, see
-    /// `priorities::librqbit_stream_lookahead_bytes(DirectInitial)`) that are
+    /// `priorities::librqbit_stream_lookahead_bytes(DirectInitial, ..)`) that are
     /// already verified on disk. Omitted while the torrent has no piece map
     /// (resolving metadata / hash-checking / error).
     #[serde(default, skip_serializing_if = "Option::is_none")]

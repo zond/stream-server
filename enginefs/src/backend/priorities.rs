@@ -50,6 +50,76 @@ pub fn is_container_metadata_request(start: u64, requested_len: u64, file_size: 
         && start >= container_metadata_start(file_size)
 }
 
+/// How far ahead a *playback* stream reads.
+///
+/// The read-ahead windows are constants tuned for a healthy connection and a
+/// patient player. A spotty link -- or a receiver with a shallower buffer than
+/// mpv's -- wants more of the file fetched before it is needed, at the cost of
+/// downloading further ahead than will necessarily be watched. This is that
+/// choice, as a multiplier applied to the playback windows.
+///
+/// It deliberately does **not** touch the startup window
+/// ([`MAX_STARTUP_WINDOW_BYTES`]): the narrow first-frame want-set is what
+/// makes playback start quickly, and widening it would spend that latency to
+/// buy read-ahead the very next request already provides. Every profile
+/// starts a stream the same way and differs only once bytes are flowing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BufferProfile {
+    /// Today's behaviour, and the default.
+    #[default]
+    Normal,
+    /// Twice the playback read-ahead.
+    Large,
+    /// Four times the playback read-ahead.
+    Maximum,
+}
+
+impl BufferProfile {
+    /// Every profile, in ascending window order -- for enumerating the choice
+    /// in a UI or a test.
+    pub const ALL: [BufferProfile; 3] = [Self::Normal, Self::Large, Self::Maximum];
+
+    /// The wire spelling, matching the `serde` representation.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Large => "large",
+            Self::Maximum => "maximum",
+        }
+    }
+
+    /// Parse a wire spelling. Surrounding whitespace and case are ignored;
+    /// anything else is `None`, which callers turn into "use the default"
+    /// rather than into a failed request.
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        Self::ALL
+            .into_iter()
+            .find(|profile| value.eq_ignore_ascii_case(profile.as_str()))
+    }
+
+    /// The multiplier this profile applies to a playback window.
+    const fn window_scale(self) -> u64 {
+        match self {
+            Self::Normal => 1,
+            Self::Large => 2,
+            Self::Maximum => 4,
+        }
+    }
+
+    /// Scale a playback read-ahead window in bytes. Saturating, so no profile
+    /// can wrap a large window round to a small one.
+    pub const fn scale_playback_window(self, bytes: u64) -> u64 {
+        bytes.saturating_mul(self.window_scale())
+    }
+
+    /// Scale a playback read-ahead window measured in pieces.
+    pub const fn scale_playback_pieces(self, pieces: i32) -> i32 {
+        pieces.saturating_mul(self.window_scale() as i32)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PlaybackIntent {
@@ -107,12 +177,15 @@ pub fn disk_backed_file_baseline_priority(intent: PlaybackIntent) -> i32 {
     }
 }
 
-pub fn disk_backed_forward_window_pieces(intent: PlaybackIntent) -> i32 {
+pub fn disk_backed_forward_window_pieces(intent: PlaybackIntent, buffer: BufferProfile) -> i32 {
     match intent {
         PlaybackIntent::DownloadFull => 64,
         PlaybackIntent::DownloadRange => 8,
+        // Startup is not scaled by the buffer profile: see [`BufferProfile`].
         PlaybackIntent::DirectInitial => MAX_STARTUP_PIECES,
-        PlaybackIntent::DirectSeek | PlaybackIntent::DirectSequential => 32,
+        PlaybackIntent::DirectSeek | PlaybackIntent::DirectSequential => {
+            buffer.scale_playback_pieces(32)
+        }
         // The container seek index (MKV Cues / MP4 moov) spans several pieces;
         // 16 lets the 16 MB MAX_CONTAINER_METADATA_WINDOW_BYTES cap govern (via
         // cap_pieces_by_bytes) so the whole region downloads in parallel instead
@@ -123,13 +196,20 @@ pub fn disk_backed_forward_window_pieces(intent: PlaybackIntent) -> i32 {
     }
 }
 
-pub fn disk_backed_forward_window_pieces_for(intent: PlaybackIntent, piece_length: u64) -> i32 {
-    let pieces = disk_backed_forward_window_pieces(intent);
+pub fn disk_backed_forward_window_pieces_for(
+    intent: PlaybackIntent,
+    piece_length: u64,
+    buffer: BufferProfile,
+) -> i32 {
+    let pieces = disk_backed_forward_window_pieces(intent, buffer);
     let byte_cap = match intent {
         PlaybackIntent::DownloadFull => MAX_WARM_WINDOW_BYTES,
         PlaybackIntent::DownloadRange => MAX_DOWNLOAD_RANGE_WINDOW_BYTES,
+        // Startup is not scaled by the buffer profile: see [`BufferProfile`].
         PlaybackIntent::DirectInitial => MAX_STARTUP_WINDOW_BYTES,
-        PlaybackIntent::DirectSeek | PlaybackIntent::DirectSequential => MAX_SEEK_HOT_WINDOW_BYTES,
+        PlaybackIntent::DirectSeek | PlaybackIntent::DirectSequential => {
+            buffer.scale_playback_window(MAX_SEEK_HOT_WINDOW_BYTES)
+        }
         PlaybackIntent::ContainerMetadata | PlaybackIntent::InternalProbe => {
             MAX_CONTAINER_METADATA_WINDOW_BYTES
         }
@@ -144,13 +224,22 @@ pub fn disk_backed_forward_window_pieces_for(intent: PlaybackIntent, piece_lengt
 /// maps each intent onto, so librqbit reads ahead by the same byte budget the
 /// disk-cache path uses. `stream_with_options` rejects a zero window, so the
 /// result is clamped to at least 1 (all constants are already > 0).
-pub fn librqbit_stream_lookahead_bytes(intent: PlaybackIntent) -> u64 {
+///
+/// `buffer` is the viewer's read-ahead choice and scales the playback windows
+/// only -- never the startup one, see [`BufferProfile`].
+pub fn librqbit_stream_lookahead_bytes(intent: PlaybackIntent, buffer: BufferProfile) -> u64 {
     match intent {
         // First-frame latency: narrow the startup want-set (4 MiB) so the head
-        // pieces verify faster than under librqbit's 32 MiB default.
+        // pieces verify faster than under librqbit's 32 MiB default. This is
+        // the one window the buffer profile leaves alone: widening it would
+        // trade first-frame latency away for read-ahead the next request
+        // (already DirectSequential, already scaled) supplies anyway.
         PlaybackIntent::DirectInitial => MAX_STARTUP_WINDOW_BYTES,
-        // Hot read-ahead once playing / after a seek.
-        PlaybackIntent::DirectSeek | PlaybackIntent::DirectSequential => MAX_SEEK_HOT_WINDOW_BYTES,
+        // Hot read-ahead once playing / after a seek -- what the viewer's
+        // buffer choice is actually about.
+        PlaybackIntent::DirectSeek | PlaybackIntent::DirectSequential => {
+            buffer.scale_playback_window(MAX_SEEK_HOT_WINDOW_BYTES)
+        }
         PlaybackIntent::DownloadFull => MAX_WARM_WINDOW_BYTES,
         PlaybackIntent::DownloadRange => MAX_DOWNLOAD_RANGE_WINDOW_BYTES,
         PlaybackIntent::ContainerMetadata
@@ -248,6 +337,8 @@ impl Default for EngineCacheConfig {
 #[derive(Debug, Clone)]
 pub struct PriorityContext {
     pub intent: PlaybackIntent,
+    /// The viewer's read-ahead choice; scales the playback windows only.
+    pub buffer: BufferProfile,
     pub current_piece: i32,
     pub first_piece: i32,
     pub last_piece: i32,
@@ -398,17 +489,21 @@ impl PlaybackPriorityPolicy {
         let original_hot = hot;
         let original_warm = warm;
         hot = cap_pieces_by_bytes(hot, ctx.piece_length, hot_byte_cap(&ctx));
-        warm = cap_pieces_by_bytes(warm, ctx.piece_length, warm_byte_cap(ctx.intent));
+        warm = cap_pieces_by_bytes(
+            warm,
+            ctx.piece_length,
+            warm_byte_cap(ctx.intent, ctx.buffer),
+        );
         if hot < original_hot || warm < original_warm {
             reason.push_str("-byte-cap");
         }
 
         hot = hot
-            .clamp(0, MAX_HOT_PIECES)
+            .clamp(0, ctx.buffer.scale_playback_pieces(MAX_HOT_PIECES))
             .min(max_cache_pieces)
             .min(remaining_pieces);
         warm = warm
-            .clamp(0, MAX_WARM_PIECES)
+            .clamp(0, ctx.buffer.scale_playback_pieces(MAX_WARM_PIECES))
             .min(max_cache_pieces.saturating_sub(hot))
             .min(remaining_pieces.saturating_sub(hot));
         immediate = immediate.min(hot).max(0);
@@ -463,9 +558,13 @@ fn cap_pieces_by_bytes(pieces: i32, piece_length: u64, max_bytes: u64) -> i32 {
 
 fn hot_byte_cap(ctx: &PriorityContext) -> u64 {
     match ctx.intent {
+        // Startup is not scaled by the buffer profile: see [`BufferProfile`].
         PlaybackIntent::DirectInitial if !ctx.first_byte_sent => MAX_STARTUP_WINDOW_BYTES,
-        PlaybackIntent::DirectInitial => MAX_SEEK_HOT_WINDOW_BYTES,
-        PlaybackIntent::DirectSeek | PlaybackIntent::DirectSequential => MAX_SEEK_HOT_WINDOW_BYTES,
+        PlaybackIntent::DirectInitial
+        | PlaybackIntent::DirectSeek
+        | PlaybackIntent::DirectSequential => {
+            ctx.buffer.scale_playback_window(MAX_SEEK_HOT_WINDOW_BYTES)
+        }
         PlaybackIntent::DownloadFull => MAX_WARM_WINDOW_BYTES,
         PlaybackIntent::DownloadRange => MAX_DOWNLOAD_RANGE_WINDOW_BYTES,
         PlaybackIntent::ContainerMetadata | PlaybackIntent::InternalProbe => {
@@ -475,12 +574,15 @@ fn hot_byte_cap(ctx: &PriorityContext) -> u64 {
     }
 }
 
-fn warm_byte_cap(intent: PlaybackIntent) -> u64 {
+fn warm_byte_cap(intent: PlaybackIntent, buffer: BufferProfile) -> u64 {
     match intent {
+        // The warm band trails the hot one through the same file: it is part
+        // of the read-ahead the viewer chose, so it scales with it. A pinned
+        // download's warm window is not a playback choice and does not.
         PlaybackIntent::DirectInitial
         | PlaybackIntent::DirectSeek
-        | PlaybackIntent::DirectSequential
-        | PlaybackIntent::DownloadFull => MAX_WARM_WINDOW_BYTES,
+        | PlaybackIntent::DirectSequential => buffer.scale_playback_window(MAX_WARM_WINDOW_BYTES),
+        PlaybackIntent::DownloadFull => MAX_WARM_WINDOW_BYTES,
         PlaybackIntent::DownloadRange
         | PlaybackIntent::ContainerMetadata
         | PlaybackIntent::InternalProbe
@@ -518,7 +620,11 @@ fn dynamic_hot_window(ctx: &PriorityContext, bitrate_ratio: Option<f64>) -> i32 
         hot = hot.min(MIN_SEEK_HOT_PIECES);
     }
 
-    hot
+    // Whatever the policy sized the hot band at, the viewer's buffer choice
+    // multiplies it -- including the few-peers clamp above, which exists to
+    // avoid spreading a thin swarm thin, and which a viewer asking for more
+    // read-ahead on a bad connection is deliberately overriding.
+    ctx.buffer.scale_playback_pieces(hot)
 }
 
 fn assignment_for(
@@ -572,6 +678,7 @@ pub fn calculate_priorities(
 
     PlaybackPriorityPolicy::decide(PriorityContext {
         intent,
+        buffer: BufferProfile::Normal,
         current_piece,
         first_piece: 0,
         last_piece: total_pieces.saturating_sub(1),
@@ -595,6 +702,7 @@ mod tests {
     fn base_context(intent: PlaybackIntent) -> PriorityContext {
         PriorityContext {
             intent,
+            buffer: BufferProfile::Normal,
             current_piece: 100,
             first_piece: 0,
             last_piece: 999,
@@ -752,12 +860,18 @@ mod tests {
         // for the 16 MB byte cap (cap_pieces_by_bytes) to govern so the whole
         // index downloads in parallel instead of one rare piece at a time.
         assert_eq!(
-            disk_backed_forward_window_pieces(PlaybackIntent::ContainerMetadata),
+            disk_backed_forward_window_pieces(
+                PlaybackIntent::ContainerMetadata,
+                BufferProfile::Normal
+            ),
             16
         );
         assert!(
-            disk_backed_forward_window_pieces(PlaybackIntent::DownloadFull)
-                > disk_backed_forward_window_pieces(PlaybackIntent::DownloadRange)
+            disk_backed_forward_window_pieces(PlaybackIntent::DownloadFull, BufferProfile::Normal)
+                > disk_backed_forward_window_pieces(
+                    PlaybackIntent::DownloadRange,
+                    BufferProfile::Normal
+                )
         );
     }
 
@@ -882,7 +996,11 @@ mod tests {
     #[test]
     fn disk_backed_forward_window_respects_piece_size_byte_cap() {
         assert_eq!(
-            disk_backed_forward_window_pieces_for(PlaybackIntent::DownloadRange, 64 * 1024 * 1024),
+            disk_backed_forward_window_pieces_for(
+                PlaybackIntent::DownloadRange,
+                64 * 1024 * 1024,
+                BufferProfile::Normal
+            ),
             1
         );
     }
@@ -903,35 +1021,41 @@ mod tests {
     #[test]
     fn librqbit_lookahead_maps_each_intent_to_its_window_cap() {
         assert_eq!(
-            librqbit_stream_lookahead_bytes(PlaybackIntent::DirectInitial),
+            librqbit_stream_lookahead_bytes(PlaybackIntent::DirectInitial, BufferProfile::Normal),
             MAX_STARTUP_WINDOW_BYTES
         );
         assert_eq!(
-            librqbit_stream_lookahead_bytes(PlaybackIntent::DirectSeek),
+            librqbit_stream_lookahead_bytes(PlaybackIntent::DirectSeek, BufferProfile::Normal),
             MAX_SEEK_HOT_WINDOW_BYTES
         );
         assert_eq!(
-            librqbit_stream_lookahead_bytes(PlaybackIntent::DirectSequential),
+            librqbit_stream_lookahead_bytes(
+                PlaybackIntent::DirectSequential,
+                BufferProfile::Normal
+            ),
             MAX_SEEK_HOT_WINDOW_BYTES
         );
         assert_eq!(
-            librqbit_stream_lookahead_bytes(PlaybackIntent::DownloadFull),
+            librqbit_stream_lookahead_bytes(PlaybackIntent::DownloadFull, BufferProfile::Normal),
             MAX_WARM_WINDOW_BYTES
         );
         assert_eq!(
-            librqbit_stream_lookahead_bytes(PlaybackIntent::DownloadRange),
+            librqbit_stream_lookahead_bytes(PlaybackIntent::DownloadRange, BufferProfile::Normal),
             MAX_DOWNLOAD_RANGE_WINDOW_BYTES
         );
         assert_eq!(
-            librqbit_stream_lookahead_bytes(PlaybackIntent::ContainerMetadata),
+            librqbit_stream_lookahead_bytes(
+                PlaybackIntent::ContainerMetadata,
+                BufferProfile::Normal
+            ),
             MAX_CONTAINER_METADATA_WINDOW_BYTES
         );
         assert_eq!(
-            librqbit_stream_lookahead_bytes(PlaybackIntent::InternalProbe),
+            librqbit_stream_lookahead_bytes(PlaybackIntent::InternalProbe, BufferProfile::Normal),
             MAX_CONTAINER_METADATA_WINDOW_BYTES
         );
         assert_eq!(
-            librqbit_stream_lookahead_bytes(PlaybackIntent::Background),
+            librqbit_stream_lookahead_bytes(PlaybackIntent::Background, BufferProfile::Normal),
             MAX_CONTAINER_METADATA_WINDOW_BYTES
         );
         // Every intent must produce a positive window (stream_with_options
@@ -946,7 +1070,7 @@ mod tests {
             PlaybackIntent::InternalProbe,
             PlaybackIntent::Background,
         ] {
-            assert!(librqbit_stream_lookahead_bytes(intent) > 0);
+            assert!(librqbit_stream_lookahead_bytes(intent, BufferProfile::Normal) > 0);
         }
     }
 
@@ -1015,5 +1139,152 @@ mod tests {
         assert_eq!(initial_window_progress(0, 100, 256, 0, have_all), (0, 0));
         // Zero piece length is impossible in a valid torrent; report nothing ready.
         assert_eq!(initial_window_progress(0, 100, 0, 1024, have_all), (0, 100));
+    }
+
+    #[test]
+    fn buffer_profiles_round_trip_their_wire_spelling() {
+        for profile in BufferProfile::ALL {
+            assert_eq!(BufferProfile::parse(profile.as_str()), Some(profile));
+            // What `serde` writes and what `parse` reads must be one spelling:
+            // the setting and the `buffer=` query parameter share it.
+            assert_eq!(
+                serde_json::to_value(profile).unwrap(),
+                serde_json::Value::String(profile.as_str().to_string())
+            );
+        }
+        assert_eq!(BufferProfile::parse("  LARGE "), Some(BufferProfile::Large));
+        for unknown in ["", "huge", "2", "normalish"] {
+            assert_eq!(BufferProfile::parse(unknown), None, "value {unknown:?}");
+        }
+        assert_eq!(BufferProfile::default(), BufferProfile::Normal);
+    }
+
+    #[test]
+    fn buffer_profiles_scale_the_playback_lookahead_window() {
+        let normal =
+            librqbit_stream_lookahead_bytes(PlaybackIntent::DirectSeek, BufferProfile::Normal);
+        assert_eq!(normal, MAX_SEEK_HOT_WINDOW_BYTES);
+        assert_eq!(
+            librqbit_stream_lookahead_bytes(PlaybackIntent::DirectSeek, BufferProfile::Large),
+            2 * MAX_SEEK_HOT_WINDOW_BYTES
+        );
+        assert_eq!(
+            librqbit_stream_lookahead_bytes(PlaybackIntent::DirectSeek, BufferProfile::Maximum),
+            4 * MAX_SEEK_HOT_WINDOW_BYTES
+        );
+        // The window a playing stream actually uses is the sequential one, and
+        // it scales the same way.
+        for profile in BufferProfile::ALL {
+            assert_eq!(
+                librqbit_stream_lookahead_bytes(PlaybackIntent::DirectSequential, profile),
+                librqbit_stream_lookahead_bytes(PlaybackIntent::DirectSeek, profile),
+                "profile {}",
+                profile.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn the_startup_window_is_the_same_under_every_buffer_profile() {
+        // Deliberate: the narrow first-frame want-set is what makes playback
+        // start quickly. Widening it would trade that latency away.
+        for profile in BufferProfile::ALL {
+            assert_eq!(
+                librqbit_stream_lookahead_bytes(PlaybackIntent::DirectInitial, profile),
+                MAX_STARTUP_WINDOW_BYTES,
+                "profile {}",
+                profile.as_str()
+            );
+            let mut ctx = base_context(PlaybackIntent::DirectInitial);
+            ctx.buffer = profile;
+            ctx.first_byte_sent = false;
+            let decision = PlaybackPriorityPolicy::decide(ctx);
+            assert!(
+                decision.hot_window_pieces as u64 * 1024 * 1024 <= MAX_STARTUP_WINDOW_BYTES,
+                "profile {} widened the startup window to {} pieces",
+                profile.as_str(),
+                decision.hot_window_pieces
+            );
+        }
+    }
+
+    #[test]
+    fn non_playback_windows_ignore_the_buffer_profile() {
+        for intent in [
+            PlaybackIntent::DownloadFull,
+            PlaybackIntent::DownloadRange,
+            PlaybackIntent::ContainerMetadata,
+            PlaybackIntent::InternalProbe,
+            PlaybackIntent::Background,
+        ] {
+            let normal = librqbit_stream_lookahead_bytes(intent, BufferProfile::Normal);
+            for profile in BufferProfile::ALL {
+                assert_eq!(
+                    librqbit_stream_lookahead_bytes(intent, profile),
+                    normal,
+                    "{intent:?} under {}",
+                    profile.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn buffer_profiles_scale_the_disk_backed_forward_window() {
+        let piece_length = 1024 * 1024;
+        let normal = disk_backed_forward_window_pieces_for(
+            PlaybackIntent::DirectSequential,
+            piece_length,
+            BufferProfile::Normal,
+        );
+        assert_eq!(
+            disk_backed_forward_window_pieces_for(
+                PlaybackIntent::DirectSequential,
+                piece_length,
+                BufferProfile::Large,
+            ),
+            2 * normal
+        );
+        assert_eq!(
+            disk_backed_forward_window_pieces_for(
+                PlaybackIntent::DirectSequential,
+                piece_length,
+                BufferProfile::Maximum,
+            ),
+            4 * normal
+        );
+        // Startup stays put here too.
+        for profile in BufferProfile::ALL {
+            assert_eq!(
+                disk_backed_forward_window_pieces_for(
+                    PlaybackIntent::DirectInitial,
+                    piece_length,
+                    profile,
+                ),
+                disk_backed_forward_window_pieces_for(
+                    PlaybackIntent::DirectInitial,
+                    piece_length,
+                    BufferProfile::Normal,
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn buffer_profiles_widen_the_policy_hot_window() {
+        let mut normal_ctx = base_context(PlaybackIntent::DirectSequential);
+        normal_ctx.cache_size_bytes = u64::MAX;
+        let mut previous = 0;
+        for profile in BufferProfile::ALL {
+            let mut ctx = normal_ctx.clone();
+            ctx.buffer = profile;
+            let decision = PlaybackPriorityPolicy::decide(ctx);
+            assert!(
+                decision.hot_window_pieces > previous,
+                "{} did not widen the hot window past {previous} pieces",
+                profile.as_str()
+            );
+            previous = decision.hot_window_pieces;
+        }
     }
 }

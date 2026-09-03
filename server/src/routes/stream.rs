@@ -730,7 +730,15 @@ pub async fn stream_video(
         "stream_video calling get_file"
     );
     let mut file = match engine
-        .try_get_file_with_intent(idx, start_offset_hint, priority, playback_intent)
+        .try_get_file_with_intent(
+            idx,
+            start_offset_hint,
+            priority,
+            playback_intent,
+            // Every stream reads ahead by the default profile for now; the
+            // setting and the per-request override land next.
+            enginefs::backend::priorities::BufferProfile::default(),
+        )
         .await
     {
         Ok(file) => file,

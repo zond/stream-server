@@ -445,6 +445,9 @@ async fn stream_file(
                         7,
                         None,
                         enginefs::backend::priorities::PlaybackIntent::DirectInitial,
+                        // Archive members are read whole, sequentially, from a
+                        // session the viewer never gets a buffer choice for.
+                        enginefs::backend::priorities::BufferProfile::Normal,
                     )
                     .await // 7 = high priority
                     .map_err(|e| {

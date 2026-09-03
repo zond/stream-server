@@ -3676,6 +3676,7 @@ mod tests {
             _priority: u8,
             _bitrate: Option<u64>,
             _intent: crate::backend::priorities::PlaybackIntent,
+            _buffer: crate::backend::priorities::BufferProfile,
         ) -> Result<Box<dyn FileStreamTrait>> {
             self.gate().await?;
             self.counters.get_file_reader.fetch_add(1, Ordering::SeqCst);
@@ -3712,6 +3713,7 @@ mod tests {
             _offset: u64,
             _timeout: Duration,
             _intent: crate::backend::priorities::PlaybackIntent,
+            _buffer: crate::backend::priorities::BufferProfile,
         ) -> Result<PieceReadiness> {
             Ok(PieceReadiness {
                 ready: true,
@@ -3916,7 +3918,7 @@ mod tests {
     // blocks (no error, no empty body) and succeeds once the torrent is ready.
     #[tokio::test(start_paused = true)]
     async fn get_file_waits_for_initializing_torrent_then_succeeds() {
-        use crate::backend::priorities::PlaybackIntent;
+        use crate::backend::priorities::{BufferProfile, PlaybackIntent};
         use tokio::io::AsyncReadExt;
         let (enginefs, counters, init) =
             test_enginefs_initializing(2, crate::backend::librqbit::TORRENT_INIT_TIMEOUT);
@@ -3933,7 +3935,13 @@ mod tests {
 
         let started = tokio::time::Instant::now();
         let mut file = engine
-            .try_get_file_with_intent(1, 0, 1, PlaybackIntent::DirectInitial)
+            .try_get_file_with_intent(
+                1,
+                0,
+                1,
+                PlaybackIntent::DirectInitial,
+                BufferProfile::Normal,
+            )
             .await
             .expect("get_file must succeed once the torrent initializes");
         flipper.await.unwrap();
@@ -3966,7 +3974,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn get_file_fails_cleanly_when_torrent_never_initializes() {
         use crate::backend::librqbit::TorrentInitError;
-        use crate::backend::priorities::PlaybackIntent;
+        use crate::backend::priorities::{BufferProfile, PlaybackIntent};
         let init_timeout = Duration::from_secs(3);
         let (enginefs, counters, init) = test_enginefs_initializing(2, init_timeout);
         let engine = enginefs.get_engine(TEST_HASH).await.expect("engine");
@@ -3975,7 +3983,13 @@ mod tests {
         // Outer bound is the "no hang" assertion (virtual time auto-advances).
         let result = tokio::time::timeout(
             Duration::from_secs(30),
-            engine.try_get_file_with_intent(1, 0, 1, PlaybackIntent::DirectInitial),
+            engine.try_get_file_with_intent(
+                1,
+                0,
+                1,
+                PlaybackIntent::DirectInitial,
+                BufferProfile::Normal,
+            ),
         )
         .await
         .expect("get_file must not hang past the initialization timeout");
