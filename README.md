@@ -188,7 +188,7 @@ The HTTP surface is deliberately small and split in two by `build_router()` (`se
 
 | Method | Path | Access | Consumer |
 |---|---|---|---|
-| GET, HEAD | `/{infoHash}/{fileIdx}` | OPEN | players — the stream URL stremio-core builds (`?tr=…`, `?f=…` as documented under [Startup phases](#startup-phases-in-statsjson)) |
+| GET, HEAD | `/{infoHash}/{fileIdx}` | OPEN | players — the stream URL stremio-core builds (`?tr=…`, `?f=…` as documented under [Startup phases](#startup-phases-in-statsjson), plus `?buffer=` — see [Buffer profiles](#buffer-profiles)) |
 | GET, HEAD | `/stream/{infoHash}/{fileIdx}` | OPEN | players (alias of the above) |
 | GET, POST | `/{rar\|zip\|7zip\|tar\|tgz}/create`, `/{…}/create/{key}` | OPEN | players — archive session creation via `?lz=` (stremio-core builds these URLs) |
 | GET | `/{rar\|zip\|7zip\|tar\|tgz}/stream`, `/{…}/stream/{key}`, `/{…}/stream/{key}/{*file}` | OPEN | players — archive member bytes |
@@ -216,6 +216,29 @@ The HTTP surface is deliberately small and split in two by `build_router()` (`se
 Unknown paths get `404`, a wrong method on a known path `405` (or `401` first, on a control route).
 
 RAR routes return a `501` JSON error in a `--no-default-features` build.
+
+### Buffer profiles
+
+How far ahead playback reads is a choice, not a constant. A spotty connection — or a receiver whose own buffer is shallower than mpv's — wants more of the file fetched before it is needed; a fast link on a metered phone wants less. The choice is one of three profiles, and it is offered twice:
+
+- **`settings.bufferProfile`** (`GET`/`POST /settings`, `ServerHandle::settings`/`update_settings`) — the default for every stream request that does not say otherwise. `"normal"` unless set.
+- **`?buffer=` on the stream route** — `GET`/`HEAD /{infoHash}/{fileIdx}` and its `/stream/…` alias, alongside the existing `tr=`, `f=` and `download=`. It overrides the setting for that request only, so a client can keep a global preference and still change the buffer for one playback.
+
+| Profile | Playback read-ahead window | Startup window |
+|---|---|---|
+| `normal` (default) | 128 MiB hot, 256 MiB warm — what this server has always used | 4 MiB |
+| `large` | 256 MiB hot, 512 MiB warm (×2) | 4 MiB |
+| `maximum` | 512 MiB hot, 1 GiB warm (×4) | 4 MiB |
+
+The hot window is librqbit's per-stream lookahead (`FileStreamOptions::lookahead_bytes`, via `priorities::librqbit_stream_lookahead_bytes`) once bytes are flowing — after a seek and while playing sequentially; the warm window is the band trailing behind it in the disk-cache forward plan. Both are byte budgets the engine tries to have on disk ahead of the read head, not a promise: a swarm that cannot fill them simply does not.
+
+**The startup window is the same under every profile, deliberately.** The narrow first-frame want-set (4 MiB, `MAX_STARTUP_WINDOW_BYTES`) is what makes playback start quickly — widening it would spend that latency to buy read-ahead the very next request already asks for. Choosing a bigger profile never slows a play down; it changes what happens after the first frame.
+
+**What it costs.** A larger window downloads further ahead of what is being watched, which means proportionally more **disk** held in the piece cache (and counted against `cacheSize`, so a big profile with a small cache just churns) and proportionally more **bandwidth** spent on bytes the viewer may seek past or never reach — worth saying out loud on mobile data. `maximum` can hold up to 1.5 GiB of one file in flight. If the connection is bad enough that even `maximum` stutters, the honest answer is not a bigger window but an offline download: pin the file (`POST /{infoHash}/{fileIdx}/download`, see [Offline downloads](#offline-downloads)) and watch it once it is there.
+
+**Validation is lenient by design.** The value is matched case-insensitively with surrounding whitespace ignored. Anything else — a profile a future build added, a typo, an empty value — is *not* an error: on `?buffer=` it falls back to `settings.bufferProfile`, and on `POST /settings` it leaves the setting as it was, like every other unrecognised value in that payload. A player must never lose a playback because it guessed a name wrong. The wire is additive throughout: a client that sends neither gets exactly today's behaviour.
+
+Archive members (RAR/ZIP/7Z/TAR/NZB) and offline downloads are not affected — neither is a playback the viewer gets to make this choice about, and both already read whole and sequentially.
 
 ### Library API
 
