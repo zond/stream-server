@@ -1227,6 +1227,41 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
     }
 
+    /// Where the registry's engines write, for the cache cleaner: every
+    /// file at the path the backend reports (`TorrentHandle::file_path`, or
+    /// the output folder joined with the file's name when the backend knows
+    /// the folder but not the path), `<download_dir>/<name>` for a backend
+    /// that knows neither. A torrent without a file list yet protects its
+    /// output folder (or `<download_dir>/<name>`). Paths outside the
+    /// download dir (a torrent placed under the downloads dir) are harmless
+    /// to the cleaner, which never walks there.
+    pub async fn protected_paths(&self) -> Vec<std::path::PathBuf> {
+        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
+        let mut paths = Vec::new();
+        for engine in engines {
+            let stats = engine.get_statistics().await;
+            let folder = engine
+                .handle
+                .output_folder()
+                .filter(|folder| *folder != self.download_dir);
+            if stats.files.is_empty() {
+                paths.push(folder.unwrap_or_else(|| self.download_dir.join(&stats.name)));
+                continue;
+            }
+            for (idx, file) in stats.files.iter().enumerate() {
+                let path = match engine.handle.file_path(idx).await {
+                    Some(path) => path,
+                    None => folder
+                        .as_deref()
+                        .unwrap_or(&self.download_dir)
+                        .join(&file.path),
+                };
+                paths.push(path);
+            }
+        }
+        paths
+    }
+
     pub async fn get_all_statistics(&self) -> HashMap<String, crate::backend::EngineStats> {
         let engines = self.engines.read().await;
         let mut stats = HashMap::new();
@@ -2983,6 +3018,13 @@ mod tests {
             self.counters.output_folder.lock().unwrap().clone()
         }
 
+        /// Like the real backend: the output folder joined with the file's
+        /// name, unknown without a folder.
+        async fn file_path(&self, file_idx: usize) -> Option<std::path::PathBuf> {
+            let folder = self.output_folder()?;
+            Some(folder.join(&self.files.get(file_idx)?.name))
+        }
+
         async fn resume_torrent(&self) -> Result<()> {
             self.counters.resume_torrent.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -4160,6 +4202,38 @@ mod tests {
             "relocation still fails"
         );
         assert!(enginefs.get_engine(TEST_HASH).await.is_none());
+    }
+
+    /// The cleaner's protected paths are where the files really are: the
+    /// backend's `file_path` (its output folder -- `<root>/<torrent name>`
+    /// for a multi-file torrent in the cache root, `<downloadsDir>/<hash>`
+    /// for a placed one), not `<root>/<relative name>`, which for a
+    /// multi-file torrent names a file that does not exist while the real
+    /// one goes unprotected.
+    #[tokio::test]
+    async fn protected_paths_follow_the_backend_output_folder() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        let root = enginefs.download_dir.clone();
+
+        // Backend without a folder or path: the historical root join.
+        assert_eq!(
+            enginefs.protected_paths().await,
+            vec![root.join("video-0.mkv"), root.join("video-1.mkv")]
+        );
+
+        let show = root.join("show");
+        *counters.output_folder.lock().unwrap() = Some(show.clone());
+        assert_eq!(
+            enginefs.protected_paths().await,
+            vec![show.join("video-0.mkv"), show.join("video-1.mkv")]
+        );
+
+        let placed = std::path::PathBuf::from("/offline").join(TEST_HASH);
+        *counters.output_folder.lock().unwrap() = Some(placed.clone());
+        assert_eq!(
+            enginefs.protected_paths().await,
+            vec![placed.join("video-0.mkv"), placed.join("video-1.mkv")]
+        );
     }
 
     // --- free-space check before pinning ---

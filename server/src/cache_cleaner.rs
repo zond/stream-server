@@ -120,31 +120,12 @@ async fn clean_cache(state: &Arc<AppState>) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // 1. Identify protected files matching current active engines
-    let mut protected_paths = HashSet::new();
-
-    for (root, engines) in [
-        (
-            state.engine.download_dir.clone(),
-            state.engine.get_all_statistics().await,
-        ),
-        (
-            state.download_engine.download_dir.clone(),
-            state.download_engine.get_all_statistics().await,
-        ),
-    ] {
-        for (_, stats) in engines {
-            if !stats.files.is_empty() {
-                for file in stats.files {
-                    let path = root.join(&file.path);
-                    protected_paths.insert(path);
-                }
-            } else {
-                let path = root.join(&stats.name);
-                protected_paths.insert(path);
-            }
-        }
-    }
+    // 1. Identify protected files: everything a live engine writes, at the
+    // paths the backend reports (a pinned engine stays live, so its data is
+    // protected for as long as the pin holds).
+    let mut protected_paths: HashSet<_> =
+        state.engine.protected_paths().await.into_iter().collect();
+    protected_paths.extend(state.download_engine.protected_paths().await);
 
     evict(&download_dirs, &protected_paths, limit).await
 }
