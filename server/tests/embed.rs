@@ -744,6 +744,13 @@ fn stats_json_exposes_startup_phase_fields_additively() -> anyhow::Result<()> {
     // Nobody is seeding this fixture torrent and the embedded session has no
     // peer to connect to, so the honest answer is 0 -- but the field is there.
     assert_eq!(stats["connectedSeeders"], 0, "{stats}");
+    // Swarm-wide scrape figures. This fixture torrent has no trackers, so
+    // there is nothing to scrape and all three are null -- present in the
+    // shape, never a stand-in 0.
+    for key in ["swarmSeeders", "swarmLeechers", "swarmScrapeAgeSecs"] {
+        assert!(obj.contains_key(key), "{key} missing: {stats}");
+        assert_eq!(stats[key], serde_json::Value::Null, "{key}: {stats}");
+    }
     assert_eq!(stats["files"][1]["initialWindowBytes"], 700);
     assert_eq!(stats["files"][1]["initialWindowReadyBytes"], 0);
 

@@ -4,6 +4,7 @@ use crate::backend::{
     SwarmCap, TorrentBackend, TorrentFilePriorityPlan, TorrentHandle, TorrentListenPort,
     TorrentPlacement, TorrentSource,
 };
+use crate::scrape::SwarmScraper;
 use anyhow::{Context, Result};
 use librqbit::{ManagedTorrent, ManagedTorrentState, Session};
 use parking_lot::Mutex;
@@ -314,6 +315,9 @@ pub struct LibrqbitBackend {
     deferred_selections: DeferredSelections,
     pinned_files: PinnedFiles,
     reported_errors: ReportedErrors,
+    /// Backend-wide tracker-scrape cache, shared by every handle so one
+    /// torrent is scraped once however many handles report on it.
+    swarm_scraper: Arc<SwarmScraper>,
 }
 
 impl LibrqbitBackend {
@@ -404,6 +408,7 @@ impl LibrqbitBackend {
         let deferred_selections: DeferredSelections = Default::default();
         let pinned_files: PinnedFiles = Default::default();
         let reported_errors: ReportedErrors = Default::default();
+        let swarm_scraper = SwarmScraper::network();
         // Restore from session
         let mut restored_handles = session.with_torrents(|iter| {
             let mut map = HashMap::new();
@@ -418,6 +423,7 @@ impl LibrqbitBackend {
                         deferred_selections: deferred_selections.clone(),
                         pinned_files: pinned_files.clone(),
                         reported_errors: reported_errors.clone(),
+                        swarm_scraper: swarm_scraper.clone(),
                     },
                 );
             }
@@ -453,6 +459,7 @@ impl LibrqbitBackend {
                                             deferred_selections: deferred_selections.clone(),
                                             pinned_files: pinned_files.clone(),
                                             reported_errors: reported_errors.clone(),
+                                            swarm_scraper: swarm_scraper.clone(),
                                         },
                                     );
                                 }
@@ -471,6 +478,7 @@ impl LibrqbitBackend {
                 deferred_selections,
                 pinned_files,
                 reported_errors,
+                swarm_scraper,
             },
             restored_handles,
         ))
@@ -497,6 +505,7 @@ impl LibrqbitBackend {
             deferred_selections: Default::default(),
             pinned_files: Default::default(),
             reported_errors: Default::default(),
+            swarm_scraper: SwarmScraper::disabled(),
         })
     }
 }
@@ -617,6 +626,8 @@ pub struct LibrqbitHandle {
     pinned_files: PinnedFiles,
     /// Backend-wide last-reported error texts (see [`ReportedErrors`]).
     reported_errors: ReportedErrors,
+    /// Backend-wide swarm-scrape cache (see [`SwarmScraper`]).
+    swarm_scraper: Arc<SwarmScraper>,
 }
 
 /// Put `trackers` into a magnet link as `tr=` params.
@@ -714,6 +725,7 @@ impl LibrqbitBackend {
             deferred_selections: self.deferred_selections.clone(),
             pinned_files: self.pinned_files.clone(),
             reported_errors: self.reported_errors.clone(),
+            swarm_scraper: self.swarm_scraper.clone(),
         }
     }
 
@@ -831,6 +843,7 @@ impl TorrentBackend for LibrqbitBackend {
             deferred_selections: self.deferred_selections.clone(),
             pinned_files: self.pinned_files.clone(),
             reported_errors: self.reported_errors.clone(),
+            swarm_scraper: self.swarm_scraper.clone(),
         })
     }
 
@@ -986,6 +999,7 @@ impl TorrentBackend for LibrqbitBackend {
             deferred_selections: self.deferred_selections.clone(),
             pinned_files: self.pinned_files.clone(),
             reported_errors: self.reported_errors.clone(),
+            swarm_scraper: self.swarm_scraper.clone(),
         })
     }
 
@@ -1152,14 +1166,39 @@ impl TorrentHandle for LibrqbitHandle {
             .trackers
             .iter()
             .map(|url| Source {
-                last_started: String::new(),
-                num_found: 0,
-                num_found_uniq: 0,
-                num_requests: 0,
                 url: url.to_string(),
+                ..Source::default()
             })
             .collect();
         sources.sort_by(|a, b| a.url.cmp(&b.url));
+
+        // Swarm-wide counts, which is a different question from
+        // `connected_seeders`: what the trackers say about everybody, not
+        // what our own connections show. Cached and rate-limited by the
+        // scraper -- this call never waits on the network, because players
+        // poll stats.json about once a second.
+        //
+        // A torrent whose metadata has not arrived cannot be shown to be
+        // public, so it counts as private and is left alone: an unsolicited
+        // scrape is exactly what private trackers ban accounts over.
+        let private = self
+            .handle
+            .with_metadata(|m| m.info.info().private)
+            .unwrap_or(true);
+        let tracker_urls: Vec<String> = sources.iter().map(|s| s.url.clone()).collect();
+        let swarm = self.swarm_scraper.snapshot(
+            &self.info_hash,
+            self.handle.info_hash().0,
+            &tracker_urls,
+            private,
+        );
+        for source in &mut sources {
+            if let Some(counts) = swarm.per_tracker.get(&source.url) {
+                source.seeders = Some(counts.seeders);
+                source.leechers = Some(counts.leechers);
+                source.completed = Some(counts.completed);
+            }
+        }
 
         EngineStats {
             name: self.name().unwrap_or_else(|| "Unknown".to_string()),
@@ -1209,6 +1248,9 @@ impl TorrentHandle for LibrqbitHandle {
             swarm_paused: false,
             swarm_size: peers,
             connected_seeders,
+            swarm_seeders: swarm.seeders,
+            swarm_leechers: swarm.leechers,
+            swarm_scrape_age_secs: swarm.age_secs,
             is_finished: stats.finished,
             has_metadata,
             phase,
@@ -1864,6 +1906,7 @@ impl Clone for LibrqbitHandle {
             deferred_selections: self.deferred_selections.clone(),
             pinned_files: self.pinned_files.clone(),
             reported_errors: self.reported_errors.clone(),
+            swarm_scraper: self.swarm_scraper.clone(),
         }
     }
 }
@@ -2096,6 +2139,102 @@ mod tests {
         assert!(stats.sources.iter().all(|s| s.num_requests == 0));
     }
 
+    /// End to end through the stats path: a tracker scrape's counters land on
+    /// the matching `sources` entry, and the swarm totals are the max across
+    /// the trackers that answered -- a tracker that did not answer reports
+    /// nothing at all rather than zero.
+    ///
+    /// The hermetic backend disables scraping outright, so the handle is
+    /// rebuilt around a scraper wired to a stub transport: no socket is
+    /// opened here either.
+    #[tokio::test]
+    async fn stats_report_swarm_counts_from_the_tracker_scrape() {
+        use crate::scrape::{ScrapeOutcome, ScrapeTransport, SwarmCounts};
+
+        struct StubTrackers;
+
+        #[async_trait::async_trait]
+        impl ScrapeTransport for StubTrackers {
+            async fn scrape(&self, tracker: &str, _info_hash: [u8; 20]) -> ScrapeOutcome {
+                if tracker.starts_with("https://one") {
+                    ScrapeOutcome::Counts(SwarmCounts {
+                        seeders: 12,
+                        leechers: 4,
+                        completed: 900,
+                    })
+                } else {
+                    ScrapeOutcome::Failed
+                }
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let payload = dir.join("payload.bin");
+        write_payload(&payload, 16 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+
+        let backend = LibrqbitBackend::new_for_tests(dir.clone())
+            .await
+            .expect("hermetic session");
+        let handle = backend
+            .add_torrent(
+                TorrentSource::Bytes(torrent_bytes),
+                vec![
+                    "udp://two.invalid:6969/announce".to_string(),
+                    "https://one.invalid/announce".to_string(),
+                ],
+            )
+            .await
+            .expect("add torrent");
+        let handle = LibrqbitHandle {
+            swarm_scraper: SwarmScraper::with_transport(Arc::new(StubTrackers)),
+            ..handle.clone()
+        };
+
+        // The first poll can only schedule the round -- stats never wait on
+        // the network -- so poll until it has landed. The bound is only there
+        // so a regression fails instead of hanging.
+        let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
+        let stats = loop {
+            let stats = TorrentHandle::stats(&handle).await;
+            if stats.swarm_seeders.is_some() || std::time::Instant::now() >= deadline {
+                break stats;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        assert_eq!(
+            stats.swarm_seeders,
+            Some(12),
+            "max over the answering trackers"
+        );
+        assert_eq!(stats.swarm_leechers, Some(4));
+        assert!(
+            stats.swarm_scrape_age_secs.is_some(),
+            "figures carry an age: {:?}",
+            stats.swarm_scrape_age_secs
+        );
+
+        let scraped = stats
+            .sources
+            .iter()
+            .find(|s| s.url.starts_with("https://one"))
+            .expect("the scraped tracker is listed");
+        assert_eq!(scraped.seeders, Some(12));
+        assert_eq!(scraped.leechers, Some(4));
+        assert_eq!(scraped.completed, Some(900));
+
+        let unanswered = stats
+            .sources
+            .iter()
+            .find(|s| s.url.starts_with("udp://two"))
+            .expect("the failing tracker is still listed");
+        assert_eq!(unanswered.seeders, None, "a failed scrape is not a zero");
+        assert_eq!(unanswered.leechers, None);
+        assert_eq!(unanswered.completed, None);
+    }
+
     /// `connected_seeders` is librqbit's `live_seeders` aggregate -- connected
     /// peers whose bitfield covers the whole torrent -- and not one of the
     /// discovery counters that sit beside it in the same struct.
@@ -2149,6 +2288,7 @@ mod tests {
             deferred_selections: Default::default(),
             pinned_files: Default::default(),
             reported_errors: Default::default(),
+            swarm_scraper: SwarmScraper::disabled(),
         };
 
         // Bounded poll: the initial peer reaches the peer list once the
@@ -3578,6 +3718,7 @@ mod tests {
             deferred_selections: backend.deferred_selections.clone(),
             pinned_files: backend.pinned_files.clone(),
             reported_errors: backend.reported_errors.clone(),
+            swarm_scraper: backend.swarm_scraper.clone(),
         };
 
         let mut stats = handle.stats().await;

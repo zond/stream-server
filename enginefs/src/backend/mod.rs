@@ -584,7 +584,7 @@ pub struct StatsOptions {
     pub r#virtual: bool,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Source {
     pub last_started: String,
@@ -592,6 +592,17 @@ pub struct Source {
     pub num_found_uniq: u64,
     pub num_requests: u64,
     pub url: String,
+    /// Seeders this tracker reported at the last scrape (BEP-48). Absent
+    /// from the JSON when the tracker has not answered -- absent, not zero,
+    /// because a swarm with no seeders is a real and different state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seeders: Option<u64>,
+    /// Leechers this tracker reported; same rules as `seeders`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leechers: Option<u64>,
+    /// Completed downloads this tracker has recorded; same rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -628,6 +639,28 @@ pub struct EngineStats {
     /// trackers, so this only ever counts peers of our own connections.
     #[serde(default)]
     pub connected_seeders: u64,
+    /// Seeders in the **whole swarm** as the trackers report them, from our
+    /// own BEP-48/BEP-15 scrapes, aggregated with `max` over the trackers
+    /// that answered (see `crate::scrape`).
+    ///
+    /// `None` -- serialized as `null`, never `0` -- whenever we do not know:
+    /// a DHT-only torrent with no trackers, a private torrent (never
+    /// scraped), trackers that have not answered yet or at all, or a last
+    /// success too old to present. A client must be able to tell that apart
+    /// from a swarm that really has no seeders.
+    ///
+    /// Not [`EngineStats::connected_seeders`], which counts peers of our own
+    /// connections and is bounded by `peers`.
+    #[serde(default)]
+    pub swarm_seeders: Option<u64>,
+    /// Leechers in the whole swarm; same rules as
+    /// [`EngineStats::swarm_seeders`].
+    #[serde(default)]
+    pub swarm_leechers: Option<u64>,
+    /// Age in seconds of the freshest scrape the swarm figures rest on, so a
+    /// client can say how current they are. `None` exactly when they are.
+    #[serde(default)]
+    pub swarm_scrape_age_secs: Option<u64>,
     /// All wanted pieces are downloaded (libtorrent `is_finished`). A finished
     /// torrent is only seeding and can be paused; an unfinished one still needs
     /// the swarm to download data or fetch metadata.
@@ -687,11 +720,8 @@ impl EngineStats {
             sources: trackers
                 .iter()
                 .map(|url| Source {
-                    last_started: String::new(),
-                    num_found: 0,
-                    num_found_uniq: 0,
-                    num_requests: 0,
                     url: url.clone(),
+                    ..Source::default()
                 })
                 .collect(),
             opts: StatsOptions {
@@ -723,6 +753,9 @@ impl EngineStats {
             swarm_paused: false,
             swarm_size: 0,
             connected_seeders: 0,
+            swarm_seeders: None,
+            swarm_leechers: None,
+            swarm_scrape_age_secs: None,
             is_finished: false,
             has_metadata: false,
             phase: StartupPhase::ResolvingMetadata,

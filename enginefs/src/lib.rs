@@ -3581,6 +3581,9 @@ mod tests {
                 swarm_paused: false,
                 swarm_size: 0,
                 connected_seeders: 0,
+                swarm_seeders: None,
+                swarm_leechers: None,
+                swarm_scrape_age_secs: None,
                 is_finished: seeded,
                 has_metadata: !self.files.is_empty(),
                 phase,
@@ -4257,6 +4260,9 @@ mod tests {
             swarm_paused: false,
             swarm_size: 0,
             connected_seeders: 0,
+            swarm_seeders: None,
+            swarm_leechers: None,
+            swarm_scrape_age_secs: None,
             is_finished: false,
             has_metadata: true,
             phase: StartupPhase::Buffering,
@@ -4340,6 +4346,13 @@ mod tests {
             serde_json::json!({ "seen": 0, "queued": 0, "connecting": 0, "live": 0 })
         );
         assert_eq!(value["connectedSeeders"], 0);
+        // Swarm scrape figures. The fake backend scrapes nothing, so all
+        // three are present and null -- "we do not know", which a client
+        // must be able to tell from a swarm that really has no seeders.
+        for key in ["swarmSeeders", "swarmLeechers", "swarmScrapeAgeSecs"] {
+            assert!(obj.contains_key(key), "{key} missing: {value}");
+            assert_eq!(value[key], serde_json::Value::Null, "{key}: {value}");
+        }
         assert_eq!(value["files"][0]["initialWindowReadyBytes"], 50);
         assert_eq!(value["files"][0]["initialWindowBytes"], 100);
         let file_keys = value["files"][0].as_object().unwrap();
@@ -4350,6 +4363,48 @@ mod tests {
         assert_eq!(value["pinnedFiles"], serde_json::json!([]));
         assert_eq!(value["files"][0]["pinned"], false);
         assert_eq!(value["files"][0]["complete"], false);
+    }
+
+    /// Per-tracker scrape counters are additive and camelCase, and are
+    /// omitted rather than zeroed while a tracker has told us nothing --
+    /// `seeders: 0` has to mean the tracker said zero.
+    #[test]
+    fn source_scrape_counters_serialize_additively() {
+        use crate::backend::Source;
+
+        let unscraped = serde_json::to_value(Source {
+            url: "udp://t.example:1337/announce".into(),
+            ..Source::default()
+        })
+        .unwrap();
+        let obj = unscraped.as_object().unwrap();
+        for key in [
+            "url",
+            "lastStarted",
+            "numFound",
+            "numFoundUniq",
+            "numRequests",
+        ] {
+            assert!(
+                obj.contains_key(key),
+                "legacy key {key} missing: {unscraped}"
+            );
+        }
+        for key in ["seeders", "leechers", "completed"] {
+            assert!(!obj.contains_key(key), "{key} must be absent: {unscraped}");
+        }
+
+        let scraped = serde_json::to_value(Source {
+            url: "udp://t.example:1337/announce".into(),
+            seeders: Some(0),
+            leechers: Some(3),
+            completed: Some(91),
+            ..Source::default()
+        })
+        .unwrap();
+        assert_eq!(scraped["seeders"], 0, "a real zero is reported: {scraped}");
+        assert_eq!(scraped["leechers"], 3);
+        assert_eq!(scraped["completed"], 91);
     }
 
     /// `complete` flips with the per-file progress and the JSON keeps the
