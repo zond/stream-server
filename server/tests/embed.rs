@@ -1440,6 +1440,24 @@ fn download_routes_match_the_library_api() -> anyhow::Result<()> {
     );
     assert!(handle.pin_download(&info_hash, 9, &[]).is_err());
 
+    // And a *destructive* DELETE for an index the torrent does not have is
+    // the same 404, not a request to delete every file of it.
+    let missing = client
+        .delete(format!("{base}/{info_hash}/9/download?deleteFiles=1"))
+        .send()?;
+    assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+    let body: serde_json::Value = missing.json()?;
+    assert!(
+        body["error"].as_str().unwrap_or_default().contains("range"),
+        "{body}"
+    );
+    assert!(handle.unpin_download(&info_hash, 9, true).is_err());
+    assert!(
+        target.join("e1.bin").is_file() && target.join("e2.bin").is_file(),
+        "no file of the torrent is touched"
+    );
+    assert_eq!(handle.downloads()?.len(), 2, "and both pins stand");
+
     // DELETE without deleteFiles: the pin goes, the data stays.
     let removed: serde_json::Value = client
         .delete(format!("{base}/{info_hash}/{first}/download"))

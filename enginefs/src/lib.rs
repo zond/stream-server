@@ -1903,7 +1903,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// must not leave the bytes behind), see
     /// [`Self::delete_download_data`]: the whole torrent when this was its
     /// last pin, only this file while other pins hold. A dormant pin has no
-    /// torrent to delete anything of.
+    /// torrent to delete anything of. A `file_idx` the torrent does not
+    /// have is then refused with [`PinDownloadError::FileNotFound`], as
+    /// [`Self::pin_download`] refuses it: a stale index must not be read as
+    /// "delete the whole torrent".
     ///
     /// Takes the same per-hash lock as [`Self::pin_download`]: an unpin
     /// issued while a pin of that hash is still resolving metadata or
@@ -1916,7 +1919,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         info_hash: &str,
         file_idx: usize,
         delete_files: bool,
-    ) -> Result<bool> {
+    ) -> Result<bool, PinDownloadError> {
         let info_hash = info_hash.to_lowercase();
         let lock = self.pin_lock(&info_hash);
         let guard = lock.lock().await;
@@ -1934,7 +1937,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         info_hash: &str,
         file_idx: usize,
         delete_files: bool,
-    ) -> Result<bool> {
+    ) -> Result<bool, PinDownloadError> {
         let info_hash = info_hash.to_string();
         let Some(engine) = self.get_engine(&info_hash).await else {
             // No torrent, but maybe a dormant pin waiting for it.
@@ -1964,6 +1967,22 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             }
             return Ok(was_dormant);
         };
+        if delete_files {
+            // A delete is destructive far beyond the one file: with no pin
+            // left on the torrent it takes the whole torrent, its files and
+            // its folder. An index the torrent does not have must therefore
+            // be refused here exactly as `pin_download` refuses it (404),
+            // never silently widened into "delete everything". Only once
+            // the metadata is in: a torrent still resolving it reports no
+            // files and nothing can be validated against.
+            let file_count = engine.handle.file_count().await;
+            if file_count > 0 && file_idx >= file_count {
+                return Err(PinDownloadError::FileNotFound {
+                    file_idx,
+                    file_count,
+                });
+            }
+        }
         let was_pinned = engine.pinned_files.write().remove(&file_idx);
         engine.handle.unpin_file(file_idx).await?;
         // Recomputed before anything is deleted: the backend must not be
@@ -5985,6 +6004,57 @@ mod tests {
             read_pinned_downloads(&enginefs.pinned_downloads_path()),
             serde_json::json!({})
         );
+    }
+
+    /// A delete for a file index the torrent does not have is refused --
+    /// the same 404-shaped `FileNotFound` a pin of it gets. Unvalidated it
+    /// would find nothing pinned, conclude the torrent has no pins left and
+    /// delete every file of it: a stale index from a client is not a
+    /// request to wipe the whole download.
+    #[tokio::test]
+    async fn unpin_download_with_delete_rejects_an_out_of_range_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("Show");
+        std::fs::create_dir_all(&folder).unwrap();
+        let file = |idx: usize| folder.join(format!("video-{idx}.mkv"));
+        let (enginefs, counters) = test_enginefs_with_file_count(3);
+        for idx in 0..3 {
+            std::fs::write(file(idx), b"payload").unwrap();
+        }
+        *counters.output_folder.lock().unwrap() = Some(folder.clone());
+        enginefs.get_or_add_magnet(TEST_HASH, None).await.unwrap();
+
+        let err = match enginefs.unpin_download(TEST_HASH, 3, true).await {
+            Ok(unpinned) => panic!("index 3 of 3 files must be refused, got {unpinned}"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(
+                err,
+                PinDownloadError::FileNotFound {
+                    file_idx: 3,
+                    file_count: 3
+                }
+            ),
+            "{err:?}"
+        );
+        for idx in 0..3 {
+            assert!(file(idx).is_file(), "file {idx} is untouched");
+        }
+        assert!(
+            enginefs
+                .get_backend()
+                .removed_with_files
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "the torrent is not dropped for an index it does not have"
+        );
+        assert!(enginefs.get_engine(TEST_HASH).await.is_some());
+
+        // Without `delete_files` there is nothing destructive to guard: an
+        // unknown index simply reports that no pin was cleared.
+        assert!(!enginefs.unpin_download(TEST_HASH, 3, false).await.unwrap());
     }
 
     #[tokio::test]

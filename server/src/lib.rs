@@ -253,7 +253,9 @@ impl ServerHandle {
     /// Returns whether a pin was cleared -- false for an unknown torrent or
     /// an unpinned file. With `delete_files` the data goes too: the whole
     /// torrent when this was its last pin, only that file while other pins
-    /// hold. Without it only the pin goes and the engine becomes an
+    /// hold, and a `file_idx` the torrent does not have is refused with
+    /// [`PinDownloadError::FileNotFound`] rather than taken for the whole
+    /// torrent. Without it only the pin goes and the engine becomes an
     /// ordinary, evictable one again.
     pub fn unpin_download(
         &self,
@@ -263,9 +265,10 @@ impl ServerHandle {
     ) -> anyhow::Result<bool> {
         let state = self.state.clone();
         let info_hash = info_hash.to_string();
-        self.block_on_server(async move {
+        let unpinned = self.block_on_server(async move {
             routes::downloads::unpin_download(&state, &info_hash, file_idx, delete_files).await
-        })?
+        })?;
+        Ok(unpinned?)
     }
 
     /// Every pinned download, exactly what `GET /downloads.json` answers

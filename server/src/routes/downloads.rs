@@ -92,14 +92,16 @@ pub async fn pin_download(
 /// `delete_files` also deletes the data -- the whole torrent when this was
 /// its last pin, only that file while other pins hold, and nothing at all
 /// for a pin whose torrent the backend does not have (see
-/// `enginefs::BackendEngineFS::unpin_download`). Without it the bytes stay
-/// where they are and the engine becomes an ordinary, evictable one again.
+/// `enginefs::BackendEngineFS::unpin_download`); a `file_idx` the torrent
+/// does not have is then refused with [`PinDownloadError::FileNotFound`]
+/// (404), like [`pin_download`]. Without it the bytes stay where they are
+/// and the engine becomes an ordinary, evictable one again.
 pub async fn unpin_download(
     state: &AppState,
     info_hash: &str,
     file_idx: usize,
     delete_files: bool,
-) -> anyhow::Result<bool> {
+) -> Result<bool, PinDownloadError> {
     state
         .stream_engine()
         .unpin_download(&info_hash.to_lowercase(), file_idx, delete_files)
@@ -194,13 +196,13 @@ pub struct PinRequest {
     pub trackers: Vec<String>,
 }
 
-/// Status and body for a refused pin: a bad file index is a 404, a full
-/// disk a 507 (the client can free space and retry), a failed magnet add
-/// whatever `compat::engine_creation_failure` says, a backend refusal a
+/// Status and body for a refused pin or unpin: a bad file index is a 404,
+/// a full disk a 507 (the client can free space and retry), a failed magnet
+/// add whatever `compat::engine_creation_failure` says, a backend refusal a
 /// 500. The body is [`PinDownloadError::client_message`], which does not
 /// leak the absolute cache/downloads paths the backend errors carry -- the
 /// full error goes to the log at the call site.
-fn pin_failure(error: &PinDownloadError) -> (StatusCode, String) {
+fn download_failure(error: &PinDownloadError) -> (StatusCode, String) {
     let status = match error {
         PinDownloadError::MagnetAdd(error) => compat::engine_creation_failure(error).0,
         PinDownloadError::FileNotFound { .. } => StatusCode::NOT_FOUND,
@@ -234,7 +236,7 @@ pub async fn post_download(
         Ok(info) => Json(info).into_response(),
         Err(error) => {
             tracing::warn!(info_hash, file_idx, error = %format!("{error:#}"), "pin_download_failed");
-            let (status, message) = pin_failure(&error);
+            let (status, message) = download_failure(&error);
             (status, Json(json!({ "error": message }))).into_response()
         }
     }
@@ -259,11 +261,8 @@ pub async fn delete_download(
         .into_response(),
         Err(error) => {
             tracing::warn!(info_hash, file_idx, error = %format!("{error:#}"), "unpin_download_failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "could not remove the download; see server logs" })),
-            )
-                .into_response()
+            let (status, message) = download_failure(&error);
+            (status, Json(json!({ "error": message }))).into_response()
         }
     }
 }
@@ -274,7 +273,7 @@ pub async fn get_downloads(State(state): State<AppState>) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{PinRequest, pin_failure};
+    use super::{PinRequest, download_failure};
     use axum::http::StatusCode;
     use enginefs::PinDownloadError;
 
@@ -283,7 +282,7 @@ mod tests {
     /// (it names absolute cache and downloads paths).
     #[test]
     fn pin_failures_map_to_actionable_statuses() {
-        let (status, message) = pin_failure(&PinDownloadError::InsufficientSpace {
+        let (status, message) = download_failure(&PinDownloadError::InsufficientSpace {
             required: 5,
             available: 3,
             margin: 2,
@@ -291,14 +290,14 @@ mod tests {
         assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
         assert!(message.contains("free space"), "{message}");
 
-        let (status, message) = pin_failure(&PinDownloadError::FileNotFound {
+        let (status, message) = download_failure(&PinDownloadError::FileNotFound {
             file_idx: 9,
             file_count: 2,
         });
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(message.contains("out of range"), "{message}");
 
-        let (status, message) = pin_failure(&PinDownloadError::Backend(anyhow::anyhow!(
+        let (status, message) = download_failure(&PinDownloadError::Backend(anyhow::anyhow!(
             "error opening /home/someone/cache/rqbit-downloads/Show/e1.bin"
         )));
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
