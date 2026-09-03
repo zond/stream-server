@@ -1966,18 +1966,21 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         };
         let was_pinned = engine.pinned_files.write().remove(&file_idx);
         engine.handle.unpin_file(file_idx).await?;
-        let torrent_dropped = if delete_files {
-            self.delete_download_data(&engine, file_idx).await
-        } else {
-            false
-        };
+        // Recomputed before anything is deleted: the backend must not be
+        // writing a file this call is about to remove, and that holds for a
+        // file that was never pinned too (the delete is what the caller
+        // asked for either way). Skipped when the whole torrent goes with
+        // it -- there is no handle left to reconcile against, and nothing
+        // left to want.
+        let drops_torrent = delete_files && !engine.is_pinned();
+        if (was_pinned || delete_files) && !drops_torrent {
+            self.reconcile_with_active_selection(engine.clone(), "unpin_download")
+                .await;
+        }
+        if delete_files {
+            self.delete_download_data(&engine, file_idx).await;
+        }
         if was_pinned {
-            // A dropped torrent has no handle to reconcile against any more
-            // (and nothing left to want).
-            if !torrent_dropped {
-                self.reconcile_with_active_selection(engine.clone(), "unpin_download")
-                    .await;
-            }
             self.persist_pinned_downloads().await;
             tracing::info!(
                 info_hash = %engine.info_hash,
@@ -1996,11 +1999,12 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// from the backend with its files and its (then empty) per-torrent
     /// folder ([`TorrentBackend::remove_torrent_and_files`]). While other
     /// files of it stay pinned the torrent must keep running, so only this
-    /// file is unlinked -- the unpin's reconcile drops it from the want-set
-    /// right after, so the backend does not write it again. Returns whether
-    /// the torrent was dropped. Best effort: a failure is logged, the unpin
-    /// stands.
-    async fn delete_download_data(&self, engine: &Arc<Engine<B::Handle>>, file_idx: usize) -> bool {
+    /// file goes -- truncated to nothing and then unlinked, since librqbit
+    /// keeps an open `File` on it for the torrent's lifetime and an unlink
+    /// alone would not free a byte. The caller reconciles the want-set
+    /// without the file first, so the backend does not write it again.
+    /// Best effort: a failure is logged, the unpin stands.
+    async fn delete_download_data(&self, engine: &Arc<Engine<B::Handle>>, file_idx: usize) {
         if engine.is_pinned() {
             let Some(path) = engine.handle.file_path(file_idx).await else {
                 tracing::warn!(
@@ -2008,8 +2012,34 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     file_idx,
                     "backend knows no path for the file; its data stays on disk"
                 );
-                return false;
+                return;
             };
+            // Truncated before it is unlinked: librqbit opens every file of
+            // a torrent at storage init and keeps the `File` for the
+            // torrent's lifetime, so an unlink alone drops the directory
+            // entry while the inode's blocks stay allocated until the
+            // torrent is dropped -- and the caller asked for the disk back.
+            match tokio::fs::OpenOptions::new().write(true).open(&path).await {
+                Ok(file) => {
+                    if let Err(error) = file.set_len(0).await {
+                        tracing::warn!(
+                            info_hash = %engine.info_hash,
+                            file_idx,
+                            path = %path.display(),
+                            %error,
+                            "could not truncate the download's file before deleting it"
+                        );
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    info_hash = %engine.info_hash,
+                    file_idx,
+                    path = %path.display(),
+                    %error,
+                    "could not open the download's file to release its blocks"
+                ),
+            }
             match tokio::fs::remove_file(&path).await {
                 Ok(()) => tracing::info!(
                     info_hash = %engine.info_hash,
@@ -2026,7 +2056,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     "could not delete the download's file"
                 ),
             }
-            return false;
+            return;
         }
         self.remove_engine_if_current(engine).await;
         match self
@@ -2046,7 +2076,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 "could not delete the download's torrent"
             ),
         }
-        true
     }
 
     /// `pinned-downloads.json` in the download dir: `{ "<info hash>": [file
@@ -5799,6 +5828,47 @@ mod tests {
             read_pinned_downloads(&enginefs.pinned_downloads_path()),
             serde_json::json!({}),
             "the persisted pin set is empty again"
+        );
+    }
+
+    /// A per-file delete must both stop the backend writing the file and
+    /// actually give the disk back. librqbit holds an open `File` on every
+    /// file of a torrent for its lifetime, so unlinking alone leaves the
+    /// inode's blocks allocated until the torrent is dropped -- the file is
+    /// truncated first. And the want-set is reconciled without the file
+    /// whether or not it was pinned, so nothing writes it again.
+    #[tokio::test]
+    async fn per_file_delete_deselects_the_file_and_frees_its_blocks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("Show");
+        std::fs::create_dir_all(&folder).unwrap();
+        let file = |idx: usize| folder.join(format!("video-{idx}.mkv"));
+        let (enginefs, counters) = test_enginefs_with_file_count(3);
+        for idx in 0..3 {
+            std::fs::write(file(idx), [7u8; 4096]).unwrap();
+        }
+        *counters.output_folder.lock().unwrap() = Some(folder.clone());
+
+        // File 2 is pinned, so the torrent keeps running; file 0 is not
+        // pinned at all (a pin lost to a crash, or a plain "remove this
+        // download") and is the one deleted.
+        enginefs.pin_download(TEST_HASH, 2, None).await.unwrap();
+        let open = std::fs::File::open(file(0)).unwrap();
+        let before = counters.reconcile_file_priorities.load(Ordering::SeqCst);
+
+        assert!(!enginefs.unpin_download(TEST_HASH, 0, true).await.unwrap());
+        assert!(!file(0).exists(), "the file is gone");
+        assert!(file(2).is_file(), "the pinned file stays");
+        assert!(enginefs.get_engine(TEST_HASH).await.is_some());
+        assert_eq!(
+            open.metadata().unwrap().len(),
+            0,
+            "the blocks are released through a handle still open on the file"
+        );
+        assert_eq!(
+            counters.reconcile_file_priorities.load(Ordering::SeqCst),
+            before + 1,
+            "the want-set is recomputed without the deleted file"
         );
     }
 
