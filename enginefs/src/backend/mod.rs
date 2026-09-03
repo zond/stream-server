@@ -612,6 +612,11 @@ pub struct EngineStats {
     pub stream_progress: f64,
     pub swarm_connections: u64,
     pub swarm_paused: bool,
+    /// NOT a swarm-size estimate, despite the name: it is currently just an
+    /// alias of `peers` (connected peers), kept because it is part of the
+    /// server.js-compatible wire shape stremio-core parses. For "how many of
+    /// the peers we are connected to have the whole file", read
+    /// [`EngineStats::connected_seeders`].
     pub swarm_size: u64,
     /// Connected peers whose bitfield covers the whole torrent, i.e. peers we
     /// can get any piece from. Not the swarm's seeder count: we do not scrape
