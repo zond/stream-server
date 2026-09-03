@@ -184,6 +184,23 @@ pub enum PinDownloadError {
     Backend(#[from] anyhow::Error),
 }
 
+impl PinDownloadError {
+    /// What an HTTP handler may put in a response body. The space and
+    /// file-index errors go verbatim (they carry nothing but numbers); the
+    /// backend ones -- whose chains name absolute cache and downloads paths
+    /// (`relocating {hash} into {folder}`, librqbit's `error opening
+    /// {path}`) -- become a generic sentence, and a failed magnet add
+    /// defers to [`MagnetAddError::client_message`]. The full error is for
+    /// the server log.
+    pub fn client_message(&self) -> String {
+        match self {
+            Self::MagnetAdd(error) => error.client_message(),
+            Self::FileNotFound { .. } | Self::InsufficientSpace { .. } => self.to_string(),
+            Self::Backend(_) => "backend refused the download; see server logs".to_string(),
+        }
+    }
+}
+
 /// Whether `remaining` more bytes may be written to a volume with
 /// `available` free bytes while keeping `margin` free. Nothing left to
 /// write is always allowed (a complete file re-pinned on a full disk).
@@ -5341,6 +5358,49 @@ mod tests {
             serde_json::json!({ TEST_HASH: [0, 1, 2] })
         );
         assert!(fourth.dormant_pins.lock().is_empty());
+    }
+
+    /// `client_message` is what a route may echo: the numeric errors as
+    /// they are, never a backend chain, which names server paths.
+    #[test]
+    fn pin_download_error_client_message_leaks_no_paths() {
+        let backend = PinDownloadError::Backend(
+            anyhow::anyhow!("error opening \"/home/user/offline/abc/Movie.mkv\"")
+                .context("relocating abc into /home/user/offline/abc"),
+        );
+        assert!(
+            format!("{backend:#}").contains("/home/user"),
+            "the log has it"
+        );
+        let message = backend.client_message();
+        assert!(!message.is_empty());
+        assert!(!message.contains("/home/user"), "{message}");
+
+        let magnet = PinDownloadError::MagnetAdd(MagnetAddError::Backend {
+            info_hash: "abc".into(),
+            error: Arc::new(anyhow::anyhow!("cannot open /home/user/downloads/x")),
+        });
+        assert!(!magnet.client_message().contains("/home/user"));
+        let timeout = MagnetAddError::MetadataTimeout {
+            info_hash: "abc".into(),
+            timeout: METADATA_RESOLVE_TIMEOUT,
+        };
+        assert_eq!(
+            PinDownloadError::MagnetAdd(timeout.clone()).client_message(),
+            timeout.client_message()
+        );
+
+        let space = PinDownloadError::InsufficientSpace {
+            required: 10,
+            available: 3,
+            margin: 2,
+        };
+        assert_eq!(space.client_message(), space.to_string());
+        let missing = PinDownloadError::FileNotFound {
+            file_idx: 9,
+            file_count: 2,
+        };
+        assert_eq!(missing.client_message(), missing.to_string());
     }
 
     // --- pinned offline downloads ---
