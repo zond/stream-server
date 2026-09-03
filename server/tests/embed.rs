@@ -194,6 +194,88 @@ fn starts_and_stops_embedded_server() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// CORS has to name what a Cast receiver asks for.
+///
+/// A Google Cast receiver plays through a browser media element, so the media
+/// request is a CORS request (Google's receiver docs are explicit that even a
+/// plain MP4 needs CORS once tracks are involved) and its preflight asks for
+/// `Content-Type`, `Accept-Encoding` and `Range`. The `*` wildcard
+/// `CorsLayer::permissive()` answered is not a guarantee -- and it never
+/// covers `Authorization`, which a browser-hosted client needs for the control
+/// API -- so the allow-list is spelled out. Seeking needs `Content-Range`,
+/// `Content-Length` and `Accept-Ranges` readable from script, so those are
+/// exposed by name.
+///
+/// The CORS layer answers a preflight itself, before routing, so this holds
+/// for every path on both listeners.
+#[test]
+fn cors_names_the_request_and_response_headers_a_cast_receiver_needs() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_dir.path().join("cache")),
+        ..stream_server::ServerConfig::default()
+    })?;
+    let base = format!("http://{}", handle.http_addr());
+    let anonymous = reqwest::blocking::Client::new();
+
+    let response = anonymous
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{base}/0123456789abcdef0123456789abcdef01234567/0"),
+        )
+        .header(reqwest::header::ORIGIN, "https://example.org")
+        .header("access-control-request-method", "GET")
+        .header("access-control-request-headers", "range")
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        header_value(&response, "access-control-allow-origin"),
+        "*",
+        "a receiver's origin is opaque"
+    );
+    let allowed = header_value(&response, "access-control-allow-headers");
+    for header in ["accept-encoding", "authorization", "content-type", "range"] {
+        assert!(
+            allowed.contains(header),
+            "{header:?} must be an allowed request header, got {allowed:?}"
+        );
+    }
+
+    let response = anonymous
+        .get(format!("{base}/heartbeat"))
+        .header(reqwest::header::ORIGIN, "https://example.org")
+        .send()?;
+    let exposed = header_value(&response, "access-control-expose-headers");
+    for header in [
+        "accept-ranges",
+        "content-length",
+        "content-range",
+        "content-type",
+    ] {
+        assert!(
+            exposed.contains(header),
+            "{header:?} must be exposed to script, got {exposed:?}"
+        );
+    }
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
+/// One response header, lowercased, or `""` when it is absent.
+fn header_value(response: &reqwest::blocking::Response, name: &str) -> String {
+    response
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
 /// The two status probes clients poll, on one server.
 ///
 /// stremio-core probes `/device-info` at startup expecting

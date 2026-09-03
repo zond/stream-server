@@ -2,7 +2,7 @@ use anyhow::Context;
 pub use auth::ServerAuth;
 use axum::{
     Router,
-    http::StatusCode,
+    http::{StatusCode, header},
     routing::{get, post},
 };
 use enginefs::EngineFS;
@@ -19,7 +19,10 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::{
+    cors::{Any, CorsLayer},
+    trace::TraceLayer,
+};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 pub const DEFAULT_HTTP_PORT: u16 = 11470;
@@ -881,8 +884,50 @@ pub fn build_router(state: AppState) -> Router {
                 )
             }),
         )
-        .layer(CorsLayer::permissive())
+        .layer(cors_layer())
         .with_state(state)
+}
+
+/// CORS for every route the server serves.
+///
+/// `CorsLayer::permissive()` answers `*` to all four lists. That is not quite
+/// enough here:
+///
+/// * A Google Cast receiver plays through a browser media element, so a media
+///   request is a CORS request even for a plain MP4 as soon as tracks are
+///   involved, and Google's receiver CORS requirements name
+///   `Content-Type`, `Accept-Encoding` and `Range` as the request headers the
+///   server has to allow. Naming them is the guarantee; a wildcard only works
+///   for as long as the receiver's fetch implementation expands it.
+/// * The `*` wildcard never covers `Authorization` (the Fetch standard
+///   excludes it by name), so a browser-hosted client could not send the
+///   control API's bearer header at all under `permissive()`.
+/// * A player that seeks needs `Content-Range`, `Content-Length` and
+///   `Accept-Ranges` readable from script, so they are exposed by name too.
+///
+/// Methods stay a wildcard: every method this server answers is one of the
+/// safelisted ones or is preflighted, and `*` is honoured for methods
+/// everywhere.
+fn cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers([
+            header::ACCEPT,
+            header::ACCEPT_ENCODING,
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::RANGE,
+        ])
+        .expose_headers([
+            header::ACCEPT_RANGES,
+            header::CONTENT_DISPOSITION,
+            header::CONTENT_ENCODING,
+            header::CONTENT_LENGTH,
+            header::CONTENT_RANGE,
+            header::CONTENT_TYPE,
+        ])
+        .max_age(Duration::from_secs(24 * 60 * 60))
 }
 
 /// Routes that hand media bytes to a player. They are OPEN (no bearer token):
