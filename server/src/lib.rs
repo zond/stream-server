@@ -5,6 +5,7 @@ use axum::{
     http::{StatusCode, header},
     routing::{get, post},
 };
+pub use cache_cleaner::{CacheUsage, EvictionReport};
 use enginefs::EngineFS;
 pub use enginefs::backend::{EngineStats, TorrentListenPort};
 pub use enginefs::{PIN_FREE_SPACE_MARGIN, PinDownloadError, UnpinOutcome};
@@ -337,6 +338,40 @@ impl ServerHandle {
         self.block_on_server(async move {
             routes::downloads::download_path(&state, &info_hash, file_idx).await
         })
+    }
+
+    /// What the cache currently occupies against its configured limit, using
+    /// the same occupancy accounting the cleaner uses ([`cache_cleaner::occupied_bytes`]
+    /// -- allocated blocks, not apparent length), exactly what `GET /cache.json`
+    /// answers (see `routes::cache::cache_usage`). [`CacheUsage::protected_bytes`]
+    /// and `protected_files` are what a live engine or a pinned download is
+    /// holding right now, so a caller can tell "over the limit but nothing
+    /// is evictable" apart from "a clean would help" without running one.
+    ///
+    /// Walks the cache tree, but only with `stat` calls -- no file reads --
+    /// and only as many of them as there are files currently in the cache;
+    /// it is the same walk the background cleaner already performs on every
+    /// debounced or hourly pass, so one call per "Storage" screen open or
+    /// manual refresh is cheap. It is not bounded or cached here, so do not
+    /// poll it on a sub-second timer -- a few seconds between calls is
+    /// plenty for a UI.
+    pub fn cache_usage(&self) -> anyhow::Result<CacheUsage> {
+        let state = self.state.clone();
+        self.block_on_server(async move { routes::cache::cache_usage(&state).await })
+    }
+
+    /// Run one eviction pass immediately and report what it freed, exactly
+    /// what `POST /cache/clean` answers (see `routes::cache::clean_cache_now`).
+    /// Respects exactly the protections the scheduled sweep does -- a pinned
+    /// download's files and anything a live engine is writing are never
+    /// touched, however far over the limit the cache is;
+    /// [`EvictionReport::shortfall_message`] is the line to show the user
+    /// when that leaves it still over: cleaning cannot reclaim what a live
+    /// engine or a pin protects, and the fix is to stop the stream or unpin
+    /// the download, not to run the clean again.
+    pub fn clean_cache_now(&self) -> anyhow::Result<EvictionReport> {
+        let state = self.state.clone();
+        self.block_on_server(async move { routes::cache::clean_cache_now(&state).await })?
     }
 
     /// Start or stop the LAN media listener (see [`crate::lan_media`]): a
@@ -1213,6 +1248,8 @@ fn control_router() -> Router<AppState> {
             "/{infoHash}/{fileIdx}/download",
             post(routes::downloads::post_download).delete(routes::downloads::delete_download),
         )
+        .route("/cache.json", get(routes::cache::get_cache_usage))
+        .route("/cache/clean", post(routes::cache::post_clean_cache))
         .nest("/casting", routes::casting::router())
 }
 

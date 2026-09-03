@@ -1689,6 +1689,157 @@ fn download_routes_match_the_library_api() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `GET /cache.json` and `POST /cache/clean` share their functions with
+/// `ServerHandle::{cache_usage, clean_cache_now}` -- the replacement for a
+/// client restarting the server just to make the cache cleaner's start-up
+/// tick fire. A pinned download's engine stays live and protects its file;
+/// an idle leftover with no engine at all is ordinary, evictable cache.
+#[test]
+fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+
+    let content = src.path().join("Movie");
+    std::fs::create_dir_all(&content)?;
+    // Two files, each a whole number of 16 KiB pieces (as `lan_media_server`
+    // does), so the torrent is a *directory* torrent whose data lands in
+    // `rqbit-downloads/Movie/` -- a single-file torrent instead would place
+    // its data directly at `rqbit-downloads/movie.mkv`, with no folder.
+    // Pinning only `movie.mkv` still protects both: the engine stays live
+    // for as long as it has any pinned file, and protection covers every
+    // file that live engine reports, not only the pinned index.
+    write_payload(&content.join("movie.mkv"), 64 * 1024);
+    write_payload(&content.join("subtitle.srt"), 16 * 1024);
+    let (torrent, info_hash) = real_torrent(&content);
+
+    // Already "streamed": the data sits in the cache root, as it would
+    // after playback, and `POST /create` below picks it up from there.
+    let cache_root = cache_dir.path().join("cache");
+    let root_folder = cache_root.join("rqbit-downloads").join("Movie");
+    std::fs::create_dir_all(&root_folder)?;
+    std::fs::copy(content.join("movie.mkv"), root_folder.join("movie.mkv"))?;
+    std::fs::copy(
+        content.join("subtitle.srt"),
+        root_folder.join("subtitle.srt"),
+    )?;
+
+    // An idle leftover with no engine managing it at all -- ordinary cache
+    // from a torrent nothing is tracking any more.
+    let idle = cache_root
+        .join("rqbit-downloads")
+        .join("Leftover")
+        .join("old.mkv");
+    std::fs::create_dir_all(idle.parent().unwrap())?;
+    write_payload(&idle, 16 * 1024);
+
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_root.clone()),
+        ..stream_server::ServerConfig::default()
+    })?;
+    let base = format!("http://{}", handle.http_addr());
+    let client = bearer_client(&handle)?;
+    let anonymous = reqwest::blocking::Client::new();
+
+    // Both routes are token-protected, like every other control route.
+    for response in [
+        anonymous.get(format!("{base}/cache.json")).send()?,
+        anonymous.post(format!("{base}/cache/clean")).send()?,
+    ] {
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+    assert!(idle.is_file(), "an unauthorized call cleans nothing");
+
+    let created: serde_json::Value = client
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    assert_eq!(created["infoHash"], info_hash);
+    let stats = stats_after_check(&client, &base, &info_hash)?;
+    let idx = file_index(&stats, "movie.mkv");
+    handle.pin_download(&info_hash, idx, &[])?;
+    stats_after_check(&client, &base, &info_hash)?;
+
+    // Read usage() before touching the limit, to learn exactly how many
+    // bytes the pinned torrent's two files occupy: `evict` never takes a
+    // single file whose own size exceeds the limit (see
+    // `cache_soft_limit_exceeded_by_single_retained_file` in
+    // `cache_cleaner::evict`), so a limit of, say, `1` would make every
+    // real file -- pinned or not -- too big to touch and evict nothing at
+    // all. The limit below sits just above the protected bytes: over what
+    // the pin alone needs, but under the idle leftover's own size added to
+    // it, so only that leftover is evictable.
+    let baseline = handle.cache_usage()?;
+    assert_eq!(baseline.protected_files, 2, "{baseline:?}");
+    let limit = baseline.protected_bytes + 1;
+    handle.update_settings(serde_json::json!({ "cacheSize": limit as f64 }))?;
+
+    // cache_usage() == GET /cache.json, and reading it evicts nothing.
+    let api_usage = handle.cache_usage()?;
+    let http_usage: serde_json::Value = client
+        .get(format!("{base}/cache.json"))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    assert_eq!(serde_json::to_value(&api_usage)?, http_usage);
+    assert!(idle.is_file(), "usage() must not touch the filesystem");
+    assert!(root_folder.join("movie.mkv").is_file());
+    assert_eq!(http_usage["limitBytes"], limit, "{http_usage}");
+    assert!(
+        http_usage["totalBytes"].as_u64().unwrap() > limit,
+        "the idle leftover pushes the cache over the limit: {http_usage}"
+    );
+    assert_eq!(
+        http_usage["protectedFiles"], 2,
+        "both of the pinned torrent's files, not only the pinned index: {http_usage}"
+    );
+    assert_eq!(
+        http_usage["protectedBytes"], baseline.protected_bytes,
+        "{http_usage}"
+    );
+
+    // clean_cache_now() over HTTP: the idle file goes, the pinned one does
+    // not, and the run lands exactly at the limit -- nothing but the idle
+    // leftover was ever evictable.
+    let report: serde_json::Value = client
+        .post(format!("{base}/cache/clean"))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    assert!(!idle.exists(), "unpinned idle cache is evictable: {report}");
+    assert!(
+        root_folder.join("movie.mkv").is_file() && root_folder.join("subtitle.srt").is_file(),
+        "a pinned download's files are never touched: {report}"
+    );
+    assert_eq!(report["deleted"], 1, "{report}");
+    assert_eq!(report["total"], baseline.protected_bytes, "{report}");
+    assert_eq!(
+        report["freed"],
+        http_usage["totalBytes"].as_u64().unwrap() - baseline.protected_bytes,
+        "{report}"
+    );
+    assert_eq!(report["protectedFiles"], 2, "{report}");
+    assert_eq!(report["protected"], baseline.protected_bytes, "{report}");
+
+    // clean_cache_now() == POST /cache/clean, run right after over the
+    // library instead: nothing is left to evict, but the pinned torrent's
+    // bytes still show up as protected -- the same function underneath
+    // both surfaces, so the two can never disagree about it.
+    let api_report = handle.clean_cache_now()?;
+    assert_eq!(api_report.deleted, 0, "nothing left to evict");
+    assert_eq!(api_report.freed, 0);
+    assert_eq!(api_report.protected_files, 2);
+    assert!(root_folder.join("movie.mkv").is_file());
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
 /// A server with a LAN media listener, its torrent pre-seeded in the cache
 /// root so media requests answer real bytes.
 ///
@@ -1802,6 +1953,7 @@ fn lan_media_listener_serves_media_but_no_control_route() -> anyhow::Result<()> 
         "/network-info",
         "/device-info",
         "/downloads.json",
+        "/cache.json",
         "/get-https?ipAddress=127.0.0.1",
         "/casting",
     ] {
@@ -1841,6 +1993,20 @@ fn lan_media_listener_serves_media_but_no_control_route() -> anyhow::Result<()> 
             .send()?
             .status(),
         reqwest::StatusCode::NOT_FOUND
+    );
+    // `POST /cache/clean` is not a route on the LAN listener either -- but
+    // its two segments match the stream route's `/{infoHash}/{fileIdx}`
+    // pattern (`"cache"`/`"clean"` parse as neither, so it would 404 on
+    // content, but routing happens on shape first), and that route only
+    // answers GET/HEAD, so this is the same collision as
+    // `/{infoHash}/create` below: `405`, not `404`, with the control
+    // handler still never reached.
+    assert_eq!(
+        anonymous
+            .post(format!("{lan}/cache/clean"))
+            .send()?
+            .status(),
+        reqwest::StatusCode::METHOD_NOT_ALLOWED
     );
     // `POST /{infoHash}/create` collides with the two-segment media route's
     // pattern, so it answers as that route would (`405`, GET and HEAD only)

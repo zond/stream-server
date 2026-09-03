@@ -144,7 +144,17 @@ pub fn start(state: Arc<AppState>) -> JoinHandle<()> {
     })
 }
 
-async fn clean_cache(state: &Arc<AppState>) -> anyhow::Result<()> {
+/// The cache roots, protections and limit both [`clean_cache`] and [`usage`]
+/// need, gathered once so the two read `AppState` the same way and can
+/// never disagree about what the cache *is*.
+struct CacheRoots {
+    download_dirs: Vec<std::path::PathBuf>,
+    protected_paths: HashSet<std::path::PathBuf>,
+    downloads_dirs: Vec<std::path::PathBuf>,
+    limit: u64,
+}
+
+async fn cache_roots(state: &AppState) -> CacheRoots {
     let settings = state.settings.read().await;
     let limit = crate::routes::system::cache_size_bytes(settings.cache_size);
     drop(settings); // Release lock
@@ -155,25 +165,19 @@ async fn clean_cache(state: &Arc<AppState>) -> anyhow::Result<()> {
     ];
     download_dirs.sort();
     download_dirs.dedup();
-    if download_dirs
-        .iter()
-        .all(|download_dir| !download_dir.exists())
-    {
-        return Ok(());
-    }
 
-    // 1. Identify protected files: everything a live engine writes, at the
-    // paths the backend reports (a pinned engine stays live, so its data is
-    // protected for as long as the pin holds).
+    // Everything a live engine writes, at the paths the backend reports (a
+    // pinned engine stays live, so its data is protected for as long as
+    // the pin holds).
     let mut protected_paths: HashSet<_> =
         state.engine.protected_paths().await.into_iter().collect();
     protected_paths.extend(state.download_engine.protected_paths().await);
 
-    // 2. The downloads dir is not cache: offline downloads live there
-    // because the user asked for them, and a pin whose torrent the backend
-    // did not restore has no engine to protect its files. Nothing under it
-    // is walked -- which matters only when it sits inside a cache root,
-    // since the cleaner walks nothing else.
+    // The downloads dir is not cache: offline downloads live there because
+    // the user asked for them, and a pin whose torrent the backend did not
+    // restore has no engine to protect its files. Nothing under it is
+    // walked -- which matters only when it sits inside a cache root, since
+    // the cleaner walks nothing else.
     let mut downloads_dirs: Vec<_> = [
         state.engine.downloads_dir(),
         state.download_engine.downloads_dir(),
@@ -184,9 +188,55 @@ async fn clean_cache(state: &Arc<AppState>) -> anyhow::Result<()> {
     downloads_dirs.sort();
     downloads_dirs.dedup();
 
-    evict(&download_dirs, &protected_paths, limit, &downloads_dirs)
-        .await
-        .map(|_report| ())
+    CacheRoots {
+        download_dirs,
+        protected_paths,
+        downloads_dirs,
+        limit,
+    }
+}
+
+/// Run one eviction pass now and report what it found and freed. Shared by
+/// the background scheduler in [`start`] and, through
+/// `routes::cache::clean_cache_now`, `ServerHandle::clean_cache_now` and
+/// `POST /cache/clean` -- the on-demand path takes exactly this function,
+/// so it can never diverge from the scheduled sweep's protections.
+pub(crate) async fn clean_cache(state: &AppState) -> anyhow::Result<EvictionReport> {
+    let roots = cache_roots(state).await;
+    if roots
+        .download_dirs
+        .iter()
+        .all(|download_dir| !download_dir.exists())
+    {
+        return Ok(EvictionReport {
+            limit: roots.limit,
+            ..EvictionReport::default()
+        });
+    }
+
+    evict(
+        &roots.download_dirs,
+        &roots.protected_paths,
+        roots.limit,
+        &roots.downloads_dirs,
+    )
+    .await
+}
+
+/// What the cache currently occupies against its configured limit
+/// ([`CacheUsage`]), without touching the filesystem: the same walk
+/// [`evict`] does -- same session-artifact and downloads-dir exclusions,
+/// same occupancy accounting ([`occupied_bytes`]), same protection rule --
+/// but nothing is aged out or evicted. Shared by `routes::cache::cache_usage`
+/// (`ServerHandle::cache_usage` and `GET /cache.json`).
+pub(crate) async fn usage(state: &AppState) -> CacheUsage {
+    let roots = cache_roots(state).await;
+    scan_usage(
+        &roots.download_dirs,
+        &roots.protected_paths,
+        roots.limit,
+        &roots.downloads_dirs,
+    )
 }
 
 /// What a cache root costs on disk, as the cleaner must count it.
@@ -219,10 +269,103 @@ pub(crate) fn occupied_bytes(metadata: &std::fs::Metadata) -> u64 {
     }
 }
 
+/// What the cache currently occupies against its configured limit
+/// ([`usage`]), in the same occupancy accounting eviction uses
+/// ([`occupied_bytes`]). `serde`-serializable so it crosses the `GET
+/// /cache.json` / `ServerHandle::cache_usage` boundary as is.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheUsage {
+    /// Occupancy of the walked cache roots right now.
+    pub total_bytes: u64,
+    /// The configured limit, in the same accounting; `None` when
+    /// `settings.cacheSize` is unlimited (JSON `null`), matching the
+    /// distinction `ServerSettings.cache_size` itself makes.
+    pub limit_bytes: Option<u64>,
+    /// How much of `total_bytes` a clean pass may never touch right now: a
+    /// live engine is writing it, or a pinned download keeps it. When this
+    /// equals `total_bytes` and the cache is still over `limit_bytes`,
+    /// nothing is evictable -- cleaning cannot help until playback stops or
+    /// something is unpinned.
+    pub protected_bytes: u64,
+    /// How many files that is.
+    pub protected_files: usize,
+}
+
+/// The read-only half of [`evict`]'s walk: every payload file's occupancy
+/// and protection status, with nothing aged out or deleted. Mirrors
+/// `evict`'s session-artifact and downloads-dir exclusions exactly, so
+/// `usage` and a `clean_cache` run right after it agree about what the
+/// cache contains.
+fn scan_usage(
+    download_dirs: &[std::path::PathBuf],
+    protected_paths: &HashSet<std::path::PathBuf>,
+    limit: u64,
+    downloads_dirs: &[std::path::PathBuf],
+) -> CacheUsage {
+    let mut total = 0u64;
+    let mut protected = 0u64;
+    let mut protected_files = 0usize;
+
+    for download_dir in download_dirs {
+        if !download_dir.exists() {
+            continue;
+        }
+
+        // Only strict descendants of this root are pruned -- see the same
+        // guard in `evict`.
+        let pruned: Vec<std::path::PathBuf> = downloads_dirs
+            .iter()
+            .filter(|dir| dir.as_path() != download_dir.as_path() && dir.starts_with(download_dir))
+            .cloned()
+            .collect();
+
+        let mut entries = walkdir::WalkDir::new(download_dir)
+            .into_iter()
+            .filter_entry(|entry| entry.depth() == 0 || !is_under(entry.path(), &pruned));
+
+        loop {
+            match entries.next() {
+                Some(Ok(entry)) => {
+                    if !entry.file_type().is_file() {
+                        continue;
+                    }
+                    let path = entry.path();
+                    if is_session_artifact(path, download_dir) {
+                        continue;
+                    }
+                    let Ok(metadata) = entry.metadata() else {
+                        continue;
+                    };
+                    let size = occupied_bytes(&metadata);
+                    total += size;
+                    if is_path_protected(path, protected_paths) {
+                        protected += size;
+                        protected_files += 1;
+                    }
+                }
+                Some(Err(e)) => {
+                    debug!("Error walking directory: {}", e);
+                }
+                None => break,
+            }
+        }
+    }
+
+    CacheUsage {
+        total_bytes: total,
+        limit_bytes: (limit != u64::MAX).then_some(limit),
+        protected_bytes: protected,
+        protected_files,
+    }
+}
+
 /// What one [`evict`] run found and did, in occupancy bytes
-/// ([`occupied_bytes`]) throughout.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(crate) struct EvictionReport {
+/// ([`occupied_bytes`]) throughout. `serde`-serializable so it crosses the
+/// `POST /cache/clean` / `ServerHandle::clean_cache_now` boundary as is.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvictionReport {
     /// Occupancy of the walked roots once eviction finished.
     pub total: u64,
     /// How much of `total` eviction may never touch: files a live engine
@@ -509,7 +652,7 @@ async fn remove_empty_parents(mut dir: &std::path::Path, root: &std::path::Path)
 mod tests {
     use super::{
         CleanSchedule, EvictionReport, evict, is_path_protected, is_session_artifact,
-        occupied_bytes, remove_empty_parents,
+        occupied_bytes, remove_empty_parents, scan_usage,
     };
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
@@ -886,6 +1029,90 @@ mod tests {
         assert!(neighbour.is_file(), "no innocent file was evicted");
         assert!(sparse.is_file());
         assert_eq!(report.shortfall_message(), None, "the cache is not over");
+    }
+
+    /// [`scan_usage`] is `usage`'s read-only walk (`usage` itself only adds
+    /// the `AppState` plumbing `evict`'s callers already do). It must count
+    /// a sparse file's occupancy honestly too: a "Storage" screen reading
+    /// `len()` would report the whole film as cached before a single byte
+    /// past its first block had landed on disk.
+    #[cfg(unix)]
+    #[test]
+    fn usage_reports_occupancy_not_apparent_length_for_a_sparse_file() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("rqbit-downloads");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let apparent = 4u64 << 30;
+        let sparse = root.join("film.mkv");
+        let mut file = std::fs::File::create(&sparse).unwrap();
+        file.set_len(apparent).unwrap();
+        file.seek(SeekFrom::Start(apparent - 1)).unwrap();
+        file.write_all(&[1]).unwrap();
+        drop(file);
+        let allocated = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&sparse).unwrap().blocks() * 512
+        };
+        if allocated >= apparent {
+            // No sparse-file support on this filesystem -- nothing to
+            // assert about occupancy that would not be a tautology.
+            return;
+        }
+
+        let usage = scan_usage(std::slice::from_ref(&root), &HashSet::new(), 0, &[]);
+
+        assert_eq!(usage.total_bytes, allocated, "occupancy, not len()");
+        assert!(
+            usage.total_bytes < 1 << 20,
+            "4 GiB of apparent length reported as {} bytes",
+            usage.total_bytes
+        );
+        assert_eq!(usage.protected_bytes, 0);
+        assert_eq!(usage.protected_files, 0);
+    }
+
+    /// A caller explaining "over the limit but nothing is evictable" needs
+    /// `protected_bytes`/`protected_files` to name exactly what a live
+    /// engine or a pin is holding -- the same set `evict` never touches.
+    #[tokio::test]
+    async fn usage_reports_the_protected_bytes_a_live_engine_holds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("rqbit-downloads");
+        let pinned = root.join("Pinned").join("movie.mkv");
+        write_aged(&pinned, &[0u8; 8192], Duration::from_secs(600));
+        let free = root.join("Free").join("e1.mkv");
+        write_aged(&free, &[0u8; 4096], Duration::from_secs(600));
+        let protected: HashSet<PathBuf> = HashSet::from([pinned.clone()]);
+        let pinned_bytes = occupancy(&pinned);
+        let free_bytes = occupancy(&free);
+
+        // `u64::MAX` is what `cache_size_bytes(None)` produces for an
+        // unlimited cache -- the only value `scan_usage` treats as "no
+        // limit" (unlike `evict`'s own `limit == 0` shortfall check: `0` is
+        // a distinct, explicit zero-size cap, per `ServerSettings.cache_size`
+        // -- `Some(0.0)`, not `None` -- and `CacheUsage` must not blur the
+        // two the way `EvictionReport::shortfall_message` does).
+        let usage = scan_usage(std::slice::from_ref(&root), &protected, u64::MAX, &[]);
+
+        assert_eq!(usage.total_bytes, pinned_bytes + free_bytes);
+        assert_eq!(usage.protected_bytes, pinned_bytes);
+        assert_eq!(usage.protected_files, 1);
+        assert_eq!(usage.limit_bytes, None, "u64::MAX means unlimited");
+
+        // Reading usage never deletes anything, unlike a clean pass.
+        assert!(pinned.is_file());
+        assert!(free.is_file());
+
+        // A `CacheUsage` crosses `GET /cache.json` and `ServerHandle::cache_usage`
+        // as JSON, camelCase like every other response type.
+        let json = serde_json::to_value(&usage).unwrap();
+        assert_eq!(json["totalBytes"], pinned_bytes + free_bytes);
+        assert_eq!(json["protectedBytes"], pinned_bytes);
+        assert_eq!(json["protectedFiles"], 1);
+        assert_eq!(json["limitBytes"], serde_json::Value::Null);
     }
 
     /// The field condition: no `downloadsDir` is configured, so downloads

@@ -1,4 +1,5 @@
 pub mod archive;
+pub mod cache;
 pub mod casting;
 pub mod compat;
 pub mod downloads;
