@@ -3716,6 +3716,25 @@ mod tests {
         test_enginefs_with_file_count(1)
     }
 
+    /// Wait for `ready` to hold instead of sleeping for it. A pin reaches
+    /// its relocation through `tokio::fs`, a blocking-pool round trip whose
+    /// duration a test on a loaded machine may not assume: a fixed sleep
+    /// that is long enough here observes the state before the move on a
+    /// busy CI runner, and asserts about the wrong moment.
+    async fn until(mut ready: impl FnMut() -> bool) {
+        while !ready() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// Holds once [`BackendEngineFS::relocate_engine`] has parked the hash
+    /// in the magnet registry and asked the backend to move the files --
+    /// `FakeBackend::relocate_torrent` records the request before it blocks
+    /// on `relocate_hold`, and `begin_relocation` runs before that.
+    fn relocation_started(enginefs: &BackendEngineFS<FakeBackend>) -> bool {
+        !enginefs.backend.relocations.lock().unwrap().is_empty()
+    }
+
     /// The persisted pin set as JSON (`{}` when the file is not there yet).
     fn read_pinned_downloads(path: &std::path::Path) -> serde_json::Value {
         match std::fs::read(path) {
@@ -4732,7 +4751,7 @@ mod tests {
         let before = enginefs.get_engine(TEST_HASH).await.unwrap();
 
         let release = async {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            until(|| relocation_started(&enginefs)).await;
             assert_eq!(
                 enginefs.backend.relocations.lock().unwrap().len(),
                 1,
@@ -4783,7 +4802,7 @@ mod tests {
             enginefs.clock,
         ));
         let swap = async {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            until(|| relocation_started(&enginefs)).await;
             assert!(started_from.is_pinned());
             enginefs
                 .engines
@@ -4884,17 +4903,24 @@ mod tests {
         async fn waited_pin(
             enginefs: &BackendEngineFS<FakeBackend>,
         ) -> Result<Arc<Engine<FakeHandle>>, MagnetAddError> {
+            // Synchronised on the relocation, not on the clock: a waiter
+            // that looks the hash up before the move parks it finds the
+            // old engine, which proves nothing about the settlement.
+            let (parked, waiter_parked) = tokio::sync::oneshot::channel();
+            let waiter = async {
+                until(|| relocation_started(enginefs)).await;
+                let _ = parked.send(());
+                enginefs.get_or_add_magnet(TEST_HASH, None).await
+            };
             let release = async {
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                // The waiter has joined the entry -- `done` is the next
+                // thing it awaits -- so let the move fail under it.
+                let _ = waiter_parked.await;
                 assert!(enginefs.pending_magnet_add(TEST_HASH).await.is_some());
                 enginefs.backend.relocate_hold.add_permits(1);
             };
-            let waiter = async {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                enginefs.get_or_add_magnet(TEST_HASH, None).await
-            };
-            let (pinned, (), waited) =
-                tokio::join!(enginefs.pin_download(TEST_HASH, 0, None), release, waiter);
+            let (pinned, waited, ()) =
+                tokio::join!(enginefs.pin_download(TEST_HASH, 0, None), waiter, release);
             assert!(matches!(pinned, Err(PinDownloadError::Backend(_))));
             waited
         }
