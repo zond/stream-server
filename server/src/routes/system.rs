@@ -7,6 +7,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use enginefs::backend::librqbit::LibrqbitHandle;
+use enginefs::backend::priorities::BufferProfile;
 use enginefs::backend::{
     EngineStats, TorrentEncryptionMode, TorrentHandle, TorrentPrivacyConfig, TorrentProxyType,
 };
@@ -296,6 +297,20 @@ pub struct ServerSettings {
     /// configured this setting does nothing at all.
     #[serde(rename = "lanMediaEnabled", default)]
     pub lan_media_enabled: bool,
+
+    /// How far ahead playback reads: the default
+    /// [`BufferProfile`](enginefs::backend::priorities::BufferProfile) for
+    /// every stream request that does not carry a `buffer=` override.
+    /// `normal` (the default) is the behaviour this server has always had;
+    /// `large` and `maximum` multiply the playback read-ahead windows by 2
+    /// and 4, which helps a spotty connection or a player with a shallower
+    /// buffer than mpv's, and costs proportionally more disk in the piece
+    /// cache and more bandwidth spent ahead of what is watched. The startup
+    /// window is the same under every profile, so first-frame latency does
+    /// not change. A value that is not one of the three leaves the setting
+    /// as it was, like every other wrong-typed value.
+    #[serde(rename = "bufferProfile", default)]
+    pub buffer_profile: BufferProfile,
 }
 
 /// The torrent cache roots the cache cleaner walks -- what a
@@ -703,6 +718,7 @@ impl Default for ServerSettings {
             downloads_dir: None,
             dht_bootstrap_nodes: None,
             lan_media_enabled: false,
+            buffer_profile: BufferProfile::default(),
         }
     }
 }
@@ -883,6 +899,15 @@ pub async fn update_settings(state: &AppState, payload: &Value) -> anyhow::Resul
             settings.seeding_enabled = enabled;
         }
         update_bool_setting(obj, "lanMediaEnabled", &mut settings.lan_media_enabled);
+        // Validated, not merged blindly: an unknown profile name leaves the
+        // setting alone rather than failing the whole update.
+        if let Some(profile) = obj
+            .get("bufferProfile")
+            .and_then(Value::as_str)
+            .and_then(BufferProfile::parse)
+        {
+            settings.buffer_profile = profile;
+        }
         if let Some(dir) = downloads_dir_patch {
             settings.downloads_dir = dir.map(|path| path.to_string_lossy().into_owned());
         }

@@ -10,7 +10,10 @@ use axum::{
 
 use axum::http::HeaderMap;
 use enginefs::backend::librqbit::TorrentInitError;
-use enginefs::backend::{HotFilePriorityPlan, TorrentHandle, priorities::PlaybackIntent};
+use enginefs::backend::{
+    HotFilePriorityPlan, TorrentHandle,
+    priorities::{BufferProfile, PlaybackIntent},
+};
 use enginefs::engine::GetFileError;
 use futures_util::Stream;
 use std::path::Path as FsPath;
@@ -143,6 +146,12 @@ impl Drop for MetadataResolutionGuard {
 struct PlaybackQuery {
     download: bool,
     filters: Vec<String>,
+    /// `buffer=normal|large|maximum`: this playback's read-ahead choice,
+    /// overriding the `bufferProfile` setting for this request only. `None`
+    /// when the parameter is absent -- and also when it carries a value this
+    /// build does not know, because a player that guessed wrong should get
+    /// the server's default rather than a failed stream.
+    buffer: Option<BufferProfile>,
 }
 
 impl PlaybackQuery {
@@ -156,6 +165,15 @@ impl PlaybackQuery {
             let (key, raw_value) = field.split_once('=').unwrap_or((field, ""));
             match key {
                 "download" => parsed.download = compat::query_value_is_true(raw_value),
+                "buffer" => {
+                    // Percent-decoded like `f=`: the values are bare words,
+                    // but a client that escapes them is not wrong.
+                    let decoded = url::form_urlencoded::parse(field.as_bytes())
+                        .next()
+                        .map(|(_, value)| value.into_owned())
+                        .unwrap_or_else(|| raw_value.to_string());
+                    parsed.buffer = BufferProfile::parse(&decoded);
+                }
                 "f" => {
                     if let Some((_, value)) = url::form_urlencoded::parse(field.as_bytes()).next() {
                         parsed.filters.push(value.into_owned());
@@ -685,6 +703,12 @@ pub async fn stream_video(
         is_download,
         is_partial,
     );
+    // The request's own `buffer=` wins; anything else (absent, or a value this
+    // build does not know) falls back to the server-wide default.
+    let buffer_profile = match query.buffer {
+        Some(profile) => profile,
+        None => state.settings.read().await.buffer_profile,
+    };
     let native_lifecycle = engine.handle.manages_playback_lifecycle();
     if !is_download && !is_partial && start == 0 {
         tracing::info!(
@@ -727,6 +751,7 @@ pub async fn stream_video(
         start_offset = start_offset_hint,
         priority,
         intent = ?playback_intent,
+        buffer = buffer_profile.as_str(),
         "stream_video calling get_file"
     );
     let mut file = match engine
@@ -735,9 +760,7 @@ pub async fn stream_video(
             start_offset_hint,
             priority,
             playback_intent,
-            // Every stream reads ahead by the default profile for now; the
-            // setting and the per-request override land next.
-            enginefs::backend::priorities::BufferProfile::default(),
+            buffer_profile,
         )
         .await
     {
@@ -1110,5 +1133,34 @@ mod tests {
 
         assert!(query.download);
         assert_eq!(query.filters, ["Episode 02"]);
+        assert_eq!(query.buffer, None);
+    }
+
+    #[test]
+    fn playback_query_reads_the_buffer_override() {
+        for (raw, expected) in [
+            ("buffer=normal", BufferProfile::Normal),
+            ("buffer=large", BufferProfile::Large),
+            ("buffer=maximum", BufferProfile::Maximum),
+            // Case and percent-encoding are a client's business, not ours.
+            ("buffer=MAXIMUM", BufferProfile::Maximum),
+            ("buffer=%20large%20", BufferProfile::Large),
+            ("f=Episode+02&buffer=large&download=1", BufferProfile::Large),
+        ] {
+            assert_eq!(
+                PlaybackQuery::parse(Some(raw)).buffer,
+                Some(expected),
+                "query {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_buffer_value_falls_back_to_the_default() {
+        // `None` is what the handler turns into "use the server's
+        // bufferProfile setting"; none of these may fail the request.
+        for raw in ["buffer=huge", "buffer=", "buffer", "buffer=2", "download=1"] {
+            assert_eq!(PlaybackQuery::parse(Some(raw)).buffer, None, "query {raw}");
+        }
     }
 }

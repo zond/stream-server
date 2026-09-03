@@ -2133,3 +2133,94 @@ fn without_a_configured_address_there_is_no_lan_media_listener() -> anyhow::Resu
     handle.join()?;
     Ok(())
 }
+
+/// The buffer profile: a server-wide default and a per-request override.
+///
+/// The setting is `bufferProfile` (`normal` by default), and the stream route
+/// takes `?buffer=` alongside its existing parameters. Both are additive, and
+/// neither can fail a playback request: a value this build does not know
+/// falls back -- the query parameter to the setting, the setting to what it
+/// already was -- rather than answering an error to a player that guessed.
+#[test]
+fn buffer_profile_is_a_setting_and_a_stream_query_override() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    let (handle, base, info_hash, idx, payload) =
+        lan_media_server(config_dir.path(), cache_dir.path(), src.path(), None)?;
+    let client = bearer_client(&handle)?;
+
+    // The default is today's behaviour, and the library agrees with the route.
+    let values: serde_json::Value = client
+        .get(format!("{base}/settings"))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    assert_eq!(values["values"]["bufferProfile"], "normal");
+    assert_eq!(
+        serde_json::to_value(handle.settings()?)?["bufferProfile"],
+        "normal"
+    );
+
+    // Every profile is accepted, persisted and visible over both surfaces.
+    for profile in ["large", "maximum", "normal"] {
+        let updated = handle.update_settings(serde_json::json!({ "bufferProfile": profile }))?;
+        assert_eq!(serde_json::to_value(&updated)?["bufferProfile"], profile);
+        let values: serde_json::Value = client
+            .get(format!("{base}/settings"))
+            .send()?
+            .error_for_status()?
+            .json()?;
+        assert_eq!(values["values"]["bufferProfile"], profile);
+    }
+    handle.update_settings(serde_json::json!({ "bufferProfile": "large" }))?;
+    let persisted: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+        config_dir.path().join("config").join("settings.json"),
+    )?)?;
+    assert_eq!(persisted["bufferProfile"], "large");
+
+    // An unknown or wrong-typed value leaves the setting as it was, exactly
+    // like every other unrecognised value in the payload -- and takes the
+    // rest of the payload with it, so the update still applies.
+    let updated = handle.update_settings(serde_json::json!({
+        "bufferProfile": "gigantic",
+        "btMaxConnections": 61,
+    }))?;
+    assert_eq!(serde_json::to_value(&updated)?["bufferProfile"], "large");
+    assert_eq!(updated.bt_max_connections, 61);
+    let updated = handle.update_settings(serde_json::json!({ "bufferProfile": 4 }))?;
+    assert_eq!(serde_json::to_value(&updated)?["bufferProfile"], "large");
+
+    // The stream route takes the override next to the parameters it already
+    // had, and serves the same bytes whichever profile is asked for -- the
+    // profile changes how far ahead the engine reads, never the response.
+    // An unknown value is not a client error: it falls back to the setting.
+    let media = format!("{base}/{info_hash}/{idx}");
+    for query in [
+        String::new(),
+        "?buffer=normal".to_string(),
+        "?buffer=large".to_string(),
+        "?buffer=MAXIMUM".to_string(),
+        "?buffer=gigantic".to_string(),
+        "?buffer=".to_string(),
+        format!("?tr=udp%3A%2F%2Fone&buffer=large&f={}", "movie.bin"),
+    ] {
+        let response = client.get(format!("{media}{query}")).send()?;
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::OK,
+            "GET /{{infoHash}}/{{fileIdx}}{query}"
+        );
+        assert_eq!(response.bytes()?.as_ref(), payload.as_slice(), "{query}");
+    }
+
+    // And a ranged request, which is what a player actually issues on a seek.
+    let response = client
+        .get(format!("{media}?buffer=maximum"))
+        .header(reqwest::header::RANGE, "bytes=0-1023")
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.bytes()?.len(), 1024);
+
+    Ok(())
+}
