@@ -571,6 +571,7 @@ pub async fn run(
             bt_validate_https_trackers: settings.bt_validate_https_trackers,
             bt_ssrf_mitigation: settings.bt_ssrf_mitigation,
         },
+        dht_bootstrap_nodes: settings.dht_bootstrap_nodes.clone().unwrap_or_default(),
     };
 
     let (download_engine, download_engine_disk_backed) = match EngineFS::new_disk_backed(

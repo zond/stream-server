@@ -248,6 +248,27 @@ pub struct ServerSettings {
     /// the cache root is relocated by its next pin.
     #[serde(rename = "downloadsDir", default)]
     pub downloads_dir: Option<String>,
+
+    /// DHT bootstrap nodes (`host:port`) used to seed librqbit's routing
+    /// table when it starts cold. `None` or an empty list (the default)
+    /// uses our built-in widened set,
+    /// `enginefs::backend::librqbit::DEFAULT_DHT_BOOTSTRAP_NODES`
+    /// (librqbit's own two plus other conventional public bootstrap
+    /// nodes -- see that constant's doc for why and the resolution check
+    /// behind it); a non-empty list REPLACES the default entirely. Entries
+    /// are validated on `POST /settings` (non-empty host, valid nonzero
+    /// port) -- an invalid entry is dropped with a `tracing::warn!` rather
+    /// than failing the request. DHT bootstrap addresses are read once when
+    /// librqbit's session opens (see
+    /// `enginefs::backend::BackendConfig::dht_bootstrap_nodes`), so unlike
+    /// the other `bt*` privacy settings this one only takes effect on the
+    /// next server start, not on the running session -- and even then, a
+    /// persisted `dht.json` routing table makes bootstrap-host reachability
+    /// less consequential in practice, since librqbit still races the
+    /// bootstrap request but already has a warm table to work with (see the
+    /// same constant's doc for the underlying librqbit behaviour).
+    #[serde(rename = "dhtBootstrapNodes", default)]
+    pub dht_bootstrap_nodes: Option<Vec<String>>,
 }
 
 /// The torrent cache roots the cache cleaner walks -- what a
@@ -534,6 +555,46 @@ fn value_as_u16(value: &Value) -> Option<u16> {
     value.as_u64().and_then(|n| u16::try_from(n).ok())
 }
 
+/// A `dhtBootstrapNodes` entry is valid when it splits into a non-empty
+/// host and a nonzero port -- `host:port` with the port as the last colon
+/// segment, so an IPv6 literal with no bracket/port suffix (which has no
+/// unambiguous "last colon is the port" reading) is rejected too, same as
+/// a bare hostname with no port at all.
+fn is_valid_dht_bootstrap_node(entry: &str) -> bool {
+    match entry.rsplit_once(':') {
+        Some((host, port)) => !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p != 0),
+        None => false,
+    }
+}
+
+/// Parse a `dhtBootstrapNodes` payload value (expected: a JSON array of
+/// `host:port` strings) into the entries to store. Returns `None` when
+/// `value` is not an array at all, leaving the existing setting unchanged
+/// -- matching every other field's merge-on-present-and-valid semantics.
+/// An array that mixes valid and invalid entries still returns `Some` with
+/// just the valid ones, each dropped invalid entry logged with
+/// `tracing::warn!` rather than failing the whole `POST /settings` request.
+fn parse_dht_bootstrap_nodes(value: &Value) -> Option<Vec<String>> {
+    let entries = value.as_array()?;
+    Some(
+        entries
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter_map(|entry| {
+                if is_valid_dht_bootstrap_node(entry) {
+                    Some(entry.to_string())
+                } else {
+                    tracing::warn!(
+                        entry,
+                        "dhtBootstrapNodes: dropping invalid entry (expected host:port)"
+                    );
+                    None
+                }
+            })
+            .collect(),
+    )
+}
+
 fn update_bool_setting(obj: &serde_json::Map<String, Value>, key: &str, target: &mut bool) {
     if let Some(value) = obj.get(key).and_then(Value::as_bool) {
         *target = value;
@@ -613,6 +674,7 @@ impl Default for ServerSettings {
             trackers_source_url: default_trackers_url(),
             seeding_enabled: default_seeding_enabled(),
             downloads_dir: None,
+            dht_bootstrap_nodes: None,
         }
     }
 }
@@ -794,6 +856,20 @@ pub async fn update_settings(state: &AppState, payload: &Value) -> anyhow::Resul
         }
         if let Some(dir) = downloads_dir_patch {
             settings.downloads_dir = dir.map(|path| path.to_string_lossy().into_owned());
+        }
+        if let Some(v) = obj.get("dhtBootstrapNodes") {
+            if v.is_null() {
+                settings.dht_bootstrap_nodes = None;
+            } else if let Some(parsed) = parse_dht_bootstrap_nodes(v) {
+                // An empty (or now-all-invalid) list is stored the same as
+                // `null`: both mean "use the default set" (see
+                // `enginefs::backend::librqbit::resolve_dht_bootstrap_nodes`).
+                settings.dht_bootstrap_nodes = if parsed.is_empty() {
+                    None
+                } else {
+                    Some(parsed)
+                };
+            }
         }
     }
 
@@ -1667,5 +1743,71 @@ mod tests {
 
         update_string_setting(&obj, "name", &mut target, true, true);
         assert_eq!(target, "", "allow_empty=true should accept it");
+    }
+
+    #[test]
+    fn is_valid_dht_bootstrap_node_requires_host_and_nonzero_port() {
+        assert!(is_valid_dht_bootstrap_node("router.bittorrent.com:6881"));
+        assert!(!is_valid_dht_bootstrap_node("no-port-here"));
+        assert!(!is_valid_dht_bootstrap_node(":6881"), "empty host");
+        assert!(!is_valid_dht_bootstrap_node("host:"), "empty port");
+        assert!(!is_valid_dht_bootstrap_node("host:0"), "zero port");
+        assert!(!is_valid_dht_bootstrap_node("host:not-a-port"));
+        assert!(
+            !is_valid_dht_bootstrap_node("host:99999"),
+            "port out of u16 range"
+        );
+    }
+
+    /// A payload with a mix of valid and invalid entries drops only the
+    /// invalid ones (logged, not fatal) -- the valid entries survive in
+    /// order.
+    #[test]
+    fn parse_dht_bootstrap_nodes_drops_invalid_entries_and_keeps_the_rest() {
+        let value = json!([
+            "router.bittorrent.com:6881",
+            "no-port-here",
+            "dht.transmissionbt.com:6881",
+            "host:0",
+            123,
+        ]);
+        let parsed = parse_dht_bootstrap_nodes(&value).expect("value is a JSON array");
+        assert_eq!(
+            parsed,
+            vec![
+                "router.bittorrent.com:6881".to_string(),
+                "dht.transmissionbt.com:6881".to_string(),
+            ]
+        );
+    }
+
+    /// Not a JSON array at all: `None`, so `update_settings` leaves the
+    /// existing setting untouched, the same as every other field's
+    /// merge-on-present-and-valid semantics.
+    #[test]
+    fn parse_dht_bootstrap_nodes_rejects_a_non_array_payload() {
+        assert!(parse_dht_bootstrap_nodes(&json!("router.bittorrent.com:6881")).is_none());
+        assert!(parse_dht_bootstrap_nodes(&json!(42)).is_none());
+    }
+
+    /// An explicitly configured *empty* list parses to `Some(vec![])`
+    /// (distinct from `None`/absent, which leaves the setting alone); the
+    /// caller (`update_settings`) stores that the same as `null`, and
+    /// `enginefs::backend::librqbit::resolve_dht_bootstrap_nodes` (see its
+    /// own tests) turns either back into the built-in default set at
+    /// session start.
+    #[test]
+    fn parse_dht_bootstrap_nodes_empty_array_falls_back_to_the_default() {
+        let parsed = parse_dht_bootstrap_nodes(&json!([])).expect("empty array is still a value");
+        assert!(parsed.is_empty());
+
+        let resolved = enginefs::backend::librqbit::resolve_dht_bootstrap_nodes(&parsed);
+        assert_eq!(
+            resolved,
+            enginefs::backend::librqbit::DEFAULT_DHT_BOOTSTRAP_NODES
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+        );
     }
 }
