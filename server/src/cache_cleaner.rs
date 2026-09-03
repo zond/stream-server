@@ -150,7 +150,10 @@ async fn clean_cache(state: &Arc<AppState>) -> anyhow::Result<()> {
 /// exceeds `limit` (0 = no limit) -- the least recently modified files.
 /// Nothing under `downloads_dirs` is walked at all: those files are
 /// offline downloads, not cache, so they are neither evicted nor counted
-/// towards `limit`.
+/// towards `limit`. Only strict descendants of a walked root are pruned
+/// that way -- a `downloads_dirs` entry that is a root or above it is
+/// warned about and ignored, since pruning it would leave nothing walked
+/// and stop every eviction rule for that root.
 async fn evict(
     download_dirs: &[std::path::PathBuf],
     protected_paths: &HashSet<std::path::PathBuf>,
@@ -169,9 +172,32 @@ async fn evict(
             continue;
         }
 
+        // Only strict descendants of this root are pruned. `filter_entry`
+        // applies its predicate to the root entry as well and a rejected
+        // directory ends the walk (`skip_current_dir`), so a downloads dir
+        // that is this root, or above it, would silently switch BOTH
+        // eviction rules off for it -- nothing walked, nothing aged out,
+        // `cacheSize` never enforced. `prepare_downloads_dir` refuses such
+        // a setting; a persisted or externally-set one is warned about and
+        // ignored here, and what is under the root is treated as cache.
+        let pruned: Vec<std::path::PathBuf> = downloads_dirs
+            .iter()
+            .filter(|dir| dir.as_path() != download_dir.as_path() && dir.starts_with(download_dir))
+            .cloned()
+            .collect();
+        for dir in downloads_dirs {
+            if download_dir.starts_with(dir) {
+                warn!(
+                    downloads_dir = %dir.display(),
+                    cache_root = %download_dir.display(),
+                    "downloadsDir is at or above a torrent cache root; it cannot be told apart from cache and is not spared from eviction"
+                );
+            }
+        }
+
         let mut entries = walkdir::WalkDir::new(download_dir)
             .into_iter()
-            .filter_entry(|entry| !is_under(entry.path(), downloads_dirs));
+            .filter_entry(|entry| entry.depth() == 0 || !is_under(entry.path(), &pruned));
 
         loop {
             match entries.next() {
@@ -564,6 +590,59 @@ mod tests {
             "the download's bytes must not count towards the limit"
         );
         assert!(offline.join(HASH).is_dir(), "and its folder stays");
+    }
+
+    /// `WalkDir::filter_entry` runs its predicate on the walk root too,
+    /// and a rejected directory ends the walk there -- so a downloads dir
+    /// that IS a cache root, or sits above it, must never prune it.
+    /// Pruning only strict descendants keeps both eviction rules running
+    /// for the root (`prepare_downloads_dir` refuses such a setting; this
+    /// is what keeps an unexpected one from switching the cleaner off).
+    #[tokio::test]
+    async fn evict_walks_a_root_its_downloads_dir_covers() {
+        let forty_days = Duration::from_secs(40 * 24 * 60 * 60);
+        for above in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("rqbit-downloads");
+            let stale = root.join("old-show").join("e1.mkv");
+            write_aged(&stale, &[0u8; 4096], forty_days);
+            let older = root.join("older.mkv");
+            write_aged(&older, &[0u8; 1024], Duration::from_secs(3600));
+            let fresh = root.join("fresh.mkv");
+            write_aged(&fresh, &[0u8; 4096], Duration::from_secs(60));
+            let downloads_dirs = if above {
+                vec![tmp.path().to_path_buf()]
+            } else {
+                vec![root.clone()]
+            };
+
+            evict(
+                std::slice::from_ref(&root),
+                &HashSet::new(),
+                0,
+                &downloads_dirs,
+            )
+            .await
+            .unwrap();
+            assert!(
+                !stale.exists(),
+                "downloads dir {downloads_dirs:?}: the age rule still runs in the walked root"
+            );
+
+            evict(
+                std::slice::from_ref(&root),
+                &HashSet::new(),
+                4096,
+                &downloads_dirs,
+            )
+            .await
+            .unwrap();
+            assert!(
+                !older.exists(),
+                "downloads dir {downloads_dirs:?}: the size rule still runs in the walked root"
+            );
+            assert!(fresh.is_file(), "back under the limit");
+        }
     }
 
     /// A pinned download in the cache root (no downloads dir configured)
