@@ -238,6 +238,40 @@ pub struct ServerSettings {
     /// peers.  When false, torrents are paused once their download finishes.
     #[serde(rename = "seedingEnabled", default = "default_seeding_enabled")]
     pub seeding_enabled: bool,
+
+    /// Where offline downloads are placed: `<downloadsDir>/<infoHash>/` per
+    /// pinned torrent. `None` (the default) keeps them in the cache root
+    /// (`<cacheRoot>/rqbit-downloads`). Set through `POST /settings` with
+    /// an absolute path (created if missing, must be writable) or `null`;
+    /// pins issued from then on go there, and a torrent already managed in
+    /// the cache root is relocated by its next pin.
+    #[serde(rename = "downloadsDir", default)]
+    pub downloads_dir: Option<String>,
+}
+
+/// Validate and prepare a `downloadsDir` value: trimmed, absolute, created
+/// if missing, and writable (a probe file is created and removed). The
+/// returned path is what the setting stores and the engines use.
+pub async fn prepare_downloads_dir(raw: &str) -> anyhow::Result<std::path::PathBuf> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        anyhow::bail!("downloadsDir must not be empty (use null to unset it)");
+    }
+    let path = std::path::PathBuf::from(raw);
+    if !path.is_absolute() {
+        anyhow::bail!("downloadsDir must be an absolute path, got {raw:?}");
+    }
+    tokio::fs::create_dir_all(&path)
+        .await
+        .map_err(|e| anyhow::anyhow!("downloadsDir {raw:?} cannot be created: {e}"))?;
+    let probe = path.join(format!(".stream-server-write-probe-{}", std::process::id()));
+    tokio::fs::write(&probe, b"")
+        .await
+        .map_err(|e| anyhow::anyhow!("downloadsDir {raw:?} is not writable: {e}"))?;
+    if let Err(error) = tokio::fs::remove_file(&probe).await {
+        tracing::debug!(path = %probe.display(), %error, "could not remove the write probe");
+    }
+    Ok(path)
 }
 
 /// Resolve the `cacheSize` field of a `POST /settings` payload into the
@@ -475,6 +509,7 @@ impl Default for ServerSettings {
             trackers_last_updated: 0,
             trackers_source_url: default_trackers_url(),
             seeding_enabled: default_seeding_enabled(),
+            downloads_dir: None,
         }
     }
 }
@@ -497,6 +532,14 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
 /// handler and `ServerHandle::update_settings`.
 pub async fn update_settings(state: &AppState, payload: &Value) -> anyhow::Result<ServerSettings> {
     tracing::debug!("update_settings: received payload: {:?}", payload);
+
+    // `downloadsDir` is the one validated setting: an unusable directory
+    // fails the whole update (nothing is merged), before the lock is taken.
+    let downloads_dir_patch = match payload.get("downloadsDir") {
+        Some(Value::Null) => Some(None),
+        Some(Value::String(raw)) => Some(Some(prepare_downloads_dir(raw).await?)),
+        _ => None,
+    };
 
     // Merge with existing settings
     let mut settings = state.settings.write().await;
@@ -641,9 +684,16 @@ pub async fn update_settings(state: &AppState, payload: &Value) -> anyhow::Resul
         {
             settings.seeding_enabled = enabled;
         }
+        if let Some(dir) = downloads_dir_patch {
+            settings.downloads_dir = dir.map(|path| path.to_string_lossy().into_owned());
+        }
     }
 
     let seeding_enabled = settings.seeding_enabled;
+    let downloads_dir = settings
+        .downloads_dir
+        .as_ref()
+        .map(std::path::PathBuf::from);
 
     // Build new speed profile from updated settings
     let new_profile = enginefs::backend::TorrentSpeedProfile {
@@ -694,6 +744,8 @@ pub async fn update_settings(state: &AppState, payload: &Value) -> anyhow::Resul
 
     state.engine.set_seeding_enabled(seeding_enabled);
     state.download_engine.set_seeding_enabled(seeding_enabled);
+    state.engine.set_downloads_dir(downloads_dir.clone());
+    state.download_engine.set_downloads_dir(downloads_dir);
 
     // Save to disk
     state.save_settings().await?;
@@ -1005,6 +1057,36 @@ pub async fn get_file_stats(
 
 #[cfg(test)]
 mod tests {
+    /// `downloadsDir` must be absolute and usable: relative, empty and
+    /// file-shadowed paths are refused, a missing directory is created,
+    /// and the probe leaves nothing behind.
+    #[tokio::test]
+    async fn prepare_downloads_dir_validates_and_creates() {
+        use super::prepare_downloads_dir;
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(prepare_downloads_dir("").await.is_err());
+        assert!(prepare_downloads_dir("   ").await.is_err());
+        assert!(prepare_downloads_dir("relative/dir").await.is_err());
+        let file = tmp.path().join("a-file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(
+            prepare_downloads_dir(file.to_str().unwrap()).await.is_err(),
+            "a file is not a directory"
+        );
+
+        let nested = tmp.path().join("offline").join("downloads");
+        let prepared = prepare_downloads_dir(&format!("  {}  ", nested.display()))
+            .await
+            .unwrap();
+        assert_eq!(prepared, nested);
+        assert!(nested.is_dir());
+        assert_eq!(
+            std::fs::read_dir(&nested).unwrap().count(),
+            0,
+            "the write probe is removed"
+        );
+    }
+
     use super::*;
     use enginefs::MagnetAddError;
     use std::sync::Arc;

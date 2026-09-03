@@ -875,3 +875,212 @@ fn stats_json_reports_resolving_metadata_with_the_requests_trackers() -> anyhow:
 
     Ok(())
 }
+
+/// A real multi-file torrent (correct piece hashes, 16 KiB pieces) built
+/// from the files under `dir`, whose name becomes the torrent name --
+/// librqbit's `<root>/<name>` folder in the cache root. Returns the
+/// metainfo bytes and the info hash.
+fn real_torrent(dir: &std::path::Path) -> (Vec<u8>, String) {
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let t = librqbit::create_torrent(
+            dir,
+            librqbit::CreateTorrentOptions {
+                name: None,
+                trackers: Vec::new(),
+                piece_length: Some(16384),
+            },
+            &librqbit::spawn_utils::BlockingSpawner::new(1),
+        )
+        .await
+        .expect("create torrent");
+        (
+            t.as_bytes().expect("serialize").to_vec(),
+            t.info_hash().as_string(),
+        )
+    })
+}
+
+/// Deterministic, non-trivial payload so piece hashes mean something.
+fn write_payload(path: &std::path::Path, len: usize) {
+    let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+    std::fs::write(path, data).expect("write payload");
+}
+
+/// Poll `/{infoHash}/stats.json` until the torrent is out of `checking`
+/// (bounded), returning the last stats.
+fn stats_after_check(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    info_hash: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let stats: serde_json::Value = client
+            .get(format!("{base}/{info_hash}/stats.json"))
+            .send()?
+            .error_for_status()?
+            .json()?;
+        match stats["phase"].as_str() {
+            Some("checking") | Some("resolvingMetadata")
+                if std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            _ => return Ok(stats),
+        }
+    }
+}
+
+/// Offline downloads with a `downloadsDir`: a torrent that was streamed
+/// first (managed in the cache root, data verified there) is relocated by
+/// the pin into `<downloadsDir>/<infoHash>` -- files moved, cache-root
+/// folder gone, re-checked in place (`checking`) and complete again --
+/// `pin_download` on the handle reports the file's new path, the setting
+/// is validated (`POST /settings` semantics) and persisted, and a restart
+/// on the same dirs restores the torrent where it is with its pin.
+#[test]
+fn pinned_download_relocates_into_downloads_dir_and_survives_a_restart() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let downloads_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+
+    let content = src.path().join("Show Season 1");
+    std::fs::create_dir_all(&content)?;
+    write_payload(&content.join("e1.bin"), 40 * 1024);
+    write_payload(&content.join("e2.bin"), 24 * 1024);
+    let (torrent, info_hash) = real_torrent(&content);
+
+    // "Streamed before": the data already sits in the cache root, where
+    // librqbit puts a multi-file torrent added without a placement.
+    let cache_root = cache_dir.path().join("cache");
+    let root_folder = cache_root.join("rqbit-downloads").join("Show Season 1");
+    std::fs::create_dir_all(&root_folder)?;
+    std::fs::copy(content.join("e1.bin"), root_folder.join("e1.bin"))?;
+    std::fs::copy(content.join("e2.bin"), root_folder.join("e2.bin"))?;
+
+    let config = || stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_root.clone()),
+        ..stream_server::ServerConfig::default()
+    };
+    let handle = stream_server::start(config())?;
+    let base = format!("http://{}", handle.http_addr());
+    let client = bearer_client(&handle)?;
+
+    let created: serde_json::Value = client
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    assert_eq!(created["infoHash"], info_hash);
+    let stats = stats_after_check(&client, &base, &info_hash)?;
+    assert_eq!(stats["files"][0]["complete"], true, "{stats}");
+    assert_eq!(stats["files"][1]["complete"], true, "{stats}");
+    assert_eq!(stats["pinnedFiles"], serde_json::json!([]));
+
+    // The setting: validated like the route, persisted, reported.
+    assert_eq!(handle.settings()?.downloads_dir, None);
+    assert!(
+        handle
+            .update_settings(serde_json::json!({ "downloadsDir": "relative/path" }))
+            .is_err(),
+        "a relative downloadsDir is refused"
+    );
+    assert_eq!(handle.settings()?.downloads_dir, None);
+    let downloads = downloads_dir.path().join("offline");
+    let updated = handle.update_settings(serde_json::json!({
+        "downloadsDir": downloads.to_str().unwrap()
+    }))?;
+    assert_eq!(
+        updated.downloads_dir.as_deref(),
+        Some(downloads.to_str().unwrap())
+    );
+    assert!(downloads.is_dir(), "created on the spot");
+    let http: serde_json::Value = client
+        .get(format!("{base}/settings"))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    assert_eq!(http["values"]["downloadsDir"], downloads.to_str().unwrap());
+
+    // Pin: relocated into <downloadsDir>/<infoHash>, re-checked there.
+    let target = downloads.join(&info_hash);
+    let info = handle.pin_download(&info_hash.to_uppercase(), 1, &[])?;
+    assert_eq!(info.info_hash, info_hash);
+    assert_eq!(info.file_idx, 1);
+    assert_eq!(info.name, "e2.bin");
+    assert_eq!(info.length, 24 * 1024);
+    assert_eq!(
+        info.path.as_deref(),
+        Some(target.join("e2.bin").to_str().unwrap()),
+        "{info:?}"
+    );
+    assert!(target.join("e2.bin").is_file());
+    assert!(target.join("e1.bin").is_file(), "the whole torrent moves");
+    assert!(!root_folder.exists(), "nothing left in the cache root");
+    let stats = stats_after_check(&client, &base, &info_hash)?;
+    assert_eq!(
+        stats["files"][1]["complete"], true,
+        "re-check found the moved data: {stats}"
+    );
+    assert_eq!(stats["files"][1]["pinned"], true);
+    assert_eq!(stats["pinnedFiles"], serde_json::json!([1]));
+    assert_eq!(stats["checkedBytes"], serde_json::Value::Null);
+    let file_stats = handle.file_stats(&info_hash, 1, &[])?;
+    assert!(file_stats.files[1].complete && file_stats.files[1].pinned);
+    let again = handle.pin_download(&info_hash, 1, &[])?;
+    assert!(again.complete, "idempotent: {again:?}");
+    let missing = handle.pin_download(&info_hash, 9, &[]);
+    assert!(
+        missing
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("out of range")),
+        "{missing:?}"
+    );
+
+    let pins_file = cache_root
+        .join("rqbit-downloads")
+        .join("pinned-downloads.json");
+    let pins: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&pins_file)?)?;
+    assert_eq!(pins, serde_json::json!({ &info_hash: [1] }));
+
+    handle.shutdown()?;
+    handle.join()?;
+
+    // Restart on the same dirs: librqbit restores the torrent in its new
+    // place (persisted output_folder / only_files), the pin comes back
+    // from the persisted pin set, the setting from settings.json.
+    let handle = stream_server::start(config())?;
+    let base = format!("http://{}", handle.http_addr());
+    let client = bearer_client(&handle)?;
+    assert_eq!(
+        handle.settings()?.downloads_dir.as_deref(),
+        Some(downloads.to_str().unwrap())
+    );
+    let stats = handle.engine_stats(&info_hash, &[])?;
+    assert_ne!(
+        stats.phase,
+        stream_server::EngineStats::resolving_metadata(&info_hash, &[]).phase,
+        "restored from the session, not re-added"
+    );
+    assert_eq!(stats.pinned_files, vec![1], "pin restored");
+    let stats = stats_after_check(&client, &base, &info_hash)?;
+    assert_eq!(stats["files"][1]["complete"], true, "{stats}");
+    assert_eq!(stats["files"][1]["pinned"], true, "{stats}");
+    assert_eq!(stats["pinnedFiles"], serde_json::json!([1]));
+    let info = handle.pin_download(&info_hash, 1, &[])?;
+    assert_eq!(
+        info.path.as_deref(),
+        Some(target.join("e2.bin").to_str().unwrap())
+    );
+    assert!(info.complete);
+    assert!(target.join("e2.bin").is_file());
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}

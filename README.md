@@ -199,8 +199,17 @@ An embedder holds a `ServerHandle` (from `stream_server::start`) and never needs
 | `update_settings(patch: serde_json::Value) -> Result<ServerSettings>` | `POST /settings` (same keys, validation, engine update and persistence); returns the settings afterwards |
 | `engine_stats(info_hash, trackers: &[String]) -> Result<EngineStats>` | `GET /{infoHash}/stats.json?tr=…` — including creating the engine with `trackers` when it is the first request for the hash and answering `resolvingMetadata` at once. `trackers` are normalised inside the shared function exactly like `tr=` (`tracker:` prefix stripped, `dht:` dropped, trimmed), so a stream's `sources` array can be passed as is |
 | `file_stats(info_hash, file_idx: usize, trackers) -> Result<EngineStats>` | `GET /{infoHash}/{fileIdx}/stats.json?tr=…`; the route's `404` is a `FileNotFound` error |
+| `pin_download(info_hash, file_idx: usize, trackers) -> Result<DownloadInfo>` | pin the file as an offline download (see [Offline downloads](#offline-downloads)); the download control route sharing it lands next |
 
-The HTTP handlers and these methods call the same functions (`routes::system::{engine_stats, file_stats, update_settings}`), so they cannot drift; `server/tests/embed.rs` compares them.
+The HTTP handlers and these methods call the same functions (`routes::system::{engine_stats, file_stats, update_settings}`, `routes::downloads::pin_download`), so they cannot drift; `server/tests/embed.rs` compares them.
+
+### Offline downloads
+
+A **pinned** file stays wanted no matter which file of the torrent is being played, and its torrent is exempt from idle removal, the seeding-disabled pause and the cache cleaner for as long as it has a pinned file. `stats.json` reports `pinnedFiles` and, per file, `pinned` and `complete` (`downloaded == length`).
+
+- **Where**: `settings.downloadsDir` (`POST /settings`, `null` by default). Unset, pinned torrents live in the cache root like everything else (`<cacheRoot>/rqbit-downloads`). Set to an absolute path (created if missing; the update fails if it cannot be created or written), every pin from then on places its torrent in `<downloadsDir>/<infoHash>/` wanting only the pinned file — and a torrent already managed in the cache root (streamed first, then pinned) is **relocated** by the pin: dropped from the session keeping its files, files moved (rename, copy + remove across devices), re-added in place, which re-checks the moved data (`phase: checking` for a moment). A persisted `downloadsDir` that is unusable at startup is cleared with a warning.
+- **Free space**: a pin is refused (`PinDownloadError::InsufficientSpace`) when the volume has less than the file's missing bytes plus a **500 MiB margin** (`PIN_FREE_SPACE_MARGIN`) available; re-pinning a complete file needs nothing.
+- **Restarts**: librqbit persists each torrent's place and want-set and, with fastresume, its verified pieces, so a pinned download resumes where it was without a full re-hash; the pin set itself is persisted in `<cacheRoot>/rqbit-downloads/pinned-downloads.json` and restored at startup.
 
 `ServerConfig::embedded()` (the `Default`) is tuned for a host process: loopback HTTP on 11470, no logging/TUI/SSDP, a generated token, and `torrent_listen_port: TorrentListenPort::Ephemeral` — librqbit's incoming BitTorrent listener takes an OS-assigned port, so any number of embedded servers (and the tests) coexist with a desktop instance. `ServerConfig::binary_default()` keeps `TorrentListenPort::Fixed(42000..42010)`: the first free port of the range, stable and forwardable. Set the field explicitly if an embedder needs a fixed port.
 

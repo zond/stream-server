@@ -1,6 +1,7 @@
 pub mod archive;
 pub mod casting;
 pub mod compat;
+pub mod downloads;
 pub mod engine;
 pub mod ftp;
 pub mod local_addon;

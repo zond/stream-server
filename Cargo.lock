@@ -4076,6 +4076,7 @@ dependencies = [
  "hex",
  "if-addrs",
  "jni",
+ "librqbit",
  "lz-str",
  "mimalloc",
  "mime_guess",

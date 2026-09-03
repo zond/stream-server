@@ -90,6 +90,14 @@ sevenz-rust2 = "0.22.2"
 chrono = "0.4.42"
 sysinfo = "0.39.5"
 
+[dev-dependencies]
+# Real .torrent fixtures for the embed tests (`librqbit::create_torrent`);
+# the same git pin as enginefs, so nothing extra is compiled.
+librqbit = { git = "https://github.com/zond/rqbit", branch = "feat/configurable-stream-lookahead", default-features = false, features = [
+    "rust-tls",
+    "http-api-client",
+] }
+
 [target.'cfg(target_os = "android")'.dependencies]
 rustls-platform-verifier = "0.7.0"
 

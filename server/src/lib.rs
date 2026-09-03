@@ -7,6 +7,8 @@ use axum::{
 };
 use enginefs::EngineFS;
 pub use enginefs::backend::{EngineStats, TorrentListenPort};
+pub use enginefs::{PIN_FREE_SPACE_MARGIN, PinDownloadError};
+pub use routes::downloads::DownloadInfo;
 pub use routes::system::{FileNotFound, ServerSettings};
 pub use state::AppState;
 use std::{
@@ -221,6 +223,28 @@ impl ServerHandle {
                 .await
         })?;
         Ok(stats?)
+    }
+
+    /// Pin `file_idx` of `info_hash` as an offline download (see
+    /// `routes::downloads::pin_download`, which the download control route
+    /// shares): created through the magnet registry with `trackers` (as in
+    /// [`Self::engine_stats`]) when new, placed under `settings.downloadsDir`
+    /// when set, kept wanted and exempt from eviction, persisted across
+    /// restarts. Fails with [`PinDownloadError`] -- `InsufficientSpace`
+    /// below [`PIN_FREE_SPACE_MARGIN`], `FileNotFound` for a bad index.
+    pub fn pin_download(
+        &self,
+        info_hash: &str,
+        file_idx: usize,
+        trackers: &[String],
+    ) -> anyhow::Result<DownloadInfo> {
+        let state = self.state.clone();
+        let info_hash = info_hash.to_string();
+        let trackers = trackers.to_vec();
+        let info = self.block_on_server(async move {
+            routes::downloads::pin_download(&state, &info_hash, file_idx, trackers).await
+        })?;
+        Ok(info?)
     }
 
     /// Run `fut` on the server's runtime and wait for it. The engines spawn
@@ -550,11 +574,31 @@ pub async fn run(
     }
 
     {
-        let settings = settings_arc.read().await;
+        let mut settings = settings_arc.write().await;
         state.engine.set_seeding_enabled(settings.seeding_enabled);
         state
             .download_engine
             .set_seeding_enabled(settings.seeding_enabled);
+        // A persisted downloadsDir that cannot be used any more (unmounted
+        // drive, permissions) is cleared rather than kept as a setting the
+        // engines silently ignore: pins fall back to the cache root and
+        // `GET /settings` says so.
+        if let Some(raw) = settings.downloads_dir.clone() {
+            match routes::system::prepare_downloads_dir(&raw).await {
+                Ok(path) => {
+                    state.engine.set_downloads_dir(Some(path.clone()));
+                    state.download_engine.set_downloads_dir(Some(path));
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        downloads_dir = %raw,
+                        error = %format!("{error:#}"),
+                        "downloadsDir is unusable; clearing it (downloads go to the cache root)"
+                    );
+                    settings.downloads_dir = None;
+                }
+            }
+        }
     }
 
     let mut background_tasks = Vec::new();
