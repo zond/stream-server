@@ -626,6 +626,27 @@ impl TorrentListenPort {
             Self::Ephemeral => vec![0],
         }
     }
+
+    /// Whether a UPnP port-forwarding request for this listener is worth
+    /// making at all.
+    ///
+    /// Only for [`Self::Fixed`]. A forwarded mapping is a lease on the
+    /// router for one external port number, and it is only worth anything if
+    /// the same port comes back next launch -- which is precisely what
+    /// `Fixed` means and what the long-running desktop instance
+    /// (`ServerConfig::binary_default`) uses. An [`Self::Ephemeral`] listener
+    /// binds a different port every launch, so each run asks the router for a
+    /// fresh mapping and leaves the previous one to expire on its own; the
+    /// embedders that use it (the Android JNI cdylib, tests) get nothing
+    /// durable out of it. On Android the request cannot succeed at all --
+    /// SSDP discovery is multicast the app sandbox is not permitted to send
+    /// ("Operation not permitted (os error 1)" in a real device log), and on
+    /// a cellular APN there is no gateway to ask -- while librqbit's
+    /// forwarder retries on an interval *forever*, so every failure is a
+    /// `librqbit_upnp` WARN for the whole life of the process.
+    pub fn wants_upnp_forwarding(&self) -> bool {
+        matches!(self, Self::Fixed(_))
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]

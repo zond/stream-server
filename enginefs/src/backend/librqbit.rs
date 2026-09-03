@@ -353,6 +353,7 @@ impl LibrqbitBackend {
         // first that binds. `Ephemeral` is the single candidate 0, which
         // librqbit itself defaults to and resolves to the bound port.
         let bootstrap_addrs = resolve_dht_bootstrap_nodes(&dht_bootstrap_nodes);
+        let upnp_forwarding = listen_port.wants_upnp_forwarding();
         let session = {
             let mut last_err = None;
             let mut session = None;
@@ -360,7 +361,13 @@ impl LibrqbitBackend {
                 let session_opts = librqbit::SessionOptions {
                     listen: Some(librqbit::ListenerOptions {
                         listen_addr: (std::net::Ipv6Addr::UNSPECIFIED, port).into(),
-                        enable_upnp_port_forwarding: true,
+                        // Only for a fixed, repeatable port -- see
+                        // `TorrentListenPort::wants_upnp_forwarding`. An
+                        // ephemeral listener would ask the router for a
+                        // mapping it can never reuse, and on the Android
+                        // embed the request cannot succeed at all while
+                        // librqbit's forwarder retries (and WARNs) forever.
+                        enable_upnp_port_forwarding: upnp_forwarding,
                         ..Default::default()
                     }),
                     persistence: Some(librqbit::SessionPersistenceConfig::Json {
@@ -2057,7 +2064,7 @@ pub(crate) fn torrent_file_index(torrent_bytes: &[u8], name: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::TorrentBackend;
+    use crate::backend::{DEFAULT_LISTEN_PORT_RANGE, TorrentBackend};
 
     /// Purely a string check -- no DNS resolution, no network. Every entry
     /// must be a nonempty host and a nonzero port, same shape a
@@ -2072,6 +2079,18 @@ mod tests {
             .parse()
             .unwrap_or_else(|e| panic!("{entry:?} has an unparseable port: {e}"));
         assert_ne!(port, 0, "{entry:?} has the zero port");
+    }
+
+    /// UPnP is asked for only when the mapping it installs is worth having
+    /// next launch -- see `TorrentListenPort::wants_upnp_forwarding`. The
+    /// embedded/JNI/test default is `Ephemeral`, where librqbit's forwarder
+    /// would otherwise retry (and WARN) on a loop for the life of the
+    /// process for a port number that never comes back.
+    #[test]
+    fn only_a_fixed_listen_port_asks_the_router_to_forward() {
+        assert!(TorrentListenPort::default().wants_upnp_forwarding());
+        assert!(TorrentListenPort::Fixed(DEFAULT_LISTEN_PORT_RANGE).wants_upnp_forwarding());
+        assert!(!TorrentListenPort::Ephemeral.wants_upnp_forwarding());
     }
 
     #[test]
