@@ -423,6 +423,11 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     /// torrent (a relocation must not be raced by a second pin); entries
     /// live only while a call holds or waits for them.
     pin_locks: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Persisted pins of torrents the backend did not have at startup
+    /// (see [`Self::restore_pinned_downloads`]): kept in the persisted file
+    /// and applied by the next `pin_download` of the torrent, or dropped by
+    /// `unpin_download`. Never held across an `.await`.
+    dormant_pins: parking_lot::Mutex<BTreeMap<String, std::collections::BTreeSet<usize>>>,
     /// Available-bytes probe for the free-space check in `pin_download`
     /// (`fs4::available_space`; tests substitute one).
     free_space_probe: VolumeProbe,
@@ -552,6 +557,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             magnet_adds: Arc::new(RwLock::new(HashMap::new())),
             downloads_dir: parking_lot::RwLock::new(None),
             pin_locks: parking_lot::Mutex::new(HashMap::new()),
+            dormant_pins: parking_lot::Mutex::new(BTreeMap::new()),
             free_space_probe: Arc::new(|path| fs4::available_space(path)),
             volume_id_probe: Arc::new(volume_id),
             clock,
@@ -1664,6 +1670,9 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// backend restored (librqbit keeps the file in its persisted
     /// `only_files` and the folder in its `output_folder`, so the download
     /// itself resumes in place; the pin makes it exempt from eviction again).
+    /// Pins the restore found no torrent for stay dormant in that file and
+    /// come back with the torrent: a pin of it applies them alongside the
+    /// new one.
     ///
     /// Calls for the same info hash run one at a time (`pin_locks`): a
     /// relocation drops the torrent from the backend and re-adds it, and a
@@ -1796,6 +1805,19 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             }
             return Err(PinDownloadError::Backend(error));
         }
+        // The torrent is back (or here for the first time since a boot
+        // without it): its dormant pins apply with this one.
+        let dormant = self.dormant_pins.lock().remove(info_hash);
+        for idx in dormant.into_iter().flatten().filter(|idx| *idx != file_idx) {
+            match engine.handle.pin_file(idx).await {
+                Ok(()) => {
+                    engine.pinned_files.write().insert(idx);
+                }
+                Err(error) => {
+                    tracing::warn!(info_hash, file_idx = idx, %error, "could not re-apply a dormant pin");
+                }
+            }
+        }
         engine.touch();
         if engine.idle_paused.swap(false, Ordering::Relaxed)
             && let Err(err) = engine.handle.resume_torrent().await
@@ -1821,7 +1843,9 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     }
 
     /// Forget the pin on `file_idx` of `info_hash`. Returns whether it was
-    /// pinned (false for an unknown torrent or an unpinned file). Only the
+    /// pinned (false for an unknown torrent or an unpinned file; true for a
+    /// dormant pin of a torrent the backend does not have, which is then
+    /// dropped from the persisted set). Only the
     /// pin goes: the data stays, the engine becomes an ordinary one again
     /// (idle removal applies), and the want-set is reconciled against the
     /// current playback selection -- with nothing playing that is a no-op,
@@ -1830,7 +1854,25 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     pub async fn unpin_download(&self, info_hash: &str, file_idx: usize) -> Result<bool> {
         let info_hash = info_hash.to_lowercase();
         let Some(engine) = self.get_engine(&info_hash).await else {
-            return Ok(false);
+            // No torrent, but maybe a dormant pin waiting for it.
+            let was_dormant = {
+                let mut dormant = self.dormant_pins.lock();
+                let removed = dormant
+                    .get_mut(&info_hash)
+                    .is_some_and(|indices| indices.remove(&file_idx));
+                if dormant
+                    .get(&info_hash)
+                    .is_some_and(|indices| indices.is_empty())
+                {
+                    dormant.remove(&info_hash);
+                }
+                removed
+            };
+            if was_dormant {
+                self.persist_pinned_downloads().await;
+                tracing::info!(info_hash, file_idx, "dormant_download_unpinned");
+            }
+            return Ok(was_dormant);
         };
         let was_pinned = engine.pinned_files.write().remove(&file_idx);
         engine.handle.unpin_file(file_idx).await?;
@@ -1854,14 +1896,19 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         self.download_dir.join(PINNED_DOWNLOADS_FILE)
     }
 
-    /// Write the current pin set to [`Self::pinned_downloads_path`]
-    /// (atomically: temp file + rename). Best effort: a failure is logged,
-    /// the in-memory pins stand.
+    /// Write the current pin set -- the engines' pins plus the dormant ones
+    /// -- to [`Self::pinned_downloads_path`] (atomically: temp file +
+    /// rename). Best effort: a failure is logged, the in-memory pins stand.
     async fn persist_pinned_downloads(&self) {
-        let mut pins: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-        for pin in self.pinned_downloads().await {
-            pins.entry(pin.info_hash).or_default().push(pin.file_idx);
+        let live = self.pinned_downloads().await;
+        let mut pins = self.dormant_pins.lock().clone();
+        for pin in live {
+            pins.entry(pin.info_hash).or_default().insert(pin.file_idx);
         }
+        let pins: BTreeMap<String, Vec<usize>> = pins
+            .into_iter()
+            .map(|(hash, indices)| (hash, indices.into_iter().collect()))
+            .collect();
         let path = self.pinned_downloads_path();
         if let Err(error) = write_pinned_downloads(&path, &pins).await {
             tracing::warn!(path = %path.display(), %error, "could not persist pinned downloads");
@@ -1869,10 +1916,15 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     }
 
     /// Re-apply the pins persisted by the last run to the engines the
-    /// backend restored (see [`Self::pin_download`]); pins of torrents the
-    /// backend no longer has are dropped, and the file is rewritten to
-    /// what was applied. Returns the number of pins restored. Called once
-    /// at startup, after the engines are registered.
+    /// backend restored (see [`Self::pin_download`]). Pins of torrents the
+    /// backend does not have right now are kept dormant, in memory and in
+    /// the file: librqbit skips (and keeps the record of) a torrent it
+    /// cannot re-add at startup -- its output folder on a volume that is
+    /// not mounted -- and brings it back on a later boot, when the pin
+    /// must still be there; a `pin_download` of the torrent meanwhile
+    /// applies them, an `unpin_download` drops them. Only a pin of a file
+    /// the torrent does not have is dropped. Returns the number of pins
+    /// restored. Called once at startup, after the engines are registered.
     pub async fn restore_pinned_downloads(&self) -> usize {
         let path = self.pinned_downloads_path();
         let pins = match tokio::fs::read(&path).await {
@@ -1890,11 +1942,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             }
         };
         let mut restored = 0;
-        let mut dropped = Vec::new();
+        let mut dormant = BTreeMap::new();
         for (info_hash, indices) in &pins {
             let info_hash = info_hash.to_lowercase();
             let Some(engine) = self.get_engine(&info_hash).await else {
-                dropped.push(info_hash);
+                dormant.insert(info_hash, indices.iter().copied().collect());
                 continue;
             };
             for &file_idx in indices {
@@ -1907,13 +1959,15 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             }
             engine.touch();
         }
-        if !dropped.is_empty() {
+        let dormant_count = dormant.len();
+        if dormant_count > 0 {
             tracing::info!(
-                torrents = ?dropped,
-                "dropping persisted pins of torrents the backend no longer has"
+                torrents = ?dormant.keys().collect::<Vec<_>>(),
+                "keeping persisted pins of torrents the backend did not restore"
             );
+            self.dormant_pins.lock().extend(dormant);
         }
-        if restored > 0 || !dropped.is_empty() {
+        if restored > 0 || dormant_count > 0 {
             self.persist_pinned_downloads().await;
         }
         tracing::info!(restored, "pinned_downloads_restored");
@@ -5100,8 +5154,8 @@ mod tests {
 
     /// Pins are written to `pinned-downloads.json` on every change and
     /// re-applied at startup to the torrents the backend restored; pins of
-    /// torrents that are gone (or files that do not exist) are dropped and
-    /// the file rewritten; an unreadable file is ignored.
+    /// files that do not exist are dropped and the file rewritten; an
+    /// unreadable file is ignored.
     #[tokio::test]
     async fn pinned_downloads_are_persisted_and_restored() {
         let tmp = tempfile::tempdir().unwrap();
@@ -5155,8 +5209,9 @@ mod tests {
         assert_eq!(read_pins(&path), serde_json::json!({ TEST_HASH: [1] }));
         drop(second);
 
-        // A torrent the backend no longer has, and an index the torrent
-        // does not have, are dropped; the rest is restored.
+        // An index the torrent does not have is dropped; a torrent the
+        // backend does not have keeps its pin (dormant, see below); the
+        // rest is restored.
         std::fs::write(
             &path,
             serde_json::to_vec(&serde_json::json!({
@@ -5175,13 +5230,117 @@ mod tests {
                 file_idx: 0
             }]
         );
-        assert_eq!(read_pins(&path), serde_json::json!({ TEST_HASH: [0] }));
+        assert_eq!(
+            read_pins(&path),
+            serde_json::json!({ OTHER_HASH: [0], TEST_HASH: [0] })
+        );
         drop(third);
 
         std::fs::write(&path, b"not json").unwrap();
         let (fourth, _counters) = make(3);
         assert_eq!(fourth.restore_pinned_downloads().await, 0);
         assert!(fourth.pinned_downloads().await.is_empty());
+    }
+
+    /// A pin whose torrent the backend did not bring back at startup (its
+    /// output folder on a volume that was not mounted -- librqbit skips the
+    /// torrent but keeps its record) is not lost: it stays in the file
+    /// through that run and any pins made meanwhile, is applied on a later
+    /// boot that has the torrent, comes along with a pin of the torrent
+    /// made before then, and is dropped by an unpin.
+    #[tokio::test]
+    async fn pins_of_torrents_the_backend_did_not_restore_are_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let make = |restored: bool, backend_hash: &str| {
+            let counters = Arc::new(FakeCounters::default());
+            let handle = FakeHandle {
+                info_hash: backend_hash.to_string(),
+                counters: counters.clone(),
+                files: (0..3)
+                    .map(|idx| BackendFileInfo {
+                        name: format!("video-{idx}.mkv"),
+                        length: 100,
+                    })
+                    .collect(),
+                init: FakeInit::new(true, Duration::from_secs(60)),
+            };
+            let restored = if restored {
+                HashMap::from([(backend_hash.to_string(), handle.clone())])
+            } else {
+                HashMap::new()
+            };
+            let enginefs = BackendEngineFS::new_with_backend(
+                FakeBackend::new(vec![handle]),
+                restored,
+                root.join("cache"),
+                root.join("downloads"),
+            );
+            (enginefs, counters)
+        };
+        let read_pins = |path: &std::path::Path| -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+        };
+
+        let (first, _counters) = make(true, TEST_HASH);
+        let path = first.pinned_downloads_path();
+        first.pin_download(TEST_HASH, 1, None).await.unwrap();
+        drop(first);
+
+        // Boot without the torrent: nothing applied, nothing lost -- not
+        // even by another pin, which rewrites the file.
+        let (second, _counters) = make(false, OTHER_HASH);
+        assert_eq!(second.restore_pinned_downloads().await, 0);
+        assert!(second.pinned_downloads().await.is_empty());
+        assert_eq!(read_pins(&path), serde_json::json!({ TEST_HASH: [1] }));
+        second.pin_download(OTHER_HASH, 0, None).await.unwrap();
+        assert_eq!(
+            read_pins(&path),
+            serde_json::json!({ OTHER_HASH: [0], TEST_HASH: [1] })
+        );
+        // An unpin reaches a dormant pin too.
+        assert!(second.unpin_download(TEST_HASH, 1).await.unwrap());
+        assert!(!second.unpin_download(TEST_HASH, 1).await.unwrap());
+        assert_eq!(read_pins(&path), serde_json::json!({ OTHER_HASH: [0] }));
+        drop(second);
+
+        // Next boot with the torrent back: applied.
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({ TEST_HASH: [1] })).unwrap(),
+        )
+        .unwrap();
+        let (third, _counters) = make(true, TEST_HASH);
+        assert_eq!(third.restore_pinned_downloads().await, 1);
+        assert_eq!(
+            third
+                .get_engine(TEST_HASH)
+                .await
+                .unwrap()
+                .pinned_file_indices(),
+            vec![1]
+        );
+        assert_eq!(read_pins(&path), serde_json::json!({ TEST_HASH: [1] }));
+        drop(third);
+
+        // Absent at boot, pinned again before the next one (the client's
+        // re-pin): the dormant pins come with the new one.
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({ TEST_HASH: [1, 2] })).unwrap(),
+        )
+        .unwrap();
+        let (fourth, counters) = make(false, TEST_HASH);
+        assert_eq!(fourth.restore_pinned_downloads().await, 0);
+        let engine = fourth.pin_download(TEST_HASH, 0, None).await.unwrap();
+        assert_eq!(engine.pinned_file_indices(), vec![0, 1, 2]);
+        assert_eq!(engine.get_statistics().await.pinned_files, vec![0, 1, 2]);
+        assert_eq!(counters.pin_file.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            read_pins(&path),
+            serde_json::json!({ TEST_HASH: [0, 1, 2] })
+        );
+        assert!(fourth.dormant_pins.lock().is_empty());
     }
 
     // --- pinned offline downloads ---
