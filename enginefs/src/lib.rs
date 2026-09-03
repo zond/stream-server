@@ -3112,23 +3112,32 @@ impl BackendEngineFS<LibrqbitBackend> {
         _cache_config: EngineCacheConfig,
     ) -> Result<Self> {
         let download_dir = root_dir.join("rqbit-downloads");
-        let (backend, restored) =
-            LibrqbitBackend::new(download_dir.clone(), TorrentListenPort::default()).await?;
+        let (backend, restored) = LibrqbitBackend::new(
+            download_dir.clone(),
+            TorrentListenPort::default(),
+            Vec::new(),
+        )
+        .await?;
         let efs = Self::new_with_backend(backend, restored, root_dir.join("cache"), download_dir);
         efs.restore_pinned_downloads().await;
         Ok(efs)
     }
 
-    /// Only `config.listen_port` is consumed here: librqbit takes the rest of
-    /// its settings from the session defaults (see `update_torrent_settings`).
+    /// Only `config.listen_port` and `config.dht_bootstrap_nodes` are
+    /// consumed here: librqbit takes the rest of its settings from the
+    /// session defaults (see `update_torrent_settings`).
     pub async fn new_with_storage(
         root_dir: std::path::PathBuf,
         config: crate::backend::BackendConfig,
         tracker_storage: Option<Arc<dyn crate::trackers::TrackerStorage>>,
     ) -> Result<Self> {
         let download_dir = root_dir.join("rqbit-downloads");
-        let (backend, restored) =
-            LibrqbitBackend::new(download_dir.clone(), config.listen_port).await?;
+        let (backend, restored) = LibrqbitBackend::new(
+            download_dir.clone(),
+            config.listen_port,
+            config.dht_bootstrap_nodes,
+        )
+        .await?;
         let efs = Self::new_with_backend_and_storage(
             backend,
             restored,

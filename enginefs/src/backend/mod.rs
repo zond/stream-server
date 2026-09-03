@@ -559,6 +559,11 @@ pub struct BackendConfig {
     pub swarm_cap: SwarmCap,
     pub speed_profile: TorrentSpeedProfile,
     pub privacy: TorrentPrivacyConfig,
+    /// DHT bootstrap nodes (`host:port`), read once at session start like
+    /// `listen_port`. Empty uses the backend's own default set (see
+    /// `librqbit::DEFAULT_DHT_BOOTSTRAP_NODES`); the `dhtBootstrapNodes`
+    /// server setting REPLACES it entirely when non-empty.
+    pub dht_bootstrap_nodes: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

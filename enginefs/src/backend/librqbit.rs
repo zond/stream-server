@@ -237,6 +237,77 @@ enum InitPolicy {
     Skip,
 }
 
+/// Public BitTorrent mainline DHT bootstrap nodes used to seed librqbit's
+/// routing table when it starts cold (no persisted `dht.json`, or a
+/// deserialize failure -- see [`DEFAULT_DHT_BOOTSTRAP_NODES`] doc below).
+///
+/// We override librqbit's own built-in fallback (`DHT_BOOTSTRAP` in the
+/// `zond/rqbit` fork's `crates/dht/src/lib.rs`) because that list is only
+/// two hosts (`dht.transmissionbt.com:6881`, `dht.libtorrent.org:25401`),
+/// which is a single point of failure: `DhtWorker::bootstrap`
+/// (`crates/dht/src/dht.rs`) queries every address in parallel and only
+/// reports failure if *all* of them fail to respond, and that failure is
+/// fatal to the whole DHT worker task (an unhandled `result?` in
+/// `DhtWorker::start`'s `select!` loop kills the DHT, not just the
+/// bootstrap step) -- so losing both of two hosts to an outage, a
+/// firewall, or transient DNS trouble takes the DHT down with them. Widen
+/// the odds instead: this is librqbit's two plus the other conventional
+/// public bootstrap nodes mainstream clients (Transmission, libtorrent
+/// itself via qBittorrent, uTorrent, Vuze/Azureus) ship, ordered
+/// most-reliable first.
+///
+/// Every host below was confirmed to currently resolve (`getent hosts`,
+/// cross-checked with `dig @8.8.8.8`/`dig @1.1.1.1`) before being added.
+/// Two other commonly cited candidates were tried and dropped because they
+/// did not resolve at the time of writing: `router.bitcomet.com` (NXDOMAIN
+/// -- the `bitcomet.com` zone answers but has no such name) and
+/// `dht.anacrolix.link` (its CNAME chain currently dead-ends in NXDOMAIN at
+/// `pub.instances.scw.cloud`).
+///
+/// Overridable via the `dhtBootstrapNodes` server setting
+/// (`server/src/routes/system.rs`) -- see [`resolve_dht_bootstrap_nodes`].
+///
+/// **Bootstrapping only matters while the routing table is cold, but
+/// "cold" is not automatic.** `PersistentDht::create`
+/// (`crates/dht/src/persistence.rs`) loads any existing `dht.json` table
+/// before the DHT worker starts, but `DhtState::with_config`'s worker
+/// (`crates/dht/src/dht.rs`) unconditionally races `self.bootstrap` against
+/// the persisted table on *every* session start -- there is no "skip
+/// bootstrap, the table is already warm" branch, and total bootstrap
+/// failure kills the DHT worker even with a warm table. So a persisted
+/// table (the normal case after the first run) makes bootstrap-host
+/// reachability *less consequential* in practice, since the DHT already
+/// has real peers to query while the bootstrap requests race in the
+/// background, but it does not make bootstrap host reachability
+/// irrelevant. Widening the list still hedges the cases where it is fully
+/// relevant: first run, a wiped or corrupted `dht.json`, and a cold start
+/// on a fresh install or container.
+pub const DEFAULT_DHT_BOOTSTRAP_NODES: &[&str] = &[
+    "router.bittorrent.com:6881",
+    "dht.transmissionbt.com:6881",
+    "router.utorrent.com:6881",
+    "dht.libtorrent.org:25401",
+    "dht.aelitis.com:6881",
+];
+
+/// Resolve the effective DHT bootstrap address list: `configured` (already
+/// validated by `server/src/routes/system.rs`'s `dhtBootstrapNodes` setting
+/// -- non-empty `host:port` strings only) if non-empty, REPLACING
+/// [`DEFAULT_DHT_BOOTSTRAP_NODES`] entirely; otherwise the default set.
+/// Mirrors `SessionOptions.dht.bootstrap_addrs`'s own `None` = built-in
+/// convention, except our built-in default is the widened list above
+/// rather than librqbit's two-host one.
+pub fn resolve_dht_bootstrap_nodes(configured: &[String]) -> Vec<String> {
+    if configured.is_empty() {
+        DEFAULT_DHT_BOOTSTRAP_NODES
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        configured.to_vec()
+    }
+}
+
 pub struct LibrqbitBackend {
     pub session: Arc<Session>,
     download_dir: PathBuf,
@@ -247,10 +318,14 @@ pub struct LibrqbitBackend {
 
 impl LibrqbitBackend {
     /// Open a session storing downloads under `download_dir`, listening for
-    /// incoming peers on `listen_port` (see [`TorrentListenPort`]).
+    /// incoming peers on `listen_port` (see [`TorrentListenPort`]) and
+    /// seeding its DHT routing table from `dht_bootstrap_nodes` when cold
+    /// (empty uses [`DEFAULT_DHT_BOOTSTRAP_NODES`]; see
+    /// [`resolve_dht_bootstrap_nodes`]).
     pub async fn new(
         download_dir: PathBuf,
         listen_port: TorrentListenPort,
+        dht_bootstrap_nodes: Vec<String>,
     ) -> Result<(Self, HashMap<String, LibrqbitHandle>)> {
         tokio::fs::create_dir_all(&download_dir).await?;
         debug!(path = ?download_dir, "Storing downloads");
@@ -260,6 +335,7 @@ impl LibrqbitBackend {
         // port-fallback is done here: try each port in order and keep the
         // first that binds. `Ephemeral` is the single candidate 0, which
         // librqbit itself defaults to and resolves to the bound port.
+        let bootstrap_addrs = resolve_dht_bootstrap_nodes(&dht_bootstrap_nodes);
         let session = {
             let mut last_err = None;
             let mut session = None;
@@ -284,7 +360,11 @@ impl LibrqbitBackend {
                     // state. librqbit's default resolves through
                     // `directories::ProjectDirs` (HOME/XDG), which has no
                     // answer on Android and would fail `Session::new`.
+                    // `bootstrap_addrs` widens librqbit's two-host default
+                    // (or applies the operator's `dhtBootstrapNodes`
+                    // override) -- see `DEFAULT_DHT_BOOTSTRAP_NODES`.
                     dht: Some(librqbit::DhtSessionConfig {
+                        bootstrap_addrs: Some(bootstrap_addrs.clone()),
                         persistence: Some(librqbit::dht::DhtPersistenceConfig {
                             config_filename: Some(download_dir.join("dht.json")),
                             ..Default::default()
@@ -1842,6 +1922,58 @@ mod tests {
     use super::*;
     use crate::backend::TorrentBackend;
 
+    /// Purely a string check -- no DNS resolution, no network. Every entry
+    /// must be a nonempty host and a nonzero port, same shape a
+    /// `dhtBootstrapNodes` entry is validated against
+    /// (`server/src/routes/system.rs`'s `is_valid_dht_bootstrap_node`).
+    fn assert_valid_host_port(entry: &str) {
+        let (host, port) = entry
+            .rsplit_once(':')
+            .unwrap_or_else(|| panic!("{entry:?} has no host:port split"));
+        assert!(!host.is_empty(), "{entry:?} has an empty host");
+        let port: u16 = port
+            .parse()
+            .unwrap_or_else(|e| panic!("{entry:?} has an unparseable port: {e}"));
+        assert_ne!(port, 0, "{entry:?} has the zero port");
+    }
+
+    #[test]
+    fn default_dht_bootstrap_nodes_is_nonempty_and_well_formed() {
+        assert!(
+            !DEFAULT_DHT_BOOTSTRAP_NODES.is_empty(),
+            "a single point of failure is exactly what widening this list is for"
+        );
+        for entry in DEFAULT_DHT_BOOTSTRAP_NODES {
+            assert_valid_host_port(entry);
+        }
+    }
+
+    #[test]
+    fn resolve_dht_bootstrap_nodes_falls_back_to_the_default_when_unconfigured() {
+        assert_eq!(
+            resolve_dht_bootstrap_nodes(&[]),
+            DEFAULT_DHT_BOOTSTRAP_NODES
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn resolve_dht_bootstrap_nodes_lets_a_configured_list_replace_the_default() {
+        let configured = vec!["example.test:6881".to_string()];
+        let resolved = resolve_dht_bootstrap_nodes(&configured);
+        // Replaces, not appends: none of the built-in defaults survive
+        // alongside the operator's override.
+        assert_eq!(resolved, configured);
+        for default_entry in DEFAULT_DHT_BOOTSTRAP_NODES {
+            assert!(
+                !resolved.contains(&default_entry.to_string()),
+                "the configured list should have replaced the default entirely"
+            );
+        }
+    }
+
     /// How long a bounded state-wait in these tests may take before it
     /// gives up. These waits poll for something a background task or the
     /// blocking hash-check pool has to do, so the bound is not a timing
@@ -1860,14 +1992,20 @@ mod tests {
     async fn ephemeral_sessions_coexist() {
         let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
 
-        let (a, _) =
-            LibrqbitBackend::new(dirs[0].path().to_path_buf(), TorrentListenPort::Ephemeral)
-                .await
-                .expect("first ephemeral session");
-        let (b, _) =
-            LibrqbitBackend::new(dirs[1].path().to_path_buf(), TorrentListenPort::Ephemeral)
-                .await
-                .expect("second ephemeral session alongside the first");
+        let (a, _) = LibrqbitBackend::new(
+            dirs[0].path().to_path_buf(),
+            TorrentListenPort::Ephemeral,
+            Vec::new(),
+        )
+        .await
+        .expect("first ephemeral session");
+        let (b, _) = LibrqbitBackend::new(
+            dirs[1].path().to_path_buf(),
+            TorrentListenPort::Ephemeral,
+            Vec::new(),
+        )
+        .await
+        .expect("second ephemeral session alongside the first");
 
         let pa = a.session.listen_addr().expect("listening").port();
         let pb = b.session.listen_addr().expect("listening").port();
@@ -2127,10 +2265,13 @@ mod tests {
         let magnet = std::env::var("STREAM_SERVER_TEST_MAGNET")
             .expect("set STREAM_SERVER_TEST_MAGNET to a magnet link");
         let tmp = tempfile::tempdir().unwrap();
-        let (backend, _restored) =
-            LibrqbitBackend::new(tmp.path().to_path_buf(), TorrentListenPort::Ephemeral)
-                .await
-                .expect("network session");
+        let (backend, _restored) = LibrqbitBackend::new(
+            tmp.path().to_path_buf(),
+            TorrentListenPort::Ephemeral,
+            Vec::new(),
+        )
+        .await
+        .expect("network session");
         let custom = "udp://custom-tracker.invalid:6969/announce".to_string();
         let handle = backend
             .add_torrent(TorrentSource::Url(magnet), vec![custom.clone()])
@@ -2482,10 +2623,13 @@ mod tests {
         let magnet = std::env::var("STREAM_SERVER_TEST_MAGNET")
             .expect("set STREAM_SERVER_TEST_MAGNET to a magnet link");
         let tmp = tempfile::tempdir().unwrap();
-        let (backend, _restored) =
-            LibrqbitBackend::new(tmp.path().to_path_buf(), TorrentListenPort::Ephemeral)
-                .await
-                .expect("network session");
+        let (backend, _restored) = LibrqbitBackend::new(
+            tmp.path().to_path_buf(),
+            TorrentListenPort::Ephemeral,
+            Vec::new(),
+        )
+        .await
+        .expect("network session");
         let handle = backend
             .add_torrent(TorrentSource::Url(magnet), vec![])
             .await
