@@ -26,6 +26,68 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 
+/// How a response body finished, for the stream-end log line.
+///
+/// A capture of four failing streams had nothing in it about why any of
+/// them stopped. The distinction that mattered was invisible: four bodies
+/// died after about ten seconds having delivered ~4 MiB of a multi-gigabyte
+/// range, i.e. the player hung up, not the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamOutcome {
+    /// The body was dropped before the range was delivered: the player
+    /// disconnected, or the request was cancelled.
+    ClientDisconnect,
+    /// The whole requested range was delivered.
+    Complete,
+    /// The reader failed part-way (see the `error` field).
+    ReaderError,
+}
+
+impl StreamOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ClientDisconnect => "client-disconnect",
+            Self::Complete => "complete",
+            Self::ReaderError => "reader-error",
+        }
+    }
+}
+
+/// What a response body delivered, accumulated as it is polled.
+#[derive(Debug, Default)]
+struct BodyProgress {
+    bytes_sent: u64,
+    /// `None` until the body ends by itself; a body dropped before that is
+    /// a player that hung up.
+    outcome: Option<StreamOutcome>,
+    error: Option<String>,
+}
+
+impl BodyProgress {
+    fn record_chunk(&mut self, len: usize) {
+        self.bytes_sent = self.bytes_sent.saturating_add(len as u64);
+    }
+
+    /// The reader failed. First error wins: what broke the stream is more
+    /// use than whatever the stream said on its way out.
+    fn record_error(&mut self, error: &std::io::Error) {
+        if self.outcome.is_none() {
+            self.outcome = Some(StreamOutcome::ReaderError);
+            self.error = Some(error.to_string());
+        }
+    }
+
+    /// The reader ran out, which for a `take`-limited body means the whole
+    /// requested range was delivered.
+    fn record_end(&mut self) {
+        self.outcome.get_or_insert(StreamOutcome::Complete);
+    }
+
+    fn outcome(&self) -> StreamOutcome {
+        self.outcome.unwrap_or(StreamOutcome::ClientDisconnect)
+    }
+}
+
 /// Guard that calls on_stream_end when dropped.
 struct StreamLifecycleGuard {
     engine: Arc<enginefs::EngineFS>,
@@ -33,6 +95,10 @@ struct StreamLifecycleGuard {
     file_idx: usize,
     stream_id: u64,
     notified: bool,
+    started: Instant,
+    /// Bytes the range asked for; 0 until the body is built.
+    requested_len: u64,
+    progress: BodyProgress,
 }
 
 impl StreamLifecycleGuard {
@@ -49,6 +115,9 @@ impl StreamLifecycleGuard {
             file_idx,
             stream_id,
             notified: false,
+            started: Instant::now(),
+            requested_len: 0,
+            progress: BodyProgress::default(),
         }
     }
 
@@ -63,6 +132,22 @@ impl StreamLifecycleGuard {
         let info_hash = self.info_hash.clone();
         let file_idx = self.file_idx;
         let stream_id = self.stream_id;
+
+        // INFO, not DEBUG: this is the only record that a playback session
+        // ended and the only one that says how much of what was asked for
+        // actually left the server.
+        tracing::info!(
+            stream_id,
+            info_hash = %info_hash,
+            file_idx,
+            bytes_sent = self.progress.bytes_sent,
+            requested_len = self.requested_len,
+            duration_ms = self.started.elapsed().as_millis() as u64,
+            reason = self.progress.outcome().as_str(),
+            error = self.progress.error.as_deref().unwrap_or(""),
+            stage = "http_stream_end",
+            "stream ended"
+        );
 
         tokio::spawn(async move {
             engine.on_stream_end(&info_hash, file_idx).await;
@@ -82,17 +167,29 @@ impl Drop for StreamLifecycleGuard {
     }
 }
 
-/// Guard that keeps the stream lifecycle alive for the response body.
+/// Guard that keeps the stream lifecycle alive for the response body, and
+/// counts what the body delivered so the stream-end line can say how a
+/// playback session actually finished.
 struct StreamGuard<S> {
     inner: S,
-    _lifecycle: StreamLifecycleGuard,
+    lifecycle: StreamLifecycleGuard,
 }
 
-impl<S: Stream + Unpin> Stream for StreamGuard<S> {
+impl<S> Stream for StreamGuard<S>
+where
+    S: Stream<Item = std::io::Result<bytes::Bytes>> + Unpin,
+{
     type Item = S::Item;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.inner).poll_next(cx)
+        let polled = Pin::new(&mut self.inner).poll_next(cx);
+        match &polled {
+            Poll::Ready(Some(Ok(chunk))) => self.lifecycle.progress.record_chunk(chunk.len()),
+            Poll::Ready(Some(Err(error))) => self.lifecycle.progress.record_error(error),
+            Poll::Ready(None) => self.lifecycle.progress.record_end(),
+            Poll::Pending => {}
+        }
+        polled
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -868,9 +965,11 @@ pub async fn stream_video(
     let base_stream = tokio_util::io::ReaderStream::with_capacity(reader, 262144);
 
     // Wrap with StreamGuard to notify when stream ends
+    let mut lifecycle = lifecycle;
+    lifecycle.requested_len = content_length;
     let guarded_stream = StreamGuard {
         inner: base_stream,
-        _lifecycle: lifecycle,
+        lifecycle,
     };
     let body = Body::from_stream(guarded_stream);
 
@@ -1162,5 +1261,36 @@ mod tests {
         for raw in ["buffer=huge", "buffer=", "buffer", "buffer=2", "download=1"] {
             assert_eq!(PlaybackQuery::parse(Some(raw)).buffer, None, "query {raw}");
         }
+    }
+
+    /// A capture of four failing streams said nothing about why any of them
+    /// stopped. What mattered was the distinction between a body that
+    /// delivered its range and one the player hung up on part-way -- so a
+    /// body that never ended by itself must read as a disconnect, and the
+    /// first error must survive whatever the stream says afterwards.
+    #[test]
+    fn body_progress_tells_a_hung_up_player_from_a_delivered_range() {
+        let mut dropped = BodyProgress::default();
+        dropped.record_chunk(4 * 1024 * 1024);
+        assert_eq!(dropped.outcome(), StreamOutcome::ClientDisconnect);
+        assert_eq!(dropped.bytes_sent, 4 * 1024 * 1024);
+        assert_eq!(dropped.error, None);
+
+        let mut delivered = BodyProgress::default();
+        delivered.record_chunk(10);
+        delivered.record_chunk(20);
+        delivered.record_end();
+        assert_eq!(delivered.outcome(), StreamOutcome::Complete);
+        assert_eq!(delivered.bytes_sent, 30);
+
+        let mut failed = BodyProgress::default();
+        failed.record_chunk(7);
+        failed.record_error(&std::io::Error::other("piece read failed"));
+        // A stream may still report end-of-stream after erroring; the error
+        // is what ended it.
+        failed.record_end();
+        assert_eq!(failed.outcome(), StreamOutcome::ReaderError);
+        assert_eq!(failed.bytes_sent, 7);
+        assert_eq!(failed.error.as_deref(), Some("piece read failed"));
     }
 }
