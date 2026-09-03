@@ -1776,6 +1776,55 @@ impl Clone for LibrqbitHandle {
     }
 }
 
+/// The file names of a serialized torrent, in the torrent's own order.
+///
+/// `librqbit::create_torrent` walks a directory with `walkdir` and never
+/// sorts, so a torrent built from a fixture folder lists its files in the
+/// filesystem's readdir order. On ext4 that order is a hash of the name,
+/// seeded per filesystem: the same fixture yields one order here and the
+/// reverse on a CI runner. A test must therefore look its file up by name
+/// and never assume the order it wrote the files in.
+#[cfg(test)]
+pub(crate) fn torrent_file_names(torrent_bytes: &[u8]) -> Vec<String> {
+    let meta = librqbit::torrent_from_bytes(torrent_bytes).expect("parse torrent");
+    let info = &meta.info.data;
+    fn decode(bytes: &[u8]) -> String {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+    match info.files.as_ref() {
+        // Multi-file: each entry is a path split into components.
+        Some(files) => files
+            .iter()
+            .map(|f| {
+                f.path
+                    .iter()
+                    .map(|c| decode(c.as_ref()))
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
+            .collect(),
+        // Single-file: the torrent name is the one file.
+        None => info
+            .name
+            .as_ref()
+            .map(|n| decode(n.as_ref()))
+            .into_iter()
+            .collect(),
+    }
+}
+
+/// The index `name` has in the torrent's file list. See
+/// [`torrent_file_names`]: a file index is never the fixture's creation
+/// order, so tests look it up instead of hardcoding it.
+#[cfg(test)]
+pub(crate) fn torrent_file_index(torrent_bytes: &[u8], name: &str) -> usize {
+    let names = torrent_file_names(torrent_bytes);
+    names
+        .iter()
+        .position(|n| n == name)
+        .unwrap_or_else(|| panic!("{name} is not among the torrent's files: {names:?}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3382,6 +3431,10 @@ mod tests {
         write_payload(&multi_src.join("e1.bin"), 40 * 1024).await;
         write_payload(&multi_src.join("e2.bin"), 24 * 1024).await;
         let (multi_bytes, multi_hash) = make_torrent(&multi_src).await;
+        // The torrent's file order is the filesystem's readdir order, not
+        // the order the fixture wrote the files in: look every index up.
+        let e1 = torrent_file_index(&multi_bytes, "e1.bin");
+        let e2 = torrent_file_index(&multi_bytes, "e2.bin");
         let single_src = dl.join("movie.bin");
         write_payload(&single_src, 20 * 1024).await;
         let (single_bytes, single_hash) = make_torrent(&single_src).await;
@@ -3409,14 +3462,14 @@ mod tests {
                 &multi_hash,
                 TorrentPlacement {
                     output_folder: Some(multi_target.clone()),
-                    only_files: Some(vec![1]),
+                    only_files: Some(vec![e2]),
                 },
                 vec![],
             )
             .await
             .expect("relocate multi-file torrent");
         assert_eq!(moved.output_folder(), Some(multi_target.clone()));
-        assert_eq!(moved.handle.only_files(), Some(vec![1]));
+        assert_eq!(moved.handle.only_files(), Some(vec![e2]));
         assert!(multi_target.join("e1.bin").is_file());
         assert!(multi_target.join("e2.bin").is_file());
         assert!(!multi_src.exists(), "emptied source folder is removed");
@@ -3427,7 +3480,7 @@ mod tests {
             "moved data verified by the re-check: {stats:?}"
         );
         assert_eq!(
-            moved.file_path(1).await.as_deref(),
+            moved.file_path(e2).await.as_deref(),
             Some(multi_target.join("e2.bin").as_path())
         );
         assert_eq!(backend.list_torrents().await.len(), 2);
@@ -3438,7 +3491,7 @@ mod tests {
                 &multi_hash,
                 TorrentPlacement {
                     output_folder: Some(multi_target.clone()),
-                    only_files: Some(vec![0]),
+                    only_files: Some(vec![e1]),
                 },
                 vec![],
             )
@@ -3480,11 +3533,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("show");
         tokio::fs::create_dir_all(&src).await.unwrap();
-        // Whole pieces per file: no boundary piece shared with e1, whose
-        // data is absent.
+        // Whole pieces per file, whichever order the torrent lists them
+        // in: no boundary piece is shared with e1, whose data is absent.
         write_payload(&src.join("e1.bin"), 32 * 1024).await;
-        write_payload(&src.join("e2.bin"), 24 * 1024).await;
+        write_payload(&src.join("e2.bin"), 16 * 1024).await;
         let (bytes, hash) = make_torrent(&src).await;
+        // Readdir order decides the file indices -- look them up.
+        let e1 = torrent_file_index(&bytes, "e1.bin");
+        let e2 = torrent_file_index(&bytes, "e2.bin");
 
         let dl = tmp.path().join("dl");
         let backend = LibrqbitBackend::new_for_tests(dl.clone())
@@ -3505,7 +3561,7 @@ mod tests {
             root_folder.join("e2.bin").is_file(),
             "librqbit pre-sizes the files"
         );
-        assert!(!handle.stats().await.files[1].complete);
+        assert!(!handle.stats().await.files[e2].complete);
 
         // The destination already holds the real e2.bin.
         let target = tmp.path().join("offline").join(&hash);
@@ -3519,7 +3575,7 @@ mod tests {
                 &hash,
                 TorrentPlacement {
                     output_folder: Some(target.clone()),
-                    only_files: Some(vec![1]),
+                    only_files: Some(vec![e2]),
                 },
                 vec![],
             )
@@ -3527,8 +3583,8 @@ mod tests {
             .expect("relocate");
         moved.handle.wait_until_initialized().await.unwrap();
         let stats = moved.stats().await;
-        assert!(stats.files[1].complete, "destination data kept: {stats:?}");
-        assert!(!stats.files[0].complete);
+        assert!(stats.files[e2].complete, "destination data kept: {stats:?}");
+        assert!(!stats.files[e1].complete);
         assert!(!root_folder.exists(), "placeholders dropped, folder gone");
         let bytes = tokio::fs::read(target.join("e2.bin")).await.unwrap();
         assert!(bytes.iter().enumerate().all(|(i, b)| *b == (i % 251) as u8));
@@ -3546,10 +3602,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("show");
         tokio::fs::create_dir_all(&src).await.unwrap();
-        // Whole pieces per file: e1's verified pieces never spill into e2.
+        // Whole pieces per file, whichever order the torrent lists them
+        // in: e1's verified pieces never spill into e2.
         write_payload(&src.join("e1.bin"), 32 * 1024).await;
-        write_payload(&src.join("e2.bin"), 24 * 1024).await;
+        write_payload(&src.join("e2.bin"), 16 * 1024).await;
         let (bytes, hash) = make_torrent(&src).await;
+        // Readdir order decides the file indices -- look them up.
+        let e1 = torrent_file_index(&bytes, "e1.bin");
+        let e2 = torrent_file_index(&bytes, "e2.bin");
         // Only e1's data is in the session root.
         tokio::fs::remove_file(src.join("e2.bin")).await.unwrap();
 
@@ -3577,7 +3637,7 @@ mod tests {
         );
         let stats = handle.stats().await;
         assert!(
-            stats.files[0].complete && !stats.files[1].complete,
+            stats.files[e1].complete && !stats.files[e2].complete,
             "{stats:?}"
         );
 
@@ -3587,7 +3647,7 @@ mod tests {
                 &hash,
                 TorrentPlacement {
                     output_folder: Some(target.clone()),
-                    only_files: Some(vec![0]),
+                    only_files: Some(vec![e1]),
                 },
                 vec![],
             )
@@ -3610,8 +3670,8 @@ mod tests {
         );
         moved.handle.wait_until_initialized().await.unwrap();
         let stats = moved.stats().await;
-        assert!(stats.files[0].complete, "moved data verified: {stats:?}");
-        assert!(!stats.files[1].complete);
+        assert!(stats.files[e1].complete, "moved data verified: {stats:?}");
+        assert!(!stats.files[e2].complete);
     }
 
     /// While a torrent is still Initializing there is no chunk tracker to

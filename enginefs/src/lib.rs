@@ -5560,6 +5560,11 @@ mod tests {
         std::fs::write(src.join("e1.bin"), &payload).unwrap();
         std::fs::write(src.join("e2.bin"), vec![3u8; 16 * 1024]).unwrap();
         let (bytes, hash) = real_torrent(&src).await;
+        // A torrent's file order is the filesystem's readdir order, not the
+        // order the fixture wrote the files in: look the indices up. (Both
+        // files are whole pieces, so neither order shares a boundary piece.)
+        let e1 = crate::backend::librqbit::torrent_file_index(&bytes, "e1.bin");
+        let e2 = crate::backend::librqbit::torrent_file_index(&bytes, "e2.bin");
         let offline = tmp.path().join("offline");
         let folder = offline.join(&hash);
         std::fs::create_dir_all(&folder).unwrap();
@@ -5585,24 +5590,24 @@ mod tests {
 
         let enginefs = make().await;
         let engine = enginefs
-            .pin_download(&hash, 0, None)
+            .pin_download(&hash, e1, None)
             .await
             .expect("a complete file in place needs no space");
         assert_eq!(engine.handle.output_folder(), Some(folder.clone()));
         engine.handle.handle.wait_until_initialized().await.unwrap();
         let stats = engine.get_statistics().await;
-        assert!(stats.files[0].complete, "verified in place: {stats:?}");
-        assert_eq!(engine.pinned_file_indices(), vec![0]);
+        assert!(stats.files[e1].complete, "verified in place: {stats:?}");
+        assert_eq!(engine.pinned_file_indices(), vec![e1]);
         enginefs.backend.remove_torrent(&hash).await.unwrap();
         drop(enginefs);
 
         let enginefs = make().await;
-        match enginefs.pin_download(&hash, 1, None).await {
+        match enginefs.pin_download(&hash, e2, None).await {
             Ok(engine) => {
                 // Still checking when measured: accepted unmeasured, and
                 // the data in place is what the check finds.
                 engine.handle.handle.wait_until_initialized().await.unwrap();
-                assert!(engine.get_statistics().await.files[0].complete);
+                assert!(engine.get_statistics().await.files[e1].complete);
             }
             Err(PinDownloadError::InsufficientSpace { .. }) => {
                 assert!(enginefs.get_engine(&hash).await.is_none());
