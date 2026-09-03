@@ -702,6 +702,23 @@ impl TorrentBackend for LibrqbitBackend {
                     continue;
                 }
                 let dst = target.join(&file.relative_filename);
+                if tokio::fs::try_exists(&dst).await.unwrap_or(false) {
+                    // Data already in the destination (downloaded there
+                    // before) wins over the source: librqbit pre-sizes
+                    // every wanted file in the old folder, so the source
+                    // is often a sparse placeholder that would wipe
+                    // verified bytes. The re-check sorts out what the
+                    // destination actually has.
+                    debug!(
+                        src = %src.display(),
+                        dst = %dst.display(),
+                        "destination file exists; keeping it and dropping the source"
+                    );
+                    tokio::fs::remove_file(&src)
+                        .await
+                        .with_context(|| format!("removing {}", src.display()))?;
+                    continue;
+                }
                 if let Some(parent) = dst.parent() {
                     tokio::fs::create_dir_all(parent).await?;
                 }
@@ -3206,6 +3223,71 @@ mod tests {
             moved.file_path(0).await.as_deref(),
             Some(single_target.join("movie.bin").as_path())
         );
+    }
+
+    /// librqbit pre-sizes every wanted file when a torrent goes live, so a
+    /// torrent added in the root without data still has full-length
+    /// placeholders there. Relocating it onto a folder that already holds
+    /// the real bytes must keep those: the placeholder is dropped, the
+    /// destination file stays and verifies complete.
+    #[tokio::test]
+    async fn relocate_torrent_keeps_a_file_already_at_the_destination() {
+        use crate::backend::TorrentHandle;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("show");
+        tokio::fs::create_dir_all(&src).await.unwrap();
+        // Whole pieces per file: no boundary piece shared with e1, whose
+        // data is absent.
+        write_payload(&src.join("e1.bin"), 32 * 1024).await;
+        write_payload(&src.join("e2.bin"), 24 * 1024).await;
+        let (bytes, hash) = make_torrent(&src).await;
+
+        let dl = tmp.path().join("dl");
+        let backend = LibrqbitBackend::new_for_tests(dl.clone())
+            .await
+            .expect("hermetic session");
+        // Added without data: the root folder gets empty placeholders.
+        let handle = backend
+            .add_torrent(TorrentSource::Bytes(bytes), vec![])
+            .await
+            .unwrap();
+        handle.handle.wait_until_initialized().await.unwrap();
+        let root_folder = dl.join("show");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !root_folder.join("e2.bin").exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            root_folder.join("e2.bin").is_file(),
+            "librqbit pre-sizes the files"
+        );
+        assert!(!handle.stats().await.files[1].complete);
+
+        // The destination already holds the real e2.bin.
+        let target = tmp.path().join("offline").join(&hash);
+        tokio::fs::create_dir_all(&target).await.unwrap();
+        tokio::fs::copy(src.join("e2.bin"), target.join("e2.bin"))
+            .await
+            .unwrap();
+
+        let moved = backend
+            .relocate_torrent(
+                &hash,
+                TorrentPlacement {
+                    output_folder: Some(target.clone()),
+                    only_files: Some(vec![1]),
+                },
+                vec![],
+            )
+            .await
+            .expect("relocate");
+        moved.handle.wait_until_initialized().await.unwrap();
+        let stats = moved.stats().await;
+        assert!(stats.files[1].complete, "destination data kept: {stats:?}");
+        assert!(!stats.files[0].complete);
+        assert!(!root_folder.exists(), "placeholders dropped, folder gone");
+        let bytes = tokio::fs::read(target.join("e2.bin")).await.unwrap();
+        assert!(bytes.iter().enumerate().all(|(i, b)| *b == (i % 251) as u8));
     }
 
     /// The cross-device fallback of `move_file` copies then removes the

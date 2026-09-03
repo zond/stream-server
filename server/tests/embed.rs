@@ -907,6 +907,17 @@ fn write_payload(path: &std::path::Path, len: usize) {
     std::fs::write(path, data).expect("write payload");
 }
 
+/// Index of the file called `name` in `stats.files` (torrent file order is
+/// whatever `create_torrent`'s directory walk produced).
+fn file_index(stats: &serde_json::Value, name: &str) -> usize {
+    stats["files"]
+        .as_array()
+        .expect("files")
+        .iter()
+        .position(|f| f["name"] == name)
+        .unwrap_or_else(|| panic!("no file {name} in {stats}"))
+}
+
 /// Poll `/{infoHash}/stats.json` until the torrent is out of `checking`
 /// (bounded), returning the last stats.
 fn stats_after_check(
@@ -981,6 +992,7 @@ fn pinned_download_relocates_into_downloads_dir_and_survives_a_restart() -> anyh
     assert_eq!(stats["files"][0]["complete"], true, "{stats}");
     assert_eq!(stats["files"][1]["complete"], true, "{stats}");
     assert_eq!(stats["pinnedFiles"], serde_json::json!([]));
+    let idx = file_index(&stats, "e2.bin");
 
     // The setting: validated like the route, persisted, reported.
     assert_eq!(handle.settings()?.downloads_dir, None);
@@ -1009,9 +1021,9 @@ fn pinned_download_relocates_into_downloads_dir_and_survives_a_restart() -> anyh
 
     // Pin: relocated into <downloadsDir>/<infoHash>, re-checked there.
     let target = downloads.join(&info_hash);
-    let info = handle.pin_download(&info_hash.to_uppercase(), 1, &[])?;
+    let info = handle.pin_download(&info_hash.to_uppercase(), idx, &[])?;
     assert_eq!(info.info_hash, info_hash);
-    assert_eq!(info.file_idx, 1);
+    assert_eq!(info.file_idx, idx);
     assert_eq!(info.name, "e2.bin");
     assert_eq!(info.length, 24 * 1024);
     assert_eq!(
@@ -1024,15 +1036,15 @@ fn pinned_download_relocates_into_downloads_dir_and_survives_a_restart() -> anyh
     assert!(!root_folder.exists(), "nothing left in the cache root");
     let stats = stats_after_check(&client, &base, &info_hash)?;
     assert_eq!(
-        stats["files"][1]["complete"], true,
+        stats["files"][idx]["complete"], true,
         "re-check found the moved data: {stats}"
     );
-    assert_eq!(stats["files"][1]["pinned"], true);
-    assert_eq!(stats["pinnedFiles"], serde_json::json!([1]));
+    assert_eq!(stats["files"][idx]["pinned"], true);
+    assert_eq!(stats["pinnedFiles"], serde_json::json!([idx]));
     assert_eq!(stats["checkedBytes"], serde_json::Value::Null);
-    let file_stats = handle.file_stats(&info_hash, 1, &[])?;
-    assert!(file_stats.files[1].complete && file_stats.files[1].pinned);
-    let again = handle.pin_download(&info_hash, 1, &[])?;
+    let file_stats = handle.file_stats(&info_hash, idx, &[])?;
+    assert!(file_stats.files[idx].complete && file_stats.files[idx].pinned);
+    let again = handle.pin_download(&info_hash, idx, &[])?;
     assert!(again.complete, "idempotent: {again:?}");
     let missing = handle.pin_download(&info_hash, 9, &[]);
     assert!(
@@ -1046,7 +1058,7 @@ fn pinned_download_relocates_into_downloads_dir_and_survives_a_restart() -> anyh
         .join("rqbit-downloads")
         .join("pinned-downloads.json");
     let pins: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&pins_file)?)?;
-    assert_eq!(pins, serde_json::json!({ &info_hash: [1] }));
+    assert_eq!(pins, serde_json::json!({ &info_hash: [idx] }));
 
     handle.shutdown()?;
     handle.join()?;
@@ -1067,12 +1079,12 @@ fn pinned_download_relocates_into_downloads_dir_and_survives_a_restart() -> anyh
         stream_server::EngineStats::resolving_metadata(&info_hash, &[]).phase,
         "restored from the session, not re-added"
     );
-    assert_eq!(stats.pinned_files, vec![1], "pin restored");
+    assert_eq!(stats.pinned_files, vec![idx], "pin restored");
     let stats = stats_after_check(&client, &base, &info_hash)?;
-    assert_eq!(stats["files"][1]["complete"], true, "{stats}");
-    assert_eq!(stats["files"][1]["pinned"], true, "{stats}");
-    assert_eq!(stats["pinnedFiles"], serde_json::json!([1]));
-    let info = handle.pin_download(&info_hash, 1, &[])?;
+    assert_eq!(stats["files"][idx]["complete"], true, "{stats}");
+    assert_eq!(stats["files"][idx]["pinned"], true, "{stats}");
+    assert_eq!(stats["pinnedFiles"], serde_json::json!([idx]));
+    let info = handle.pin_download(&info_hash, idx, &[])?;
     assert_eq!(
         info.path.as_deref(),
         Some(target.join("e2.bin").to_str().unwrap())
