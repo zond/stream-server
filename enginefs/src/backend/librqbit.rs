@@ -946,13 +946,17 @@ impl TorrentHandle for LibrqbitHandle {
         files
     }
 
-    async fn get_file_path(&self, _file_idx: usize) -> Option<String> {
-        // A real path is not obtainable through librqbit 8.1.1's public API:
-        // the torrent's resolved output folder lives in ManagedTorrentOptions,
-        // which is pub(crate). Returning None makes the engine probe through
-        // the HTTP loopback stream instead, which blocks correctly on pieces
-        // that are not downloaded yet (a sparse local file would not).
-        None
+    /// The torrent's resolved output folder (`ManagedTorrent::output_folder`,
+    /// public since librqbit 9) joined with the file's relative name from
+    /// the metadata's `file_infos` -- exactly where librqbit's storage
+    /// writes it. `None` while a magnet is still resolving or for a bad
+    /// index. This is for handing a *complete* file to a local player;
+    /// reads of an in-progress file keep going through the FileStream,
+    /// which blocks on missing pieces where a sparse file would not.
+    async fn file_path(&self, file_idx: usize) -> Option<PathBuf> {
+        let metadata = self.handle.metadata.load_full()?;
+        let file = metadata.file_infos.get(file_idx)?;
+        Some(self.handle.output_folder().join(&file.relative_filename))
     }
 
     /// Select `file_idx` as the only wanted file (exclusive downloading, per
@@ -2803,6 +2807,63 @@ mod tests {
         multi.handle.wait_until_initialized().await.unwrap();
         backend.remove_torrent(&multi_hash).await.unwrap();
         assert!(dl.join("src").join("a.bin").is_file());
+    }
+
+    /// `file_path` is the torrent's output folder joined with the file's
+    /// relative name -- straight in the session root for a single-file
+    /// torrent, under the torrent's own folder for a multi-file one -- and
+    /// points at the real bytes. Out of range: None. `get_file_path` is the
+    /// same path as a string.
+    #[tokio::test]
+    async fn file_path_points_at_the_file_on_disk() {
+        use crate::backend::TorrentHandle;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+
+        let payload = dir.join("payload.bin");
+        write_payload(&payload, 32 * 1024).await;
+        let (single_bytes, _) = make_torrent(&payload).await;
+        let content_dir = dir.join("multi");
+        tokio::fs::create_dir_all(&content_dir).await.unwrap();
+        write_payload(&content_dir.join("a.bin"), 16 * 1024).await;
+        write_payload(&content_dir.join("b.bin"), 24 * 1024).await;
+        let (multi_bytes, _) = make_torrent(&content_dir).await;
+
+        let backend = LibrqbitBackend::new_for_tests(dir.clone())
+            .await
+            .expect("hermetic session");
+        let single = backend
+            .add_torrent(TorrentSource::Bytes(single_bytes), vec![])
+            .await
+            .unwrap();
+        let multi = backend
+            .add_torrent(TorrentSource::Bytes(multi_bytes), vec![])
+            .await
+            .unwrap();
+
+        let path = single.file_path(0).await.expect("single-file path");
+        assert_eq!(path, dir.join("payload.bin"));
+        assert_eq!(
+            single.get_file_path(0).await.as_deref(),
+            Some(path.to_string_lossy().as_ref())
+        );
+        let bytes = tokio::fs::read(&path).await.expect("path exists on disk");
+        assert_eq!(bytes.len(), 32 * 1024);
+        assert!(bytes.iter().enumerate().all(|(i, b)| *b == (i % 251) as u8));
+        assert_eq!(single.file_path(1).await, None, "out of range");
+
+        assert_eq!(
+            multi.file_path(1).await.as_deref(),
+            Some(content_dir.join("b.bin").as_path())
+        );
+        assert_eq!(
+            tokio::fs::metadata(multi.file_path(0).await.unwrap())
+                .await
+                .unwrap()
+                .len(),
+            16 * 1024
+        );
+        assert_eq!(multi.file_path(2).await, None);
     }
 
     #[tokio::test]

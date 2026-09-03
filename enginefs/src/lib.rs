@@ -2393,10 +2393,6 @@ mod tests {
             self.files.clone()
         }
 
-        async fn get_file_path(&self, _file_idx: usize) -> Option<String> {
-            None
-        }
-
         async fn prepare_file_for_streaming(&self, _file_idx: usize) -> Result<()> {
             self.gate().await?;
             self.counters
