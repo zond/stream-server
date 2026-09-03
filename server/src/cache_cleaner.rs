@@ -146,6 +146,17 @@ async fn clean_cache(state: &Arc<AppState>) -> anyhow::Result<()> {
         }
     }
 
+    evict(&download_dirs, &protected_paths, limit).await
+}
+
+/// Walk `download_dirs` and evict what is neither protected nor a session
+/// artefact: first every file older than 30 days, then -- while the rest
+/// exceeds `limit` (0 = no limit) -- the least recently modified files.
+async fn evict(
+    download_dirs: &[std::path::PathBuf],
+    protected_paths: &HashSet<std::path::PathBuf>,
+    limit: u64,
+) -> anyhow::Result<()> {
     // 2. Scan and Evict immediately based on age (30 days)
     let thirty_days = Duration::from_secs(30 * 24 * 60 * 60);
     let now = std::time::SystemTime::now();
@@ -153,7 +164,7 @@ async fn clean_cache(state: &Arc<AppState>) -> anyhow::Result<()> {
     let mut files = Vec::new();
     let mut total_size = 0u64;
 
-    for download_dir in &download_dirs {
+    for download_dir in download_dirs {
         if !download_dir.exists() {
             continue;
         }
@@ -165,14 +176,11 @@ async fn clean_cache(state: &Arc<AppState>) -> anyhow::Result<()> {
                 Some(Ok(entry)) => {
                     if entry.file_type().is_file() {
                         let path = entry.path().to_path_buf();
-                        if path
-                            .components()
-                            .any(|component| component.as_os_str() == ".metadata")
-                        {
+                        if is_session_artifact(&path, download_dir) {
                             continue;
                         }
                         // Is protected?
-                        let is_protected = is_path_protected(&path, &protected_paths);
+                        let is_protected = is_path_protected(&path, protected_paths);
 
                         if let Ok(metadata) = entry.metadata() {
                             let size = metadata.len();
@@ -273,6 +281,43 @@ async fn clean_cache(state: &Arc<AppState>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether `path` (under the session root `root`) is state the torrent
+/// session or the engine keeps next to the payload rather than payload: it
+/// is neither aged out nor counted against the cache limit. librqbit's
+/// `session.json` and per-torrent `<info hash>.torrent` / `.bitv`
+/// (fastresume bitfield) records at the top level, with their `.tmp`
+/// siblings; everything under `.metadata/` and `.cache/`; and the engine's
+/// `pinned-downloads.json` with its `.json.tmp-*` temp files. All of these
+/// change only when the session does, so by mtime a stable pin set or a
+/// finished pinned download would be the first casualties.
+fn is_session_artifact(path: &std::path::Path, root: &std::path::Path) -> bool {
+    if path
+        .components()
+        .any(|component| matches!(component.as_os_str().to_str(), Some(".metadata" | ".cache")))
+    {
+        return true;
+    }
+    if path.parent() != Some(root) {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let name = name.strip_suffix(".tmp").unwrap_or(name);
+    if name == "session.json" || name == "pinned-downloads.json" {
+        return true;
+    }
+    if let Some(rest) = name.strip_prefix("pinned-downloads.json.tmp-") {
+        return !rest.is_empty();
+    }
+    match name.rsplit_once('.') {
+        Some((stem, "torrent" | "bitv")) => {
+            stem.len() == 40 && stem.bytes().all(|b| b.is_ascii_hexdigit())
+        }
+        _ => false,
+    }
+}
+
 /// A file is protected from eviction when its full path is in `protected` or
 /// when it lives under a protected directory. Uses `Path::starts_with`, which
 /// matches whole path components — so `/dl/Movie2/x.mkv` is NOT shielded by a
@@ -295,9 +340,111 @@ async fn remove_empty_parents(mut dir: &std::path::Path, root: &std::path::Path)
 
 #[cfg(test)]
 mod tests {
-    use super::{is_path_protected, remove_empty_parents};
+    use super::{evict, is_path_protected, is_session_artifact, remove_empty_parents};
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime};
+
+    const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn session_artifacts_are_recognised_at_the_top_level_only() {
+        let root = Path::new("/dl");
+        for name in [
+            "session.json",
+            "session.json.tmp",
+            "pinned-downloads.json",
+            "pinned-downloads.json.tmp-4242-7",
+            &format!("{HASH}.torrent"),
+            &format!("{HASH}.bitv"),
+            &format!("{HASH}.bitv.tmp"),
+        ] {
+            assert!(is_session_artifact(&root.join(name), root), "{name}");
+            assert!(
+                !is_session_artifact(&root.join("show").join(name), root),
+                "a payload file named {name} inside a torrent folder is payload"
+            );
+        }
+        assert!(is_session_artifact(
+            &root.join(".cache").join("x.torrent"),
+            root
+        ));
+        assert!(is_session_artifact(&root.join(".metadata").join("y"), root));
+        for name in [
+            "movie.mkv",
+            "movie.torrent",
+            "notes.json",
+            "pinned-downloads.json.tmp-",
+            "0123.bitv",
+        ] {
+            assert!(!is_session_artifact(&root.join(name), root), "{name}");
+        }
+    }
+
+    fn write_aged(path: &Path, bytes: &[u8], age: Duration) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - age)
+            .unwrap();
+    }
+
+    /// The session's own records live in the walked root but are not cache:
+    /// neither the 30-day rule nor the size limit touches them, while stale
+    /// payload beside them still goes.
+    #[tokio::test]
+    async fn evict_leaves_the_session_records_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("rqbit-downloads");
+        let forty_days = Duration::from_secs(40 * 24 * 60 * 60);
+        let records = [
+            root.join("session.json"),
+            root.join("pinned-downloads.json"),
+            root.join(format!("{HASH}.bitv")),
+            root.join(format!("{HASH}.torrent")),
+            root.join(".cache").join(format!("{HASH}.torrent")),
+        ];
+        for record in &records {
+            write_aged(record, b"{}", forty_days);
+        }
+        let stale = root.join("old-show").join("e1.mkv");
+        write_aged(&stale, &[0u8; 4096], forty_days);
+        let recent = root.join("recent.mkv");
+        write_aged(&recent, &[0u8; 4096], Duration::from_secs(60));
+
+        evict(std::slice::from_ref(&root), &HashSet::new(), 0)
+            .await
+            .unwrap();
+        for record in &records {
+            assert!(
+                record.is_file(),
+                "{} survives the age rule",
+                record.display()
+            );
+        }
+        assert!(!stale.exists(), "stale payload aged out");
+        assert!(recent.is_file());
+
+        // Size pressure: the records are the oldest files but never LRU
+        // casualties, and they do not count towards the size either.
+        let newer = root.join("newer.mkv");
+        write_aged(&newer, &[0u8; 4096], Duration::from_secs(1));
+        evict(std::slice::from_ref(&root), &HashSet::new(), 4096)
+            .await
+            .unwrap();
+        for record in &records {
+            assert!(
+                record.is_file(),
+                "{} survives the size rule",
+                record.display()
+            );
+        }
+        assert!(!recent.exists(), "oldest payload evicted first");
+        assert!(newer.is_file(), "back under the limit");
+    }
 
     #[tokio::test]
     async fn remove_empty_parents_prunes_up_to_but_not_including_root() {
