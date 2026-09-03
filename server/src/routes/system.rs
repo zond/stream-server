@@ -116,17 +116,32 @@ pub async fn device_info() -> impl IntoResponse {
     Json(json!({ "availableHardwareAccelerations": Vec::<String>::new() }))
 }
 
+/// Every IPv4 address the host's interfaces carry, **loopback included**,
+/// with the netmask that came with it.
+///
+/// This is the one interface enumeration in the server, so a second caller
+/// never grows a second copy of it. [`network_info`] applies its own
+/// loopback filter on top: `GET /network-info` advertises the addresses a
+/// *remote* client could use, while a caller matching an interface against a
+/// peer's subnet needs the loopback entries too. An enumeration failure is an
+/// empty list, exactly as it was for `/network-info` before.
+pub fn local_ipv4_interfaces() -> Vec<if_addrs::Ifv4Addr> {
+    if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|iface| match iface.addr {
+            if_addrs::IfAddr::V4(addr) => Some(addr),
+            if_addrs::IfAddr::V6(_) => None,
+        })
+        .collect()
+}
+
 pub async fn network_info() -> impl IntoResponse {
-    let mut interfaces = Vec::new();
-    if let Ok(if_addrs) = if_addrs::get_if_addrs() {
-        for iface in if_addrs {
-            if !iface.is_loopback()
-                && let if_addrs::IfAddr::V4(addr) = iface.addr
-            {
-                interfaces.push(addr.ip.to_string());
-            }
-        }
-    }
+    let interfaces = local_ipv4_interfaces()
+        .into_iter()
+        .filter(|addr| !addr.ip.is_loopback())
+        .map(|addr| addr.ip.to_string())
+        .collect::<Vec<_>>();
     Json(json!({ "availableInterfaces": interfaces }))
 }
 
