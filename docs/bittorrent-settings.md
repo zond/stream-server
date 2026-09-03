@@ -38,6 +38,20 @@ Windows or `~/.config/stremio-server/settings.json` on Linux.
 | `btAllowMultipleConnectionsPerIp` | boolean | `false` | Allows more than one peer connection per IP address. Keep disabled unless you explicitly need it. |
 | `btValidateHttpsTrackers` | boolean | `true` | Validates HTTPS tracker certificates. Disabling this weakens tracker TLS checks. |
 | `btSsrfMitigation` | boolean | `true` | Keeps SSRF mitigations enabled for tracker and web seed access. |
+| `dhtBootstrapNodes` | array of strings, or `null` | `null` (uses the built-in list below) | DHT bootstrap nodes (`"host:port"`) used to seed the routing table on a cold start. A non-empty list *replaces* the default entirely; `null` or `[]` uses it. Invalid entries (no `host:port` split, or an unparseable/zero port) are dropped with a warning instead of failing the request. Unlike the other `bt*` settings above, this one is read once when librqbit's session opens, so a change here takes effect on the **next server start**, not the running session. |
+
+The built-in default is `router.bittorrent.com:6881`, `dht.transmissionbt.com:6881`,
+`router.utorrent.com:6881`, `dht.libtorrent.org:25401`, `dht.aelitis.com:6881`
+(most reliable first) — librqbit's own two-host default
+(`dht.transmissionbt.com`, `dht.libtorrent.org`) plus the other conventional
+public bootstrap nodes mainstream clients ship, so a cold start (no
+`dht.json` routing table yet, or a wiped/corrupted one) isn't relying on
+just two hosts. Once a session has run once, librqbit persists its routing
+table to `dht.json` next to the downloads; on every later start it loads
+that table *and* still queries the bootstrap nodes in the background, but
+with a warm table already available the bootstrap hosts' reachability
+matters far less — in practice `dhtBootstrapNodes` normally only matters on
+first run, or after that persisted table is lost.
 
 Privacy-focused example:
 
@@ -167,3 +181,6 @@ curl -X POST http://127.0.0.1:11470/settings \
 - `btListenInterfaces`, `btOutgoingInterfaces`, proxy options, and SSRF/TLS
   settings are applied by the `librqbit` backend on a best-effort basis; not
   every knob has an equivalent in every backend.
+- `dhtBootstrapNodes` is the one setting on this page that is not applied to
+  the running session at all -- it is read once, at session construction, so
+  a change takes effect on the next server start.
