@@ -88,6 +88,58 @@ impl BodyProgress {
     }
 }
 
+/// How often an open stream reports what the torrent is doing.
+///
+/// Once a second, and only while a body is open: the owner's capture of
+/// four stalling streams had nothing between "response ready" and silence,
+/// so there was no way to tell a dead swarm from a slow one, or either from
+/// a window waiting on a piece bigger than itself.
+const STREAM_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Log what the torrent behind an open stream is doing, once a second,
+/// until the task is aborted (the body ended) or the engine is gone.
+///
+/// `peek_engine`, not `get_engine`: watching a stream must not be what
+/// keeps its torrent out of the idle sweep -- the open reader already does
+/// that, honestly.
+fn spawn_stream_progress_log(
+    engine: Arc<enginefs::EngineFS>,
+    info_hash: String,
+    file_idx: usize,
+    stream_id: u64,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(STREAM_PROGRESS_LOG_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick is immediate; skip it so a short request does not
+        // log a line saying nothing has happened yet.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let Some(engine) = engine.peek_engine(&info_hash).await else {
+                return;
+            };
+            let mut stats = engine.get_statistics().await;
+            stats.focus_stream_file(file_idx);
+            tracing::info!(
+                stream_id,
+                info_hash = %info_hash,
+                file_idx,
+                phase = ?stats.phase,
+                download_speed = stats.download_speed,
+                peers = stats.peers,
+                connected_seeders = stats.connected_seeders,
+                swarm_seeders = stats.swarm_seeders,
+                initial_window_ready_bytes = stats.initial_window_ready_bytes,
+                initial_window_bytes = stats.initial_window_bytes,
+                piece_length = stats.piece_length,
+                stage = "stream_progress",
+                "stream progress"
+            );
+        }
+    })
+}
+
 /// Guard that calls on_stream_end when dropped.
 struct StreamLifecycleGuard {
     engine: Arc<enginefs::EngineFS>,
@@ -99,6 +151,8 @@ struct StreamLifecycleGuard {
     /// Bytes the range asked for; 0 until the body is built.
     requested_len: u64,
     progress: BodyProgress,
+    /// The per-second progress logger, aborted when the stream ends.
+    progress_log: tokio::task::JoinHandle<()>,
 }
 
 impl StreamLifecycleGuard {
@@ -109,6 +163,8 @@ impl StreamLifecycleGuard {
         stream_id: u64,
     ) -> Self {
         crate::diagnostics::logging::direct_stream_started();
+        let progress_log =
+            spawn_stream_progress_log(engine.clone(), info_hash.clone(), file_idx, stream_id);
         Self {
             engine,
             info_hash,
@@ -118,6 +174,7 @@ impl StreamLifecycleGuard {
             started: Instant::now(),
             requested_len: 0,
             progress: BodyProgress::default(),
+            progress_log,
         }
     }
 
@@ -126,6 +183,7 @@ impl StreamLifecycleGuard {
             return;
         }
         self.notified = true;
+        self.progress_log.abort();
         crate::diagnostics::logging::direct_stream_ended();
 
         let engine = self.engine.clone();

@@ -1293,6 +1293,15 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         })
     }
 
+    /// The registry's engine for `info_hash` **without** counting as a
+    /// poll, unlike [`Self::get_engine`]. For observers -- a progress
+    /// logger, a diagnostics sweep -- that must not keep a torrent alive
+    /// just by looking at it.
+    pub async fn peek_engine(&self, info_hash: &str) -> Option<Arc<Engine<B::Handle>>> {
+        let engines = self.engines.read().await;
+        engines.get(&info_hash.to_lowercase()).cloned()
+    }
+
     pub async fn get_engine(&self, info_hash: &str) -> Option<Arc<Engine<B::Handle>>> {
         let engines = self.engines.read().await;
         let engine = engines.get(&info_hash.to_lowercase()).cloned();
@@ -3731,6 +3740,33 @@ mod tests {
 
     fn test_enginefs() -> (BackendEngineFS<FakeBackend>, Arc<FakeCounters>) {
         test_enginefs_with_file_count(1)
+    }
+
+    /// An observer -- the per-stream progress logger, a diagnostics sweep --
+    /// must be able to read an engine without that being what keeps its
+    /// torrent out of the idle sweep. `get_engine` counts as a poll on
+    /// purpose; `peek_engine` must not.
+    #[tokio::test]
+    async fn peek_engine_does_not_count_as_a_poll() {
+        let (enginefs, _counters) = test_enginefs();
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        let stale = u64::MAX;
+        engine.last_accessed.store(stale, Ordering::SeqCst);
+
+        assert!(enginefs.peek_engine(TEST_HASH).await.is_some());
+        assert_eq!(
+            engine.last_accessed.load(Ordering::SeqCst),
+            stale,
+            "peeking left the idle clock alone"
+        );
+
+        enginefs.get_engine(TEST_HASH).await.unwrap();
+        assert_ne!(
+            engine.last_accessed.load(Ordering::SeqCst),
+            stale,
+            "a real lookup still counts as a poll"
+        );
+        assert!(enginefs.peek_engine("no-such-hash").await.is_none());
     }
 
     /// Wait for `ready` to hold instead of sleeping for it. A pin reaches
