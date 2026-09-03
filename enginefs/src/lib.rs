@@ -3761,8 +3761,6 @@ mod tests {
         (enginefs, counters)
     }
 
-    /// Engine over a fake torrent that is still initializing (`ready: false`)
-    /// with a caller-chosen initialization timeout.
     /// A scratch root of its own for one fake-engine fixture.
     ///
     /// Never a fixed path under `std::env::temp_dir()`: the pin set is
@@ -3783,6 +3781,8 @@ mod tests {
         root
     }
 
+    /// Engine over a fake torrent that is still initializing (`ready: false`)
+    /// with a caller-chosen initialization timeout.
     fn test_enginefs_initializing(
         file_count: usize,
         timeout: Duration,
