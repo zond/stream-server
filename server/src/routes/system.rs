@@ -259,10 +259,21 @@ pub fn cache_roots(state: &AppState) -> [std::path::PathBuf; 2] {
     ]
 }
 
-/// Validate and prepare a `downloadsDir` value: trimmed, absolute, created
-/// if missing, writable (a probe file is created and removed), and not at
-/// or above any of `cache_roots` ([`cache_roots`]). The returned path is
-/// what the setting stores and the engines use.
+/// Validate and prepare a `downloadsDir` value: trimmed, absolute, not at
+/// or above any of `cache_roots` ([`cache_roots`]), created if missing and
+/// writable (a probe file is created and removed). The returned path --
+/// **resolved**, see below -- is what the setting stores and the engines
+/// use.
+///
+/// Checked before it is created, so a refused setting leaves no directory
+/// behind; and resolved before it is returned, because the stored value is
+/// compared as a plain path prefix from then on: `cache_cleaner::evict`
+/// prunes it from the walk with `starts_with` against the roots it walks,
+/// and the engines place torrents under exactly this path, so the cleaner
+/// matches their files by name. A spelling that reaches the same directory
+/// through a symlinked prefix passes validation (a directory *below* a
+/// cache root is allowed) and then matches neither -- an offline download
+/// inside a cache root would be walked as cache and aged out.
 pub async fn prepare_downloads_dir(
     raw: &str,
     cache_roots: &[std::path::PathBuf],
@@ -274,16 +285,6 @@ pub async fn prepare_downloads_dir(
     let path = std::path::PathBuf::from(raw);
     if !path.is_absolute() {
         anyhow::bail!("downloadsDir must be an absolute path, got {raw:?}");
-    }
-    tokio::fs::create_dir_all(&path)
-        .await
-        .map_err(|e| anyhow::anyhow!("downloadsDir {raw:?} cannot be created: {e}"))?;
-    let probe = path.join(format!(".stream-server-write-probe-{}", std::process::id()));
-    tokio::fs::write(&probe, b"")
-        .await
-        .map_err(|e| anyhow::anyhow!("downloadsDir {raw:?} is not writable: {e}"))?;
-    if let Err(error) = tokio::fs::remove_file(&probe).await {
-        tracing::debug!(path = %probe.display(), %error, "could not remove the write probe");
     }
     // A downloads dir that is a cache root, or above one, cannot be told
     // apart from the cache in it: the cleaner walks those roots and would
@@ -301,7 +302,44 @@ pub async fn prepare_downloads_dir(
             );
         }
     }
-    Ok(path)
+    tokio::fs::create_dir_all(&path)
+        .await
+        .map_err(|e| anyhow::anyhow!("downloadsDir {raw:?} cannot be created: {e}"))?;
+    let probe = path.join(format!(".stream-server-write-probe-{}", std::process::id()));
+    tokio::fs::write(&probe, b"")
+        .await
+        .map_err(|e| anyhow::anyhow!("downloadsDir {raw:?} is not writable: {e}"))?;
+    if let Err(error) = tokio::fs::remove_file(&probe).await {
+        tracing::debug!(path = %probe.display(), %error, "could not remove the write probe");
+    }
+    Ok(plain_path(canonical_prefix(&path)))
+}
+
+/// A canonicalised path as the rest of the world should see it. On Windows
+/// `canonicalize` returns a `\\?\`-prefixed (verbatim) path, which reaches
+/// the same directory but is not what a settings file or a client expects;
+/// the plain drive spelling is restored for an ordinary local path.
+#[cfg(windows)]
+fn plain_path(path: std::path::PathBuf) -> std::path::PathBuf {
+    use std::path::{Component, Prefix};
+    let mut components = path.components();
+    if let Some(Component::Prefix(prefix)) = components.next()
+        && let Prefix::VerbatimDisk(letter) = prefix.kind()
+    {
+        let rest = components.as_path();
+        let mut plain = std::path::PathBuf::from(format!("{}:\\", letter as char));
+        plain.push(
+            rest.strip_prefix(std::path::Component::RootDir)
+                .unwrap_or(rest),
+        );
+        return plain;
+    }
+    path
+}
+
+#[cfg(not(windows))]
+fn plain_path(path: std::path::PathBuf) -> std::path::PathBuf {
+    path
 }
 
 /// `path` with its deepest existing ancestor canonicalised and the rest of
@@ -1134,13 +1172,54 @@ mod tests {
         let prepared = prepare_downloads_dir(&format!("  {}  ", nested.display()), &[])
             .await
             .unwrap();
-        assert_eq!(prepared, nested);
+        assert_eq!(prepared, nested.canonicalize().unwrap());
         assert!(nested.is_dir());
         assert_eq!(
             std::fs::read_dir(&nested).unwrap().count(),
             0,
             "the write probe is removed"
         );
+    }
+
+    /// The stored `downloadsDir` is the resolved path, and a refused one
+    /// leaves nothing on disk. Both matter to the cleaner: it prunes the
+    /// downloads dir from its walk, and protects a live engine's files, by
+    /// plain path prefix against the roots it walks -- a spelling that
+    /// reaches the same directory through a symlinked prefix is accepted
+    /// (below a cache root is allowed) and then matches neither, so an
+    /// offline download inside a cache root would age out as cache.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepare_downloads_dir_stores_the_resolved_path() {
+        use super::prepare_downloads_dir;
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().canonicalize().unwrap();
+        let cache_root = real.join("cache");
+        std::fs::create_dir_all(&cache_root).unwrap();
+        let link = real.join("link");
+        std::os::unix::fs::symlink(&cache_root, &link).unwrap();
+
+        let prepared = prepare_downloads_dir(
+            link.join("offline").to_str().unwrap(),
+            std::slice::from_ref(&cache_root),
+        )
+        .await
+        .expect("a directory below a cache root is allowed");
+        assert_eq!(
+            prepared,
+            cache_root.join("offline"),
+            "the symlinked spelling would be walked as cache and never matched"
+        );
+        assert!(prepared.starts_with(&cache_root));
+
+        // A refused setting creates nothing: the check runs first.
+        let refused = real.join("would-cover");
+        assert!(
+            prepare_downloads_dir(refused.to_str().unwrap(), &[refused.join("cache")])
+                .await
+                .is_err()
+        );
+        assert!(!refused.exists(), "a refused downloadsDir is not created");
     }
 
     /// A `downloadsDir` that is a torrent cache root, or above one, is
