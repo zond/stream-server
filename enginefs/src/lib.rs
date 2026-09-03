@@ -350,6 +350,10 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     /// Where pinned downloads are placed (`<downloads_dir>/<info hash>`),
     /// see [`Self::set_downloads_dir`]. `None` = the backend's default root.
     downloads_dir: parking_lot::RwLock<Option<std::path::PathBuf>>,
+    /// One lock per info hash serialising `pin_download` calls for the same
+    /// torrent (a relocation must not be raced by a second pin); entries
+    /// live only while a call holds or waits for them.
+    pin_locks: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Available-bytes probe for the free-space check in `pin_download`
     /// (`fs4::available_space`; tests substitute one).
     free_space_probe: FreeSpaceProbe,
@@ -474,6 +478,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             seeding_enabled: Arc::new(AtomicBool::new(true)),
             magnet_adds: Arc::new(RwLock::new(HashMap::new())),
             downloads_dir: parking_lot::RwLock::new(None),
+            pin_locks: parking_lot::Mutex::new(HashMap::new()),
             free_space_probe: Arc::new(|path| fs4::available_space(path)),
             clock,
         };
@@ -1172,6 +1177,20 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         engines.remove(&info_hash.to_lowercase());
     }
 
+    /// Drop the registry entry for `engine`'s hash only while it still is
+    /// `engine` (an entry someone else published meanwhile stays). Returns
+    /// whether anything was removed.
+    async fn remove_engine_if_current(&self, engine: &Arc<Engine<B::Handle>>) -> bool {
+        let mut engines = self.engines.write().await;
+        match engines.get(&engine.info_hash) {
+            Some(current) if Arc::ptr_eq(current, engine) => {
+                engines.remove(&engine.info_hash);
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub async fn get_all_statistics(&self) -> HashMap<String, crate::backend::EngineStats> {
         let engines = self.engines.read().await;
         let mut stats = HashMap::new();
@@ -1529,6 +1548,13 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// backend restored (librqbit keeps the file in its persisted
     /// `only_files` and the folder in its `output_folder`, so the download
     /// itself resumes in place; the pin makes it exempt from eviction again).
+    ///
+    /// Calls for the same info hash run one at a time (`pin_locks`): a
+    /// relocation drops the torrent from the backend and re-adds it, and a
+    /// second pin racing through that window would find nothing to
+    /// relocate, fail, and could tear down the engine the first one has
+    /// just published. Serialised, the second caller simply sees the torrent
+    /// already in place.
     pub async fn pin_download(
         &self,
         info_hash: &str,
@@ -1536,14 +1562,41 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         extra_trackers: Option<Vec<String>>,
     ) -> Result<Arc<Engine<B::Handle>>, PinDownloadError> {
         let info_hash = info_hash.to_lowercase();
-        let folder = self.download_folder(&info_hash);
+        let lock = self
+            .pin_locks
+            .lock()
+            .entry(info_hash.clone())
+            .or_default()
+            .clone();
+        let guard = lock.lock().await;
+        let result = self
+            .pin_download_locked(&info_hash, file_idx, extra_trackers)
+            .await;
+        drop(guard);
+        let mut locks = self.pin_locks.lock();
+        // Ours plus the map's: nobody is waiting for this lock, so it can go
+        // (a waiter holds its own clone, which keeps the entry alive).
+        if Arc::strong_count(&lock) == 2 {
+            locks.remove(&info_hash);
+        }
+        result
+    }
+
+    /// [`Self::pin_download`] with the per-hash lock held.
+    async fn pin_download_locked(
+        &self,
+        info_hash: &str,
+        file_idx: usize,
+        extra_trackers: Option<Vec<String>>,
+    ) -> Result<Arc<Engine<B::Handle>>, PinDownloadError> {
+        let folder = self.download_folder(info_hash);
         let placement = TorrentPlacement {
             output_folder: folder.clone(),
             only_files: Some(vec![file_idx]),
         };
-        let was_managed = self.get_engine(&info_hash).await.is_some();
+        let was_managed = self.get_engine(info_hash).await.is_some();
         let engine = self
-            .get_or_add_magnet_placed(&info_hash, extra_trackers.clone(), placement)
+            .get_or_add_magnet_placed(info_hash, extra_trackers.clone(), placement)
             .await?;
         let checked = self
             .check_pin_preconditions(&engine, file_idx, folder.as_deref())
@@ -1551,28 +1604,48 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         if let Err(error) = checked {
             if !was_managed && !engine.is_pinned() {
                 // Added only for this pin: do not leave it behind.
-                self.remove_engine(&info_hash).await;
-                if let Err(e) = self.backend.remove_torrent(&info_hash).await {
+                self.remove_engine_if_current(&engine).await;
+                if let Err(e) = self.backend.remove_torrent(info_hash).await {
                     debug!(info_hash, error = %e, "could not drop the torrent added for a refused pin");
                 }
             }
             return Err(error);
         }
-        let engine = match folder {
+        // Pinned before anything slow happens: a relocation can outlast the
+        // idle window, and `is_pinned()` is what keeps the sweeper off the
+        // engine meanwhile. Undone below if the pin does not go through
+        // (unless the file was pinned already -- a re-pin changes nothing).
+        let newly_pinned = engine.pinned_files.write().insert(file_idx);
+        let relocated = match folder {
             Some(folder)
                 if engine
                     .handle
                     .output_folder()
                     .is_some_and(|current| current != folder) =>
             {
-                self.relocate_engine(engine, folder, file_idx, extra_trackers)
-                    .await?
+                self.relocate_engine(engine.clone(), folder, extra_trackers)
+                    .await
             }
-            _ => engine,
+            _ => Ok(engine.clone()),
         };
-        engine.pinned_files.write().insert(file_idx);
+        let engine = match relocated {
+            Ok(engine) => engine,
+            Err(error) => {
+                if newly_pinned {
+                    engine.pinned_files.write().remove(&file_idx);
+                    // The failure path may have rebuilt the registry's
+                    // engine from the old pin set, this file included.
+                    if let Some(current) = self.get_engine(info_hash).await {
+                        current.pinned_files.write().remove(&file_idx);
+                    }
+                }
+                return Err(error);
+            }
+        };
         if let Err(error) = engine.handle.pin_file(file_idx).await {
-            engine.pinned_files.write().remove(&file_idx);
+            if newly_pinned {
+                engine.pinned_files.write().remove(&file_idx);
+            }
             return Err(PinDownloadError::Backend(error));
         }
         engine.touch();
@@ -1803,21 +1876,21 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     }
 
     /// Move `engine`'s torrent into `folder` (see [`Self::pin_download`]),
-    /// wanting its pinned files plus `file_idx`, and publish the backend's
-    /// new handle as the registry's engine for the hash with the pins
-    /// carried over. On failure the backend may or may not still manage the
-    /// torrent: the registry entry is rebuilt from `get_torrent` when it
-    /// does and dropped otherwise, so the next request re-adds through the
-    /// registry instead of using a handle to a torrent that is gone.
+    /// wanting its pinned files (the caller has already recorded the pin
+    /// being made), and publish the backend's new handle as the registry's
+    /// engine for the hash with the pins carried over. On failure the
+    /// backend may or may not still manage the torrent: the registry entry
+    /// is rebuilt from `get_torrent` when it does and dropped otherwise --
+    /// but only if it is still `engine`; an entry published by someone else
+    /// meanwhile is theirs to keep -- so the next request re-adds through
+    /// the registry instead of using a handle to a torrent that is gone.
     async fn relocate_engine(
         &self,
         engine: Arc<Engine<B::Handle>>,
         folder: std::path::PathBuf,
-        file_idx: usize,
         extra_trackers: Option<Vec<String>>,
     ) -> Result<Arc<Engine<B::Handle>>, PinDownloadError> {
-        let mut wanted = engine.pinned_files.read().clone();
-        wanted.insert(file_idx);
+        let wanted = engine.pinned_files.read().clone();
         let placement = TorrentPlacement {
             output_folder: Some(folder.clone()),
             only_files: Some(wanted.into_iter().collect()),
@@ -1845,7 +1918,9 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     Some(handle) => {
                         self.replace_engine(&engine, handle).await;
                     }
-                    None => self.remove_engine(&engine.info_hash).await,
+                    None => {
+                        self.remove_engine_if_current(&engine).await;
+                    }
                 }
                 Err(PinDownloadError::Backend(error.context(format!(
                     "relocating {} into {}",
@@ -2550,6 +2625,14 @@ mod tests {
         /// Test knob: make `relocate_torrent` fail (the torrent stays
         /// managed where it was, as the real backend's recovery leaves it).
         fail_relocate: Arc<AtomicBool>,
+        /// Test knob: while set, `relocate_torrent` blocks (after recording
+        /// the request) until the test adds a permit to `relocate_hold`,
+        /// standing in for a slow cross-device move.
+        hold_relocate: Arc<AtomicBool>,
+        relocate_hold: Arc<tokio::sync::Semaphore>,
+        /// Test knob: `get_torrent` finds nothing (the torrent is gone from
+        /// the session, as after a relocation that failed to re-add).
+        hide_torrents: Arc<AtomicBool>,
     }
 
     impl FakeBackend {
@@ -2560,6 +2643,9 @@ mod tests {
                 placements: Arc::new(Mutex::new(Vec::new())),
                 relocations: Arc::new(Mutex::new(Vec::new())),
                 fail_relocate: Arc::new(AtomicBool::new(false)),
+                hold_relocate: Arc::new(AtomicBool::new(false)),
+                relocate_hold: Arc::new(tokio::sync::Semaphore::new(0)),
+                hide_torrents: Arc::new(AtomicBool::new(false)),
             }
         }
     }
@@ -2602,6 +2688,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((info_hash.to_string(), placement.clone()));
+            if self.hold_relocate.load(Ordering::SeqCst) {
+                self.relocate_hold.acquire().await.unwrap().forget();
+            }
             if self.fail_relocate.load(Ordering::SeqCst) {
                 anyhow::bail!("fake relocation failed");
             }
@@ -2616,6 +2705,9 @@ mod tests {
         }
 
         async fn get_torrent(&self, info_hash: &str) -> Option<Self::Handle> {
+            if self.hide_torrents.load(Ordering::SeqCst) {
+                return None;
+            }
             self.handles
                 .iter()
                 .find(|h| h.info_hash == info_hash)
@@ -3845,6 +3937,101 @@ mod tests {
                 file_idx: 1
             }]
         );
+    }
+
+    /// Two pins of one torrent issued together (two episodes of a season
+    /// pack, the client's re-pin loop) relocate it once: the second waits
+    /// for the first, then finds the torrent in place. The pin is recorded
+    /// on the engine before the relocation starts, so the idle sweeper's
+    /// `is_pinned()` exemption covers the whole move.
+    #[tokio::test]
+    async fn concurrent_pins_of_one_torrent_relocate_it_once() {
+        let (enginefs, counters) = test_enginefs_with_file_count(3);
+        *counters.output_folder.lock().unwrap() = Some("/cache/rqbit-downloads/show".into());
+        let dir = std::path::PathBuf::from("/offline");
+        enginefs.set_downloads_dir(Some(dir.clone()));
+        enginefs.backend.hold_relocate.store(true, Ordering::SeqCst);
+        let before = enginefs.get_engine(TEST_HASH).await.unwrap();
+
+        let release = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(
+                enginefs.backend.relocations.lock().unwrap().len(),
+                1,
+                "the second pin waits instead of relocating too"
+            );
+            let held = enginefs.get_engine(TEST_HASH).await.unwrap();
+            assert!(Arc::ptr_eq(&held, &before), "not published yet");
+            assert!(held.is_pinned(), "pinned before the move, sweeper-exempt");
+            assert_eq!(held.pinned_file_indices(), vec![0]);
+            enginefs.backend.relocate_hold.add_permits(1);
+        };
+        let (a, b, ()) = tokio::join!(
+            enginefs.pin_download(TEST_HASH, 0, None),
+            enginefs.pin_download(TEST_HASH, 1, None),
+            release,
+        );
+        let a = a.expect("first pin");
+        let b = b.expect("second pin");
+        assert_eq!(enginefs.backend.relocations.lock().unwrap().len(), 1);
+        let current = enginefs.get_engine(TEST_HASH).await.unwrap();
+        assert!(Arc::ptr_eq(&a, &current));
+        assert!(Arc::ptr_eq(&b, &current));
+        assert_eq!(current.pinned_file_indices(), vec![0, 1]);
+        assert_eq!(current.handle.output_folder(), Some(dir.join(TEST_HASH)));
+        assert_eq!(current.get_statistics().await.pinned_files, vec![0, 1]);
+        assert!(enginefs.pin_locks.lock().is_empty(), "locks are per call");
+    }
+
+    /// When a relocation fails and the torrent is gone from the backend,
+    /// only the registry entry the call started from is dropped -- an
+    /// engine someone else published for the hash meanwhile stays -- and
+    /// the pin that did not go through is not left on either engine.
+    #[tokio::test]
+    async fn failed_relocation_removes_only_the_engine_it_started_from() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        *counters.output_folder.lock().unwrap() = Some("/cache/rqbit-downloads/show".into());
+        enginefs.set_downloads_dir(Some("/offline".into()));
+        enginefs.backend.hold_relocate.store(true, Ordering::SeqCst);
+        enginefs.backend.fail_relocate.store(true, Ordering::SeqCst);
+        enginefs.backend.hide_torrents.store(true, Ordering::SeqCst);
+        let started_from = enginefs.get_engine(TEST_HASH).await.unwrap();
+
+        let other = Arc::new(Engine::new_with_handle(
+            started_from.handle.clone(),
+            TEST_HASH,
+            enginefs.clock,
+        ));
+        let swap = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(started_from.is_pinned());
+            enginefs
+                .engines
+                .write()
+                .await
+                .insert(TEST_HASH.to_string(), other.clone());
+            enginefs.backend.relocate_hold.add_permits(1);
+        };
+        let (result, ()) = tokio::join!(enginefs.pin_download(TEST_HASH, 0, None), swap);
+        assert!(matches!(result, Err(PinDownloadError::Backend(_))));
+        let current = enginefs
+            .get_engine(TEST_HASH)
+            .await
+            .expect("the other engine is not removed");
+        assert!(Arc::ptr_eq(&current, &other));
+        assert!(!started_from.is_pinned(), "failed pin undone");
+        assert!(!other.is_pinned());
+
+        // Nobody else in the way: the stale entry itself is dropped.
+        enginefs
+            .backend
+            .hold_relocate
+            .store(false, Ordering::SeqCst);
+        assert!(
+            enginefs.pin_download(TEST_HASH, 1, None).await.is_err(),
+            "relocation still fails"
+        );
+        assert!(enginefs.get_engine(TEST_HASH).await.is_none());
     }
 
     // --- free-space check before pinning ---
