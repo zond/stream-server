@@ -3763,6 +3763,26 @@ mod tests {
 
     /// Engine over a fake torrent that is still initializing (`ready: false`)
     /// with a caller-chosen initialization timeout.
+    /// A scratch root of its own for one fake-engine fixture.
+    ///
+    /// Never a fixed path under `std::env::temp_dir()`: the pin set is
+    /// persisted to `<download dir>/pinned-downloads.json` on every change
+    /// and the tests run in parallel, so a shared root has every pinning
+    /// test writing (and racing the rename of) one file another test reads.
+    /// The parent is wiped once per test process so the roots do not pile
+    /// up across runs.
+    fn fake_engine_root() -> std::path::PathBuf {
+        static ROOTS: AtomicUsize = AtomicUsize::new(0);
+        static WIPE: std::sync::Once = std::sync::Once::new();
+        let parent = std::env::temp_dir().join("enginefs-fake-engine-tests");
+        WIPE.call_once(|| {
+            let _ = std::fs::remove_dir_all(&parent);
+        });
+        let root = parent.join(ROOTS.fetch_add(1, Ordering::SeqCst).to_string());
+        std::fs::create_dir_all(root.join("downloads")).unwrap();
+        root
+    }
+
     fn test_enginefs_initializing(
         file_count: usize,
         timeout: Duration,
@@ -3799,19 +3819,7 @@ mod tests {
         };
         let mut restored = HashMap::new();
         restored.insert(TEST_HASH.to_string(), handle.clone());
-        // A root of its own per engine. The pin set is persisted to
-        // `<download dir>/pinned-downloads.json` on every change, and the
-        // tests run in parallel: sharing one root, a test that pins races
-        // every test that asserts on that file. The parent is wiped once
-        // per test process so the roots do not pile up across runs.
-        static ROOTS: AtomicUsize = AtomicUsize::new(0);
-        static WIPE: std::sync::Once = std::sync::Once::new();
-        let parent = std::env::temp_dir().join("enginefs-fake-engine-tests");
-        WIPE.call_once(|| {
-            let _ = std::fs::remove_dir_all(&parent);
-        });
-        let root = parent.join(ROOTS.fetch_add(1, Ordering::SeqCst).to_string());
-        std::fs::create_dir_all(root.join("downloads")).unwrap();
+        let root = fake_engine_root();
         let enginefs = BackendEngineFS::new_with_backend(
             FakeBackend::new(vec![handle]),
             restored,
@@ -3856,7 +3864,7 @@ mod tests {
         ]);
         let backend = FakeBackend::new(vec![a, b]);
         let removed = backend.removed.clone();
-        let root = std::env::temp_dir().join("enginefs-two-engine-tests");
+        let root = fake_engine_root();
         let enginefs = BackendEngineFS::new_with_backend(
             backend,
             restored,
@@ -3869,6 +3877,14 @@ mod tests {
             removed,
         }
     }
+
+    /// How long a bounded state-wait in these tests may take before it
+    /// gives up. Under `start_paused` this is virtual time; in the handful
+    /// of real-time tests it is wall clock, and generous on purpose -- the
+    /// bound is not a timing assertion, only there so a regression fails
+    /// instead of hanging, and a tight one turns CPU contention on a CI
+    /// runner into a spurious failure.
+    const TEST_WAIT_BOUND: Duration = Duration::from_secs(60);
 
     /// Poll `cond` until it holds or `bound` of (virtual) time elapses.
     async fn wait_until(bound: Duration, mut cond: impl FnMut() -> bool) -> bool {
@@ -4376,7 +4392,12 @@ mod tests {
         assert_eq!(snapshot.active_playback_leases[0].file_idx, 1);
     }
 
-    #[tokio::test]
+    /// Paused time: the wait is for the 5 s delayed-cleanup task to fire,
+    /// which the virtual clock does the instant the runtime is idle. Slept
+    /// for real it would be six seconds of wall clock *and* a race -- a
+    /// loaded runner that had not run the task by then would pass
+    /// vacuously, one that ran it late would fail.
+    #[tokio::test(start_paused = true)]
     async fn old_cleanup_cannot_clear_newer_multifile_active_file() {
         let (enginefs, counters) = test_enginefs_with_file_count(3);
 
@@ -4525,7 +4546,7 @@ mod tests {
         };
         let backend = FakeBackend::new(vec![handle]);
         let placements = backend.placements.clone();
-        let root = std::env::temp_dir().join("enginefs-placement-tests");
+        let root = fake_engine_root();
         let enginefs = BackendEngineFS::new_with_backend(
             backend,
             HashMap::new(),
@@ -4587,7 +4608,7 @@ mod tests {
                 .collect(),
             init: FakeInit::new(true, Duration::from_secs(60)),
         };
-        let root = std::env::temp_dir().join("enginefs-downloads-dir-tests");
+        let root = fake_engine_root();
         let enginefs = BackendEngineFS::new_with_backend(
             FakeBackend::new(vec![handle]),
             HashMap::new(),
@@ -5249,7 +5270,7 @@ mod tests {
             }],
             init: FakeInit::new(false, Duration::from_secs(60)),
         };
-        let root = std::env::temp_dir().join("enginefs-downloads-dir-tests");
+        let root = fake_engine_root();
         let mut enginefs = BackendEngineFS::new_with_backend(
             FakeBackend::new(vec![handle]),
             HashMap::new(),
@@ -5343,7 +5364,7 @@ mod tests {
                 .collect(),
             init: FakeInit::new(false, Duration::from_secs(60)),
         };
-        let root = std::env::temp_dir().join("enginefs-downloads-dir-tests");
+        let root = fake_engine_root();
         let enginefs = BackendEngineFS::new_with_backend(
             FakeBackend::new(vec![handle]),
             HashMap::new(),
@@ -5443,7 +5464,17 @@ mod tests {
         ));
 
         let release = async {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            // Wait for the state, not for a stopwatch: the stream's add has
+            // reached the (held) backend and the pin has taken the per-hash
+            // lock, so whether it started an add of its own is decided.
+            assert!(
+                wait_until(TEST_WAIT_BOUND, || {
+                    !enginefs.backend.placements.lock().unwrap().is_empty()
+                        && enginefs.pin_locks.lock().contains_key(TEST_HASH)
+                })
+                .await,
+                "the stream's add and the pin both got going"
+            );
             assert_eq!(
                 enginefs.backend.placements.lock().unwrap().as_slice(),
                 &[TorrentPlacement::default()],
@@ -6261,9 +6292,20 @@ mod tests {
         std::fs::create_dir_all(root.path().join("downloads")).unwrap();
         enginefs.backend.hold_add.store(true, Ordering::SeqCst);
 
+        // Both handoffs are waited for by state, never by a stopwatch: a
+        // loaded runner that missed a fixed sleep would let the unpin run
+        // before the pin exists (finding nothing to unpin, so the pin lands
+        // and is persisted behind it) and fail the assertions below.
         let unpin = async {
-            // Long enough for the pin to be inside the held add.
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            // The pin is inside the held add once the backend has recorded
+            // its placement.
+            assert!(
+                wait_until(TEST_WAIT_BOUND, || {
+                    !enginefs.backend.placements.lock().unwrap().is_empty()
+                })
+                .await,
+                "the pin reached the held backend add"
+            );
             assert!(enginefs.get_engine(TEST_HASH).await.is_none());
             enginefs
                 .unpin_download(TEST_HASH, 0, true)
@@ -6272,7 +6314,20 @@ mod tests {
                 .unpinned
         };
         let release = async {
-            tokio::time::sleep(Duration::from_millis(150)).await;
+            // The pin holds the per-hash lock and the map holds the `Arc`;
+            // a third reference means the unpin has taken it too and is
+            // parked on it -- exactly the interleaving under test.
+            assert!(
+                wait_until(TEST_WAIT_BOUND, || {
+                    enginefs
+                        .pin_locks
+                        .lock()
+                        .get(TEST_HASH)
+                        .is_some_and(|lock| Arc::strong_count(lock) >= 3)
+                })
+                .await,
+                "the unpin queued behind the in-flight pin"
+            );
             enginefs.backend.add_hold.add_permits(1);
         };
         let (pinned, _unpinned, ()) =
@@ -6881,7 +6936,7 @@ mod tests {
             panic!("expected to join the in-flight add");
         };
         assert!(
-            wait_until(Duration::from_secs(1), || gated.adds() == 1).await,
+            wait_until(TEST_WAIT_BOUND, || gated.adds() == 1).await,
             "backend add started once"
         );
 
@@ -6892,7 +6947,7 @@ mod tests {
         assert_eq!(engine.info_hash, TEST_HASH);
         assert!(enginefs.get_engine(TEST_HASH).await.is_some());
         // The task clears its pending entry right after publishing the engine.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let deadline = tokio::time::Instant::now() + TEST_WAIT_BOUND;
         while enginefs.pending_magnet_add(TEST_HASH).await.is_some() {
             assert!(
                 tokio::time::Instant::now() < deadline,
