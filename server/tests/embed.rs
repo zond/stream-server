@@ -543,14 +543,16 @@ fn library_api_matches_the_http_control_routes() -> anyhow::Result<()> {
         .error_for_status()?
         .json()?;
     let info_hash = created["infoHash"].as_str().expect("infoHash").to_string();
+    // Let the hash check finish first: the per-file initial-window fields
+    // only exist once it has, and the two calls below must see one state.
+    stats_after_check(&client, &base, &info_hash)?;
     let api = handle.file_stats(&info_hash, 1, &[])?;
     let http: serde_json::Value = client
         .get(format!("{base}/{info_hash}/1/stats.json"))
         .send()?
         .error_for_status()?
         .json()?;
-    // The hash check may finish between the two calls, so compare the
-    // fields that do not depend on timing.
+    // Compare the fields that do not depend on timing (peer counts move).
     let api_json = serde_json::to_value(&api)?;
     for key in ["infoHash", "streamName", "streamLen", "files", "sources"] {
         assert_eq!(api_json[key], http[key], "{key}");
@@ -1091,6 +1093,137 @@ fn pinned_download_relocates_into_downloads_dir_and_survives_a_restart() -> anyh
     );
     assert!(info.complete);
     assert!(target.join("e2.bin").is_file());
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
+/// The `.bitv` bitfields librqbit's persistent BitV factory writes next to
+/// the session state (`<cacheRoot>/rqbit-downloads/<infoHash>.bitv`).
+fn bitv_files(session_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files: Vec<_> = std::fs::read_dir(session_dir)
+        .expect("session dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "bitv"))
+        .collect();
+    files.sort();
+    files
+}
+
+/// With fastresume on, librqbit persists each torrent's verified-piece
+/// bitfield (`<infoHash>.bitv` beside the session state) instead of
+/// re-hashing every file on every launch: after a complete torrent in the
+/// cache root and a complete pinned one under `downloadsDir`, both
+/// bitfields exist, and a restart brings both torrents back ready and
+/// complete with the bitfields still in place (the `.bitv` + `overwrite:
+/// true` combination librqbit needs to resume on top of existing files).
+#[test]
+fn fastresume_persists_piece_bitfields_on_both_roots() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let downloads_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+
+    let streamed = src.path().join("Streamed");
+    std::fs::create_dir_all(&streamed)?;
+    write_payload(&streamed.join("s1.bin"), 48 * 1024);
+    write_payload(&streamed.join("s2.bin"), 20 * 1024);
+    let (streamed_torrent, streamed_hash) = real_torrent(&streamed);
+    let pinned = src.path().join("Pinned");
+    std::fs::create_dir_all(&pinned)?;
+    // Whole pieces per file (16 KiB pieces): only p2 gets data, and it
+    // must not share a boundary piece with p1, whatever the file order.
+    write_payload(&pinned.join("p1.bin"), 32 * 1024);
+    write_payload(&pinned.join("p2.bin"), 48 * 1024);
+    let (pinned_torrent, pinned_hash) = real_torrent(&pinned);
+
+    let cache_root = cache_dir.path().join("cache");
+    let session_dir = cache_root.join("rqbit-downloads");
+    let root_folder = session_dir.join("Streamed");
+    std::fs::create_dir_all(&root_folder)?;
+    std::fs::copy(streamed.join("s1.bin"), root_folder.join("s1.bin"))?;
+    std::fs::copy(streamed.join("s2.bin"), root_folder.join("s2.bin"))?;
+    let downloads = downloads_dir.path().join("offline");
+    let pinned_folder = downloads.join(&pinned_hash);
+    std::fs::create_dir_all(&pinned_folder)?;
+    std::fs::copy(pinned.join("p2.bin"), pinned_folder.join("p2.bin"))?;
+
+    let config = || stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_root.clone()),
+        ..stream_server::ServerConfig::default()
+    };
+    let handle = stream_server::start(config())?;
+    let base = format!("http://{}", handle.http_addr());
+    let client = bearer_client(&handle)?;
+
+    client
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": hex::encode(&streamed_torrent) }))
+        .send()?
+        .error_for_status()?;
+    let stats = stats_after_check(&client, &base, &streamed_hash)?;
+    assert_eq!(stats["files"][0]["complete"], true, "{stats}");
+    assert_eq!(stats["files"][1]["complete"], true, "{stats}");
+
+    handle.update_settings(serde_json::json!({ "downloadsDir": downloads.to_str().unwrap() }))?;
+    // Only a pin places a torrent under the downloads dir, and a pin by
+    // hash needs the metadata: /create supplies it (cache root, no data
+    // there) and the pin relocates the torrent onto the pre-seeded file.
+    client
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": hex::encode(&pinned_torrent) }))
+        .send()?
+        .error_for_status()?;
+    let stats = stats_after_check(&client, &base, &pinned_hash)?;
+    let p2 = file_index(&stats, "p2.bin");
+    let info = handle.pin_download(&pinned_hash, p2, &[])?;
+    assert_eq!(
+        info.path.as_deref(),
+        Some(pinned_folder.join("p2.bin").to_str().unwrap())
+    );
+    let stats = stats_after_check(&client, &base, &pinned_hash)?;
+    assert_eq!(stats["files"][p2]["complete"], true, "{stats}");
+    assert_eq!(stats["files"][1 - p2]["complete"], false, "{stats}");
+
+    let bitvs = bitv_files(&session_dir);
+    assert_eq!(
+        bitvs.len(),
+        2,
+        "one persisted bitfield per torrent (fastresume): {bitvs:?}"
+    );
+    for bitv in &bitvs {
+        let name = bitv.file_stem().unwrap().to_string_lossy().to_lowercase();
+        assert!(name == streamed_hash || name == pinned_hash, "{bitv:?}");
+        assert!(std::fs::metadata(bitv)?.len() > 0);
+    }
+
+    handle.shutdown()?;
+    handle.join()?;
+
+    // Restart: both torrents come back from the session with their
+    // bitfields, ready and complete, in both roots.
+    let handle = stream_server::start(config())?;
+    let base = format!("http://{}", handle.http_addr());
+    let client = bearer_client(&handle)?;
+    let stats = stats_after_check(&client, &base, &streamed_hash)?;
+    assert_eq!(stats["phase"], "ready", "{stats}");
+    assert_eq!(stats["files"][0]["complete"], true, "{stats}");
+    assert_eq!(stats["files"][1]["complete"], true, "{stats}");
+    let stats = stats_after_check(&client, &base, &pinned_hash)?;
+    assert_eq!(stats["phase"], "ready", "{stats}");
+    assert_eq!(stats["files"][p2]["complete"], true, "{stats}");
+    assert_eq!(stats["pinnedFiles"], serde_json::json!([p2]));
+    assert_eq!(
+        bitv_files(&session_dir).len(),
+        2,
+        "bitfields survive the restart"
+    );
+    assert!(pinned_folder.join("p2.bin").is_file());
+    assert!(root_folder.join("s1.bin").is_file());
 
     handle.shutdown()?;
     handle.join()?;

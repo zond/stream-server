@@ -256,6 +256,13 @@ impl LibrqbitBackend {
                     persistence: Some(librqbit::SessionPersistenceConfig::Json {
                         folder: Some(download_dir.clone()),
                     }),
+                    // Persist each torrent's verified-piece bitfield
+                    // (`<info hash>.bitv` in the persistence folder) so a
+                    // restart validates a sample of pieces instead of
+                    // re-hashing every file; a corrupted sample falls back
+                    // to the full check. Matters most for pinned offline
+                    // downloads, which are large and restart-resident.
+                    fastresume: true,
                     // Pin the DHT routing-table dump next to the session
                     // state. librqbit's default resolves through
                     // `directories::ProjectDirs` (HOME/XDG), which has no
