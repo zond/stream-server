@@ -28,6 +28,25 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 /// [`ServerHandle::lan_media_base_url`] without depending on `url` itself.
 pub use url::Url;
 
+/// Default log directives, applied WITHOUT any environment variable. The
+/// application code lives in the `stream_server` lib crate (targets
+/// `stream_server::*`); `server` covers the thin `server` bin
+/// (src/main.rs). Both must be listed or the lib rename silently filters
+/// out every log line. `RUST_LOG` only overrides this when it is set to a
+/// non-empty value; an unset or blank `RUST_LOG` keeps this.
+///
+/// `librqbit` is here at WARN because it is the only place a storage
+/// failure is reported at all: a piece that cannot be written (a full or
+/// unwritable cache volume) is librqbit's own error, and with the crate
+/// unlisted it was filtered out entirely -- a phone whose downloads were
+/// failing logged not one line about it. enginefs reports the *torrent*
+/// error state on top of that (`torrent_error_state`), but only when
+/// something polls the torrent's statistics, so it cannot be relied on to
+/// notice a disk problem by itself. WARN, not INFO: librqbit is chatty
+/// per-peer at INFO and would drown the log.
+pub(crate) const DEFAULT_LOG_FILTER: &str =
+    "server=info,stream_server=info,tower_http=info,enginefs=info,librqbit=warn";
+
 pub const DEFAULT_HTTP_PORT: u16 = 11470;
 pub const DEFAULT_HTTPS_PORT: u16 = 12470;
 
@@ -535,14 +554,6 @@ pub async fn run(
         let json_writer = log_writers.json_writer;
         let guards = log_writers.guards;
 
-        // Default log directives, applied WITHOUT any environment variable. The
-        // application code lives in the `stream_server` lib crate (targets
-        // `stream_server::*`); `server` covers the thin `server` bin
-        // (src/main.rs). Both must be listed or the lib rename silently filters
-        // out every log line. `RUST_LOG` only overrides this when it is set to a
-        // non-empty value; an unset or blank `RUST_LOG` keeps the default below.
-        const DEFAULT_LOG_FILTER: &str =
-            "server=info,stream_server=info,tower_http=info,enginefs=info";
         let log_filter = std::env::var("RUST_LOG")
             .ok()
             .filter(|directives| !directives.trim().is_empty())
@@ -1203,4 +1214,28 @@ fn control_router() -> Router<AppState> {
             post(routes::downloads::post_download).delete(routes::downloads::delete_download),
         )
         .nest("/casting", routes::casting::router())
+}
+
+#[cfg(test)]
+mod default_log_filter_tests {
+    use super::DEFAULT_LOG_FILTER;
+
+    /// Every crate whose diagnostics a field report depends on must be in
+    /// the default directives: an unlisted crate is filtered out entirely,
+    /// with nothing to say it happened. `librqbit` is the one that reports
+    /// a failed piece write, which is how a full or unwritable cache
+    /// volume becomes visible at all.
+    #[test]
+    fn the_default_directives_cover_every_crate_that_reports_trouble() {
+        for crate_name in ["server", "stream_server", "enginefs", "librqbit"] {
+            assert!(
+                DEFAULT_LOG_FILTER
+                    .split(',')
+                    .any(|directive| directive.starts_with(&format!("{crate_name}="))),
+                "{crate_name} is missing from {DEFAULT_LOG_FILTER}"
+            );
+        }
+        // Parses as directives at all.
+        tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER);
+    }
 }
