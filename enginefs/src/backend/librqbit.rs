@@ -196,9 +196,11 @@ type DeferredSelections = Arc<Mutex<HashMap<String, Arc<DeferredSelection<Deferr
 /// Per-torrent pinned file sets (`TorrentHandle::pin_file`), keyed by info
 /// hash and shared by every handle clone for the same reason as
 /// `DeferredSelections`. Consulted by every want-set update so a pinned file
-/// survives playback switching. In-memory only: librqbit persists the
-/// resulting `only_files`, so a pinned file keeps downloading across a
-/// restart, but the pin itself has to be re-issued by whoever owns it.
+/// survives playback switching. The map itself is not persisted: librqbit
+/// persists the resulting `only_files` (so the file keeps downloading
+/// across a restart) and `BackendEngineFS::restore_pinned_downloads`
+/// rebuilds the map at startup from its `pinned-downloads.json` by calling
+/// `pin_file` again for every restored torrent.
 type PinnedFiles = Arc<Mutex<HashMap<String, BTreeSet<usize>>>>;
 
 /// A selection op parked until the torrent initializes.
