@@ -284,6 +284,18 @@ pub struct ServerSettings {
     /// same constant's doc for the underlying librqbit behaviour).
     #[serde(rename = "dhtBootstrapNodes", default)]
     pub dht_bootstrap_nodes: Option<Vec<String>>,
+
+    /// Whether the LAN media listener may run at all (see
+    /// `ServerHandle::set_lan_media`). `false` -- the default -- refuses
+    /// every request to start it, so an operator can forbid handing media
+    /// bytes to the local network outright; turning it back off through
+    /// `POST /settings` also stops a listener that is already running.
+    ///
+    /// It only decides whether the listener is *allowed*: the address it
+    /// would bind is `ServerConfig::lan_media_addr`, and with no address
+    /// configured this setting does nothing at all.
+    #[serde(rename = "lanMediaEnabled", default)]
+    pub lan_media_enabled: bool,
 }
 
 /// The torrent cache roots the cache cleaner walks -- what a
@@ -690,6 +702,7 @@ impl Default for ServerSettings {
             seeding_enabled: default_seeding_enabled(),
             downloads_dir: None,
             dht_bootstrap_nodes: None,
+            lan_media_enabled: false,
         }
     }
 }
@@ -869,6 +882,7 @@ pub async fn update_settings(state: &AppState, payload: &Value) -> anyhow::Resul
         {
             settings.seeding_enabled = enabled;
         }
+        update_bool_setting(obj, "lanMediaEnabled", &mut settings.lan_media_enabled);
         if let Some(dir) = downloads_dir_patch {
             settings.downloads_dir = dir.map(|path| path.to_string_lossy().into_owned());
         }
