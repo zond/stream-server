@@ -1688,3 +1688,384 @@ fn download_routes_match_the_library_api() -> anyhow::Result<()> {
     handle.join()?;
     Ok(())
 }
+
+/// A server with a LAN media listener, its torrent pre-seeded in the cache
+/// root so media requests answer real bytes.
+///
+/// Returns the handle, the loopback base URL, the info hash, the file index
+/// and the payload the file holds.
+fn lan_media_server(
+    config_dir: &std::path::Path,
+    cache_dir: &std::path::Path,
+    src: &std::path::Path,
+    lan_media_addr: Option<std::net::SocketAddr>,
+) -> anyhow::Result<(ServerHandle, String, String, usize, Vec<u8>)> {
+    let content = src.join("Movie");
+    std::fs::create_dir_all(&content)?;
+    // Two files, each a whole number of 16 KiB pieces, so neither shares a
+    // boundary piece with the other whatever order `create_torrent`'s
+    // directory walk produced -- and so the torrent is a directory torrent
+    // whose data lands in `rqbit-downloads/Movie/`.
+    write_payload(&content.join("movie.bin"), 64 * 1024);
+    write_payload(&content.join("extra.bin"), 16 * 1024);
+    let payload = std::fs::read(content.join("movie.bin"))?;
+    let (torrent, info_hash) = real_torrent(&content);
+
+    let cache_root = cache_dir.join("cache");
+    let seeded = cache_root.join("rqbit-downloads").join("Movie");
+    std::fs::create_dir_all(&seeded)?;
+    std::fs::copy(content.join("movie.bin"), seeded.join("movie.bin"))?;
+    std::fs::copy(content.join("extra.bin"), seeded.join("extra.bin"))?;
+
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        lan_media_addr,
+        config_dir: Some(config_dir.join("config")),
+        cache_dir: Some(cache_root),
+        ..stream_server::ServerConfig::default()
+    })?;
+    let base = format!("http://{}", handle.http_addr());
+    let client = bearer_client(&handle)?;
+    client
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
+        .send()?
+        .error_for_status()?;
+    let stats = stats_after_check(&client, &base, &info_hash)?;
+    let idx = file_index(&stats, "movie.bin");
+    // The hash check of the pre-seeded copy is what makes the bytes
+    // servable, and `phase` can already read `buffering` while it is still
+    // queued -- so wait on the observable state the media requests need
+    // (bounded, not a timing assertion), never on a sleep.
+    let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
+    let stats = loop {
+        let stats = file_stats_after_check(&client, &base, &info_hash, idx)?;
+        if stats["files"][idx]["complete"] == true {
+            break stats;
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the pre-seeded file was still incomplete after {CHECK_WAIT_BOUND:?}: {stats}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    anyhow::ensure!(stats["files"][idx]["complete"] == true, "{stats}");
+
+    Ok((handle, base, info_hash, idx, payload))
+}
+
+/// The LAN media listener hands out media bytes and nothing else.
+///
+/// It exists so a Chromecast can fetch a stream from a server that otherwise
+/// binds loopback only. What it must NOT expose is the control API: the
+/// control router is not mounted on it at all, so a control path is an
+/// unknown path there -- `404`, never the `401` that would tell the LAN the
+/// route exists and only a token is missing. The loopback listener keeps
+/// serving both, and range and HEAD requests -- what a receiver actually
+/// issues -- work through the LAN listener too.
+#[test]
+fn lan_media_listener_serves_media_but_no_control_route() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    let (handle, base, info_hash, idx, payload) = lan_media_server(
+        config_dir.path(),
+        cache_dir.path(),
+        src.path(),
+        // Port 0: the OS picks, so any number of these run in parallel.
+        Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
+    )?;
+
+    let lan_addr = handle.lan_media_addr().expect("LAN listener bound");
+    assert!(handle.lan_media_running());
+    assert_ne!(
+        lan_addr,
+        handle.http_addr(),
+        "the LAN media listener is a second socket, not a rebind of the first"
+    );
+    let lan = format!("http://{lan_addr}");
+
+    let anonymous = reqwest::blocking::Client::new();
+    let with_token = bearer_client(&handle)?;
+    for path in [
+        "/heartbeat",
+        "/stats.json",
+        "/settings",
+        "/network-info",
+        "/device-info",
+        "/downloads.json",
+        "/get-https?ipAddress=127.0.0.1",
+        "/casting",
+    ] {
+        for client in [&anonymous, &with_token] {
+            let response = client.get(format!("{lan}{path}")).send()?;
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::NOT_FOUND,
+                "{path} must not exist on the LAN listener"
+            );
+            assert!(
+                response
+                    .headers()
+                    .get(reqwest::header::WWW_AUTHENTICATE)
+                    .is_none(),
+                "{path} must not even advertise that a token would help"
+            );
+        }
+        // The same path on the loopback listener is a control route that
+        // exists: it answers the request rather than the 404 fallback.
+        // (`/get-https` is a 400 without its `authKey`; what matters is that
+        // it is not a 404.)
+        let response = with_token.get(format!("{base}{path}")).send()?;
+        assert_ne!(response.status(), reqwest::StatusCode::NOT_FOUND, "{path}");
+        assert_ne!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "{path}"
+        );
+    }
+    // `POST /settings` is not a route on the LAN listener either -- the
+    // fallback answers whatever the method.
+    assert_eq!(
+        anonymous
+            .post(format!("{lan}/settings"))
+            .json(&serde_json::json!({ "cacheSize": 1.0 }))
+            .send()?
+            .status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+    // `POST /{infoHash}/create` collides with the two-segment media route's
+    // pattern, so it answers as that route would (`405`, GET and HEAD only)
+    // rather than 404 -- but it still never reaches the control handler, and
+    // no engine is created.
+    assert_eq!(
+        anonymous
+            .post(format!("{lan}/{info_hash}/create"))
+            .send()?
+            .status(),
+        reqwest::StatusCode::METHOD_NOT_ALLOWED
+    );
+
+    // Media bytes, on both listeners, from the same engine.
+    for origin in [&lan, &base] {
+        let response = anonymous
+            .get(format!("{origin}/{info_hash}/{idx}"))
+            .send()?
+            .error_for_status()?;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            header_value(&response, "accept-ranges"),
+            "bytes",
+            "{origin}"
+        );
+        assert_eq!(response.bytes()?.as_ref(), payload.as_slice(), "{origin}");
+    }
+
+    // A receiver seeks with byte ranges, so the LAN listener has to answer
+    // `206` with a `Content-Range` and exactly the requested bytes.
+    let response = anonymous
+        .get(format!("{lan}/{info_hash}/{idx}"))
+        .header(reqwest::header::RANGE, "bytes=1024-2047")
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        header_value(&response, "content-range"),
+        format!("bytes 1024-2047/{}", payload.len())
+    );
+    assert_eq!(header_value(&response, "content-length"), "1024");
+    assert_eq!(response.bytes()?.as_ref(), &payload[1024..2048]);
+
+    // And it probes with HEAD first: the headers, no body.
+    let response = anonymous
+        .head(format!("{lan}/{info_hash}/{idx}"))
+        .send()?
+        .error_for_status()?;
+    assert_eq!(
+        header_value(&response, "content-length"),
+        payload.len().to_string()
+    );
+    assert_eq!(header_value(&response, "accept-ranges"), "bytes");
+    assert!(response.bytes()?.is_empty());
+
+    // CORS reaches the LAN listener as well -- a receiver preflights the
+    // media request before it fetches a byte.
+    let response = anonymous
+        .request(reqwest::Method::OPTIONS, format!("{lan}/{info_hash}/{idx}"))
+        .header(reqwest::header::ORIGIN, "https://example.org")
+        .header("access-control-request-method", "GET")
+        .header("access-control-request-headers", "range")
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(header_value(&response, "access-control-allow-origin"), "*");
+    let allowed = header_value(&response, "access-control-allow-headers");
+    for header in ["accept-encoding", "content-type", "range"] {
+        assert!(allowed.contains(header), "{header:?} in {allowed:?}");
+    }
+    let response = anonymous
+        .get(format!("{lan}/{info_hash}/{idx}"))
+        .header(reqwest::header::ORIGIN, "https://example.org")
+        .header(reqwest::header::RANGE, "bytes=0-15")
+        .send()?;
+    let exposed = header_value(&response, "access-control-expose-headers");
+    for header in ["accept-ranges", "content-length", "content-range"] {
+        assert!(exposed.contains(header), "{header:?} in {exposed:?}");
+    }
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
+/// `set_lan_media` is the per-cast-session switch, and `lanMediaEnabled` is
+/// the operator's veto over it.
+///
+/// Stopping is an abort: the socket is closed by the time the call returns.
+/// It must leave the loopback listener alone, so a media request loop runs
+/// against loopback across every toggle and every one of them has to succeed.
+#[test]
+fn set_lan_media_toggles_the_listener_and_the_setting_can_forbid_it() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    let (handle, base, info_hash, idx, payload) = lan_media_server(
+        config_dir.path(),
+        cache_dir.path(),
+        src.path(),
+        Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
+    )?;
+
+    // Loopback media, hammered from another thread for as long as the
+    // toggling below takes. Not a timing assertion -- it just has to be
+    // in flight while the LAN listener starts and stops.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let probe = {
+        let stop = stop.clone();
+        let url = format!("{base}/{info_hash}/{idx}");
+        let expected = payload[..1024].to_vec();
+        std::thread::spawn(move || -> anyhow::Result<u64> {
+            let client = reqwest::blocking::Client::new();
+            let mut served = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let response = client
+                    .get(&url)
+                    .header(reqwest::header::RANGE, "bytes=0-1023")
+                    .send()?;
+                anyhow::ensure!(
+                    response.status() == reqwest::StatusCode::PARTIAL_CONTENT,
+                    "loopback media answered {} while the LAN listener was toggling",
+                    response.status()
+                );
+                anyhow::ensure!(response.bytes()?.as_ref() == expected.as_slice());
+                served += 1;
+            }
+            Ok(served)
+        })
+    };
+
+    let started = handle.lan_media_addr().expect("bound at startup");
+    let peer = std::net::IpAddr::from([127, 0, 0, 1]);
+    assert_eq!(
+        handle.lan_media_base_url(peer).map(|url| url.to_string()),
+        Some(format!("http://{started}/")),
+        "a listener bound to one address advertises that address"
+    );
+
+    // Stop: the socket is gone when the call returns, and so is the URL.
+    assert_eq!(handle.set_lan_media(false)?, None);
+    assert!(!handle.lan_media_running());
+    assert_eq!(handle.lan_media_addr(), None);
+    assert_eq!(handle.lan_media_base_url(peer), None);
+    let refused = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?
+        .get(format!("http://{started}/{info_hash}/{idx}"))
+        .send();
+    assert!(
+        refused.is_err(),
+        "the stopped LAN listener still answered: {refused:?}"
+    );
+
+    // Starting again is refused while the setting forbids it (the default).
+    assert!(!handle.settings()?.lan_media_enabled);
+    let error = handle.set_lan_media(true).unwrap_err().to_string();
+    assert!(error.contains("lanMediaEnabled"), "{error}");
+    assert!(!handle.lan_media_running());
+
+    // Permitted, it comes back -- on a fresh OS-assigned port -- and serves
+    // media again.
+    handle.update_settings(serde_json::json!({ "lanMediaEnabled": true }))?;
+    let restarted = handle.set_lan_media(true)?.expect("bound");
+    assert!(handle.lan_media_running());
+    assert_eq!(handle.lan_media_addr(), Some(restarted));
+    assert_eq!(
+        handle.set_lan_media(true)?,
+        Some(restarted),
+        "starting an already-running listener is a no-op"
+    );
+    let response = reqwest::blocking::Client::new()
+        .get(format!("http://{restarted}/{info_hash}/{idx}"))
+        .send()?
+        .error_for_status()?;
+    assert_eq!(response.bytes()?.as_ref(), payload.as_slice());
+
+    // Revoking the setting stops a listener that is already running --
+    // otherwise "forbid it" would only mean "forbid the next one".
+    handle.update_settings(serde_json::json!({ "lanMediaEnabled": false }))?;
+    assert!(!handle.lan_media_running());
+    assert_eq!(handle.lan_media_base_url(peer), None);
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let served = probe
+        .join()
+        .map_err(|_| anyhow::anyhow!("loopback probe thread panicked"))??;
+    assert!(
+        served > 0,
+        "the loopback probe never completed a request, so it proved nothing"
+    );
+
+    // And the loopback listener still serves control routes too.
+    let heartbeat: serde_json::Value = bearer_client(&handle)?
+        .get(format!("{base}/heartbeat"))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    assert_eq!(heartbeat["success"], true);
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
+/// With no `lan_media_addr` configured -- the default for both stock
+/// configurations -- there is no LAN listener and nothing to start, whatever
+/// the setting says.
+#[test]
+fn without_a_configured_address_there_is_no_lan_media_listener() -> anyhow::Result<()> {
+    assert_eq!(ServerConfig::embedded().lan_media_addr, None);
+    assert_eq!(ServerConfig::binary_default().lan_media_addr, None);
+
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_dir.path().join("cache")),
+        ..stream_server::ServerConfig::default()
+    })?;
+
+    assert!(!handle.lan_media_running());
+    assert_eq!(
+        handle.lan_media_base_url(std::net::IpAddr::from([127, 0, 0, 1])),
+        None
+    );
+    handle.update_settings(serde_json::json!({ "lanMediaEnabled": true }))?;
+    let error = handle.set_lan_media(true).unwrap_err().to_string();
+    assert!(error.contains("lan_media_addr"), "{error}");
+    assert!(!handle.lan_media_running());
+    // Stopping something that never ran is fine.
+    assert_eq!(handle.set_lan_media(false)?, None);
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}

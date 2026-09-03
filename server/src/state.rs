@@ -21,6 +21,10 @@ pub struct AppState {
     pub archive_cache: Arc<dashmap::DashMap<String, crate::archives::ArchiveSession>>,
     pub nzb_sessions: Arc<dashmap::DashMap<String, crate::archives::nzb::session::NzbSession>>,
     pub devices: Arc<RwLock<Vec<crate::ssdp::Device>>>,
+    /// The optional LAN media listener shared by `run` and `ServerHandle`
+    /// (see `crate::lan_media`). Constructed disabled; `run` replaces it with
+    /// one carrying `ServerConfig::lan_media_addr`.
+    pub lan_media: Arc<crate::lan_media::LanMedia>,
 }
 
 impl AppState {
@@ -97,6 +101,7 @@ impl AppState {
             archive_cache: Arc::new(dashmap::DashMap::new()),
             nzb_sessions: Arc::new(dashmap::DashMap::new()),
             devices: Arc::new(RwLock::new(Vec::new())),
+            lan_media: Arc::new(crate::lan_media::LanMedia::new(None)),
         }
     }
 

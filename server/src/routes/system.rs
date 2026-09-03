@@ -903,6 +903,7 @@ pub async fn update_settings(state: &AppState, payload: &Value) -> anyhow::Resul
     }
 
     let seeding_enabled = settings.seeding_enabled;
+    let lan_media_enabled = settings.lan_media_enabled;
     let downloads_dir = settings
         .downloads_dir
         .as_ref()
@@ -954,6 +955,12 @@ pub async fn update_settings(state: &AppState, payload: &Value) -> anyhow::Resul
         .download_engine
         .update_torrent_settings(&new_profile, &new_privacy)
         .await;
+
+    // The operator's veto has to reach a listener that is already running,
+    // or "forbid it" would only mean "forbid the next one".
+    if !lan_media_enabled {
+        state.lan_media.stop().await;
+    }
 
     state.engine.set_seeding_enabled(seeding_enabled);
     state.download_engine.set_seeding_enabled(seeding_enabled);

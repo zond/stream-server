@@ -24,6 +24,9 @@ use tower_http::{
     trace::TraceLayer,
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+/// Re-exported so an embedder can name the return type of
+/// [`ServerHandle::lan_media_base_url`] without depending on `url` itself.
+pub use url::Url;
 
 pub const DEFAULT_HTTP_PORT: u16 = 11470;
 pub const DEFAULT_HTTPS_PORT: u16 = 12470;
@@ -34,6 +37,7 @@ mod archives;
 mod auth;
 mod cache_cleaner;
 mod diagnostics;
+mod lan_media;
 mod routes;
 mod ssdp;
 mod state;
@@ -71,6 +75,19 @@ pub struct ServerConfig {
     /// embedded servers coexist), the fixed `42000..42010` range for
     /// [`Self::binary_default`].
     pub torrent_listen_port: TorrentListenPort,
+    /// Where the LAN media listener binds when it runs: a second HTTP
+    /// listener serving [`media_router`] and nothing else, so a Chromecast or
+    /// other receiver on the local network can fetch media bytes while the
+    /// control API stays on the loopback listener only (see
+    /// [`crate::lan_media`]).
+    ///
+    /// `None` -- the default for both [`Self::embedded`] and
+    /// [`Self::binary_default`] -- means there is no LAN listener at all and
+    /// [`ServerHandle::set_lan_media`] has nothing to start. `Some(addr)`
+    /// (typically `0.0.0.0:0`, letting the OS pick the port) binds it at
+    /// startup; from then on [`ServerHandle::set_lan_media`] stops and starts
+    /// it per cast session, subject to the `lanMediaEnabled` setting.
+    pub lan_media_addr: Option<SocketAddr>,
 }
 
 impl Default for ServerConfig {
@@ -99,6 +116,7 @@ impl ServerConfig {
             graceful_shutdown_timeout: Duration::from_secs(3),
             auth: ServerAuth::Generated,
             torrent_listen_port: TorrentListenPort::Ephemeral,
+            lan_media_addr: None,
         }
     }
 
@@ -121,6 +139,7 @@ impl ServerConfig {
             graceful_shutdown_timeout: Duration::from_secs(3),
             auth: ServerAuth::Generated,
             torrent_listen_port: TorrentListenPort::default(),
+            lan_media_addr: None,
         }
     }
 }
@@ -299,6 +318,74 @@ impl ServerHandle {
         self.block_on_server(async move {
             routes::downloads::download_path(&state, &info_hash, file_idx).await
         })
+    }
+
+    /// Start or stop the LAN media listener (see [`crate::lan_media`]): a
+    /// second HTTP listener on [`ServerConfig::lan_media_addr`] serving
+    /// [`media_router`] and nothing else, for handing media bytes to a
+    /// Chromecast or other receiver on the local network. Returns the address
+    /// it is bound to afterwards -- `Some` after a successful start, `None`
+    /// after a stop.
+    ///
+    /// Meant to be called around a cast session, so the LAN surface exists
+    /// only while something is actually casting. Both directions are
+    /// idempotent.
+    ///
+    /// `set_lan_media(true)` fails when the `lanMediaEnabled` setting is
+    /// `false` (the default -- an operator can forbid the listener outright),
+    /// when [`ServerConfig::lan_media_addr`] is unset, or when the bind
+    /// fails.
+    ///
+    /// `set_lan_media(false)` **aborts** the listener rather than draining
+    /// it: when it returns, the socket is closed and any response still
+    /// streaming to the LAN has been dropped mid-body. The loopback listener
+    /// and every request in flight on it are untouched. See
+    /// [`lan_media::LanMedia::stop`].
+    pub fn set_lan_media(&self, enabled: bool) -> anyhow::Result<Option<SocketAddr>> {
+        let state = self.state.clone();
+        self.block_on_server(async move {
+            if !enabled {
+                state.lan_media.stop().await;
+                return Ok(None);
+            }
+            anyhow::ensure!(
+                state.settings.read().await.lan_media_enabled,
+                "the lanMediaEnabled setting forbids the LAN media listener;                  set it through POST /settings (or update_settings) first"
+            );
+            state.lan_media.start(&state).await.map(Some)
+        })?
+    }
+
+    /// The address the LAN media listener is bound to, or `None` when it is
+    /// not running. With a configured port of `0` this is the port the OS
+    /// assigned.
+    pub fn lan_media_addr(&self) -> Option<SocketAddr> {
+        let state = self.state.clone();
+        self.block_on_server(async move { state.lan_media.bound_addr().await })
+            .ok()
+            .flatten()
+    }
+
+    /// Whether the LAN media listener is running right now.
+    pub fn lan_media_running(&self) -> bool {
+        self.lan_media_addr().is_some()
+    }
+
+    /// The base URL to hand a receiver at `for_peer` (e.g.
+    /// `http://192.168.1.20:11471/`), so a media URL built on it is one that
+    /// receiver can actually reach: the host is the local interface sharing
+    /// `for_peer`'s subnet, taken from the same interface enumeration
+    /// `GET /network-info` answers from, since the first interface on a host
+    /// with a VPN or a container bridge is regularly the wrong one. A
+    /// listener bound to one specific address reports that address as is.
+    ///
+    /// `None` when the LAN media listener is not running -- which is also the
+    /// answer that says a cast URL cannot be built yet.
+    pub fn lan_media_base_url(&self, for_peer: IpAddr) -> Option<Url> {
+        let state = self.state.clone();
+        self.block_on_server(async move { state.lan_media.base_url_for(for_peer).await })
+            .ok()
+            .flatten()
     }
 
     /// Run `fut` on the server's runtime and wait for it. The engines spawn
@@ -612,6 +699,7 @@ pub async fn run(
     state.base_url = base_url.clone();
     state.http_addr = public_http_addr;
     state.auth_token = cfg.auth.resolve()?.map(Arc::from);
+    state.lan_media = Arc::new(lan_media::LanMedia::new(cfg.lan_media_addr));
     match state.auth_token.as_deref() {
         Some(token) => {
             tracing::info!("control API requires `Authorization: Bearer <token>`");
@@ -690,6 +778,16 @@ pub async fn run(
     }
 
     let app = build_router(state.clone());
+
+    // Bind the LAN media listener before reporting ready, so a configured
+    // address is either serving or has failed the start -- never "maybe" --
+    // by the time `start` hands back a `ServerHandle`. A configured address
+    // that cannot be bound is as fatal as the loopback one: the embedder
+    // asked for it explicitly.
+    let lan_media = state.lan_media.clone();
+    if lan_media.configured_addr().is_some() {
+        lan_media.start(&state).await?;
+    }
 
     tracing::info!("listening on {}", bound_http_addr);
     if cfg.print_startup {
@@ -806,6 +904,7 @@ pub async fn run(
     for task in background_tasks {
         task.abort();
     }
+    lan_media.stop().await;
 
     Ok(shutdown_source)
 }
@@ -830,41 +929,41 @@ fn connectable_addr(addr: SocketAddr) -> SocketAddr {
     }
 }
 
+fn peer_from_request(req: &axum::extract::Request) -> Option<SocketAddr> {
+    req.extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map(|info| info.0)
+}
+
+async fn fallback_handler(req: axum::extract::Request) -> impl axum::response::IntoResponse {
+    diagnostics::logging::log_unhandled(
+        "no matching route (404)",
+        StatusCode::NOT_FOUND.as_u16(),
+        peer_from_request(&req),
+        req.method(),
+        req.uri(),
+        Some(req.version()),
+        req.headers(),
+    );
+    StatusCode::NOT_FOUND
+}
+
+async fn method_not_allowed_handler(
+    req: axum::extract::Request,
+) -> impl axum::response::IntoResponse {
+    diagnostics::logging::log_unhandled(
+        "method not allowed for matched route (405)",
+        StatusCode::METHOD_NOT_ALLOWED.as_u16(),
+        peer_from_request(&req),
+        req.method(),
+        req.uri(),
+        Some(req.version()),
+        req.headers(),
+    );
+    StatusCode::METHOD_NOT_ALLOWED
+}
+
 pub fn build_router(state: AppState) -> Router {
-    fn peer_from_request(req: &axum::extract::Request) -> Option<SocketAddr> {
-        req.extensions()
-            .get::<axum::extract::ConnectInfo<SocketAddr>>()
-            .map(|info| info.0)
-    }
-
-    async fn fallback_handler(req: axum::extract::Request) -> impl axum::response::IntoResponse {
-        diagnostics::logging::log_unhandled(
-            "no matching route (404)",
-            StatusCode::NOT_FOUND.as_u16(),
-            peer_from_request(&req),
-            req.method(),
-            req.uri(),
-            Some(req.version()),
-            req.headers(),
-        );
-        StatusCode::NOT_FOUND
-    }
-
-    async fn method_not_allowed_handler(
-        req: axum::extract::Request,
-    ) -> impl axum::response::IntoResponse {
-        diagnostics::logging::log_unhandled(
-            "method not allowed for matched route (405)",
-            StatusCode::METHOD_NOT_ALLOWED.as_u16(),
-            peer_from_request(&req),
-            req.method(),
-            req.uri(),
-            Some(req.version()),
-            req.headers(),
-        );
-        StatusCode::METHOD_NOT_ALLOWED
-    }
-
     let control = control_router().route_layer(axum::middleware::from_fn_with_state(
         state.clone(),
         auth::require_bearer,
@@ -928,6 +1027,37 @@ fn cors_layer() -> CorsLayer {
             header::CONTENT_TYPE,
         ])
         .max_age(Duration::from_secs(24 * 60 * 60))
+}
+
+/// The router the LAN media listener serves (see [`crate::lan_media`]):
+/// [`media_router`] and the two unhandled-request fallbacks, with the same
+/// tracing and CORS layers the loopback router carries.
+///
+/// [`control_router`] is deliberately absent -- not merged and left behind the
+/// bearer middleware, but *not mounted at all*. A control path on this
+/// listener is an unknown path: it answers `404`, never `401`, so the LAN
+/// cannot even learn which control routes exist, let alone reach settings,
+/// downloads, stats or the torrent session with a guessed or leaked token.
+/// (`/{infoHash}/create` and `/{infoHash}/stats.json` are the exception in
+/// shape only: they collide with the two-segment media route's pattern, so
+/// they answer as that route would -- `405` for the POST, a file-index error
+/// for the stats path -- and still never reach a control handler.)
+fn build_lan_media_router(state: AppState) -> Router {
+    Router::new()
+        .merge(media_router())
+        .fallback(fallback_handler)
+        .method_not_allowed_fallback(method_not_allowed_handler)
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
+                tracing::info_span!(
+                    "lan-request",
+                    method = %request.method(),
+                    path = request.uri().path(),
+                )
+            }),
+        )
+        .layer(cors_layer())
+        .with_state(state)
 }
 
 /// Routes that hand media bytes to a player. They are OPEN (no bearer token):
