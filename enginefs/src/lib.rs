@@ -1721,24 +1721,35 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         extra_trackers: Option<Vec<String>>,
     ) -> Result<Arc<Engine<B::Handle>>, PinDownloadError> {
         let info_hash = info_hash.to_lowercase();
-        let lock = self
-            .pin_locks
-            .lock()
-            .entry(info_hash.clone())
-            .or_default()
-            .clone();
+        let lock = self.pin_lock(&info_hash);
         let guard = lock.lock().await;
         let result = self
             .pin_download_locked(&info_hash, file_idx, extra_trackers)
             .await;
         drop(guard);
-        let mut locks = self.pin_locks.lock();
-        // Ours plus the map's: nobody is waiting for this lock, so it can go
-        // (a waiter holds its own clone, which keeps the entry alive).
-        if Arc::strong_count(&lock) == 2 {
-            locks.remove(&info_hash);
-        }
+        self.release_pin_lock(&info_hash, lock);
         result
+    }
+
+    /// The lock serialising [`Self::pin_download`] and
+    /// [`Self::unpin_download`] for one info hash, created on demand. Hand
+    /// it to [`Self::release_pin_lock`] once the guard is dropped.
+    fn pin_lock(&self, info_hash: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.pin_locks
+            .lock()
+            .entry(info_hash.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// Drop the map's entry for a released [`Self::pin_lock`] when nobody
+    /// is waiting for it (`lock` is ours plus the map's -- a waiter holds
+    /// its own clone, which keeps the entry alive).
+    fn release_pin_lock(&self, info_hash: &str, lock: Arc<tokio::sync::Mutex<()>>) {
+        let mut locks = self.pin_locks.lock();
+        if Arc::strong_count(&lock) == 2 {
+            locks.remove(info_hash);
+        }
     }
 
     /// [`Self::pin_download`] with the per-hash lock held.
@@ -1893,6 +1904,13 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// [`Self::delete_download_data`]: the whole torrent when this was its
     /// last pin, only this file while other pins hold. A dormant pin has no
     /// torrent to delete anything of.
+    ///
+    /// Takes the same per-hash lock as [`Self::pin_download`]: an unpin
+    /// issued while a pin of that hash is still resolving metadata or
+    /// relocating queues behind it and applies to the finished pin.
+    /// Unlocked it would find no engine (the hash is parked in the magnet
+    /// registry for the length of the add), report that nothing was pinned,
+    /// and leave the pin to land and be persisted behind it.
     pub async fn unpin_download(
         &self,
         info_hash: &str,
@@ -1900,6 +1918,24 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         delete_files: bool,
     ) -> Result<bool> {
         let info_hash = info_hash.to_lowercase();
+        let lock = self.pin_lock(&info_hash);
+        let guard = lock.lock().await;
+        let result = self
+            .unpin_download_locked(&info_hash, file_idx, delete_files)
+            .await;
+        drop(guard);
+        self.release_pin_lock(&info_hash, lock);
+        result
+    }
+
+    /// [`Self::unpin_download`] with the per-hash lock held.
+    async fn unpin_download_locked(
+        &self,
+        info_hash: &str,
+        file_idx: usize,
+        delete_files: bool,
+    ) -> Result<bool> {
+        let info_hash = info_hash.to_string();
         let Some(engine) = self.get_engine(&info_hash).await else {
             // No torrent, but maybe a dormant pin waiting for it.
             let was_dormant = {
@@ -5778,6 +5814,62 @@ mod tests {
             vec![TEST_HASH.to_string()]
         );
         assert!(enginefs.get_engine(TEST_HASH).await.is_none());
+    }
+
+    /// An unpin issued while a pin of the same hash is still in flight --
+    /// a magnet add resolving metadata, or a relocation moving files --
+    /// must queue behind it and apply to the finished pin. It takes the
+    /// same per-hash lock: without one it would find no engine (the hash
+    /// is parked in the magnet registry for the length of the add), fall
+    /// into the dormant branch, do nothing, and leave the pin to land and
+    /// be persisted behind it.
+    #[tokio::test]
+    async fn unpin_download_queues_behind_an_in_flight_pin() {
+        let root = tempfile::tempdir().unwrap();
+        let counters = Arc::new(FakeCounters::default());
+        let handle = FakeHandle {
+            info_hash: TEST_HASH.to_string(),
+            counters: counters.clone(),
+            files: (0..2)
+                .map(|idx| BackendFileInfo {
+                    name: format!("video-{idx}.mkv"),
+                    length: 100,
+                })
+                .collect(),
+            init: FakeInit::new(true, Duration::from_secs(60)),
+        };
+        let enginefs = BackendEngineFS::new_with_backend(
+            FakeBackend::new(vec![handle]),
+            HashMap::new(),
+            root.path().join("cache"),
+            root.path().join("downloads"),
+        );
+        std::fs::create_dir_all(root.path().join("downloads")).unwrap();
+        enginefs.backend.hold_add.store(true, Ordering::SeqCst);
+
+        let unpin = async {
+            // Long enough for the pin to be inside the held add.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(enginefs.get_engine(TEST_HASH).await.is_none());
+            enginefs.unpin_download(TEST_HASH, 0, true).await.unwrap()
+        };
+        let release = async {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            enginefs.backend.add_hold.add_permits(1);
+        };
+        let (pinned, _unpinned, ()) =
+            tokio::join!(enginefs.pin_download(TEST_HASH, 0, None), unpin, release);
+        pinned.expect("the pin itself goes through");
+
+        assert!(
+            enginefs.pinned_downloads().await.is_empty(),
+            "the unpin applies to the pin it queued behind"
+        );
+        assert_eq!(
+            read_pinned_downloads(&enginefs.pinned_downloads_path()),
+            serde_json::json!({}),
+            "and nothing survives in the persisted set"
+        );
     }
 
     /// A dormant pin (no torrent in the backend) has nothing on disk this
