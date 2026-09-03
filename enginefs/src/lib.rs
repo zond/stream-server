@@ -2,7 +2,7 @@ use crate::engine::Engine;
 use anyhow::Result;
 use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -39,6 +39,34 @@ const INACTIVE_TORRENT_REMOVE_TIMEOUT: Duration = Duration::from_secs(300); // 5
 /// ([`PinDownloadError::InsufficientSpace`]). Re-pinning a complete file
 /// needs nothing and is never refused.
 pub const PIN_FREE_SPACE_MARGIN: u64 = 500 * 1024 * 1024;
+/// Where the pin set is persisted, relative to the download dir (see
+/// `BackendEngineFS::pinned_downloads_path`).
+const PINNED_DOWNLOADS_FILE: &str = "pinned-downloads.json";
+
+/// Serialize `pins` to `path` through a uniquely named temp file in the
+/// same directory and a rename, so a crash leaves the old file intact and
+/// concurrent writers never see each other's temp file.
+async fn write_pinned_downloads(
+    path: &std::path::Path,
+    pins: &BTreeMap<String, Vec<usize>>,
+) -> Result<()> {
+    static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
+    let json = serde_json::to_vec_pretty(pins)?;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let tmp = path.with_extension(format!(
+        "json.tmp-{}-{}",
+        std::process::id(),
+        NEXT_TMP.fetch_add(1, Ordering::Relaxed)
+    ));
+    tokio::fs::write(&tmp, json).await?;
+    if let Err(error) = tokio::fs::rename(&tmp, path).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(error.into());
+    }
+    Ok(())
+}
 /// How long a magnet add may spend resolving metadata inside the backend
 /// before it is given up on. librqbit's `Session::add_torrent` has no timeout
 /// of its own, so without this an unresolvable magnet (no peers, dead
@@ -1495,10 +1523,12 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// readers still open on the old one end, new requests find the new
     /// one. Without a downloads dir everything stays in the backend's root.
     ///
-    /// In-memory only: a restart forgets the pin (librqbit keeps the file in
-    /// its persisted `only_files` and the folder in its `output_folder`, so
-    /// the download itself resumes in place) -- the owner of the download
-    /// re-issues it.
+    /// Persisted: the pin set is written to `pinned-downloads.json` in the
+    /// download dir on every change and re-applied by
+    /// [`Self::restore_pinned_downloads`] at startup to the torrents the
+    /// backend restored (librqbit keeps the file in its persisted
+    /// `only_files` and the folder in its `output_folder`, so the download
+    /// itself resumes in place; the pin makes it exempt from eviction again).
     pub async fn pin_download(
         &self,
         info_hash: &str,
@@ -1559,6 +1589,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
         self.reconcile_with_active_selection(engine.clone(), "pin_download")
             .await;
+        self.persist_pinned_downloads().await;
         tracing::info!(
             info_hash = %engine.info_hash,
             file_idx,
@@ -1585,6 +1616,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         if was_pinned {
             self.reconcile_with_active_selection(engine.clone(), "unpin_download")
                 .await;
+            self.persist_pinned_downloads().await;
             tracing::info!(
                 info_hash = %engine.info_hash,
                 file_idx,
@@ -1593,6 +1625,78 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             );
         }
         Ok(was_pinned)
+    }
+
+    /// `pinned-downloads.json` in the download dir: `{ "<info hash>": [file
+    /// indices] }`, the pin set as of the last change.
+    pub fn pinned_downloads_path(&self) -> std::path::PathBuf {
+        self.download_dir.join(PINNED_DOWNLOADS_FILE)
+    }
+
+    /// Write the current pin set to [`Self::pinned_downloads_path`]
+    /// (atomically: temp file + rename). Best effort: a failure is logged,
+    /// the in-memory pins stand.
+    async fn persist_pinned_downloads(&self) {
+        let mut pins: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for pin in self.pinned_downloads().await {
+            pins.entry(pin.info_hash).or_default().push(pin.file_idx);
+        }
+        let path = self.pinned_downloads_path();
+        if let Err(error) = write_pinned_downloads(&path, &pins).await {
+            tracing::warn!(path = %path.display(), %error, "could not persist pinned downloads");
+        }
+    }
+
+    /// Re-apply the pins persisted by the last run to the engines the
+    /// backend restored (see [`Self::pin_download`]); pins of torrents the
+    /// backend no longer has are dropped, and the file is rewritten to
+    /// what was applied. Returns the number of pins restored. Called once
+    /// at startup, after the engines are registered.
+    pub async fn restore_pinned_downloads(&self) -> usize {
+        let path = self.pinned_downloads_path();
+        let pins = match tokio::fs::read(&path).await {
+            Ok(bytes) => match serde_json::from_slice::<BTreeMap<String, Vec<usize>>>(&bytes) {
+                Ok(pins) => pins,
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "ignoring unreadable pinned downloads file");
+                    return 0;
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return 0,
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "could not read pinned downloads file");
+                return 0;
+            }
+        };
+        let mut restored = 0;
+        let mut dropped = Vec::new();
+        for (info_hash, indices) in &pins {
+            let info_hash = info_hash.to_lowercase();
+            let Some(engine) = self.get_engine(&info_hash).await else {
+                dropped.push(info_hash);
+                continue;
+            };
+            for &file_idx in indices {
+                if let Err(error) = engine.handle.pin_file(file_idx).await {
+                    tracing::warn!(info_hash, file_idx, %error, "could not restore pin");
+                    continue;
+                }
+                engine.pinned_files.write().insert(file_idx);
+                restored += 1;
+            }
+            engine.touch();
+        }
+        if !dropped.is_empty() {
+            tracing::info!(
+                torrents = ?dropped,
+                "dropping persisted pins of torrents the backend no longer has"
+            );
+        }
+        if restored > 0 || !dropped.is_empty() {
+            self.persist_pinned_downloads().await;
+        }
+        tracing::info!(restored, "pinned_downloads_restored");
+        restored
     }
 
     /// Every pinned download, ordered by info hash then file index.
@@ -2204,12 +2308,9 @@ impl BackendEngineFS<LibrqbitBackend> {
         let download_dir = root_dir.join("rqbit-downloads");
         let (backend, restored) =
             LibrqbitBackend::new(download_dir.clone(), TorrentListenPort::default()).await?;
-        Ok(Self::new_with_backend(
-            backend,
-            restored,
-            root_dir.join("cache"),
-            download_dir,
-        ))
+        let efs = Self::new_with_backend(backend, restored, root_dir.join("cache"), download_dir);
+        efs.restore_pinned_downloads().await;
+        Ok(efs)
     }
 
     /// Only `config.listen_port` is consumed here: librqbit takes the rest of
@@ -2222,13 +2323,15 @@ impl BackendEngineFS<LibrqbitBackend> {
         let download_dir = root_dir.join("rqbit-downloads");
         let (backend, restored) =
             LibrqbitBackend::new(download_dir.clone(), config.listen_port).await?;
-        Ok(Self::new_with_backend_and_storage(
+        let efs = Self::new_with_backend_and_storage(
             backend,
             restored,
             root_dir.join("cache"),
             download_dir,
             tracker_storage,
-        ))
+        );
+        efs.restore_pinned_downloads().await;
+        Ok(efs)
     }
 
     /// librqbit sessions always persist downloads to disk, so the disk-backed
@@ -3853,6 +3956,94 @@ mod tests {
         let (mut enginefs, _counters) = test_enginefs_with_file_count(2);
         enginefs.set_free_space_probe(|_| Err(std::io::Error::other("no statvfs here")));
         enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
+    }
+
+    // --- pin persistence across restarts ---
+
+    /// Pins are written to `pinned-downloads.json` on every change and
+    /// re-applied at startup to the torrents the backend restored; pins of
+    /// torrents that are gone (or files that do not exist) are dropped and
+    /// the file rewritten; an unreadable file is ignored.
+    #[tokio::test]
+    async fn pinned_downloads_are_persisted_and_restored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let make = |files: usize| {
+            let counters = Arc::new(FakeCounters::default());
+            let handle = FakeHandle {
+                info_hash: TEST_HASH.to_string(),
+                counters: counters.clone(),
+                files: (0..files)
+                    .map(|idx| BackendFileInfo {
+                        name: format!("video-{idx}.mkv"),
+                        length: 100,
+                    })
+                    .collect(),
+                init: FakeInit::new(true, Duration::from_secs(60)),
+            };
+            let restored = HashMap::from([(TEST_HASH.to_string(), handle.clone())]);
+            let enginefs = BackendEngineFS::new_with_backend(
+                FakeBackend::new(vec![handle]),
+                restored,
+                root.join("cache"),
+                root.join("downloads"),
+            );
+            (enginefs, counters)
+        };
+        let read_pins = |path: &std::path::Path| -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+        };
+
+        let (first, _counters) = make(3);
+        let path = first.pinned_downloads_path();
+        assert_eq!(path, root.join("downloads").join("pinned-downloads.json"));
+        assert_eq!(first.restore_pinned_downloads().await, 0, "nothing yet");
+        first.pin_download(TEST_HASH, 2, None).await.unwrap();
+        first.pin_download(TEST_HASH, 1, None).await.unwrap();
+        assert_eq!(read_pins(&path), serde_json::json!({ TEST_HASH: [1, 2] }));
+        assert!(first.unpin_download(TEST_HASH, 2).await.unwrap());
+        assert_eq!(read_pins(&path), serde_json::json!({ TEST_HASH: [1] }));
+        drop(first);
+
+        // "Restart": a new engine over the backend's restored torrent.
+        let (second, counters) = make(3);
+        assert!(second.pinned_downloads().await.is_empty());
+        assert_eq!(second.restore_pinned_downloads().await, 1);
+        let engine = second.get_engine(TEST_HASH).await.unwrap();
+        assert_eq!(engine.pinned_file_indices(), vec![1]);
+        assert!(engine.is_pinned(), "exempt from eviction again");
+        assert_eq!(counters.pin_file.load(Ordering::SeqCst), 1);
+        assert_eq!(engine.get_statistics().await.pinned_files, vec![1]);
+        assert_eq!(read_pins(&path), serde_json::json!({ TEST_HASH: [1] }));
+        drop(second);
+
+        // A torrent the backend no longer has, and an index the torrent
+        // does not have, are dropped; the rest is restored.
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                OTHER_HASH: [0],
+                TEST_HASH.to_uppercase(): [0, 7],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let (third, _counters) = make(3);
+        assert_eq!(third.restore_pinned_downloads().await, 1);
+        assert_eq!(
+            third.pinned_downloads().await,
+            vec![PinnedDownload {
+                info_hash: TEST_HASH.to_string(),
+                file_idx: 0
+            }]
+        );
+        assert_eq!(read_pins(&path), serde_json::json!({ TEST_HASH: [0] }));
+        drop(third);
+
+        std::fs::write(&path, b"not json").unwrap();
+        let (fourth, _counters) = make(3);
+        assert_eq!(fourth.restore_pinned_downloads().await, 0);
+        assert!(fourth.pinned_downloads().await.is_empty());
     }
 
     // --- pinned offline downloads ---
