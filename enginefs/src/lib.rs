@@ -3549,6 +3549,7 @@ mod tests {
                         progress: if seeded { 1.0 } else { 0.5 },
                         initial_window_ready_bytes: window.map(|(ready, _)| ready),
                         initial_window_bytes: window.map(|(_, total)| total),
+                        in_flight_piece: None,
                         pinned: pinned.contains(&idx),
                         complete: seeded,
                     };
@@ -3601,6 +3602,7 @@ mod tests {
                 check_total_bytes: (phase == StartupPhase::Checking).then_some(total_len),
                 initial_window_ready_bytes: None,
                 initial_window_bytes: None,
+                in_flight_piece: None,
                 peer_discovery: PeerDiscovery::default(),
                 error: None,
                 pinned_files: pinned.into_iter().collect(),
@@ -4262,7 +4264,10 @@ mod tests {
 
     /// `focus_stream_file` re-judges the phase for the exact file a client
     /// asked about (`/{infoHash}/{fileIdx}/stats.json`), only in the
-    /// buffering/ready phases, and ignores out-of-range indices.
+    /// buffering/ready phases, and ignores out-of-range indices. It also
+    /// lifts that file's in-flight piece to the top level, and only that
+    /// file's: the piece another file's reader waits on says nothing about
+    /// the stream this request is about.
     #[test]
     fn focus_stream_file_refines_phase_per_file() {
         let file = |ready: u64, total: u64| StatsFile {
@@ -4274,6 +4279,12 @@ mod tests {
             progress: 0.0,
             initial_window_ready_bytes: Some(ready),
             initial_window_bytes: Some(total),
+            in_flight_piece: (ready < total).then_some(crate::backend::InFlightPiece {
+                index: 3,
+                downloaded_bytes: ready,
+                total_bytes: total,
+                verified: false,
+            }),
             pinned: false,
             complete: ready == total,
         };
@@ -4322,6 +4333,7 @@ mod tests {
             check_total_bytes: None,
             initial_window_ready_bytes: None,
             initial_window_bytes: None,
+            in_flight_piece: None,
             peer_discovery: PeerDiscovery::default(),
             error: None,
             pinned_files: Vec::new(),
@@ -4332,17 +4344,21 @@ mod tests {
         assert_eq!(stats.phase, StartupPhase::Buffering);
         assert_eq!(stats.initial_window_ready_bytes, Some(10));
         assert_eq!(stats.initial_window_bytes, Some(100));
+        assert_eq!(stats.in_flight_piece, base.files[0].in_flight_piece);
 
         let mut stats = base.clone();
         stats.focus_stream_file(1);
         assert_eq!(stats.phase, StartupPhase::Ready);
         assert_eq!(stats.initial_window_ready_bytes, Some(60));
+        // File 1 has no reader waiting on a piece; file 0's must not leak in.
+        assert_eq!(stats.in_flight_piece, None);
 
         // Out of range: untouched.
         let mut stats = base.clone();
         stats.focus_stream_file(7);
         assert_eq!(stats.phase, StartupPhase::Buffering);
         assert_eq!(stats.initial_window_bytes, None);
+        assert_eq!(stats.in_flight_piece, None);
 
         // Not a piece-map phase: untouched even though the file is complete.
         let mut stats = base.clone();
@@ -4350,6 +4366,7 @@ mod tests {
         stats.focus_stream_file(1);
         assert_eq!(stats.phase, StartupPhase::Checking);
         assert_eq!(stats.initial_window_bytes, None);
+        assert_eq!(stats.in_flight_piece, None);
     }
 
     /// Wire contract: the new fields serialize camelCase and additively; the
@@ -4405,6 +4422,19 @@ mod tests {
             assert!(obj.contains_key(key), "{key} missing: {value}");
             assert_eq!(value[key], serde_json::Value::Null, "{key}: {value}");
         }
+        // Sub-piece progress is `null` at the top level, never a zeroed
+        // object: the fake backend has no reader on any file, so nothing is
+        // in flight and a client must be able to tell that from "0 of 16 MB
+        // downloaded". Per file it is omitted entirely for the same reason.
+        assert!(obj.contains_key("inFlightPiece"), "{value}");
+        assert_eq!(value["inFlightPiece"], serde_json::Value::Null, "{value}");
+        assert!(
+            !value["files"][0]
+                .as_object()
+                .unwrap()
+                .contains_key("inFlightPiece"),
+            "{value}"
+        );
         assert_eq!(value["files"][0]["initialWindowReadyBytes"], 50);
         assert_eq!(value["files"][0]["initialWindowBytes"], 100);
         let file_keys = value["files"][0].as_object().unwrap();
@@ -7400,9 +7430,14 @@ mod tests {
         assert!(stats.files.is_empty());
         assert_eq!(stats.sources.len(), 1);
         assert_eq!(stats.sources[0].url, "udp://one.invalid/announce");
+        // Nothing is in flight before there is a piece map: `null`, not a
+        // zeroed piece a client would render as "0 of 0 bytes".
+        assert_eq!(stats.in_flight_piece, None);
         let json = serde_json::to_value(&stats).unwrap();
         assert_eq!(json["phase"], "resolvingMetadata");
         assert_eq!(json["hasMetadata"], false);
         assert_eq!(json["streamLen"], 0);
+        assert_eq!(json["pieceLength"], serde_json::Value::Null);
+        assert_eq!(json["inFlightPiece"], serde_json::Value::Null);
     }
 }

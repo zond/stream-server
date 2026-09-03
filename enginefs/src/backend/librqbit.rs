@@ -1146,8 +1146,18 @@ impl TorrentHandle for LibrqbitHandle {
         let mut total_size = 0u64;
         let mut offset = 0u64;
         if let Some(m) = self.handle.metadata.load_full() {
-            let piece_length = m.lengths().default_piece_length() as u64;
+            let lengths = *m.lengths();
+            let piece_length = lengths.default_piece_length() as u64;
             torrent_piece_length = Some(piece_length);
+            // Chunk size straight from librqbit's own arithmetic rather than
+            // a copy of its 16 KiB constant: a full piece is split into
+            // `default_chunks_per_piece` equal chunks. Only the *last* chunk
+            // of the torrent's last piece is short, which
+            // `InFlightPiece::from_chunks` handles by clamping.
+            let chunk_size = match lengths.default_chunks_per_piece() as u64 {
+                0 => None,
+                chunks => Some(piece_length / chunks),
+            };
             for (i, f) in m.info.iter_file_details().enumerate() {
                 let filename = f.filename.to_string();
                 // file_progress is empty while the torrent is Initializing.
@@ -1169,6 +1179,32 @@ impl TorrentHandle for LibrqbitHandle {
                         |piece| bf.get(piece as usize).is_some_and(|bit| *bit),
                     )
                 });
+                // Sub-piece progress for the piece this file's reader is
+                // waiting on. Only for a file somebody has actually opened
+                // (`read_from`): otherwise there is no reader, nothing is in
+                // flight for it, and absence is the honest answer -- and it
+                // keeps the per-poll cost at one cheap bit-count per open
+                // stream instead of one per file of the torrent.
+                let in_flight_piece = read_from.zip(chunk_size).and_then(|(from, chunk_size)| {
+                    let index = crate::backend::priorities::reader_piece_index(
+                        offset,
+                        f.len,
+                        piece_length,
+                        from,
+                    )?;
+                    let valid = lengths.validate_piece_index(u32::try_from(index).ok()?)?;
+                    // Errors when the torrent has no chunk tracker (neither
+                    // live nor paused), which is exactly when we must report
+                    // absence rather than a zeroed piece.
+                    let progress = self.handle.piece_chunk_progress(valid.get()).ok()?;
+                    Some(crate::backend::InFlightPiece::from_chunks(
+                        index,
+                        progress.downloaded_chunks,
+                        chunk_size,
+                        lengths.piece_length(valid) as u64,
+                        progress.verified,
+                    ))
+                });
                 files.push(StatsFile {
                     name: filename.clone(),
                     path: filename,
@@ -1178,6 +1214,7 @@ impl TorrentHandle for LibrqbitHandle {
                     progress: file_progress,
                     initial_window_ready_bytes: window.map(|(ready, _)| ready),
                     initial_window_bytes: window.map(|(_, total)| total),
+                    in_flight_piece,
                     pinned: pinned.contains(&i),
                     complete,
                 });
@@ -1235,6 +1272,9 @@ impl TorrentHandle for LibrqbitHandle {
             name: self.name().unwrap_or_else(|| "Unknown".to_string()),
             info_hash: self.info_hash(),
             piece_length: torrent_piece_length,
+            // Torrent-level stats describe no particular file; a client
+            // asking about one gets it through `focus_stream_file`.
+            in_flight_piece: None,
             files,
             sources,
             opts: StatsOptions {
@@ -2122,12 +2162,22 @@ mod tests {
     /// Returns (serialized torrent bytes, info hash as hex). We extract what we
     /// need immediately rather than holding the borrowing result.
     pub(super) async fn make_torrent(path: &std::path::Path) -> (Vec<u8>, String) {
+        make_torrent_with_piece_length(path, 16384).await
+    }
+
+    /// [`make_torrent`] with the piece length spelled out, for tests that
+    /// care how a piece divides into librqbit's 16 KiB chunks -- a 16 KiB
+    /// piece is exactly one chunk, which hides every chunk-to-byte question.
+    pub(super) async fn make_torrent_with_piece_length(
+        path: &std::path::Path,
+        piece_length: u32,
+    ) -> (Vec<u8>, String) {
         let t = librqbit::create_torrent(
             path,
             librqbit::CreateTorrentOptions {
                 name: None,
                 trackers: Vec::new(),
-                piece_length: Some(16384),
+                piece_length: Some(piece_length),
             },
             &librqbit::spawn_utils::BlockingSpawner::new(1),
         )
@@ -2639,6 +2689,131 @@ mod tests {
             "the window is what the reader is waiting for, not the head"
         );
         assert_eq!(stats.piece_length, Some(piece_length));
+    }
+
+    /// Sub-piece progress for the piece the reader is sitting on: without it
+    /// a player waiting on a single 16 MiB piece can only ever be shown 0%
+    /// or 100%, because whole verified pieces are all the have-bitfield can
+    /// say. Also the honesty cases -- absence, not zero, when no reader is
+    /// open -- and the short last piece, whose bytes are not
+    /// `chunks * 16 KiB`.
+    #[tokio::test]
+    async fn stats_report_the_progress_of_the_piece_the_reader_waits_for() {
+        use crate::backend::TorrentHandle;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let payload = dir.join("payload.bin");
+        // Two whole 64 KiB pieces (four 16 KiB chunks each) plus a short
+        // last piece of 5000 bytes -- less than one chunk, so multiplying
+        // its single chunk by the chunk size would overstate it by 11384.
+        let piece_length = 64 * 1024u64;
+        let last_piece_len = 5000u64;
+        let payload_len = 2 * piece_length + last_piece_len;
+        write_payload(&payload, payload_len as usize).await;
+        let (torrent_bytes, _hash) =
+            make_torrent_with_piece_length(&payload, piece_length as u32).await;
+
+        let (_backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
+        handle.handle.wait_until_initialized().await.unwrap();
+        assert_eq!(
+            TorrentHandle::stats(&handle).await.piece_length,
+            Some(piece_length)
+        );
+
+        // Nothing has opened the file, so nothing is in flight for it: a
+        // client must be able to tell that from "0 bytes of the piece".
+        let mut stats = TorrentHandle::stats(&handle).await;
+        assert_eq!(stats.files[0].in_flight_piece, None);
+        stats.focus_stream_file(0);
+        assert_eq!(stats.in_flight_piece, None);
+
+        // A reader at the head waits on piece 0, which this fixture has
+        // fully on disk: complete *and* verified, the only state in which a
+        // client may treat it as ready.
+        let _reader = handle
+            .get_file_reader(
+                0,
+                0,
+                0,
+                None,
+                crate::backend::priorities::PlaybackIntent::DirectInitial,
+                crate::backend::priorities::BufferProfile::Normal,
+            )
+            .await
+            .unwrap();
+        let mut stats = TorrentHandle::stats(&handle).await;
+        let head = stats.files[0].in_flight_piece.expect("a reader is open");
+        assert_eq!(head.index, 0);
+        assert_eq!(head.total_bytes, piece_length);
+        assert_eq!(head.downloaded_bytes, piece_length);
+        assert!(head.verified);
+        // The same piece reaches the top level for the focused file, which
+        // is what both stats.json routes serve.
+        stats.focus_stream_file(0);
+        assert_eq!(stats.in_flight_piece, Some(head));
+
+        // Seek into the short last piece. Its bytes are the piece's real
+        // length, not its one chunk rounded up to 16 KiB.
+        let _reader = handle
+            .get_file_reader(
+                0,
+                payload_len - 1,
+                0,
+                None,
+                crate::backend::priorities::PlaybackIntent::DirectSeek,
+                crate::backend::priorities::BufferProfile::Normal,
+            )
+            .await
+            .unwrap();
+        let stats = TorrentHandle::stats(&handle).await;
+        let tail = stats.files[0].in_flight_piece.expect("a reader is open");
+        assert_eq!(tail.index, 2);
+        assert_eq!(tail.total_bytes, last_piece_len);
+        assert_eq!(tail.downloaded_bytes, last_piece_len);
+        assert!(tail.verified);
+    }
+
+    /// A piece nobody has sent us yet is reported as a real 0-of-N, with
+    /// `verified` false -- never as absence (which means "we do not know")
+    /// and never as ready.
+    #[tokio::test]
+    async fn stats_never_report_an_unverified_piece_as_ready() {
+        use crate::backend::TorrentHandle;
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        tokio::fs::create_dir_all(&src_dir).await.unwrap();
+        let payload = src_dir.join("payload.bin");
+        let piece_length = 64 * 1024u64;
+        write_payload(&payload, (2 * piece_length) as usize).await;
+        let (torrent_bytes, _hash) =
+            make_torrent_with_piece_length(&payload, piece_length as u32).await;
+
+        // Empty download dir: the torrent has metadata and a chunk map, but
+        // not one byte of data.
+        let download_dir = tmp.path().join("dl");
+        let (_backend, handle) = backend_with_torrent(&download_dir, &torrent_bytes).await;
+        handle.handle.wait_until_initialized().await.unwrap();
+        let _reader = handle
+            .get_file_reader(
+                0,
+                0,
+                0,
+                None,
+                crate::backend::priorities::PlaybackIntent::DirectInitial,
+                crate::backend::priorities::BufferProfile::Normal,
+            )
+            .await
+            .unwrap();
+
+        let mut stats = TorrentHandle::stats(&handle).await;
+        stats.focus_stream_file(0);
+        let piece = stats.in_flight_piece.expect("a reader is open");
+        assert_eq!(piece.index, 0);
+        assert_eq!(piece.downloaded_bytes, 0);
+        assert_eq!(piece.total_bytes, piece_length);
+        assert!(!piece.verified);
+        assert_eq!(stats.phase, StartupPhase::Buffering);
+        assert_eq!(stats.initial_window_ready_bytes, Some(0));
     }
 
     /// An unseeded torrent with no peers sits in `buffering` with an empty

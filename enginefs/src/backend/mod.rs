@@ -281,6 +281,69 @@ pub struct BackendFileInfo {
     pub length: u64,
 }
 
+/// Byte progress of the single piece an open reader is sitting on -- the
+/// piece that has to arrive before that reader can advance.
+///
+/// A piece is the unit that becomes readable, and on a multi-gigabyte
+/// torrent it is 8-16 MiB. Whole verified pieces are all the have-bitfield
+/// can show, so a player waiting on its first piece could only ever be told
+/// 0% or 100%. librqbit counts a piece's 16 KiB chunks as they are written,
+/// which is what this turns into bytes a client can render directly --
+/// "waiting for the first piece, 6.2 of 16 MB" -- without knowing anything
+/// about chunks.
+///
+/// **The numbers can go backwards.** A chunk counts as downloaded the moment
+/// it is written, *not* when it is verified: the hash is only checked once
+/// every chunk is in, and a piece that fails is discarded, dropping the
+/// count back to zero. [`Self::verified`] is the only field that means
+/// "known good" -- a full `downloaded_bytes` on its own means nothing more
+/// than "complete enough to be hashed". A client should hold a nearly-full
+/// bar where it is until `verified`, and never animate a decrease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InFlightPiece {
+    /// The piece's index in the torrent (not in the file).
+    pub index: u64,
+    /// Bytes of the piece written to disk so far, verified or not. Never
+    /// more than [`Self::total_bytes`].
+    pub downloaded_bytes: u64,
+    /// The piece's real length: `piece_length` for every piece but the
+    /// torrent's last, which is short.
+    pub total_bytes: u64,
+    /// The piece is fully downloaded *and* passed its hash check, i.e. it is
+    /// in the have-bitfield and can be served. While this is false the piece
+    /// is never ready, however close `downloaded_bytes` is to
+    /// `total_bytes`.
+    pub verified: bool,
+}
+
+impl InFlightPiece {
+    /// Build one from librqbit's `PieceChunkProgress` counts.
+    ///
+    /// Chunks are a fixed `chunk_size` (16 KiB) each **except the last chunk
+    /// of the torrent's last piece**, which is short -- so chunks-to-bytes
+    /// is not a flat multiplication and the product is clamped to
+    /// `piece_bytes`, the piece's real length. A fully downloaded short last
+    /// piece therefore reports exactly its own length rather than a rounded-
+    /// up one, and no piece can ever report more bytes than it has.
+    pub fn from_chunks(
+        index: u64,
+        downloaded_chunks: u32,
+        chunk_size: u64,
+        piece_bytes: u64,
+        verified: bool,
+    ) -> Self {
+        Self {
+            index,
+            downloaded_bytes: (downloaded_chunks as u64)
+                .saturating_mul(chunk_size)
+                .min(piece_bytes),
+            total_bytes: piece_bytes,
+            verified,
+        }
+    }
+}
+
 // Stremio-compatible stats structures
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -303,6 +366,11 @@ pub struct StatsFile {
     /// Omitted together with `initial_window_ready_bytes`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_window_bytes: Option<u64>,
+    /// Byte progress of the piece an open reader on *this* file is sitting
+    /// on, see [`InFlightPiece`]. Omitted unless a reader has been opened on
+    /// the file and the torrent has a chunk map (live or paused).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_flight_piece: Option<InFlightPiece>,
     /// The file is pinned as an offline download (`TorrentHandle::pin_file`):
     /// kept wanted regardless of playback selection.
     #[serde(default)]
@@ -710,6 +778,15 @@ pub struct EngineStats {
     /// ETA from `download_speed`, rather than as a stalled percentage.
     #[serde(default)]
     pub piece_length: Option<u64>,
+    /// The focused stream file's `StatsFile::in_flight_piece`: sub-piece
+    /// progress for the one piece a reader is waiting on, so a client can
+    /// draw a bar that moves inside a 16 MiB piece instead of a percentage
+    /// stuck at 0. `null` -- never a zeroed object -- whenever we do not
+    /// know: no reader open on the file, no metadata yet, or a torrent
+    /// without a chunk map (resolving/checking/error). See
+    /// [`InFlightPiece`] for why the number can regress.
+    #[serde(default)]
+    pub in_flight_piece: Option<InFlightPiece>,
     /// Peer-discovery counters, see [`PeerDiscovery`].
     #[serde(default)]
     pub peer_discovery: PeerDiscovery,
@@ -786,6 +863,7 @@ impl EngineStats {
             initial_window_ready_bytes: None,
             initial_window_bytes: None,
             piece_length: None,
+            in_flight_piece: None,
             peer_discovery: PeerDiscovery::default(),
             error: None,
             pinned_files: Vec::new(),
@@ -804,8 +882,9 @@ impl EngineStats {
     }
 
     /// Refine `phase` for the file the client is about to play: in
-    /// `buffering`/`ready` copy that file's initial-window progress to the
-    /// top level and flip the phase on whether the window is fully on disk.
+    /// `buffering`/`ready` copy that file's initial-window progress and
+    /// in-flight piece to the top level and flip the phase on whether the
+    /// window is fully on disk.
     /// Other phases (and files without a window, e.g. no piece map) are left
     /// untouched. Out-of-range indices are a no-op.
     pub fn focus_stream_file(&mut self, file_idx: usize) {
@@ -822,6 +901,7 @@ impl EngineStats {
         };
         self.initial_window_ready_bytes = Some(ready);
         self.initial_window_bytes = Some(total);
+        self.in_flight_piece = file.in_flight_piece;
         self.phase = if ready >= total {
             StartupPhase::Ready
         } else {

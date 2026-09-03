@@ -305,6 +305,31 @@ pub fn initial_window_progress(
     (ready, span_end - span_start)
 }
 
+/// The index of the piece an open reader is sitting on: the piece that has
+/// to arrive before the reader can advance, and so the one whose sub-piece
+/// progress is worth showing (see `backend::InFlightPiece`).
+///
+/// `read_from` is the reader's offset **inside the file**, the same offset
+/// [`initial_window_progress`] measures its window from, and the result is a
+/// **torrent-wide** piece index. An offset at or past the end of the file is
+/// clamped to its last byte, so a reader parked on the end still names the
+/// piece it last needed rather than a neighbouring file's.
+///
+/// `None` for an empty file or an unknown piece length: there is no piece to
+/// wait for, and absence is the honest answer.
+pub fn reader_piece_index(
+    file_offset: u64,
+    file_len: u64,
+    piece_length: u64,
+    read_from: u64,
+) -> Option<u64> {
+    if file_len == 0 || piece_length == 0 {
+        return None;
+    }
+    let within = read_from.min(file_len - 1);
+    Some((file_offset + within) / piece_length)
+}
+
 pub fn playback_deadline_step_ms(
     piece_length: u64,
     bitrate_bytes_per_sec: Option<u64>,
@@ -1370,5 +1395,62 @@ mod tests {
             );
             previous = decision.hot_window_pieces;
         }
+    }
+    /// The piece whose sub-piece progress is worth showing is the one the
+    /// reader sits on, in torrent-wide indices -- a file that does not start
+    /// at the torrent's head is offset by its own position.
+    #[test]
+    fn reader_piece_index_names_the_piece_under_the_reader() {
+        let piece = 1024 * 1024u64;
+        // File at the torrent head, reader at the head: the first piece.
+        assert_eq!(reader_piece_index(0, 10 * piece, piece, 0), Some(0));
+        // Anywhere inside a piece names that piece, not the next one.
+        assert_eq!(reader_piece_index(0, 10 * piece, piece, piece - 1), Some(0));
+        assert_eq!(reader_piece_index(0, 10 * piece, piece, piece), Some(1));
+        // A second file's offset shifts the index: a reader at that file's
+        // head waits on the piece the torrent has there.
+        assert_eq!(reader_piece_index(3 * piece, piece, piece, 0), Some(3));
+        // Past the end is clamped to the file's last byte rather than
+        // naming a piece that belongs to whatever follows it.
+        assert_eq!(reader_piece_index(0, 2 * piece, piece, 99 * piece), Some(1));
+        // Nothing to wait for.
+        assert_eq!(reader_piece_index(0, 0, piece, 0), None);
+        assert_eq!(reader_piece_index(0, piece, 0, 0), None);
+    }
+
+    /// Chunks are 16 KiB each except the last chunk of the torrent's last
+    /// piece, so chunks-to-bytes is not a flat multiplication: the product
+    /// is clamped to the piece's real length. Getting this wrong would have
+    /// the final piece of a file report more bytes than it contains, and a
+    /// finished download sit at 103%.
+    #[test]
+    fn in_flight_piece_bytes_clamp_to_a_short_last_piece() {
+        use crate::backend::InFlightPiece;
+        let chunk = 16 * 1024u64;
+
+        // A full 16 MiB piece, 400 of its 1024 chunks written: exactly the
+        // "6.2 of 16 MB" a client renders.
+        let partial = InFlightPiece::from_chunks(0, 400, chunk, 1024 * chunk, false);
+        assert_eq!(partial.downloaded_bytes, 400 * chunk);
+        assert_eq!(partial.total_bytes, 1024 * chunk);
+        assert!(!partial.verified);
+
+        // The torrent's last piece is short (3 chunks would be 49152 bytes;
+        // the piece holds 40000). Complete means exactly its own length.
+        let short = InFlightPiece::from_chunks(41, 3, chunk, 40_000, true);
+        assert_eq!(short.downloaded_bytes, 40_000);
+        assert_eq!(short.total_bytes, 40_000);
+        assert!(short.verified);
+
+        // Part-way through the same short piece, still under the cap.
+        let short_partial = InFlightPiece::from_chunks(41, 1, chunk, 40_000, false);
+        assert_eq!(short_partial.downloaded_bytes, chunk);
+        assert_eq!(short_partial.total_bytes, 40_000);
+
+        // Nothing written yet is a real, renderable state -- 0 of the
+        // piece, not absence.
+        let empty = InFlightPiece::from_chunks(7, 0, chunk, 1024 * chunk, false);
+        assert_eq!(empty.downloaded_bytes, 0);
+        assert_eq!(empty.total_bytes, 1024 * chunk);
     }
 }
