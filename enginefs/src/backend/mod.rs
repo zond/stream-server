@@ -180,6 +180,12 @@ pub trait TorrentHandle: Send + Sync + Clone {
     fn output_folder(&self) -> Option<std::path::PathBuf> {
         None
     }
+    /// The torrent's piece length -- the unit a read blocks on, so the one
+    /// number that makes "this read waited 28 seconds" legible. `None`
+    /// until metadata resolves, or for a backend without pieces.
+    fn piece_length(&self) -> Option<u64> {
+        None
+    }
     /// `buffer` is the viewer's read-ahead choice (the `bufferProfile`
     /// setting or the stream request's `buffer=` override); it scales the
     /// playback windows this reader is opened with, never the startup one.

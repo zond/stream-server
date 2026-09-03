@@ -1406,6 +1406,13 @@ impl TorrentHandle for LibrqbitHandle {
         Some(self.handle.output_folder().to_path_buf())
     }
 
+    fn piece_length(&self) -> Option<u64> {
+        self.handle
+            .metadata
+            .load_full()
+            .map(|m| m.lengths().default_piece_length() as u64)
+    }
+
     /// Select `file_idx` as the only wanted file (exclusive downloading, per
     /// the trait contract) on multi-file torrents. Blocks (bounded) while the
     /// torrent is still Initializing -- librqbit refuses selection updates in

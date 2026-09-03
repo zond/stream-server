@@ -444,6 +444,13 @@ impl<H: TorrentHandle> Engine<H> {
 
         // Use raw reader directly for better performance
         // The torrent backend reads from local files, caching adds overhead
-        Ok(FileHandle::new(length, name, reader, self.clone()))
+        Ok(FileHandle::new(
+            length,
+            name,
+            reader,
+            self.clone(),
+            file_idx,
+            start_offset,
+        ))
     }
 }
