@@ -607,8 +607,14 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                             let selections = active_multifile_files_clone.read().await;
                             selections.contains_key(hash)
                         };
+                        // An offline download is idle by nature (nothing
+                        // reads it until it is complete); removing the
+                        // torrent from the session would stop it.
+                        let pinned = engine.is_pinned();
 
-                        let skip_reason = if engine_active_streams > 0 {
+                        let skip_reason = if pinned {
+                            Some("pinned_files")
+                        } else if engine_active_streams > 0 {
                             Some("engine_active_streams")
                         } else if active_stream_count > 0 {
                             Some("active_streams")
@@ -688,6 +694,12 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     let read = engines_clone.read().await;
                     for (hash, engine) in read.iter() {
                         if engine.handle.manages_playback_lifecycle() {
+                            continue;
+                        }
+                        // A pinned download must keep downloading; seeding
+                        // is stopped for it the moment it completes and is
+                        // unpinned, like any other torrent.
+                        if engine.is_pinned() {
                             continue;
                         }
                         let hash_active = {
@@ -1717,6 +1729,13 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     );
                     return;
                 }
+                if engine.is_pinned() {
+                    tracing::debug!(
+                        info_hash = %info_hash,
+                        "Skipping idle pause because the torrent has a pinned download"
+                    );
+                    return;
+                }
                 if !engine.handle.stats().await.has_metadata {
                     tracing::debug!(
                         info_hash = %info_hash,
@@ -2147,7 +2166,11 @@ mod tests {
     }
 
     struct FakeBackend {
-        handle: FakeHandle,
+        /// Every torrent the fake session holds, keyed by info hash. The
+        /// first one stands in for whatever `add_torrent` is asked for.
+        handles: Vec<FakeHandle>,
+        /// Info hashes `remove_torrent` was asked to drop, in order.
+        removed: Arc<Mutex<Vec<String>>>,
     }
 
     #[async_trait::async_trait]
@@ -2159,19 +2182,23 @@ mod tests {
             _source: TorrentSource,
             _trackers: Vec<String>,
         ) -> Result<Self::Handle> {
-            Ok(self.handle.clone())
+            Ok(self.handles[0].clone())
         }
 
         async fn get_torrent(&self, info_hash: &str) -> Option<Self::Handle> {
-            (info_hash == self.handle.info_hash).then(|| self.handle.clone())
+            self.handles
+                .iter()
+                .find(|h| h.info_hash == info_hash)
+                .cloned()
         }
 
-        async fn remove_torrent(&self, _info_hash: &str) -> Result<()> {
+        async fn remove_torrent(&self, info_hash: &str) -> Result<()> {
+            self.removed.lock().unwrap().push(info_hash.to_string());
             Ok(())
         }
 
         async fn list_torrents(&self) -> Vec<String> {
-            vec![self.handle.info_hash.clone()]
+            self.handles.iter().map(|h| h.info_hash.clone()).collect()
         }
 
         async fn memory_diagnostics(&self) -> BackendMemoryDiagnostics {
@@ -2467,12 +2494,66 @@ mod tests {
         restored.insert(TEST_HASH.to_string(), handle.clone());
         let root = std::env::temp_dir().join("enginefs-hls-lease-tests");
         let enginefs = BackendEngineFS::new_with_backend(
-            FakeBackend { handle },
+            FakeBackend {
+                handles: vec![handle],
+                removed: Arc::new(Mutex::new(Vec::new())),
+            },
             restored,
             root.join("cache"),
             root.join("downloads"),
         );
         (enginefs, counters, init)
+    }
+
+    const OTHER_HASH: &str = "fedcba9876543210fedcba9876543210fedcba98";
+
+    /// Engine over two initialized two-file fake torrents (`TEST_HASH`,
+    /// `OTHER_HASH`) with separate counters, plus the backend's removal log,
+    /// for policies that must treat engines differently.
+    struct TwoEngines {
+        enginefs: BackendEngineFS<FakeBackend>,
+        counters: [Arc<FakeCounters>; 2],
+        removed: Arc<Mutex<Vec<String>>>,
+    }
+
+    fn test_enginefs_with_two_engines() -> TwoEngines {
+        let make = |hash: &str| {
+            let counters = Arc::new(FakeCounters::default());
+            let handle = FakeHandle {
+                info_hash: hash.to_string(),
+                counters: counters.clone(),
+                files: (0..2)
+                    .map(|idx| BackendFileInfo {
+                        name: format!("video-{idx}.mkv"),
+                        length: 100,
+                    })
+                    .collect(),
+                init: FakeInit::new(true, Duration::from_secs(60)),
+            };
+            (handle, counters)
+        };
+        let (a, counters_a) = make(TEST_HASH);
+        let (b, counters_b) = make(OTHER_HASH);
+        let restored = HashMap::from([
+            (TEST_HASH.to_string(), a.clone()),
+            (OTHER_HASH.to_string(), b.clone()),
+        ]);
+        let removed = Arc::new(Mutex::new(Vec::new()));
+        let root = std::env::temp_dir().join("enginefs-two-engine-tests");
+        let enginefs = BackendEngineFS::new_with_backend(
+            FakeBackend {
+                handles: vec![a, b],
+                removed: removed.clone(),
+            },
+            restored,
+            root.join("cache"),
+            root.join("downloads"),
+        );
+        TwoEngines {
+            enginefs,
+            counters: [counters_a, counters_b],
+            removed,
+        }
     }
 
     /// Poll `cond` until it holds or `bound` of (virtual) time elapses.
@@ -3227,6 +3308,87 @@ mod tests {
         assert_eq!(counters.pin_file.load(Ordering::SeqCst), 1);
         assert_eq!(counters.reconcile_file_priorities.load(Ordering::SeqCst), 0);
         assert!(engine.get_statistics().await.files[0].pinned);
+    }
+
+    /// The inactivity sweep must leave a pinned engine alone -- removing the
+    /// torrent from the session would stop the offline download -- while
+    /// still removing an idle unpinned one; once unpinned, the engine is
+    /// ordinary again and the next window removes it.
+    #[tokio::test(start_paused = true)]
+    async fn idle_sweeper_keeps_pinned_engine_and_removes_unpinned() {
+        let TwoEngines {
+            enginefs, removed, ..
+        } = test_enginefs_with_two_engines();
+        enginefs.pin_download(TEST_HASH, 1, None).await.unwrap();
+        let present = |hash: &str| {
+            let engines = enginefs.engines.clone();
+            let hash = hash.to_string();
+            async move { engines.read().await.contains_key(&hash) }
+        };
+
+        // Nobody touches either engine for a full inactivity window (the
+        // sweep runs every 15 s; +30 s covers the tick after the window).
+        tokio::time::sleep(INACTIVE_TORRENT_REMOVE_TIMEOUT + Duration::from_secs(30)).await;
+        assert!(present(TEST_HASH).await, "pinned engine must survive");
+        assert!(
+            !present(OTHER_HASH).await,
+            "idle unpinned engine is removed"
+        );
+        assert_eq!(*removed.lock().unwrap(), vec![OTHER_HASH.to_string()]);
+        assert_eq!(enginefs.pinned_downloads().await.len(), 1);
+
+        // Still pinned after another window.
+        tokio::time::sleep(INACTIVE_TORRENT_REMOVE_TIMEOUT + Duration::from_secs(30)).await;
+        assert!(present(TEST_HASH).await);
+
+        // Unpinned: swept on the next idle window like any other engine.
+        assert!(enginefs.unpin_download(TEST_HASH, 1).await.unwrap());
+        tokio::time::sleep(INACTIVE_TORRENT_REMOVE_TIMEOUT + Duration::from_secs(30)).await;
+        assert!(!present(TEST_HASH).await, "unpinned engine is removed");
+        assert_eq!(
+            *removed.lock().unwrap(),
+            vec![OTHER_HASH.to_string(), TEST_HASH.to_string()]
+        );
+    }
+
+    /// With seeding disabled the periodic loop pauses idle torrents; a
+    /// pinned one must keep downloading.
+    #[tokio::test(start_paused = true)]
+    async fn seeding_disabled_loop_skips_pinned_engine() {
+        let TwoEngines {
+            enginefs,
+            counters: [pinned, unpinned],
+            ..
+        } = test_enginefs_with_two_engines();
+        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
+        enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
+
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        assert_eq!(unpinned.pause_torrent.load(Ordering::SeqCst), 1);
+        assert_eq!(pinned.pause_torrent.load(Ordering::SeqCst), 0);
+        assert!(
+            !enginefs
+                .get_engine(TEST_HASH)
+                .await
+                .unwrap()
+                .idle_paused
+                .load(Ordering::Relaxed)
+        );
+    }
+
+    /// The post-stream grace-period pause skips a pinned torrent too.
+    #[tokio::test]
+    async fn idle_pause_after_stream_skips_pinned_torrent() {
+        let (enginefs, counters) = test_enginefs_with_file_count(3);
+        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
+        enginefs.pin_download(TEST_HASH, 2, None).await.unwrap();
+
+        enginefs
+            .schedule_torrent_pause_after(TEST_HASH.to_string(), Duration::from_millis(10))
+            .await
+            .unwrap();
+
+        assert_eq!(counters.pause_torrent.load(Ordering::SeqCst), 0);
     }
 
     // --- season-pack episode guessing (server.js guessFileIdx parity) ---

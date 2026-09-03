@@ -613,6 +613,10 @@ impl TorrentBackend for LibrqbitBackend {
     async fn remove_torrent(&self, info_hash: &str) -> Result<()> {
         let id = librqbit::api::TorrentIdOrHash::parse(info_hash)
             .with_context(|| format!("invalid info hash {info_hash}"))?;
+        let output_folder = self
+            .session
+            .get(id)
+            .map(|handle| handle.output_folder().to_path_buf());
         // delete_files=false keeps downloaded data on disk, matching the
         // libtorrent backend's remove_torrent(handle, false).
         self.session
@@ -621,6 +625,22 @@ impl TorrentBackend for LibrqbitBackend {
             .with_context(|| format!("failed to remove torrent {info_hash}"))?;
         self.deferred_selections.lock().remove(info_hash);
         self.pinned_files.lock().remove(info_hash);
+        // `Session::delete(_, false)` only removes empty directories on the
+        // delete_files=true branch, so a torrent that never wrote anything
+        // (or whose files were cleaned out) would leave its output folder
+        // behind on every idle sweep. `remove_dir` fails on a non-empty
+        // directory, so this can only ever drop an empty folder -- and never
+        // the session root, which single-file torrents write straight into.
+        if let Some(folder) = output_folder
+            && folder != self.download_dir
+            && let Err(e) = tokio::fs::remove_dir(&folder).await
+            && !matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            )
+        {
+            debug!(error = %e, path = ?folder, "Left the torrent's output folder in place");
+        }
         // Best-effort: drop the cached .torrent file so the restore path in
         // `new()` does not resurrect the torrent on the next startup.
         let cached = self
@@ -2713,6 +2733,76 @@ mod tests {
         handle.prepare_file_for_streaming(0).await.unwrap();
         handle.clear_file_streaming(0).await.unwrap();
         assert_eq!(handle.handle.only_files(), None);
+    }
+
+    /// `Session::delete(_, false)` leaves the output folder behind even
+    /// when it is empty; `remove_torrent` cleans that up -- and only that:
+    /// a folder with data in it and the session root itself stay.
+    #[tokio::test]
+    async fn remove_torrent_removes_empty_output_folder_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        tokio::fs::create_dir_all(&src).await.unwrap();
+        write_payload(&src.join("a.bin"), 32 * 1024).await;
+        write_payload(&src.join("b.bin"), 32 * 1024).await;
+        let (multi_bytes, multi_hash) = make_torrent(&src).await;
+        let single_payload = tmp.path().join("single.bin");
+        write_payload(&single_payload, 16 * 1024).await;
+        let (single_bytes, single_hash) = make_torrent(&single_payload).await;
+
+        let dl = tmp.path().join("dl");
+        let backend = LibrqbitBackend::new_for_tests(dl.clone())
+            .await
+            .expect("hermetic session");
+        let multi = backend
+            .add_torrent(TorrentSource::Bytes(multi_bytes.clone()), vec![])
+            .await
+            .unwrap();
+        multi.handle.wait_until_initialized().await.unwrap();
+        let single = backend
+            .add_torrent(TorrentSource::Bytes(single_bytes), vec![])
+            .await
+            .unwrap();
+        single.handle.wait_until_initialized().await.unwrap();
+        assert_eq!(
+            single.handle.output_folder(),
+            dl,
+            "single-file torrents write into the root"
+        );
+        let multi_dir = multi.handle.output_folder().to_path_buf();
+        assert_eq!(multi_dir, dl.join("src"));
+        assert!(multi_dir.is_dir());
+
+        // Nothing downloaded: the multi-file torrent's folder is empty
+        // (drop whatever librqbit pre-created) and goes with the torrent.
+        tokio::fs::remove_dir_all(&multi_dir).await.unwrap();
+        tokio::fs::create_dir_all(&multi_dir).await.unwrap();
+        backend.remove_torrent(&multi_hash).await.unwrap();
+        assert!(!multi_dir.exists(), "empty output folder must be removed");
+
+        // The root is never removed, however empty, and a single-file
+        // torrent's data survives in it.
+        for entry in std::fs::read_dir(&dl).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                std::fs::remove_dir_all(&path).unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+            }
+        }
+        backend.remove_torrent(&single_hash).await.unwrap();
+        assert!(dl.is_dir(), "session root must survive");
+
+        // A folder that still holds data is left alone.
+        tokio::fs::create_dir_all(&dl.join("src")).await.unwrap();
+        write_payload(&dl.join("src").join("a.bin"), 32 * 1024).await;
+        let multi = backend
+            .add_torrent(TorrentSource::Bytes(multi_bytes), vec![])
+            .await
+            .unwrap();
+        multi.handle.wait_until_initialized().await.unwrap();
+        backend.remove_torrent(&multi_hash).await.unwrap();
+        assert!(dl.join("src").join("a.bin").is_file());
     }
 
     #[tokio::test]
