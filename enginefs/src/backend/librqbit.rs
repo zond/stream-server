@@ -2251,7 +2251,7 @@ mod tests {
         handle.handle.wait_until_initialized().await.unwrap();
 
         let r = handle
-            .wait_for_piece_ready(0, 0, Duration::from_secs(5), PlaybackIntent::DirectInitial)
+            .wait_for_piece_ready(0, 0, TEST_WAIT_BOUND, PlaybackIntent::DirectInitial)
             .await
             .unwrap();
         assert!(r.ready, "seeded torrent must be ready: {}", r.reason);
@@ -2263,12 +2263,7 @@ mod tests {
         // torrent, so the file starts at torrent offset 0).
         let offset = 40_000u64;
         let r = handle
-            .wait_for_piece_ready(
-                0,
-                offset,
-                Duration::from_secs(5),
-                PlaybackIntent::DirectSeek,
-            )
+            .wait_for_piece_ready(0, offset, TEST_WAIT_BOUND, PlaybackIntent::DirectSeek)
             .await
             .unwrap();
         assert!(r.ready, "mid-file offset must be ready: {}", r.reason);
@@ -3066,7 +3061,7 @@ mod tests {
 
         // Gating must not starve the selected, streamed file.
         let r = handle
-            .wait_for_piece_ready(0, 0, Duration::from_secs(5), PlaybackIntent::DirectInitial)
+            .wait_for_piece_ready(0, 0, TEST_WAIT_BOUND, PlaybackIntent::DirectInitial)
             .await
             .unwrap();
         assert!(r.ready, "selected file must stay readable: {}", r.reason);
