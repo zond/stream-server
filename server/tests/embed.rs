@@ -1051,6 +1051,12 @@ fn pinned_download_relocates_into_downloads_dir_and_survives_a_restart() -> anyh
             .is_err(),
         "a relative downloadsDir is refused"
     );
+    assert!(
+        handle
+            .update_settings(serde_json::json!({ "downloadsDir": 123 }))
+            .is_err(),
+        "a downloadsDir that is neither a string nor null is refused, not ignored"
+    );
     assert_eq!(handle.settings()?.downloads_dir, None);
     let downloads = downloads_dir.path().join("offline");
     let updated = handle.update_settings(serde_json::json!({

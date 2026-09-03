@@ -526,19 +526,22 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// Merge `payload` (the `POST /settings` body: any subset of the camelCase
-/// settings keys; wrong-typed values leave that setting unchanged) into the
-/// live settings, push the torrent-related values into both engines and
+/// settings keys; wrong-typed values leave that setting unchanged, except
+/// `downloadsDir`, which is validated and fails the update) into the live
+/// settings, push the torrent-related values into both engines and
 /// persist. Returns the settings as they are afterwards. Shared by the HTTP
 /// handler and `ServerHandle::update_settings`.
 pub async fn update_settings(state: &AppState, payload: &Value) -> anyhow::Result<ServerSettings> {
     tracing::debug!("update_settings: received payload: {:?}", payload);
 
     // `downloadsDir` is the one validated setting: an unusable directory
-    // fails the whole update (nothing is merged), before the lock is taken.
+    // -- or a value that is neither a path nor `null` -- fails the whole
+    // update (nothing is merged), before the lock is taken.
     let downloads_dir_patch = match payload.get("downloadsDir") {
+        None => None,
         Some(Value::Null) => Some(None),
         Some(Value::String(raw)) => Some(Some(prepare_downloads_dir(raw).await?)),
-        _ => None,
+        Some(other) => anyhow::bail!("downloadsDir must be a string or null, got {other}"),
     };
 
     // Merge with existing settings
