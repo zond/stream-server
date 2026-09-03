@@ -312,7 +312,23 @@ pub async fn prepare_downloads_dir(
     if let Err(error) = tokio::fs::remove_file(&probe).await {
         tracing::debug!(path = %probe.display(), %error, "could not remove the write probe");
     }
-    Ok(plain_path(canonical_prefix(&path)))
+    Ok(resolved_path(&path))
+}
+
+/// The spelling [`prepare_downloads_dir`] resolves `path` to, without
+/// creating or validating anything.
+///
+/// Exported for tests only. A test that builds an expectation from a
+/// `TempDir` path and compares it against what the server reports must
+/// send it through exactly this, or it compares two spellings of the same
+/// directory: on Windows `TempDir` hands back the 8.3 short name
+/// (`C:\Users\RUNNER~1\...`) while the server answers with the long one
+/// (`C:\Users\runneradmin\...`), and on macOS `/var/...` is a symlink to
+/// `/private/var/...`. Never duplicate the normalisation in a test -- the
+/// point is that both sides go through the same code.
+#[doc(hidden)]
+pub fn resolved_path(path: &std::path::Path) -> std::path::PathBuf {
+    plain_path(canonical_prefix(path))
 }
 
 /// A canonicalised path as the rest of the world should see it. On Windows

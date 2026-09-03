@@ -909,6 +909,19 @@ fn write_payload(path: &std::path::Path, len: usize) {
     std::fs::write(path, data).expect("write payload");
 }
 
+/// A `TempDir`-derived path in the spelling the server answers with.
+///
+/// `prepare_downloads_dir` stores and reports the *resolved* `downloadsDir`,
+/// so an expectation built from a `TempDir` path has to be resolved the same
+/// way or it compares two spellings of the same directory: on Windows
+/// `TempDir` hands back the 8.3 short name (`C:\Users\RUNNER~1\...`) while
+/// the server answers with the long one (`C:\Users\runneradmin\...`), and on
+/// macOS `/var/...` is a symlink to `/private/var/...`. Both sides go through
+/// the server's own `resolved_path` rather than a copy of it.
+fn resolved(path: &std::path::Path) -> std::path::PathBuf {
+    stream_server::resolved_path(path)
+}
+
 /// Index of the file called `name` in `stats.files` (torrent file order is
 /// whatever `create_torrent`'s directory walk produced).
 fn file_index(stats: &serde_json::Value, name: &str) -> usize {
@@ -966,7 +979,7 @@ fn unusable_persisted_downloads_dir_is_cleared_on_disk() -> anyhow::Result<()> {
             &settings_file,
         )?)?)
     };
-    let downloads = downloads_dir.path().join("offline");
+    let downloads = resolved(&downloads_dir.path().join("offline"));
 
     let handle = stream_server::start(config())?;
     handle.update_settings(serde_json::json!({ "downloadsDir": downloads.to_str().unwrap() }))?;
@@ -1058,7 +1071,7 @@ fn pinned_download_relocates_into_downloads_dir_and_survives_a_restart() -> anyh
         "a downloadsDir that is neither a string nor null is refused, not ignored"
     );
     assert_eq!(handle.settings()?.downloads_dir, None);
-    let downloads = downloads_dir.path().join("offline");
+    let downloads = resolved(&downloads_dir.path().join("offline"));
     let updated = handle.update_settings(serde_json::json!({
         "downloadsDir": downloads.to_str().unwrap()
     }))?;
@@ -1198,7 +1211,7 @@ fn fastresume_persists_piece_bitfields_on_both_roots() -> anyhow::Result<()> {
     std::fs::create_dir_all(&root_folder)?;
     std::fs::copy(streamed.join("s1.bin"), root_folder.join("s1.bin"))?;
     std::fs::copy(streamed.join("s2.bin"), root_folder.join("s2.bin"))?;
-    let downloads = downloads_dir.path().join("offline");
+    let downloads = resolved(&downloads_dir.path().join("offline"));
     let pinned_folder = downloads.join(&pinned_hash);
     std::fs::create_dir_all(&pinned_folder)?;
     std::fs::copy(pinned.join("p2.bin"), pinned_folder.join("p2.bin"))?;
@@ -1329,7 +1342,7 @@ fn download_routes_match_the_library_api() -> anyhow::Result<()> {
     let first = file_index(&stats, "e1.bin");
     let second = file_index(&stats, "e2.bin");
 
-    let downloads = downloads_dir.path().join("offline");
+    let downloads = resolved(&downloads_dir.path().join("offline"));
     handle.update_settings(serde_json::json!({ "downloadsDir": downloads.to_str().unwrap() }))?;
     let target = downloads.join(&info_hash);
 

@@ -9,7 +9,7 @@ use enginefs::EngineFS;
 pub use enginefs::backend::{EngineStats, TorrentListenPort};
 pub use enginefs::{PIN_FREE_SPACE_MARGIN, PinDownloadError, UnpinOutcome};
 pub use routes::downloads::DownloadInfo;
-pub use routes::system::{FileNotFound, ServerSettings};
+pub use routes::system::{FileNotFound, ServerSettings, resolved_path};
 pub use state::AppState;
 use std::{
     future::{IntoFuture, pending},
