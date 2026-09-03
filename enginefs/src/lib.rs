@@ -2117,6 +2117,27 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         pinned
     }
 
+    /// The pins [`Self::restore_pinned_downloads`] found no torrent for,
+    /// ordered like [`Self::pinned_downloads`] -- persisted pins of a
+    /// torrent the backend did not restore (its output folder on a volume
+    /// that is not mounted, say). They are not downloading anything: the
+    /// torrent comes back on a later boot, or with the next
+    /// [`Self::pin_download`] of it, which applies them alongside its own.
+    /// A caller listing downloads reports these as the stalled entries they
+    /// are instead of losing them.
+    pub fn dormant_pinned_downloads(&self) -> Vec<PinnedDownload> {
+        self.dormant_pins
+            .lock()
+            .iter()
+            .flat_map(|(info_hash, indices)| {
+                indices.iter().map(|file_idx| PinnedDownload {
+                    info_hash: info_hash.clone(),
+                    file_idx: *file_idx,
+                })
+            })
+            .collect()
+    }
+
     /// The file exists, and the volume it is (or will be) written to has
     /// room for what the pin will write there plus [`PIN_FREE_SPACE_MARGIN`]:
     /// the file's missing bytes -- or, when the pin relocates the torrent
@@ -5506,6 +5527,15 @@ mod tests {
         let (second, _counters) = make(false, OTHER_HASH);
         assert_eq!(second.restore_pinned_downloads().await, 0);
         assert!(second.pinned_downloads().await.is_empty());
+        // Not live, but listable: a caller enumerating downloads reports
+        // them as stalled instead of dropping them from its list.
+        assert_eq!(
+            second.dormant_pinned_downloads(),
+            vec![PinnedDownload {
+                info_hash: TEST_HASH.to_string(),
+                file_idx: 1
+            }]
+        );
         assert_eq!(read_pins(&path), serde_json::json!({ TEST_HASH: [1] }));
         second.pin_download(OTHER_HASH, 0, None).await.unwrap();
         assert_eq!(
@@ -5515,6 +5545,7 @@ mod tests {
         // An unpin reaches a dormant pin too.
         assert!(second.unpin_download(TEST_HASH, 1, false).await.unwrap());
         assert!(!second.unpin_download(TEST_HASH, 1, false).await.unwrap());
+        assert!(second.dormant_pinned_downloads().is_empty());
         assert_eq!(read_pins(&path), serde_json::json!({ OTHER_HASH: [0] }));
         drop(second);
 
