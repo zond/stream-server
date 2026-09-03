@@ -81,7 +81,7 @@ mod app {
 
     fn run(options: CliOptions) -> anyhow::Result<()> {
         let rt = tokio::runtime::Runtime::new()?;
-        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let (_tx, rx) = tokio::sync::mpsc::channel::<()>(1);
         let mut cfg = stream_server::ServerConfig::binary_default();
         cfg.use_tui = options.use_tui;
         cfg.auth = options.auth;
