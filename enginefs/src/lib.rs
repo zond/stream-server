@@ -3780,7 +3780,19 @@ mod tests {
         };
         let mut restored = HashMap::new();
         restored.insert(TEST_HASH.to_string(), handle.clone());
-        let root = std::env::temp_dir().join("enginefs-hls-lease-tests");
+        // A root of its own per engine. The pin set is persisted to
+        // `<download dir>/pinned-downloads.json` on every change, and the
+        // tests run in parallel: sharing one root, a test that pins races
+        // every test that asserts on that file. The parent is wiped once
+        // per test process so the roots do not pile up across runs.
+        static ROOTS: AtomicUsize = AtomicUsize::new(0);
+        static WIPE: std::sync::Once = std::sync::Once::new();
+        let parent = std::env::temp_dir().join("enginefs-fake-engine-tests");
+        WIPE.call_once(|| {
+            let _ = std::fs::remove_dir_all(&parent);
+        });
+        let root = parent.join(ROOTS.fetch_add(1, Ordering::SeqCst).to_string());
+        std::fs::create_dir_all(root.join("downloads")).unwrap();
         let enginefs = BackendEngineFS::new_with_backend(
             FakeBackend::new(vec![handle]),
             restored,
