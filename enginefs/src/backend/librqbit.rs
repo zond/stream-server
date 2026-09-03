@@ -3291,6 +3291,17 @@ mod tests {
             "error opening {:?} in read/write mode",
             tmp.path().join("dl").join("src").join("a.bin")
         );
+        // The server path as the error renders it. `Debug` on a path escapes
+        // the separator, so on Windows the chain holds `C:\\dir\\dl` where
+        // `Path::to_str` would give `C:\dir\dl`: match the formatting the
+        // error itself used rather than the raw path, or the check passes
+        // vacuously on one platform and fails on the other.
+        let server_path = format!("{:?}", tmp.path());
+        let server_path = server_path.trim_matches('"');
+        assert!(
+            librqbit_error.contains(server_path),
+            "the fixture error names the server path: {librqbit_error}"
+        );
         let response = backend
             .session
             .add_torrent(
@@ -3328,7 +3339,8 @@ mod tests {
         let reported = stats.error.expect("the reason reaches the client");
         assert!(!reported.is_empty());
         assert!(
-            !reported.contains(tmp.path().to_str().unwrap())
+            !reported.contains(server_path)
+                && !reported.contains(tmp.path().to_str().unwrap())
                 && !reported.contains("a.bin")
                 && !reported.contains(&hash),
             "no server path leaks into the response: {reported}"
@@ -3338,7 +3350,7 @@ mod tests {
                 .reported_errors
                 .lock()
                 .get(&hash)
-                .is_some_and(|logged| logged.contains(tmp.path().to_str().unwrap())),
+                .is_some_and(|logged| logged.contains(server_path)),
             "the full chain is kept for the log, and logged once"
         );
 
