@@ -1044,7 +1044,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1158,7 +1158,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2208,7 +2208,7 @@ dependencies = [
 [[package]]
 name = "librqbit"
 version = "9.0.1"
-source = "git+https://github.com/zond/rqbit?branch=feat%2Fconfigurable-stream-lookahead#539f31a2122567d4eba6915214b996b5bc5240c6"
+source = "git+https://github.com/zond/rqbit?branch=feat%2Fconfigurable-stream-lookahead#499aae8009d10ddc6cba7cf2ddcc791a0bcbf5de"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2271,7 +2271,7 @@ dependencies = [
 [[package]]
 name = "librqbit-bencode"
 version = "9.0.1"
-source = "git+https://github.com/zond/rqbit?branch=feat%2Fconfigurable-stream-lookahead#539f31a2122567d4eba6915214b996b5bc5240c6"
+source = "git+https://github.com/zond/rqbit?branch=feat%2Fconfigurable-stream-lookahead#499aae8009d10ddc6cba7cf2ddcc791a0bcbf5de"
 dependencies = [
  "anyhow",
  "arrayvec",
@@ -2287,7 +2287,7 @@ dependencies = [
 [[package]]
 name = "librqbit-buffers"
 version = "9.0.1"
-source = "git+https://github.com/zond/rqbit?branch=feat%2Fconfigurable-stream-lookahead#539f31a2122567d4eba6915214b996b5bc5240c6"
+source = "git+https://github.com/zond/rqbit?branch=feat%2Fconfigurable-stream-lookahead#499aae8009d10ddc6cba7cf2ddcc791a0bcbf5de"
 dependencies = [
  "bytes",
  "librqbit-clone-to-owned",
@@ -2298,7 +2298,7 @@ dependencies = [
 [[package]]
 name = "librqbit-clone-to-owned"
 version = "9.0.1"
-source = "git+https://github.com/zond/rqbit?branch=feat%2Fconfigurable-stream-lookahead#539f31a2122567d4eba6915214b996b5bc5240c6"
+source = "git+https://github.com/zond/rqbit?branch=feat%2Fconfigurable-stream-lookahead#499aae8009d10ddc6cba7cf2ddcc791a0bcbf5de"
 dependencies = [
  "bytes",
 ]
@@ -2306,7 +2306,7 @@ dependencies = [
 [[package]]
 name = "librqbit-core"
 version = "9.0.1"
-source = "git+https://github.com/zond/rqbit?branch=feat%2Fconfigurable-stream-lookahead#539f31a2122567d4eba6915214b996b5bc5240c6"
+source = "git+https://github.com/zond/rqbit?branch=feat%2Fconfigurable-stream-lookahead#499aae8009d10ddc6cba7cf2ddcc791a0bcbf5de"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2335,7 +2335,7 @@ dependencies = [
 [[package]]
 name = "librqbit-dht"
 version = "9.0.1"
-source = "git+https://github.com/zond/rqbit?branch=feat%2Fconfigurable-stream-lookahead#539f31a2122567d4eba6915214b996b5bc5240c6"
+source = "git+https://github.com/zond/rqbit?branch=feat%2Fconfigurable-stream-lookahead#499aae8009d10ddc6cba7cf2ddcc791a0bcbf5de"
 dependencies = [
  "anyhow",
  "backon",
@@ -2382,7 +2382,7 @@ dependencies = [
 [[package]]
 name = "librqbit-lsd"
 version = "9.0.1"
-source = "git+https://github.com/zond/rqbit?branch=feat%2Fconfigurable-stream-lookahead#539f31a2122567d4eba6915214b996b5bc5240c6"
+source = "git+https://github.com/zond/rqbit?branch=feat%2Fconfigurable-stream-lookahead#499aae8009d10ddc6cba7cf2ddcc791a0bcbf5de"
 dependencies = [
  "anyhow",
  "atoi",
@@ -2401,7 +2401,7 @@ dependencies = [
 [[package]]
 name = "librqbit-peer-protocol"
 version = "9.0.1"
-source = "git+https://github.com/zond/rqbit?branch=feat%2Fconfigurable-stream-lookahead#539f31a2122567d4eba6915214b996b5bc5240c6"
+source = "git+https://github.com/zond/rqbit?branch=feat%2Fconfigurable-stream-lookahead#499aae8009d10ddc6cba7cf2ddcc791a0bcbf5de"
 dependencies = [
  "anyhow",
  "bitvec",
@@ -2421,7 +2421,7 @@ dependencies = [
 [[package]]
 name = "librqbit-sha1-wrapper"
 version = "9.0.1"
-source = "git+https://github.com/zond/rqbit?branch=feat%2Fconfigurable-stream-lookahead#539f31a2122567d4eba6915214b996b5bc5240c6"
+source = "git+https://github.com/zond/rqbit?branch=feat%2Fconfigurable-stream-lookahead#499aae8009d10ddc6cba7cf2ddcc791a0bcbf5de"
 dependencies = [
  "assert_cfg",
  "aws-lc-rs",
@@ -2430,7 +2430,7 @@ dependencies = [
 [[package]]
 name = "librqbit-tracker-comms"
 version = "9.0.1"
-source = "git+https://github.com/zond/rqbit?branch=feat%2Fconfigurable-stream-lookahead#539f31a2122567d4eba6915214b996b5bc5240c6"
+source = "git+https://github.com/zond/rqbit?branch=feat%2Fconfigurable-stream-lookahead#499aae8009d10ddc6cba7cf2ddcc791a0bcbf5de"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2458,7 +2458,7 @@ dependencies = [
 [[package]]
 name = "librqbit-upnp"
 version = "9.0.1"
-source = "git+https://github.com/zond/rqbit?branch=feat%2Fconfigurable-stream-lookahead#539f31a2122567d4eba6915214b996b5bc5240c6"
+source = "git+https://github.com/zond/rqbit?branch=feat%2Fconfigurable-stream-lookahead#499aae8009d10ddc6cba7cf2ddcc791a0bcbf5de"
 dependencies = [
  "anyhow",
  "bstr",
@@ -2800,7 +2800,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3312,7 +3312,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3752,7 +3752,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3810,7 +3810,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4256,7 +4256,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4463,7 +4463,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4476,7 +4476,7 @@ dependencies = [
  "parking_lot",
  "rustix",
  "signal-hook",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5301,7 +5301,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
