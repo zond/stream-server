@@ -1,6 +1,7 @@
 use crate::backend::{EngineStats, TorrentHandle, priorities::PlaybackIntent};
 use crate::cache::DataCache;
 use anyhow::Context;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -252,6 +253,11 @@ pub struct Engine<H: TorrentHandle> {
     /// Whether this torrent was paused by the idle seeding-disabled policy.
     /// A new playback request resumes it before making a file wanted.
     pub idle_paused: AtomicBool,
+    /// Files pinned as offline downloads (`BackendEngineFS::pin_download`).
+    /// While non-empty the engine is exempt from idle removal and the
+    /// seeding-disabled pause; the handle keeps its own copy for the
+    /// want-set planner (`TorrentHandle::pin_file`).
+    pub pinned_files: parking_lot::RwLock<BTreeSet<usize>>,
 }
 
 impl<H: TorrentHandle> Engine<H> {
@@ -267,7 +273,18 @@ impl<H: TorrentHandle> Engine<H> {
                 .max_capacity(64 * 1024 * 1024) // 64MB cache per engine
                 .build(),
             idle_paused: AtomicBool::new(false),
+            pinned_files: parking_lot::RwLock::new(BTreeSet::new()),
         }
+    }
+
+    /// Whether any file of this torrent is pinned as an offline download.
+    pub fn is_pinned(&self) -> bool {
+        !self.pinned_files.read().is_empty()
+    }
+
+    /// The pinned file indices, ascending.
+    pub fn pinned_file_indices(&self) -> Vec<usize> {
+        self.pinned_files.read().iter().copied().collect()
     }
 
     pub fn touch(&self) {

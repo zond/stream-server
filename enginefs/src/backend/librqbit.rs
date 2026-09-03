@@ -7,7 +7,7 @@ use crate::backend::{
 use anyhow::{Context, Result};
 use librqbit::{ManagedTorrent, ManagedTorrentState, Session};
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -193,6 +193,14 @@ impl<Op: Send + 'static> DeferredSelection<Op> {
 /// every `LibrqbitHandle` clone (handles are re-created by `get_torrent`).
 type DeferredSelections = Arc<Mutex<HashMap<String, Arc<DeferredSelection<DeferredOp>>>>>;
 
+/// Per-torrent pinned file sets (`TorrentHandle::pin_file`), keyed by info
+/// hash and shared by every handle clone for the same reason as
+/// `DeferredSelections`. Consulted by every want-set update so a pinned file
+/// survives playback switching. In-memory only: librqbit persists the
+/// resulting `only_files`, so a pinned file keeps downloading across a
+/// restart, but the pin itself has to be re-issued by whoever owns it.
+type PinnedFiles = Arc<Mutex<HashMap<String, BTreeSet<usize>>>>;
+
 /// A selection op parked until the torrent initializes.
 #[derive(Debug, Clone, Copy)]
 struct DeferredOp {
@@ -217,6 +225,7 @@ pub struct LibrqbitBackend {
     pub session: Arc<Session>,
     download_dir: PathBuf,
     deferred_selections: DeferredSelections,
+    pinned_files: PinnedFiles,
 }
 
 impl LibrqbitBackend {
@@ -289,6 +298,7 @@ impl LibrqbitBackend {
             }
         };
         let deferred_selections: DeferredSelections = Default::default();
+        let pinned_files: PinnedFiles = Default::default();
         // Restore from session
         let mut restored_handles = session.with_torrents(|iter| {
             let mut map = HashMap::new();
@@ -301,6 +311,7 @@ impl LibrqbitBackend {
                         info_hash,
                         session: session.clone(),
                         deferred_selections: deferred_selections.clone(),
+                        pinned_files: pinned_files.clone(),
                     },
                 );
             }
@@ -334,6 +345,7 @@ impl LibrqbitBackend {
                                             info_hash,
                                             session: session.clone(),
                                             deferred_selections: deferred_selections.clone(),
+                                            pinned_files: pinned_files.clone(),
                                         },
                                     );
                                 }
@@ -350,6 +362,7 @@ impl LibrqbitBackend {
                 session,
                 download_dir,
                 deferred_selections,
+                pinned_files,
             },
             restored_handles,
         ))
@@ -374,6 +387,7 @@ impl LibrqbitBackend {
             session,
             download_dir,
             deferred_selections: Default::default(),
+            pinned_files: Default::default(),
         })
     }
 }
@@ -396,19 +410,25 @@ fn file_progress_fields(len: u64, have: u64) -> (u64, f64) {
 /// `plan_only_files` onto librqbit's `only_files` want-set.
 #[derive(Debug, Clone, Copy)]
 enum SelectionOp {
-    /// Exclusive selection of one file for streaming.
+    /// Exclusive selection of one file for streaming (plus the pinned set).
     Prepare(usize),
-    /// Deselect one file, keeping the rest of the selection.
+    /// Deselect one file, keeping the rest of the selection (a pinned file
+    /// is never deselected).
     Clear(usize),
-    /// Want exactly the union of the active and hot files.
+    /// Want exactly the union of the active and hot files (plus the pinned
+    /// set).
     Reconcile {
         active: Option<usize>,
         hot: Option<usize>,
     },
+    /// Add one file to whatever is currently selected (plus the pinned set)
+    /// without disturbing the playback selection.
+    Pin(usize),
 }
 
-/// Pure planner mapping the current `only_files` selection and an operation to
-/// the new selection to apply. `None` means "apply nothing".
+/// Pure planner mapping the current `only_files` selection, the pinned set
+/// and an operation to the new selection to apply. `None` means "apply
+/// nothing".
 ///
 /// Invariants enforced here (unit-tested):
 /// - Single-file torrents are always fully wanted: never touch selection.
@@ -417,45 +437,60 @@ enum SelectionOp {
 /// - `Clear` of a file that is not currently selected (a newer `Prepare`
 ///   already switched away) is a no-op, so late delayed-cleanup and HLS-lease
 ///   expiry cannot clobber the active selection.
+/// - Every in-range pinned index is in every result, and `Clear` of a pinned
+///   index is a no-op: playback switching never deselects an offline
+///   download.
 /// - Out-of-range indices are dropped; a plan left empty by that is a no-op.
 fn plan_only_files(
     current: Option<&[usize]>,
     file_count: usize,
+    pinned: &BTreeSet<usize>,
     op: SelectionOp,
 ) -> Option<HashSet<usize>> {
     if file_count <= 1 {
         return None;
     }
+    let in_range = |i: &usize| *i < file_count;
+    let with_pinned = |set: HashSet<usize>| -> Option<HashSet<usize>> {
+        let set: HashSet<usize> = set
+            .into_iter()
+            .chain(pinned.iter().copied())
+            .filter(in_range)
+            .collect();
+        if set.is_empty() { None } else { Some(set) }
+    };
     match op {
         SelectionOp::Prepare(idx) => {
             if idx >= file_count {
                 return None;
             }
-            Some(std::iter::once(idx).collect())
+            with_pinned(std::iter::once(idx).collect())
         }
         SelectionOp::Clear(idx) => {
             let current = current?;
-            if !current.contains(&idx) {
+            if !current.contains(&idx) || pinned.contains(&idx) {
                 return None;
             }
-            let remainder: HashSet<usize> = current
-                .iter()
-                .copied()
-                .filter(|i| *i != idx && *i < file_count)
-                .collect();
+            let remainder: HashSet<usize> = current.iter().copied().filter(|i| *i != idx).collect();
             if remainder.is_empty() {
                 None
             } else {
-                Some(remainder)
+                with_pinned(remainder)
             }
         }
         SelectionOp::Reconcile { active, hot } => {
-            let set: HashSet<usize> = active
-                .into_iter()
-                .chain(hot)
-                .filter(|i| *i < file_count)
-                .collect();
-            if set.is_empty() { None } else { Some(set) }
+            with_pinned(active.into_iter().chain(hot).collect())
+        }
+        SelectionOp::Pin(idx) => {
+            if idx >= file_count {
+                return None;
+            }
+            // `current == None` is librqbit for "everything wanted": pinning
+            // narrows that to the pinned set, which is the point of an
+            // offline download (fetch this file, not the whole torrent).
+            let mut set: HashSet<usize> = current.unwrap_or_default().iter().copied().collect();
+            set.insert(idx);
+            with_pinned(set)
         }
     }
 }
@@ -469,6 +504,8 @@ pub struct LibrqbitHandle {
     session: Arc<Session>,
     /// Backend-wide deferred-selection slots (see `DeferredSelection`).
     deferred_selections: DeferredSelections,
+    /// Backend-wide pinned file sets (see `PinnedFiles`).
+    pinned_files: PinnedFiles,
 }
 
 /// Put `trackers` into a magnet link as `tr=` params.
@@ -556,6 +593,7 @@ impl TorrentBackend for LibrqbitBackend {
             info_hash,
             session: self.session.clone(),
             deferred_selections: self.deferred_selections.clone(),
+            pinned_files: self.pinned_files.clone(),
         })
     }
 
@@ -568,6 +606,7 @@ impl TorrentBackend for LibrqbitBackend {
             info_hash,
             session: self.session.clone(),
             deferred_selections: self.deferred_selections.clone(),
+            pinned_files: self.pinned_files.clone(),
         })
     }
 
@@ -581,6 +620,7 @@ impl TorrentBackend for LibrqbitBackend {
             .await
             .with_context(|| format!("failed to remove torrent {info_hash}"))?;
         self.deferred_selections.lock().remove(info_hash);
+        self.pinned_files.lock().remove(info_hash);
         // Best-effort: drop the cached .torrent file so the restore path in
         // `new()` does not resurrect the torrent on the next startup.
         let cached = self
@@ -684,6 +724,7 @@ impl TorrentHandle for LibrqbitHandle {
             crate::backend::priorities::PlaybackIntent::DirectInitial,
         );
 
+        let pinned = self.pinned_set();
         let mut files = Vec::new();
         let mut total_size = 0u64;
         let mut offset = 0u64;
@@ -694,6 +735,11 @@ impl TorrentHandle for LibrqbitHandle {
                 // file_progress is empty while the torrent is Initializing.
                 let have = stats.file_progress.get(i).copied().unwrap_or(0);
                 let (file_downloaded, file_progress) = file_progress_fields(f.len, have);
+                // Complete = every byte verified; `have` is clamped to the
+                // length above, so equality is the whole test. A torrent
+                // without a piece map yet (empty file_progress) reports 0
+                // and so never claims completion of a non-empty file.
+                let complete = file_downloaded == f.len;
                 let window = haves.as_ref().map(|bf| {
                     crate::backend::priorities::initial_window_progress(
                         offset,
@@ -712,6 +758,8 @@ impl TorrentHandle for LibrqbitHandle {
                     progress: file_progress,
                     initial_window_ready_bytes: window.map(|(ready, _)| ready),
                     initial_window_bytes: window.map(|(_, total)| total),
+                    pinned: pinned.contains(&i),
+                    complete,
                 });
                 total_size += f.len;
                 offset += f.len;
@@ -794,6 +842,7 @@ impl TorrentHandle for LibrqbitHandle {
             initial_window_bytes: None,
             peer_discovery,
             error: None,
+            pinned_files: pinned.into_iter().collect(),
         }
     }
 
@@ -941,6 +990,52 @@ impl TorrentHandle for LibrqbitHandle {
             InitPolicy::Skip,
         )
         .await
+    }
+
+    /// Pin `file_idx` (see the trait doc): record it in the backend-wide pin
+    /// set, which every later planner run unions in, and add it to the
+    /// current selection right away. Deferred like `reconcile_file_priorities`
+    /// while the torrent is Initializing -- the pin is already recorded, so a
+    /// prepare/reconcile that lands first carries it anyway. Err only for a
+    /// provably-bad index; other selection failures are best-effort.
+    async fn pin_file(&self, file_idx: usize) -> Result<()> {
+        let file_count = self.file_count_from_metadata();
+        if let Some(file_count) = file_count
+            && file_idx >= file_count
+        {
+            anyhow::bail!("File index {file_idx} out of range ({file_count} files)");
+        }
+        self.pinned_files
+            .lock()
+            .entry(self.info_hash.clone())
+            .or_default()
+            .insert(file_idx);
+        let Some(file_count) = file_count else {
+            // Metadata still resolving: the pin is recorded and the first
+            // selection update after resolution applies it.
+            return Ok(());
+        };
+        self.apply_selection(
+            SelectionOp::Pin(file_idx),
+            file_count,
+            "pin_file",
+            InitPolicy::Defer,
+        )
+        .await
+    }
+
+    /// Forget the pin (see the trait doc). The selection is left alone: the
+    /// file may be the one currently streaming, and only the engine layer
+    /// knows what should stay wanted -- it reconciles right after.
+    async fn unpin_file(&self, file_idx: usize) -> Result<()> {
+        let mut pinned = self.pinned_files.lock();
+        if let Some(set) = pinned.get_mut(&self.info_hash) {
+            set.remove(&file_idx);
+            if set.is_empty() {
+                pinned.remove(&self.info_hash);
+            }
+        }
+        Ok(())
     }
 
     /// The engine's primary multi-file switching hook
@@ -1120,6 +1215,15 @@ impl LibrqbitHandle {
         self.handle.metadata.load_full().map(|m| m.file_infos.len())
     }
 
+    /// Snapshot of this torrent's pinned file indices.
+    fn pinned_set(&self) -> BTreeSet<usize> {
+        self.pinned_files
+            .lock()
+            .get(&self.info_hash)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// True for any torrent state that must go through the init gate rather
     /// than take the fast path: literally `Initializing` (opening/hash-
     /// checking files, where `update_only_files` bails and `FileStream`
@@ -1279,7 +1383,8 @@ impl LibrqbitHandle {
         context: &'static str,
     ) -> bool {
         let current = self.handle.only_files();
-        let Some(set) = plan_only_files(current.as_deref(), file_count, op) else {
+        let pinned = self.pinned_set();
+        let Some(set) = plan_only_files(current.as_deref(), file_count, &pinned, op) else {
             return true;
         };
         match self.session.update_only_files(&self.handle, &set).await {
@@ -1349,6 +1454,7 @@ impl Clone for LibrqbitHandle {
             info_hash: self.info_hash.clone(),
             session: self.session.clone(),
             deferred_selections: self.deferred_selections.clone(),
+            pinned_files: self.pinned_files.clone(),
         }
     }
 }
@@ -2236,7 +2342,11 @@ mod tests {
     #[test]
     fn plan_only_files_rules() {
         use SelectionOp::*;
-        let plan = plan_only_files;
+        // Nothing pinned: the pre-pin rules hold unchanged.
+        let none = BTreeSet::new();
+        let plan = |current: Option<&[usize]>, file_count: usize, op: SelectionOp| {
+            plan_only_files(current, file_count, &none, op)
+        };
         let set = |v: &[usize]| Some(v.iter().copied().collect::<HashSet<usize>>());
 
         // Single-file torrents: never touch selection, for any op.
@@ -2314,6 +2424,219 @@ mod tests {
                 }
             ),
             None
+        );
+        // Pin adds to the current selection; with nothing selected ("all
+        // wanted") it narrows to just the pin. Out of range: nothing.
+        assert_eq!(plan(Some(&[1]), 3, Pin(2)), set(&[1, 2]));
+        assert_eq!(plan(None, 3, Pin(2)), set(&[2]));
+        assert_eq!(plan(None, 3, Pin(3)), None);
+    }
+
+    /// The pinned set is unioned into every plan, so playback switching
+    /// (exclusive `Prepare`, `Reconcile` to another file, `Clear` after a
+    /// stream ends) never deselects an offline download.
+    #[test]
+    fn plan_only_files_unions_pinned_into_every_branch() {
+        use SelectionOp::*;
+        let pinned: BTreeSet<usize> = [0].into_iter().collect();
+        let plan = |current: Option<&[usize]>, file_count: usize, op: SelectionOp| {
+            plan_only_files(current, file_count, &pinned, op)
+        };
+        let set = |v: &[usize]| Some(v.iter().copied().collect::<HashSet<usize>>());
+
+        // Single-file torrents: still never touched, pinned or not.
+        assert_eq!(plan(None, 1, Prepare(0)), None);
+        assert_eq!(plan(None, 1, Pin(0)), None);
+
+        // Prepare is exclusive *plus* the pin.
+        assert_eq!(plan(None, 3, Prepare(1)), set(&[0, 1]));
+        assert_eq!(plan(Some(&[2]), 3, Prepare(0)), set(&[0]));
+
+        // Clear never drops the pinned file, even when it is the only one
+        // selected or a stale cleanup targets it.
+        assert_eq!(plan(Some(&[0, 1]), 3, Clear(0)), None);
+        assert_eq!(plan(Some(&[0]), 3, Clear(0)), None);
+        // Clearing another file keeps the pin in the remainder.
+        assert_eq!(plan(Some(&[0, 1]), 3, Clear(1)), set(&[0]));
+        assert_eq!(plan(Some(&[1, 2]), 3, Clear(1)), set(&[0, 2]));
+
+        // Reconcile chains the pin; with no active/hot file the pin alone
+        // is the want-set instead of "apply nothing".
+        assert_eq!(
+            plan(
+                Some(&[0]),
+                3,
+                Reconcile {
+                    active: Some(2),
+                    hot: Some(1)
+                }
+            ),
+            set(&[0, 1, 2])
+        );
+        assert_eq!(
+            plan(
+                Some(&[1]),
+                3,
+                Reconcile {
+                    active: None,
+                    hot: None
+                }
+            ),
+            set(&[0])
+        );
+
+        // Pin keeps the current selection and adds the new pin.
+        let both: BTreeSet<usize> = [0, 2].into_iter().collect();
+        assert_eq!(
+            plan_only_files(Some(&[1]), 3, &both, Pin(2)),
+            set(&[0, 1, 2])
+        );
+
+        // An out-of-range pinned index (metadata mismatch) is dropped, and
+        // a plan that is empty apart from it is a no-op.
+        let stale: BTreeSet<usize> = [7].into_iter().collect();
+        assert_eq!(
+            plan_only_files(Some(&[1]), 3, &stale, Prepare(2)),
+            set(&[2])
+        );
+        assert_eq!(
+            plan_only_files(
+                None,
+                3,
+                &stale,
+                Reconcile {
+                    active: None,
+                    hot: None
+                }
+            ),
+            None
+        );
+    }
+
+    /// End-to-end on a real multi-file torrent: a pinned file stays in
+    /// librqbit's `only_files` through the whole playback lifecycle of
+    /// another file, and leaves it only after an unpin plus a reconcile.
+    /// `stats()` reports the pin per file and torrent-wide.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pinned_file_survives_playback_switching_on_real_torrent() {
+        use crate::backend::{TorrentFilePriorityPlan, TorrentHandle};
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let content_dir = dir.join("multi");
+        tokio::fs::create_dir_all(&content_dir).await.unwrap();
+        write_payload(&content_dir.join("a.bin"), 48 * 1024).await;
+        write_payload(&content_dir.join("b.bin"), 64 * 1024).await;
+        write_payload(&content_dir.join("c.bin"), 32 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&content_dir).await;
+
+        let (backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
+        handle.handle.wait_until_initialized().await.unwrap();
+
+        let selection = |h: &LibrqbitHandle| {
+            let mut v = h.handle.only_files().unwrap_or_default();
+            v.sort_unstable();
+            v
+        };
+        let reconcile = |h: LibrqbitHandle, active: Option<usize>| async move {
+            h.reconcile_file_priorities(TorrentFilePriorityPlan {
+                active_file: active,
+                hot_file: None,
+                generation: 1,
+                reason: "test",
+            })
+            .await
+            .unwrap();
+        };
+
+        // Pin narrows "everything wanted" to the pin.
+        handle.pin_file(0).await.unwrap();
+        assert_eq!(selection(&handle), vec![0]);
+        // Idempotent.
+        handle.pin_file(0).await.unwrap();
+        assert_eq!(selection(&handle), vec![0]);
+
+        // Playback of another file: exclusive prepare keeps the pin ...
+        handle.prepare_file_for_streaming(1).await.unwrap();
+        assert_eq!(selection(&handle), vec![0, 1]);
+        // ... reconcile to yet another file keeps it ...
+        reconcile(handle.clone(), Some(2)).await;
+        assert_eq!(selection(&handle), vec![0, 2]);
+        // ... and clearing the pinned file is refused.
+        handle.clear_file_streaming(0).await.unwrap();
+        assert_eq!(selection(&handle), vec![0, 2]);
+
+        // A handle re-created by get_torrent shares the pin set.
+        let again = backend.get_torrent(&handle.info_hash).await.unwrap();
+        let stats = TorrentHandle::stats(&again).await;
+        assert_eq!(stats.pinned_files, vec![0]);
+        assert!(stats.files[0].pinned);
+        assert!(!stats.files[1].pinned && !stats.files[2].pinned);
+        // Seeded torrent: every file is complete.
+        assert!(stats.files.iter().all(|f| f.complete), "{:?}", stats.files);
+
+        // Unpin alone leaves the selection; the next reconcile drops it.
+        again.unpin_file(0).await.unwrap();
+        assert_eq!(selection(&handle), vec![0, 2]);
+        assert!(TorrentHandle::stats(&handle).await.pinned_files.is_empty());
+        reconcile(handle.clone(), Some(2)).await;
+        assert_eq!(selection(&handle), vec![2]);
+
+        // Out-of-range pin is a structural error and records nothing.
+        assert!(handle.pin_file(3).await.is_err());
+        assert!(TorrentHandle::stats(&handle).await.pinned_files.is_empty());
+    }
+
+    /// `complete` follows the per-file progress: nothing on disk means no
+    /// file is complete (and none is pinned by default).
+    #[tokio::test]
+    async fn stats_report_incomplete_unpinned_files_for_unseeded_torrent() {
+        use crate::backend::TorrentHandle;
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        tokio::fs::create_dir_all(&src_dir).await.unwrap();
+        write_payload(&src_dir.join("payload.bin"), 64 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&src_dir.join("payload.bin")).await;
+        let (_backend, handle) = backend_with_torrent(&tmp.path().join("dl"), &torrent_bytes).await;
+        handle.handle.wait_until_initialized().await.unwrap();
+
+        let stats = TorrentHandle::stats(&handle).await;
+        assert!(!stats.files[0].complete);
+        assert!(!stats.files[0].pinned);
+        assert!(stats.pinned_files.is_empty());
+        let json = serde_json::to_value(&stats).unwrap();
+        assert_eq!(json["pinnedFiles"], serde_json::json!([]));
+        assert_eq!(json["files"][0]["pinned"], false);
+        assert_eq!(json["files"][0]["complete"], false);
+    }
+
+    /// A pin issued while the torrent is still hash-checking is parked on
+    /// the deferred-selection path and applied once librqbit accepts
+    /// selection updates, so a "download" pressed during startup sticks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pin_file_defers_while_initializing() {
+        use crate::backend::TorrentHandle;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let content_dir = dir.join("multi");
+        tokio::fs::create_dir_all(&content_dir).await.unwrap();
+        write_payload(&content_dir.join("a.bin"), 4 * 1024 * 1024).await;
+        write_payload(&content_dir.join("b.bin"), 4 * 1024 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&content_dir).await;
+
+        let (_backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
+        let was_initializing = handle.is_initializing();
+        handle.pin_file(1).await.unwrap();
+        // Recorded immediately, applied once initialized.
+        assert_eq!(TorrentHandle::stats(&handle).await.pinned_files, vec![1]);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while handle.handle.only_files() != Some(vec![1]) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(handle.handle.only_files(), Some(vec![1]));
+        assert!(!handle.deferred_selection().has_pending());
+        assert!(
+            was_initializing,
+            "test must exercise the initializing gate, not a torrent that was already ready"
         );
     }
 

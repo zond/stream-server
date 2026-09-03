@@ -97,6 +97,31 @@ pub trait TorrentHandle: Send + Sync + Clone {
     async fn reconcile_file_priorities(&self, _plan: TorrentFilePriorityPlan) -> Result<()> {
         Ok(())
     }
+    /// Keep `file_idx` wanted regardless of playback selection: every later
+    /// `prepare_file_for_streaming` / `clear_file_streaming` /
+    /// `reconcile_file_priorities` keeps it in the want-set until
+    /// `unpin_file`. This is the backend half of an offline download; the
+    /// engine layer (`BackendEngineFS::pin_download`) also exempts the torrent
+    /// from idle removal and the seeding-disabled pause. Backends that cannot
+    /// select files per file (or always want everything) may leave this as a
+    /// no-op. Err only for a provably-bad file index.
+    async fn pin_file(&self, _file_idx: usize) -> Result<()> {
+        Ok(())
+    }
+    /// Undo `pin_file`. Only forgets the pin: the file stays wanted until
+    /// the next selection update recomputes the want-set without it, which
+    /// the caller drives (`BackendEngineFS::unpin_download` reconciles).
+    async fn unpin_file(&self, _file_idx: usize) -> Result<()> {
+        Ok(())
+    }
+    /// The file's on-disk path (the torrent's output folder joined with the
+    /// file's relative name), for handing a completed download to a local
+    /// player. `None` when the backend does not know (no metadata yet, bad
+    /// index, or a backend without a per-file path). Reads still go through
+    /// `get_file_reader`, which blocks on pieces a sparse file would not.
+    async fn file_path(&self, _file_idx: usize) -> Option<std::path::PathBuf> {
+        None
+    }
     async fn get_file_reader(
         &self,
         file_idx: usize,
@@ -205,6 +230,15 @@ pub struct StatsFile {
     /// Omitted together with `initial_window_ready_bytes`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_window_bytes: Option<u64>,
+    /// The file is pinned as an offline download (`TorrentHandle::pin_file`):
+    /// kept wanted regardless of playback selection.
+    #[serde(default)]
+    pub pinned: bool,
+    /// Every byte of the file is verified on disk (`downloaded == length`,
+    /// from the backend's per-file progress). False while the torrent has no
+    /// piece map yet (resolving metadata / hash-checking).
+    #[serde(default)]
+    pub complete: bool,
 }
 
 /// Coarse torrent startup phase for pre-playback progress UIs (the official
@@ -552,6 +586,10 @@ pub struct EngineStats {
     /// [`EngineStats::magnet_add_failed`]); absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Indices of the files pinned as offline downloads (ascending); the
+    /// same files carry `StatsFile::pinned`.
+    #[serde(default)]
+    pub pinned_files: Vec<usize>,
 }
 
 impl EngineStats {
@@ -613,6 +651,7 @@ impl EngineStats {
             initial_window_bytes: None,
             peer_discovery: PeerDiscovery::default(),
             error: None,
+            pinned_files: Vec::new(),
         }
     }
 

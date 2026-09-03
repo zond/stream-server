@@ -127,6 +127,28 @@ impl MagnetAddError {
 /// Outcome of a magnet add shared between every waiter.
 pub type MagnetAddResult<H> = Result<Arc<Engine<H>>, MagnetAddError>;
 
+/// Why [`BackendEngineFS::pin_download`] could not pin a file.
+#[derive(Debug, thiserror::Error)]
+pub enum PinDownloadError {
+    /// The engine could not be created (metadata timeout, backend refusal).
+    #[error(transparent)]
+    MagnetAdd(#[from] MagnetAddError),
+    /// The torrent has no such file.
+    #[error("file index {file_idx} out of range ({file_count} files)")]
+    FileNotFound { file_idx: usize, file_count: usize },
+    /// The backend refused the pin.
+    #[error(transparent)]
+    Backend(#[from] anyhow::Error),
+}
+
+/// One pinned offline download, see [`BackendEngineFS::pinned_downloads`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PinnedDownload {
+    pub info_hash: String,
+    pub file_idx: usize,
+}
+
 /// A magnet add whose backend `add_torrent` has not returned yet.
 ///
 /// librqbit resolves a magnet's metadata *inside* `Session::add_torrent`, with
@@ -1366,6 +1388,133 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         true
     }
 
+    /// Pin `file_idx` of `info_hash` as an offline download: the file stays
+    /// wanted no matter which file is being played, and the engine is exempt
+    /// from idle removal and the seeding-disabled pause for as long as it has
+    /// a pinned file. Creates the engine if needed (through the magnet
+    /// registry, waiting for metadata -- the file index has to be validated
+    /// against the file list) with `extra_trackers` merged in, resumes a
+    /// torrent the idle policy had paused, and reconciles the want-set so the
+    /// pin takes effect now. Idempotent.
+    ///
+    /// In-memory only: a restart forgets the pin (librqbit keeps the file in
+    /// its persisted `only_files`, so the download itself resumes) -- the
+    /// owner of the download re-issues it.
+    pub async fn pin_download(
+        &self,
+        info_hash: &str,
+        file_idx: usize,
+        extra_trackers: Option<Vec<String>>,
+    ) -> Result<Arc<Engine<B::Handle>>, PinDownloadError> {
+        let engine = self.get_or_add_magnet(info_hash, extra_trackers).await?;
+        let file_count = engine.handle.file_count().await;
+        if file_idx >= file_count {
+            return Err(PinDownloadError::FileNotFound {
+                file_idx,
+                file_count,
+            });
+        }
+        engine.pinned_files.write().insert(file_idx);
+        if let Err(error) = engine.handle.pin_file(file_idx).await {
+            engine.pinned_files.write().remove(&file_idx);
+            return Err(PinDownloadError::Backend(error));
+        }
+        engine.touch();
+        if engine.idle_paused.swap(false, Ordering::Relaxed)
+            && let Err(err) = engine.handle.resume_torrent().await
+        {
+            tracing::warn!(
+                info_hash = %engine.info_hash,
+                file_idx,
+                error = %err,
+                "Failed to resume idle-paused torrent for pinned download"
+            );
+            engine.idle_paused.store(true, Ordering::Relaxed);
+        }
+        self.reconcile_with_active_selection(engine.clone(), "pin_download")
+            .await;
+        tracing::info!(
+            info_hash = %engine.info_hash,
+            file_idx,
+            pinned = ?engine.pinned_file_indices(),
+            "download_pinned"
+        );
+        Ok(engine)
+    }
+
+    /// Forget the pin on `file_idx` of `info_hash`. Returns whether it was
+    /// pinned (false for an unknown torrent or an unpinned file). Only the
+    /// pin goes: the data stays, the engine becomes an ordinary one again
+    /// (idle removal applies), and the want-set is reconciled against the
+    /// current playback selection -- with nothing playing that is a no-op,
+    /// so the file keeps downloading until the engine is swept or another
+    /// file is prepared.
+    pub async fn unpin_download(&self, info_hash: &str, file_idx: usize) -> Result<bool> {
+        let info_hash = info_hash.to_lowercase();
+        let Some(engine) = self.get_engine(&info_hash).await else {
+            return Ok(false);
+        };
+        let was_pinned = engine.pinned_files.write().remove(&file_idx);
+        engine.handle.unpin_file(file_idx).await?;
+        if was_pinned {
+            self.reconcile_with_active_selection(engine.clone(), "unpin_download")
+                .await;
+            tracing::info!(
+                info_hash = %engine.info_hash,
+                file_idx,
+                pinned = ?engine.pinned_file_indices(),
+                "download_unpinned"
+            );
+        }
+        Ok(was_pinned)
+    }
+
+    /// Every pinned download, ordered by info hash then file index.
+    pub async fn pinned_downloads(&self) -> Vec<PinnedDownload> {
+        let engines = self.engines.read().await;
+        let mut pinned: Vec<PinnedDownload> = engines
+            .iter()
+            .flat_map(|(info_hash, engine)| {
+                engine
+                    .pinned_file_indices()
+                    .into_iter()
+                    .map(|file_idx| PinnedDownload {
+                        info_hash: info_hash.clone(),
+                        file_idx,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        pinned.sort_by(|a, b| (&a.info_hash, a.file_idx).cmp(&(&b.info_hash, b.file_idx)));
+        pinned
+    }
+
+    /// Re-plan the engine's want-set from whatever multi-file selection is
+    /// currently active (or none) so a pin change is applied without
+    /// disturbing playback. The one hot-file caller (`routes/stream.rs`)
+    /// always passes the active file as the hot file, so dropping the hot
+    /// plan here loses nothing.
+    async fn reconcile_with_active_selection(
+        &self,
+        engine: Arc<Engine<B::Handle>>,
+        reason: &'static str,
+    ) {
+        let selection = self
+            .active_multifile_files
+            .read()
+            .await
+            .get(&engine.info_hash)
+            .cloned();
+        Self::reconcile_multifile_engine(
+            engine,
+            selection.as_ref().map(|s| s.file_idx),
+            None,
+            selection.as_ref().map(|s| s.generation).unwrap_or(0),
+            reason,
+        )
+        .await;
+    }
+
     /// Refresh a lease only if playback is already known to be active. This is
     /// used by stats.json so a progress poll cannot create a new download.
     pub async fn refresh_existing_hls_playback(
@@ -1905,6 +2054,11 @@ mod tests {
         /// Test knob: report every file as fully on disk (seeded torrent)
         /// instead of the default half-downloaded state.
         seeded: AtomicBool,
+        pin_file: AtomicUsize,
+        unpin_file: AtomicUsize,
+        /// The fake handle's own pin set (what the real backend keeps in its
+        /// `PinnedFiles` map), reported through `stats()`.
+        pinned: Mutex<std::collections::BTreeSet<usize>>,
     }
 
     /// Simulates librqbit's `Initializing` state for the fake torrent: the
@@ -2053,11 +2207,13 @@ mod tests {
                 StartupPhase::Buffering
             };
             let total_len: u64 = self.files.iter().map(|f| f.length).sum();
+            let pinned = self.counters.pinned.lock().unwrap().clone();
             let mut offset = 0u64;
             let files = self
                 .files
                 .iter()
-                .map(|file| {
+                .enumerate()
+                .map(|(idx, file)| {
                     let downloaded = if seeded { file.length } else { file.length / 2 };
                     let window = initialized.then(|| {
                         let total = file
@@ -2074,6 +2230,8 @@ mod tests {
                         progress: if seeded { 1.0 } else { 0.5 },
                         initial_window_ready_bytes: window.map(|(ready, _)| ready),
                         initial_window_bytes: window.map(|(_, total)| total),
+                        pinned: pinned.contains(&idx),
+                        complete: seeded,
                     };
                     offset += file.length;
                     stats_file
@@ -2121,10 +2279,26 @@ mod tests {
                 initial_window_bytes: None,
                 peer_discovery: PeerDiscovery::default(),
                 error: None,
+                pinned_files: pinned.into_iter().collect(),
             }
         }
 
         async fn add_trackers(&self, _trackers: Vec<String>) -> Result<()> {
+            Ok(())
+        }
+
+        async fn pin_file(&self, file_idx: usize) -> Result<()> {
+            if file_idx >= self.files.len() {
+                anyhow::bail!("file index {file_idx} out of range");
+            }
+            self.counters.pin_file.fetch_add(1, Ordering::SeqCst);
+            self.counters.pinned.lock().unwrap().insert(file_idx);
+            Ok(())
+        }
+
+        async fn unpin_file(&self, file_idx: usize) -> Result<()> {
+            self.counters.unpin_file.fetch_add(1, Ordering::SeqCst);
+            self.counters.pinned.lock().unwrap().remove(&file_idx);
             Ok(())
         }
 
@@ -2624,6 +2798,8 @@ mod tests {
             progress: 0.0,
             initial_window_ready_bytes: Some(ready),
             initial_window_bytes: Some(total),
+            pinned: false,
+            complete: ready == total,
         };
         let base = EngineStats {
             name: "t".into(),
@@ -2667,6 +2843,7 @@ mod tests {
             initial_window_bytes: None,
             peer_discovery: PeerDiscovery::default(),
             error: None,
+            pinned_files: Vec::new(),
         };
 
         let mut stats = base.clone();
@@ -2745,6 +2922,27 @@ mod tests {
         for key in ["name", "path", "length", "offset", "downloaded", "progress"] {
             assert!(file_keys.contains_key(key), "legacy file key {key} missing");
         }
+        // Offline-download additions, always present (camelCase).
+        assert_eq!(value["pinnedFiles"], serde_json::json!([]));
+        assert_eq!(value["files"][0]["pinned"], false);
+        assert_eq!(value["files"][0]["complete"], false);
+    }
+
+    /// `complete` flips with the per-file progress and the JSON keeps the
+    /// bool shape a client can key on; a resolving magnet lists no pins.
+    #[tokio::test]
+    async fn stats_complete_flag_follows_file_progress() {
+        let (enginefs, counters) = test_enginefs();
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        assert!(!engine.get_statistics().await.files[0].complete);
+        counters.seeded.store(true, Ordering::SeqCst);
+        let value = serde_json::to_value(engine.get_statistics().await).unwrap();
+        assert_eq!(value["files"][0]["complete"], true);
+        assert_eq!(value["files"][0]["downloaded"], value["files"][0]["length"]);
+
+        let resolving =
+            serde_json::to_value(EngineStats::resolving_metadata(TEST_HASH, &[])).unwrap();
+        assert_eq!(resolving["pinnedFiles"], serde_json::json!([]));
     }
 
     #[tokio::test]
@@ -2910,6 +3108,125 @@ mod tests {
         cleanup.await.expect("cleanup task completed");
 
         assert_eq!(counters.clear_file_streaming.load(Ordering::SeqCst), 1);
+    }
+
+    // --- pinned offline downloads ---
+
+    /// `pin_download` records the pin on the engine and the handle, applies
+    /// it through a reconcile that keeps the current playback selection,
+    /// and surfaces it in stats and `pinned_downloads`; `unpin_download`
+    /// undoes exactly that.
+    #[tokio::test]
+    async fn pin_download_pins_file_and_reconciles_around_playback() {
+        let (enginefs, counters) = test_enginefs_with_file_count(3);
+
+        let engine = enginefs.pin_download(TEST_HASH, 1, None).await.unwrap();
+        assert_eq!(engine.pinned_file_indices(), vec![1]);
+        assert!(engine.is_pinned());
+        assert_eq!(counters.pin_file.load(Ordering::SeqCst), 1);
+        // Nothing playing: reconciled with no active file.
+        assert_eq!(counters.reconcile_file_priorities.load(Ordering::SeqCst), 1);
+        assert_eq!(*counters.last_active_file.lock().unwrap(), None);
+
+        let stats = engine.get_statistics().await;
+        assert_eq!(stats.pinned_files, vec![1]);
+        assert!(stats.files[1].pinned);
+        assert!(!stats.files[0].pinned && !stats.files[2].pinned);
+        let json = serde_json::to_value(&stats).unwrap();
+        assert_eq!(json["pinnedFiles"], serde_json::json!([1]));
+        assert_eq!(json["files"][1]["pinned"], true);
+        assert_eq!(
+            enginefs.pinned_downloads().await,
+            vec![PinnedDownload {
+                info_hash: TEST_HASH.to_string(),
+                file_idx: 1
+            }]
+        );
+
+        // Idempotent, and a second pin lists in order.
+        enginefs.pin_download(TEST_HASH, 1, None).await.unwrap();
+        enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
+        assert_eq!(engine.pinned_file_indices(), vec![0, 1]);
+        assert_eq!(enginefs.pinned_downloads().await.len(), 2);
+
+        // With file 2 playing, pinning reconciles around that selection.
+        enginefs.on_stream_start(TEST_HASH, 2).await;
+        assert_eq!(*counters.last_active_file.lock().unwrap(), Some(2));
+        let before = counters.reconcile_file_priorities.load(Ordering::SeqCst);
+        enginefs.pin_download(TEST_HASH, 1, None).await.unwrap();
+        assert_eq!(
+            counters.reconcile_file_priorities.load(Ordering::SeqCst),
+            before + 1
+        );
+        assert_eq!(*counters.last_active_file.lock().unwrap(), Some(2));
+
+        // Unpin forgets the pin and reconciles again around the selection.
+        assert!(enginefs.unpin_download(TEST_HASH, 1).await.unwrap());
+        assert_eq!(counters.unpin_file.load(Ordering::SeqCst), 1);
+        assert_eq!(engine.pinned_file_indices(), vec![0]);
+        assert_eq!(
+            counters.reconcile_file_priorities.load(Ordering::SeqCst),
+            before + 2
+        );
+        assert_eq!(*counters.last_active_file.lock().unwrap(), Some(2));
+        assert!(!engine.get_statistics().await.files[1].pinned);
+        // Not pinned (any more) / unknown torrent: false, no reconcile.
+        assert!(!enginefs.unpin_download(TEST_HASH, 1).await.unwrap());
+        assert!(!enginefs.unpin_download(&"f".repeat(40), 0).await.unwrap());
+        assert_eq!(
+            counters.reconcile_file_priorities.load(Ordering::SeqCst),
+            before + 2
+        );
+        assert!(enginefs.unpin_download(TEST_HASH, 0).await.unwrap());
+        assert!(!engine.is_pinned());
+        assert!(enginefs.pinned_downloads().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pin_download_rejects_out_of_range_file() {
+        let (enginefs, counters) = test_enginefs_with_file_count(3);
+        let err = match enginefs.pin_download(TEST_HASH, 3, None).await {
+            Ok(_) => panic!("index 3 of 3 files must be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(
+                err,
+                PinDownloadError::FileNotFound {
+                    file_idx: 3,
+                    file_count: 3
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(counters.pin_file.load(Ordering::SeqCst), 0);
+        assert!(enginefs.pinned_downloads().await.is_empty());
+        assert!(!enginefs.get_engine(TEST_HASH).await.unwrap().is_pinned());
+    }
+
+    /// A torrent the seeding-disabled policy had paused must download again
+    /// once one of its files is pinned.
+    #[tokio::test]
+    async fn pin_download_resumes_idle_paused_torrent() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        engine.idle_paused.store(true, Ordering::Relaxed);
+
+        enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
+        assert!(counters.resume_torrent.load(Ordering::SeqCst) > 0);
+        assert!(!engine.idle_paused.load(Ordering::Relaxed));
+    }
+
+    /// Single-file torrents are always fully wanted: the pin is recorded
+    /// (so the engine is exempt from eviction) but no selection is planned.
+    #[tokio::test]
+    async fn pin_download_on_single_file_torrent_records_pin_without_reconcile() {
+        let (enginefs, counters) = test_enginefs();
+        let engine = enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
+        assert_eq!(engine.pinned_file_indices(), vec![0]);
+        assert_eq!(counters.pin_file.load(Ordering::SeqCst), 1);
+        assert_eq!(counters.reconcile_file_priorities.load(Ordering::SeqCst), 0);
+        assert!(engine.get_statistics().await.files[0].pinned);
     }
 
     // --- season-pack episode guessing (server.js guessFileIdx parity) ---
