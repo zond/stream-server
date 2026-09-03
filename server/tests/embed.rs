@@ -940,13 +940,28 @@ fn stats_after_check(
     base: &str,
     info_hash: &str,
 ) -> anyhow::Result<serde_json::Value> {
+    poll_stats(client, &format!("{base}/{info_hash}/stats.json"))
+}
+
+/// The same for `/{infoHash}/{fileIdx}/stats.json`.
+///
+/// Torrent-wide `phase` describes the *guessed* stream file, which for a
+/// multi-file torrent is whichever file the guess picks out of an order
+/// the fixture does not control (see `file_index`). A test that cares
+/// about one particular file's readiness must ask about that file.
+fn file_stats_after_check(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    info_hash: &str,
+    file_idx: usize,
+) -> anyhow::Result<serde_json::Value> {
+    poll_stats(client, &format!("{base}/{info_hash}/{file_idx}/stats.json"))
+}
+
+fn poll_stats(client: &reqwest::blocking::Client, url: &str) -> anyhow::Result<serde_json::Value> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
-        let stats: serde_json::Value = client
-            .get(format!("{base}/{info_hash}/stats.json"))
-            .send()?
-            .error_for_status()?
-            .json()?;
+        let stats: serde_json::Value = client.get(url).send()?.error_for_status()?.json()?;
         match stats["phase"].as_str() {
             Some("checking") | Some("resolvingMetadata")
                 if std::time::Instant::now() < deadline =>
@@ -1279,7 +1294,11 @@ fn fastresume_persists_piece_bitfields_on_both_roots() -> anyhow::Result<()> {
     assert_eq!(stats["phase"], "ready", "{stats}");
     assert_eq!(stats["files"][0]["complete"], true, "{stats}");
     assert_eq!(stats["files"][1]["complete"], true, "{stats}");
-    let stats = stats_after_check(&client, &base, &pinned_hash)?;
+    // The pinned file's own stats, not the torrent's: only the pinned file
+    // was ever seeded, and torrent-wide `phase` describes whichever file
+    // the stream guess picks -- the other one, in half the file orders
+    // `create_torrent`'s directory walk can produce.
+    let stats = file_stats_after_check(&client, &base, &pinned_hash, p2)?;
     assert_eq!(stats["phase"], "ready", "{stats}");
     assert_eq!(stats["files"][p2]["complete"], true, "{stats}");
     assert_eq!(stats["pinnedFiles"], serde_json::json!([p2]));
