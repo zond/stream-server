@@ -125,6 +125,7 @@ The `stremio-runtime` stub spawns the server with `--no-auth`: it is the compati
 | `checkedBytes`, `checkTotalBytes` | Hash-check progress; non-null only while `checking` |
 | `initialWindowReadyBytes`, `initialWindowBytes` | Bytes of the stream file's head window (`min(4 MiB, file length)`) already verified on disk; non-null only in `buffering`/`ready`. Also present per entry in `files[]` |
 | `peerDiscovery` | `{ seen, queued, connecting, live }` peer counters (`peers`/`unique`/`queued` remain as before) |
+| `connectedSeeders` | How many of the peers we are **connected to** hold the complete torrent, i.e. can serve any piece. It is **not** the swarm's seeder count: this server does not scrape trackers, so nothing here reflects seeders we never connected to, and the number is always bounded by `peers`. 0 while `resolvingMetadata` — a magnet with no metadata yet has no peers. (`swarmSize` is not this either: it is a server.js-compatible alias of `peers`, kept for wire compatibility.) |
 
 The top-level window/phase describe the guessed stream file for `/{infoHash}/stats.json` and the requested file for `/{infoHash}/{fileIdx}/stats.json`.
 
