@@ -1666,21 +1666,37 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             only_files: Some(vec![file_idx]),
         };
         let was_managed = self.get_engine(info_hash).await.is_some();
+        // Asked before the add, which creates the folder: one that already
+        // exists may hold the data of an earlier session whose backend
+        // records are gone (a purged cache dir with the downloads dir
+        // intact) -- data a refused pin must not delete, and that the
+        // free-space check must not count as missing while the backend is
+        // still checking it (`downloaded` reads 0 until then).
+        let folder_existed = match &folder {
+            Some(folder) => tokio::fs::try_exists(folder).await.unwrap_or(false),
+            None => false,
+        };
         let engine = self
             .get_or_add_magnet_placed(info_hash, extra_trackers.clone(), placement)
             .await?;
         let checked = self
-            .check_pin_preconditions(&engine, file_idx, folder.as_deref(), was_managed)
+            .check_pin_preconditions(
+                &engine,
+                file_idx,
+                folder.as_deref(),
+                was_managed || folder_existed,
+            )
             .await;
         if let Err(error) = checked {
             if !was_managed && !engine.is_pinned() {
                 // Added only for this pin: do not leave it behind. Under
-                // the downloads dir its folder is ours and holds nothing
+                // the downloads dir a folder this add created holds nothing
                 // but the placeholder librqbit pre-sized, so it goes too;
-                // in the cache root the files stay for the cache cleaner,
-                // like any other streamed data.
+                // a folder that was there before keeps whatever it holds,
+                // and in the cache root the files stay for the cache
+                // cleaner, like any other streamed data.
                 self.remove_engine_if_current(&engine).await;
-                let dropped = if folder.is_some() {
+                let dropped = if folder.is_some() && !folder_existed {
                     self.backend.remove_torrent_and_files(info_hash).await
                 } else {
                     self.backend.remove_torrent(info_hash).await
@@ -1884,18 +1900,21 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// the pin (logged); volumes whose identity cannot be told apart are
     /// assumed different (the strict side).
     ///
-    /// A torrent that was managed before this call (`was_managed`), stays
-    /// where it is and is still `checking` its data (right after a restart
-    /// or a relocation) is not measured at all: `downloaded` reads 0 until
-    /// the check ends, so a complete file would be refused as if it had
-    /// everything left to write -- and refusing changes nothing about the
-    /// download, which librqbit already wants.
+    /// A torrent that stays where it is and is still `checking` data that
+    /// may already be there (`may_have_data_in_place`: it was managed
+    /// before this call -- a restart, a relocation -- or the pin added it
+    /// into a folder that already existed) is not measured at all:
+    /// `downloaded` reads 0 until the check ends, so a complete file would
+    /// be refused as if it had everything left to write -- and refusing
+    /// changes nothing about a download librqbit already wants. A torrent
+    /// the pin added into a fresh folder is measured even while checking:
+    /// nothing of it is on disk, so 0 is right.
     async fn check_pin_preconditions(
         &self,
         engine: &Arc<Engine<B::Handle>>,
         file_idx: usize,
         folder: Option<&std::path::Path>,
-        was_managed: bool,
+        may_have_data_in_place: bool,
     ) -> Result<(), PinDownloadError> {
         let file_count = engine.handle.file_count().await;
         if file_idx >= file_count {
@@ -1910,7 +1929,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             (Some(folder), Some(current)) if folder != current => Some(folder),
             _ => None,
         };
-        if was_managed
+        if may_have_data_in_place
             && relocating_to.is_none()
             && stats.phase == crate::backend::StartupPhase::Checking
         {
@@ -4505,6 +4524,275 @@ mod tests {
             enginefs.pin_download(TEST_HASH, 0, None).await,
             Err(PinDownloadError::InsufficientSpace { .. })
         ));
+    }
+
+    /// Engine over an unmanaged fake torrent that is still checking (as a
+    /// real torrent is right after `add_torrent` returns), for pins that
+    /// add it.
+    fn test_enginefs_unmanaged_checking() -> (BackendEngineFS<FakeBackend>, Arc<FakeCounters>) {
+        let counters = Arc::new(FakeCounters::default());
+        let handle = FakeHandle {
+            info_hash: TEST_HASH.to_string(),
+            counters: counters.clone(),
+            files: (0..2)
+                .map(|idx| BackendFileInfo {
+                    name: format!("video-{idx}.mkv"),
+                    length: 100,
+                })
+                .collect(),
+            init: FakeInit::new(false, Duration::from_secs(60)),
+        };
+        let root = std::env::temp_dir().join("enginefs-downloads-dir-tests");
+        let enginefs = BackendEngineFS::new_with_backend(
+            FakeBackend::new(vec![handle]),
+            HashMap::new(),
+            root.join("cache"),
+            root.join("downloads"),
+        );
+        (enginefs, counters)
+    }
+
+    /// A fresh pin into a `<dir>/<hash>` folder that already exists (the
+    /// data of an earlier session whose backend records are gone) is not
+    /// measured while the torrent is still checking that data -- its
+    /// `downloaded` reads 0 -- and, refused, drops the torrent but never
+    /// the folder's files. Only a folder the pin itself created goes with
+    /// a refused pin.
+    #[tokio::test]
+    async fn fresh_pin_into_an_existing_folder_keeps_its_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join(TEST_HASH);
+        std::fs::create_dir_all(&folder).unwrap();
+        let data = folder.join("video-0.mkv");
+        std::fs::write(&data, [7u8; 100]).unwrap();
+
+        // Still checking, disk reports no room: accepted, unmeasured.
+        let (mut enginefs, _counters) = test_enginefs_unmanaged_checking();
+        enginefs.set_downloads_dir(Some(tmp.path().to_path_buf()));
+        enginefs.set_free_space_probe(|_| Ok(0));
+        enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
+        assert!(
+            enginefs
+                .backend
+                .removed_with_files
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(data.is_file());
+
+        // Refused (no such file): the torrent goes, the folder stays.
+        let (mut enginefs, _counters) = test_enginefs_unmanaged_checking();
+        enginefs.set_downloads_dir(Some(tmp.path().to_path_buf()));
+        enginefs.set_free_space_probe(|_| Ok(0));
+        assert!(matches!(
+            enginefs.pin_download(TEST_HASH, 5, None).await,
+            Err(PinDownloadError::FileNotFound { .. })
+        ));
+        assert!(enginefs.get_engine(TEST_HASH).await.is_none());
+        assert_eq!(
+            enginefs.backend.removed.lock().unwrap().as_slice(),
+            &[TEST_HASH.to_string()],
+            "dropped keeping its files"
+        );
+        assert!(
+            enginefs
+                .backend
+                .removed_with_files
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(data.is_file(), "pre-existing data survives a refused pin");
+
+        // No folder yet: nothing is on disk, so the checking torrent is
+        // measured, refused, and dropped with the placeholder it made.
+        let (mut enginefs, _counters) = test_enginefs_unmanaged_checking();
+        enginefs.set_downloads_dir(Some(tmp.path().join("elsewhere")));
+        enginefs.set_free_space_probe(|_| Ok(0));
+        assert!(matches!(
+            enginefs.pin_download(TEST_HASH, 0, None).await,
+            Err(PinDownloadError::InsufficientSpace { .. })
+        ));
+        assert_eq!(
+            enginefs
+                .backend
+                .removed_with_files
+                .lock()
+                .unwrap()
+                .as_slice(),
+            &[TEST_HASH.to_string()]
+        );
+        assert!(enginefs.backend.removed.lock().unwrap().is_empty());
+    }
+
+    /// `LibrqbitBackend` behind a shim that answers a magnet add for a known
+    /// hash with the torrent's own bytes: the hermetic session has no peers
+    /// to resolve metadata from, so this is how `pin_download`'s fresh-add
+    /// path is driven against the real backend.
+    struct BytesForMagnet {
+        inner: LibrqbitBackend,
+        torrents: HashMap<String, Vec<u8>>,
+    }
+
+    impl BytesForMagnet {
+        fn resolve(&self, source: TorrentSource) -> TorrentSource {
+            if let TorrentSource::Url(url) = &source
+                && let Some(hash) = url.strip_prefix("magnet:?xt=urn:btih:")
+                && let Some(bytes) = self.torrents.get(hash)
+            {
+                return TorrentSource::Bytes(bytes.clone());
+            }
+            source
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TorrentBackend for BytesForMagnet {
+        type Handle = <LibrqbitBackend as TorrentBackend>::Handle;
+
+        async fn add_torrent(
+            &self,
+            source: TorrentSource,
+            trackers: Vec<String>,
+        ) -> Result<Self::Handle> {
+            self.inner.add_torrent(self.resolve(source), trackers).await
+        }
+
+        async fn add_torrent_placed(
+            &self,
+            source: TorrentSource,
+            trackers: Vec<String>,
+            placement: TorrentPlacement,
+        ) -> Result<Self::Handle> {
+            self.inner
+                .add_torrent_placed(self.resolve(source), trackers, placement)
+                .await
+        }
+
+        async fn relocate_torrent(
+            &self,
+            info_hash: &str,
+            placement: TorrentPlacement,
+            trackers: Vec<String>,
+        ) -> Result<Self::Handle> {
+            self.inner
+                .relocate_torrent(info_hash, placement, trackers)
+                .await
+        }
+
+        async fn get_torrent(&self, info_hash: &str) -> Option<Self::Handle> {
+            self.inner.get_torrent(info_hash).await
+        }
+
+        async fn remove_torrent(&self, info_hash: &str) -> Result<()> {
+            self.inner.remove_torrent(info_hash).await
+        }
+
+        async fn remove_torrent_and_files(&self, info_hash: &str) -> Result<()> {
+            self.inner.remove_torrent_and_files(info_hash).await
+        }
+
+        async fn list_torrents(&self) -> Vec<String> {
+            self.inner.list_torrents().await
+        }
+
+        async fn memory_diagnostics(&self) -> BackendMemoryDiagnostics {
+            self.inner.memory_diagnostics().await
+        }
+    }
+
+    /// A .torrent for `path` (small pieces): its bytes and hex info hash.
+    async fn real_torrent(path: &std::path::Path) -> (Vec<u8>, String) {
+        let t = librqbit::create_torrent(
+            path,
+            librqbit::CreateTorrentOptions {
+                name: None,
+                trackers: Vec::new(),
+                piece_length: Some(16384),
+            },
+            &librqbit::spawn_utils::BlockingSpawner::new(1),
+        )
+        .await
+        .expect("create torrent");
+        (
+            t.as_bytes().expect("serialize torrent").to_vec(),
+            t.info_hash().as_string(),
+        )
+    }
+
+    /// The cache-purge case against the real backend: the session's
+    /// records are gone but `<downloadsDir>/<hash>/e1.bin` is complete. A
+    /// fresh pin of that file is accepted although the volume reports no
+    /// free space (librqbit verifies the data in place; while it does, the
+    /// file is not counted as missing), and a pin of the torrent's other
+    /// file -- refused once the check shows it missing, or accepted
+    /// unmeasured while the check runs -- never takes the folder's data
+    /// with it: the folder was not this pin's to empty.
+    #[tokio::test]
+    async fn fresh_pin_over_pre_seeded_data_survives_with_the_real_backend() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("show");
+        std::fs::create_dir_all(&src).unwrap();
+        let payload: Vec<u8> = (0..32 * 1024).map(|i| (i % 251) as u8).collect();
+        std::fs::write(src.join("e1.bin"), &payload).unwrap();
+        std::fs::write(src.join("e2.bin"), vec![3u8; 16 * 1024]).unwrap();
+        let (bytes, hash) = real_torrent(&src).await;
+        let offline = tmp.path().join("offline");
+        let folder = offline.join(&hash);
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("e1.bin"), &payload).unwrap();
+
+        let make = || async {
+            let inner = LibrqbitBackend::new_for_tests(tmp.path().join("dl"))
+                .await
+                .expect("hermetic session");
+            let mut enginefs = BackendEngineFS::new_with_backend(
+                BytesForMagnet {
+                    inner,
+                    torrents: HashMap::from([(hash.clone(), bytes.clone())]),
+                },
+                HashMap::new(),
+                tmp.path().join("cache"),
+                tmp.path().join("dl"),
+            );
+            enginefs.set_downloads_dir(Some(offline.clone()));
+            enginefs.set_free_space_probe(|_| Ok(0));
+            enginefs
+        };
+
+        let enginefs = make().await;
+        let engine = enginefs
+            .pin_download(&hash, 0, None)
+            .await
+            .expect("a complete file in place needs no space");
+        assert_eq!(engine.handle.output_folder(), Some(folder.clone()));
+        engine.handle.handle.wait_until_initialized().await.unwrap();
+        let stats = engine.get_statistics().await;
+        assert!(stats.files[0].complete, "verified in place: {stats:?}");
+        assert_eq!(engine.pinned_file_indices(), vec![0]);
+        enginefs.backend.remove_torrent(&hash).await.unwrap();
+        drop(enginefs);
+
+        let enginefs = make().await;
+        match enginefs.pin_download(&hash, 1, None).await {
+            Ok(engine) => {
+                // Still checking when measured: accepted unmeasured, and
+                // the data in place is what the check finds.
+                engine.handle.handle.wait_until_initialized().await.unwrap();
+                assert!(engine.get_statistics().await.files[0].complete);
+            }
+            Err(PinDownloadError::InsufficientSpace { .. }) => {
+                assert!(enginefs.get_engine(&hash).await.is_none());
+                assert!(enginefs.backend.list_torrents().await.is_empty());
+            }
+            Err(other) => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(
+            std::fs::read(folder.join("e1.bin")).unwrap(),
+            payload,
+            "pre-existing data survives a refused pin"
+        );
     }
 
     // --- pin persistence across restarts ---
