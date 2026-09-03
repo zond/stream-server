@@ -127,16 +127,35 @@ async fn clean_cache(state: &Arc<AppState>) -> anyhow::Result<()> {
         state.engine.protected_paths().await.into_iter().collect();
     protected_paths.extend(state.download_engine.protected_paths().await);
 
-    evict(&download_dirs, &protected_paths, limit).await
+    // 2. The downloads dir is not cache: offline downloads live there
+    // because the user asked for them, and a pin whose torrent the backend
+    // did not restore has no engine to protect its files. Nothing under it
+    // is walked -- which matters only when it sits inside a cache root,
+    // since the cleaner walks nothing else.
+    let mut downloads_dirs: Vec<_> = [
+        state.engine.downloads_dir(),
+        state.download_engine.downloads_dir(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    downloads_dirs.sort();
+    downloads_dirs.dedup();
+
+    evict(&download_dirs, &protected_paths, limit, &downloads_dirs).await
 }
 
 /// Walk `download_dirs` and evict what is neither protected nor a session
 /// artefact: first every file older than 30 days, then -- while the rest
 /// exceeds `limit` (0 = no limit) -- the least recently modified files.
+/// Nothing under `downloads_dirs` is walked at all: those files are
+/// offline downloads, not cache, so they are neither evicted nor counted
+/// towards `limit`.
 async fn evict(
     download_dirs: &[std::path::PathBuf],
     protected_paths: &HashSet<std::path::PathBuf>,
     limit: u64,
+    downloads_dirs: &[std::path::PathBuf],
 ) -> anyhow::Result<()> {
     // 2. Scan and Evict immediately based on age (30 days)
     let thirty_days = Duration::from_secs(30 * 24 * 60 * 60);
@@ -150,7 +169,9 @@ async fn evict(
             continue;
         }
 
-        let mut entries = walkdir::WalkDir::new(download_dir).into_iter();
+        let mut entries = walkdir::WalkDir::new(download_dir)
+            .into_iter()
+            .filter_entry(|entry| !is_under(entry.path(), downloads_dirs));
 
         loop {
             match entries.next() {
@@ -299,6 +320,12 @@ fn is_session_artifact(path: &std::path::Path, root: &std::path::Path) -> bool {
     }
 }
 
+/// Whether `path` is one of `roots` or lives under one, component-wise (as
+/// in [`is_path_protected`]).
+fn is_under(path: &std::path::Path, roots: &[std::path::PathBuf]) -> bool {
+    roots.iter().any(|root| path.starts_with(root))
+}
+
 /// A file is protected from eviction when its full path is in `protected` or
 /// when it lives under a protected directory. Uses `Path::starts_with`, which
 /// matches whole path components — so `/dl/Movie2/x.mkv` is NOT shielded by a
@@ -396,7 +423,7 @@ mod tests {
         let recent = root.join("recent.mkv");
         write_aged(&recent, &[0u8; 4096], Duration::from_secs(60));
 
-        evict(std::slice::from_ref(&root), &HashSet::new(), 0)
+        evict(std::slice::from_ref(&root), &HashSet::new(), 0, &[])
             .await
             .unwrap();
         for record in &records {
@@ -413,7 +440,7 @@ mod tests {
         // casualties, and they do not count towards the size either.
         let newer = root.join("newer.mkv");
         write_aged(&newer, &[0u8; 4096], Duration::from_secs(1));
-        evict(std::slice::from_ref(&root), &HashSet::new(), 4096)
+        evict(std::slice::from_ref(&root), &HashSet::new(), 4096, &[])
             .await
             .unwrap();
         for record in &records {
@@ -486,5 +513,83 @@ mod tests {
         assert!(!is_path_protected(Path::new("/dl/Series2/ep.mkv"), &set));
         // Wholly unrelated file.
         assert!(!is_path_protected(Path::new("/dl/Other/x.mkv"), &set));
+    }
+
+    /// The downloads dir holds offline downloads, not cache. Even when it
+    /// sits inside a walked cache root, nothing under it is aged out, and
+    /// its bytes never count towards the size limit -- otherwise a finished
+    /// download would evict the cache around it, and a pin whose torrent
+    /// the backend did not restore (no engine, so no protected path) would
+    /// be deleted after 30 days.
+    #[tokio::test]
+    async fn evict_never_walks_the_downloads_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("rqbit-downloads");
+        let forty_days = Duration::from_secs(40 * 24 * 60 * 60);
+        let offline = root.join("offline");
+        let download = offline.join(HASH).join("movie.mkv");
+        write_aged(&download, &[0u8; 8192], forty_days);
+        let stale = root.join("old-show").join("e1.mkv");
+        write_aged(&stale, &[0u8; 4096], forty_days);
+        let fresh = root.join("fresh.mkv");
+        write_aged(&fresh, &[0u8; 4096], Duration::from_secs(60));
+        let downloads_dirs = [offline.clone()];
+
+        evict(
+            std::slice::from_ref(&root),
+            &HashSet::new(),
+            0,
+            &downloads_dirs,
+        )
+        .await
+        .unwrap();
+        assert!(download.is_file(), "an old download is not cache");
+        assert!(!stale.exists(), "stale cache beside it still goes");
+        assert!(fresh.is_file());
+
+        // Size rule: the download is the biggest and oldest file there is,
+        // and neither is evicted nor counted -- the cache below it is
+        // already under the limit.
+        evict(
+            std::slice::from_ref(&root),
+            &HashSet::new(),
+            4096,
+            &downloads_dirs,
+        )
+        .await
+        .unwrap();
+        assert!(download.is_file(), "never an LRU casualty");
+        assert!(
+            fresh.is_file(),
+            "the download's bytes must not count towards the limit"
+        );
+        assert!(offline.join(HASH).is_dir(), "and its folder stays");
+    }
+
+    /// A pinned download in the cache root (no downloads dir configured)
+    /// keeps its engine -- the idle sweeper skips pinned torrents -- so its
+    /// files come through `protected_paths` and neither rule touches them,
+    /// however old they are.
+    #[tokio::test]
+    async fn evict_keeps_the_files_a_pinned_engine_reports() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("rqbit-downloads");
+        let forty_days = Duration::from_secs(40 * 24 * 60 * 60);
+        let pinned = root.join("Show").join("e1.mkv");
+        write_aged(&pinned, &[0u8; 8192], forty_days);
+        let stale = root.join("Show").join("e2.mkv");
+        write_aged(&stale, &[0u8; 4096], forty_days);
+        let protected: HashSet<PathBuf> = HashSet::from([pinned.clone()]);
+
+        evict(std::slice::from_ref(&root), &protected, 0, &[])
+            .await
+            .unwrap();
+        assert!(pinned.is_file(), "the pinned file survives the age rule");
+        assert!(!stale.exists(), "its unpinned neighbour does not");
+
+        evict(std::slice::from_ref(&root), &protected, 1024, &[])
+            .await
+            .unwrap();
+        assert!(pinned.is_file(), "and the size rule");
     }
 }
