@@ -631,7 +631,9 @@ pub async fn run(
         // once the lock is released) -- an embedder reading it sees the
         // same value, and the next boot does not warn again.
         if let Some(raw) = settings.downloads_dir.clone() {
-            match routes::system::prepare_downloads_dir(&raw).await {
+            match routes::system::prepare_downloads_dir(&raw, &routes::system::cache_roots(&state))
+                .await
+            {
                 Ok(path) => {
                     state.engine.set_downloads_dir(Some(path.clone()));
                     state.download_engine.set_downloads_dir(Some(path));

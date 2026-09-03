@@ -242,17 +242,31 @@ pub struct ServerSettings {
     /// Where offline downloads are placed: `<downloadsDir>/<infoHash>/` per
     /// pinned torrent. `None` (the default) keeps them in the cache root
     /// (`<cacheRoot>/rqbit-downloads`). Set through `POST /settings` with
-    /// an absolute path (created if missing, must be writable) or `null`;
+    /// an absolute path (created if missing, must be writable, and not at
+    /// or above a cache root -- see [`prepare_downloads_dir`]) or `null`;
     /// pins issued from then on go there, and a torrent already managed in
     /// the cache root is relocated by its next pin.
     #[serde(rename = "downloadsDir", default)]
     pub downloads_dir: Option<String>,
 }
 
+/// The torrent cache roots the cache cleaner walks -- what a
+/// `downloadsDir` may not cover (see [`prepare_downloads_dir`]).
+pub fn cache_roots(state: &AppState) -> [std::path::PathBuf; 2] {
+    [
+        state.engine.download_dir.clone(),
+        state.download_engine.download_dir.clone(),
+    ]
+}
+
 /// Validate and prepare a `downloadsDir` value: trimmed, absolute, created
-/// if missing, and writable (a probe file is created and removed). The
-/// returned path is what the setting stores and the engines use.
-pub async fn prepare_downloads_dir(raw: &str) -> anyhow::Result<std::path::PathBuf> {
+/// if missing, writable (a probe file is created and removed), and not at
+/// or above any of `cache_roots` ([`cache_roots`]). The returned path is
+/// what the setting stores and the engines use.
+pub async fn prepare_downloads_dir(
+    raw: &str,
+    cache_roots: &[std::path::PathBuf],
+) -> anyhow::Result<std::path::PathBuf> {
     let raw = raw.trim();
     if raw.is_empty() {
         anyhow::bail!("downloadsDir must not be empty (use null to unset it)");
@@ -271,7 +285,42 @@ pub async fn prepare_downloads_dir(raw: &str) -> anyhow::Result<std::path::PathB
     if let Err(error) = tokio::fs::remove_file(&probe).await {
         tracing::debug!(path = %probe.display(), %error, "could not remove the write probe");
     }
+    // A downloads dir that is a cache root, or above one, cannot be told
+    // apart from the cache in it: the cleaner walks those roots and would
+    // have to prune the walk at its own root to spare the downloads,
+    // which switches both eviction rules off for it (see
+    // `cache_cleaner::evict`). Compared through the deepest existing
+    // ancestor so a symlink to a root is caught too.
+    let resolved = canonical_prefix(&path);
+    for root in cache_roots {
+        if canonical_prefix(root).starts_with(&resolved) {
+            anyhow::bail!(
+                "downloadsDir {raw:?} is at or above the torrent cache root {}; \
+                 pick a directory outside it (or unset it to download into the cache root)",
+                root.display()
+            );
+        }
+    }
     Ok(path)
+}
+
+/// `path` with its deepest existing ancestor canonicalised and the rest of
+/// the path appended unchanged -- so a directory that does not exist yet
+/// still compares against one reached through a symlink.
+fn canonical_prefix(path: &std::path::Path) -> std::path::PathBuf {
+    let mut rest = Vec::new();
+    let mut candidate = Some(path);
+    while let Some(dir) = candidate {
+        if let Ok(canonical) = dir.canonicalize() {
+            let mut resolved = canonical;
+            resolved.extend(rest.iter().rev());
+            return resolved;
+        }
+        let Some(name) = dir.file_name() else { break };
+        rest.push(name.to_os_string());
+        candidate = dir.parent();
+    }
+    path.to_path_buf()
 }
 
 /// Resolve the `cacheSize` field of a `POST /settings` payload into the
@@ -540,7 +589,9 @@ pub async fn update_settings(state: &AppState, payload: &Value) -> anyhow::Resul
     let downloads_dir_patch = match payload.get("downloadsDir") {
         None => None,
         Some(Value::Null) => Some(None),
-        Some(Value::String(raw)) => Some(Some(prepare_downloads_dir(raw).await?)),
+        Some(Value::String(raw)) => {
+            Some(Some(prepare_downloads_dir(raw, &cache_roots(state)).await?))
+        }
         Some(other) => anyhow::bail!("downloadsDir must be a string or null, got {other}"),
     };
 
@@ -1067,18 +1118,20 @@ mod tests {
     async fn prepare_downloads_dir_validates_and_creates() {
         use super::prepare_downloads_dir;
         let tmp = tempfile::tempdir().unwrap();
-        assert!(prepare_downloads_dir("").await.is_err());
-        assert!(prepare_downloads_dir("   ").await.is_err());
-        assert!(prepare_downloads_dir("relative/dir").await.is_err());
+        assert!(prepare_downloads_dir("", &[]).await.is_err());
+        assert!(prepare_downloads_dir("   ", &[]).await.is_err());
+        assert!(prepare_downloads_dir("relative/dir", &[]).await.is_err());
         let file = tmp.path().join("a-file");
         std::fs::write(&file, b"x").unwrap();
         assert!(
-            prepare_downloads_dir(file.to_str().unwrap()).await.is_err(),
+            prepare_downloads_dir(file.to_str().unwrap(), &[])
+                .await
+                .is_err(),
             "a file is not a directory"
         );
 
         let nested = tmp.path().join("offline").join("downloads");
-        let prepared = prepare_downloads_dir(&format!("  {}  ", nested.display()))
+        let prepared = prepare_downloads_dir(&format!("  {}  ", nested.display()), &[])
             .await
             .unwrap();
         assert_eq!(prepared, nested);
@@ -1088,6 +1141,52 @@ mod tests {
             0,
             "the write probe is removed"
         );
+    }
+
+    /// A `downloadsDir` that is a torrent cache root, or above one, is
+    /// refused: the cache cleaner walks those roots, and a downloads dir
+    /// covering one cannot be pruned from the walk without switching every
+    /// eviction rule off for it. Below it and beside it are both fine.
+    #[tokio::test]
+    async fn prepare_downloads_dir_refuses_a_path_covering_a_cache_root() {
+        use super::prepare_downloads_dir;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("cache").join("rqbit-downloads");
+        let roots = [root.clone()];
+
+        assert!(
+            prepare_downloads_dir(root.to_str().unwrap(), &roots)
+                .await
+                .is_err(),
+            "the cache root itself"
+        );
+        assert!(
+            prepare_downloads_dir(tmp.path().to_str().unwrap(), &roots)
+                .await
+                .is_err(),
+            "an ancestor of the cache root"
+        );
+
+        prepare_downloads_dir(root.join("offline").to_str().unwrap(), &roots)
+            .await
+            .expect("inside the cache root is what an unset downloadsDir already does");
+        prepare_downloads_dir(tmp.path().join("elsewhere").to_str().unwrap(), &roots)
+            .await
+            .expect("a directory beside it");
+
+        // Same directory reached through a symlink: still the cache root.
+        #[cfg(unix)]
+        {
+            std::fs::create_dir_all(&root).unwrap();
+            let link = tmp.path().join("link");
+            std::os::unix::fs::symlink(&root, &link).unwrap();
+            assert!(
+                prepare_downloads_dir(link.to_str().unwrap(), &roots)
+                    .await
+                    .is_err(),
+                "a symlink to the cache root"
+            );
+        }
     }
 
     use super::*;
