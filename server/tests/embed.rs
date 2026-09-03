@@ -91,7 +91,12 @@ fn two_embedded_servers_start_concurrently() -> anyhow::Result<()> {
 /// the protected `http://127.0.0.1:11470/local-addon/manifest.json` addon and
 /// requests `/local-addon/stream/{type}/{id}.json` on every details page, so
 /// the stub must answer the manifest and an empty stream list without a token
-/// (legacy clients call it too); `meta` stays a 404.
+/// (legacy clients call it too). A profile synced from an account carries a
+/// descriptor for the same addon that also declares an `other`/`local`
+/// catalog, so `catalog/{type}/{id}.json` and the extra-args
+/// `catalog/{type}/{id}/{extra}.json` shape must answer an empty but valid
+/// catalog; `meta` stays a 404, and so does every other resource under the
+/// prefix.
 #[test]
 fn starts_and_stops_embedded_server() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -180,10 +185,37 @@ fn starts_and_stops_embedded_server() -> anyhow::Result<()> {
         let body: serde_json::Value = response.json()?;
         assert_eq!(body, serde_json::json!({ "streams": [] }), "{path}");
     }
+    // The catalog resource: both shapes `AddonHTTPTransport::resource` builds
+    // (`{id}.json`, and `{id}/{extra}.json` once paging/filtering kicks in),
+    // plus the suffix-less spelling the stream stub also accepts.
+    for path in [
+        "/local-addon/catalog/other/local.json",
+        "/local-addon/catalog/other/local",
+        "/local-addon/catalog/other/local/skip=100.json",
+        "/local-addon/catalog/other/local/genre=Action&skip=100.json",
+        "/local-addon/catalog/other/local/search=the%20matrix.json",
+    ] {
+        let response = anonymous.get(format!("{base}{path}")).send()?;
+        assert_eq!(response.status(), reqwest::StatusCode::OK, "{path}");
+        let body: serde_json::Value = response.json()?;
+        assert_eq!(body, serde_json::json!({ "metas": [] }), "{path}");
+    }
+
     let response = anonymous
         .get(format!("{base}/local-addon/meta/movie/local:abc.json"))
         .send()?;
     assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // Anything else under the prefix is a deliberate 404 from the stub's own
+    // fallback -- never the ERROR-level unhandled-request fallback.
+    for path in [
+        "/local-addon/subtitles/movie/tt0111161.json",
+        "/local-addon/addon_catalog/all/local.json",
+        "/local-addon/",
+    ] {
+        let response = anonymous.get(format!("{base}{path}")).send()?;
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND, "{path}");
+    }
 
     handle.shutdown()?;
     assert_eq!(
