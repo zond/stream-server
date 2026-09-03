@@ -40,6 +40,9 @@ urlencoding = "2.1"
 bumpalo = { version = "3.19", features = ["collections"] }
 memmap2 = "0.9.9"
 parking_lot = "0.12.5"
+# Free-space probe (`available_space`) for the pin_download margin check:
+# pure Rust on Unix and Windows, default `sync` feature only.
+fs4 = "1.1.0"
 
 [dev-dependencies]
 tempfile = "3.23.0"

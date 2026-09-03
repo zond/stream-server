@@ -34,6 +34,11 @@ use crate::backend::{
 };
 
 const INACTIVE_TORRENT_REMOVE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
+/// Free space that must remain on the download volume after a pinned file's
+/// missing bytes are written; `pin_download` refuses below it
+/// ([`PinDownloadError::InsufficientSpace`]). Re-pinning a complete file
+/// needs nothing and is never refused.
+pub const PIN_FREE_SPACE_MARGIN: u64 = 500 * 1024 * 1024;
 /// How long a magnet add may spend resolving metadata inside the backend
 /// before it is given up on. librqbit's `Session::add_torrent` has no timeout
 /// of its own, so without this an unresolvable magnet (no peers, dead
@@ -136,10 +141,50 @@ pub enum PinDownloadError {
     /// The torrent has no such file.
     #[error("file index {file_idx} out of range ({file_count} files)")]
     FileNotFound { file_idx: usize, file_count: usize },
+    /// The download volume has less than the file's missing bytes plus
+    /// [`PIN_FREE_SPACE_MARGIN`] available.
+    #[error(
+        "not enough free space for the download: {required} bytes needed (including a {margin} byte margin), {available} available"
+    )]
+    InsufficientSpace {
+        required: u64,
+        available: u64,
+        margin: u64,
+    },
     /// The backend refused the pin.
     #[error(transparent)]
     Backend(#[from] anyhow::Error),
 }
+
+/// Whether `remaining` more bytes may be written to a volume with
+/// `available` free bytes while keeping `margin` free. Nothing left to
+/// write is always allowed (a complete file re-pinned on a full disk).
+pub fn free_space_allows(available: u64, remaining: u64, margin: u64) -> bool {
+    remaining == 0 || available >= remaining.saturating_add(margin)
+}
+
+/// Available bytes on the volume holding `path`, probed at the nearest
+/// existing ancestor (the torrent's folder may not exist yet). `Err` only
+/// when no ancestor can be probed.
+fn free_space_at(
+    probe: &(dyn Fn(&std::path::Path) -> std::io::Result<u64> + Send + Sync),
+    path: &std::path::Path,
+) -> std::io::Result<u64> {
+    let mut candidate = Some(path);
+    let mut last_error = None;
+    while let Some(dir) = candidate {
+        match probe(dir) {
+            Ok(available) => return Ok(available),
+            Err(e) => {
+                last_error = Some(e);
+                candidate = dir.parent();
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| std::io::Error::other("empty path")))
+}
+
+type FreeSpaceProbe = Arc<dyn Fn(&std::path::Path) -> std::io::Result<u64> + Send + Sync>;
 
 /// One pinned offline download, see [`BackendEngineFS::pinned_downloads`].
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -277,6 +322,9 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     /// Where pinned downloads are placed (`<downloads_dir>/<info hash>`),
     /// see [`Self::set_downloads_dir`]. `None` = the backend's default root.
     downloads_dir: parking_lot::RwLock<Option<std::path::PathBuf>>,
+    /// Available-bytes probe for the free-space check in `pin_download`
+    /// (`fs4::available_space`; tests substitute one).
+    free_space_probe: FreeSpaceProbe,
     /// Epoch of every `*_secs` timestamp this instance and its engines keep.
     clock: Clock,
 }
@@ -398,6 +446,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             seeding_enabled: Arc::new(AtomicBool::new(true)),
             magnet_adds: Arc::new(RwLock::new(HashMap::new())),
             downloads_dir: parking_lot::RwLock::new(None),
+            free_space_probe: Arc::new(|path| fs4::available_space(path)),
             clock,
         };
 
@@ -1462,15 +1511,22 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             output_folder: folder.clone(),
             only_files: Some(vec![file_idx]),
         };
+        let was_managed = self.get_engine(&info_hash).await.is_some();
         let engine = self
             .get_or_add_magnet_placed(&info_hash, extra_trackers.clone(), placement)
             .await?;
-        let file_count = engine.handle.file_count().await;
-        if file_idx >= file_count {
-            return Err(PinDownloadError::FileNotFound {
-                file_idx,
-                file_count,
-            });
+        let checked = self
+            .check_pin_preconditions(&engine, file_idx, folder.as_deref())
+            .await;
+        if let Err(error) = checked {
+            if !was_managed && !engine.is_pinned() {
+                // Added only for this pin: do not leave it behind.
+                self.remove_engine(&info_hash).await;
+                if let Err(e) = self.backend.remove_torrent(&info_hash).await {
+                    debug!(info_hash, error = %e, "could not drop the torrent added for a refused pin");
+                }
+            }
+            return Err(error);
         }
         let engine = match folder {
             Some(folder)
@@ -1557,6 +1613,64 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             .collect();
         pinned.sort_by(|a, b| (&a.info_hash, a.file_idx).cmp(&(&b.info_hash, b.file_idx)));
         pinned
+    }
+
+    /// The file exists, and the volume it is (or will be) written to has
+    /// room for its missing bytes plus [`PIN_FREE_SPACE_MARGIN`]. A volume
+    /// that cannot be probed is not held against the pin (logged).
+    async fn check_pin_preconditions(
+        &self,
+        engine: &Arc<Engine<B::Handle>>,
+        file_idx: usize,
+        folder: Option<&std::path::Path>,
+    ) -> Result<(), PinDownloadError> {
+        let file_count = engine.handle.file_count().await;
+        if file_idx >= file_count {
+            return Err(PinDownloadError::FileNotFound {
+                file_idx,
+                file_count,
+            });
+        }
+        let stats = engine.handle.stats().await;
+        let remaining = stats
+            .files
+            .get(file_idx)
+            .map(|file| file.length.saturating_sub(file.downloaded))
+            .unwrap_or(0);
+        if remaining == 0 {
+            return Ok(());
+        }
+        let volume = folder
+            .map(std::path::Path::to_path_buf)
+            .or_else(|| engine.handle.output_folder())
+            .unwrap_or_else(|| self.download_dir.clone());
+        match free_space_at(&*self.free_space_probe, &volume) {
+            Ok(available) if free_space_allows(available, remaining, PIN_FREE_SPACE_MARGIN) => {
+                Ok(())
+            }
+            Ok(available) => Err(PinDownloadError::InsufficientSpace {
+                required: remaining.saturating_add(PIN_FREE_SPACE_MARGIN),
+                available,
+                margin: PIN_FREE_SPACE_MARGIN,
+            }),
+            Err(error) => {
+                tracing::warn!(
+                    info_hash = %engine.info_hash,
+                    path = %volume.display(),
+                    %error,
+                    "could not probe free space; pinning anyway"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn set_free_space_probe(
+        &mut self,
+        probe: impl Fn(&std::path::Path) -> std::io::Result<u64> + Send + Sync + 'static,
+    ) {
+        self.free_space_probe = Arc::new(probe);
     }
 
     /// Where pinned downloads go: `<dir>/<info hash>` per torrent, or the
@@ -3628,6 +3742,117 @@ mod tests {
                 file_idx: 1
             }]
         );
+    }
+
+    // --- free-space check before pinning ---
+
+    #[test]
+    fn free_space_allows_requires_the_margin_unless_nothing_is_left_to_write() {
+        assert!(free_space_allows(1_000, 500, 400));
+        assert!(free_space_allows(900, 500, 400));
+        assert!(!free_space_allows(899, 500, 400));
+        assert!(!free_space_allows(0, 1, 0));
+        assert!(
+            free_space_allows(0, 0, 400),
+            "complete file: nothing to write"
+        );
+        assert!(!free_space_allows(u64::MAX - 1, u64::MAX, 1), "no overflow");
+    }
+
+    /// `free_space_at` probes the nearest existing ancestor -- the torrent's
+    /// folder does not exist before its first write -- and the default
+    /// probe answers for a real directory.
+    #[test]
+    fn free_space_at_walks_up_to_an_existing_ancestor() {
+        let probed = Mutex::new(Vec::new());
+        let probe = |path: &std::path::Path| {
+            probed.lock().unwrap().push(path.to_path_buf());
+            if path == std::path::Path::new("/root") {
+                Ok(42)
+            } else {
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            }
+        };
+        assert_eq!(
+            free_space_at(&probe, std::path::Path::new("/root/downloads/hash")).unwrap(),
+            42
+        );
+        assert_eq!(
+            probed.lock().unwrap().as_slice(),
+            &[
+                std::path::PathBuf::from("/root/downloads/hash"),
+                "/root/downloads".into(),
+                "/root".into()
+            ]
+        );
+        assert!(free_space_at(&probe, std::path::Path::new("/nowhere/at/all")).is_err());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real = |path: &std::path::Path| fs4::available_space(path);
+        assert!(free_space_at(&real, tmp.path()).unwrap() > 0);
+        assert!(free_space_at(&real, &tmp.path().join("not").join("yet")).unwrap() > 0);
+    }
+
+    /// A pin is refused when the volume lacks the file's missing bytes plus
+    /// the margin, a torrent added only for that pin is dropped again, a
+    /// complete file needs no space, and a volume that cannot be probed
+    /// does not block the pin.
+    #[tokio::test]
+    async fn pin_download_refuses_without_the_free_space_margin() {
+        let (mut enginefs, _counters) = test_enginefs_unmanaged();
+        // Fake files are 100 bytes, half downloaded: 50 remain.
+        let available = Arc::new(AtomicU64::new(PIN_FREE_SPACE_MARGIN + 49));
+        let probe_available = available.clone();
+        enginefs.set_free_space_probe(move |_| Ok(probe_available.load(Ordering::SeqCst)));
+        enginefs.set_downloads_dir(Some("/offline".into()));
+
+        let err = match enginefs.pin_download(TEST_HASH, 0, None).await {
+            Ok(_) => panic!("must refuse"),
+            Err(err) => err,
+        };
+        match err {
+            PinDownloadError::InsufficientSpace {
+                required,
+                available,
+                margin,
+            } => {
+                assert_eq!(required, PIN_FREE_SPACE_MARGIN + 50);
+                assert_eq!(available, PIN_FREE_SPACE_MARGIN + 49);
+                assert_eq!(margin, PIN_FREE_SPACE_MARGIN);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert!(enginefs.get_engine(TEST_HASH).await.is_none());
+        assert_eq!(
+            enginefs.backend.removed.lock().unwrap().as_slice(),
+            &[TEST_HASH.to_string()],
+            "the torrent added for the refused pin is dropped"
+        );
+        assert!(enginefs.pinned_downloads().await.is_empty());
+
+        available.store(PIN_FREE_SPACE_MARGIN + 50, Ordering::SeqCst);
+        enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
+        assert_eq!(enginefs.pinned_downloads().await.len(), 1);
+
+        // Already managed and pinned: a refused second pin keeps the engine.
+        available.store(0, Ordering::SeqCst);
+        assert!(matches!(
+            enginefs.pin_download(TEST_HASH, 1, None).await,
+            Err(PinDownloadError::InsufficientSpace { .. })
+        ));
+        assert!(enginefs.get_engine(TEST_HASH).await.is_some());
+        assert_eq!(enginefs.backend.removed.lock().unwrap().len(), 1);
+
+        // Complete file: nothing to write, no space needed.
+        let (mut enginefs, counters) = test_enginefs_with_file_count(2);
+        counters.seeded.store(true, Ordering::SeqCst);
+        enginefs.set_free_space_probe(|_| Ok(0));
+        enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
+
+        // Unprobeable volume: pinned anyway.
+        let (mut enginefs, _counters) = test_enginefs_with_file_count(2);
+        enginefs.set_free_space_probe(|_| Err(std::io::Error::other("no statvfs here")));
+        enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
     }
 
     // --- pinned offline downloads ---
