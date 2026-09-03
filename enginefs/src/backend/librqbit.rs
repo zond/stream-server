@@ -1830,6 +1830,16 @@ mod tests {
     use super::*;
     use crate::backend::TorrentBackend;
 
+    /// How long a bounded state-wait in these tests may take before it
+    /// gives up. These waits poll for something a background task or the
+    /// blocking hash-check pool has to do, so the bound is not a timing
+    /// assertion: it is only there so a regression fails instead of
+    /// hanging. Generous on purpose -- a CI runner under load (or
+    /// `--test-threads=16` on two cores) can be an order of magnitude
+    /// slower than an idle laptop, and a tight bound turns that into a
+    /// spurious failure.
+    const TEST_WAIT_BOUND: Duration = Duration::from_secs(60);
+
     /// `Ephemeral` sessions never collide: the OS hands each its own port.
     /// (Whether a second bind of an already-taken *fixed* port fails is
     /// platform-dependent -- Windows lets it through -- so that is not
@@ -2661,7 +2671,7 @@ mod tests {
         // A deferred reconcile that raced initialization must settle to the
         // latest selection state, never leave a stale parked op behind.
         let slot = handle.deferred_selection();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
         while slot.has_pending() && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -2697,7 +2707,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
         while handle.handle.only_files() != Some(vec![0]) && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -2994,7 +3004,7 @@ mod tests {
         handle.pin_file(1).await.unwrap();
         // Recorded immediately, applied once initialized.
         assert_eq!(TorrentHandle::stats(&handle).await.pinned_files, vec![1]);
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
         while handle.handle.only_files() != Some(vec![1]) && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -3170,6 +3180,10 @@ mod tests {
         write_payload(&content_dir.join("a.bin"), 16 * 1024).await;
         write_payload(&content_dir.join("b.bin"), 24 * 1024).await;
         let (multi_bytes, _) = make_torrent(&content_dir).await;
+        // The torrent's file order is the filesystem's readdir order, not
+        // the order the fixture wrote the files in: look every index up.
+        let a = torrent_file_index(&multi_bytes, "a.bin");
+        let b = torrent_file_index(&multi_bytes, "b.bin");
 
         let backend = LibrqbitBackend::new_for_tests(dir.clone())
             .await
@@ -3195,11 +3209,11 @@ mod tests {
         assert_eq!(single.file_path(1).await, None, "out of range");
 
         assert_eq!(
-            multi.file_path(1).await.as_deref(),
+            multi.file_path(b).await.as_deref(),
             Some(content_dir.join("b.bin").as_path())
         );
         assert_eq!(
-            tokio::fs::metadata(multi.file_path(0).await.unwrap())
+            tokio::fs::metadata(multi.file_path(a).await.unwrap())
                 .await
                 .unwrap()
                 .len(),
@@ -3328,10 +3342,8 @@ mod tests {
         };
 
         let mut stats = handle.stats().await;
-        for _ in 0..100 {
-            if stats.phase == StartupPhase::Error {
-                break;
-            }
+        let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
+        while stats.phase != StartupPhase::Error && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(50)).await;
             stats = handle.stats().await;
         }
@@ -3368,6 +3380,12 @@ mod tests {
         write_payload(&src.join("a.bin"), 32 * 1024).await;
         write_payload(&src.join("b.bin"), 48 * 1024).await;
         let (bytes, hash) = make_torrent(&src).await;
+        // The torrent's file order is the filesystem's readdir order, not
+        // the order the fixture wrote the files in: look every index up.
+        // (Both files are whole 16 KiB pieces, so neither order makes them
+        // share a boundary piece.)
+        let a = torrent_file_index(&bytes, "a.bin");
+        let b = torrent_file_index(&bytes, "b.bin");
 
         let dl = tmp.path().join("dl");
         let backend = LibrqbitBackend::new_for_tests(dl.clone())
@@ -3386,24 +3404,24 @@ mod tests {
                 vec![],
                 TorrentPlacement {
                     output_folder: Some(folder.clone()),
-                    only_files: Some(vec![1]),
+                    only_files: Some(vec![b]),
                 },
             )
             .await
             .expect("add with placement");
         assert_eq!(handle.output_folder(), Some(folder.clone()));
-        assert_eq!(handle.handle.only_files(), Some(vec![1]));
+        assert_eq!(handle.handle.only_files(), Some(vec![b]));
         assert_eq!(
-            handle.file_path(1).await.as_deref(),
+            handle.file_path(b).await.as_deref(),
             Some(folder.join("b.bin").as_path())
         );
         handle.handle.wait_until_initialized().await.unwrap();
         let stats = handle.stats().await;
         assert!(
-            stats.files[1].complete,
+            stats.files[b].complete,
             "pre-seeded file verified: {stats:?}"
         );
-        assert!(!stats.files[0].complete);
+        assert!(!stats.files[a].complete);
         assert!(
             !dl.join("src").exists(),
             "nothing lands in the session root"
@@ -3565,7 +3583,7 @@ mod tests {
             .unwrap();
         handle.handle.wait_until_initialized().await.unwrap();
         let root_folder = dl.join("show");
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
         while !root_folder.join("e2.bin").exists() && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -3639,7 +3657,7 @@ mod tests {
             .await
             .unwrap();
         handle.handle.wait_until_initialized().await.unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
         while !root_folder.join("e2.bin").exists() && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
