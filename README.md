@@ -125,15 +125,40 @@ The `stremio-runtime` stub spawns the server with `--no-auth`: it is the compati
 | `checkedBytes`, `checkTotalBytes` | Hash-check progress; non-null only while `checking` |
 | `initialWindowReadyBytes`, `initialWindowBytes` | Bytes of the stream file's head window (`min(4 MiB, file length)`) already verified on disk; non-null only in `buffering`/`ready`. Also present per entry in `files[]` |
 | `peerDiscovery` | `{ seen, queued, connecting, live }` peer counters (`peers`/`unique`/`queued` remain as before) |
-| `connectedSeeders` | How many of the peers we are **connected to** hold the complete torrent, i.e. can serve any piece. It is **not** the swarm's seeder count: this server does not scrape trackers, so nothing here reflects seeders we never connected to, and the number is always bounded by `peers`. 0 while `resolvingMetadata` — a magnet with no metadata yet has no peers. (`swarmSize` is not this either: it is a server.js-compatible alias of `peers`, kept for wire compatibility.) |
+| `connectedSeeders` | How many of the peers we are **connected to** hold the complete torrent, i.e. can serve any piece. Not the swarm's seeder count — it only ever counts our own connections and is always bounded by `peers`; for the swarm read `swarmSeeders`. 0 while `resolvingMetadata` — a magnet with no metadata yet has no peers. (`swarmSize` is not this either: it is a server.js-compatible alias of `peers`, kept for wire compatibility.) |
+| `swarmSeeders`, `swarmLeechers` | Seeders and leechers in the **whole swarm**, as the torrent's trackers report them — see [Swarm counts](#swarm-counts-from-tracker-scrapes) below. `null` when unknown, **never** `0` |
+| `swarmScrapeAgeSecs` | How many seconds ago the freshest scrape behind those two numbers came back. `null` exactly when they are |
 
 The top-level window/phase describe the guessed stream file for `/{infoHash}/stats.json` and the requested file for `/{infoHash}/{fileIdx}/stats.json`.
+
+#### Swarm counts from tracker scrapes
+
+`stats.json` reports **three different numbers** that are easy to confuse:
+
+| Field | Question it answers |
+|---|---|
+| `peers` | How many peers we currently have a live connection to (`swarmSize` is a server.js-compatible alias of this — it is not a swarm-size estimate) |
+| `connectedSeeders` | How many of *those* connections hold the complete torrent. Always `<= peers` |
+| `swarmSeeders` / `swarmLeechers` | How many seeders and leechers exist **in the whole swarm**, including everyone we never connected to |
+
+The swarm numbers come from this server scraping the torrent's own trackers — BEP-48 over HTTP(S), BEP-15 action 2 over UDP. A scrape is read-only: it carries no port, peer id or event, so it cannot register us as a peer or interfere with the announces the torrent engine makes. (This is why the engine does not do it for us: a client is expected to scrape for itself.)
+
+Because they are a **tracker snapshot rather than a live measurement**, they come with `swarmScrapeAgeSecs`, the age of the freshest scrape behind them — show it, or at least do not present a 20-minute-old count as "now". A tracker is scraped at most once every 15 minutes per torrent, with an exponential backoff (60 s up to 30 min) after failures, and only while something is actually polling that torrent's stats. Numbers older than an hour are dropped rather than shown.
+
+`swarmSeeders` and `swarmLeechers` are **`null`, never `0`, when we do not know** — a swarm with zero seeders is a real state, and a client has to be able to tell "nobody is seeding this" from "we have not been able to ask". Expect `null` for:
+
+- a **DHT-only** torrent (a magnet with no `tr=` trackers — there is nothing to scrape),
+- a **private** torrent (`private` in the info dictionary): those are never scraped at all, since an unsolicited request can breach a private tracker's rules and its announce URL carries a passkey,
+- a torrent whose trackers have not answered yet, do not answer, or do not know the info hash,
+- a magnet whose metadata has not arrived (we cannot yet tell whether it is private, so we leave it alone).
+
+Multiple trackers are aggregated with **`max`, not `sum`**, computed separately for seeders and leechers. Each tracker only ever sees the peers that registered with *it*, so no tracker's number is a share of a total; and several trackers in the shipped list share a backend and answer with byte-identical counts, so summing would report the same swarm several times over. The largest number a single tracker vouches for is the honest floor. Trackers that failed or do not know the hash contribute nothing at all (they are not folded in as zeroes), and an implausible count (above 100000) is logged and ignored. Per-tracker figures are in `sources[]`, so a client can see the disagreement for itself.
 
 Both stats routes accept the same query parameters as `/{infoHash}/{fileIdx}` and behave like it when they are the first request for a torrent:
 
 - **`tr=`** (repeatable, `tracker:`-prefixed values accepted, `dht:` ignored) — trackers merged into the engine when the stats request is the one that creates it. Poll stats before the first stream request freely: the engine is created exactly as the stream route would create it, so the addon's trackers are kept for the session (the engine passes them to librqbit as `tr=` params of the magnet link it adds — librqbit reads a magnet's trackers from the link alone, so `sources` lists them once metadata arrives). Trackers can only be set by the request that creates the engine — librqbit has no API to add trackers to a torrent later (`add_trackers` is a documented no-op), so a later request carrying extra trackers does not extend the set.
 - **`f=`** (per-file route, repeatable) — file filters for resolving `fileIdx=-1`, as on the stream route.
-- **`sources`** lists the trackers the torrent was added with (`url` only; librqbit exposes no per-tracker announce counters, so `numRequests`/`numFound`/`lastStarted` are `0`/empty).
+- **`sources`** lists the trackers the torrent was added with. librqbit exposes no per-tracker announce counters, so `numRequests`/`numFound`/`lastStarted` are `0`/empty; a tracker we have successfully scraped also carries `seeders`, `leechers` and `completed` (absent until it answers).
 
 **During metadata resolution** (a magnet whose info dictionary has not arrived yet) both routes answer immediately with `200` and `phase: "resolvingMetadata"`, `hasMetadata: false`, an empty `files` array, `streamLen: 0` and `sources` listing the trackers in use — the per-file route included, since there is no file list to index into yet. Requests never block on metadata, and concurrent requests for one magnet share a single resolution — the stream routes, both stats routes and stremio-core's `/{infoHash}/create` all join the same in-flight add. Once metadata is known, a `fileIdx` that does not exist returns `404` as before.
 
