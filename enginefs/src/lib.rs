@@ -1985,6 +1985,16 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
         let was_pinned = engine.pinned_files.write().remove(&file_idx);
         engine.handle.unpin_file(file_idx).await?;
+        if delete_files {
+            // Before the want-set is re-planned, because it is planned from
+            // exactly this bookkeeping: `reconcile_with_active_selection`
+            // unions the registered active file into `only_files`, so
+            // deleting the file that is playing would leave it selected,
+            // librqbit writing on through the handle it keeps open on the
+            // torrent's files, and the unlinked inode's blocks growing with
+            // nothing able to reclaim them until the process exits.
+            self.forget_playback_of(&info_hash, file_idx).await;
+        }
         // Recomputed before anything is deleted: the backend must not be
         // writing a file this call is about to remove, and that holds for a
         // file that was never pinned too (the delete is what the caller
@@ -2538,6 +2548,35 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             .await
             .insert(old.info_hash.clone(), engine.clone());
         engine
+    }
+
+    /// Forget that `file_idx` of `info_hash` is being played: its active
+    /// selection, its lease and its stream count go, as
+    /// `activate_multifile_file` drops them for the files a new selection
+    /// supersedes. What a delete needs before it reconciles -- the want-set
+    /// is planned from this bookkeeping, and a file still registered as the
+    /// active one is unioned back into `only_files` however it was deleted.
+    /// A selection naming another file of the torrent is left alone: that
+    /// file keeps playing.
+    async fn forget_playback_of(&self, info_hash: &str, file_idx: usize) {
+        {
+            let mut selections = self.active_multifile_files.write().await;
+            if selections
+                .get(info_hash)
+                .is_some_and(|selection| selection.file_idx == file_idx)
+            {
+                selections.remove(info_hash);
+            }
+        }
+        let key = (info_hash.to_string(), file_idx);
+        self.active_playback_leases.write().await.remove(&key);
+        self.active_file_streams.write().await.remove(&key);
+        {
+            let mut active = self.active_file.write().await;
+            if active.as_ref() == Some(&key) {
+                *active = None;
+            }
+        }
     }
 
     /// Re-plan the engine's want-set from whatever multi-file selection is
@@ -5889,6 +5928,79 @@ mod tests {
             before + 1,
             "the want-set is recomputed without the deleted file"
         );
+    }
+
+    /// The file a per-file delete removes must stop being the file playback
+    /// is registered on, or the want-set re-planned right after it puts the
+    /// deleted index straight back into `only_files` (the active file is
+    /// always unioned in) -- librqbit then keeps writing through the handle
+    /// it holds open on the torrent's files and re-allocates blocks on the
+    /// unlinked inode, which nothing can reclaim until the process exits.
+    #[tokio::test]
+    async fn per_file_delete_stops_the_file_counting_as_the_one_playing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("Show");
+        std::fs::create_dir_all(&folder).unwrap();
+        let file = |idx: usize| folder.join(format!("video-{idx}.mkv"));
+        let (enginefs, counters) = test_enginefs_with_file_count(3);
+        for idx in 0..3 {
+            std::fs::write(file(idx), [7u8; 4096]).unwrap();
+        }
+        *counters.output_folder.lock().unwrap() = Some(folder.clone());
+
+        // File 2 is pinned, so the torrent keeps running after the delete;
+        // file 0 is the one being played, and the one deleted.
+        enginefs.pin_download(TEST_HASH, 2, None).await.unwrap();
+        enginefs
+            .activate_multifile_file_for_playback(TEST_HASH, 0, None, "test-playing")
+            .await;
+        insert_active_lease(&enginefs, 0).await;
+        enginefs
+            .active_file_streams
+            .write()
+            .await
+            .insert((TEST_HASH.to_string(), 0), 1);
+        assert_eq!(*counters.last_active_file.lock().unwrap(), Some(0));
+
+        assert!(!enginefs.unpin_download(TEST_HASH, 0, true).await.unwrap());
+
+        assert_eq!(
+            *counters.last_active_file.lock().unwrap(),
+            None,
+            "the deleted file is not planned back into the want-set"
+        );
+        assert!(
+            !enginefs
+                .active_multifile_files
+                .read()
+                .await
+                .contains_key(TEST_HASH),
+            "and it is no longer the torrent's active selection"
+        );
+        let key = (TEST_HASH.to_string(), 0);
+        assert!(
+            !enginefs
+                .active_playback_leases
+                .read()
+                .await
+                .contains_key(&key),
+            "its playback lease goes with it"
+        );
+        assert!(
+            !enginefs.active_file_streams.read().await.contains_key(&key),
+            "and its stream count"
+        );
+        assert_eq!(*enginefs.active_file.read().await, None);
+        assert!(!file(0).exists());
+        assert!(file(2).is_file(), "the pinned file is untouched");
+
+        // A selection naming another file of the same torrent is left
+        // alone: that file is still playing.
+        enginefs
+            .activate_multifile_file_for_playback(TEST_HASH, 2, None, "test-playing")
+            .await;
+        assert!(!enginefs.unpin_download(TEST_HASH, 1, true).await.unwrap());
+        assert_eq!(*counters.last_active_file.lock().unwrap(), Some(2));
     }
 
     /// A delete of a file nothing pinned (a pin lost to a crash, or a plain
