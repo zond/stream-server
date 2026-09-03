@@ -1635,7 +1635,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             .get_or_add_magnet_placed(info_hash, extra_trackers.clone(), placement)
             .await?;
         let checked = self
-            .check_pin_preconditions(&engine, file_idx, folder.as_deref())
+            .check_pin_preconditions(&engine, file_idx, folder.as_deref(), was_managed)
             .await;
         if let Err(error) = checked {
             if !was_managed && !engine.is_pinned() {
@@ -1848,11 +1848,19 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// the missing bytes. A volume that cannot be probed is not held against
     /// the pin (logged); volumes whose identity cannot be told apart are
     /// assumed different (the strict side).
+    ///
+    /// A torrent that was managed before this call (`was_managed`), stays
+    /// where it is and is still `checking` its data (right after a restart
+    /// or a relocation) is not measured at all: `downloaded` reads 0 until
+    /// the check ends, so a complete file would be refused as if it had
+    /// everything left to write -- and refusing changes nothing about the
+    /// download, which librqbit already wants.
     async fn check_pin_preconditions(
         &self,
         engine: &Arc<Engine<B::Handle>>,
         file_idx: usize,
         folder: Option<&std::path::Path>,
+        was_managed: bool,
     ) -> Result<(), PinDownloadError> {
         let file_count = engine.handle.file_count().await;
         if file_idx >= file_count {
@@ -1867,6 +1875,12 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             (Some(folder), Some(current)) if folder != current => Some(folder),
             _ => None,
         };
+        if was_managed
+            && relocating_to.is_none()
+            && stats.phase == crate::backend::StartupPhase::Checking
+        {
+            return Ok(());
+        }
         let crosses_volumes = match (relocating_to, current.as_deref()) {
             (Some(to), Some(from)) => !self.same_volume(from, to),
             _ => false,
@@ -4358,6 +4372,65 @@ mod tests {
         cross_volume(&mut enginefs);
         enginefs.set_free_space_probe(|_| Ok(PIN_FREE_SPACE_MARGIN + 50));
         enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
+    }
+
+    /// Re-pinning a file of a torrent that is still checking its data in
+    /// place (a restart, a relocation) is not refused for space: its
+    /// `downloaded` reads 0 until the check ends, and the download is
+    /// already librqbit's to continue. A torrent added by the pin itself is
+    /// measured even while initializing (nothing of it is on disk yet), and
+    /// so is a checking torrent the pin would relocate.
+    #[tokio::test]
+    async fn re_pin_of_a_checking_torrent_in_place_skips_the_space_check() {
+        let (mut enginefs, _counters, _init) =
+            test_enginefs_initializing(2, Duration::from_secs(60));
+        enginefs.set_free_space_probe(|_| Ok(0));
+        assert_eq!(
+            enginefs
+                .get_engine(TEST_HASH)
+                .await
+                .unwrap()
+                .get_statistics()
+                .await
+                .phase,
+            StartupPhase::Checking
+        );
+        enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
+
+        // Would relocate: measured (and refused -- everything would move).
+        let (mut enginefs, counters, _init) =
+            test_enginefs_initializing(2, Duration::from_secs(60));
+        *counters.output_folder.lock().unwrap() = Some("/cache/rqbit-downloads/show".into());
+        enginefs.set_downloads_dir(Some("/offline".into()));
+        enginefs.set_free_space_probe(|_| Ok(0));
+        assert!(matches!(
+            enginefs.pin_download(TEST_HASH, 1, None).await,
+            Err(PinDownloadError::InsufficientSpace { .. })
+        ));
+
+        // Freshly added for the pin: measured.
+        let counters = Arc::new(FakeCounters::default());
+        let handle = FakeHandle {
+            info_hash: TEST_HASH.to_string(),
+            counters,
+            files: vec![BackendFileInfo {
+                name: "video.mkv".into(),
+                length: 100,
+            }],
+            init: FakeInit::new(false, Duration::from_secs(60)),
+        };
+        let root = std::env::temp_dir().join("enginefs-downloads-dir-tests");
+        let mut enginefs = BackendEngineFS::new_with_backend(
+            FakeBackend::new(vec![handle]),
+            HashMap::new(),
+            root.join("cache"),
+            root.join("downloads"),
+        );
+        enginefs.set_free_space_probe(|_| Ok(0));
+        assert!(matches!(
+            enginefs.pin_download(TEST_HASH, 0, None).await,
+            Err(PinDownloadError::InsufficientSpace { .. })
+        ));
     }
 
     // --- pin persistence across restarts ---
