@@ -1,3 +1,4 @@
+use crate::backend::dht_bootstrap::{self, BootstrapResolvers};
 use crate::backend::{
     BackendFileInfo, BackendMemoryDiagnostics, DhtStatus, EngineStats, FileStreamTrait, Growler,
     PeerDiscovery, PeerSearch, PieceReadiness, Source, StartupPhase, StatsFile, StatsOptions,
@@ -280,7 +281,10 @@ enum InitPolicy {
 /// The two survivors are exactly librqbit's own built-in fallback
 /// (`DHT_BOOTSTRAP` in the `zond/rqbit` fork's `crates/dht/src/lib.rs`), so
 /// overriding that default buys one speculative extra host, not a
-/// meaningfully different failure surface.
+/// meaningfully different failure surface. What the override *does* buy is
+/// that these entries pass through [`dht_bootstrap::resolve_bootstrap_addrs`]
+/// first, which turns the names into address literals -- see that module for
+/// why (a field log had the system resolver itself returning nothing).
 ///
 /// Overridable via the `dhtBootstrapNodes` server setting
 /// (`server/src/routes/system.rs`) -- see [`resolve_dht_bootstrap_nodes`].
@@ -312,7 +316,10 @@ pub const DEFAULT_DHT_BOOTSTRAP_NODES: &[&str] = &[
 /// [`DEFAULT_DHT_BOOTSTRAP_NODES`] entirely; otherwise the default set.
 /// Mirrors `SessionOptions.dht.bootstrap_addrs`'s own `None` = built-in
 /// convention, except our built-in default is the measured list above
-/// rather than librqbit's two-host one.
+/// rather than librqbit's two-host one. Both branches then go through
+/// [`dht_bootstrap::resolve_bootstrap_addrs`], so a configured list gets the
+/// same name resolution the default does -- and a configured list of
+/// address literals still passes through untouched.
 pub fn resolve_dht_bootstrap_nodes(configured: &[String]) -> Vec<String> {
     if configured.is_empty() {
         DEFAULT_DHT_BOOTSTRAP_NODES
@@ -322,6 +329,22 @@ pub fn resolve_dht_bootstrap_nodes(configured: &[String]) -> Vec<String> {
     } else {
         configured.to_vec()
     }
+}
+
+/// The full bootstrap pipeline: pick the effective list
+/// ([`resolve_dht_bootstrap_nodes`]) and then turn its names into address
+/// literals ([`dht_bootstrap::resolve_bootstrap_addrs`]).
+///
+/// The two steps are one function because they must not drift apart: a
+/// configured `dhtBootstrapNodes` list gets exactly the same DNS treatment
+/// the built-in default does, and neither list can be silently replaced by
+/// the other.
+pub async fn effective_dht_bootstrap_addrs(
+    configured: &[String],
+    resolvers: &BootstrapResolvers,
+) -> Vec<String> {
+    dht_bootstrap::resolve_bootstrap_addrs(&resolve_dht_bootstrap_nodes(configured), resolvers)
+        .await
 }
 
 pub struct LibrqbitBackend {
@@ -350,10 +373,18 @@ impl LibrqbitBackend {
     /// seeding its DHT routing table from `dht_bootstrap_nodes` when cold
     /// (empty uses [`DEFAULT_DHT_BOOTSTRAP_NODES`]; see
     /// [`resolve_dht_bootstrap_nodes`]).
+    ///
+    /// Whatever that list ends up being, `bootstrap_resolvers` turns its
+    /// names into address literals before librqbit sees them -- see
+    /// [`dht_bootstrap`] for why and for the ladder it walks.
+    /// [`BootstrapResolvers::production`] is the real one;
+    /// [`BootstrapResolvers::offline`] does no DNS at all and is what
+    /// hermetic callers want.
     pub async fn new(
         download_dir: PathBuf,
         listen_port: TorrentListenPort,
         dht_bootstrap_nodes: Vec<String>,
+        bootstrap_resolvers: BootstrapResolvers,
     ) -> Result<(Self, HashMap<String, LibrqbitHandle>)> {
         tokio::fs::create_dir_all(&download_dir).await?;
         debug!(path = ?download_dir, "Storing downloads");
@@ -363,7 +394,8 @@ impl LibrqbitBackend {
         // port-fallback is done here: try each port in order and keep the
         // first that binds. `Ephemeral` is the single candidate 0, which
         // librqbit itself defaults to and resolves to the bound port.
-        let bootstrap_addrs = resolve_dht_bootstrap_nodes(&dht_bootstrap_nodes);
+        let bootstrap_addrs =
+            effective_dht_bootstrap_addrs(&dht_bootstrap_nodes, &bootstrap_resolvers).await;
         let upnp_forwarding = listen_port.wants_upnp_forwarding();
         let session = {
             let mut last_err = None;
@@ -396,8 +428,9 @@ impl LibrqbitBackend {
                     // `directories::ProjectDirs` (HOME/XDG), which has no
                     // answer on Android and would fail `Session::new`.
                     // `bootstrap_addrs` is `DEFAULT_DHT_BOOTSTRAP_NODES`
-                    // (or the operator's `dhtBootstrapNodes` override) --
-                    // see that constant.
+                    // (or the operator's `dhtBootstrapNodes` override),
+                    // already turned into address literals wherever DNS
+                    // managed it -- see `dht_bootstrap`.
                     dht: Some(librqbit::DhtSessionConfig {
                         bootstrap_addrs: Some(bootstrap_addrs.clone()),
                         persistence: Some(librqbit::dht::DhtPersistenceConfig {
@@ -2196,6 +2229,58 @@ mod tests {
         );
     }
 
+    /// A configured list survives the DNS step intact: its names are the
+    /// ones resolved, and none of the defaults sneak back in.
+    #[tokio::test]
+    async fn a_configured_list_is_what_gets_resolved_not_the_default() {
+        let configured = vec!["mydht.example.test:6881".to_string()];
+        let addrs = effective_dht_bootstrap_addrs(
+            &configured,
+            &crate::backend::dht_bootstrap::BootstrapResolvers::offline(),
+        )
+        .await;
+        assert_eq!(addrs, configured);
+        for default_entry in DEFAULT_DHT_BOOTSTRAP_NODES {
+            let host = default_entry.rsplit_once(':').unwrap().0;
+            assert!(
+                !addrs.iter().any(|a| a.contains(host)),
+                "a configured list must not be topped up with the defaults"
+            );
+        }
+    }
+
+    /// A configured list of address literals reaches librqbit byte for
+    /// byte -- an operator who already knows the addresses (because DNS on
+    /// their network does not work) must not have them re-resolved.
+    #[tokio::test]
+    async fn a_configured_list_of_literals_reaches_librqbit_untouched() {
+        let configured = vec![
+            "67.215.246.10:6881".to_string(),
+            "[2001:db8::1]:25401".to_string(),
+        ];
+        assert_eq!(
+            effective_dht_bootstrap_addrs(
+                &configured,
+                &crate::backend::dht_bootstrap::BootstrapResolvers::offline(),
+            )
+            .await,
+            configured
+        );
+    }
+
+    /// Unconfigured still means the built-in default, resolved the same way.
+    #[tokio::test]
+    async fn an_unconfigured_list_resolves_the_built_in_default() {
+        assert_eq!(
+            effective_dht_bootstrap_addrs(
+                &[],
+                &crate::backend::dht_bootstrap::BootstrapResolvers::offline(),
+            )
+            .await,
+            DEFAULT_DHT_BOOTSTRAP_NODES
+        );
+    }
+
     #[test]
     fn resolve_dht_bootstrap_nodes_lets_a_configured_list_replace_the_default() {
         let configured = vec!["example.test:6881".to_string()];
@@ -2229,10 +2314,13 @@ mod tests {
     async fn ephemeral_sessions_coexist() {
         let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
 
+        // `offline()`: this test is about port binding, and a real
+        // resolver here would put a DNS lookup on a hermetic test's path.
         let (a, _) = LibrqbitBackend::new(
             dirs[0].path().to_path_buf(),
             TorrentListenPort::Ephemeral,
             Vec::new(),
+            BootstrapResolvers::offline(),
         )
         .await
         .expect("first ephemeral session");
@@ -2240,6 +2328,7 @@ mod tests {
             dirs[1].path().to_path_buf(),
             TorrentListenPort::Ephemeral,
             Vec::new(),
+            BootstrapResolvers::offline(),
         )
         .await
         .expect("second ephemeral session alongside the first");
@@ -2614,6 +2703,7 @@ mod tests {
             tmp.path().to_path_buf(),
             TorrentListenPort::Ephemeral,
             Vec::new(),
+            BootstrapResolvers::production_in(tmp.path()),
         )
         .await
         .expect("network session");
@@ -3178,6 +3268,7 @@ mod tests {
             tmp.path().to_path_buf(),
             TorrentListenPort::Ephemeral,
             Vec::new(),
+            BootstrapResolvers::production_in(tmp.path()),
         )
         .await
         .expect("network session");

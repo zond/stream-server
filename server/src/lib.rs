@@ -123,6 +123,18 @@ pub struct ServerConfig {
     /// startup; from then on [`ServerHandle::set_lan_media`] stops and starts
     /// it per cast session, subject to the `lanMediaEnabled` setting.
     pub lan_media_addr: Option<SocketAddr>,
+    /// Whether DHT bootstrap *names* are resolved to address literals before
+    /// librqbit sees them (system resolver, then DNS over HTTPS, then a
+    /// cache next to the routing table -- see
+    /// `enginefs::backend::dht_bootstrap`). `true` for both
+    /// [`Self::embedded`] and [`Self::binary_default`]: the Android embed is
+    /// exactly the case this exists for, since that is where the system
+    /// resolver was observed returning nothing.
+    ///
+    /// `false` does no DNS and no HTTP at start-up, leaving the names for
+    /// librqbit to resolve itself. **Tests set this**, so `cargo test` makes
+    /// no DNS query and no DoH request of its own.
+    pub resolve_dht_bootstrap_names: bool,
 }
 
 impl Default for ServerConfig {
@@ -152,6 +164,7 @@ impl ServerConfig {
             auth: ServerAuth::Generated,
             torrent_listen_port: TorrentListenPort::Ephemeral,
             lan_media_addr: None,
+            resolve_dht_bootstrap_names: true,
         }
     }
 
@@ -175,6 +188,7 @@ impl ServerConfig {
             auth: ServerAuth::Generated,
             torrent_listen_port: TorrentListenPort::default(),
             lan_media_addr: None,
+            resolve_dht_bootstrap_names: true,
         }
     }
 }
@@ -736,6 +750,11 @@ pub async fn run(
             bt_ssrf_mitigation: settings.bt_ssrf_mitigation,
         },
         dht_bootstrap_nodes: settings.dht_bootstrap_nodes.clone().unwrap_or_default(),
+        dht_bootstrap_dns: if cfg.resolve_dht_bootstrap_names {
+            enginefs::backend::dht_bootstrap::DhtBootstrapDns::Resolve
+        } else {
+            enginefs::backend::dht_bootstrap::DhtBootstrapDns::Off
+        },
     };
 
     let (download_engine, download_engine_disk_backed) = match EngineFS::new_disk_backed(

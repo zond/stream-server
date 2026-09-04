@@ -54,6 +54,17 @@ widely deployed bootstrap name in the ecosystem and may answer from other
 networks — it is listed last so the two working hosts are queried first.
 **Do not add a host here without pinging it first.**
 
+Names in this list — the default *and* a configured one — are resolved by the
+server before librqbit sees them: the system resolver first, then DNS over
+HTTPS (`dns.google`, then `cloudflare-dns.com`) if the system resolver returns
+no address, then a `dht-bootstrap.json` cache kept next to the routing table.
+Anything still unresolved is handed to librqbit as a name so its own retries
+can still succeed. Address literals you configure here are passed through
+untouched, with no DNS at all — which is the useful thing to configure if you
+already know the addresses because DNS on your network does not work. **This
+fixes DNS only: if the network drops the DHT's UDP outright, correct
+addresses do not help.**
+
 Once a session has run once, librqbit persists its routing
 table to `dht.json` next to the downloads; on every later start it loads
 that table *and* still queries the bootstrap nodes in the background, but

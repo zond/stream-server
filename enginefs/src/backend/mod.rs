@@ -4,6 +4,7 @@ use tokio::io::{AsyncRead, AsyncSeek};
 
 use priorities::PlaybackIntent;
 
+pub mod dht_bootstrap;
 pub mod librqbit;
 
 pub mod metadata;
@@ -703,6 +704,12 @@ pub struct BackendConfig {
     /// `librqbit::DEFAULT_DHT_BOOTSTRAP_NODES`); the `dhtBootstrapNodes`
     /// server setting REPLACES it entirely when non-empty.
     pub dht_bootstrap_nodes: Vec<String>,
+    /// Whether those bootstrap names are resolved to address literals before
+    /// librqbit sees them (see `dht_bootstrap`). Defaults to
+    /// `DhtBootstrapDns::Resolve`; `Off` is for callers that must make no
+    /// outbound request at start-up, and every test.
+    #[serde(default)]
+    pub dht_bootstrap_dns: dht_bootstrap::DhtBootstrapDns,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

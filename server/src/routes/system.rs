@@ -289,7 +289,11 @@ pub struct ServerSettings {
     /// (the two hosts that were measured to answer a DHT ping, plus
     /// `router.bittorrent.com` on reputation -- see that constant's doc for
     /// the measurements); a non-empty list REPLACES the default entirely.
-    /// Entries
+    /// Either way the entries go through
+    /// `enginefs::backend::librqbit::effective_dht_bootstrap_addrs`, which
+    /// turns names into address literals where DNS (system resolver, then
+    /// DNS over HTTPS, then the on-disk cache) can manage it and passes
+    /// literals through untouched. Entries
     /// are validated on `POST /settings` (non-empty host, valid nonzero
     /// port) -- an invalid entry is dropped with a `tracing::warn!` rather
     /// than failing the request. DHT bootstrap addresses are read once when

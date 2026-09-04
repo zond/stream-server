@@ -3132,6 +3132,7 @@ impl BackendEngineFS<LibrqbitBackend> {
             download_dir.clone(),
             TorrentListenPort::default(),
             Vec::new(),
+            crate::backend::dht_bootstrap::DhtBootstrapDns::default().resolvers_in(&download_dir),
         )
         .await?;
         let efs = Self::new_with_backend(backend, restored, root_dir.join("cache"), download_dir);
@@ -3152,6 +3153,7 @@ impl BackendEngineFS<LibrqbitBackend> {
             download_dir.clone(),
             config.listen_port,
             config.dht_bootstrap_nodes,
+            config.dht_bootstrap_dns.resolvers_in(&download_dir),
         )
         .await?;
         let efs = Self::new_with_backend_and_storage(

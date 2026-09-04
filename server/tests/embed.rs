@@ -24,6 +24,27 @@ fn bearer_client(handle: &ServerHandle) -> anyhow::Result<reqwest::blocking::Cli
     Ok(bearer_client_builder(handle).build()?)
 }
 
+/// The base config every test here spreads from: `ServerConfig::embedded()`
+/// with DHT bootstrap name resolution turned off, so starting a server makes
+/// no DNS query and no DNS-over-HTTPS request. The stock configs leave it on
+/// (that is asserted below); tests must stay offline, and on a runner with
+/// no DNS at all the resolution ladder would otherwise spend its whole
+/// budget failing, once per server.
+fn offline_config() -> ServerConfig {
+    ServerConfig {
+        resolve_dht_bootstrap_names: false,
+        ..ServerConfig::default()
+    }
+}
+
+/// Resolving bootstrap names is on for both shipped configurations -- the
+/// Android embed, which uses `embedded()`, is the case it exists for.
+#[test]
+fn stock_configs_resolve_dht_bootstrap_names() {
+    assert!(ServerConfig::embedded().resolve_dht_bootstrap_names);
+    assert!(ServerConfig::binary_default().resolve_dht_bootstrap_names);
+}
+
 /// Both stock configurations generate a per-launch token; opening the
 /// control API is an explicit opt-out (`ServerAuth::Disabled`, `--no-auth`).
 #[test]
@@ -61,7 +82,7 @@ fn two_embedded_servers_start_concurrently() -> anyhow::Result<()> {
                 http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
                 config_dir: Some(config_dir.path().join("config")),
                 cache_dir: Some(cache_dir.path().join("cache")),
-                ..stream_server::ServerConfig::default()
+                ..offline_config()
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
@@ -108,7 +129,7 @@ fn starts_and_stops_embedded_server() -> anyhow::Result<()> {
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         config_dir: Some(config_dir.path().join("config")),
         cache_dir: Some(cache_dir.path().join("cache")),
-        ..stream_server::ServerConfig::default()
+        ..offline_config()
     })?;
     let base = format!("http://{}", handle.http_addr());
 
@@ -248,7 +269,7 @@ fn cors_names_the_request_and_response_headers_a_cast_receiver_needs() -> anyhow
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         config_dir: Some(config_dir.path().join("config")),
         cache_dir: Some(cache_dir.path().join("cache")),
-        ..stream_server::ServerConfig::default()
+        ..offline_config()
     })?;
     let base = format!("http://{}", handle.http_addr());
     let anonymous = reqwest::blocking::Client::new();
@@ -328,7 +349,7 @@ fn device_info_and_stats_json_sys_probes_keep_their_shapes() -> anyhow::Result<(
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         config_dir: Some(config_dir.path().join("config")),
         cache_dir: Some(cache_dir.path().join("cache")),
-        ..stream_server::ServerConfig::default()
+        ..offline_config()
     })?;
     let client = bearer_client(&handle)?;
 
@@ -403,7 +424,7 @@ fn casting_player_reports_failure_since_casting_is_not_implemented() -> anyhow::
         config_dir: Some(config_dir.path().join("config")),
         cache_dir: Some(cache_dir.path().join("cache")),
         auth: ServerAuth::Disabled,
-        ..stream_server::ServerConfig::default()
+        ..offline_config()
     })?;
     assert_eq!(handle.auth_token(), None);
 
@@ -453,7 +474,7 @@ fn create_engine_reports_failure_with_non_2xx_status() -> anyhow::Result<()> {
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         config_dir: Some(config_dir.path().join("config")),
         cache_dir: Some(cache_dir.path().join("cache")),
-        ..stream_server::ServerConfig::default()
+        ..offline_config()
     })?;
 
     let client = bearer_client(&handle)?;
@@ -534,7 +555,7 @@ fn create_engine_guesses_episode_from_season_pack() -> anyhow::Result<()> {
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         config_dir: Some(config_dir.path().join("config")),
         cache_dir: Some(cache_dir.path().join("cache")),
-        ..stream_server::ServerConfig::default()
+        ..offline_config()
     })?;
 
     let client = bearer_client(&handle)?;
@@ -591,7 +612,7 @@ fn library_api_matches_the_http_control_routes() -> anyhow::Result<()> {
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         config_dir: Some(config_dir.path().join("config")),
         cache_dir: Some(cache_dir.path().join("cache")),
-        ..stream_server::ServerConfig::default()
+        ..offline_config()
     })?;
     let base = format!("http://{}", handle.http_addr());
     let client = bearer_client_builder(&handle)
@@ -771,7 +792,7 @@ fn starts_without_home_env() -> anyhow::Result<()> {
         config_dir: Some(config_dir.path().join("config")),
         // No cache_dir: it must fall back to a location inside config_dir.
         cache_dir: None,
-        ..stream_server::ServerConfig::default()
+        ..offline_config()
     })?;
 
     let response = bearer_client(&handle)?
@@ -805,7 +826,7 @@ fn stats_json_exposes_startup_phase_fields_additively() -> anyhow::Result<()> {
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         config_dir: Some(config_dir.path().join("config")),
         cache_dir: Some(cache_dir.path().join("cache")),
-        ..stream_server::ServerConfig::default()
+        ..offline_config()
     })?;
     let base = format!("http://{}", handle.http_addr());
     let client = bearer_client(&handle)?;
@@ -956,7 +977,7 @@ fn stats_json_reports_resolving_metadata_with_the_requests_trackers() -> anyhow:
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         config_dir: Some(config_dir.path().join("config")),
         cache_dir: Some(cache_dir.path().join("cache")),
-        ..stream_server::ServerConfig::default()
+        ..offline_config()
     })?;
     let base = format!("http://{}", handle.http_addr());
     let client = bearer_client_builder(&handle)
@@ -1176,7 +1197,7 @@ fn unusable_persisted_downloads_dir_is_cleared_on_disk() -> anyhow::Result<()> {
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         config_dir: Some(config_dir.path().join("config")),
         cache_dir: Some(cache_dir.path().join("cache")),
-        ..stream_server::ServerConfig::default()
+        ..offline_config()
     };
     let settings_file = config_dir.path().join("config").join("settings.json");
     let read_persisted = || -> anyhow::Result<serde_json::Value> {
@@ -1242,7 +1263,7 @@ fn pinned_download_relocates_into_downloads_dir_and_survives_a_restart() -> anyh
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         config_dir: Some(config_dir.path().join("config")),
         cache_dir: Some(cache_root.clone()),
-        ..stream_server::ServerConfig::default()
+        ..offline_config()
     };
     let handle = stream_server::start(config())?;
     let base = format!("http://{}", handle.http_addr());
@@ -1425,7 +1446,7 @@ fn fastresume_persists_piece_bitfields_on_both_roots() -> anyhow::Result<()> {
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         config_dir: Some(config_dir.path().join("config")),
         cache_dir: Some(cache_root.clone()),
-        ..stream_server::ServerConfig::default()
+        ..offline_config()
     };
     let handle = stream_server::start(config())?;
     let base = format!("http://{}", handle.http_addr());
@@ -1535,7 +1556,7 @@ fn download_routes_match_the_library_api() -> anyhow::Result<()> {
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         config_dir: Some(config_dir.path().join("config")),
         cache_dir: Some(cache_root.clone()),
-        ..stream_server::ServerConfig::default()
+        ..offline_config()
     })?;
     let base = format!("http://{}", handle.http_addr());
     let client = bearer_client(&handle)?;
@@ -1816,7 +1837,7 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         config_dir: Some(config_dir.path().join("config")),
         cache_dir: Some(cache_root.clone()),
-        ..stream_server::ServerConfig::default()
+        ..offline_config()
     })?;
     let base = format!("http://{}", handle.http_addr());
     let client = bearer_client(&handle)?;
@@ -1952,7 +1973,7 @@ fn lan_media_server(
         lan_media_addr,
         config_dir: Some(config_dir.join("config")),
         cache_dir: Some(cache_root),
-        ..stream_server::ServerConfig::default()
+        ..offline_config()
     })?;
     let base = format!("http://{}", handle.http_addr());
     let client = bearer_client(&handle)?;
@@ -2428,7 +2449,7 @@ fn without_a_configured_address_there_is_no_lan_media_listener() -> anyhow::Resu
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         config_dir: Some(config_dir.path().join("config")),
         cache_dir: Some(cache_dir.path().join("cache")),
-        ..stream_server::ServerConfig::default()
+        ..offline_config()
     })?;
 
     assert!(!handle.lan_media_running());
