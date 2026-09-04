@@ -590,10 +590,14 @@ async fn evict(
 /// is neither aged out nor counted against the cache limit. librqbit's
 /// `session.json` and per-torrent `<info hash>.torrent` / `.bitv`
 /// (fastresume bitfield) records at the top level, with their `.tmp`
-/// siblings; everything under `.metadata/` and `.cache/`; and the engine's
-/// `pinned-downloads.json` with its `.json.tmp-*` temp files. All of these
-/// change only when the session does, so by mtime a stable pin set or a
-/// finished pinned download would be the first casualties.
+/// siblings; everything under `.metadata/` and `.cache/`; the engine's
+/// `pinned-downloads.json` with its `.json.tmp-*` temp files; and the two
+/// DHT files, librqbit's `dht.json` routing table and our
+/// `dht-bootstrap.json` bootstrap address cache. All of these change only
+/// when the session does, so by mtime a stable pin set, a finished pinned
+/// download or a DHT that has been up for a while would be the first
+/// casualties -- and both DHT files exist precisely so a later start does
+/// not have to reach the network, which evicting them defeats.
 fn is_session_artifact(path: &std::path::Path, root: &std::path::Path) -> bool {
     if path
         .components()
@@ -608,7 +612,10 @@ fn is_session_artifact(path: &std::path::Path, root: &std::path::Path) -> bool {
         return false;
     };
     let name = name.strip_suffix(".tmp").unwrap_or(name);
-    if name == "session.json" || name == "pinned-downloads.json" {
+    if matches!(
+        name,
+        "session.json" | "pinned-downloads.json" | "dht.json" | "dht-bootstrap.json"
+    ) {
         return true;
     }
     if let Some(rest) = name.strip_prefix("pinned-downloads.json.tmp-") {
@@ -668,6 +675,11 @@ mod tests {
             "session.json.tmp",
             "pinned-downloads.json",
             "pinned-downloads.json.tmp-4242-7",
+            // Both halves of "what the DHT knew last time": librqbit's
+            // routing table and our bootstrap address cache. Tiny, rarely
+            // rewritten, and the whole point of them is to survive.
+            "dht.json",
+            "dht-bootstrap.json",
             &format!("{HASH}.torrent"),
             &format!("{HASH}.bitv"),
             &format!("{HASH}.bitv.tmp"),
