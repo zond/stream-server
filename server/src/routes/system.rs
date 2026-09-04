@@ -286,9 +286,10 @@ pub struct ServerSettings {
     /// DHT bootstrap nodes (`host:port`) used to seed librqbit's routing
     /// table when it starts cold. `None` or an empty list (the default)
     /// uses `enginefs::backend::librqbit::DEFAULT_DHT_BOOTSTRAP_NODES`
-    /// (the two hosts that were measured to answer a DHT ping, plus
-    /// `router.bittorrent.com` on reputation -- see that constant's doc for
-    /// the measurements); a non-empty list REPLACES the default entirely.
+    /// (the two hosts that were measured to answer a DHT ping -- see that
+    /// constant's doc for the measurements, including the three names that
+    /// answer nothing and were removed); a non-empty list REPLACES the
+    /// default entirely.
     /// Either way the entries go through
     /// `enginefs::backend::librqbit::effective_dht_bootstrap_addrs`, which
     /// turns names into address literals where DNS (system resolver, then

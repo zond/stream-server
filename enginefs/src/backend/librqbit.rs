@@ -268,23 +268,32 @@ enum InitPolicy {
 /// | `router.utorrent.com:6881` | yes (`82.221.103.244`) | 0/3 |
 /// | `dht.aelitis.com:6881` | yes (`34.203.221.232`) | 0/3 |
 ///
-/// `router.utorrent.com` and `dht.aelitis.com` were therefore removed: a
-/// name that resolves but never replies is not resilience, it is one more
-/// address for `DhtWorker::bootstrap` to time out on and one more retry line
-/// in the log. `router.bittorrent.com` is kept despite scoring the same 0/3
-/// here purely because it is the most widely deployed bootstrap name in the
-/// ecosystem and its address is anycast/geographically routed, so it may
-/// well answer from a network that is not this one; it is listed last so the
-/// two hosts known to work are queried first. Nothing else belongs here
-/// unless someone has actually pinged it.
+/// `router.utorrent.com` and `dht.aelitis.com` went first: a name that
+/// resolves but never replies is not resilience, it is one more address for
+/// `DhtWorker::bootstrap` to time out on and one more retry line in the log.
 ///
-/// The two survivors are exactly librqbit's own built-in fallback
-/// (`DHT_BOOTSTRAP` in the `zond/rqbit` fork's `crates/dht/src/lib.rs`), so
-/// overriding that default buys one speculative extra host, not a
-/// meaningfully different failure surface. What the override *does* buy is
-/// that these entries pass through [`dht_bootstrap::resolve_bootstrap_addrs`]
-/// first, which turns the names into address literals -- see that module for
-/// why (a field log had the system resolver itself returning nothing).
+/// `router.bittorrent.com` survived one revision longer, on the argument
+/// that it is the most widely deployed bootstrap name in the ecosystem and
+/// that its address is anycast, so it might answer from some network that
+/// was not the one measured. It was re-probed in 2026-09 from two
+/// networks, twice each, with both `ping` and `find_node`: it still
+/// resolves to `67.215.246.10` and still answers nothing, on either
+/// network, while `dht.libtorrent.org` replied in 11 ms and
+/// `dht.transmissionbt.com` in 32 ms on those same runs and both returned
+/// nodes. Reputation is not a measurement, and the entry cost one
+/// forever-retrying backoff loop per launch, so it is gone too. Nothing
+/// else belongs here unless someone has actually pinged it.
+///
+/// What is left is exactly librqbit's own built-in fallback
+/// (`DHT_BOOTSTRAP` in the `zond/rqbit` fork's `crates/dht/src/lib.rs`),
+/// ordered fastest-first rather than in librqbit's order. Overriding that
+/// default therefore no longer changes *which* hosts are used at all. What
+/// the override still buys is that these entries pass through
+/// [`dht_bootstrap::resolve_bootstrap_addrs`] first, which turns the names
+/// into address literals and drops the v6 ones on a host with no v6 route
+/// -- see that module for why (a field log had the system resolver itself
+/// returning nothing, and an IPv4-only device retrying AAAA records
+/// forever).
 ///
 /// Overridable via the `dhtBootstrapNodes` server setting
 /// (`server/src/routes/system.rs`) -- see [`resolve_dht_bootstrap_nodes`].
@@ -304,11 +313,8 @@ enum InitPolicy {
 /// irrelevant. The cases where it is fully relevant are the first run, a
 /// wiped or corrupted `dht.json`, and a cold start on a fresh install or
 /// container.
-pub const DEFAULT_DHT_BOOTSTRAP_NODES: &[&str] = &[
-    "dht.libtorrent.org:25401",
-    "dht.transmissionbt.com:6881",
-    "router.bittorrent.com:6881",
-];
+pub const DEFAULT_DHT_BOOTSTRAP_NODES: &[&str] =
+    &["dht.libtorrent.org:25401", "dht.transmissionbt.com:6881"];
 
 /// Resolve the effective DHT bootstrap address list: `configured` (already
 /// validated by `server/src/routes/system.rs`'s `dhtBootstrapNodes` setting
@@ -2187,28 +2193,29 @@ mod tests {
     fn default_dht_bootstrap_nodes_is_the_measured_list() {
         assert_eq!(
             DEFAULT_DHT_BOOTSTRAP_NODES,
-            [
-                "dht.libtorrent.org:25401",
-                "dht.transmissionbt.com:6881",
-                "router.bittorrent.com:6881",
-            ]
+            ["dht.libtorrent.org:25401", "dht.transmissionbt.com:6881"]
         );
         for entry in DEFAULT_DHT_BOOTSTRAP_NODES {
             assert_valid_host_port(entry);
         }
     }
 
-    /// The two hosts that answered are the two librqbit itself ships, and
-    /// they lead: a bootstrap round should reach a live node before it
-    /// reaches the speculative one.
+    /// Every name measured to answer nothing stays out, `router.bittorrent`
+    /// included -- it was re-probed from two networks and answered on
+    /// neither. The fastest of the two survivors leads, so a bootstrap
+    /// round reaches a live node as early as possible.
     #[test]
-    fn default_dht_bootstrap_nodes_lead_with_the_hosts_that_answer() {
+    fn default_dht_bootstrap_nodes_hold_no_host_that_answers_nothing() {
         assert_eq!(DEFAULT_DHT_BOOTSTRAP_NODES[0], "dht.libtorrent.org:25401");
         assert_eq!(
             DEFAULT_DHT_BOOTSTRAP_NODES[1],
             "dht.transmissionbt.com:6881"
         );
-        for dead in ["router.utorrent.com", "dht.aelitis.com"] {
+        for dead in [
+            "router.bittorrent.com",
+            "router.utorrent.com",
+            "dht.aelitis.com",
+        ] {
             assert!(
                 !DEFAULT_DHT_BOOTSTRAP_NODES
                     .iter()

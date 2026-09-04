@@ -41,17 +41,17 @@ Windows or `~/.config/stremio-server/settings.json` on Linux.
 | `dhtBootstrapNodes` | array of strings, or `null` | `null` (uses the built-in list below) | DHT bootstrap nodes (`"host:port"`) used to seed the routing table on a cold start. A non-empty list *replaces* the default entirely; `null` or `[]` uses it. Invalid entries (no `host:port` split, or an unparseable/zero port) are dropped with a warning instead of failing the request. Unlike the other `bt*` settings above, this one is read once when librqbit's session opens, so a change here takes effect on the **next server start**, not the running session. |
 
 The built-in default is `dht.libtorrent.org:25401`,
-`dht.transmissionbt.com:6881`, `router.bittorrent.com:6881`.
+`dht.transmissionbt.com:6881` — librqbit's own default list, fastest first.
 
-The first two are librqbit's own default and are the only two of the
-conventional public bootstrap names that were measured to actually answer a
-mainline DHT `ping` (3/3 attempts each, ~11 ms and ~31 ms). An earlier
-revision also shipped `router.utorrent.com:6881` and `dht.aelitis.com:6881`;
-both resolve but answered 0/3, so they were retry noise rather than
-resilience and have been removed. `router.bittorrent.com` also answered 0/3
-from the machine that measured, and is kept only because it is the most
-widely deployed bootstrap name in the ecosystem and may answer from other
-networks — it is listed last so the two working hosts are queried first.
+They are the only two of the conventional public bootstrap names that were
+measured to actually answer a mainline DHT `ping` (3/3 attempts each, ~11 ms
+and ~31 ms). An earlier revision also shipped `router.utorrent.com:6881` and
+`dht.aelitis.com:6881`; both resolve but answered 0/3, so they were retry
+noise rather than resilience and were removed. `router.bittorrent.com:6881`
+was kept a while longer on reputation — it is the most widely deployed
+bootstrap name in the ecosystem — but a 2026-09 re-probe from two networks,
+twice each, with both `ping` and `find_node`, had it resolving to
+`67.215.246.10` and answering nothing on either, so it went the same way.
 **Do not add a host here without pinging it first.**
 
 Names in this list — the default *and* a configured one — are resolved by the
