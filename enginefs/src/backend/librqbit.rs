@@ -385,7 +385,7 @@ impl LibrqbitBackend {
     /// Whatever that list ends up being, `bootstrap_resolvers` turns its
     /// names into address literals before librqbit sees them -- see
     /// [`dht_bootstrap`] for why and for the ladder it walks.
-    /// [`BootstrapResolvers::production`] is the real one;
+    /// [`BootstrapResolvers::production_in`] is the real one;
     /// [`BootstrapResolvers::offline`] does no DNS at all and is what
     /// hermetic callers want.
     pub async fn new(
