@@ -251,30 +251,36 @@ enum InitPolicy {
 
 /// Public BitTorrent mainline DHT bootstrap nodes used to seed librqbit's
 /// routing table when it starts cold (no persisted `dht.json`, or a
-/// deserialize failure -- see [`DEFAULT_DHT_BOOTSTRAP_NODES`] doc below).
+/// deserialize failure).
 ///
-/// We override librqbit's own built-in fallback (`DHT_BOOTSTRAP` in the
-/// `zond/rqbit` fork's `crates/dht/src/lib.rs`) because that list is only
-/// two hosts (`dht.transmissionbt.com:6881`, `dht.libtorrent.org:25401`),
-/// which is a single point of failure: `DhtWorker::bootstrap`
-/// (`crates/dht/src/dht.rs`) queries every address in parallel and only
-/// reports failure if *all* of them fail to respond, and that failure is
-/// fatal to the whole DHT worker task (an unhandled `result?` in
-/// `DhtWorker::start`'s `select!` loop kills the DHT, not just the
-/// bootstrap step) -- so losing both of two hosts to an outage, a
-/// firewall, or transient DNS trouble takes the DHT down with them. Widen
-/// the odds instead: this is librqbit's two plus the other conventional
-/// public bootstrap nodes mainstream clients (Transmission, libtorrent
-/// itself via qBittorrent, uTorrent, Vuze/Azureus) ship, ordered
-/// most-reliable first.
+/// **This list is not "wider is safer".** An earlier revision padded it out
+/// with every conventional public bootstrap name mainstream clients ship, on
+/// the theory that more hosts hedge against an outage. Measurement said
+/// otherwise: of the five, only two answer a mainline DHT `ping` query at
+/// all. Three attempts each, from a working residential connection:
 ///
-/// Every host below was confirmed to currently resolve (`getent hosts`,
-/// cross-checked with `dig @8.8.8.8`/`dig @1.1.1.1`) before being added.
-/// Two other commonly cited candidates were tried and dropped because they
-/// did not resolve at the time of writing: `router.bitcomet.com` (NXDOMAIN
-/// -- the `bitcomet.com` zone answers but has no such name) and
-/// `dht.anacrolix.link` (its CNAME chain currently dead-ends in NXDOMAIN at
-/// `pub.instances.scw.cloud`).
+/// | host | resolves | answers a DHT ping |
+/// |---|---|---|
+/// | `dht.libtorrent.org:25401` | yes | 3/3, ~11 ms |
+/// | `dht.transmissionbt.com:6881` | yes | 3/3, ~31 ms |
+/// | `router.bittorrent.com:6881` | yes (`67.215.246.10`) | 0/3 |
+/// | `router.utorrent.com:6881` | yes (`82.221.103.244`) | 0/3 |
+/// | `dht.aelitis.com:6881` | yes (`34.203.221.232`) | 0/3 |
+///
+/// `router.utorrent.com` and `dht.aelitis.com` were therefore removed: a
+/// name that resolves but never replies is not resilience, it is one more
+/// address for `DhtWorker::bootstrap` to time out on and one more retry line
+/// in the log. `router.bittorrent.com` is kept despite scoring the same 0/3
+/// here purely because it is the most widely deployed bootstrap name in the
+/// ecosystem and its address is anycast/geographically routed, so it may
+/// well answer from a network that is not this one; it is listed last so the
+/// two hosts known to work are queried first. Nothing else belongs here
+/// unless someone has actually pinged it.
+///
+/// The two survivors are exactly librqbit's own built-in fallback
+/// (`DHT_BOOTSTRAP` in the `zond/rqbit` fork's `crates/dht/src/lib.rs`), so
+/// overriding that default buys one speculative extra host, not a
+/// meaningfully different failure surface.
 ///
 /// Overridable via the `dhtBootstrapNodes` server setting
 /// (`server/src/routes/system.rs`) -- see [`resolve_dht_bootstrap_nodes`].
@@ -291,15 +297,13 @@ enum InitPolicy {
 /// reachability *less consequential* in practice, since the DHT already
 /// has real peers to query while the bootstrap requests race in the
 /// background, but it does not make bootstrap host reachability
-/// irrelevant. Widening the list still hedges the cases where it is fully
-/// relevant: first run, a wiped or corrupted `dht.json`, and a cold start
-/// on a fresh install or container.
+/// irrelevant. The cases where it is fully relevant are the first run, a
+/// wiped or corrupted `dht.json`, and a cold start on a fresh install or
+/// container.
 pub const DEFAULT_DHT_BOOTSTRAP_NODES: &[&str] = &[
-    "router.bittorrent.com:6881",
-    "dht.transmissionbt.com:6881",
-    "router.utorrent.com:6881",
     "dht.libtorrent.org:25401",
-    "dht.aelitis.com:6881",
+    "dht.transmissionbt.com:6881",
+    "router.bittorrent.com:6881",
 ];
 
 /// Resolve the effective DHT bootstrap address list: `configured` (already
@@ -307,7 +311,7 @@ pub const DEFAULT_DHT_BOOTSTRAP_NODES: &[&str] = &[
 /// -- non-empty `host:port` strings only) if non-empty, REPLACING
 /// [`DEFAULT_DHT_BOOTSTRAP_NODES`] entirely; otherwise the default set.
 /// Mirrors `SessionOptions.dht.bootstrap_addrs`'s own `None` = built-in
-/// convention, except our built-in default is the widened list above
+/// convention, except our built-in default is the measured list above
 /// rather than librqbit's two-host one.
 pub fn resolve_dht_bootstrap_nodes(configured: &[String]) -> Vec<String> {
     if configured.is_empty() {
@@ -391,9 +395,9 @@ impl LibrqbitBackend {
                     // state. librqbit's default resolves through
                     // `directories::ProjectDirs` (HOME/XDG), which has no
                     // answer on Android and would fail `Session::new`.
-                    // `bootstrap_addrs` widens librqbit's two-host default
-                    // (or applies the operator's `dhtBootstrapNodes`
-                    // override) -- see `DEFAULT_DHT_BOOTSTRAP_NODES`.
+                    // `bootstrap_addrs` is `DEFAULT_DHT_BOOTSTRAP_NODES`
+                    // (or the operator's `dhtBootstrapNodes` override) --
+                    // see that constant.
                     dht: Some(librqbit::DhtSessionConfig {
                         bootstrap_addrs: Some(bootstrap_addrs.clone()),
                         persistence: Some(librqbit::dht::DhtPersistenceConfig {
@@ -2141,14 +2145,43 @@ mod tests {
         assert!(!status.ever_bootstrapped);
     }
 
+    /// The exact list, not just "non-empty and well-formed": every entry
+    /// here is a host somebody has actually sent a DHT `ping` to (see the
+    /// `DEFAULT_DHT_BOOTSTRAP_NODES` doc comment for the measurements).
+    /// Adding one without that evidence should fail this test and make the
+    /// author go and measure.
     #[test]
-    fn default_dht_bootstrap_nodes_is_nonempty_and_well_formed() {
-        assert!(
-            !DEFAULT_DHT_BOOTSTRAP_NODES.is_empty(),
-            "a single point of failure is exactly what widening this list is for"
+    fn default_dht_bootstrap_nodes_is_the_measured_list() {
+        assert_eq!(
+            DEFAULT_DHT_BOOTSTRAP_NODES,
+            [
+                "dht.libtorrent.org:25401",
+                "dht.transmissionbt.com:6881",
+                "router.bittorrent.com:6881",
+            ]
         );
         for entry in DEFAULT_DHT_BOOTSTRAP_NODES {
             assert_valid_host_port(entry);
+        }
+    }
+
+    /// The two hosts that answered are the two librqbit itself ships, and
+    /// they lead: a bootstrap round should reach a live node before it
+    /// reaches the speculative one.
+    #[test]
+    fn default_dht_bootstrap_nodes_lead_with_the_hosts_that_answer() {
+        assert_eq!(DEFAULT_DHT_BOOTSTRAP_NODES[0], "dht.libtorrent.org:25401");
+        assert_eq!(
+            DEFAULT_DHT_BOOTSTRAP_NODES[1],
+            "dht.transmissionbt.com:6881"
+        );
+        for dead in ["router.utorrent.com", "dht.aelitis.com"] {
+            assert!(
+                !DEFAULT_DHT_BOOTSTRAP_NODES
+                    .iter()
+                    .any(|e| e.starts_with(dead)),
+                "{dead} resolves but never answers a ping; it is retry noise, not resilience"
+            );
         }
     }
 

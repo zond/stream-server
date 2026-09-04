@@ -40,13 +40,21 @@ Windows or `~/.config/stremio-server/settings.json` on Linux.
 | `btSsrfMitigation` | boolean | `true` | Keeps SSRF mitigations enabled for tracker and web seed access. |
 | `dhtBootstrapNodes` | array of strings, or `null` | `null` (uses the built-in list below) | DHT bootstrap nodes (`"host:port"`) used to seed the routing table on a cold start. A non-empty list *replaces* the default entirely; `null` or `[]` uses it. Invalid entries (no `host:port` split, or an unparseable/zero port) are dropped with a warning instead of failing the request. Unlike the other `bt*` settings above, this one is read once when librqbit's session opens, so a change here takes effect on the **next server start**, not the running session. |
 
-The built-in default is `router.bittorrent.com:6881`, `dht.transmissionbt.com:6881`,
-`router.utorrent.com:6881`, `dht.libtorrent.org:25401`, `dht.aelitis.com:6881`
-(most reliable first) — librqbit's own two-host default
-(`dht.transmissionbt.com`, `dht.libtorrent.org`) plus the other conventional
-public bootstrap nodes mainstream clients ship, so a cold start (no
-`dht.json` routing table yet, or a wiped/corrupted one) isn't relying on
-just two hosts. Once a session has run once, librqbit persists its routing
+The built-in default is `dht.libtorrent.org:25401`,
+`dht.transmissionbt.com:6881`, `router.bittorrent.com:6881`.
+
+The first two are librqbit's own default and are the only two of the
+conventional public bootstrap names that were measured to actually answer a
+mainline DHT `ping` (3/3 attempts each, ~11 ms and ~31 ms). An earlier
+revision also shipped `router.utorrent.com:6881` and `dht.aelitis.com:6881`;
+both resolve but answered 0/3, so they were retry noise rather than
+resilience and have been removed. `router.bittorrent.com` also answered 0/3
+from the machine that measured, and is kept only because it is the most
+widely deployed bootstrap name in the ecosystem and may answer from other
+networks — it is listed last so the two working hosts are queried first.
+**Do not add a host here without pinging it first.**
+
+Once a session has run once, librqbit persists its routing
 table to `dht.json` next to the downloads; on every later start it loads
 that table *and* still queries the bootstrap nodes in the background, but
 with a warm table already available the bootstrap hosts' reachability
