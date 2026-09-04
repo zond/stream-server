@@ -321,8 +321,10 @@ pub const DEFAULT_DHT_BOOTSTRAP_NODES: &[&str] =
 /// -- non-empty `host:port` strings only) if non-empty, REPLACING
 /// [`DEFAULT_DHT_BOOTSTRAP_NODES`] entirely; otherwise the default set.
 /// Mirrors `SessionOptions.dht.bootstrap_addrs`'s own `None` = built-in
-/// convention, except our built-in default is the measured list above
-/// rather than librqbit's two-host one. Both branches then go through
+/// convention -- and since [`DEFAULT_DHT_BOOTSTRAP_NODES`] is now exactly
+/// librqbit's own two-host list, leaving it unconfigured and configuring
+/// that same list are the same thing. Configuring anything *else* is what
+/// changes which hosts are used. Both branches then go through
 /// [`dht_bootstrap::resolve_bootstrap_addrs`], so a configured list gets the
 /// same name resolution the default does -- and a configured list of
 /// address literals still passes through untouched.
