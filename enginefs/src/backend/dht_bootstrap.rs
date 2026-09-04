@@ -688,30 +688,32 @@ fn is_ipv6_literal(addr: &str) -> bool {
 /// This is not a fallback or a preference: it is removing addresses the
 /// host provably cannot reach, and the noise they generate with them.
 ///
-/// An entry left with no address at all goes with them. The one exception
-/// is a list that would end up *entirely* empty, which is worse than the
-/// noise: librqbit's `bootstrap` counts successes and returns
-/// `BootstrapFailed` when there are none, and a failed bootstrap kills the
-/// DHT worker. So an operator who configured a v6-only list on a host with
-/// no v6 route keeps it, unfiltered, and keeps the retries with it.
-fn apply_ipv6_route_policy(resolved: &mut Vec<ResolvedEntry>, has_ipv6_route: bool) {
+/// An entry left with no address at all keeps its place in the list with an
+/// empty `addrs`: nothing is handed to librqbit for it either way, but the
+/// report can then say it was dropped for want of a route instead of
+/// counting it as a host DNS never answered for. The one exception is a
+/// list that would end up *entirely* empty, which is worse than the noise:
+/// librqbit's `bootstrap` counts successes and returns `BootstrapFailed`
+/// when there are none, and a failed bootstrap kills the DHT worker. So an
+/// operator who configured a v6-only list on a host with no v6 route keeps
+/// it, unfiltered, and keeps the retries with it.
+fn apply_ipv6_route_policy(resolved: &mut [ResolvedEntry], has_ipv6_route: bool) {
     if has_ipv6_route {
         return;
     }
 
-    let unfiltered = resolved.clone();
+    let unfiltered = resolved.to_vec();
     for entry in resolved.iter_mut() {
         entry.addrs.retain(|addr| !is_ipv6_literal(addr));
     }
-    resolved.retain(|entry| !entry.addrs.is_empty());
 
-    if resolved.is_empty() {
+    if resolved.iter().all(|entry| entry.addrs.is_empty()) {
         warn!(
             "every DHT bootstrap address is IPv6 and this host has no IPv6 route; keeping them \
              anyway, because an empty bootstrap list fails librqbit's bootstrap outright and \
              takes the DHT worker with it"
         );
-        *resolved = unfiltered;
+        resolved.clone_from_slice(&unfiltered);
         return;
     }
 
@@ -795,26 +797,48 @@ async fn resolve_all(entries: &[String], resolvers: &BootstrapResolvers) -> Vec<
     resolved
 }
 
-/// One INFO line saying what resolved and by which path, and one WARN when
-/// every path failed for every host -- the state the Android field log was
-/// in, which previously showed up only as librqbit's own retry spam.
-fn report(resolved: &[ResolvedEntry]) {
-    if resolved.is_empty() {
-        return;
-    }
-    let summary = resolved
+/// One line per entry: how it resolved, or that it did not, or that it did
+/// but this host has no route to what came back.
+///
+/// The third case is why the entry survives `apply_ipv6_route_policy` with
+/// an empty `addrs` rather than being removed: "resolved to AAAA records we
+/// cannot reach" and "DNS answered nothing" are different faults with
+/// different fixes, and a report that cannot tell them apart sends the
+/// reader after the wrong one.
+fn report_summary(resolved: &[ResolvedEntry]) -> String {
+    resolved
         .iter()
         .map(|r| {
             if r.via == ResolvedVia::Unresolved {
                 format!("{}=unresolved", r.entry)
+            } else if r.addrs.is_empty() {
+                format!("{}=dropped, no IPv6 route (via {})", r.entry, r.via.label())
             } else {
                 format!("{}={} via {}", r.entry, r.addrs.join(","), r.via.label())
             }
         })
         .collect::<Vec<_>>()
-        .join(" ");
+        .join(" ")
+}
 
-    if resolved.iter().all(|r| r.via == ResolvedVia::Unresolved) {
+/// Whether every entry failed the whole DNS ladder -- the state the Android
+/// field log was in. A host that resolved and then lost its addresses to
+/// the IPv6 route filter is *not* this: DNS worked for it, so saying DNS
+/// failed would be a wrong diagnosis.
+fn nothing_resolved(resolved: &[ResolvedEntry]) -> bool {
+    resolved.iter().all(|r| r.via == ResolvedVia::Unresolved)
+}
+
+/// One INFO line saying what resolved and by which path, and one WARN when
+/// every path failed for every host, which previously showed up only as
+/// librqbit's own retry spam.
+fn report(resolved: &[ResolvedEntry]) {
+    if resolved.is_empty() {
+        return;
+    }
+    let summary = report_summary(resolved);
+
+    if nothing_resolved(resolved) {
         warn!(
             entries = %summary,
             "no DHT bootstrap host could be resolved by the system resolver, DNS over HTTPS or \
@@ -1034,6 +1058,49 @@ mod tests {
         )
         .await;
         assert_eq!(out, entries);
+    }
+
+    /// A host whose only records are AAAA on a device with no v6 route is a
+    /// *routing* failure, not a DNS one. Reporting it as "no DHT bootstrap
+    /// host could be resolved" sends the reader after the resolver when the
+    /// resolver worked fine, so the entry stays in the report with no
+    /// addresses and the WARN does not fire.
+    #[tokio::test]
+    async fn a_host_dropped_for_want_of_an_ipv6_route_is_not_reported_as_unresolved() {
+        let entries = [
+            "v6only.test:6881".to_string(),
+            "brokenname.test:6881".to_string(),
+        ];
+        let resolvers = with_ipv6_probe(
+            resolvers(
+                Arc::new(FakeSystem::with("v6only.test", &["[2001:db8::1]:6881"])),
+                None,
+                None,
+            ),
+            FakeIpv6::new(false),
+        );
+
+        let resolved = resolve_all(&entries, &resolvers).await;
+        let summary = report_summary(&resolved);
+        assert!(
+            !nothing_resolved(&resolved),
+            "DNS answered for v6only.test, so the DNS-failed WARN must not fire: {summary}"
+        );
+        assert!(
+            summary.contains("v6only.test:6881=dropped, no IPv6 route (via system)"),
+            "the report must say why the host lost its addresses: {summary}"
+        );
+        assert!(
+            summary.contains("brokenname.test:6881=unresolved"),
+            "the host DNS really did fail for is still reported as unresolved: {summary}"
+        );
+
+        // What librqbit gets is unchanged: an entry with no addresses
+        // contributes none.
+        assert_eq!(
+            resolve_bootstrap_addrs(&entries, &resolvers).await,
+            ["brokenname.test:6881"]
+        );
     }
 
     /// An address literal is what librqbit wants already; resolving it would
