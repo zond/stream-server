@@ -39,6 +39,12 @@
 //!    we could not resolve is never *dropped*: librqbit retrying forever is
 //!    better than a bootstrap list that lost an entry.
 //!
+//! What comes out of that ladder is then filtered by this host's own IPv6
+//! route (`apply_ipv6_route_policy`, probed once per pass by
+//! [`Ipv6RouteProbe`]): a device with no route to global IPv6 is handed the
+//! v4 addresses only, because librqbit would otherwise retry the v6 ones
+//! forever. A dual-stack device keeps both, v4 first.
+//!
 //! Entries are resolved concurrently and the whole pass is bounded by
 //! [`RESOLUTION_BUDGET`]; if that elapses, the raw entries are handed to
 //! librqbit and start-up continues. **Nothing here may fail start-up or
@@ -58,7 +64,7 @@
 //! `diagnostics::dht_health` still exists to say so once.
 
 use std::collections::BTreeMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -111,6 +117,18 @@ pub trait DohDnsResolver: Send + Sync {
     /// A-record addresses for `host`, or empty. Never errors, same reasoning
     /// as [`SystemDnsResolver::lookup`].
     async fn lookup(&self, host: &str) -> Vec<IpAddr>;
+}
+
+/// Whether this host has a usable route to the global IPv6 internet,
+/// behind a trait for the same reason the two resolvers above are: no test
+/// may depend on whether the machine running it happens to have IPv6.
+///
+/// Sync, unlike the resolvers: the production probe neither blocks nor
+/// sends anything (see [`UdpConnectIpv6Probe`]), so there is nothing to
+/// await and no timeout to bound.
+pub trait Ipv6RouteProbe: Send + Sync {
+    /// `true` when a *global* IPv6 destination is routable from here.
+    fn has_ipv6_route(&self) -> bool;
 }
 
 /// [`SystemDnsResolver`] over `tokio::net::lookup_host`.
@@ -210,6 +228,55 @@ impl DohDnsResolver for HttpsDohResolver {
             debug!(host, endpoint, "DoH provider answered with no address");
         }
         Vec::new()
+    }
+}
+
+/// The address [`UdpConnectIpv6Probe`] asks the kernel to route to: a
+/// global unicast address out of `2000::/3` (Google public DNS). Nothing is
+/// ever sent to it, so any stable global address would do -- the question
+/// asked is about this host's routing table, not about that host.
+pub const IPV6_PROBE_TARGET: SocketAddr = SocketAddr::new(
+    IpAddr::V6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888)),
+    53,
+);
+
+/// [`Ipv6RouteProbe`] over a UDP `connect()`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct UdpConnectIpv6Probe;
+
+impl Ipv6RouteProbe for UdpConnectIpv6Probe {
+    fn has_ipv6_route(&self) -> bool {
+        // `connect()` on a UDP socket sends no packet: it only asks the
+        // kernel to pick a route and a source address, and fails
+        // immediately with `ENETUNREACH` when there is no route. That makes
+        // it the cheap, standard way to ask "could v6 leave this host at
+        // all" -- no traffic, no DNS, no timeout to wait out.
+        //
+        // A link-local address is deliberately not enough to answer yes,
+        // which is why the target is a *global* address. The device this
+        // was measured on (an IPv4-only Chromecast) has `fe80::/64` on
+        // `wlan0` and no v6 default route: the bind below succeeds and the
+        // socket has a v6 address, yet nothing outside its own link is
+        // reachable. Only the route lookup tells those two cases apart.
+        let Ok(socket) = std::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)) else {
+            // No v6 stack at all, or v6 disabled: certainly no route.
+            return false;
+        };
+        socket.connect(IPV6_PROBE_TARGET).is_ok()
+    }
+}
+
+/// An [`Ipv6RouteProbe`] that answers yes without looking.
+///
+/// This is the hermetic choice, and yes is the *inert* answer: it drops
+/// nothing, so [`BootstrapResolvers::offline`] still hands back exactly
+/// what it was given.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AssumeIpv6Route;
+
+impl Ipv6RouteProbe for AssumeIpv6Route {
+    fn has_ipv6_route(&self) -> bool {
+        true
     }
 }
 
@@ -386,6 +453,9 @@ pub struct BootstrapResolvers {
     /// `None` means "no DoH fallback available", which is the same as a DoH
     /// provider that answers nothing.
     pub doh: Option<Arc<dyn DohDnsResolver>>,
+    /// Asked once per pass whether IPv6 bootstrap addresses are worth
+    /// handing to librqbit at all -- see `apply_ipv6_route_policy`.
+    pub ipv6: Arc<dyn Ipv6RouteProbe>,
     /// Where to read and write the address cache; `None` disables caching.
     pub cache_path: Option<PathBuf>,
 }
@@ -431,6 +501,7 @@ impl BootstrapResolvers {
         Self {
             system: Arc::new(TokioSystemResolver),
             doh: HttpsDohResolver::new().map(|r| Arc::new(r) as Arc<dyn DohDnsResolver>),
+            ipv6: Arc::new(UdpConnectIpv6Probe),
             cache_path: Some(dht_dir.join(CACHE_FILE_NAME)),
         }
     }
@@ -443,6 +514,7 @@ impl BootstrapResolvers {
         Self {
             system: Arc::new(NoDnsResolver),
             doh: None,
+            ipv6: Arc::new(AssumeIpv6Route),
             cache_path: None,
         }
     }
@@ -568,17 +640,92 @@ async fn resolve_entry(
     unresolved(ResolvedVia::Unresolved)
 }
 
+/// Deduplicate a host's addresses, order IPv4 first, and cap the result.
+///
+/// v4 leads for two reasons. It is the family more likely to connect on the
+/// devices this server runs on (see [`apply_ipv6_route_policy`]), and the
+/// cap is applied *after* the ordering, so a name whose AAAA records come
+/// back first cannot spend every slot on addresses a host with no v6 route
+/// would then have to drop. (`apply_ipv6_route_policy` is what drops them.)
 fn dedup_capped(addrs: impl Iterator<Item = IpAddr>) -> Vec<IpAddr> {
     let mut out: Vec<IpAddr> = Vec::new();
     for addr in addrs {
         if !out.contains(&addr) {
             out.push(addr);
         }
-        if out.len() == MAX_ADDRS_PER_HOST {
-            break;
-        }
     }
+    // Stable, so within each family the resolver's own order survives.
+    out.sort_by_key(|a| u8::from(a.is_ipv6()));
+    out.truncate(MAX_ADDRS_PER_HOST);
     out
+}
+
+/// Whether a `bootstrap_addrs` entry is an IPv6 address literal. A name we
+/// could not resolve (`dht.libtorrent.org:25401`) does not parse, and so
+/// answers `false` -- it is not an address at all, and dropping it is not
+/// this function's business.
+fn is_ipv6_literal(addr: &str) -> bool {
+    addr.parse::<SocketAddr>().is_ok_and(|a| a.is_ipv6())
+}
+
+/// Drop the IPv6 bootstrap addresses when this host has no route to them.
+///
+/// # Why
+///
+/// librqbit gives every entry of `bootstrap_addrs` its own
+/// `bootstrap_hostname_with_backoff` loop, which retries *forever* and
+/// warns on every attempt. On the owner's IPv4-only Chromecast (`wlan0`:
+/// one v4 address, a v6 link-local, and no v6 default route) the AAAA
+/// records of the bootstrap names produced exactly that, for the life of
+/// the process:
+///
+/// ```text
+/// error in bootstrap: no successful lookups, 1 errors addr="[2a02:752:0:18::128]:25401"
+/// ```
+///
+/// The v4 literals of those same hosts brought the DHT up to 66-69 nodes in
+/// under a second on that device, so the v6 entries bought nothing there.
+/// This is not a fallback or a preference: it is removing addresses the
+/// host provably cannot reach, and the noise they generate with them.
+///
+/// An entry left with no address at all goes with them. The one exception
+/// is a list that would end up *entirely* empty, which is worse than the
+/// noise: librqbit's `bootstrap` counts successes and returns
+/// `BootstrapFailed` when there are none, and a failed bootstrap kills the
+/// DHT worker. So an operator who configured a v6-only list on a host with
+/// no v6 route keeps it, unfiltered, and keeps the retries with it.
+fn apply_ipv6_route_policy(resolved: &mut Vec<ResolvedEntry>, has_ipv6_route: bool) {
+    if has_ipv6_route {
+        return;
+    }
+
+    let unfiltered = resolved.clone();
+    for entry in resolved.iter_mut() {
+        entry.addrs.retain(|addr| !is_ipv6_literal(addr));
+    }
+    resolved.retain(|entry| !entry.addrs.is_empty());
+
+    if resolved.is_empty() {
+        warn!(
+            "every DHT bootstrap address is IPv6 and this host has no IPv6 route; keeping them \
+             anyway, because an empty bootstrap list fails librqbit's bootstrap outright and \
+             takes the DHT worker with it"
+        );
+        *resolved = unfiltered;
+        return;
+    }
+
+    let dropped = addr_count(&unfiltered) - addr_count(resolved);
+    if dropped > 0 {
+        debug!(
+            dropped,
+            "dropped IPv6 DHT bootstrap addresses: this host has no route to them"
+        );
+    }
+}
+
+fn addr_count(entries: &[ResolvedEntry]) -> usize {
+    entries.iter().map(|e| e.addrs.len()).sum()
 }
 
 /// Resolve every bootstrap entry to address literals where possible, and
@@ -611,6 +758,11 @@ pub async fn resolve_bootstrap_addrs(
 
 /// The resolution pass proper, without the budget or the reporting.
 async fn resolve_all(entries: &[String], resolvers: &BootstrapResolvers) -> Vec<ResolvedEntry> {
+    // Once per pass, not once per address: the answer is a property of this
+    // host's routing table, so asking again per entry could only cost
+    // syscalls and risk an inconsistent list.
+    let has_ipv6_route = resolvers.ipv6.has_ipv6_route();
+
     let cache = match &resolvers.cache_path {
         Some(path) => BootstrapCache::load(path).await,
         None => BootstrapCache::default(),
@@ -634,6 +786,11 @@ async fn resolve_all(entries: &[String], resolvers: &BootstrapResolvers) -> Vec<
     {
         updated.store(path).await;
     }
+
+    // After caching, not before: what a host resolves to does not depend on
+    // whether we can reach it today, and a device that gains IPv6 later
+    // should find both families in the cache.
+    apply_ipv6_route_policy(&mut resolved, has_ipv6_route);
 
     resolved
 }
@@ -673,6 +830,7 @@ fn report(resolved: &[ResolvedEntry]) {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Records every host it was asked about, so a test can assert that a
     /// path was *not* taken (an address literal must reach librqbit without
@@ -733,6 +891,29 @@ mod tests {
         }
     }
 
+    /// Counts how often it was asked, so a test can hold the module to
+    /// deciding once per pass rather than once per address.
+    struct FakeIpv6 {
+        has_route: bool,
+        asked: AtomicUsize,
+    }
+
+    impl FakeIpv6 {
+        fn new(has_route: bool) -> Arc<Self> {
+            Arc::new(Self {
+                has_route,
+                asked: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl Ipv6RouteProbe for FakeIpv6 {
+        fn has_ipv6_route(&self) -> bool {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            self.has_route
+        }
+    }
+
     fn resolvers(
         system: Arc<dyn SystemDnsResolver>,
         doh: Option<Arc<dyn DohDnsResolver>>,
@@ -741,8 +922,118 @@ mod tests {
         BootstrapResolvers {
             system,
             doh,
+            // The inert probe: these tests are about the DNS ladder, and
+            // an assumed v6 route drops nothing.
+            ipv6: Arc::new(AssumeIpv6Route),
             cache_path,
         }
+    }
+
+    /// Both families for one name, AAAA first, so a test asserting v4 leads
+    /// is asserting a reordering rather than the input order.
+    fn dual_stack_system() -> Arc<FakeSystem> {
+        Arc::new(FakeSystem::with(
+            "dht.libtorrent.org",
+            &["[2a02:752:0:18::128]:25401", "185.157.221.247:25401"],
+        ))
+    }
+
+    fn with_ipv6_probe(
+        mut resolvers: BootstrapResolvers,
+        probe: Arc<FakeIpv6>,
+    ) -> BootstrapResolvers {
+        resolvers.ipv6 = probe;
+        resolvers
+    }
+
+    /// The Chromecast case: no v6 default route, so the AAAA record is
+    /// dropped instead of becoming a bootstrap entry librqbit retries
+    /// forever.
+    #[tokio::test]
+    async fn a_host_with_no_ipv6_route_gets_only_the_v4_bootstrap_addresses() {
+        let out = resolve_bootstrap_addrs(
+            &["dht.libtorrent.org:25401".to_string()],
+            &with_ipv6_probe(
+                resolvers(dual_stack_system(), None, None),
+                FakeIpv6::new(false),
+            ),
+        )
+        .await;
+        assert_eq!(out, ["185.157.221.247:25401"]);
+    }
+
+    /// A dual-stack host keeps every address it resolved -- v6 is only
+    /// dropped where it cannot be reached -- but v4 still leads, because
+    /// it is the family more likely to connect.
+    #[tokio::test]
+    async fn a_dual_stack_host_keeps_both_families_with_v4_first() {
+        let out = resolve_bootstrap_addrs(
+            &["dht.libtorrent.org:25401".to_string()],
+            &with_ipv6_probe(
+                resolvers(dual_stack_system(), None, None),
+                FakeIpv6::new(true),
+            ),
+        )
+        .await;
+        assert_eq!(out, ["185.157.221.247:25401", "[2a02:752:0:18::128]:25401"]);
+    }
+
+    /// One routing table, one answer: the probe is a per-pass decision, not
+    /// a per-address one.
+    #[tokio::test]
+    async fn the_ipv6_route_is_probed_once_per_pass() {
+        let probe = FakeIpv6::new(false);
+        let out = resolve_bootstrap_addrs(
+            &[
+                "dht.libtorrent.org:25401".to_string(),
+                "9.9.9.9:6881".to_string(),
+                "[2001:db8::1]:6881".to_string(),
+            ],
+            &with_ipv6_probe(resolvers(dual_stack_system(), None, None), probe.clone()),
+        )
+        .await;
+        assert_eq!(out, ["185.157.221.247:25401", "9.9.9.9:6881"]);
+        assert_eq!(probe.asked.load(Ordering::SeqCst), 1);
+    }
+
+    /// A configured v6 literal is an address like any other and goes; a
+    /// name nothing could resolve is not an address at all and stays, so
+    /// librqbit can keep trying its own lookup.
+    #[tokio::test]
+    async fn a_v6_literal_is_dropped_but_an_unresolved_name_is_kept() {
+        let out = resolve_bootstrap_addrs(
+            &[
+                "[2001:db8::1]:6881".to_string(),
+                "unresolvable.test:6881".to_string(),
+                "9.9.9.9:6881".to_string(),
+            ],
+            &with_ipv6_probe(
+                resolvers(Arc::new(FakeSystem::default()), None, None),
+                FakeIpv6::new(false),
+            ),
+        )
+        .await;
+        assert_eq!(out, ["unresolvable.test:6881", "9.9.9.9:6881"]);
+    }
+
+    /// Filtering may not empty the list: librqbit's `bootstrap` returns
+    /// `BootstrapFailed` when no entry succeeds, and that kills the DHT
+    /// worker. Unreachable addresses are noise; no addresses is no DHT.
+    #[tokio::test]
+    async fn a_v6_only_list_is_kept_whole_rather_than_emptied() {
+        let entries = vec![
+            "[2001:db8::1]:6881".to_string(),
+            "[2001:db8::2]:25401".to_string(),
+        ];
+        let out = resolve_bootstrap_addrs(
+            &entries,
+            &with_ipv6_probe(
+                resolvers(Arc::new(FakeSystem::default()), None, None),
+                FakeIpv6::new(false),
+            ),
+        )
+        .await;
+        assert_eq!(out, entries);
     }
 
     /// An address literal is what librqbit wants already; resolving it would
@@ -1002,6 +1293,7 @@ mod tests {
             &BootstrapResolvers {
                 system: Arc::new(NoDnsResolver),
                 doh: HttpsDohResolver::new().map(|r| Arc::new(r) as Arc<dyn DohDnsResolver>),
+                ipv6: Arc::new(UdpConnectIpv6Probe),
                 cache_path: None,
             },
         )
