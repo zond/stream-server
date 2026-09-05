@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::tracker_prober::TrackerProber;
@@ -27,6 +28,11 @@ pub trait TrackerStorage: Send + Sync {
 pub struct TrackerManager {
     trackers: Arc<RwLock<Vec<String>>>,
     storage: Option<Arc<dyn TrackerStorage>>,
+    /// The periodic refresh task, held until its owner takes it -- see
+    /// [`TrackerManager::take_refresh_task`]. Shared with every clone (the
+    /// task holds one itself) so the manager the engine keeps can hand out
+    /// the task a constructor spawned.
+    refresh_task: Arc<parking_lot::Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl Default for TrackerManager {
@@ -41,11 +47,12 @@ impl TrackerManager {
         let instance = Self {
             trackers: Arc::new(RwLock::new(Vec::new())),
             storage: None,
+            refresh_task: Arc::new(parking_lot::Mutex::new(None)),
         };
 
         // Initial fetch and periodic refresh
         let manager = instance.clone();
-        tokio::spawn(async move {
+        instance.set_refresh_task(tokio::spawn(async move {
             // Initial fetch
             if let Err(e) = manager
                 .refresh_trackers_internal(DEFAULT_TRACKERS_URL)
@@ -64,7 +71,7 @@ impl TrackerManager {
                     warn!(error = %e, "Failed to refresh trackers");
                 }
             }
-        });
+        }));
 
         instance
     }
@@ -74,11 +81,12 @@ impl TrackerManager {
         let instance = Self {
             trackers: Arc::new(RwLock::new(Vec::new())),
             storage: Some(storage.clone()),
+            refresh_task: Arc::new(parking_lot::Mutex::new(None)),
         };
 
         // Initial load from cache + periodic refresh
         let manager = instance.clone();
-        tokio::spawn(async move {
+        instance.set_refresh_task(tokio::spawn(async move {
             // Try to load from cache first
             manager.load_from_cache().await;
 
@@ -95,9 +103,24 @@ impl TrackerManager {
                     warn!(error = %e, "Failed to refresh trackers");
                 }
             }
-        });
+        }));
 
         instance
+    }
+
+    fn set_refresh_task(&self, task: JoinHandle<()>) {
+        *self.refresh_task.lock() = Some(task);
+    }
+
+    /// Take the periodic refresh task, so whoever shuts this process down can
+    /// abort it -- the way `server::run` cancels every other forever-loop it
+    /// starts. Left running, the loop arms its next `tokio::time::interval`
+    /// while the runtime is going down and panics with "A Tokio 1.x context
+    /// was found, but it is being shutdown"; tokio catches it, so it is only
+    /// noise, but it is the kind of noise a real panic hides in. Returns the
+    /// task once: the second caller gets `None`.
+    pub fn take_refresh_task(&self) -> Option<JoinHandle<()>> {
+        self.refresh_task.lock().take()
     }
 
     /// Load trackers from cache (settings)
@@ -231,5 +254,55 @@ impl TrackerManager {
             storage.save_trackers(Vec::new(), 0);
         }
         self.refresh_if_needed().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Storage whose cached list is fresh, so a refresh loop that does get
+    /// polled finds nothing to fetch: no test here may reach the network.
+    struct FreshCache;
+
+    impl TrackerStorage for FreshCache {
+        fn get_cached_trackers(&self) -> Vec<String> {
+            vec!["udp://tracker.invalid:6969/announce".to_string()]
+        }
+
+        fn get_last_updated(&self) -> i64 {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64
+        }
+
+        fn get_source_url(&self) -> String {
+            unreachable!("a fresh cache is never refetched")
+        }
+
+        fn save_trackers(&self, _trackers: Vec<String>, _timestamp: i64) {}
+    }
+
+    /// The refresh loop must belong to someone who can stop it: detached, it
+    /// arms its next interval while the runtime is shutting down and panics.
+    /// Aborting the task it hands over must end it by cancellation.
+    #[tokio::test]
+    async fn the_refresh_loop_is_handed_over_and_stops_when_aborted() {
+        let manager = TrackerManager::new_with_storage(Arc::new(FreshCache));
+
+        let task = manager
+            .take_refresh_task()
+            .expect("the constructor must hand its refresh loop over, not detach it");
+        task.abort();
+
+        let error = task
+            .await
+            .expect_err("an endless loop cannot have finished on its own");
+        assert!(error.is_cancelled(), "ended by {error}, not cancellation");
+        assert!(
+            manager.take_refresh_task().is_none(),
+            "the task has one owner; a second taker must not get it too"
+        );
     }
 }

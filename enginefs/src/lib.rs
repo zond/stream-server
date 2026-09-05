@@ -984,6 +984,15 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         efs
     }
 
+    /// Take the tracker manager's periodic refresh task, for the caller to
+    /// abort when it shuts down -- `server::run` puts it with the other
+    /// long-lived tasks it cancels. It comes out once; a second call (the
+    /// stream and download engines are often the same `Arc`) yields `None`.
+    /// See [`crate::trackers::TrackerManager::take_refresh_task`].
+    pub fn take_tracker_refresh_task(&self) -> Option<tokio::task::JoinHandle<()>> {
+        self.tracker_manager.take_refresh_task()
+    }
+
     /// The tracker list a torrent is added with: the built-in defaults, the
     /// tracker manager's cached list (ranked by RTT), and any request-supplied
     /// extras, sorted and de-duplicated.
@@ -3960,6 +3969,32 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         true
+    }
+
+    /// The engine hands its tracker refresher over exactly once, so
+    /// `server::run` can abort it with the rest of its background tasks
+    /// instead of leaving a detached loop to arm a timer on a runtime that is
+    /// going down. Aborting it here is also what keeps this test offline:
+    /// the storage-less refresher fetches the tracker list on its first poll.
+    #[tokio::test]
+    async fn the_engine_hands_its_tracker_refresh_task_over_once() {
+        let root = fake_engine_root();
+        let enginefs = BackendEngineFS::new_with_backend(
+            FakeBackend::new(Vec::new()),
+            HashMap::new(),
+            root.join("cache"),
+            root.join("downloads"),
+        );
+
+        let task = enginefs
+            .take_tracker_refresh_task()
+            .expect("the engine must own its tracker refresher");
+        task.abort();
+
+        assert!(
+            enginefs.take_tracker_refresh_task().is_none(),
+            "the task has one owner; the second engine sharing this Arc must not get it too"
+        );
     }
 
     // (a) A torrent that is Initializing when the request arrives: the request
