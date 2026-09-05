@@ -863,6 +863,12 @@ pub async fn run(
     // and the second call yields `None` here, where they are the same `Arc`.
     background_tasks.extend(state.engine.take_tracker_refresh_task());
     background_tasks.extend(state.download_engine.take_tracker_refresh_task());
+    // And the engines' housekeeping sweep, the other forever loop they start
+    // for themselves. It is parked on a 15-second sleep between passes rather
+    // than an hourly one, so of the two it is the likelier to be holding a
+    // timer when the driver goes down.
+    background_tasks.extend(state.engine.take_sweep_task());
+    background_tasks.extend(state.download_engine.take_sweep_task());
     if cfg.enable_cache_cleaner {
         background_tasks.push(cache_cleaner::start(Arc::new(state.clone())));
     }

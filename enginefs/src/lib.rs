@@ -487,6 +487,9 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     volume_id_probe: VolumeProbe,
     /// Epoch of every `*_secs` timestamp this instance and its engines keep.
     clock: Clock,
+    /// The housekeeping sweep started by the constructor, kept so its owner
+    /// can cancel it. See [`Self::take_sweep_task`].
+    sweep_task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -611,6 +614,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             free_space_probe: Arc::new(|path| fs4::available_space(path)),
             volume_id_probe: Arc::new(volume_id),
             clock,
+            sweep_task: parking_lot::Mutex::new(None),
         };
 
         let engines_clone = engines.clone();
@@ -623,7 +627,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let seeding_flag = efs.seeding_enabled.clone();
         let magnet_adds_clone = efs.magnet_adds.clone();
         let clock = efs.clock;
-        tokio::spawn(async move {
+        let sweep = tokio::spawn(async move {
             loop {
                 // Run fairly frequently so seeding stops promptly after the
                 // user disables it; torrent removal is still gated by the much
@@ -980,8 +984,28 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 }
             }
         });
+        *efs.sweep_task.lock() = Some(sweep);
 
         efs
+    }
+
+    /// Take the housekeeping sweep this constructor started -- the loop above
+    /// that expires playback leases, prunes the magnet registry and pauses or
+    /// removes idle torrents -- for the caller to abort when it shuts down.
+    /// `server::run` puts it with the other long-lived tasks it cancels. It
+    /// comes out once; a second call (the stream and download engines are
+    /// often the same `Arc`) yields `None`.
+    ///
+    /// It is the other task with the shape described on
+    /// [`crate::trackers::TrackerManager::take_refresh_task`], and the one
+    /// that is always in it: between sweeps it is parked on a 15-second
+    /// `tokio::time::sleep`, so every single shutdown finds it holding a
+    /// timer for the driver to fire on its way down. Aborting it costs
+    /// nothing -- every step of the sweep is housekeeping the process is
+    /// about to stop needing, and each `.await` in it is a lock or a backend
+    /// call that cancellation simply drops.
+    pub fn take_sweep_task(&self) -> Option<tokio::task::JoinHandle<()>> {
+        self.sweep_task.lock().take()
     }
 
     /// Take the tracker manager's periodic refresh task, for the caller to
@@ -3993,6 +4017,35 @@ mod tests {
 
         assert!(
             enginefs.take_tracker_refresh_task().is_none(),
+            "the task has one owner; the second engine sharing this Arc must not get it too"
+        );
+    }
+
+    /// The same contract for the housekeeping sweep, which the constructor
+    /// starts for itself and which nothing could cancel while it was
+    /// detached. Neither task is polled here -- a current-thread test that
+    /// never awaits leaves both parked on their first instruction -- which is
+    /// also what keeps this offline.
+    #[tokio::test]
+    async fn the_engine_hands_its_housekeeping_sweep_over_once() {
+        let root = fake_engine_root();
+        let enginefs = BackendEngineFS::new_with_backend(
+            FakeBackend::new(Vec::new()),
+            HashMap::new(),
+            root.join("cache"),
+            root.join("downloads"),
+        );
+
+        let task = enginefs
+            .take_sweep_task()
+            .expect("the engine must own the sweep it started");
+        task.abort();
+        if let Some(refresher) = enginefs.take_tracker_refresh_task() {
+            refresher.abort();
+        }
+
+        assert!(
+            enginefs.take_sweep_task().is_none(),
             "the task has one owner; the second engine sharing this Arc must not get it too"
         );
     }
