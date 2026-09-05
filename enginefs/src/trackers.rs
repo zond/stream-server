@@ -114,11 +114,22 @@ impl TrackerManager {
 
     /// Take the periodic refresh task, so whoever shuts this process down can
     /// abort it -- the way `server::run` cancels every other forever-loop it
-    /// starts. Left running, the loop arms its next `tokio::time::interval`
-    /// while the runtime is going down and panics with "A Tokio 1.x context
-    /// was found, but it is being shutdown"; tokio catches it, so it is only
-    /// noise, but it is the kind of noise a real panic hides in. Returns the
-    /// task once: the second caller gets `None`.
+    /// starts. Returns the task once: the second caller gets `None`.
+    ///
+    /// What aborting it avoids: the `tokio::time::interval` above is built
+    /// once, before the loop, so between refreshes the task is *parked* on
+    /// `interval.tick()` with a timer registered on the runtime's time
+    /// driver. Shutting that driver down marks it shut down and then fires
+    /// every pending timer to the end of time
+    /// (`runtime::time::Handle::shutdown` -> `process_at_time(u64::MAX)`),
+    /// which wakes every task parked on one; a worker that polls such a task
+    /// before the scheduler drops it trips `TimerEntry::poll_elapsed`'s
+    /// `assert!(!self.driver().is_shutdown())` and panics with "A Tokio 1.x
+    /// context was found, but it is being shutdown". Tokio catches it and the
+    /// process survives, so it is only noise -- but it is the kind of noise a
+    /// real panic hides in, and which of the wake and the drop wins is why it
+    /// appears on some shutdowns and not others. A task that has been aborted
+    /// is not there to be woken.
     pub fn take_refresh_task(&self) -> Option<JoinHandle<()>> {
         self.refresh_task.lock().take()
     }

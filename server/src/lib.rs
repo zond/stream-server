@@ -851,13 +851,16 @@ pub async fn run(
 
     let mut background_tasks = Vec::new();
     // The engines' tracker refresher is a forever loop like the rest, so it
-    // belongs in the list this function aborts. Detached, it is still running
-    // when the runtime goes down and panics arming its next hourly interval
-    // ("A Tokio 1.x context was found, but it is being shutdown") -- caught by
-    // tokio, so only noise, but noise a real panic can hide in. The task has
-    // one owner, so it is taken, not read: both engines are asked because
-    // `AppState` allows two, and the second call yields `None` here, where
-    // they are the same `Arc`.
+    // belongs in the list this function aborts. Detached, it is still parked
+    // on its hourly `interval.tick()` when the runtime goes down, and a task
+    // parked on a timer is what panics there: the time driver fires every
+    // pending timer as it shuts down, and a worker that polls the task it
+    // just woke asserts on the shut-down driver ("A Tokio 1.x context was
+    // found, but it is being shutdown") -- caught by tokio, so only noise,
+    // but noise a real panic can hide in. See
+    // `TrackerManager::take_refresh_task`. The task has one owner, so it is
+    // taken, not read: both engines are asked because `AppState` allows two,
+    // and the second call yields `None` here, where they are the same `Arc`.
     background_tasks.extend(state.engine.take_tracker_refresh_task());
     background_tasks.extend(state.download_engine.take_tracker_refresh_task());
     if cfg.enable_cache_cleaner {
