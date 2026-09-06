@@ -134,6 +134,37 @@ fn redirect_target(response: &reqwest::Response, from: &Url) -> Option<Url> {
     matches!(target.scheme(), "http" | "https").then_some(target)
 }
 
+/// The `Location` of a redirect this proxy declined to follow, in the form
+/// it is relayed in: absolute, so the client resolves it against the host
+/// that wrote it.
+///
+/// A relative `Location` is relative to the URL it came *from*, and the
+/// client reading our response never saw that URL -- it asked this server,
+/// so `Location: /elsewhere` resolves against `http://127.0.0.1:11470` and
+/// points the player back at us, at a path we do not serve. Resolving it
+/// here makes no request, so the reason not to rewrite it into a `/proxy/`
+/// link is untouched: naming where an origin pointed is not going there.
+///
+/// A value that is already absolute is relayed byte for byte rather than
+/// round-tripped through [`Url`], which would normalise a spelling that is
+/// the origin's to choose. That includes one naming a scheme this proxy
+/// will not fetch -- an `ftp://` `Location` is exactly the diagnostic the
+/// relay was added to preserve, and it needs nothing resolved. So does a
+/// value we cannot read as text or cannot resolve at all: whatever the
+/// origin wrote is better than nothing.
+fn relayed_location(location: &HeaderValue, from: &Url) -> HeaderValue {
+    let Ok(written) = location.to_str() else {
+        return location.clone();
+    };
+    if Url::parse(written).is_ok() {
+        return location.clone();
+    }
+    from.join(written)
+        .ok()
+        .and_then(|absolute| HeaderValue::from_str(absolute.as_str()).ok())
+        .unwrap_or_else(|| location.clone())
+}
+
 /// Whether a `206`'s `Content-Range` says the part it carries is the whole
 /// entity -- `bytes 0-<len-1>/<len>`.
 ///
@@ -1009,15 +1040,17 @@ async fn proxy(
     // `content-length: 0`, which makes an unfollowable redirect and a
     // headerless one the same dead end, and neither one diagnosable.
     //
-    // Relayed exactly as the origin wrote it, not resolved and not
-    // rewritten into a proxy URL of our own. We are declining to follow it;
-    // handing the player a `/proxy/` link to the same place would be making
-    // the request anyway with extra steps, and for a `305` that is the
-    // whole of what must not happen.
+    // Not rewritten into a proxy URL of our own: we are declining to follow
+    // it, and handing the player a `/proxy/` link to the same place would
+    // be making the request anyway with extra steps -- for a `305` that is
+    // the whole of what must not happen. Absolutised, though, because a
+    // relative `Location` relayed as written is resolved by the client
+    // against *this* server. See [`relayed_location`].
     if status.is_redirection()
         && let Some(location) = res_headers.get(header::LOCATION)
     {
-        res_builder = res_builder.header(header::LOCATION, location);
+        res_builder =
+            res_builder.header(header::LOCATION, relayed_location(location, &fetched_url));
     }
 
     // What the origin said about *its own body*: only true of a body we hand
@@ -1989,6 +2022,43 @@ mod tests {
         assert!(!covers_the_whole_entity("bytes */180"));
         assert!(!covers_the_whole_entity("items 0-179/180"));
         assert!(!covers_the_whole_entity(""));
+    }
+
+    /// The four forms a `Location` we are not following can take. Only the
+    /// relative ones are resolved; the rest are the origin's own bytes,
+    /// including the `ftp://` this relay exists to preserve as a
+    /// diagnostic.
+    #[test]
+    fn only_a_relative_location_is_resolved_before_it_is_relayed() {
+        let from = Url::parse("https://cdn.example.com/cdn/2024/film.mkv").unwrap();
+        let relayed = |written: &str| {
+            relayed_location(&HeaderValue::from_str(written).unwrap(), &from)
+                .to_str()
+                .expect("the fixture values are all text")
+                .to_string()
+        };
+
+        assert_eq!(relayed("/elsewhere"), "https://cdn.example.com/elsewhere");
+        assert_eq!(
+            relayed("v2/film.mkv"),
+            "https://cdn.example.com/cdn/2024/v2/film.mkv",
+            "beside the resource that sent it, which is what relative means here"
+        );
+        assert_eq!(
+            relayed("//edge.example.org/film.mkv"),
+            "https://edge.example.org/film.mkv",
+            "a protocol-relative value takes the scheme of the hop it came from"
+        );
+        assert_eq!(
+            relayed("http://edge.example.org/film.mkv"),
+            "http://edge.example.org/film.mkv",
+            "an absolute value is the origin's spelling and is not normalised"
+        );
+        assert_eq!(
+            relayed("ftp://files.example.com/film.mkv"),
+            "ftp://files.example.com/film.mkv",
+            "including one naming a scheme we would never fetch"
+        );
     }
 
     #[test]

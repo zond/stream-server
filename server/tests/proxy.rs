@@ -1922,6 +1922,59 @@ fn an_unfollowed_redirect_still_says_where_it_pointed() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The same relay, with a *relative* `Location`, which is the form that
+/// cannot be handed on as written.
+///
+/// A relative `Location` is relative to the URL it came from, and the
+/// player never saw that URL -- it asked this proxy. Relayed byte for byte,
+/// `Location: /elsewhere` resolved against *us*: measured, a player
+/// following the `302` we relayed came back to
+/// `http://127.0.0.1:<proxy>/elsewhere`, a path this server does not serve,
+/// instead of going to the origin that named it. Resolving it against the
+/// URL the response came from makes no request of our own -- it just says
+/// where the origin pointed, in a form that means the same thing to
+/// somebody who was not on the hop.
+#[test]
+fn a_relative_location_we_will_not_follow_is_relayed_absolute() -> anyhow::Result<()> {
+    // `305 Use Proxy`: a status this route relays rather than follows, so
+    // the `Location` is ours to hand on and nothing has resolved it already.
+    let origin = Origin::start_with(|_request: &Request, socket: &mut TcpStream| {
+        let _ = socket.write_all(
+            b"HTTP/1.1 305 Use Proxy\r\nLocation: /elsewhere\r\n\
+              Content-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let _ = socket.flush();
+    })?;
+
+    let fixture = fixture_with(origin)?;
+    let target = format!("http://{}/cdn/film.mkv", fixture.origin.addr);
+    let response = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?
+        .get(format!("{}/proxy/?d={}", fixture.base, encode(&target)))
+        .send()?;
+
+    assert_eq!(response.status().as_u16(), 305);
+    let location = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        location,
+        format!("http://{}/elsewhere", fixture.origin.addr),
+        "resolved against the URL the response came from, not left to the player"
+    );
+    assert!(
+        !location.starts_with(&fixture.base),
+        "and so it does not point the player back at this proxy: {location}"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
 /// The statuses in `300..400` that are not "the resource is over there".
 /// Following any status with a `Location` -- what the reference does -- had
 /// the proxy fetch and serve the `Location` of a `300`, a `304`, a `305`
@@ -1976,8 +2029,9 @@ fn a_3xx_that_does_not_move_the_resource_is_not_followed() -> anyhow::Result<()>
                 .headers()
                 .get(reqwest::header::LOCATION)
                 .and_then(|value| value.to_str().ok()),
-            Some("/elsewhere"),
-            "with the Location it named, so the player can see where it was sent"
+            Some(format!("http://{}/elsewhere", fixture.origin.addr).as_str()),
+            "with the Location it named -- absolute, so the player can see where it was \
+             sent rather than resolving it against us"
         );
         assert_ne!(
             response.text()?,
