@@ -2192,9 +2192,9 @@ fn lan_media_listener_serves_media_but_no_control_route() -> anyhow::Result<()> 
     // `/proxy` and `/ftp` are open on the loopback listener too -- players
     // cannot attach headers, same as every other media route -- but neither
     // serves bytes *from this server*: each fetches an arbitrary
-    // caller-supplied remote URL (`/proxy` with
-    // `danger_accept_invalid_certs`, `/ftp` via `reqwest` or a spawned
-    // `curl`), which makes it an open proxy rather than "media bytes". The
+    // caller-supplied remote URL (`/proxy` via `reqwest`, `/ftp` via
+    // `reqwest` or a spawned `curl`), which makes it an open proxy rather
+    // than "media bytes". The
     // LAN listener's allow-list (`lan_media_routes`) excludes both. The
     // requests below are malformed just enough to prove the routing
     // decision (an invalid target URL, a missing `lz` parameter) without
