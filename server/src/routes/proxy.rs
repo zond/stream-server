@@ -207,13 +207,15 @@ async fn proxy(
 
     let mut req_builder = client.request(method, url.clone());
 
-    // Forward standard headers
+    // What the player asked for, forwarded as it asked for it. `connection`
+    // and `transfer-encoding` are deliberately absent: both describe the
+    // framing of one hop, and this is a new hop -- reqwest frames its own
+    // request, and a `transfer-encoding: chunked` copied from a bodyless
+    // player request describes a body that is not there.
     let allowed_req_headers = [
         "accept",
         "accept-encoding",
         "accept-language",
-        "connection",
-        "transfer-encoding",
         "range",
         "if-range",
         "user-agent",
@@ -236,25 +238,52 @@ async fn proxy(
     };
 
     let status = response.status();
+    let res_headers = response.headers().clone();
+
+    let content_type = res_headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+    let is_playlist = url.path().ends_with(".m3u8")
+        || url.path().ends_with(".m3u")
+        || content_type.contains("mpegurl");
+
     let mut res_builder = Response::builder().status(status);
 
-    let allowed_res_headers = [
-        "accept-ranges",
-        "content-type",
-        "content-length",
-        "content-range",
-        "connection",
-        "transfer-encoding",
-        "last-modified",
-        "etag",
-        "server",
-        "date",
-    ];
-
-    let res_headers = response.headers().clone();
-    for name in allowed_res_headers {
+    // What the origin said about the *resource*: true of whatever we send
+    // back, because none of it describes the bytes on this hop.
+    let resource_res_headers = ["content-type", "server", "date"];
+    for name in resource_res_headers {
         if let Some(value) = res_headers.get(name) {
             res_builder = res_builder.header(name, value);
+        }
+    }
+
+    // What the origin said about *its own body*: only true of a body we hand
+    // on byte for byte. A rewritten playlist is a different body, and the
+    // origin's framing copied onto it is a lie hyper catches -- with
+    // `Content-Length` the connection task panics ("payload claims
+    // content-length of 180, custom content-length header claims 82"), with
+    // `Transfer-Encoding: chunked` it closes having written nothing, and only
+    // a close-delimited origin survived by accident. That was every proxied
+    // HLS stream failing to play. `Accept-Ranges`, `Content-Range`, `ETag`
+    // and `Last-Modified` go with it: they all describe the entity at the
+    // origin, and a client that acted on them -- ranging into the rewritten
+    // playlist, or caching it under the origin's tag -- would be acting on
+    // the wrong bytes. `connection` and `transfer-encoding` are relayed in
+    // neither branch: framing this response is hyper's job, not the origin's.
+    let relayed_body_res_headers = [
+        "accept-ranges",
+        "content-length",
+        "content-range",
+        "last-modified",
+        "etag",
+    ];
+    if !is_playlist {
+        for name in relayed_body_res_headers {
+            if let Some(value) = res_headers.get(name) {
+                res_builder = res_builder.header(name, value);
+            }
         }
     }
 
@@ -268,20 +297,25 @@ async fn proxy(
         .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS")
         .header(header::ACCESS_CONTROL_ALLOW_HEADERS, "*");
 
-    let content_type = res_headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("");
-    let is_playlist = url.path().ends_with(".m3u8")
-        || url.path().ends_with(".m3u")
-        || content_type.contains("mpegurl");
-
     if is_playlist {
-        // We need to rewrite the playlist.
-        // For now, let's just stream it without rewriting as a first step,
-        // then add rewriting if segments fail.
-        let body = response.text().await.unwrap_or_default();
+        // Every line of the playlist is rewritten to come back through this
+        // proxy, so the whole body has to be in hand before any of it is
+        // sent. A body we could not read is a playlist we cannot rewrite:
+        // saying so beats handing the player an empty one that parses as a
+        // stream with no segments.
+        let body = match response.text().await {
+            Ok(body) => body,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    format!("Proxy could not read the playlist: {e}"),
+                )
+                    .into_response();
+            }
+        };
         let rewritten = rewrite_playlist(&body, &url);
+        // The framing of the body we built, measured on that body.
+        res_builder = res_builder.header(header::CONTENT_LENGTH, rewritten.len().to_string());
         return finalize_response(res_builder, axum::body::Body::from(rewritten));
     }
 

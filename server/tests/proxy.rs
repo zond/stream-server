@@ -13,7 +13,7 @@
 //! line of an HLS playlist into the query format (`/proxy/?d=<url>`).
 
 use std::io::{BufRead, BufReader, Write};
-use std::net::{SocketAddr, TcpListener};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 
 /// The config every test here spreads from: no DHT bootstrap name
 /// resolution, so starting a server makes no DNS query (see `embed.rs`).
@@ -31,95 +31,137 @@ fn byte_at(offset: usize) -> u8 {
     (offset % 251) as u8
 }
 
-/// A minimal origin serving [`ORIGIN_LENGTH`] bytes of [`byte_at`] with
-/// `Range` support, on a thread of its own. It records the request line and
-/// the `Range` header of everything it is asked for, which is how a test
-/// tells "the proxy relayed the range" from "the proxy fetched the whole
-/// file and sliced it".
+/// One request an [`Origin`] was asked for: the request line, and the header
+/// names and values in the order they arrived. Tests assert against this
+/// rather than against what they *sent*, because the whole point of a proxy
+/// bug is the gap between the two.
+#[derive(Clone, Debug)]
+struct Request {
+    line: String,
+    headers: Vec<(String, String)>,
+}
+
+impl Request {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn range(&self) -> Option<&str> {
+        self.header("range")
+    }
+}
+
+/// A one-connection-per-thread origin that answers with whatever its
+/// responder writes to the socket, and records every request it was asked
+/// for. Threaded rather than sequential because two players streaming at
+/// once is exactly what the close test needs.
 struct Origin {
     addr: SocketAddr,
-    requests: std::sync::mpsc::Receiver<(String, Option<String>)>,
+    requests: std::sync::mpsc::Receiver<Request>,
 }
 
 const ORIGIN_LENGTH: usize = 1024 * 1024;
 
 impl Origin {
+    /// The default origin: [`ORIGIN_LENGTH`] bytes of [`byte_at`] with
+    /// `Range` support, which is how a test tells "the proxy relayed the
+    /// range" from "the proxy fetched the whole file and sliced it".
     fn start() -> anyhow::Result<Self> {
+        Self::start_with(|request: &Request, socket: &mut TcpStream| {
+            let served = request.range().and_then(|value| {
+                let (first, last) = value.trim_start_matches("bytes=").split_once('-')?;
+                let first: usize = first.parse().ok()?;
+                let last: usize = if last.is_empty() {
+                    ORIGIN_LENGTH - 1
+                } else {
+                    last.parse().ok()?
+                };
+                Some((first, last))
+            });
+            let (head, body) = match served {
+                Some((first, last)) => {
+                    let body: Vec<u8> = (first..=last).map(byte_at).collect();
+                    (
+                        format!(
+                            "HTTP/1.1 206 Partial Content\r\nAccept-Ranges: bytes\r\n\
+                             Content-Type: video/mp4\r\n\
+                             Content-Range: bytes {first}-{last}/{ORIGIN_LENGTH}\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        ),
+                        body,
+                    )
+                }
+                None => {
+                    let body: Vec<u8> = (0..ORIGIN_LENGTH).map(byte_at).collect();
+                    (
+                        format!(
+                            "HTTP/1.1 200 OK\r\nAccept-Ranges: bytes\r\n\
+                             Content-Type: video/mp4\r\n\
+                             Content-Length: {ORIGIN_LENGTH}\r\nConnection: close\r\n\r\n"
+                        ),
+                        body,
+                    )
+                }
+            };
+            let _ = socket.write_all(head.as_bytes());
+            let _ = socket.write_all(&body);
+            let _ = socket.flush();
+        })
+    }
+
+    fn start_with<R>(responder: R) -> anyhow::Result<Self>
+    where
+        R: Fn(&Request, &mut TcpStream) + Send + Sync + 'static,
+    {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         let (sender, requests) = std::sync::mpsc::channel();
+        let responder = std::sync::Arc::new(responder);
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
                 let Ok(peer) = stream.try_clone() else { break };
-                let mut reader = BufReader::new(peer);
-                let mut request_line = String::new();
-                if reader.read_line(&mut request_line).is_err() {
-                    continue;
-                }
-                let mut range = None;
-                loop {
-                    let mut header = String::new();
-                    match reader.read_line(&mut header) {
-                        Ok(0) => break,
-                        Ok(_) if header.trim().is_empty() => break,
-                        Ok(_) => {}
-                        Err(_) => break,
+                let sender = sender.clone();
+                let responder = responder.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(peer);
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        return;
                     }
-                    if let Some((name, value)) = header.split_once(':')
-                        && name.eq_ignore_ascii_case("range")
-                    {
-                        range = Some(value.trim().to_string());
+                    let mut headers = vec![];
+                    loop {
+                        let mut header = String::new();
+                        match reader.read_line(&mut header) {
+                            Ok(0) => break,
+                            Ok(_) if header.trim().is_empty() => break,
+                            Ok(_) => {}
+                            Err(_) => break,
+                        }
+                        if let Some((name, value)) = header.split_once(':') {
+                            headers.push((name.trim().to_string(), value.trim().to_string()));
+                        }
                     }
-                }
-                let served = range.as_deref().and_then(|value| {
-                    let (first, last) = value.trim_start_matches("bytes=").split_once('-')?;
-                    let first: usize = first.parse().ok()?;
-                    let last: usize = if last.is_empty() {
-                        ORIGIN_LENGTH - 1
-                    } else {
-                        last.parse().ok()?
+                    let request = Request {
+                        line: line.trim_end().to_string(),
+                        headers,
                     };
-                    Some((first, last))
+                    if sender.send(request.clone()).is_err() {
+                        return;
+                    }
+                    responder(&request, &mut stream);
                 });
-                let _ = sender.send((request_line.trim_end().to_string(), range));
-                let (head, body) = match served {
-                    Some((first, last)) => {
-                        let body: Vec<u8> = (first..=last).map(byte_at).collect();
-                        (
-                            format!(
-                                "HTTP/1.1 206 Partial Content\r\nAccept-Ranges: bytes\r\n\
-                                 Content-Type: video/mp4\r\n\
-                                 Content-Range: bytes {first}-{last}/{ORIGIN_LENGTH}\r\n\
-                                 Content-Length: {}\r\nConnection: close\r\n\r\n",
-                                body.len()
-                            ),
-                            body,
-                        )
-                    }
-                    None => {
-                        let body: Vec<u8> = (0..ORIGIN_LENGTH).map(byte_at).collect();
-                        (
-                            format!(
-                                "HTTP/1.1 200 OK\r\nAccept-Ranges: bytes\r\n\
-                                 Content-Type: video/mp4\r\n\
-                                 Content-Length: {ORIGIN_LENGTH}\r\nConnection: close\r\n\r\n"
-                            ),
-                            body,
-                        )
-                    }
-                };
-                let _ = stream.write_all(head.as_bytes());
-                let _ = stream.write_all(&body);
-                let _ = stream.flush();
             }
         });
         Ok(Self { addr, requests })
     }
 
-    /// The request line and `Range` header of the next request the origin
-    /// was asked for.
-    fn next_request(&self) -> (String, Option<String>) {
+    /// The next request the origin was asked for.
+    fn next_request(&self) -> Request {
         self.requests
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("the origin was asked for something")
@@ -196,8 +238,10 @@ fn the_core_path_format_relays_the_target() -> anyhow::Result<()> {
 
     // The path after the `d=` segment, and the proxy URL's own query, both
     // reach the origin: a signed URL loses neither.
-    let (request_line, _) = fixture.origin.next_request();
-    assert_eq!(request_line, "GET /dir/movie.mp4?token=abc HTTP/1.1");
+    assert_eq!(
+        fixture.origin.next_request().line,
+        "GET /dir/movie.mp4?token=abc HTTP/1.1"
+    );
 
     drop(fixture.handle);
     Ok(())
@@ -221,8 +265,10 @@ fn the_query_format_relays_the_target() -> anyhow::Result<()> {
     );
     assert_eq!(response.bytes()?.len(), ORIGIN_LENGTH);
 
-    let (request_line, _) = fixture.origin.next_request();
-    assert_eq!(request_line, "GET /dir/movie.mp4?token=abc HTTP/1.1");
+    assert_eq!(
+        fixture.origin.next_request().line,
+        "GET /dir/movie.mp4?token=abc HTTP/1.1"
+    );
 
     drop(fixture.handle);
     Ok(())
@@ -271,8 +317,10 @@ fn a_byte_range_is_forwarded_to_the_origin_and_its_206_relayed_back() -> anyhow:
 
     // The origin was asked for the range, not for the file: the proxy is not
     // fetching from the start and discarding the front of it.
-    let (_, range) = fixture.origin.next_request();
-    assert_eq!(range.as_deref(), Some("bytes=1000-1099"));
+    assert_eq!(
+        fixture.origin.next_request().range(),
+        Some("bytes=1000-1099")
+    );
 
     drop(fixture.handle);
     Ok(())
@@ -300,8 +348,7 @@ fn nothing_the_proxy_fetched_is_cached() -> anyhow::Result<()> {
 
     // Twice asked for, twice fetched.
     for _ in 0..2 {
-        let (_, range) = fixture.origin.next_request();
-        assert_eq!(range.as_deref(), Some("bytes=0-99"));
+        assert_eq!(fixture.origin.next_request().range(), Some("bytes=0-99"));
     }
 
     // And a megabyte of proxied stream leaves nothing behind: the cache root
@@ -317,6 +364,143 @@ fn nothing_the_proxy_fetched_is_cached() -> anyhow::Result<()> {
 
     drop(fixture.handle);
     Ok(())
+}
+
+/// The playlist an HLS origin serves, and what the proxy must hand the
+/// player instead: every line pointing back through the proxy, which makes
+/// the body *longer* than the one the origin sent. That length difference is
+/// the whole of defect 1 -- a relayed `Content-Length` describing 82 bytes in
+/// front of 180 is a response hyper refuses to write.
+const ORIGIN_PLAYLIST: &str =
+    "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:10,\nseg-0.ts\n#EXTINF:10,\nseg-1.ts\n";
+
+fn expected_playlist(origin: SocketAddr) -> String {
+    let mut expected = String::new();
+    for line in ORIGIN_PLAYLIST.lines() {
+        if line.starts_with('#') {
+            expected.push_str(line);
+        } else {
+            expected.push_str(&format!(
+                "/proxy/?d={}",
+                encode(&format!("http://{origin}/live/{line}"))
+            ));
+        }
+        expected.push('\n');
+    }
+    expected
+}
+
+/// An origin that serves [`ORIGIN_PLAYLIST`] with the framing `framing`
+/// spells -- the three ways an origin can delimit a body, all of which the
+/// proxy has to survive, because it replaces that body with a longer one.
+fn playlist_origin(framing: Framing) -> anyhow::Result<Origin> {
+    Origin::start_with(move |_request: &Request, socket: &mut TcpStream| {
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\n{}\r\n",
+            match framing {
+                Framing::ContentLength => format!("Content-Length: {}\r\n", ORIGIN_PLAYLIST.len()),
+                Framing::Chunked => "Transfer-Encoding: chunked\r\n".to_string(),
+                Framing::CloseDelimited => "Connection: close\r\n".to_string(),
+            }
+        );
+        let _ = socket.write_all(head.as_bytes());
+        match framing {
+            Framing::Chunked => {
+                let _ = socket.write_all(
+                    format!(
+                        "{:x}\r\n{ORIGIN_PLAYLIST}\r\n0\r\n\r\n",
+                        ORIGIN_PLAYLIST.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+            _ => {
+                let _ = socket.write_all(ORIGIN_PLAYLIST.as_bytes());
+            }
+        }
+        let _ = socket.flush();
+        let _ = socket.shutdown(std::net::Shutdown::Write);
+    })
+}
+
+#[derive(Clone, Copy)]
+enum Framing {
+    ContentLength,
+    Chunked,
+    CloseDelimited,
+}
+
+/// Fetches the playlist through the proxy and asserts the player got the
+/// whole rewritten thing, framed by its own length rather than the origin's.
+fn assert_playlist_is_reframed(framing: Framing) -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_root = tempfile::tempdir()?;
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_root.path().join("cache")),
+        ..offline_config()
+    })?;
+    let origin = playlist_origin(framing)?;
+    let target = format!("http://{}/live/master.m3u8", origin.addr);
+    let response = reqwest::blocking::Client::new()
+        .get(format!(
+            "http://{}/proxy/?d={}",
+            handle.http_addr(),
+            encode(&target)
+        ))
+        .send()?;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let declared = response
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
+    let body = response.text()?;
+
+    assert_eq!(
+        body,
+        expected_playlist(origin.addr),
+        "the whole playlist arrives, every line rewritten"
+    );
+    assert_eq!(
+        declared.as_deref(),
+        Some(body.len().to_string().as_str()),
+        "and the length we declare is the length of what we sent, not what we fetched"
+    );
+    assert_ne!(
+        body.len(),
+        ORIGIN_PLAYLIST.len(),
+        "the rewrite really did change the length -- otherwise this test proves nothing"
+    );
+
+    drop(handle);
+    Ok(())
+}
+
+/// The framing the origin sent is the one that used to panic the connection
+/// task: `payload claims content-length of 180, custom content-length header
+/// claims 82`.
+#[test]
+fn a_playlist_from_a_content_length_origin_is_framed_by_its_rewritten_length() -> anyhow::Result<()>
+{
+    assert_playlist_is_reframed(Framing::ContentLength)
+}
+
+/// With the origin's `Transfer-Encoding: chunked` relayed, the response
+/// closed having written nothing at all.
+#[test]
+fn a_playlist_from_a_chunked_origin_is_framed_by_its_rewritten_length() -> anyhow::Result<()> {
+    assert_playlist_is_reframed(Framing::Chunked)
+}
+
+/// The one framing that worked before, by accident -- a close-delimited
+/// origin gave the proxy nothing to relay. It must keep working.
+#[test]
+fn a_playlist_from_a_close_delimited_origin_is_framed_by_its_rewritten_length() -> anyhow::Result<()>
+{
+    assert_playlist_is_reframed(Framing::CloseDelimited)
 }
 
 fn walk(directory: &std::path::Path) -> Vec<std::path::PathBuf> {
