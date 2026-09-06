@@ -467,6 +467,76 @@ fn percent_encoding_in_the_path_reaches_the_origin_as_the_caller_wrote_it() -> a
     Ok(())
 }
 
+/// A compressed origin response. This client decodes nothing -- the server's
+/// reqwest has no gzip/brotli/deflate feature -- so two things have to hold:
+/// the origin is asked for `identity` rather than being handed the player's
+/// `accept-encoding: gzip`, and if it compresses anyway the bytes come back
+/// with the `content-encoding` that names them. Dropping that header, which
+/// is what this route used to do, hands the player gzip labelled as
+/// identity. The target is a playlist as well, so it also pins that we do
+/// not try to rewrite lines that are not text yet.
+#[test]
+fn a_compressed_origin_response_keeps_the_header_that_names_its_coding() -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(ORIGIN_PLAYLIST.as_bytes())?;
+    let gzipped = encoder.finish()?;
+    let served = gzipped.clone();
+
+    let origin = Origin::start_with(move |_request: &Request, socket: &mut TcpStream| {
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\n\
+             Content-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            served.len()
+        );
+        let _ = socket.write_all(head.as_bytes());
+        let _ = socket.write_all(&served);
+        let _ = socket.flush();
+    })?;
+
+    let config_dir = tempfile::tempdir()?;
+    let cache_root = tempfile::tempdir()?;
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_root.path().join("cache")),
+        ..offline_config()
+    })?;
+    let target = format!("http://{}/live/master.m3u8", origin.addr);
+    let response = reqwest::blocking::Client::new()
+        .get(format!(
+            "http://{}/proxy/?d={}",
+            handle.http_addr(),
+            encode(&target)
+        ))
+        .header(reqwest::header::ACCEPT_ENCODING, "gzip, deflate, br")
+        .send()?;
+
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_ENCODING)
+            .and_then(|value| value.to_str().ok()),
+        Some("gzip"),
+        "the coding of the bytes we are handing on is named"
+    );
+    assert_eq!(
+        response.bytes()?.as_ref(),
+        gzipped.as_slice(),
+        "and the bytes are the origin's own, neither decoded nor rewritten"
+    );
+
+    assert_eq!(
+        origin.next_request().header("accept-encoding"),
+        Some("identity"),
+        "the player's gzip is not forwarded by a proxy that cannot decode it"
+    );
+
+    drop(handle);
+    Ok(())
+}
+
 /// The playlist an HLS origin serves, and what the proxy must hand the
 /// player instead: every line pointing back through the proxy, which makes
 /// the body *longer* than the one the origin sent. That length difference is

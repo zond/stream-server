@@ -246,7 +246,6 @@ async fn proxy(
     // player request describes a body that is not there.
     let allowed_req_headers = [
         "accept",
-        "accept-encoding",
         "accept-language",
         "range",
         "if-range",
@@ -258,6 +257,15 @@ async fn proxy(
             req_builder = req_builder.header(name, value);
         }
     }
+
+    // `accept-encoding` is answered here rather than forwarded. This client
+    // has no gzip/brotli/deflate feature, so it decodes nothing, and a
+    // playlist arrives as bytes we cannot rewrite -- while the player's own
+    // `accept-encoding: gzip` invited exactly that. Asking for `identity`
+    // says what we can actually take. An origin that compresses anyway is
+    // still relayed honestly: `content-encoding` travels back with the body
+    // it describes (see the relayed-body headers below).
+    req_builder = req_builder.header(header::ACCEPT_ENCODING, "identity");
 
     // Apply custom headers from query params (Core format)
     for (name, value) in custom_headers {
@@ -279,6 +287,26 @@ async fn proxy(
     let is_playlist = url.path().ends_with(".m3u8")
         || url.path().ends_with(".m3u")
         || content_type.contains("mpegurl");
+
+    // A body under a content coding we cannot decode is a body we must not
+    // rewrite: the lines are not text yet. We relay it whole instead --
+    // its segment URLs then point straight at the origin, which loses the
+    // `h=` request headers, so say so rather than serving the player a
+    // rewritten playlist made of compressed bytes.
+    let content_encoding = res_headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+    let encoded_body =
+        !content_encoding.is_empty() && !content_encoding.eq_ignore_ascii_case("identity");
+    let rewriting_playlist = is_playlist && !encoded_body;
+    if is_playlist && encoded_body {
+        tracing::warn!(
+            content_encoding = %content_encoding,
+            url = %url,
+            "relaying a compressed playlist unrewritten; its segments will bypass the proxy"
+        );
+    }
 
     let mut res_builder = Response::builder().status(status);
 
@@ -302,16 +330,20 @@ async fn proxy(
     // and `Last-Modified` go with it: they all describe the entity at the
     // origin, and a client that acted on them -- ranging into the rewritten
     // playlist, or caching it under the origin's tag -- would be acting on
-    // the wrong bytes. `connection` and `transfer-encoding` are relayed in
-    // neither branch: framing this response is hyper's job, not the origin's.
+    // the wrong bytes. `content-encoding` belongs to the same set and for
+    // the same reason -- it names the coding of *these* bytes, and dropping
+    // it (as this route used to) hands the player gzip labelled as identity.
+    // `connection` and `transfer-encoding` are relayed in neither branch:
+    // framing this response is hyper's job, not the origin's.
     let relayed_body_res_headers = [
         "accept-ranges",
+        "content-encoding",
         "content-length",
         "content-range",
         "last-modified",
         "etag",
     ];
-    if !is_playlist {
+    if !rewriting_playlist {
         for name in relayed_body_res_headers {
             if let Some(value) = res_headers.get(name) {
                 res_builder = res_builder.header(name, value);
@@ -329,7 +361,7 @@ async fn proxy(
         .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS")
         .header(header::ACCESS_CONTROL_ALLOW_HEADERS, "*");
 
-    if is_playlist {
+    if rewriting_playlist {
         // Every line of the playlist is rewritten to come back through this
         // proxy, so the whole body has to be in hand before any of it is
         // sent. A body we could not read is a playlist we cannot rewrite:
