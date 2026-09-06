@@ -310,6 +310,29 @@ async fn proxy(
         url.set_query(Some(&q));
     }
 
+    // A token that has been closed is not given another stream. ffmpeg
+    // reconnects through the URL it already has -- token and all -- so
+    // without this the close is a stutter rather than an end: measured,
+    // three closes on one live reader produced three fresh origin fetches
+    // at the offsets the closes interrupted. `410 Gone` because that is
+    // exactly what happened: this stream was here and was deliberately
+    // ended. A `404` would read as a target that never existed and send a
+    // client looking for a typo in its URL. The check comes before the
+    // fetch, so a refusal costs the origin nothing.
+    if let Some(token) = player_token.as_deref()
+        && state.proxy_streams.is_closed(token)
+    {
+        tracing::debug!(
+            token = %token,
+            "refusing a proxied read for a player token that was closed"
+        );
+        return (
+            StatusCode::GONE,
+            "This player's stream was closed by its client",
+        )
+            .into_response();
+    }
+
     // The host is fetched verified unless a previous request for it failed
     // on its certificate (see [`UNVERIFIED_HOSTS`]).
     let host = url.host_str().unwrap_or_default().to_string();
@@ -511,12 +534,14 @@ async fn proxy(
     finalize_response(res_builder, axum::body::Body::from_stream(stream))
 }
 
-/// Rewrites every URL in a playlist to come back through this proxy, and
-/// carries `player_token` into each one: a segment fetched by the same
-/// player is part of the same stream, and closing that player has to close
-/// the segment read that is actually in flight.
 /// `POST /proxy-streams/{token}/close`: end every proxied stream the client
 /// marked with `token`, and say how many that was.
+///
+/// It also retires the token, which is the half that makes it stick: the
+/// closed reads break, and any later `/proxy` request bearing the same `p=`
+/// is answered `410 Gone` instead of being given a fresh stream. Without
+/// that, ffmpeg's `reconnect=1` re-fetches through the URL it already has
+/// and playback carries on.
 ///
 /// A **control** route -- bearer token, loopback listener, and never on the
 /// LAN media listener, which serves no control route at all: the ability to
@@ -532,6 +557,10 @@ pub async fn close_proxy_streams(
     Json(serde_json::json!({ "closed": closed }))
 }
 
+/// Rewrites every URL in a playlist to come back through this proxy, and
+/// carries `player_token` into each one: a segment fetched by the same
+/// player is part of the same stream, and closing that player has to close
+/// the segment read that is actually in flight.
 fn rewrite_playlist(body: &str, base_url: &Url, player_token: Option<&str>) -> String {
     let token_param = player_token
         .map(|token| format!("&p={}", urlencoding::encode(token)))

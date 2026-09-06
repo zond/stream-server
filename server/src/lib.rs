@@ -421,13 +421,21 @@ impl ServerHandle {
     /// how many that was -- exactly what
     /// `POST /proxy-streams/{token}/close` does, through the same function.
     ///
-    /// The token is the client's own: it mints one per player, puts it in
-    /// the `/proxy` URL that player is given (`p=`), and closing it here
-    /// makes that player's read fail at once instead of waiting out
-    /// `network-timeout`, which is generous on purpose. Zero is an ordinary
-    /// answer -- the player may already have finished -- and closing twice
-    /// is harmless. See [`crate::proxy_streams`] for what this does not end:
-    /// a demuxer wedged on something other than the read.
+    /// The token is the client's own: it mints one per player and puts it in
+    /// the `/proxy` URL that player is given (`p=`). Closing it here makes
+    /// that player's read fail at once instead of waiting out
+    /// `network-timeout`, which is generous on purpose, **and retires the
+    /// token**: a later `/proxy` request carrying it is refused with `410
+    /// Gone` rather than given a fresh stream. Both halves are needed --
+    /// ffmpeg reconnects through the URL it already has, so the broken read
+    /// alone would only be a stutter.
+    ///
+    /// Ask the player to quit before calling this, not after: a cancelled
+    /// demuxer has already ended its own read, so the close finds nothing
+    /// live and answers 0, which is the outcome to want. Zero is an ordinary
+    /// answer anyway -- the player may already have finished -- and closing
+    /// twice is harmless. See [`crate::proxy_streams`] for what this does
+    /// not end: a demuxer wedged on something other than the read.
     pub fn close_proxy_streams(&self, token: &str) -> usize {
         self.state.proxy_streams.close(token)
     }

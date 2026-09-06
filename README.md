@@ -266,7 +266,7 @@ The HTTP surface is deliberately small and split in two by `build_router()` (`se
 | GET | `/downloads.json` | TOKEN | offline downloads — every pinned file |
 | GET | `/cache.json` | TOKEN | cache usage against `settings.cacheSize` — see [Cache usage and cleaning](#cache-usage-and-cleaning) |
 | POST | `/cache/clean` | TOKEN | run one eviction pass now and report what it freed — see [Cache usage and cleaning](#cache-usage-and-cleaning) |
-| POST | `/proxy-streams/{token}/close` | TOKEN | end every `/proxy` stream carrying the client's own `p=` token; answers `{"closed": n}` — see [Ending a proxied stream](#ending-a-proxied-stream) |
+| POST | `/proxy-streams/{token}/close` | TOKEN | end every `/proxy` stream carrying the client's own `p=` token, and retire the token; answers `{"closed": n}` — see [Ending a proxied stream](#ending-a-proxied-stream) |
 
 Unknown paths get `404`, a wrong method on a known path `405` (or `401` first, on a control route).
 
@@ -313,7 +313,7 @@ An embedder holds a `ServerHandle` (from `stream_server::start`) and never needs
 | `download_path(info_hash, file_idx: usize) -> Result<Option<String>>` | the `path` of that file's `downloads()` entry on its own — where to hand a finished download to a local player. Never creates an engine |
 | `cache_usage() -> Result<CacheUsage>` | `GET /cache.json` — what the cache occupies against its limit right now, without evicting anything. See [Cache usage and cleaning](#cache-usage-and-cleaning) |
 | `clean_cache_now() -> Result<EvictionReport>` | `POST /cache/clean` — run one eviction pass immediately and report what it freed, with the same protections as the scheduled sweep. See [Cache usage and cleaning](#cache-usage-and-cleaning) |
-| `close_proxy_streams(token: &str) -> usize` | `POST /proxy-streams/{token}/close` — end every proxied stream the client marked with `token`, and how many that was. See [Ending a proxied stream](#ending-a-proxied-stream) |
+| `close_proxy_streams(token: &str) -> usize` | `POST /proxy-streams/{token}/close` — end every proxied stream the client marked with `token`, retire the token, and answer how many streams that was. See [Ending a proxied stream](#ending-a-proxied-stream) |
 | `proxy_streams_live() -> usize` | how many proxied streams are being read right now, over all tokens — the number of players attached through `/proxy` |
 | `set_lan_media(enabled: bool) -> Result<Option<SocketAddr>>` | start/stop the [LAN media listener](#lan-media-listener); returns its bound address afterwards. Refused while the `lanMediaEnabled` setting is false or `ServerConfig::lan_media_addr` is unset |
 | `lan_media_addr() -> Option<SocketAddr>` / `lan_media_running() -> bool` | where that listener is bound right now, and whether it is running at all |
@@ -360,7 +360,11 @@ The token is the proxy's own parameter, like `d=`, `h=` and `r=`: it is never se
 
 Then `POST /proxy-streams/{token}/close` (`ServerHandle::close_proxy_streams`) ends every live stream carrying that token and answers `{"closed": n}`. Zero is an ordinary answer — the player may already have finished — and closing twice is harmless. It is a **control** route: bearer token, loopback listener, and absent from the LAN media listener like every other control route, because the ability to cut playback is not something to hand the network.
 
-**What it ends, and what it does not.** The closed stream's body yields an error, so the connection drops and the player's demuxer sees its source fail at once rather than at timeout. A demuxer wedged on something *other* than the read — a texture handoff, an audio device — is not waiting on this and is unaffected. A player that has stopped reading altogether is not polling the body either, so it observes the close when it next reads, or when it goes away.
+**What it ends is the read *and the token*.** The closed stream's body yields an error, so the connection drops and the player's demuxer sees its source fail at once rather than at timeout. On its own that would not end the stream: ffmpeg runs with `reconnect=1` and re-fetches the aborted body through the very same URL, token and all — measured, three closes on one live reader gave three `{"closed": 1}` answers and three fresh origin fetches at the offsets they interrupted. So the token is retired at the same time: every later `/proxy` request carrying it is answered **`410 Gone`** — gone, not `404`, because the stream was here and was deliberately ended. The pair is what ends a stream.
+
+**Close after the player has been told to quit, not before.** A demuxer that has been cancelled never reaches its reconnect — ffmpeg checks its interrupt callback before the retry delay, before every read and inside the socket poll — so the close arrives to find nothing live and answers `{"closed": 0}`, which is the outcome to want. Closing *first* races the cancel, and losing that race provokes exactly the reconnect the refusal then has to catch: one more origin connection on the way out. A client whose teardown is a quit followed by a close never needs the refusal; it is there for the case where the quit does not arrive, or does not work.
+
+**And what it does not end.** A demuxer wedged on something *other* than the read — a texture handoff, an audio device — is not waiting on this and is unaffected; a wedged player still costs its own teardown deadline. A player that has stopped reading altogether is not polling the body either, so it observes the close when it next reads, or when it goes away.
 
 `ServerHandle::proxy_streams_live()` is the same registry counted: how many players are attached through `/proxy` right now.
 

@@ -17,10 +17,27 @@
 //! a token is the count of players actually attached, which nothing outside
 //! this process could work out before.
 //!
-//! **What this ends, and what it does not.** Closing makes the *read*
-//! return: the body yields an error, hyper drops the connection, and the
-//! player's demuxer sees its source fail at once instead of at timeout. A
-//! demuxer wedged somewhere else -- on a texture handoff, on the audio
+//! **What this ends is the read *and the token*.** Closing makes the body
+//! yield an error, so hyper drops the connection and the player's demuxer
+//! sees its source fail at once instead of at timeout. On its own that is
+//! not the end of the stream: ffmpeg is started with `reconnect=1`, and a
+//! body that broke mid-file is re-fetched through the very same
+//! `/proxy/...&p=<token>` URL -- measured, three times over on one live
+//! reader, each close answering `{"closed":1}` and each answer followed by
+//! a fresh origin fetch at the offset the last one died at. So the token is
+//! struck off too: [`ProxyStreams::is_closed`] stays true for it, and
+//! `/proxy` refuses any later request bearing it. The pair is what ends a
+//! stream -- the read fails, and the retry has nowhere to go.
+//!
+//! **Ask the player to quit first, then close.** A cancelled demuxer never
+//! reaches the reconnect at all (ffmpeg checks its interrupt callback
+//! before the retry sleep, before every `url_read` and inside the socket
+//! poll), so the close then finds nothing left to close and answers
+//! `{"closed":0}` -- which is the quiet, correct outcome. Closing *first*
+//! races the cancel, and losing that race is a reconnect provoked on the
+//! way out: one more origin connection for a player that is leaving.
+//!
+//! A demuxer wedged somewhere else -- on a texture handoff, on the audio
 //! device -- is not waiting on this read and is untouched by it. And a
 //! player that has stopped reading entirely is not polling the body either,
 //! so the close is observed when it next reads, or when it goes away.
@@ -28,19 +45,35 @@
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures_util::{Stream, StreamExt};
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use tokio::sync::oneshot;
 
+/// How many closed tokens are remembered. A token names one player, and a
+/// client mints a new one for the next playback, so the only reader a
+/// forgotten token could let back in is a reconnect from a player that was
+/// closed several hundred playbacks ago -- and ffmpeg reconnects within
+/// seconds or not at all. The bound is here so a long-lived server's memory
+/// is a function of nothing.
+const CLOSED_TOKENS_REMEMBERED: usize = 512;
+
 /// Every proxied stream currently being read, keyed by an id of ours and
-/// tagged with the token the client minted for the player reading it.
+/// tagged with the token the client minted for the player reading it --
+/// plus the tokens that have been closed, which are refused a new one.
 #[derive(Default)]
 pub struct ProxyStreams {
     next_id: AtomicU64,
     live: DashMap<u64, LiveStream>,
+    /// The most recently closed tokens, oldest first. A `VecDeque` rather
+    /// than a set because the bound needs an order to evict by, and it is
+    /// scanned rather than hashed because it is at most
+    /// [`CLOSED_TOKENS_REMEMBERED`] short strings and the scan happens once
+    /// per proxied request, not once per byte.
+    closed: Mutex<VecDeque<String>>,
 }
 
 struct LiveStream {
@@ -92,7 +125,16 @@ impl ProxyStreams {
     /// Ends every live stream carrying `token`, and answers how many that
     /// was. Zero is a perfectly ordinary answer: the player may have
     /// finished, or never have started, and closing is idempotent.
+    ///
+    /// The token is struck off first and for good (see
+    /// [`ProxyStreams::is_closed`]), because the count this returns is the
+    /// count of reads that were *live*, and the reader that matters most is
+    /// the one that is about to come back: a player that reconnects after
+    /// its body broke must not be handed a new stream on a name its client
+    /// has finished with. Striking off before closing leaves no window in
+    /// which the reconnect arrives while the token is still good.
     pub fn close(&self, token: &str) -> usize {
+        self.remember_closed(token);
         let ids: Vec<u64> = self
             .live
             .iter()
@@ -115,6 +157,35 @@ impl ProxyStreams {
     /// How many proxied streams are being read right now, over all tokens.
     pub fn live(&self) -> usize {
         self.live.len()
+    }
+
+    /// Whether `token` has been closed, and so must not be given another
+    /// stream.
+    ///
+    /// This is what makes closing stick. ffmpeg's `reconnect=1` re-fetches
+    /// an aborted body through the URL it already has, token and all, so
+    /// without this the close is a stutter in the playback it was meant to
+    /// end. `/proxy` asks this before it opens anything, so a refused
+    /// request costs the origin nothing.
+    pub fn is_closed(&self, token: &str) -> bool {
+        self.closed
+            .lock()
+            .is_ok_and(|closed| closed.iter().any(|closed| closed == token))
+    }
+
+    /// Writes `token` down as closed, evicting the oldest once there are
+    /// more than [`CLOSED_TOKENS_REMEMBERED`] of them.
+    fn remember_closed(&self, token: &str) {
+        let Ok(mut closed) = self.closed.lock() else {
+            return;
+        };
+        if closed.iter().any(|closed| closed == token) {
+            return;
+        }
+        closed.push_back(token.to_string());
+        while closed.len() > CLOSED_TOKENS_REMEMBERED {
+            closed.pop_front();
+        }
     }
 }
 
@@ -172,5 +243,41 @@ impl Stream for ClosableStream {
             this.registration = None;
         }
         next
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Closing is what retires a token, and it stays retired: the reconnect
+    /// this exists to refuse arrives *after* the close, on a registry that
+    /// no longer has a live stream to count.
+    #[test]
+    fn a_closed_token_stays_closed_even_though_nothing_was_live() {
+        let streams = ProxyStreams::new();
+        assert!(!streams.is_closed("player-one"));
+        assert_eq!(streams.close("player-one"), 0);
+        assert!(streams.is_closed("player-one"));
+        assert!(!streams.is_closed("player-two"));
+        // Closing twice is harmless, and does not double the bookkeeping.
+        assert_eq!(streams.close("player-one"), 0);
+        assert!(streams.is_closed("player-one"));
+    }
+
+    /// The bound is a bound: the oldest token is forgotten rather than the
+    /// list growing for the life of the process.
+    #[test]
+    fn only_the_last_few_hundred_closed_tokens_are_remembered() {
+        let streams = ProxyStreams::new();
+        for n in 0..=CLOSED_TOKENS_REMEMBERED {
+            streams.close(&format!("player-{n}"));
+        }
+        assert!(
+            !streams.is_closed("player-0"),
+            "the oldest has been evicted"
+        );
+        assert!(streams.is_closed("player-1"));
+        assert!(streams.is_closed(&format!("player-{CLOSED_TOKENS_REMEMBERED}")));
     }
 }

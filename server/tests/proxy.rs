@@ -756,6 +756,78 @@ fn closing_one_player_token_ends_that_stream_and_leaves_the_other_playing() -> a
     Ok(())
 }
 
+/// The half that makes closing stick: the token is retired, so the
+/// reconnect ffmpeg makes through the URL it already has is refused rather
+/// than served.
+///
+/// Measured against the real thing before it was built: three closes on one
+/// live libmpv reader answered `{"closed":1}` three times, and each answer
+/// was followed by a fresh origin fetch at the offset the close had
+/// interrupted. A close that only breaks the read is a stutter.
+#[test]
+fn a_closed_token_is_refused_a_new_stream_and_the_origin_is_never_asked() -> anyhow::Result<()> {
+    use std::io::Read as _;
+
+    let fixture = fixture_with(endless_origin()?)?;
+    let origin = format!("http://{}", fixture.origin.addr);
+    let client = reqwest::blocking::Client::new();
+    let film = format!(
+        "{}/proxy/?d={}&p=player-one",
+        fixture.base,
+        encode(&format!("{origin}/film.mkv"))
+    );
+
+    let mut watching = client.get(&film).send()?;
+    let mut byte = [0u8; 1];
+    watching.read_exact(&mut byte)?;
+    assert_eq!(fixture.origin.next_request().line, "GET /film.mkv HTTP/1.1");
+
+    assert_eq!(fixture.handle.close_proxy_streams("player-one"), 1);
+    std::io::copy(&mut watching, &mut std::io::sink())
+        .expect_err("the closed stream breaks, as it always did");
+
+    // The reconnect: the same URL, the same token, and this time there is
+    // nothing behind it.
+    let refused = client.get(&film).send()?;
+    assert_eq!(
+        refused.status(),
+        reqwest::StatusCode::GONE,
+        "gone, not missing -- the stream was here and was ended on purpose"
+    );
+
+    // The Core path format carries the token in its own segment, and is
+    // refused on the same grounds.
+    let refused = client
+        .get(format!(
+            "{}/proxy/d={}&p=player-one/film.mkv",
+            fixture.base,
+            encode(&origin)
+        ))
+        .send()?;
+    assert_eq!(refused.status(), reqwest::StatusCode::GONE);
+
+    // Neither refusal reached the origin: the next thing it was asked for
+    // is the request made after them, under a token nobody closed -- which
+    // still works, because retiring one player's name retires only that
+    // player's.
+    let mut other = client
+        .get(format!(
+            "{}/proxy/?d={}&p=player-two",
+            fixture.base,
+            encode(&format!("{origin}/second.mkv"))
+        ))
+        .send()?;
+    other.read_exact(&mut byte)?;
+    assert_eq!(
+        fixture.origin.next_request().line,
+        "GET /second.mkv HTTP/1.1"
+    );
+    assert_eq!(fixture.handle.proxy_streams_live(), 1);
+
+    drop(fixture.handle);
+    Ok(())
+}
+
 /// The control route is a control route: no token, no close.
 #[test]
 fn closing_a_stream_needs_the_control_token() -> anyhow::Result<()> {
