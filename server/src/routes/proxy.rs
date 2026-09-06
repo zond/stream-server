@@ -137,7 +137,9 @@ fn covers_the_whole_entity(content_range: &str) -> bool {
     ) else {
         return false;
     };
-    first == 0 && total > 0 && last + 1 == total
+    // `total - 1` rather than `last + 1`, so an origin claiming the last
+    // byte is `u64::MAX` is a `false` and not an overflow panic.
+    first == 0 && total.checked_sub(1) == Some(last)
 }
 
 /// Whether a URL's path names a playlist by its extension.
@@ -416,7 +418,9 @@ impl ProxyParams {
     /// `200` and every segment `403`. `p=` because the segment read has to
     /// belong to the same player as the playlist that named it: closing an
     /// HLS player has to break the read that is actually in flight, and
-    /// that is a segment, never the playlist.
+    /// that is a segment, never the playlist. `p=` has no counterpart in
+    /// the reference at all -- it is this fork's, and a reader diffing
+    /// against `server.js` will not find it there.
     ///
     /// **`r=` is deliberately not here.** It is a response-header override
     /// for *the resource the caller named*, and the caller named a
@@ -1079,6 +1083,15 @@ fn rewrite_line<'a>(line: &'a str, base: &Url, carried: &str) -> Cow<'a, str> {
 /// as the origin wrote it, since there is nothing this proxy could fetch
 /// for it.
 fn proxied_uri(uri: &str, base: &Url, carried: &str) -> Option<String> {
+    // A blank URI names nothing. [`Url::join`] disagrees -- it strips the
+    // whitespace and hands back `base` itself -- so a line of spaces, or an
+    // `URI=""`, would otherwise be rewritten into a proxy URL for the
+    // playlist that contains it. (The reference's `URI="([^"]+)"` cannot
+    // match an empty one, and a blank line falls out of its URI branch
+    // untouched; this is the same answer for both.)
+    if uri.trim().is_empty() {
+        return None;
+    }
     let target = base.join(uri).ok()?;
     if !matches!(target.scheme(), "http" | "https") {
         return None;
@@ -1472,6 +1485,20 @@ mod tests {
                 "#EXT-X-KEY:METHOD=AES-128,IV=0xabc,URI=\"{}\"\n",
                 proxied("http://example.com/streams/0xabc")
             )
+        );
+    }
+
+    /// A blank line, and a tag attribute that names nothing. `Url::join`
+    /// strips the whitespace and hands back the base, so both used to be
+    /// rewritten into a proxy URL for the playlist itself -- a segment
+    /// list in which the playlist is one of its own segments.
+    #[test]
+    fn a_line_that_names_nothing_is_not_turned_into_the_playlist_s_own_url() {
+        assert_eq!(rewrite_playlist("   \n", &base(), ""), "   \n");
+        let empty_attribute = "#EXT-X-KEY:METHOD=NONE,URI=\"\"\n";
+        assert_eq!(
+            rewrite_playlist(empty_attribute, &base(), ""),
+            empty_attribute
         );
     }
 
