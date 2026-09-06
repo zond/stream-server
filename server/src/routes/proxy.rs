@@ -1,14 +1,14 @@
 use crate::state::AppState;
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header, response::Builder},
     response::{IntoResponse, Response},
     routing::any,
 };
 use dashmap::DashSet;
 use reqwest::{Client, Method};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::{LazyLock, OnceLock};
 use url::Url;
 
@@ -104,12 +104,12 @@ fn is_certificate_error(error: &reqwest::Error) -> bool {
 /// debug level rather than propagated.
 fn apply_custom_response_headers(
     mut builder: Builder,
-    custom_response_headers: HashMap<String, String>,
+    custom_response_headers: &BTreeMap<String, String>,
 ) -> Builder {
     for (name, value) in custom_response_headers {
         match (
             HeaderName::from_bytes(name.as_bytes()),
-            HeaderValue::from_str(&value),
+            HeaderValue::from_str(value),
         ) {
             (Ok(header_name), Ok(header_value)) => {
                 builder = builder.header(header_name, header_value);
@@ -139,6 +139,96 @@ fn finalize_response(builder: Builder, body: axum::body::Body) -> Response {
     }
 }
 
+/// The proxy's own parameters, in whichever URL shape carried them: the
+/// target (`d=`), the request headers to send with it (`h=`), the response
+/// headers to send back (`r=`), and the client's name for the player
+/// reading the stream (`p=`).
+///
+/// One parser for both shapes. The Core format spells them in the path
+/// segment before the target's path, the query format in the request's own
+/// query, and until this struct existed only the Core format could express
+/// `h=`/`r=` at all -- which meant [`rewrite_playlist`], which writes the
+/// query format, could not carry an authenticated playlist's headers into
+/// the segments it rewrote. Measured: the playlist fetched `200`, every
+/// segment `403`, the origin logging `auth=[]`.
+///
+/// `BTreeMap` rather than `HashMap` because the order the headers come back
+/// out in is written into every line of every rewritten playlist, and a
+/// body that differs between two identical requests is not something to
+/// hand a caching player.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ProxyParams {
+    /// The target URL, as `d=` spelled it. In the Core format this is the
+    /// origin, and the request path is appended to it.
+    target: String,
+    /// `h=Name:Value` -- sent to the origin, replacing whatever we would
+    /// otherwise have forwarded under that name.
+    request_headers: BTreeMap<String, String>,
+    /// `r=Name:Value` -- sent back to the player, replacing whatever the
+    /// origin said under that name.
+    response_headers: BTreeMap<String, String>,
+    /// `p=<token>` -- never sent to the origin. See [`crate::proxy_streams`].
+    player_token: Option<String>,
+}
+
+impl ProxyParams {
+    /// Reads the four parameters out of one `application/x-www-form-
+    /// urlencoded` string, whether it came off the path segment or the
+    /// query. Anything else in it belongs to the target and is ignored
+    /// here.
+    fn parse(query: &str) -> Self {
+        let mut params = Self::default();
+        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            match key.as_ref() {
+                "d" => params.target = value.into_owned(),
+                // Header format "Name:Value", for the request and the
+                // response respectively.
+                "h" => {
+                    if let Some((name, value)) = value.split_once(':') {
+                        params
+                            .request_headers
+                            .insert(name.trim().to_string(), value.trim().to_string());
+                    }
+                }
+                "r" => {
+                    if let Some((name, value)) = value.split_once(':') {
+                        params
+                            .response_headers
+                            .insert(name.trim().to_string(), value.trim().to_string());
+                    }
+                }
+                "p" if !value.is_empty() => params.player_token = Some(value.into_owned()),
+                _ => {}
+            }
+        }
+        params
+    }
+
+    /// Everything but the target, spelled as query parameters, ready to be
+    /// appended to a `/proxy/?d=<url>` a rewrite is writing.
+    ///
+    /// This is what a rewritten playlist line has to carry: a segment of an
+    /// authenticated stream needs the same `h=` the playlist needed, a
+    /// player told to read a corrected `Content-Type` needs it corrected on
+    /// the segments too, and the segment read has to belong to the same
+    /// player as the playlist that named it.
+    fn carried(&self) -> String {
+        let mut carried = String::new();
+        for (key, headers) in [("h", &self.request_headers), ("r", &self.response_headers)] {
+            for (name, value) in headers {
+                carried.push_str(&format!(
+                    "&{key}={}",
+                    urlencoding::encode(&format!("{name}:{value}"))
+                ));
+            }
+        }
+        if let Some(token) = &self.player_token {
+            carried.push_str(&format!("&p={}", urlencoding::encode(token)));
+        }
+        carried
+    }
+}
+
 /// Every shape `/proxy` answers, at absolute paths and merged rather than
 /// nested under the prefix.
 ///
@@ -161,17 +251,19 @@ pub fn router() -> Router<AppState> {
 
 /// `/proxy/?d=<url>`: the whole target in the query, nothing in the path.
 ///
-/// The one format the wildcard above cannot express. It carries no `h=`/`r=`
-/// pairs (those live in the path segment of the Core format), so everything
-/// it needs is the `d=` the shared handler reads out of `params`.
+/// The one format the wildcard above cannot express, and the one this
+/// server writes itself -- [`rewrite_playlist`] turns every line of every
+/// playlist into it. Its query carries the same proxy parameters the Core
+/// format carries in its path segment (`d=`, `h=`, `r=`, `p=`), read by
+/// the same parser, because a rewritten segment URL has to be able to say
+/// everything the playlist's own URL said.
 pub async fn proxy_root_handler(
     State(state): State<AppState>,
     raw_query: axum::extract::RawQuery,
-    params: Query<HashMap<String, String>>,
     headers: HeaderMap,
     method: Method,
 ) -> impl IntoResponse {
-    proxy(state, None, raw_query.0, params.0, headers, method).await
+    proxy(state, None, raw_query.0, headers, method).await
 }
 
 /// The Core path format, read from the URI rather than from the router's
@@ -192,7 +284,6 @@ pub async fn proxy_handler(
     State(state): State<AppState>,
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
-    Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
     method: Method,
 ) -> impl IntoResponse {
@@ -200,15 +291,7 @@ pub async fn proxy_handler(
     // always there; an empty rest could only come of a router change, and it
     // answers 400 the way any unparseable target does.
     let rest = uri.path().strip_prefix("/proxy/").unwrap_or_default();
-    proxy(
-        state,
-        Some(rest.to_string()),
-        raw_query,
-        params,
-        headers,
-        method,
-    )
-    .await
+    proxy(state, Some(rest.to_string()), raw_query, headers, method).await
 }
 
 /// `rest` is what the path held after `/proxy/`, and *that is what decides
@@ -227,7 +310,6 @@ async fn proxy(
     state: AppState,
     rest: Option<String>,
     raw_query: Option<String>,
-    params: HashMap<String, String>,
     headers: HeaderMap,
     method: Method,
 ) -> Response {
@@ -235,73 +317,38 @@ async fn proxy(
     // Format 1: ?d=URL (standard)
     // Format 2: /<query_params>/<path> (Core) where query_params contains d=ORIGIN&h=HEADER&r=RESPONSE_HEADER
 
-    let mut target_url = String::new();
-    let mut custom_headers = HashMap::new();
-    let mut custom_response_headers = HashMap::new();
-    // The client's name for the player this stream is for, if it minted one
-    // (`p=`). It is ours, not the target's: it never travels to the origin,
-    // and it is what `POST /proxy-streams/{token}/close` addresses. See
-    // [`crate::proxy_streams`].
-    let mut player_token = None;
     let is_path_format = rest.is_some();
-
-    match rest {
-        None => {
-            if let Some(d) = params.get("d") {
-                target_url = d.clone();
-            }
-            player_token = params.get("p").filter(|t| !t.is_empty()).cloned();
-        }
+    let params = match &rest {
+        None => ProxyParams::parse(raw_query.as_deref().unwrap_or_default()),
         Some(rest) => {
-            // Handle path-based format: /proxy/d=...&h=.../path/to/file
-            // Split rest by first slash to get query_segment and path
+            // The Core path format: /proxy/d=...&h=.../path/to/file. The
+            // segment before the first slash is the proxy's own parameters,
+            // everything after it is the target's path.
             let (query_seg, path_seg) = match rest.split_once('/') {
                 Some((q, p)) => (q, p),
                 None => (rest.as_str(), ""),
             };
-
-            // Parse the query segment
-            for (key, val) in url::form_urlencoded::parse(query_seg.as_bytes()) {
-                match key.as_ref() {
-                    "d" => target_url = val.into_owned(),
-                    "h" => {
-                        // Header format "Name:Value"
-                        if let Some((name, value)) = val.split_once(':') {
-                            custom_headers
-                                .insert(name.trim().to_string(), value.trim().to_string());
-                        }
-                    }
-                    "r" => {
-                        // Response header format "Name:Value"
-                        if let Some((name, value)) = val.split_once(':') {
-                            custom_response_headers
-                                .insert(name.trim().to_string(), value.trim().to_string());
-                        }
-                    }
-                    "p" if !val.is_empty() => player_token = Some(val.into_owned()),
-                    _ => {}
-                }
-            }
-
-            // If we found 'd', construct the full URL
-            if !target_url.is_empty() {
-                // target_url is the origin (e.g. http://example.com)
-                // path_seg is the relative path (e.g. video.mp4)
-                // Join them carefully
-                if !path_seg.is_empty() {
-                    if !target_url.ends_with('/') {
-                        target_url.push('/');
-                    }
-                    target_url.push_str(path_seg);
-                }
-            } else {
+            let mut params = ProxyParams::parse(query_seg);
+            if params.target.is_empty() {
                 // Fallback: assume whole rest is the URL (legacy/simple proxy)
-                target_url = rest;
+                params.target = rest.clone();
+            } else if !path_seg.is_empty() {
+                // `d=` is the origin, the rest of the path is the file on it.
+                if !params.target.ends_with('/') {
+                    params.target.push('/');
+                }
+                params.target.push_str(path_seg);
             }
+            params
         }
-    }
+    };
+    // The client's name for the player this stream is for, if it minted one
+    // (`p=`). It is ours, not the target's: it never travels to the origin,
+    // and it is what `POST /proxy-streams/{token}/close` addresses. See
+    // [`crate::proxy_streams`].
+    let player_token = params.player_token.clone();
 
-    let mut url = match Url::parse(&target_url) {
+    let mut url = match Url::parse(&params.target) {
         Ok(u) => u,
         Err(_) => return (StatusCode::BAD_REQUEST, "Invalid target URL").into_response(),
     };
@@ -384,8 +431,8 @@ async fn proxy(
         // headers below).
         req_builder = req_builder.header(header::ACCEPT_ENCODING, "identity");
 
-        // Apply custom headers from query params (Core format)
-        for (name, value) in &custom_headers {
+        // Apply custom headers from query params (`h=`)
+        for (name, value) in &params.request_headers {
             req_builder = req_builder.header(name, value);
         }
         req_builder
@@ -496,7 +543,7 @@ async fn proxy(
 
     // Apply custom response headers (Core format), validated so a malformed
     // r= param can never poison the response builder.
-    res_builder = apply_custom_response_headers(res_builder, custom_response_headers);
+    res_builder = apply_custom_response_headers(res_builder, &params.response_headers);
 
     // CORS headers
     res_builder = res_builder
@@ -520,7 +567,7 @@ async fn proxy(
                     .into_response();
             }
         };
-        let rewritten = rewrite_playlist(&body, &url, player_token.as_deref());
+        let rewritten = rewrite_playlist(&body, &url, &params.carried());
         // The framing of the body we built, measured on that body.
         res_builder = res_builder.header(header::CONTENT_LENGTH, rewritten.len().to_string());
         return finalize_response(res_builder, axum::body::Body::from(rewritten));
@@ -557,14 +604,16 @@ pub async fn close_proxy_streams(
     Json(serde_json::json!({ "closed": closed }))
 }
 
-/// Rewrites every URL in a playlist to come back through this proxy, and
-/// carries `player_token` into each one: a segment fetched by the same
-/// player is part of the same stream, and closing that player has to close
-/// the segment read that is actually in flight.
-fn rewrite_playlist(body: &str, base_url: &Url, player_token: Option<&str>) -> String {
-    let token_param = player_token
-        .map(|token| format!("&p={}", urlencoding::encode(token)))
-        .unwrap_or_default();
+/// Rewrites every URL in a playlist to come back through this proxy,
+/// carrying `carried` -- [`ProxyParams::carried`], the `h=`/`r=`/`p=` the
+/// playlist's own URL arrived with -- into each one.
+///
+/// All of them, because a segment is not a different stream: it needs the
+/// same request headers to be allowed at the origin, the same response
+/// headers to be read correctly by the player, and the same player token,
+/// since closing an HLS player has to close the segment read that is
+/// actually in flight rather than the playlist read that is not.
+fn rewrite_playlist(body: &str, base_url: &Url, carried: &str) -> String {
     let mut rewritten = String::new();
     for line in body.lines() {
         if line.is_empty() {
@@ -585,10 +634,8 @@ fn rewrite_playlist(body: &str, base_url: &Url, player_token: Option<&str>) -> S
                             .map(|u: Url| u.to_string())
                             .unwrap_or_else(|_| uri.to_string())
                     };
-                    let proxy_uri = format!(
-                        "/proxy/?d={}{token_param}",
-                        urlencoding::encode(&absolute_uri)
-                    );
+                    let proxy_uri =
+                        format!("/proxy/?d={}{carried}", urlencoding::encode(&absolute_uri));
                     rewritten.push_str(&line[..start + 5]);
                     rewritten.push_str(&proxy_uri);
                     rewritten.push_str(&rest[end..]);
@@ -608,10 +655,7 @@ fn rewrite_playlist(body: &str, base_url: &Url, player_token: Option<&str>) -> S
                     .map(|u: Url| u.to_string())
                     .unwrap_or_else(|_| line.to_string())
             };
-            let proxy_uri = format!(
-                "/proxy/?d={}{token_param}",
-                urlencoding::encode(&absolute_uri)
-            );
+            let proxy_uri = format!("/proxy/?d={}{carried}", urlencoding::encode(&absolute_uri));
             rewritten.push_str(&proxy_uri);
             rewritten.push('\n');
         }
@@ -634,7 +678,7 @@ mod tests {
     #[test]
     fn relative_segment_is_joined_against_base_and_wrapped() {
         let body = "seg-0.ts\n";
-        let rewritten = rewrite_playlist(body, &base(), None);
+        let rewritten = rewrite_playlist(body, &base(), "");
         assert_eq!(
             rewritten,
             format!("{}\n", proxied("http://example.com/streams/seg-0.ts"))
@@ -644,7 +688,7 @@ mod tests {
     #[test]
     fn absolute_http_line_is_wrapped_without_double_joining() {
         let body = "http://cdn.example.org/other/seg-0.ts\n";
-        let rewritten = rewrite_playlist(body, &base(), None);
+        let rewritten = rewrite_playlist(body, &base(), "");
         assert_eq!(
             rewritten,
             format!("{}\n", proxied("http://cdn.example.org/other/seg-0.ts"))
@@ -654,7 +698,7 @@ mod tests {
     #[test]
     fn absolute_https_line_is_wrapped_without_double_joining() {
         let body = "https://cdn.example.org/other/seg-0.ts\n";
-        let rewritten = rewrite_playlist(body, &base(), None);
+        let rewritten = rewrite_playlist(body, &base(), "");
         assert_eq!(
             rewritten,
             format!("{}\n", proxied("https://cdn.example.org/other/seg-0.ts"))
@@ -667,7 +711,7 @@ mod tests {
             "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"English\",",
             "URI=\"audio/en.m3u8\",DEFAULT=YES,AUTOSELECT=YES\n"
         );
-        let rewritten = rewrite_playlist(body, &base(), None);
+        let rewritten = rewrite_playlist(body, &base(), "");
         let expected = format!(
             concat!(
                 "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"English\",",
@@ -684,7 +728,7 @@ mod tests {
             "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"English\",",
             "URI=\"https://cdn.example.org/audio/en.m3u8\"\n"
         );
-        let rewritten = rewrite_playlist(body, &base(), None);
+        let rewritten = rewrite_playlist(body, &base(), "");
         let expected = format!(
             "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"English\",URI=\"{}\"\n",
             proxied("https://cdn.example.org/audio/en.m3u8")
@@ -699,7 +743,7 @@ mod tests {
     #[test]
     fn ext_x_key_uri_is_proxied_like_other_uri_attributes() {
         let body = "#EXT-X-KEY:METHOD=AES-128,URI=\"key/enc.key\",IV=0x0123456789abcdef\n";
-        let rewritten = rewrite_playlist(body, &base(), None);
+        let rewritten = rewrite_playlist(body, &base(), "");
         let expected = format!(
             "#EXT-X-KEY:METHOD=AES-128,URI=\"{}\",IV=0x0123456789abcdef\n",
             proxied("http://example.com/streams/key/enc.key")
@@ -710,7 +754,7 @@ mod tests {
     #[test]
     fn root_relative_path_resolves_against_origin() {
         let body = "/videos/seg-0.ts\n";
-        let rewritten = rewrite_playlist(body, &base(), None);
+        let rewritten = rewrite_playlist(body, &base(), "");
         assert_eq!(
             rewritten,
             format!("{}\n", proxied("http://example.com/videos/seg-0.ts"))
@@ -724,7 +768,8 @@ mod tests {
     #[test]
     fn the_player_token_is_carried_into_every_rewritten_line() {
         let body = "#EXT-X-KEY:METHOD=AES-128,URI=\"key/enc.key\"\nseg-0.ts\n";
-        let rewritten = rewrite_playlist(body, &base(), Some("player one"));
+        let params = ProxyParams::parse("d=whatever&p=player+one");
+        let rewritten = rewrite_playlist(body, &base(), &params.carried());
         let expected = format!(
             "#EXT-X-KEY:METHOD=AES-128,URI=\"{}&p=player%20one\"\n{}&p=player%20one\n",
             proxied("http://example.com/streams/key/enc.key"),
@@ -733,16 +778,77 @@ mod tests {
         assert_eq!(rewritten, expected);
     }
 
+    /// Both URL shapes carry the same four parameters, and one parser reads
+    /// them: the Core format spells them in its path segment, the query
+    /// format -- the one the rewrite writes -- in the query.
+    #[test]
+    fn both_url_shapes_are_read_by_the_same_parser() {
+        let expected = ProxyParams {
+            target: "http://example.com/film.mkv".to_string(),
+            request_headers: BTreeMap::from([(
+                "Authorization".to_string(),
+                "Bearer x:y".to_string(),
+            )]),
+            response_headers: BTreeMap::from([(
+                "Content-Type".to_string(),
+                "video/mp4".to_string(),
+            )]),
+            player_token: Some("player one".to_string()),
+        };
+        let query = "d=http%3A%2F%2Fexample.com%2Ffilm.mkv\
+                     &h=Authorization%3ABearer%20x%3Ay\
+                     &r=Content-Type%3Avideo%2Fmp4\
+                     &p=player%20one";
+        assert_eq!(ProxyParams::parse(query), expected);
+        // A header value's own colons belong to the value, and a `%`-encoded
+        // separator is decoded exactly once.
+        assert_eq!(
+            expected
+                .request_headers
+                .get("Authorization")
+                .map(String::as_str),
+            Some("Bearer x:y")
+        );
+    }
+
+    /// The whole point of [`ProxyParams::carried`]: a segment fetched
+    /// through a rewritten line is asked for with the headers the
+    /// playlist's own URL carried. Without this an authenticated HLS stream
+    /// served its playlist and 403ed every segment.
+    #[test]
+    fn the_headers_are_carried_into_every_rewritten_line_too() {
+        let params = ProxyParams::parse(
+            "d=whatever&h=Authorization%3ABearer+abc&r=Content-Type%3Avideo%2Fmp4&p=one",
+        );
+        let rewritten = rewrite_playlist("seg-0.ts\n", &base(), &params.carried());
+        assert_eq!(
+            rewritten,
+            format!(
+                "{}&h=Authorization%3ABearer%20abc&r=Content-Type%3Avideo%2Fmp4&p=one\n",
+                proxied("http://example.com/streams/seg-0.ts")
+            )
+        );
+    }
+
+    /// Several of each, and the order is the same every time: the rewritten
+    /// playlist is a body a player may cache and re-fetch, and two spellings
+    /// of the same playlist would be two.
+    #[test]
+    fn carried_parameters_come_out_in_a_stable_order() {
+        let params = ProxyParams::parse("d=whatever&h=B%3A2&h=A%3A1&r=Y%3Ayes&r=X%3Ano&p=t");
+        assert_eq!(params.carried(), "&h=A%3A1&h=B%3A2&r=X%3Ano&r=Y%3Ayes&p=t");
+    }
+
     #[test]
     fn comment_and_blank_lines_are_left_unchanged() {
         let body = "#EXTM3U\n#EXT-X-VERSION:3\n\n#EXT-X-TARGETDURATION:10\n";
-        let rewritten = rewrite_playlist(body, &base(), None);
+        let rewritten = rewrite_playlist(body, &base(), "");
         assert_eq!(rewritten, body);
     }
 
     #[test]
     fn apply_custom_response_headers_skips_invalid_name_and_value() {
-        let mut headers = HashMap::new();
+        let mut headers = BTreeMap::new();
         // Valid pair: should be applied.
         headers.insert("X-Proxy-Ok".to_string(), "yes".to_string());
         // Invalid value: embedded CR/LF must never reach the header map.
@@ -753,7 +859,7 @@ mod tests {
         // Invalid name: space is not a legal header-name character.
         headers.insert("Bad Name".to_string(), "value".to_string());
 
-        let builder = apply_custom_response_headers(Response::builder().status(200), headers);
+        let builder = apply_custom_response_headers(Response::builder().status(200), &headers);
         let response = builder.body(axum::body::Body::empty()).unwrap();
 
         assert_eq!(response.headers().get("x-proxy-ok").unwrap(), "yes");
@@ -768,11 +874,13 @@ mod tests {
         // newline. Feeding this straight into a response builder (the old
         // `.header(name, value)` + `.unwrap()` code path) would poison the
         // builder and panic at `.body()`. The validated path must not.
-        let mut custom_response_headers = HashMap::new();
+        let mut custom_response_headers = BTreeMap::new();
         custom_response_headers.insert("X-Evil".to_string(), "bad\r\nInjected: true".to_string());
 
-        let builder =
-            apply_custom_response_headers(Response::builder().status(200), custom_response_headers);
+        let builder = apply_custom_response_headers(
+            Response::builder().status(200),
+            &custom_response_headers,
+        );
         let response = finalize_response(builder, axum::body::Body::empty());
 
         // No panic occurred (we got here), and the handler degrades to a

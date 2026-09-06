@@ -655,6 +655,92 @@ fn a_playlist_from_a_close_delimited_origin_is_framed_by_its_rewritten_length() 
     assert_playlist_is_reframed(Framing::CloseDelimited)
 }
 
+/// An authenticated HLS stream, end to end: the playlist and every segment
+/// need the same `Authorization` the addon put in `h=`, and only the
+/// playlist's own URL was carrying it.
+///
+/// `rewrite_playlist` used to write `d=` and `p=` and nothing else, so the
+/// segments came back through the proxy stripped of the header that made
+/// them fetchable. Measured before the fix: playlist `200`, every segment
+/// `403`, the origin logging `auth=[]`.
+#[test]
+fn an_authenticated_playlist_carries_its_headers_into_every_segment() -> anyhow::Result<()> {
+    const SECRET: &str = "Bearer s3cret";
+
+    let origin = Origin::start_with(|request: &Request, socket: &mut TcpStream| {
+        if request.header("authorization") != Some(SECRET) {
+            let _ = socket.write_all(
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+            return;
+        }
+        let (content_type, body) = if request.target().ends_with(".m3u8") {
+            ("application/vnd.apple.mpegurl", ORIGIN_PLAYLIST.to_string())
+        } else {
+            ("video/mp2t", "segment bytes".to_string())
+        };
+        let _ = socket.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        let _ = socket.write_all(body.as_bytes());
+        let _ = socket.flush();
+    })?;
+
+    let fixture = fixture_with(origin)?;
+    let client = reqwest::blocking::Client::new();
+    // The Core path format, which is what stremio-core writes for an addon
+    // stream that needs a header.
+    let playlist = client
+        .get(format!(
+            "{}/proxy/d={}&h={}/live/master.m3u8",
+            fixture.base,
+            encode(&format!("http://{}", fixture.origin.addr)),
+            encode(&format!("Authorization:{SECRET}"))
+        ))
+        .send()?;
+    assert_eq!(playlist.status(), reqwest::StatusCode::OK);
+    let body = playlist.text()?;
+    assert_eq!(
+        fixture.origin.next_request().header("authorization"),
+        Some(SECRET),
+        "the playlist itself was fetched with the header"
+    );
+
+    // Every rewritten line carries it too, so the player can fetch what the
+    // playlist names.
+    let segment = body
+        .lines()
+        .find(|line| !line.starts_with('#') && !line.is_empty())
+        .expect("the rewritten playlist names a segment");
+    assert!(
+        segment.contains(&format!(
+            "&h={}",
+            encode(&format!("Authorization:{SECRET}"))
+        )),
+        "the segment URL carries the header the playlist arrived with: {segment}"
+    );
+
+    let fetched = client.get(format!("{}{segment}", fixture.base)).send()?;
+    assert_eq!(
+        fetched.status(),
+        reqwest::StatusCode::OK,
+        "and fetching it through the proxy is allowed at the origin"
+    );
+    assert_eq!(fetched.text()?, "segment bytes");
+    assert_eq!(
+        fixture.origin.next_request().header("authorization"),
+        Some(SECRET)
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
 /// An origin that never stops sending: a long film, a live stream, the
 /// swarm that `network-timeout` is generous for. Closing has to be visible
 /// against *this*, not against a body that was about to end anyway.
