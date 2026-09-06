@@ -50,6 +50,18 @@ static INSECURE_HTTP_CLIENT: OnceLock<Option<Client>> = OnceLock::new();
 /// us which hosts to scope it to, and this can.
 static UNVERIFIED_HOSTS: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
 
+/// Every host this process has downgraded, for a test to assert against.
+///
+/// [`UNVERIFIED_HOSTS`] is the only record that a downgrade happened at
+/// all: over plain HTTP the unverified client behaves identically to the
+/// verified one, so marking the wrong host is invisible from outside --
+/// which is how a plain-HTTP host came to be marked at all. Exported
+/// doc-hidden so the test that pins it can see what was written down.
+#[doc(hidden)]
+pub fn unverified_hosts() -> Vec<String> {
+    UNVERIFIED_HOSTS.iter().map(|host| host.clone()).collect()
+}
+
 fn http_client() -> Option<&'static Client> {
     HTTP_CLIENT
         .get_or_init(|| {
@@ -73,26 +85,60 @@ fn insecure_http_client() -> Option<&'static Client> {
         .as_ref()
 }
 
-/// Whether a failed fetch failed *because of the certificate*, which is the
-/// only failure the unverified retry can help with -- a refused connection
-/// or a DNS miss must stay an error.
+/// Whether a failed fetch failed *because the peer's certificate would not
+/// verify*, which is the only failure the unverified retry can help with --
+/// a refused connection or a DNS miss must stay an error.
 ///
-/// reqwest exposes no typed predicate for this, and the rustls error that
-/// carries the detail is several `source()`s down (`invalid peer
-/// certificate: UnknownIssuer`), so the chain is walked and read. A false
-/// positive costs one extra request that fails the same way; a false
-/// negative costs a stream that a retry would have played.
-fn is_certificate_error(error: &reqwest::Error) -> bool {
-    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
-    while let Some(error) = source {
-        if error
-            .to_string()
-            .to_ascii_lowercase()
-            .contains("certificate")
-        {
+/// **Matched by type, never by prose.** This used to be a case-insensitive
+/// search for the word "certificate" over every `Display` in the chain, and
+/// reqwest writes the request URL into that text: measured with no TLS
+/// anywhere in the picture, one request for
+/// `http://127.0.0.1:1/certificate-of-authenticity.mkv` -- a refused
+/// connection -- put `127.0.0.1` into [`UNVERIFIED_HOSTS`] for the life of
+/// the process. A filename could turn certificate verification off.
+///
+/// The error that actually says so is a
+/// `rustls::Error::InvalidCertificate`, which covers every reason a chain
+/// can be rejected (unknown issuer, expired, not valid for the name) and is
+/// exactly the set `danger_accept_invalid_certs` waives. Measured, it sits
+/// under reqwest's connect error inside **two** nested `io::Error`s -- and
+/// `source()` alone walks straight past it, because `io::Error::source`
+/// delegates to the inner error's source instead of yielding the inner
+/// error itself. So every node is asked for its `get_ref` as well as its
+/// `source`.
+///
+/// The rustls type comes from `tokio_rustls`, which re-exports the same
+/// `rustls` reqwest links (one entry in the lockfile, and the whole
+/// workspace is on one TLS backend on purpose). If that ever stopped being
+/// true the downcast would simply stop matching, and the failure would be
+/// a stream that is not retried rather than a host quietly downgraded.
+fn is_certificate_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    use tokio_rustls::rustls;
+
+    // Both links out of each node are followed, and the walk is bounded
+    // rather than trusting an error chain not to loop.
+    let mut pending: Vec<&(dyn std::error::Error + 'static)> = vec![error];
+    let mut visited = 0;
+    while let Some(error) = pending.pop() {
+        visited += 1;
+        if visited > 32 {
+            break;
+        }
+        if matches!(
+            error.downcast_ref::<rustls::Error>(),
+            Some(rustls::Error::InvalidCertificate(_))
+        ) {
             return true;
         }
-        source = error.source();
+        if let Some(inner) = error
+            .downcast_ref::<std::io::Error>()
+            .and_then(|error| error.get_ref())
+        {
+            pending.push(inner);
+        }
+        if let Some(source) = error.source() {
+            pending.push(source);
+        }
     }
     false
 }
@@ -484,6 +530,30 @@ async fn proxy(
     let response = match build_request(client).send().await {
         Ok(resp) => resp,
         Err(e) if !known_unverified && is_certificate_error(&e) => {
+            // Only a host we asked for over `https` is a host we can name.
+            // reqwest attributes a connect failure to the URL the request
+            // *started* at -- measured through a plain-HTTP redirect to a
+            // self-signed origin, where the error still named the http URL
+            // -- so when we did not ask for https ourselves, the
+            // certificate that failed belongs to some redirect target we
+            // cannot identify from here. A host we cannot identify is not
+            // one to write down: this used to mark the redirecting
+            // plain-HTTP host unverified, which downgrades a host whose
+            // certificate was never even looked at, and leaves the one that
+            // actually failed unmarked. Better to fail the fetch and say
+            // why. (A chain that starts at https and redirects to another
+            // https host has the same blind spot in miniature: the host
+            // named is the first, which is the failing one unless the
+            // redirect intervened.)
+            if url.scheme() != "https" {
+                tracing::warn!(
+                    url = %url,
+                    error = %e,
+                    "a certificate failed verification behind a redirect; not retrying, \
+                     because the host it belongs to cannot be named from here"
+                );
+                return (StatusCode::BAD_GATEWAY, format!("Proxy error: {}", e)).into_response();
+            }
             // One retry, for this host only, and say so once per process.
             tracing::warn!(
                 host = %host,
@@ -999,21 +1069,57 @@ mod tests {
     /// The retry is for a certificate and nothing else: a refused connection
     /// or a DNS miss must not be retried unverified, because verification is
     /// not what stopped it.
+    ///
+    /// The second URL is the measured reproduction of what reading the
+    /// chain's prose cost. There is no TLS anywhere here -- plain HTTP to a
+    /// port nothing listens on -- and the old substring search found the
+    /// word "certificate" in reqwest's own "error sending request for url
+    /// (...)", so the *filename* marked `127.0.0.1` unverified for the life
+    /// of the process.
     #[test]
     fn only_a_certificate_failure_is_read_as_one() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        // Nothing listens on this port, so the failure is a refused
-        // connection with no certificate anywhere in its chain.
-        let refused = rt.block_on(async {
-            reqwest::Client::new()
-                .get("http://127.0.0.1:1/")
-                .send()
-                .await
-                .expect_err("nothing is listening there")
-        });
-        assert!(!is_certificate_error(&refused));
+        let refused = |url: &'static str| {
+            rt.block_on(async move {
+                reqwest::Client::new()
+                    .get(url)
+                    .send()
+                    .await
+                    .expect_err("nothing is listening there")
+            })
+        };
+        assert!(!is_certificate_error(&refused("http://127.0.0.1:1/")));
+        assert!(!is_certificate_error(&refused(
+            "http://127.0.0.1:1/certificate-of-authenticity.mkv"
+        )));
+    }
+
+    /// The shape the real failure arrives in, measured against a self-signed
+    /// origin: reqwest's connect error, an `io::Error`, a second
+    /// `io::Error`, and only then the rustls one. `source()` alone stops at
+    /// the first of the two, because `io::Error::source` yields the inner
+    /// error's source rather than the inner error.
+    #[test]
+    fn a_rustls_failure_is_found_through_the_nested_io_errors_it_arrives_in() {
+        use tokio_rustls::rustls;
+
+        let rustls_error =
+            rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer);
+        let nested = std::io::Error::other(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            rustls_error,
+        ));
+        assert!(is_certificate_error(&nested));
+
+        // A TLS failure that verification would not have prevented is not
+        // one to waive it for.
+        let unrelated = std::io::Error::other(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            rustls::Error::DecryptError,
+        ));
+        assert!(!is_certificate_error(&unrelated));
     }
 }

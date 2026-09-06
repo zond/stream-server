@@ -748,6 +748,156 @@ fn an_authenticated_playlist_carries_its_headers_into_every_segment() -> anyhow:
     Ok(())
 }
 
+/// A TLS origin with a certificate nothing will verify: self-signed, and a
+/// CA certificate used as an end entity at that, so rustls rejects it
+/// whatever the hostname. The PEMs beside this file are throwaways for
+/// exactly this listener, which binds loopback and serves one string.
+struct TlsOrigin {
+    addr: SocketAddr,
+    _certificates: tempfile::TempDir,
+}
+
+impl TlsOrigin {
+    fn start() -> anyhow::Result<Self> {
+        let certificates = tempfile::tempdir()?;
+        let cert = certificates.path().join("cert.pem");
+        let key = certificates.path().join("key.pem");
+        std::fs::write(&cert, include_str!("selfsigned-cert.pem"))?;
+        std::fs::write(&key, include_str!("selfsigned-key.pem"))?;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        // axum-server registers the listener with tokio, which refuses a
+        // blocking socket.
+        listener.set_nonblocking(true)?;
+        let addr = listener.local_addr()?;
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime for the TLS origin");
+            runtime.block_on(async move {
+                let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
+                    .await
+                    .expect("the fixture certificate is readable");
+                let app: axum::Router =
+                    axum::Router::new().fallback(axum::routing::get(|| async { "secret bytes" }));
+                let _ = axum_server::from_tcp_rustls(listener, config)
+                    .expect("the listener is ours")
+                    .serve(app.into_make_service())
+                    .await;
+            });
+        });
+        Ok(Self {
+            addr,
+            _certificates: certificates,
+        })
+    }
+}
+
+/// The downgrade, working as advertised: a host whose certificate will not
+/// verify is fetched once with verification, once without, and written down
+/// by name so the next request pays only one handshake.
+///
+/// It is addressed as `localhost` rather than `127.0.0.1` so the host this
+/// records cannot be confused with the one the redirect test below asserts
+/// was *not* recorded -- [`stream_server::unverified_hosts`] is process-wide
+/// and these tests share a process.
+#[test]
+fn a_host_whose_certificate_fails_is_fetched_unverified_and_named() -> anyhow::Result<()> {
+    let tls = TlsOrigin::start()?;
+    let fixture = fixture()?;
+    let target = format!("https://localhost:{}/film.mkv", tls.addr.port());
+    let response = reqwest::blocking::Client::new()
+        .get(format!("{}/proxy/?d={}", fixture.base, encode(&target)))
+        .send()?;
+
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::OK,
+        "the stream plays, which is why the downgrade exists at all"
+    );
+    assert_eq!(response.text()?, "secret bytes");
+    assert!(
+        stream_server::unverified_hosts().contains(&"localhost".to_string()),
+        "and the host is written down by name: {:?}",
+        stream_server::unverified_hosts()
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
+/// The same failure one redirect away, which is where the host recorded
+/// used to be the wrong one entirely: the plain-HTTP host that redirected
+/// us got marked unverified, and the https host whose handshake actually
+/// failed did not.
+///
+/// reqwest attributes the failure to the URL the request started at, so
+/// from here the failing host has no name -- and an unnameable host is not
+/// one to write down. The fetch fails instead.
+#[test]
+fn a_certificate_failure_behind_a_redirect_downgrades_nobody() -> anyhow::Result<()> {
+    let tls = TlsOrigin::start()?;
+    let tls_addr = tls.addr;
+    let redirector = Origin::start_with(move |_request: &Request, socket: &mut TcpStream| {
+        let _ = socket.write_all(
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: https://127.0.0.1:{}/film.mkv\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n",
+                tls_addr.port()
+            )
+            .as_bytes(),
+        );
+        let _ = socket.flush();
+    })?;
+
+    let fixture = fixture_with(redirector)?;
+    let target = format!("http://{}/film.mkv", fixture.origin.addr);
+    let response = reqwest::blocking::Client::new()
+        .get(format!("{}/proxy/?d={}", fixture.base, encode(&target)))
+        .send()?;
+
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::BAD_GATEWAY,
+        "the fetch fails rather than silently downgrading something"
+    );
+    assert!(
+        !stream_server::unverified_hosts().contains(&"127.0.0.1".to_string()),
+        "and no plain-HTTP host is marked unverified: {:?}",
+        stream_server::unverified_hosts()
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
+/// The measured reproduction of reading the error's prose instead of its
+/// type: no TLS anywhere, a refused connection, and a filename with the
+/// word "certificate" in it. It marked the host unverified for the life of
+/// the process.
+#[test]
+fn a_filename_cannot_turn_certificate_verification_off() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let response = reqwest::blocking::Client::new()
+        .get(format!(
+            "{}/proxy/?d={}",
+            fixture.base,
+            encode("http://127.0.0.1:1/certificate-of-authenticity.mkv")
+        ))
+        .send()?;
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+    assert!(
+        !stream_server::unverified_hosts().contains(&"127.0.0.1".to_string()),
+        "a connection refused is not a certificate failure: {:?}",
+        stream_server::unverified_hosts()
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
 /// `h=` and `r=` are overrides, and each collides with a header that is
 /// already there: the player's `User-Agent` on the way out, the origin's
 /// `Content-Type` on the way back. Both used to be *added*, so the origin
