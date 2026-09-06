@@ -19,7 +19,9 @@ const CLEAN_DEBOUNCE: Duration = Duration::from_secs(60);
 /// there is no filesystem event left to arm the debounce with, and the hourly
 /// fallback is ninety minutes of black screen. The check itself is one lock
 /// read per live engine and no I/O (`EngineFS::out_of_space_torrents`), which
-/// is what makes a short interval affordable.
+/// is what makes a short interval affordable. What follows a positive answer
+/// is a full cache walk, which is not -- so [`DiskFullRecovery`] runs it once
+/// per situation rather than once per tick.
 const DISK_FULL_POLL_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Fallback sweep for a cache nothing is writing to. Long on purpose: with
@@ -228,6 +230,7 @@ pub fn start(state: Arc<AppState>) -> JoinHandle<()> {
         let mut disk_full_poll = tokio::time::interval(DISK_FULL_POLL_INTERVAL);
 
         let mut schedule = CleanSchedule::default();
+        let mut disk_full_recovery = DiskFullRecovery::default();
         let mut active_cleaning_timer = Box::pin(tokio::time::sleep(Duration::MAX)); // Inactive initially
 
         loop {
@@ -257,7 +260,7 @@ pub fn start(state: Arc<AppState>) -> JoinHandle<()> {
 
                 // 3. A torrent the backend stopped for want of disk space
                 _ = disk_full_poll.tick() => {
-                    recover_out_of_space_torrents(&state).await;
+                    recover_out_of_space_torrents(&state, &mut disk_full_recovery).await;
                 }
 
                 // 4. Debounce Timer Fired
@@ -290,7 +293,52 @@ pub fn start(state: Arc<AppState>) -> JoinHandle<()> {
 /// left to evict, [`EvictionReport::shortfall_message`] has already said what
 /// protection is holding, and the torrent stays stopped where a client can
 /// report it honestly.
-async fn recover_out_of_space_torrents(state: &AppState) {
+/// What the disk-full poll has already tried and failed to make room for.
+///
+/// A stopped torrent stays stopped and stays in the backend's error state,
+/// so `out_of_space_torrents` answers with the same hash on every tick.
+/// When the clean that follows frees nothing there is nothing to be done
+/// about it and nothing new to say -- yet the arm walked the whole cache
+/// tree, a `metadata()` per file, and emitted two WARN lines, four times a
+/// minute. For a *pinned* offline download, which the idle sweeper never
+/// removes, that never ends: some five and a half thousand WARN pairs a
+/// day into the append-only log archive, on a device that is out of disk.
+/// The DHT taught this repo the same lesson -- an unreachable DHT is
+/// reported once, not once per retry.
+///
+/// So a hash the cleaner could not make room for is remembered here and
+/// the tick does nothing at all until the stopped set changes. What
+/// re-arms it is the torrent leaving the error state (restarted, removed
+/// or swept) or a later clean actually reclaiming something: both are
+/// changes to the situation the refusal described, and the next failure
+/// then gets a fresh pass and a fresh line.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DiskFullRecovery {
+    exhausted: HashSet<String>,
+}
+
+impl DiskFullRecovery {
+    /// Whether `stopped` holds a torrent this has not already given up on.
+    /// Forgets anything no longer stopped as it goes, so a torrent that
+    /// recovers and later fills the disk again is a fresh case.
+    fn has_new_work(&mut self, stopped: &HashSet<String>) -> bool {
+        self.exhausted.retain(|hash| stopped.contains(hash));
+        stopped.len() > self.exhausted.len()
+    }
+
+    /// Nothing could be evicted for these: said once, then quiet.
+    fn give_up(&mut self, stopped: &HashSet<String>) {
+        self.exhausted.extend(stopped.iter().cloned());
+    }
+
+    /// A pass reclaimed space, so every earlier refusal described a device
+    /// that no longer exists.
+    fn room_was_made(&mut self) {
+        self.exhausted.clear();
+    }
+}
+
+async fn recover_out_of_space_torrents(state: &AppState, recovery: &mut DiskFullRecovery) {
     // The stream and download engines are often the same `Arc`; asking one
     // twice would restart a torrent that is already live again and log the
     // backend's complaint about it.
@@ -308,6 +356,13 @@ async fn recover_out_of_space_torrents(state: &AppState) {
         }
     }
     if stopped.is_empty() {
+        recovery.room_was_made();
+        return;
+    }
+    // Every tick after a pass that could not help would walk the whole
+    // cache and say the same two things again; see [`DiskFullRecovery`].
+    let hashes: HashSet<String> = stopped.iter().map(|(_, hash)| hash.clone()).collect();
+    if !recovery.has_new_work(&hashes) {
         return;
     }
 
@@ -323,12 +378,15 @@ async fn recover_out_of_space_torrents(state: &AppState) {
         }
     };
     if !report.made_room() {
+        recovery.give_up(&hashes);
         warn!(
             torrents = stopped.len(),
-            "nothing could be evicted, so the stopped torrents stay stopped rather than failing again"
+            "nothing could be evicted, so the stopped torrents stay stopped rather than failing again; \
+             not reported again until the situation changes"
         );
         return;
     }
+    recovery.room_was_made();
 
     for (engine, info_hash) in stopped {
         match engine.restart_after_error(&info_hash).await {
@@ -950,8 +1008,9 @@ async fn remove_empty_parents(mut dir: &std::path::Path, root: &std::path::Path)
 #[cfg(test)]
 mod tests {
     use super::{
-        CACHE_FREE_SPACE_FLOOR, CacheLimit, CleanSchedule, EvictionReport, available_space, evict,
-        is_path_protected, is_session_artifact, occupied_bytes, remove_empty_parents, scan_usage,
+        CACHE_FREE_SPACE_FLOOR, CacheLimit, CleanSchedule, DiskFullRecovery, EvictionReport,
+        available_space, evict, is_path_protected, is_session_artifact, occupied_bytes,
+        remove_empty_parents, scan_usage,
     };
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
@@ -1604,6 +1663,50 @@ mod tests {
             capped_at_nothing.shortfall_message().is_some(),
             "a cap of 0 is a cap, and this run is over it"
         );
+    }
+
+    /// A disk with nothing left to evict is reported once, not four times a
+    /// minute for the life of the process. A stopped torrent stays in the
+    /// backend's error state, so without this every tick walked the whole
+    /// cache tree and wrote the same two WARN lines again -- unbounded for
+    /// a pinned download, which the idle sweeper never removes.
+    #[test]
+    fn a_disk_with_nothing_left_to_evict_is_reported_once() {
+        let a = HASH.to_string();
+        let b = HASH.replace('0', "f");
+        let mut recovery = DiskFullRecovery::default();
+
+        let stuck: HashSet<String> = [a.clone()].into_iter().collect();
+        assert!(recovery.has_new_work(&stuck), "the first sight of it");
+        recovery.give_up(&stuck);
+        assert!(
+            !recovery.has_new_work(&stuck),
+            "and quiet on every tick after"
+        );
+        assert!(!recovery.has_new_work(&stuck));
+
+        // A second torrent running out of space has not been tried, so it
+        // is worth a pass even though the first one is still stuck.
+        let both: HashSet<String> = [a.clone(), b.clone()].into_iter().collect();
+        assert!(recovery.has_new_work(&both));
+        recovery.give_up(&both);
+        assert!(!recovery.has_new_work(&both));
+
+        // One recovering by other means leaves only what was already tried.
+        let only_b: HashSet<String> = [b.clone()].into_iter().collect();
+        assert!(!recovery.has_new_work(&only_b));
+
+        // Nothing stopped at all forgets everything, so the same torrent
+        // filling the disk again later gets a fresh pass and a fresh line.
+        assert!(!recovery.has_new_work(&HashSet::new()));
+        assert!(recovery.has_new_work(&only_b));
+
+        // So does a clean that actually reclaimed something: the device the
+        // refusal described is not the device any more.
+        recovery.give_up(&only_b);
+        assert!(!recovery.has_new_work(&only_b));
+        recovery.room_was_made();
+        assert!(recovery.has_new_work(&only_b));
     }
 
     /// The cap is the smaller of the two, and which one binds depends only
