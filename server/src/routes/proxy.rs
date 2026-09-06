@@ -79,6 +79,18 @@ fn origin_key(url: &Url) -> String {
     url.origin().ascii_serialization()
 }
 
+/// Whether a URL's path names a playlist by its extension.
+///
+/// Case-insensitively, which the reference is not: `path.extname()` against
+/// a list of two lowercase literals does not see `/live/master.M3U8` at
+/// all, and only its content-type arm catches one. There is no reason to
+/// inherit that -- a filename's case is the origin's spelling, not a
+/// statement about the format.
+fn names_a_playlist(url: &Url) -> bool {
+    let path = url.path().to_ascii_lowercase();
+    path.ends_with(".m3u8") || path.ends_with(".m3u")
+}
+
 tokio::task_local! {
     /// The URL the verifying client is about to connect to, for the
     /// duration of one fetch.
@@ -687,8 +699,18 @@ async fn proxy(
     // too (`(responseHeaders["content-type"]||"").toLowerCase()
     // .includes("mpegurl")`) -- and that arm is the only reason it copes
     // with a playlist whose URL does not end `.m3u8`.
-    let is_playlist = fetched_url.path().ends_with(".m3u8")
-        || fetched_url.path().ends_with(".m3u")
+    // Both URLs are asked, because either one alone has a blind spot. The
+    // URL the *caller* named is the one an HLS player knows it asked for,
+    // and it is the only evidence left when a redirect lands on an
+    // extension-less URL an indifferent origin labels
+    // `application/octet-stream` -- testing the fetched path alone stopped
+    // rewriting that stream at all. The URL the body *came from* is the one
+    // that catches the other direction, a caller naming an extension-less
+    // URL that redirects to a `.m3u8`. The reference tests only the
+    // pre-redirect path (its `dest` is the router's, untouched by the
+    // redirect loop) and leans on its content-type arm for the rest.
+    let is_playlist = names_a_playlist(&url)
+        || names_a_playlist(&fetched_url)
         || content_type.to_ascii_lowercase().contains("mpegurl");
 
     // A body under a content coding we cannot decode is a body we must not

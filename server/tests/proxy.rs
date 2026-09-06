@@ -710,6 +710,55 @@ fn a_playlist_is_recognised_however_its_content_type_is_capitalised() -> anyhow:
     Ok(())
 }
 
+/// The redirect that made the fetched path the wrong thing to ask. A CDN
+/// sends a `.m3u8` request on to an edge that serves the same playlist at
+/// an extension-less URL under a content type that says nothing -- an
+/// ordinary signed-URL deployment -- and the only evidence left that this
+/// is a playlist is the URL the caller named. Testing the post-redirect
+/// path alone relayed it whole, so a player got a playlist of origin URLs
+/// and every segment bypassed the proxy, `h=` and all.
+#[test]
+fn a_playlist_is_recognised_by_the_url_the_caller_named() -> anyhow::Result<()> {
+    let edge = Origin::start_with(|_request: &Request, socket: &mut TcpStream| {
+        let _ = socket.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{ORIGIN_PLAYLIST}",
+                ORIGIN_PLAYLIST.len()
+            )
+            .as_bytes(),
+        );
+        let _ = socket.flush();
+    })?;
+    let edge_addr = edge.addr;
+    let cdn = Origin::start_with(move |_request: &Request, socket: &mut TcpStream| {
+        let _ = socket.write_all(
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{edge_addr}/edge/9f3a1c\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        let _ = socket.flush();
+    })?;
+
+    let fixture = fixture_with(cdn)?;
+    let target = format!("http://{}/cdn/master.m3u8", fixture.origin.addr);
+    let response = reqwest::blocking::Client::new()
+        .get(format!("{}/proxy/?d={}", fixture.base, encode(&target)))
+        .send()?;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body = response.text()?;
+    assert!(
+        body.contains("/proxy/"),
+        "the URL the caller named ends .m3u8, and nothing else here says so: {body}"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
 /// An authenticated HLS stream, end to end: the playlist and every segment
 /// need the same `Authorization` the addon put in `h=`, and only the
 /// playlist's own URL was carrying it.
