@@ -2435,6 +2435,104 @@ fn set_lan_media_toggles_the_listener_and_the_setting_can_forbid_it() -> anyhow:
     Ok(())
 }
 
+/// The LAN listener counts what has reached it, per cast session.
+///
+/// This is the only way to tell a receiver that never fetched the stream
+/// from one that fetched it and could not play it, and the two need
+/// different words: the first says this device could not be reached at the
+/// address it handed out, the second says nothing about the network at all.
+/// A receiver told an unroutable address raises no error -- the connect
+/// hangs -- so nothing else distinguishes them.
+///
+/// The count is therefore per session and not cumulative: a start resets it,
+/// or the previous cast would answer for this one. Only the LAN listener
+/// counts; loopback traffic is this host's own client, not a receiver.
+#[test]
+fn the_lan_listener_counts_the_requests_that_reach_it() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    let (handle, base, info_hash, idx, payload) = lan_media_server(
+        config_dir.path(),
+        cache_dir.path(),
+        src.path(),
+        Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
+    )?;
+    let lan = format!("http://{}", handle.lan_media_addr().expect("LAN bound"));
+    let anonymous = reqwest::blocking::Client::new();
+
+    assert_eq!(
+        handle.lan_media_requests_served(),
+        0,
+        "a listener nothing has fetched from yet"
+    );
+
+    // Loopback is not the LAN listener, however much it is served.
+    anonymous
+        .get(format!("{base}/{info_hash}/{idx}"))
+        .send()?
+        .error_for_status()?;
+    assert_eq!(
+        handle.lan_media_requests_served(),
+        0,
+        "a request to the loopback listener is not a receiver fetching"
+    );
+
+    // What a receiver actually does: probe with HEAD, then read a range.
+    // The count is bumped when the request arrives, so it is already up to
+    // date by the time the response is in hand -- nothing to wait for.
+    anonymous
+        .head(format!("{lan}/{info_hash}/{idx}"))
+        .send()?
+        .error_for_status()?;
+    assert_eq!(handle.lan_media_requests_served(), 1);
+    let response = anonymous
+        .get(format!("{lan}/{info_hash}/{idx}"))
+        .header(reqwest::header::RANGE, "bytes=0-15")
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.bytes()?.as_ref(), &payload[0..16]);
+    assert_eq!(handle.lan_media_requests_served(), 2);
+
+    // A request the fallback answers still reached us, which is the whole
+    // question the count exists to answer.
+    assert_eq!(
+        anonymous
+            .get(format!("{lan}/no-such-route"))
+            .send()?
+            .status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+    assert_eq!(handle.lan_media_requests_served(), 3);
+
+    // A new session starts from nothing, so a cast that is never fetched
+    // from reads zero however busy the one before it was.
+    handle.set_lan_media(false)?;
+    // A configured address is bound at startup whatever the setting says;
+    // restarting one by hand needs the operator's permission first.
+    handle.update_settings(serde_json::json!({ "lanMediaEnabled": true }))?;
+    let restarted = handle.set_lan_media(true)?.expect("bound again");
+    assert_eq!(
+        handle.lan_media_requests_served(),
+        0,
+        "the count belongs to the session, not to the process"
+    );
+    assert_eq!(
+        anonymous
+            .get(format!("http://{restarted}/{info_hash}/{idx}"))
+            .send()?
+            .error_for_status()?
+            .bytes()?
+            .as_ref(),
+        payload.as_slice()
+    );
+    assert_eq!(handle.lan_media_requests_served(), 1);
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
 /// With no `lan_media_addr` configured -- the default for both stock
 /// configurations -- there is no LAN listener and nothing to start, whatever
 /// the setting says.

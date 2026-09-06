@@ -28,6 +28,7 @@ use crate::routes::system::LocalIpv4Interface;
 use crate::state::AppState;
 use anyhow::Context;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use url::Url;
 
 /// The LAN media listener's control block, held by [`AppState`] so both
@@ -42,6 +43,11 @@ pub struct LanMedia {
     /// The running listener, if any. A single mutex serialises start and
     /// stop, so two concurrent toggles cannot both bind.
     running: tokio::sync::Mutex<Option<Running>>,
+    /// Requests that have reached the listener since it last started -- see
+    /// [`LanMedia::requests_served`]. Not behind the mutex: it is written
+    /// from the serving task on every request and read from whatever thread
+    /// asks, and neither cares to be ordered against anything else.
+    requests: AtomicU64,
 }
 
 struct Running {
@@ -54,6 +60,7 @@ impl LanMedia {
         Self {
             configured_addr,
             running: tokio::sync::Mutex::new(None),
+            requests: AtomicU64::new(0),
         }
     }
 
@@ -93,6 +100,11 @@ impl LanMedia {
             .await
             .with_context(|| format!("failed to bind the LAN media listener on {addr}"))?;
         let bound = listener.local_addr()?;
+        // The count belongs to this session, not to the process: a caller
+        // asking "has the receiver fetched anything yet?" is asking about
+        // the cast it just started, and a count left over from the previous
+        // one would answer yes for a receiver that never connected.
+        self.requests.store(0, Ordering::Relaxed);
         let app = crate::build_lan_media_router(state.clone());
         let task = tokio::spawn(async move {
             if let Err(error) = axum::serve(
@@ -138,6 +150,27 @@ impl LanMedia {
             let _ = running.task.await;
             tracing::info!(bound = %running.bound, "LAN media listener stopped");
         }
+    }
+
+    /// Count one request arriving on the listener. Called by the tracing
+    /// layer [`crate::build_lan_media_router`] installs, which is the one
+    /// place every request to this listener passes through -- including the
+    /// ones the fallbacks answer with a `404`, since a receiver that asks
+    /// for the wrong path has still demonstrably reached us.
+    pub fn record_request(&self) {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many requests have reached the listener since it last started.
+    ///
+    /// Zero is the diagnosis a caller cannot make any other way. A receiver
+    /// that never fetched the stream and one that fetched it and failed to
+    /// play it look identical from the sofa -- both are a still picture --
+    /// and only the first is this device's fault: it means the address we
+    /// handed out was one the receiver could not reach. A non-zero count
+    /// says the network is fine and the problem is the media.
+    pub fn requests_served(&self) -> u64 {
+        self.requests.load(Ordering::Relaxed)
     }
 
     /// The base URL to hand a receiver at `peer`, e.g.

@@ -467,6 +467,24 @@ impl ServerHandle {
         self.lan_media_addr().is_some()
     }
 
+    /// How many requests have reached the LAN media listener since it last
+    /// started -- per cast session, not per process, since
+    /// [`ServerHandle::set_lan_media`] resets it on every start.
+    ///
+    /// It answers one question nothing else can: whether the receiver ever
+    /// came back for the stream. A receiver told an address it cannot route
+    /// to never reports an error -- the connect hangs -- so from the outside
+    /// it is indistinguishable from one that is buffering, and this is the
+    /// only signal that separates them. Zero, well after a load, means the
+    /// address was wrong and the cast cannot recover; non-zero means the
+    /// receiver reached this device and whatever went wrong afterwards is
+    /// about the media, not the network.
+    ///
+    /// Cheap: one relaxed atomic load, no runtime hop, safe to poll.
+    pub fn lan_media_requests_served(&self) -> u64 {
+        self.state.lan_media.requests_served()
+    }
+
     /// The base URL to hand a receiver at `for_peer` (e.g.
     /// `http://192.168.1.20:11471/`), so a media URL built on it is one that
     /// receiver can actually reach: the host is the local interface sharing
@@ -1171,6 +1189,7 @@ fn cors_layer() -> CorsLayer {
 /// This is deliberately *not* [`media_router`] minus a couple of routes --
 /// see [`lan_media_routes`] for why.
 fn build_lan_media_router(state: AppState) -> Router {
+    let lan_media = state.lan_media.clone();
     Router::new()
         .merge(lan_media_routes())
         .merge(lan_closed_hazard_routes())
@@ -1192,7 +1211,8 @@ fn build_lan_media_router(state: AppState) -> Router {
                 // and stops with nothing in between. This is the line that
                 // tells the two apart, and the peer is the one field that
                 // says whether the address we handed out was reachable.
-                .on_request(|request: &axum::extract::Request, _: &tracing::Span| {
+                .on_request(move |request: &axum::extract::Request, _: &tracing::Span| {
+                    lan_media.record_request();
                     tracing::info!(
                         method = %request.method(),
                         path = %request.uri().path(),
