@@ -1418,7 +1418,14 @@ struct TlsOrigin {
 }
 
 impl TlsOrigin {
+    /// The default: one string under every path.
     fn start() -> anyhow::Result<Self> {
+        Self::start_with(
+            axum::Router::new().fallback(axum::routing::get(|| async { "secret bytes" })),
+        )
+    }
+
+    fn start_with(app: axum::Router) -> anyhow::Result<Self> {
         let certificates = tempfile::tempdir()?;
         let cert = certificates.path().join("cert.pem");
         let key = certificates.path().join("key.pem");
@@ -1439,8 +1446,6 @@ impl TlsOrigin {
                 let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
                     .await
                     .expect("the fixture certificate is readable");
-                let app: axum::Router =
-                    axum::Router::new().fallback(axum::routing::get(|| async { "secret bytes" }));
                 let _ = axum_server::from_tcp_rustls(listener, config)
                     .expect("the listener is ours")
                     .serve(app.into_make_service())
@@ -1751,6 +1756,104 @@ fn a_header_from_h_survives_the_redirect_the_origin_chose() -> anyhow::Result<()
         edge.next_request().header("authorization"),
         Some(SECRET),
         "and so did the hop the origin sent us to"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
+/// The one place the trade above must not reach: a redirect that steps down
+/// from `https` to plain `http`.
+///
+/// `h=` is re-applied on every hop, and `redirect_target` takes any
+/// `http`/`https` target without comparing it to the scheme it came from --
+/// so an `https` origin answering `302 Location: http://...` could have the
+/// caller's `Authorization` (or `Cookie`) written onto a cleartext hop that
+/// anybody on the path can read. That is not the credential following the
+/// resource; it is the origin choosing to publish it, and no `403` is
+/// avoided by obliging. reqwest's own policy strips those three names
+/// across such a hop (`remove_sensitive_headers`), and walking the chain
+/// ourselves is what took that away.
+///
+/// The rest of `h=` still travels: a `User-Agent` an addon needs is a
+/// description, not a secret to spend, and dropping it would break the
+/// stream for nothing.
+#[test]
+fn a_redirect_that_steps_down_to_http_does_not_carry_the_h_credentials() -> anyhow::Result<()> {
+    const SECRET: &str = "Bearer s3cret";
+
+    // The cleartext hop, which must be asked for the film with no
+    // credential on it -- and with the `h=` that is not one.
+    let cleartext = Origin::start_with(|request: &Request, socket: &mut TcpStream| {
+        let body = format!(
+            "authorization={:?} cookie={:?} user-agent={:?}",
+            request.header("authorization"),
+            request.header("cookie"),
+            request.header("user-agent")
+        );
+        let _ = socket.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        let _ = socket.flush();
+    })?;
+    let cleartext_addr = cleartext.addr;
+
+    // The TLS origin that sends us there, recording what it was asked with:
+    // the credential has to reach the hop the caller actually named, or
+    // this test would pass on a proxy that simply dropped `h=`.
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>> = Default::default();
+    let recorder = seen.clone();
+    let location = format!("http://{cleartext_addr}/film.mkv");
+    let tls = TlsOrigin::start_with(axum::Router::new().fallback(axum::routing::any(
+        move |headers: axum::http::HeaderMap| {
+            let recorder = recorder.clone();
+            let location = location.clone();
+            async move {
+                recorder
+                    .lock()
+                    .expect("no test panicked holding this")
+                    .push(
+                        headers
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string),
+                    );
+                (
+                    axum::http::StatusCode::FOUND,
+                    [(axum::http::header::LOCATION, location)],
+                )
+            }
+        },
+    )))?;
+
+    let fixture = fixture_with(cleartext)?;
+    let target = format!("https://127.0.0.1:{}/film.mkv", tls.addr.port());
+    let response = reqwest::blocking::Client::new()
+        .get(format!(
+            "{}/proxy/?d={}&h={}&h={}&h={}",
+            fixture.base,
+            encode(&target),
+            encode(&format!("Authorization:{SECRET}")),
+            encode("Cookie:session=abc"),
+            encode("User-Agent:addon/1")
+        ))
+        .send()?;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.text()?,
+        "authorization=None cookie=None user-agent=Some(\"addon/1\")",
+        "the credentials stay behind at the downgrade; the rest of h= does not"
+    );
+    assert_eq!(
+        *seen.lock().expect("no test panicked holding this"),
+        vec![Some(SECRET.to_string())],
+        "and the hop the caller named -- the https one -- was asked with the credential"
     );
 
     drop(fixture.handle);

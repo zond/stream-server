@@ -125,6 +125,11 @@ const FOLLOWED_REDIRECTS: [StatusCode; 5] = [
 /// route fetches whatever a caller names, so the one thing it must not do
 /// is let an *origin* redirect it somewhere a caller could not have asked
 /// for.
+///
+/// The target's scheme is not compared with the one it came from, so an
+/// `https` hop may legitimately end at an `http` one -- what such a step
+/// down costs is decided where the request is built, not here: the caller's
+/// `h=` credentials stop travelling (see the loop in [`proxy`]).
 fn redirect_target(response: &reqwest::Response, from: &Url) -> Option<Url> {
     if !FOLLOWED_REDIRECTS.contains(&response.status()) {
         return None;
@@ -452,6 +457,30 @@ fn custom_request_headers(overrides: &BTreeMap<String, String>) -> HeaderMap {
     headers
 }
 
+/// The `h=` names that are credentials rather than description: the three
+/// reqwest's own redirect policy calls sensitive and strips across hosts
+/// (`remove_sensitive_headers`).
+///
+/// Nothing else this route sends can be one. The player's own headers are
+/// a fixed allow-list (see `build_request`) with no credential in it, so
+/// `h=` is the only way a secret reaches an origin at all.
+const CREDENTIAL_REQUEST_HEADERS: [&str; 3] = ["authorization", "cookie", "proxy-authorization"];
+
+/// The same header map with every name in [`CREDENTIAL_REQUEST_HEADERS`]
+/// left out -- what a hop that no longer deserves the caller's secret is
+/// built with.
+///
+/// The rest of `h=` still goes: a `User-Agent`, a `Referer` or an
+/// addon's own `X-` header describes the request and is not a secret to
+/// spend, and dropping those would break the stream for no gain.
+fn without_credentials(headers: &HeaderMap) -> HeaderMap {
+    headers
+        .iter()
+        .filter(|(name, _)| !CREDENTIAL_REQUEST_HEADERS.contains(&name.as_str()))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
+}
+
 /// Finishes building a response, turning a builder error (which can no
 /// longer happen for headers we control, but is handled defensively for any
 /// other builder failure) into a 502 instead of panicking via `.unwrap()`.
@@ -730,7 +759,8 @@ async fn proxy(
     }
 
     let custom_request_headers = custom_request_headers(&params.request_headers);
-    let build_request = |client: &Client, url: &Url| {
+    let uncredentialed_request_headers = without_credentials(&custom_request_headers);
+    let build_request = |client: &Client, url: &Url, carry_credentials: bool| {
         let mut req_builder = client.request(method.clone(), url.clone());
 
         // What the player asked for, forwarded as it asked for it.
@@ -765,8 +795,13 @@ async fn proxy(
         // The `h=` overrides last, and replacing rather than adding to what
         // the player sent: an override that leaves the original in place
         // is not one. Every hop of a redirect chain is built through here,
-        // so every hop gets them (see the loop below).
-        req_builder = req_builder.headers(custom_request_headers.clone());
+        // so every hop gets them (see the loop below) -- minus the
+        // credentials once the chain has stepped down to cleartext.
+        req_builder = req_builder.headers(if carry_credentials {
+            custom_request_headers.clone()
+        } else {
+            uncredentialed_request_headers.clone()
+        });
         req_builder
     };
 
@@ -795,12 +830,33 @@ async fn proxy(
     // origin sent the resource; that is the trade the caller made by naming
     // a header for a stream, and the alternative is the `403`.
     //
+    // **One thing that trade does not cover is the wire going cleartext.**
+    // [`redirect_target`] takes any `http` or `https` target without
+    // comparing it to the scheme it came from, so an `https` origin could
+    // answer `302 Location: http://...` and have the caller's `h=`
+    // `Authorization` -- or `Cookie` -- re-applied on a hop anyone on the
+    // path can read. That is not "the credential goes where the resource
+    // went": it is the origin choosing to publish it, and no `403` is
+    // avoided by obliging. So a hop that steps down from `https` to `http`
+    // stops carrying [`CREDENTIAL_REQUEST_HEADERS`], and every hop after it
+    // does too -- once a chain has been continued over cleartext, where it
+    // goes next was named in the clear as well, so an upgrade back to
+    // `https` is not the caller's `https` origin talking. The rest of `h=`
+    // still travels (see [`without_credentials`]), and a chain that never
+    // downgrades is unchanged: a caller who names an `http://` target
+    // itself has made that choice, and its first hop carries what it asked
+    // for.
+    //
     // The method is kept across hops, as the reference keeps it. A `303`
     // asks for a `GET` and a browser would give it one, but this route is
     // reached with a `GET`, a `HEAD` or an `OPTIONS` from a player and
     // never with a body, so there is nothing for the distinction to change.
     let mut fetched_url = url.clone();
     let mut hops = 0usize;
+    // Set for the life of this chain the first time a hop steps down to
+    // cleartext. `true` until then, including for the URL the caller named
+    // whatever its scheme.
+    let mut carry_credentials = true;
     let response = loop {
         // The origin is fetched verified unless a previous request for this
         // endpoint failed on its certificate (see [`UNVERIFIED_ORIGINS`]).
@@ -824,7 +880,10 @@ async fn proxy(
             }
         };
 
-        let response = match build_request(client, &fetched_url).send().await {
+        let response = match build_request(client, &fetched_url, carry_credentials)
+            .send()
+            .await
+        {
             Ok(resp) => resp,
             Err(e) if !known_unverified && is_certificate_error(&e) => {
                 // The endpoint whose handshake failed, which is this hop and
@@ -866,7 +925,10 @@ async fn proxy(
                     )
                         .into_response();
                 };
-                match build_request(client, &fetched_url).send().await {
+                match build_request(client, &fetched_url, carry_credentials)
+                    .send()
+                    .await
+                {
                     Ok(resp) => resp,
                     Err(e) => {
                         return (StatusCode::BAD_GATEWAY, format!("Proxy error: {}", e))
@@ -885,6 +947,27 @@ async fn proxy(
         if hops >= MAX_REDIRECTS {
             tracing::warn!(url = %url, "too many redirects; giving up");
             return (StatusCode::BAD_GATEWAY, "Proxy error: too many redirects").into_response();
+        }
+        if carry_credentials && fetched_url.scheme() == "https" && location.scheme() == "http" {
+            carry_credentials = false;
+            // At WARN only when there was something to drop, and by header
+            // name rather than value: a stream that now `403`s has to be
+            // diagnosable, and a chain with no credential in it is not an
+            // event.
+            let dropped: Vec<&str> = custom_request_headers
+                .keys()
+                .map(|name| name.as_str())
+                .filter(|name| CREDENTIAL_REQUEST_HEADERS.contains(name))
+                .collect();
+            if !dropped.is_empty() {
+                tracing::warn!(
+                    from = %fetched_url,
+                    to = %location,
+                    headers = ?dropped,
+                    "a redirect steps down to cleartext; not carrying the caller's h= \
+                     credentials onto it, nor onto the rest of this chain"
+                );
+            }
         }
         hops += 1;
         tracing::debug!(from = %fetched_url, to = %location, "following a proxied redirect");
