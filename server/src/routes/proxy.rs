@@ -154,6 +154,67 @@ fn names_a_playlist(url: &Url) -> bool {
     path.ends_with(".m3u8") || path.ends_with(".m3u")
 }
 
+/// The content type this response will be *served* under, folded to lower
+/// case: the caller's `r=Content-Type` when it sent one, the origin's own
+/// value otherwise.
+///
+/// After `r=`, deliberately, and the reference does the same (it computes
+/// `isPlaylist` from headers it has already merged `r=` into). `r=` is how
+/// a caller corrects an origin that mislabels -- stremio-core sends
+/// `r=Content-Type:application/x-mpegurl` for an HLS stream -- so the label
+/// the *player* will act on is the one that has to decide what this body
+/// is. Without that, the veto below would refuse to rewrite the very
+/// playlists `r=` exists to rescue.
+///
+/// Folded because the spelling that matters most is not lower case: Apple
+/// writes `application/x-mpegURL`, that is what stremio-core sends and what
+/// this repo's README uses, and a case-sensitive `contains("mpegurl")` sees
+/// none of it.
+fn effective_content_type(
+    res_headers: &HeaderMap,
+    response_header_overrides: &BTreeMap<String, String>,
+) -> String {
+    response_header_overrides
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| value.as_str())
+        .or_else(|| {
+            res_headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+        })
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+/// Whether a content type says plainly that this body is *not* a playlist,
+/// whatever the URL naming it was called.
+///
+/// `video/*`, `image/*` and `audio/*` outside the mpegurl family: bodies
+/// that would be run through a line rewriter, stripped of their framing and
+/// handed to a player as text. `audio/x-mpegurl` and `audio/mpegurl` are
+/// the classic `.m3u` spellings, so the family is asked for first and
+/// vetoes nothing.
+///
+/// A type this does not recognise vetoes nothing either, and that is the
+/// point of naming a set rather than a complement:
+/// `application/octet-stream` is what an indifferent origin labels
+/// everything, including the playlist an extension-less edge URL serves,
+/// and it says nothing at all. Only a type that positively describes some
+/// other medium is allowed to overrule the URL.
+///
+/// The parameters are cut off first: `video/mp4; charset=binary` is still
+/// `video/mp4`.
+fn cannot_be_a_playlist(content_type: &str) -> bool {
+    let essence = content_type.split(';').next().unwrap_or_default().trim();
+    if essence.contains("mpegurl") {
+        return false;
+    }
+    ["video/", "audio/", "image/"]
+        .iter()
+        .any(|medium| essence.starts_with(medium))
+}
+
 fn http_client() -> Option<&'static Client> {
     HTTP_CLIENT
         .get_or_init(|| {
@@ -431,11 +492,14 @@ impl ProxyParams {
     ///
     /// The reference does copy it, on every same-origin line and every
     /// absolute path, because its virtual root is the caller's whole opts
-    /// string -- and there it is worse than here: it computes `isPlaylist`
-    /// *after* merging `r=` into the response headers, so a segment fetched
-    /// through such a line is itself classified a playlist and run through
-    /// the line rewriter. Its own cross-origin branch drops `r=` (`newOpts`
-    /// has only `d` and `h`), which is the half worth keeping.
+    /// string -- and there it compounds: it classifies a response by the
+    /// content type it has already merged `r=` into, so a segment fetched
+    /// through such a line is itself called a playlist and run through the
+    /// line rewriter. We ask the merged type too, and for a good reason
+    /// (see [`effective_content_type`]); what keeps the same thing from
+    /// happening here is exactly this -- `r=` is not on the line, so a
+    /// segment inherits no label. Its own cross-origin branch drops `r=`
+    /// (`newOpts` has only `d` and `h`), which is the half worth keeping.
     fn carried(&self) -> String {
         let mut carried = String::new();
         for (name, value) in &self.request_headers {
@@ -768,18 +832,7 @@ async fn proxy(
     let status = response.status();
     let res_headers = response.headers().clone();
 
-    let content_type = res_headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("");
-    // The content type is matched with the case folded away, because the
-    // spelling that matters most is not lowercase: Apple writes
-    // `application/x-mpegURL`, it is the spelling stremio-core sends in
-    // `r=` and the one this repo's README uses, and a case-sensitive
-    // `contains("mpegurl")` sees none of it. The reference lowercases here
-    // too (`(responseHeaders["content-type"]||"").toLowerCase()
-    // .includes("mpegurl")`) -- and that arm is the only reason it copes
-    // with a playlist whose URL does not end `.m3u8`.
+    let content_type = effective_content_type(&res_headers, &params.response_headers);
     // Both URLs are asked, because either one alone has a blind spot. The
     // URL the *caller* named is the one an HLS player knows it asked for,
     // and it is the only evidence left when a redirect lands on an
@@ -790,9 +843,24 @@ async fn proxy(
     // URL that redirects to a `.m3u8`. The reference tests only the
     // pre-redirect path (its `dest` is the router's, untouched by the
     // redirect loop) and leans on its content-type arm for the rest.
-    let is_playlist = names_a_playlist(&url)
-        || names_a_playlist(&fetched_url)
-        || content_type.to_ascii_lowercase().contains("mpegurl");
+    //
+    // But a name is only evidence, and the body gets a veto: a URL that
+    // ends `.m3u8` and answers with an MP4 is an MP4. Measured -- a caller
+    // naming `/s/index.m3u8`, the origin redirecting to `/movie.mp4` and
+    // serving 39,998 bytes of `video/mp4` -- the response lost its
+    // `Content-Length`, claimed `Accept-Ranges: none`, dropped
+    // `Content-Range`, `ETag` and `Last-Modified`, turned a `206` into a
+    // `200`, and ran the video through the line rewriter; ffmpeg then
+    // failed on it. **The reference has the same weakness and we are
+    // deliberately not keeping it**: its `path.extname(dest.pathname)` is
+    // the pre-redirect, caller-named path, so nothing there stops a named
+    // `.m3u8` that serves a film. See [`cannot_be_a_playlist`] for what
+    // counts as a veto -- and note that the type a caller *forces* with
+    // `r=Content-Type` is the one asked, so an origin that mislabels its
+    // playlist can still be corrected.
+    let is_playlist = content_type.contains("mpegurl")
+        || ((names_a_playlist(&url) || names_a_playlist(&fetched_url))
+            && !cannot_be_a_playlist(&content_type));
 
     // A body under a content coding we cannot decode is a body we must not
     // rewrite: the lines are not text yet. We relay it whole instead --

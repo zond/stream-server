@@ -761,6 +761,186 @@ fn a_playlist_is_recognised_by_the_url_the_caller_named() -> anyhow::Result<()> 
     Ok(())
 }
 
+/// How long the film is. Not a round number and not the playlist's length:
+/// the assertion is that the byte count survives, and a length the rewriter
+/// could have arrived at by accident would prove nothing.
+const FILM_LENGTH: usize = 39_998;
+
+/// An origin serving [`FILM_LENGTH`] bytes of `video/mp4`, ranges and all,
+/// under whatever path it is asked for.
+fn film_origin() -> anyhow::Result<Origin> {
+    Origin::start_with(|request: &Request, socket: &mut TcpStream| {
+        let range = request.range().and_then(|value| {
+            let (first, last) = value.trim_start_matches("bytes=").split_once('-')?;
+            let first: usize = first.parse().ok()?;
+            let last = if last.is_empty() {
+                FILM_LENGTH - 1
+            } else {
+                last.parse().ok()?
+            };
+            Some((first, last))
+        });
+        let (first, last) = range.unwrap_or((0, FILM_LENGTH - 1));
+        let body: Vec<u8> = (first..=last).map(byte_at).collect();
+        let head = match range {
+            Some(_) => format!(
+                "HTTP/1.1 206 Partial Content\r\n\
+                 Content-Range: bytes {first}-{last}/{FILM_LENGTH}\r\n"
+            ),
+            None => "HTTP/1.1 200 OK\r\n".to_string(),
+        };
+        let _ = socket.write_all(
+            format!(
+                "{head}Content-Type: video/mp4\r\nAccept-Ranges: bytes\r\n\
+                 ETag: \"the-film\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        let _ = socket.write_all(&body);
+        let _ = socket.flush();
+    })
+}
+
+/// A `.m3u8` URL that serves a film, which is the shape the URL test above
+/// cannot tell from a real playlist -- and the origin gets the last word.
+///
+/// Measured before the content type had a veto: the caller named
+/// `/s/index.m3u8`, the origin sent it on to `/movie.mp4` and served
+/// [`FILM_LENGTH`] bytes of `video/mp4`, and what came back had no
+/// `Content-Length`, `Accept-Ranges: none`, no `Content-Range`, no `ETag`
+/// -- and the video's bytes through the line rewriter. ffmpeg failed on it.
+///
+/// The reference is wrong here in exactly the same way (`path.extname` of
+/// the caller-named, pre-redirect path, with nothing to overrule it) and
+/// this is a deliberate divergence from it.
+#[test]
+fn a_playlist_url_that_serves_a_film_is_relayed_as_the_film_it_is() -> anyhow::Result<()> {
+    let film = film_origin()?;
+    let film_addr = film.addr;
+    let front = Origin::start_with(move |_request: &Request, socket: &mut TcpStream| {
+        let _ = socket.write_all(
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{film_addr}/movie.mp4\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        let _ = socket.flush();
+    })?;
+
+    let fixture = fixture_with(front)?;
+    let client = reqwest::blocking::Client::new();
+    let url = format!(
+        "{}/proxy/?d={}",
+        fixture.base,
+        encode(&format!("http://{}/s/index.m3u8", fixture.origin.addr))
+    );
+
+    let whole = client.get(&url).send()?;
+    assert_eq!(whole.status(), reqwest::StatusCode::OK);
+    let headers = whole.headers().clone();
+    assert_eq!(
+        headers
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok()),
+        Some(FILM_LENGTH.to_string().as_str()),
+        "the film is framed by its own length, not written as a rewritten body"
+    );
+    assert_eq!(
+        headers
+            .get(reqwest::header::ACCEPT_RANGES)
+            .and_then(|value| value.to_str().ok()),
+        Some("bytes"),
+        "and it can still be seeked in"
+    );
+    assert!(
+        headers.get(reqwest::header::ETAG).is_some(),
+        "the entity headers that go with a relayed body are relayed"
+    );
+    let body = whole.bytes()?;
+    assert_eq!(body.len(), FILM_LENGTH);
+    assert_eq!(body[0], byte_at(0), "and the bytes are the film's own");
+    assert!(
+        !body.windows(7).any(|window| window == b"/proxy/"),
+        "nothing here went through the line rewriter"
+    );
+
+    // The other half of the same mistake: a `206` that happens to cover the
+    // whole entity was rewritten and answered as a `200`, so a player
+    // opening the stream with `Range: bytes=0-` to find out whether the
+    // origin is seekable was told it is not.
+    let ranged = client
+        .get(&url)
+        .header(reqwest::header::RANGE, "bytes=0-")
+        .send()?;
+    assert_eq!(
+        ranged.status(),
+        reqwest::StatusCode::PARTIAL_CONTENT,
+        "a 206 carrying a film stays a 206"
+    );
+    assert_eq!(
+        ranged
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok()),
+        Some(format!("bytes 0-{}/{FILM_LENGTH}", FILM_LENGTH - 1).as_str())
+    );
+    assert_eq!(ranged.bytes()?.len(), FILM_LENGTH);
+
+    drop(fixture.handle);
+    Ok(())
+}
+
+/// The veto the test above relies on, and the escape hatch that has to
+/// survive it: an origin serving a real playlist under `video/mp2t`.
+///
+/// Unasked, the content type wins and the body is relayed -- which is the
+/// veto doing its job, since from here a mislabelled playlist and a film at
+/// a `.m3u8` URL are the same response. `r=Content-Type:application/
+/// x-mpegURL` is how a caller says otherwise, and it is what stremio-core
+/// sends for an HLS stream, so the type the *player* will be given is the
+/// one the classification asks.
+#[test]
+fn a_content_type_override_still_forces_the_playlist_path() -> anyhow::Result<()> {
+    let fixture = fixture_with(playlist_origin_typed("video/mp2t")?)?;
+    let client = reqwest::blocking::Client::new();
+    let target = format!("http://{}/live/master.m3u8", fixture.origin.addr);
+    let url = format!("{}/proxy/?d={}", fixture.base, encode(&target));
+
+    let unasked = client.get(&url).send()?;
+    assert_eq!(unasked.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        unasked.text()?,
+        ORIGIN_PLAYLIST,
+        "video/mp2t at a .m3u8 URL is relayed: the origin's label is the evidence we have"
+    );
+
+    let forced = client
+        .get(format!(
+            "{url}&r={}",
+            encode("Content-Type:application/x-mpegURL")
+        ))
+        .send()?;
+    assert_eq!(forced.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        forced
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/x-mpegURL"),
+        "the override reaches the player"
+    );
+    assert_eq!(
+        forced.text()?,
+        expected_playlist(fixture.origin.addr),
+        "and it is the type the classification asked, so every line came back rewritten"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
 /// The four forms a playlist line can take, all four through the proxy,
 /// asserted on what the origin was actually asked for.
 ///
