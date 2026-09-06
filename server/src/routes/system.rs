@@ -135,8 +135,21 @@ pub async fn device_info() -> impl IntoResponse {
     Json(json!({ "availableHardwareAccelerations": Vec::<String>::new() }))
 }
 
+/// One IPv4 address a host interface carries, with the netmask that came
+/// with it and the name of the interface carrying it.
+///
+/// The name is kept because it is the only thing that distinguishes a
+/// Wi-Fi interface from a cellular or tunnel one when nothing else can:
+/// `crate::lan_media`'s host pick ranks on it when it has no peer subnet to
+/// match, and picking a cellular address there is a cast that never starts.
+#[derive(Clone, Debug)]
+pub struct LocalIpv4Interface {
+    pub name: String,
+    pub addr: if_addrs::Ifv4Addr,
+}
+
 /// Every IPv4 address the host's interfaces carry, **loopback included**,
-/// with the netmask that came with it.
+/// with the netmask and interface name that came with it.
 ///
 /// This is the one interface enumeration in the server, so a second caller
 /// never grows a second copy of it. [`network_info`] applies its own
@@ -144,12 +157,15 @@ pub async fn device_info() -> impl IntoResponse {
 /// *remote* client could use, while a caller matching an interface against a
 /// peer's subnet needs the loopback entries too. An enumeration failure is an
 /// empty list, exactly as it was for `/network-info` before.
-pub fn local_ipv4_interfaces() -> Vec<if_addrs::Ifv4Addr> {
+pub fn local_ipv4_interfaces() -> Vec<LocalIpv4Interface> {
     if_addrs::get_if_addrs()
         .unwrap_or_default()
         .into_iter()
         .filter_map(|iface| match iface.addr {
-            if_addrs::IfAddr::V4(addr) => Some(addr),
+            if_addrs::IfAddr::V4(addr) => Some(LocalIpv4Interface {
+                name: iface.name,
+                addr,
+            }),
             if_addrs::IfAddr::V6(_) => None,
         })
         .collect()
@@ -158,8 +174,8 @@ pub fn local_ipv4_interfaces() -> Vec<if_addrs::Ifv4Addr> {
 pub async fn network_info() -> impl IntoResponse {
     let interfaces = local_ipv4_interfaces()
         .into_iter()
-        .filter(|addr| !addr.ip.is_loopback())
-        .map(|addr| addr.ip.to_string())
+        .filter(|iface| !iface.addr.ip.is_loopback())
+        .map(|iface| iface.addr.ip.to_string())
         .collect::<Vec<_>>();
     Json(json!({ "availableInterfaces": interfaces }))
 }

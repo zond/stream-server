@@ -24,9 +24,9 @@
 //! [`ServerConfig::lan_media_addr`]: crate::ServerConfig::lan_media_addr
 //! [`ServerHandle::set_lan_media`]: crate::ServerHandle::set_lan_media
 
+use crate::routes::system::LocalIpv4Interface;
 use crate::state::AppState;
 use anyhow::Context;
-use if_addrs::Ifv4Addr;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use url::Url;
 
@@ -200,81 +200,214 @@ fn host_for_peer(bound: SocketAddr, peer: IpAddr) -> Option<IpAddr> {
 
 /// The local IPv4 address to advertise to a receiver at `peer`.
 ///
-/// The interface whose subnet contains `peer` if there is one -- that is the
-/// address `peer` can route back to. Otherwise the first non-loopback
-/// address, as a best effort for a peer behind a router we cannot see;
+/// The interface whose subnet contains `peer` wins outright: that is the
+/// address `peer` can demonstrably route back to, and everything else here
+/// is guesswork beside it. Loopback is a subnet like any other for that
+/// match.
+///
+/// Failing that -- `peer` is behind a router we cannot see, or there is no
+/// real peer at all, which is what every platform that does not report a
+/// receiver's address gives us -- the answer is a guess, and it used to be
+/// whichever non-loopback address `getifaddrs` listed first. On a phone
+/// that is as likely to be the cellular interface as the Wi-Fi one, and a
+/// cellular address handed to a Chromecast is a cast that hangs on a TCP
+/// connect nobody ever times out. So the candidates are ranked instead (see
+/// [`Reachability`]) and the best one wins, ties keeping enumeration order.
+///
 /// `None` only when the host has nothing but loopback and `peer` is not on
-/// it either.
-fn pick_host(interfaces: &[Ifv4Addr], peer: Ipv4Addr) -> Option<Ipv4Addr> {
+/// it either: a loopback address is never a guess worth making, since a
+/// receiver reaching this process over loopback is not a receiver.
+fn pick_host(interfaces: &[LocalIpv4Interface], peer: Ipv4Addr) -> Option<Ipv4Addr> {
+    if let Some(iface) = interfaces.iter().find(|iface| same_subnet(iface, peer)) {
+        return Some(iface.addr.ip);
+    }
     interfaces
         .iter()
-        .find(|iface| same_subnet(iface, peer))
-        .or_else(|| interfaces.iter().find(|iface| !iface.ip.is_loopback()))
-        .map(|iface| iface.ip)
+        .filter(|iface| !iface.addr.ip.is_loopback())
+        .min_by_key(|iface| reachability(iface))
+        .map(|iface| iface.addr.ip)
 }
 
-fn same_subnet(iface: &Ifv4Addr, peer: Ipv4Addr) -> bool {
-    let mask = u32::from(iface.netmask);
-    u32::from(iface.ip) & mask == u32::from(peer) & mask
+/// How plausibly a receiver on the same home network could reach one of our
+/// addresses, best first -- the `Ord` derive *is* the ranking, and
+/// [`pick_host`] takes the minimum.
+///
+/// The order encodes two judgements, the first outranking the second. A
+/// tunnel or carrier link is one no receiver on the LAN has a route into,
+/// whatever address it carries, so both of its ranks sit below every
+/// ordinary interface. Within a kind, an RFC1918 address is what a device
+/// on a home network has and anything else is a worse guess.
+///
+/// Both are heuristics, and deliberately only tie-breaks: an interface on
+/// the receiver's own subnet never reaches this, and a host whose only
+/// routable address is a cellular one still offers it rather than nothing.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum Reachability {
+    /// A private address on an ordinary interface: the Wi-Fi or Ethernet
+    /// address of a machine sharing a home network with the receiver, and
+    /// the rank this is expected to answer with nearly always.
+    PrivateOnOrdinary,
+    /// Any other address on an ordinary interface -- a public address, or a
+    /// carrier-grade NAT or link-local one. A poor guess, but the link
+    /// itself is one the receiver may genuinely share.
+    OtherOnOrdinary,
+    /// A private address on a tunnel: a VPN's `10.x`, which looks exactly
+    /// like a LAN address and is reachable only from inside the tunnel.
+    PrivateOnTunnel,
+    /// Everything else, the case this ranking was written for: a cellular
+    /// address, which no receiver has ever been able to reach.
+    OtherOnTunnel,
+}
+
+fn reachability(iface: &LocalIpv4Interface) -> Reachability {
+    match (is_tunnel(&iface.name), iface.addr.ip.is_private()) {
+        (false, true) => Reachability::PrivateOnOrdinary,
+        (false, false) => Reachability::OtherOnOrdinary,
+        (true, true) => Reachability::PrivateOnTunnel,
+        (true, false) => Reachability::OtherOnTunnel,
+    }
+}
+
+/// Interface names that are point-to-point or virtual by construction.
+/// `rmnet` is Android's cellular interface and `pdp_ip` iOS's; `tun`, `tap`
+/// and `wg` are tunnels, a VPN typically being up for a whole session;
+/// `dummy` is the kernel's blackhole device. Loopback needs no prefix here
+/// -- it is excluded before the ranking runs.
+///
+/// Matching a name is coarse, which is why it only ever demotes: the cost
+/// of being wrong is offering a second-choice address that also works, not
+/// refusing one that does.
+const TUNNEL_INTERFACE_PREFIXES: [&str; 6] = ["rmnet", "pdp_ip", "tun", "tap", "dummy", "wg"];
+
+fn is_tunnel(name: &str) -> bool {
+    TUNNEL_INTERFACE_PREFIXES.iter().any(|prefix| {
+        name.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    })
+}
+
+fn same_subnet(iface: &LocalIpv4Interface, peer: Ipv4Addr) -> bool {
+    let mask = u32::from(iface.addr.netmask);
+    u32::from(iface.addr.ip) & mask == u32::from(peer) & mask
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn iface(ip: [u8; 4], prefixlen: u8) -> Ifv4Addr {
+    fn iface(name: &str, ip: [u8; 4], prefixlen: u8) -> LocalIpv4Interface {
         let mask = if prefixlen == 0 {
             0
         } else {
             u32::MAX << (32 - prefixlen)
         };
-        Ifv4Addr {
-            ip: Ipv4Addr::from(ip),
-            netmask: Ipv4Addr::from(mask),
-            prefixlen,
-            broadcast: None,
+        LocalIpv4Interface {
+            name: name.to_string(),
+            addr: if_addrs::Ifv4Addr {
+                ip: Ipv4Addr::from(ip),
+                netmask: Ipv4Addr::from(mask),
+                prefixlen,
+                broadcast: None,
+            },
         }
     }
 
-    /// The interface a receiver can route back to wins over the ones that
-    /// merely come first -- a VPN or container bridge is regularly ahead of
-    /// the LAN in the enumeration.
-    #[test]
-    fn pick_host_prefers_the_interface_on_the_peers_subnet() {
-        let interfaces = [
-            iface([127, 0, 0, 1], 8),
-            iface([172, 17, 0, 1], 16),
-            iface([192, 168, 1, 20], 24),
-        ];
-        assert_eq!(
-            pick_host(&interfaces, Ipv4Addr::new(192, 168, 1, 50)),
-            Some(Ipv4Addr::new(192, 168, 1, 20))
-        );
-        assert_eq!(
-            pick_host(&interfaces, Ipv4Addr::new(172, 17, 0, 9)),
-            Some(Ipv4Addr::new(172, 17, 0, 1))
-        );
-        assert_eq!(
-            pick_host(&interfaces, Ipv4Addr::LOCALHOST),
-            Some(Ipv4Addr::LOCALHOST),
-            "loopback is a subnet like any other, and the only one a test can rely on"
-        );
+    fn loopback() -> LocalIpv4Interface {
+        iface("lo", [127, 0, 0, 1], 8)
     }
 
-    /// No interface shares the peer's subnet (it is behind a router): the
-    /// first routable address is the best guess, and loopback is never it.
+    fn wifi() -> LocalIpv4Interface {
+        iface("wlan0", [192, 168, 1, 20], 24)
+    }
+
+    /// A carrier that hands out an RFC1918 address, so this case can only be
+    /// decided by the interface name.
+    fn cellular() -> LocalIpv4Interface {
+        iface("rmnet_data0", [10, 82, 3, 4], 24)
+    }
+
+    /// The peer a caller passes when it has no receiver address at all --
+    /// which is every platform that does not report one. It matches no
+    /// interface's subnet, so it is the ranking's real workload rather than
+    /// an edge case.
+    const NO_PEER: Ipv4Addr = Ipv4Addr::UNSPECIFIED;
+
+    /// The whole of the host pick, on the shapes of host it runs on.
+    ///
+    /// Everything here is a pure function over a list, so the awkward cases
+    /// -- a phone on Wi-Fi and cellular at once, a machine with a VPN up, a
+    /// host with nothing but loopback -- are built rather than found, and no
+    /// case touches the network.
     #[test]
-    fn pick_host_falls_back_to_the_first_non_loopback_interface() {
-        let interfaces = [iface([127, 0, 0, 1], 8), iface([10, 1, 2, 3], 24)];
-        assert_eq!(
-            pick_host(&interfaces, Ipv4Addr::new(203, 0, 113, 5)),
-            Some(Ipv4Addr::new(10, 1, 2, 3))
-        );
-        assert_eq!(
-            pick_host(&[iface([127, 0, 0, 1], 8)], Ipv4Addr::new(203, 0, 113, 5)),
-            None,
-            "nothing but loopback and a peer that is not on it: no URL to give"
-        );
+    fn pick_host_ranks_what_a_receiver_could_reach() {
+        let cases: [(&str, Vec<LocalIpv4Interface>, Ipv4Addr, Option<Ipv4Addr>); 10] = [
+            (
+                "the interface on the peer's subnet wins over the ones that merely come first",
+                vec![loopback(), iface("docker0", [172, 17, 0, 1], 16), wifi()],
+                Ipv4Addr::new(192, 168, 1, 50),
+                Some(Ipv4Addr::new(192, 168, 1, 20)),
+            ),
+            (
+                "a peer on the bridge's subnet is answered with the bridge, ranking or not",
+                vec![loopback(), iface("docker0", [172, 17, 0, 1], 16), wifi()],
+                Ipv4Addr::new(172, 17, 0, 9),
+                Some(Ipv4Addr::new(172, 17, 0, 1)),
+            ),
+            (
+                "loopback is a subnet like any other for the match",
+                vec![loopback(), wifi()],
+                Ipv4Addr::LOCALHOST,
+                Some(Ipv4Addr::LOCALHOST),
+            ),
+            (
+                "a phone on Wi-Fi and cellular at once answers Wi-Fi, cellular listed first",
+                vec![loopback(), cellular(), wifi()],
+                NO_PEER,
+                Some(Ipv4Addr::new(192, 168, 1, 20)),
+            ),
+            (
+                "and answers Wi-Fi with the enumeration the other way round",
+                vec![loopback(), wifi(), cellular()],
+                NO_PEER,
+                Some(Ipv4Addr::new(192, 168, 1, 20)),
+            ),
+            (
+                "a VPN's address looks like a LAN address and still loses to the LAN",
+                vec![loopback(), iface("tun0", [10, 8, 0, 6], 24), wifi()],
+                NO_PEER,
+                Some(Ipv4Addr::new(192, 168, 1, 20)),
+            ),
+            (
+                "an ordinary interface wins even carrying a public address a tunnel's is private",
+                vec![
+                    iface("wg0", [10, 9, 0, 2], 24),
+                    iface("eth0", [198, 51, 100, 7], 24),
+                ],
+                NO_PEER,
+                Some(Ipv4Addr::new(198, 51, 100, 7)),
+            ),
+            (
+                "a peer behind a router we cannot see still gets the one routable address",
+                vec![loopback(), iface("eth0", [10, 1, 2, 3], 24)],
+                Ipv4Addr::new(203, 0, 113, 5),
+                Some(Ipv4Addr::new(10, 1, 2, 3)),
+            ),
+            (
+                "a cellular address is a last resort, not a disqualification",
+                vec![loopback(), cellular()],
+                NO_PEER,
+                Some(Ipv4Addr::new(10, 82, 3, 4)),
+            ),
+            (
+                "nothing but loopback and a peer that is not on it: no URL to give",
+                vec![loopback()],
+                Ipv4Addr::new(203, 0, 113, 5),
+                None,
+            ),
+        ];
+        for (why, interfaces, peer, expected) in cases {
+            assert_eq!(pick_host(&interfaces, peer), expected, "{why}");
+        }
     }
 
     /// A listener bound to one address answers only there, so that address is

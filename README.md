@@ -314,7 +314,7 @@ An embedder holds a `ServerHandle` (from `stream_server::start`) and never needs
 | `clean_cache_now() -> Result<EvictionReport>` | `POST /cache/clean` — run one eviction pass immediately and report what it freed, with the same protections as the scheduled sweep. See [Cache usage and cleaning](#cache-usage-and-cleaning) |
 | `set_lan_media(enabled: bool) -> Result<Option<SocketAddr>>` | start/stop the [LAN media listener](#lan-media-listener); returns its bound address afterwards. Refused while the `lanMediaEnabled` setting is false or `ServerConfig::lan_media_addr` is unset |
 | `lan_media_addr() -> Option<SocketAddr>` / `lan_media_running() -> bool` | where that listener is bound right now, and whether it is running at all |
-| `lan_media_base_url(for_peer: IpAddr) -> Option<Url>` | the base URL to hand a receiver at `for_peer` — host = the local interface on its subnet. `None` while the listener is off |
+| `lan_media_base_url(for_peer: IpAddr) -> Option<Url>` | the base URL to hand a receiver at `for_peer` — host = the local interface on its subnet, or the best-ranked one when nothing matches. `None` while the listener is off |
 
 The HTTP handlers and these methods call the same functions (`routes::system::{engine_stats, file_stats, update_settings}`, `routes::downloads::{pin_download, unpin_download, downloads, download_path}`, `routes::cache::{cache_usage, clean_cache_now}`), so they cannot drift; `server/tests/embed.rs` compares them.
 
@@ -366,6 +366,18 @@ VPN or a container bridge the first interface in the list is regularly one the
 receiver cannot route back to. A listener bound to one specific address
 reports that address as is. It is `None` whenever the listener is not running,
 which is also the signal that no cast URL can be built yet.
+
+**When no interface matches**, because the receiver is behind a router or
+because the caller has no receiver address to give (not every platform reports
+one), the candidates are *ranked* rather than taken in enumeration order: an
+ordinary interface before a tunnel or carrier link — `rmnet`, `pdp_ip`, `tun`,
+`tap`, `wg`, `dummy`, matched by name — and, within each, an RFC1918 address
+before anything else. A phone is on Wi-Fi and cellular at once and
+`getifaddrs` will happily list the cellular interface first; naming that
+address to a Chromecast is a cast that hangs forever, because a TCP connect to
+an unroutable host does not fail, it waits. The demotion is only ever a
+tie-break: a matching subnet still wins outright, and a host whose one
+routable address is cellular is still offered it rather than nothing.
 
 **Shutdown is an abort, not a drain.** `set_lan_media(false)` aborts the
 serving task and awaits it, so by the time the call returns the socket is
