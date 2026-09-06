@@ -1481,17 +1481,12 @@ impl TorrentHandle for LibrqbitHandle {
         have >= len
     }
 
-    /// Deliberate no-op: librqbit (zond/rqbit `feat/configurable-stream-lookahead`)
-    /// has no API to add trackers to a torrent that is already managed. The
-    /// tracker set lives in `ManagedTorrentShared::trackers`, a plain
-    /// `HashSet<Url>` with no interior mutability, and `Session::make_peer_rx`
-    /// hands `TrackerComms::start` a one-shot snapshot of it when the torrent
-    /// goes live; `TrackerComms::add_tracker` is private startup plumbing. The
-    /// only way to change a torrent's trackers is to remove and re-add it,
-    /// which would drop its peers and piece state mid-stream. So trackers must
-    /// be supplied to `add_torrent` by whichever request creates the engine
-    /// (see `routes::compat::get_or_create_engine` in the server crate), and
-    /// `stats().sources` reports the set that was actually used.
+    /// Whether the backend stopped this torrent because the volume ran out
+    /// of space, which the cache cleaner treats as a signal to evict rather
+    /// than as a dead torrent. The free `is_out_of_space` above is what
+    /// tells that error apart from every other fatal one, and says how the
+    /// needles were measured.
+    ///
     /// Reads the state librqbit already holds behind one lock: no stats
     /// rebuild, no syscall, cheap enough for the cleaner to ask on a timer.
     async fn is_out_of_space(&self) -> bool {
@@ -1511,6 +1506,17 @@ impl TorrentHandle for LibrqbitHandle {
         self.session.unpause(&self.handle).await
     }
 
+    /// Deliberate no-op: librqbit (zond/rqbit `feat/configurable-stream-lookahead`)
+    /// has no API to add trackers to a torrent that is already managed. The
+    /// tracker set lives in `ManagedTorrentShared::trackers`, a plain
+    /// `HashSet<Url>` with no interior mutability, and `Session::make_peer_rx`
+    /// hands `TrackerComms::start` a one-shot snapshot of it when the torrent
+    /// goes live; `TrackerComms::add_tracker` is private startup plumbing. The
+    /// only way to change a torrent's trackers is to remove and re-add it,
+    /// which would drop its peers and piece state mid-stream. So trackers must
+    /// be supplied to `add_torrent` by whichever request creates the engine
+    /// (see `routes::compat::get_or_create_engine` in the server crate), and
+    /// `stats().sources` reports the set that was actually used.
     async fn add_trackers(&self, _trackers: Vec<String>) -> Result<()> {
         Ok(())
     }
