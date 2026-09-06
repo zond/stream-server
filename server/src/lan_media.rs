@@ -168,11 +168,6 @@ impl LanMedia {
     /// modified.
     pub async fn stop(&self) {
         let mut running = self.running.lock().await;
-        // Nothing is listening once this returns, so nothing can have
-        // reached us: leaving the last session's count standing would have
-        // [`LanMedia::requests_served`] report a receiver fetching from a
-        // listener that no longer exists.
-        self.requests.store(0, Ordering::Relaxed);
         if let Some(running) = running.take() {
             running.task.abort();
             // Awaiting the aborted task is what makes the stop observable:
@@ -181,6 +176,18 @@ impl LanMedia {
             let _ = running.task.await;
             tracing::info!(bound = %running.bound, "LAN media listener stopped");
         }
+        // The reset goes below that await, not above the abort. Aborting is
+        // not instantaneous: the accept loop can already have taken a
+        // connection whose request is dispatched -- and counted, from the
+        // serving task -- while this one sits at the await. Reset first and
+        // that arrival lands on the fresh zero, handing the next session a
+        // request its receiver never made, which is exactly the reading
+        // [`LanMedia::requests_served`] exists to be trusted for. Reset last
+        // and it cannot: by then the accept loop is gone and the shutdown has
+        // reached the connection tasks, which take no further request.
+        // Unconditional, running listener or not, so the count reads zero
+        // whenever nothing is listening.
+        self.requests.store(0, Ordering::Relaxed);
     }
 
     /// Count one request arriving on the listener. Called by the tracing
