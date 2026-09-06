@@ -371,9 +371,17 @@ which is also the signal that no cast URL can be built yet.
 **When no interface matches**, because the receiver is behind a router or
 because the caller has no receiver address to give (not every platform reports
 one), the candidates are *ranked* rather than taken in enumeration order: an
-ordinary interface before a tunnel or carrier link — `rmnet`, `pdp_ip`, `tun`,
-`tap`, `wg`, `dummy`, matched by name — and, within each, an RFC1918 address
-before anything else. A phone is on Wi-Fi and cellular at once and
+ordinary interface before one no receiver on a home network can be behind —
+carrier links (`rmnet`, `ccmni`, `pdp_ip`), tunnels (`tun`, `utun`, `tap`,
+`wg`), container and VM bridges (`docker`, `br-`, `veth`, `virbr`, `vboxnet`),
+the interfaces this device hands out rather than reaches a LAN through (`ap0`,
+`p2p`, `rndis`) and `dummy`, all matched by name — and, within each, an RFC1918
+address before anything else. The bridges are why the address shape cannot
+decide this on its own: `docker0`'s `172.17.0.1` is as private as the Wi-Fi
+address beside it, and only the name tells them apart. An interface the kernel
+reported no netmask for is matched against no subnet at all, since a `0.0.0.0`
+mask matches every peer and would win outright over the interface that really
+shares one. A phone is on Wi-Fi and cellular at once and
 `getifaddrs` will happily list the cellular interface first; naming that
 address to a Chromecast is a cast that hangs forever, because a TCP connect to
 an unroutable host does not fail, it waits. The demotion is only ever a

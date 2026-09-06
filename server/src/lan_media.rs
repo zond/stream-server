@@ -252,7 +252,9 @@ fn host_for_peer(bound: SocketAddr, peer: IpAddr) -> Option<IpAddr> {
 /// The interface whose subnet contains `peer` wins outright: that is the
 /// address `peer` can demonstrably route back to, and everything else here
 /// is guesswork beside it. Loopback is a subnet like any other for that
-/// match.
+/// match, and an interface whose netmask the kernel never reported is on
+/// nobody's subnet (see [`same_subnet`]) and takes its chances in the
+/// ranking.
 ///
 /// Failing that -- `peer` is behind a router we cannot see, or there is no
 /// real peer at all, which is what every platform that does not report a
@@ -281,11 +283,12 @@ fn pick_host(interfaces: &[LocalIpv4Interface], peer: Ipv4Addr) -> Option<Ipv4Ad
 /// addresses, best first -- the `Ord` derive *is* the ranking, and
 /// [`pick_host`] takes the minimum.
 ///
-/// The order encodes two judgements, the first outranking the second. A
-/// tunnel or carrier link is one no receiver on the LAN has a route into,
-/// whatever address it carries, so both of its ranks sit below every
-/// ordinary interface. Within a kind, an RFC1918 address is what a device
-/// on a home network has and anything else is a worse guess.
+/// The order encodes two judgements, the first outranking the second. An
+/// interface the receiver cannot be behind -- a tunnel, a carrier link, a
+/// container or VM bridge (see [`OFF_LAN_INTERFACE_PREFIXES`]) -- is no way
+/// back to it whatever address it carries, so both of its ranks sit below
+/// every ordinary interface. Within a kind, an RFC1918 address is what a
+/// device on a home network has and anything else is a worse guess.
 ///
 /// Both are heuristics, and deliberately only tie-breaks: an interface on
 /// the receiver's own subnet never reaches this, and a host whose only
@@ -300,36 +303,57 @@ enum Reachability {
     /// carrier-grade NAT or link-local one. A poor guess, but the link
     /// itself is one the receiver may genuinely share.
     OtherOnOrdinary,
-    /// A private address on a tunnel: a VPN's `10.x`, which looks exactly
-    /// like a LAN address and is reachable only from inside the tunnel.
-    PrivateOnTunnel,
-    /// Everything else, the case this ranking was written for: a cellular
-    /// address, which no receiver has ever been able to reach.
-    OtherOnTunnel,
+    /// A private address on an interface the receiver is not behind: a
+    /// VPN's `10.x` or `docker0`'s `172.17.x`, each of which looks exactly
+    /// like a LAN address and is reachable only from inside its own tunnel
+    /// or bridge. This is the tie the ranking mostly exists to break --
+    /// without it, the address shape alone says these are as good as the
+    /// Wi-Fi address and enumeration order decides.
+    PrivateOffLan,
+    /// Everything else, the case that started this: a cellular address,
+    /// which no receiver has ever been able to reach.
+    OtherOffLan,
 }
 
 fn reachability(iface: &LocalIpv4Interface) -> Reachability {
-    match (is_tunnel(&iface.name), iface.addr.ip.is_private()) {
+    match (is_off_lan(&iface.name), iface.addr.ip.is_private()) {
         (false, true) => Reachability::PrivateOnOrdinary,
         (false, false) => Reachability::OtherOnOrdinary,
-        (true, true) => Reachability::PrivateOnTunnel,
-        (true, false) => Reachability::OtherOnTunnel,
+        (true, true) => Reachability::PrivateOffLan,
+        (true, false) => Reachability::OtherOffLan,
     }
 }
 
-/// Interface names that are point-to-point or virtual by construction.
-/// `rmnet` is Android's cellular interface and `pdp_ip` iOS's; `tun`, `tap`
-/// and `wg` are tunnels, a VPN typically being up for a whole session;
-/// `dummy` is the kernel's blackhole device. Loopback needs no prefix here
-/// -- it is excluded before the ranking runs.
+/// Interface names a receiver on a home network cannot be behind, whatever
+/// address they carry, by prefix.
+///
+/// Cellular: `rmnet` is Android's, `ccmni` MediaTek's, `pdp_ip` iOS's.
+/// Tunnels: `tun`, `tap` and `wg`, plus macOS and iOS's `utun`, which the
+/// `tun` prefix does not match -- a VPN is typically up for a whole
+/// session. Container and VM bridges: `docker`, Docker's user-defined
+/// `br-<id>`, the `veth` half of a container's pair, libvirt's `virbr` and
+/// VirtualBox's `vboxnet`, every one of which carries an RFC1918 address on
+/// a machine that also has a real LAN address. Interfaces this device hands
+/// *out* rather than reaches a LAN through: Android's `ap0` hotspot, `p2p`
+/// (Wi-Fi Direct) and `rndis` (USB tethering). And `dummy`, the kernel's
+/// blackhole device. Loopback needs no prefix here -- it is excluded before
+/// the ranking runs.
+///
+/// `br-` keeps its hyphen deliberately: a bare `br0` is as often a real
+/// bridged LAN interface as a virtual one, and demoting the address a
+/// bridged host actually answers on would be the mistake this list exists
+/// to avoid.
 ///
 /// Matching a name is coarse, which is why it only ever demotes: the cost
 /// of being wrong is offering a second-choice address that also works, not
 /// refusing one that does.
-const TUNNEL_INTERFACE_PREFIXES: [&str; 6] = ["rmnet", "pdp_ip", "tun", "tap", "dummy", "wg"];
+const OFF_LAN_INTERFACE_PREFIXES: [&str; 16] = [
+    "rmnet", "ccmni", "pdp_ip", "tun", "utun", "tap", "wg", "docker", "br-", "veth", "virbr",
+    "vboxnet", "ap0", "p2p", "rndis", "dummy",
+];
 
-fn is_tunnel(name: &str) -> bool {
-    TUNNEL_INTERFACE_PREFIXES.iter().any(|prefix| {
+fn is_off_lan(name: &str) -> bool {
+    OFF_LAN_INTERFACE_PREFIXES.iter().any(|prefix| {
         name.get(..prefix.len())
             .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
     })
@@ -337,6 +361,16 @@ fn is_tunnel(name: &str) -> bool {
 
 fn same_subnet(iface: &LocalIpv4Interface, peer: Ipv4Addr) -> bool {
     let mask = u32::from(iface.addr.netmask);
+    // `if-addrs` substitutes `0.0.0.0` when the kernel reports no netmask
+    // for an interface, and a zero mask matches *every* peer -- the
+    // `0.0.0.0` a caller passes when it has no receiver address included.
+    // Such an interface would win the outright match against anything at
+    // all, taking the ranking and the loopback exclusion with it. An
+    // interface with no netmask cannot be subnet-matched; let the ranking
+    // have it.
+    if mask == 0 {
+        return false;
+    }
     u32::from(iface.addr.ip) & mask == u32::from(peer) & mask
 }
 
@@ -384,12 +418,13 @@ mod tests {
     /// The whole of the host pick, on the shapes of host it runs on.
     ///
     /// Everything here is a pure function over a list, so the awkward cases
-    /// -- a phone on Wi-Fi and cellular at once, a machine with a VPN up, a
-    /// host with nothing but loopback -- are built rather than found, and no
-    /// case touches the network.
+    /// -- a phone on Wi-Fi and cellular at once, a machine with a VPN up or
+    /// containers running, an interface the kernel gave no netmask, a host
+    /// with nothing but loopback -- are built rather than found, and no case
+    /// touches the network.
     #[test]
     fn pick_host_ranks_what_a_receiver_could_reach() {
-        let cases: [(&str, Vec<LocalIpv4Interface>, Ipv4Addr, Option<Ipv4Addr>); 10] = [
+        let cases: [(&str, Vec<LocalIpv4Interface>, Ipv4Addr, Option<Ipv4Addr>); 18] = [
             (
                 "the interface on the peer's subnet wins over the ones that merely come first",
                 vec![loopback(), iface("docker0", [172, 17, 0, 1], 16), wifi()],
@@ -427,6 +462,42 @@ mod tests {
                 Some(Ipv4Addr::new(192, 168, 1, 20)),
             ),
             (
+                "a macOS VPN too, whose name the `tun` prefix does not match",
+                vec![loopback(), iface("utun0", [10, 8, 0, 6], 24), wifi()],
+                NO_PEER,
+                Some(Ipv4Addr::new(192, 168, 1, 20)),
+            ),
+            (
+                "a container bridge with no peer to match is the tie this ranking is for",
+                vec![loopback(), iface("docker0", [172, 17, 0, 1], 16), wifi()],
+                NO_PEER,
+                Some(Ipv4Addr::new(192, 168, 1, 20)),
+            ),
+            (
+                "and it loses listed last too, so it is the rank deciding and not the order",
+                vec![loopback(), wifi(), iface("docker0", [172, 17, 0, 1], 16)],
+                NO_PEER,
+                Some(Ipv4Addr::new(192, 168, 1, 20)),
+            ),
+            (
+                "a libvirt bridge is the same tie under another name",
+                vec![loopback(), iface("virbr0", [192, 168, 122, 1], 24), wifi()],
+                NO_PEER,
+                Some(Ipv4Addr::new(192, 168, 1, 20)),
+            ),
+            (
+                "the hotspot this device hands out is not a way back to the receiver",
+                vec![loopback(), iface("ap0", [192, 168, 43, 1], 24), wifi()],
+                NO_PEER,
+                Some(Ipv4Addr::new(192, 168, 1, 20)),
+            ),
+            (
+                "a MediaTek phone's cellular link ranks with every other carrier link",
+                vec![loopback(), iface("ccmni0", [10, 50, 1, 2], 24), wifi()],
+                NO_PEER,
+                Some(Ipv4Addr::new(192, 168, 1, 20)),
+            ),
+            (
                 "an ordinary interface wins even carrying a public address a tunnel's is private",
                 vec![
                     iface("wg0", [10, 9, 0, 2], 24),
@@ -452,6 +523,18 @@ mod tests {
                 vec![loopback()],
                 Ipv4Addr::new(203, 0, 113, 5),
                 None,
+            ),
+            (
+                "an interface the kernel gave no netmask is on nobody's subnet, not everybody's",
+                vec![loopback(), iface("rmnet_data0", [10, 82, 3, 4], 0), wifi()],
+                NO_PEER,
+                Some(Ipv4Addr::new(192, 168, 1, 20)),
+            ),
+            (
+                "loopback with no netmask does not swallow the match either",
+                vec![iface("lo", [127, 0, 0, 1], 0), wifi()],
+                NO_PEER,
+                Some(Ipv4Addr::new(192, 168, 1, 20)),
             ),
         ];
         for (why, interfaces, peer, expected) in cases {
