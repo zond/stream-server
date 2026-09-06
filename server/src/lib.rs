@@ -433,10 +433,13 @@ impl ServerHandle {
     /// fails.
     ///
     /// `set_lan_media(false)` **aborts** the listener rather than draining
-    /// it: when it returns, the socket is closed and any response still
-    /// streaming to the LAN has been dropped mid-body. The loopback listener
-    /// and every request in flight on it are untouched. See
-    /// [`lan_media::LanMedia::stop`].
+    /// it: when it returns, the listener socket is closed and the port is
+    /// free, so nothing new can reach the LAN surface -- but a response that
+    /// was already streaming keeps running to its end on its own connection
+    /// task. Stopping ends new fetches, not the fetch in progress; see
+    /// [`lan_media::LanMedia::stop`] for why, and for what stopping the bytes
+    /// too would cost. The loopback listener and every request in flight on
+    /// it are untouched.
     pub fn set_lan_media(&self, enabled: bool) -> anyhow::Result<Option<SocketAddr>> {
         let state = self.state.clone();
         self.block_on_server(async move {

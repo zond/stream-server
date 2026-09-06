@@ -408,14 +408,21 @@ where the receiver fetched the stream and the problem is the media. The
 addresses in those log lines are private ones on the user's own LAN, and the
 one thing that is secret, the bearer token, is never on this listener at all.
 
-**Shutdown is an abort, not a drain.** `set_lan_media(false)` aborts the
-serving task and awaits it, so by the time the call returns the socket is
-closed, the port is free and any response still streaming over the LAN has
-been dropped mid-body. That is the intent: the call marks the end of a cast
-session, and a receiver still pulling bytes is exactly what should stop —
-draining would mean waiting out a movie-length response before the LAN surface
-actually closed. The loopback listener owns a different socket and a different
-serve future; it and every request in flight on it are untouched.
+**Stopping closes the door, not the connections already through it.**
+`set_lan_media(false)` aborts the serving task and awaits it, so by the time
+the call returns the listener socket is closed and the port is free (it
+rebinds immediately): nothing new is accepted, and a connection idling on
+keep-alive is closed without serving another request. A response that is
+*already* streaming is **not** cut — axum spawns each accepted connection into
+its own task, and dropping the serve future asks those to shut down
+gracefully, which finishes the response in flight — so a receiver mid-file
+keeps being fed until it has the whole thing or hangs up. The call is still
+not a drain, which is the point: it returns at once rather than waiting out a
+movie-length response, so ending a cast session or revoking `lanMediaEnabled`
+never blocks. But it is not a kill switch for bytes already on the wire, and
+the server has none; stopping the LAN listener stops new fetches. The loopback
+listener owns a different socket and a different serve future; it and every
+request in flight on it are untouched.
 
 **The trade-off, stated plainly.** While the listener is up, *anyone* on the
 same network can fetch media from this server: the media routes are open by

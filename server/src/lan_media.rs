@@ -133,14 +133,33 @@ impl LanMedia {
 
     /// Stop the listener. A no-op when it is not running.
     ///
-    /// **Shutdown is an abort, not a drain.** The serving task is aborted and
-    /// awaited, so by the time this returns the socket is closed, the port is
-    /// free and every response that was still streaming over the LAN has been
-    /// dropped mid-body. That is the intended behaviour: this is called when
-    /// a cast session ends (or when the operator revokes `lanMediaEnabled`),
-    /// and a receiver that is still pulling bytes is exactly what should stop.
-    /// Draining instead would mean waiting for a movie-length response to
-    /// finish before the LAN surface actually closed.
+    /// **This closes the door, not the connections already through it.** The
+    /// serving task owns the `TcpListener` and the accept loop, so aborting
+    /// and awaiting it closes the socket: by the time this returns the port
+    /// is free -- it rebinds immediately -- nothing new is accepted, and a
+    /// connection sitting idle on keep-alive is closed without serving
+    /// another request.
+    ///
+    /// A response that is *already* streaming is not cut. axum spawns every
+    /// accepted connection into a task of its own, and dropping the serve
+    /// future signals those tasks rather than owning them: each answers by
+    /// calling hyper's `graceful_shutdown`, which stops the connection taking
+    /// further requests and then lets the response in flight run to its end.
+    /// So a receiver mid-file keeps being fed, by this process, through an
+    /// interface this call has otherwise shut, until it has the whole thing
+    /// or hangs up. That is measured behaviour on axum 0.8, not an inference
+    /// from the API.
+    ///
+    /// The call is still not a drain, and that is the point of the abort: it
+    /// returns as soon as the accept loop is gone instead of waiting out a
+    /// movie-length response, so ending a cast session -- or the operator
+    /// revoking `lanMediaEnabled` -- never blocks on a receiver's download.
+    /// What it does not do is stop the bytes, and nothing else here does
+    /// either: cutting a stream in progress would mean holding each
+    /// connection's task and aborting it, which needs the listener built on
+    /// `hyper_util`'s connection builder by hand (axum's `serve` hands out no
+    /// such handle) or every media body wrapped in a cancellation token.
+    /// Neither is a reordering of this function.
     ///
     /// Nothing here touches the loopback listener: it owns a different socket
     /// and a different `axum::serve` future, and requests in flight on it --
