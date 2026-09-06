@@ -845,6 +845,85 @@ fn an_authenticated_playlist_carries_its_headers_into_every_segment() -> anyhow:
     Ok(())
 }
 
+/// `r=` labels the resource the caller named, and the caller named a
+/// playlist. Copying it onto every rewritten line told the player that the
+/// MPEG-TS segments and the 16-byte AES key were playlists too -- and
+/// `r=Content-Type:application/x-mpegurl` is exactly what stremio-core
+/// sends for an HLS stream, so this was every proxied HLS stream, not a
+/// corner.
+///
+/// The reference copies it (its virtual root is the caller's whole opts
+/// string) and is worse off for it: it decides `isPlaylist` *after*
+/// merging `r=` in, so a segment reached through such a line is classified
+/// a playlist and run through the line rewriter -- MPEG-TS, rewritten as
+/// text. Its cross-origin branch drops `r=`, and that is the half ported.
+#[test]
+fn a_segment_named_by_a_rewritten_line_does_not_carry_the_playlist_s_r() -> anyhow::Result<()> {
+    let origin = Origin::start_with(|request: &Request, socket: &mut TcpStream| {
+        let (content_type, body) = if request.target().contains(".m3u8") {
+            ("application/vnd.apple.mpegurl", ORIGIN_PLAYLIST.to_string())
+        } else {
+            ("video/mp2t", "segment bytes".to_string())
+        };
+        let _ = socket.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        let _ = socket.write_all(body.as_bytes());
+        let _ = socket.flush();
+    })?;
+
+    let fixture = fixture_with(origin)?;
+    let client = reqwest::blocking::Client::new();
+    let playlist = client
+        .get(format!(
+            "{}/proxy/d={}&r={}/live/master.m3u8",
+            fixture.base,
+            encode(&format!("http://{}", fixture.origin.addr)),
+            encode("Content-Type:application/x-mpegurl")
+        ))
+        .send()?;
+
+    assert_eq!(playlist.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        playlist
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/x-mpegurl"),
+        "the resource the caller named is labelled the way the caller said"
+    );
+    let body = playlist.text()?;
+    let segment = body
+        .lines()
+        .find(|line| !line.starts_with('#') && !line.is_empty())
+        .expect("the rewritten playlist names a segment")
+        .to_string();
+    assert!(
+        !segment.contains("r="),
+        "the label belongs to the playlist, not to what it names: {segment}"
+    );
+
+    let fetched = client.get(format!("{}{segment}", fixture.base)).send()?;
+    assert_eq!(fetched.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        fetched
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("video/mp2t"),
+        "so the segment arrives as what it is, not as a playlist"
+    );
+    assert_eq!(fetched.text()?, "segment bytes");
+
+    drop(fixture.handle);
+    Ok(())
+}
+
 /// `r=` comes from addon metadata, and one of its names is a loaded gun:
 /// `r=Content-Length:1` in front of a megabyte is a response hyper will not
 /// write. In a debug build the connection task panics on it; in a release

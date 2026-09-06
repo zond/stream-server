@@ -372,23 +372,37 @@ impl ProxyParams {
         params
     }
 
-    /// Everything but the target, spelled as query parameters, ready to be
-    /// appended to a `/proxy/?d=<url>` a rewrite is writing.
+    /// Everything a rewritten playlist line has to carry besides its own
+    /// target, spelled as query parameters: `h=` and `p=`.
     ///
-    /// This is what a rewritten playlist line has to carry: a segment of an
-    /// authenticated stream needs the same `h=` the playlist needed, a
-    /// player told to read a corrected `Content-Type` needs it corrected on
-    /// the segments too, and the segment read has to belong to the same
-    /// player as the playlist that named it.
+    /// `h=` because a segment of an authenticated stream needs the same
+    /// authorization the playlist needed -- without it the playlist fetched
+    /// `200` and every segment `403`. `p=` because the segment read has to
+    /// belong to the same player as the playlist that named it: closing an
+    /// HLS player has to break the read that is actually in flight, and
+    /// that is a segment, never the playlist.
+    ///
+    /// **`r=` is deliberately not here.** It is a response-header override
+    /// for *the resource the caller named*, and the caller named a
+    /// playlist: stremio-core sends `r=Content-Type:application/x-mpegurl`
+    /// for an HLS stream, so copying it onto every line labelled the
+    /// segments and the AES keys as playlists too. mpv was handed MPEG-TS
+    /// under `application/x-mpegurl` and a 16-byte key under it as well.
+    ///
+    /// The reference does copy it, on every same-origin line and every
+    /// absolute path, because its virtual root is the caller's whole opts
+    /// string -- and there it is worse than here: it computes `isPlaylist`
+    /// *after* merging `r=` into the response headers, so a segment fetched
+    /// through such a line is itself classified a playlist and run through
+    /// the line rewriter. Its own cross-origin branch drops `r=` (`newOpts`
+    /// has only `d` and `h`), which is the half worth keeping.
     fn carried(&self) -> String {
         let mut carried = String::new();
-        for (key, headers) in [("h", &self.request_headers), ("r", &self.response_headers)] {
-            for (name, value) in headers {
-                carried.push_str(&format!(
-                    "&{key}={}",
-                    urlencoding::encode(&format!("{name}:{value}"))
-                ));
-            }
+        for (name, value) in &self.request_headers {
+            carried.push_str(&format!(
+                "&h={}",
+                urlencoding::encode(&format!("{name}:{value}"))
+            ));
         }
         if let Some(token) = &self.player_token {
             carried.push_str(&format!("&p={}", urlencoding::encode(token)));
@@ -891,14 +905,14 @@ pub async fn close_proxy_streams(
 }
 
 /// Rewrites every URL in a playlist to come back through this proxy,
-/// carrying `carried` -- [`ProxyParams::carried`], the `h=`/`r=`/`p=` the
+/// carrying `carried` -- [`ProxyParams::carried`], the `h=`/`p=` the
 /// playlist's own URL arrived with -- into each one.
 ///
-/// All of them, because a segment is not a different stream: it needs the
-/// same request headers to be allowed at the origin, the same response
-/// headers to be read correctly by the player, and the same player token,
-/// since closing an HLS player has to close the segment read that is
-/// actually in flight rather than the playlist read that is not.
+/// Both of them, because a segment is not a different stream: it needs the
+/// same request headers to be allowed at the origin, and the same player
+/// token, since closing an HLS player has to close the segment read that is
+/// actually in flight rather than the playlist read that is not. What it
+/// does *not* need is the caller's `r=`; see [`ProxyParams::carried`].
 fn rewrite_playlist(body: &str, base_url: &Url, carried: &str) -> String {
     let mut rewritten = String::new();
     for line in body.lines() {
@@ -1101,6 +1115,9 @@ mod tests {
     /// through a rewritten line is asked for with the headers the
     /// playlist's own URL carried. Without this an authenticated HLS stream
     /// served its playlist and 403ed every segment.
+    ///
+    /// And `r=` stays behind. The playlist is what the caller labelled; a
+    /// segment carrying that label is MPEG-TS announced as a playlist.
     #[test]
     fn the_headers_are_carried_into_every_rewritten_line_too() {
         let params = ProxyParams::parse(
@@ -1110,19 +1127,19 @@ mod tests {
         assert_eq!(
             rewritten,
             format!(
-                "{}&h=Authorization%3ABearer%20abc&r=Content-Type%3Avideo%2Fmp4&p=one\n",
+                "{}&h=Authorization%3ABearer%20abc&p=one\n",
                 proxied("http://example.com/streams/seg-0.ts")
             )
         );
     }
 
-    /// Several of each, and the order is the same every time: the rewritten
+    /// Several of them, and the order is the same every time: the rewritten
     /// playlist is a body a player may cache and re-fetch, and two spellings
     /// of the same playlist would be two.
     #[test]
     fn carried_parameters_come_out_in_a_stable_order() {
         let params = ProxyParams::parse("d=whatever&h=B%3A2&h=A%3A1&r=Y%3Ayes&r=X%3Ano&p=t");
-        assert_eq!(params.carried(), "&h=A%3A1&h=B%3A2&r=X%3Ano&r=Y%3Ayes&p=t");
+        assert_eq!(params.carried(), "&h=A%3A1&h=B%3A2&p=t");
     }
 
     #[test]
