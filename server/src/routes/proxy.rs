@@ -1,7 +1,7 @@
 use crate::state::AppState;
 use axum::{
     Router,
-    extract::{Path, Query},
+    extract::Query,
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header, response::Builder},
     response::{IntoResponse, Response},
     routing::any,
@@ -107,14 +107,32 @@ pub async fn proxy_root_handler(
     proxy(None, raw_query.0, params.0, headers, method).await
 }
 
+/// The Core path format, read from the URI rather than from the router's
+/// capture, because the capture is percent-*decoded*.
+///
+/// Both [`Path`] and `RawPathParams` decode what the wildcard matched, and
+/// the target's path is not ours to decode: `%2F` became a path separator,
+/// `%3F` began a query and everything from a `%23` on was read as a
+/// fragment and lost. Measured end to end, `https://host/a%2Fb/film.mkv`
+/// reached the origin as `GET /a/b/film.mkv` -- a signed link whose path
+/// segment carries a base64 signature gets a 403, and a file named with a
+/// `#` gets a 404. [`Uri::path`] is the target as it came off the wire, so
+/// what the caller encoded is what the origin is asked for. It also means
+/// the `d=`/`h=`/`r=` segment is decoded exactly once, by
+/// `form_urlencoded` -- a header value carrying a `%` or a `&` used to be
+/// decoded twice and lose its meaning.
 pub async fn proxy_handler(
-    Path(rest): Path<String>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
     method: Method,
 ) -> impl IntoResponse {
-    proxy(Some(rest), raw_query, params, headers, method).await
+    // The route this handler serves is `/proxy/{*rest}`, so the prefix is
+    // always there; an empty rest could only come of a router change, and it
+    // answers 400 the way any unparseable target does.
+    let rest = uri.path().strip_prefix("/proxy/").unwrap_or_default();
+    proxy(Some(rest.to_string()), raw_query, params, headers, method).await
 }
 
 /// `rest` is what the path held after `/proxy/`, and *that is what decides

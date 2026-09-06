@@ -52,6 +52,16 @@ impl Request {
     fn range(&self) -> Option<&str> {
         self.header("range")
     }
+
+    /// The request target exactly as it came off the wire -- still
+    /// percent-encoded, which is the only form in which a `%2F` can be told
+    /// from the separator it stands for.
+    fn target(&self) -> &str {
+        self.line
+            .split_whitespace()
+            .nth(1)
+            .expect("a request line has a target")
+    }
 }
 
 /// A one-connection-per-thread origin that answers with whatever its
@@ -419,6 +429,38 @@ fn a_url_shaped_d_in_the_target_query_is_not_fetched_instead_of_the_target() -> 
     assert_eq!(
         fixture.origin.next_request().line,
         "GET /film.mkv?d=http%3A%2F%2Fnot-the-target.invalid%2Fother.mkv HTTP/1.1"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
+/// What the caller encoded is what the origin is asked for. axum decodes
+/// the wildcard capture, so reading the path from there turned `%2F` into a
+/// separator, `%3F` into the start of a query and dropped everything from
+/// `%23` on -- a signed link whose path segment carries a base64 signature
+/// 403s, and a file named with a `#` 404s. The `%20` the earlier test used
+/// round-tripped by accident: a space survives being decoded and re-encoded,
+/// and the other three do not.
+#[test]
+fn percent_encoding_in_the_path_reaches_the_origin_as_the_caller_wrote_it() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let origin = format!("http://{}", fixture.origin.addr);
+    let encoded_path = "a%2Fb/sig%3Dx%2Fy/film%20name%231%3Fnot-a-query.mkv";
+    let response = reqwest::blocking::Client::new()
+        .get(format!(
+            "{}/proxy/d={}/{encoded_path}",
+            fixture.base,
+            encode(&origin)
+        ))
+        .send()?;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        fixture.origin.next_request().target(),
+        format!("/{encoded_path}"),
+        "every escape survives the trip, including the ones that change \
+         meaning when they do not"
     );
 
     drop(fixture.handle);
