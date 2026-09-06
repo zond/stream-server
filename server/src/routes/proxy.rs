@@ -80,6 +80,37 @@ fn origin_key(url: &Url) -> String {
     url.origin().ascii_serialization()
 }
 
+/// Whether a `206`'s `Content-Range` says the part it carries is the whole
+/// entity -- `bytes 0-<len-1>/<len>`.
+///
+/// Which is not a corner: a player that opens a stream with
+/// `Range: bytes=0-` to find out whether the origin is seekable gets a
+/// `206` back with the entire body in it, and for a playlist that body is
+/// one we must still rewrite. A `206` that carries a *part* is a fragment
+/// of a playlist, and there is nothing coherent to do with a rewritten
+/// fragment: its length is not the length the range promised, and the
+/// lines at its edges are cut.
+fn covers_the_whole_entity(content_range: &str) -> bool {
+    let Some((range, total)) = content_range
+        .trim()
+        .strip_prefix("bytes ")
+        .and_then(|range| range.split_once('/'))
+    else {
+        return false;
+    };
+    let Some((first, last)) = range.split_once('-') else {
+        return false;
+    };
+    let (Ok(first), Ok(last), Ok(total)) = (
+        first.trim().parse::<u64>(),
+        last.trim().parse::<u64>(),
+        total.trim().parse::<u64>(),
+    ) else {
+        return false;
+    };
+    first == 0 && total > 0 && last + 1 == total
+}
+
 /// Whether a URL's path names a playlist by its extension.
 ///
 /// Case-insensitively, which the reference is not: `path.extname()` against
@@ -748,8 +779,23 @@ async fn proxy(
     // asking how big the resource is was told nothing is there. Both fall
     // through to the plain relay, which is what they always should have
     // been.
-    let rewriting_playlist =
-        is_playlist && !encoded_body && status.is_success() && method != Method::HEAD;
+    // A rewritten body replaces the origin's, so the response has to be one
+    // that *is* the whole body. `status.is_success()` was not that test: a
+    // `206` passed it, and a rewritten fragment of a playlist is a body
+    // whose length is not the length the range promised and whose edge
+    // lines are cut in half. A `206` that carries the whole entity is
+    // different, and it is not a corner -- it is what an origin answers the
+    // `Range: bytes=0-` a player opens a stream with -- so it is rewritten
+    // and answered as the `200` it has become. The reference guards none of
+    // this; it rewrites a `206` and relays its `Content-Range` beside a body
+    // that no longer matches it.
+    let whole_body = status == StatusCode::OK
+        || (status == StatusCode::PARTIAL_CONTENT
+            && res_headers
+                .get(header::CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(covers_the_whole_entity));
+    let rewriting_playlist = is_playlist && !encoded_body && whole_body && method != Method::HEAD;
     if is_playlist && encoded_body {
         tracing::warn!(
             content_encoding = %content_encoding,
@@ -757,8 +803,21 @@ async fn proxy(
             "relaying a compressed playlist unrewritten; its segments will bypass the proxy"
         );
     }
+    if is_playlist && !whole_body && status.is_success() && method != Method::HEAD {
+        tracing::warn!(
+            status = %status,
+            url = %fetched_url,
+            "relaying part of a playlist unrewritten; its segments will bypass the proxy"
+        );
+    }
 
-    let mut res_builder = Response::builder().status(status);
+    // A rewritten playlist is the whole resource however it was asked for,
+    // so it is answered `200` even when the origin said `206`.
+    let mut res_builder = Response::builder().status(if rewriting_playlist {
+        StatusCode::OK
+    } else {
+        status
+    });
 
     // What the origin said about the *resource*: true of whatever we send
     // back, because none of it describes the bytes on this hop.
@@ -1453,6 +1512,23 @@ mod tests {
         let response = finalize_response(builder, axum::body::Body::empty());
 
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// The two `206`s that mean different things. The first is what an
+    /// origin answers a player's opening `Range: bytes=0-` with: the whole
+    /// entity, which is a playlist to rewrite. The second is a fragment,
+    /// and there is no rewriting a fragment.
+    #[test]
+    fn only_a_206_that_carries_the_whole_entity_is_a_body_to_rewrite() {
+        assert!(covers_the_whole_entity("bytes 0-179/180"));
+        assert!(!covers_the_whole_entity("bytes 10-40/180"));
+        assert!(!covers_the_whole_entity("bytes 0-178/180"));
+        // An origin that will not say how long the entity is has not said
+        // this is all of it.
+        assert!(!covers_the_whole_entity("bytes 0-179/*"));
+        assert!(!covers_the_whole_entity("bytes */180"));
+        assert!(!covers_the_whole_entity("items 0-179/180"));
+        assert!(!covers_the_whole_entity(""));
     }
 
     #[test]

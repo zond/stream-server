@@ -1499,6 +1499,107 @@ fn only_a_2xx_get_at_a_playlist_url_is_rewritten_as_a_playlist() -> anyhow::Resu
     Ok(())
 }
 
+/// A ranged request for a playlist, which is a shape both this proxy and
+/// the reference used to get wrong in the same way: a `206` was rewritten,
+/// its `Content-Range` describing an entity the rewritten body is not.
+///
+/// The two `206`s mean different things. `Range: bytes=0-` -- what a player
+/// sends to find out whether the origin is seekable -- comes back as the
+/// whole entity, and that is a playlist to rewrite and to answer as the
+/// `200` it has become. A `206` carrying a *part* is a fragment whose edge
+/// lines are cut in half: it is relayed exactly as the origin sent it,
+/// range headers and all, with a WARN saying its segments will bypass the
+/// proxy.
+#[test]
+fn a_ranged_playlist_is_rewritten_only_when_the_range_is_all_of_it() -> anyhow::Result<()> {
+    let origin = Origin::start_with(|request: &Request, socket: &mut TcpStream| {
+        let length = ORIGIN_PLAYLIST.len();
+        let (first, last) = match request.range() {
+            Some(value) => {
+                let (first, last) = value
+                    .trim_start_matches("bytes=")
+                    .split_once('-')
+                    .expect("the test sends a well-formed range");
+                (
+                    first.parse::<usize>().expect("a first byte"),
+                    if last.is_empty() {
+                        length - 1
+                    } else {
+                        last.parse::<usize>().expect("a last byte")
+                    },
+                )
+            }
+            None => (0, length - 1),
+        };
+        let body = &ORIGIN_PLAYLIST[first..=last];
+        let _ = socket.write_all(
+            format!(
+                "HTTP/1.1 206 Partial Content\r\n\
+                 Content-Type: application/vnd.apple.mpegurl\r\n\
+                 Content-Range: bytes {first}-{last}/{length}\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        let _ = socket.flush();
+    })?;
+
+    let fixture = fixture_with(origin)?;
+    let client = reqwest::blocking::Client::new();
+    let url = format!(
+        "{}/proxy/?d={}",
+        fixture.base,
+        encode(&format!("http://{}/live/master.m3u8", fixture.origin.addr))
+    );
+
+    let whole = client
+        .get(&url)
+        .header(reqwest::header::RANGE, "bytes=0-")
+        .send()?;
+    assert_eq!(
+        whole.status(),
+        reqwest::StatusCode::OK,
+        "the rewritten body is the whole resource, whatever was asked for"
+    );
+    assert!(
+        whole
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .is_none(),
+        "and it is not a range of the origin's entity any more"
+    );
+    assert_eq!(
+        whole.text()?,
+        expected_playlist(fixture.origin.addr),
+        "every line rewritten, exactly as for a 200"
+    );
+
+    let part = client
+        .get(&url)
+        .header(reqwest::header::RANGE, "bytes=10-40")
+        .send()?;
+    assert_eq!(
+        part.status(),
+        reqwest::StatusCode::PARTIAL_CONTENT,
+        "a fragment is relayed as the fragment it is"
+    );
+    assert_eq!(
+        part.headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok()),
+        Some(format!("bytes 10-40/{}", ORIGIN_PLAYLIST.len()).as_str())
+    );
+    assert_eq!(
+        part.text()?,
+        ORIGIN_PLAYLIST[10..=40],
+        "the origin's own bytes -- there is no rewriting half a line"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
 /// An origin that never stops sending: a long film, a live stream, the
 /// swarm that `network-timeout` is generous for. Closing has to be visible
 /// against *this*, not against a body that was about to end anyway.
