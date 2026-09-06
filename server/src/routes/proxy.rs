@@ -454,7 +454,10 @@ async fn proxy(
     // exactly what happened: this stream was here and was deliberately
     // ended. A `404` would read as a target that never existed and send a
     // client looking for a typo in its URL. The check comes before the
-    // fetch, so a refusal costs the origin nothing.
+    // fetch, so a refusal costs the origin nothing -- but it is only the
+    // cheap half of the refusal: the fetch below takes as long as the origin
+    // takes, and the token can be retired while it does. The registration
+    // asks again (see the `attach` below).
     if let Some(token) = player_token.as_deref()
         && state.proxy_streams.is_closed(token)
     {
@@ -722,10 +725,24 @@ async fn proxy(
     }
 
     // Registered under the client's token, so the client can end this exact
-    // read rather than waiting out a timeout meant for a slow swarm.
-    let stream = state
+    // read rather than waiting out a timeout meant for a slow swarm -- or
+    // refused, if the close landed while the origin was still thinking. Same
+    // `410` and for the same reason as the check above: the stream was asked
+    // for, and its client ended it before a byte of it arrived.
+    let Some(stream) = state
         .proxy_streams
-        .attach(player_token, response.bytes_stream());
+        .attach(player_token.clone(), response.bytes_stream())
+    else {
+        tracing::debug!(
+            token = player_token.as_deref().unwrap_or_default(),
+            "a player token was closed while its origin was being fetched"
+        );
+        return (
+            StatusCode::GONE,
+            "This player's stream was closed by its client",
+        )
+            .into_response();
+    };
     finalize_response(res_builder, axum::body::Body::from_stream(stream))
 }
 

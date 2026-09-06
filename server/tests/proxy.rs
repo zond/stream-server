@@ -1299,6 +1299,71 @@ fn a_playlist_read_is_registered_and_can_be_closed() -> anyhow::Result<()> {
         "the wedged playlist read ends now, rather than at a timeout"
     );
 
+/// The close arriving during the origin's time-to-first-byte. The token was
+/// live when `/proxy` checked it, before the fetch, and retired by the time
+/// the origin's headers came back -- so the check that costs the origin
+/// nothing is exactly the check that cannot see this.
+///
+/// Measured before the fix, against a RealDebrid file behind a slow first
+/// byte: the close answered `{"closed":0}`, because nothing was registered
+/// yet, and 3.9 MB was then relayed under a token that no longer existed.
+/// The registration is what refuses now, so the answer is the same `410` a
+/// later request would have got.
+#[test]
+fn closing_during_the_origin_s_time_to_first_byte_ends_that_stream() -> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const PAYLOAD: usize = 64 * 1024;
+
+    // Nothing at all until the test says so: the request has arrived, the
+    // pre-fetch check has passed, and not a header has been written back.
+    let answer = std::sync::Arc::new(AtomicBool::new(false));
+    let origin_answer = answer.clone();
+    let origin = Origin::start_with(move |_request: &Request, socket: &mut TcpStream| {
+        while !origin_answer.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let _ = socket.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\n\
+                 Content-Length: {PAYLOAD}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        let _ = socket.write_all(&vec![0u8; PAYLOAD]);
+        let _ = socket.flush();
+    })?;
+
+    let fixture = fixture_with(origin)?;
+    let target = format!("http://{}/slow.mp4", fixture.origin.addr);
+    let url = format!(
+        "{}/proxy/?d={}&p=player-slow",
+        fixture.base,
+        encode(&target)
+    );
+    let reader = std::thread::spawn(move || {
+        let response = reqwest::blocking::Client::new().get(url).send()?;
+        let status = response.status();
+        Ok::<_, reqwest::Error>((status, response.bytes()?.len()))
+    });
+
+    // The origin has been asked and has not answered, which is the window.
+    fixture.origin.next_request();
+    assert_eq!(
+        fixture.handle.close_proxy_streams("player-slow"),
+        0,
+        "there is nothing live to close yet -- that is what makes this a race"
+    );
+    answer.store(true, Ordering::SeqCst);
+
+    let (status, relayed) = reader.join().expect("the reader thread")?;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::GONE,
+        "the stream its client already ended is not served to it"
+    );
+    assert_ne!(relayed, PAYLOAD, "and the origin's body is not relayed");
+
     drop(fixture.handle);
     Ok(())
 }

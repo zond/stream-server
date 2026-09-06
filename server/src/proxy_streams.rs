@@ -94,24 +94,50 @@ impl ProxyStreams {
     /// registers it under `token`. Without a token there is nothing to
     /// address the stream by, so it is only wrapped -- the caller gets one
     /// body type either way.
-    pub fn attach<S, E>(self: &Arc<Self>, token: Option<String>, inner: S) -> ClosableStream
+    ///
+    /// `None` means the token was retired while this stream was being
+    /// opened, and the caller must refuse the read rather than serve it.
+    /// `/proxy` asks [`ProxyStreams::is_closed`] before it opens the origin,
+    /// which is the cheap half -- a refusal that costs the origin nothing --
+    /// but that check is over long before the origin's first byte arrives.
+    /// The window is the whole time-to-first-byte: measured, a close during
+    /// one answered `{"closed":0}` and 3.9 MB was relayed afterwards, under
+    /// a token nothing could name any more. So the retirement and the
+    /// registration are decided under the same lock, and a stream either
+    /// belongs to a token that is still live or is never registered at all.
+    pub fn attach<S, E>(self: &Arc<Self>, token: Option<String>, inner: S) -> Option<ClosableStream>
     where
         S: Stream<Item = Result<Bytes, E>> + Send + 'static,
         E: std::error::Error + Send + Sync + 'static,
     {
         let inner = Box::pin(inner.map(|chunk| chunk.map_err(std::io::Error::other)));
         let Some(token) = token else {
-            return ClosableStream {
+            return Some(ClosableStream {
                 inner,
                 close: None,
                 registration: None,
                 ended: false,
-            };
+            });
         };
         let (close, closed) = oneshot::channel();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.live.insert(id, LiveStream { token, close });
-        ClosableStream {
+        {
+            // The retired list is the lock both sides take, and each takes
+            // it before touching `live`: `close` writes the token down and
+            // then reads `live`, this reads the token and then writes
+            // `live`. There is no interleaving left in which a close sees no
+            // stream and the stream sees no closure. A poisoned lock refuses
+            // the read, which is the safe direction: it can only cost a
+            // player a stream it can ask for again.
+            let Ok(retired) = self.closed.lock() else {
+                return None;
+            };
+            if retired.iter().any(|retired| retired == &token) {
+                return None;
+            }
+            self.live.insert(id, LiveStream { token, close });
+        }
+        Some(ClosableStream {
             inner,
             close: Some(closed),
             registration: Some(Registration {
@@ -119,7 +145,7 @@ impl ProxyStreams {
                 id,
             }),
             ended: false,
-        }
+        })
     }
 
     /// Ends every live stream carrying `token`, and answers how many that
@@ -133,14 +159,24 @@ impl ProxyStreams {
     /// its body broke must not be handed a new stream on a name its client
     /// has finished with. Striking off before closing leaves no window in
     /// which the reconnect arrives while the token is still good.
+    ///
+    /// Striking off and reading `live` happen under one lock, for the
+    /// stream that is not back yet but is already on its way: a `/proxy`
+    /// request waiting on an origin's headers is registered by
+    /// [`ProxyStreams::attach`] under that same lock, so it is either
+    /// counted here or refused there.
     pub fn close(&self, token: &str) -> usize {
-        self.remember_closed(token);
-        let ids: Vec<u64> = self
-            .live
-            .iter()
-            .filter(|entry| entry.value().token == token)
-            .map(|entry| *entry.key())
-            .collect();
+        let ids: Vec<u64> = {
+            let Ok(mut retired) = self.closed.lock() else {
+                return 0;
+            };
+            Self::remember_closed(&mut retired, token);
+            self.live
+                .iter()
+                .filter(|entry| entry.value().token == token)
+                .map(|entry| *entry.key())
+                .collect()
+        };
         let mut closed = 0;
         for id in ids {
             // A stream that ended between the scan and here has already
@@ -166,7 +202,9 @@ impl ProxyStreams {
     /// an aborted body through the URL it already has, token and all, so
     /// without this the close is a stutter in the playback it was meant to
     /// end. `/proxy` asks this before it opens anything, so a refused
-    /// request costs the origin nothing.
+    /// request costs the origin nothing -- and asks again, by way of
+    /// [`ProxyStreams::attach`], once the origin has answered, because a
+    /// token can be retired while a fetch is in flight.
     pub fn is_closed(&self, token: &str) -> bool {
         self.closed
             .lock()
@@ -174,11 +212,10 @@ impl ProxyStreams {
     }
 
     /// Writes `token` down as closed, evicting the oldest once there are
-    /// more than [`CLOSED_TOKENS_REMEMBERED`] of them.
-    fn remember_closed(&self, token: &str) {
-        let Ok(mut closed) = self.closed.lock() else {
-            return;
-        };
+    /// more than [`CLOSED_TOKENS_REMEMBERED`] of them. Takes the list rather
+    /// than the lock, because its caller holds that lock across more than
+    /// this.
+    fn remember_closed(closed: &mut VecDeque<String>, token: &str) {
         if closed.iter().any(|closed| closed == token) {
             return;
         }
@@ -263,6 +300,25 @@ mod tests {
         // Closing twice is harmless, and does not double the bookkeeping.
         assert_eq!(streams.close("player-one"), 0);
         assert!(streams.is_closed("player-one"));
+    }
+
+    /// A stream opened while its token was live but registered after the
+    /// close: the fetch was in flight the whole time, which is the window
+    /// `/proxy`'s pre-fetch check cannot see. It is refused rather than
+    /// registered, so the close that already answered `{"closed":0}` is
+    /// still the end of that player's stream.
+    #[test]
+    fn a_token_retired_while_its_stream_was_opening_is_refused_the_stream() {
+        let streams = Arc::new(ProxyStreams::new());
+        assert_eq!(streams.close("player-one"), 0, "nothing was live yet");
+        let empty = futures_util::stream::empty::<Result<Bytes, std::io::Error>>();
+        assert!(
+            streams
+                .attach(Some("player-one".to_string()), empty)
+                .is_none(),
+            "the origin answered, and there is nobody left to answer it to"
+        );
+        assert_eq!(streams.live(), 0, "and nothing was registered");
     }
 
     /// The bound is a bound: the oldest token is forgotten rather than the
