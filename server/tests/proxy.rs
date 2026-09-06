@@ -1917,6 +1917,22 @@ fn an_unfollowed_redirect_still_says_where_it_pointed() -> anyhow::Result<()> {
         Some("ftp://files.example.com/film.mkv"),
         "the origin's own value, not one resolved or rewritten through the proxy"
     );
+    // And readable by the client that has to act on it. A browser-hosted
+    // client sees only the headers CORS names, and `location` was not in
+    // the allow-list -- so the diagnostic this relay exists to be arrived
+    // and could not be read in exactly the client shape that reads headers
+    // by name.
+    assert!(
+        response
+            .headers()
+            .get("access-control-expose-headers")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .contains("location"),
+        "the relayed Location has to be readable from script: {:?}",
+        response.headers().get("access-control-expose-headers")
+    );
 
     drop(fixture.handle);
     Ok(())

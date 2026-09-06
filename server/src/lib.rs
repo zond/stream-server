@@ -1179,6 +1179,11 @@ pub fn build_router(state: AppState) -> Router {
 ///   control API's bearer header at all under `permissive()`.
 /// * A player that seeks needs `Content-Range`, `Content-Length` and
 ///   `Accept-Ranges` readable from script, so they are exposed by name too.
+/// * `Location` goes with them. `/proxy` relays the `Location` of a `3xx` it
+///   declines to follow (`routes::proxy`), and that header exists to be read
+///   -- it is the only thing saying where the origin sent us. Unexposed, the
+///   one client shape that reads response headers by name, a browser-hosted
+///   one, could not see it, which is the shape the relay was for.
 ///
 /// Methods stay a wildcard: every method this server answers is one of the
 /// safelisted ones or is preflighted, and `*` is honoured for methods
@@ -1201,6 +1206,7 @@ fn cors_layer() -> CorsLayer {
             header::CONTENT_LENGTH,
             header::CONTENT_RANGE,
             header::CONTENT_TYPE,
+            header::LOCATION,
         ])
         .max_age(Duration::from_secs(24 * 60 * 60))
 }

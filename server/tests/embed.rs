@@ -257,7 +257,8 @@ fn starts_and_stops_embedded_server() -> anyhow::Result<()> {
 /// covers `Authorization`, which a browser-hosted client needs for the control
 /// API -- so the allow-list is spelled out. Seeking needs `Content-Range`,
 /// `Content-Length` and `Accept-Ranges` readable from script, so those are
-/// exposed by name.
+/// exposed by name -- and `Location` with them, which `/proxy` relays for a
+/// `3xx` it will not follow and which is unreadable from script otherwise.
 ///
 /// The CORS layer answers a preflight itself, before routing, so this holds
 /// for every path on both listeners.
@@ -307,6 +308,7 @@ fn cors_names_the_request_and_response_headers_a_cast_receiver_needs() -> anyhow
         "content-length",
         "content-range",
         "content-type",
+        "location",
     ] {
         assert!(
             exposed.contains(header),
