@@ -748,6 +748,56 @@ fn an_authenticated_playlist_carries_its_headers_into_every_segment() -> anyhow:
     Ok(())
 }
 
+/// `h=` and `r=` are overrides, and each collides with a header that is
+/// already there: the player's `User-Agent` on the way out, the origin's
+/// `Content-Type` on the way back. Both used to be *added*, so the origin
+/// saw two user agents and the player two content types -- and a client
+/// reading the first of two read the origin's, which is the value
+/// stremio-core sends `r=` to correct.
+#[test]
+fn a_header_override_replaces_the_header_it_names() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let response = reqwest::blocking::Client::new()
+        .get(format!(
+            "{}/proxy/d={}&h={}&r={}/movie.mp4",
+            fixture.base,
+            encode(&format!("http://{}", fixture.origin.addr)),
+            encode("User-Agent:addon/1"),
+            encode("Content-Type:video/x-corrected")
+        ))
+        .header(reqwest::header::USER_AGENT, "mpv/0.41")
+        .send()?;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let content_types: Vec<&str> = response
+        .headers()
+        .get_all(reqwest::header::CONTENT_TYPE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+    assert_eq!(
+        content_types,
+        vec!["video/x-corrected"],
+        "the origin said video/mp4, and r= is what replaces it"
+    );
+
+    let request = fixture.origin.next_request();
+    let user_agents: Vec<&str> = request
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+        .map(|(_, value)| value.as_str())
+        .collect();
+    assert_eq!(
+        user_agents,
+        vec!["addon/1"],
+        "the addon's user agent, not the player's as well"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
 /// A CDN that redirects to an edge, which is what an ordinary HLS
 /// deployment looks like. The playlist's relative lines are relative to
 /// where it *came from*, so they have to be resolved against the edge and

@@ -97,11 +97,21 @@ fn is_certificate_error(error: &reqwest::Error) -> bool {
     false
 }
 
-/// Applies the `r=` (Core-format) custom response headers to a response
-/// builder, validating each name/value pair first so that a malicious or
-/// malformed header (e.g. containing a newline) can never poison the
-/// builder's internal error state. Invalid pairs are skipped and logged at
-/// debug level rather than propagated.
+/// Applies the `r=` custom response headers to a response builder,
+/// validating each name/value pair first so that a malicious or malformed
+/// header (e.g. containing a newline) can never poison the builder's
+/// internal error state. Invalid pairs are skipped and logged at debug
+/// level rather than propagated.
+///
+/// They **replace**, which is the whole of what `r=` is for. Appending
+/// them, as this did, left the origin's own header in place beside the
+/// override and a client reading the first of two `content-type`s got the
+/// origin's -- which is exactly the value stremio-core sends `r=` to
+/// correct. `Builder::header` appends; `HeaderMap::insert` takes the name
+/// over entirely, which is why the map is reached through `headers_mut`
+/// rather than the builder's own method. A builder already in an error
+/// state has no map to reach, and skipping is right there too: it is about
+/// to become a 502 (see [`finalize_response`]).
 fn apply_custom_response_headers(
     mut builder: Builder,
     custom_response_headers: &BTreeMap<String, String>,
@@ -112,7 +122,9 @@ fn apply_custom_response_headers(
             HeaderValue::from_str(value),
         ) {
             (Ok(header_name), Ok(header_value)) => {
-                builder = builder.header(header_name, header_value);
+                if let Some(headers) = builder.headers_mut() {
+                    headers.insert(header_name, header_value);
+                }
             }
             _ => {
                 tracing::debug!(
@@ -124,6 +136,36 @@ fn apply_custom_response_headers(
         }
     }
     builder
+}
+
+/// The `h=` custom request headers as a header map, validated the same way
+/// and for the same reason as the response ones.
+///
+/// A map rather than a series of `RequestBuilder::header` calls because
+/// those *append*: an addon's `h=User-Agent:...` used to be sent alongside
+/// the player's own, two `user-agent` headers on one request, and which of
+/// them the origin honoured was its business. `RequestBuilder::headers`
+/// replaces the name outright, which is what an override means.
+fn custom_request_headers(overrides: &BTreeMap<String, String>) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for (name, value) in overrides {
+        match (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            (Ok(header_name), Ok(header_value)) => {
+                headers.insert(header_name, header_value);
+            }
+            _ => {
+                tracing::debug!(
+                    name = %name,
+                    value = %value,
+                    "Skipping invalid custom request header from h= proxy param"
+                );
+            }
+        }
+    }
+    headers
 }
 
 /// Finishes building a response, turning a builder error (which can no
@@ -399,6 +441,7 @@ async fn proxy(
         }
     };
 
+    let custom_request_headers = custom_request_headers(&params.request_headers);
     let build_request = |client: &Client| {
         let mut req_builder = client.request(method.clone(), url.clone());
 
@@ -431,10 +474,10 @@ async fn proxy(
         // headers below).
         req_builder = req_builder.header(header::ACCEPT_ENCODING, "identity");
 
-        // Apply custom headers from query params (`h=`)
-        for (name, value) in &params.request_headers {
-            req_builder = req_builder.header(name, value);
-        }
+        // The `h=` overrides last, and replacing rather than adding to what
+        // the player sent: an override that leaves the original in place
+        // is not one.
+        req_builder = req_builder.headers(custom_request_headers.clone());
         req_builder
     };
 
@@ -852,6 +895,43 @@ mod tests {
         let body = "#EXTM3U\n#EXT-X-VERSION:3\n\n#EXT-X-TARGETDURATION:10\n";
         let rewritten = rewrite_playlist(body, &base(), "");
         assert_eq!(rewritten, body);
+    }
+
+    /// `r=` is an override: the origin's value for that name goes, rather
+    /// than the two of them being sent together for the client to choose
+    /// between -- and a client reading the first of two `content-type`s
+    /// read the origin's, which is the value `r=` exists to correct.
+    #[test]
+    fn a_custom_response_header_replaces_the_origin_s_own() {
+        let builder = Response::builder()
+            .status(200)
+            .header("content-type", "application/octet-stream");
+        let overrides = BTreeMap::from([("Content-Type".to_string(), "video/mp4".to_string())]);
+        let response = finalize_response(
+            apply_custom_response_headers(builder, &overrides),
+            axum::body::Body::empty(),
+        );
+
+        assert_eq!(
+            response.headers().get_all("content-type").iter().count(),
+            1,
+            "one value, not the override queued behind the origin's"
+        );
+        assert_eq!(response.headers().get("content-type").unwrap(), "video/mp4");
+    }
+
+    /// The same for `h=`, where the collision is with what the player sent.
+    #[test]
+    fn a_custom_request_header_replaces_what_the_player_sent() {
+        let overrides = BTreeMap::from([("User-Agent".to_string(), "addon/1".to_string())]);
+        let mut request = HeaderMap::new();
+        request.insert("user-agent", HeaderValue::from_static("mpv/0.41"));
+        // What `RequestBuilder::headers` does with the map this builds.
+        for (name, value) in custom_request_headers(&overrides) {
+            request.insert(name.expect("a named header"), value);
+        }
+        assert_eq!(request.get_all("user-agent").iter().count(), 1);
+        assert_eq!(request.get("user-agent").unwrap(), "addon/1");
     }
 
     #[test]
