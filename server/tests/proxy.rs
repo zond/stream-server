@@ -794,16 +794,17 @@ impl TlsOrigin {
     }
 }
 
-/// The downgrade, working as advertised: a host whose certificate will not
-/// verify is fetched once with verification, once without, and written down
-/// by name so the next request pays only one handshake.
+/// The downgrade, working as advertised: an endpoint whose certificate will
+/// not verify is fetched once with verification, once without, and written
+/// down so the next request pays only one handshake.
 ///
-/// It is addressed as `localhost` rather than `127.0.0.1` so the host this
-/// records cannot be confused with the one the redirect test below asserts
-/// was *not* recorded -- [`stream_server::unverified_hosts`] is process-wide
-/// and these tests share a process.
+/// What is written down is the whole origin -- scheme, host *and* port. A
+/// certificate is served by a TLS endpoint, not by a name: keyed by host
+/// alone, this failure would also have turned verification off for the same
+/// host's `:443`, and for `http://localhost`, which has no certificate to
+/// verify in the first place.
 #[test]
-fn a_host_whose_certificate_fails_is_fetched_unverified_and_named() -> anyhow::Result<()> {
+fn an_endpoint_whose_certificate_fails_is_fetched_unverified_and_named() -> anyhow::Result<()> {
     let tls = TlsOrigin::start()?;
     let fixture = fixture()?;
     let target = format!("https://localhost:{}/film.mkv", tls.addr.port());
@@ -817,10 +818,14 @@ fn a_host_whose_certificate_fails_is_fetched_unverified_and_named() -> anyhow::R
         "the stream plays, which is why the downgrade exists at all"
     );
     assert_eq!(response.text()?, "secret bytes");
+    let downgraded = stream_server::unverified_origins();
     assert!(
-        stream_server::unverified_hosts().contains(&"localhost".to_string()),
-        "and the host is written down by name: {:?}",
-        stream_server::unverified_hosts()
+        downgraded.contains(&format!("https://localhost:{}", tls.addr.port())),
+        "the endpoint is written down with its scheme and port: {downgraded:?}"
+    );
+    assert!(
+        !downgraded.contains(&"localhost".to_string()),
+        "and not as a bare host, which would take every port with it: {downgraded:?}"
     );
 
     drop(fixture.handle);
@@ -828,15 +833,20 @@ fn a_host_whose_certificate_fails_is_fetched_unverified_and_named() -> anyhow::R
 }
 
 /// The same failure one redirect away, which is where the host recorded
-/// used to be the wrong one entirely: the plain-HTTP host that redirected
-/// us got marked unverified, and the https host whose handshake actually
-/// failed did not.
+/// used to be the wrong one entirely. reqwest attributes a connect failure
+/// to the URL the request *started* at, so the redirecting host was marked
+/// unverified for a certificate it never presented, and the endpoint whose
+/// handshake actually failed was not marked at all -- the same mistake an
+/// `https` -> `https` chain makes, where the host downgraded is the *good*
+/// one. Its redirect policy is asked before every hop, so the failing one
+/// has a name after all.
 ///
-/// reqwest attributes the failure to the URL the request started at, so
-/// from here the failing host has no name -- and an unnameable host is not
-/// one to write down. The fetch fails instead.
+/// The redirector is plain HTTP because a verifiable first hop needs a
+/// certificate authority; the hop that fails is the second either way, and
+/// it is the second that must be the one written down.
 #[test]
-fn a_certificate_failure_behind_a_redirect_downgrades_nobody() -> anyhow::Result<()> {
+fn a_certificate_failure_behind_a_redirect_downgrades_the_endpoint_that_failed()
+-> anyhow::Result<()> {
     let tls = TlsOrigin::start()?;
     let tls_addr = tls.addr;
     let redirector = Origin::start_with(move |_request: &Request, socket: &mut TcpStream| {
@@ -852,20 +862,27 @@ fn a_certificate_failure_behind_a_redirect_downgrades_nobody() -> anyhow::Result
     })?;
 
     let fixture = fixture_with(redirector)?;
-    let target = format!("http://{}/film.mkv", fixture.origin.addr);
+    let redirector_addr = fixture.origin.addr;
+    let target = format!("http://{redirector_addr}/film.mkv");
     let response = reqwest::blocking::Client::new()
         .get(format!("{}/proxy/?d={}", fixture.base, encode(&target)))
         .send()?;
 
     assert_eq!(
         response.status(),
-        reqwest::StatusCode::BAD_GATEWAY,
-        "the fetch fails rather than silently downgrading something"
+        reqwest::StatusCode::OK,
+        "the retry follows the same redirect, and the stream plays"
+    );
+    assert_eq!(response.text()?, "secret bytes");
+
+    let downgraded = stream_server::unverified_origins();
+    assert!(
+        downgraded.contains(&format!("https://127.0.0.1:{}", tls_addr.port())),
+        "the endpoint whose handshake failed is the one written down: {downgraded:?}"
     );
     assert!(
-        !stream_server::unverified_hosts().contains(&"127.0.0.1".to_string()),
-        "and no plain-HTTP host is marked unverified: {:?}",
-        stream_server::unverified_hosts()
+        !downgraded.contains(&format!("http://{redirector_addr}")),
+        "and the host that only redirected us is not: {downgraded:?}"
     );
 
     drop(fixture.handle);
@@ -888,10 +905,10 @@ fn a_filename_cannot_turn_certificate_verification_off() -> anyhow::Result<()> {
         .send()?;
 
     assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+    let downgraded = stream_server::unverified_origins();
     assert!(
-        !stream_server::unverified_hosts().contains(&"127.0.0.1".to_string()),
-        "a connection refused is not a certificate failure: {:?}",
-        stream_server::unverified_hosts()
+        !downgraded.contains(&"http://127.0.0.1:1".to_string()),
+        "a connection refused is not a certificate failure: {downgraded:?}"
     );
 
     drop(fixture.handle);

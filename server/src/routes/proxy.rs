@@ -10,7 +10,7 @@ use dashmap::DashSet;
 use futures_util::StreamExt;
 use reqwest::{Client, Method};
 use std::collections::BTreeMap;
-use std::sync::{LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use url::Url;
 
 /// Lazily-built, process-wide reqwest client for the proxy route: the one
@@ -27,10 +27,17 @@ static HTTP_CLIENT: OnceLock<Option<Client>> = OnceLock::new();
 /// needs it. See [`UNVERIFIED_HOSTS`] for why it exists at all.
 static INSECURE_HTTP_CLIENT: OnceLock<Option<Client>> = OnceLock::new();
 
-/// Hosts whose certificate this process could not verify. The request that
-/// discovered it is retried unverified; every later request for that host
-/// goes straight to the unverified client, so a stream pays the failed
-/// handshake once rather than once per segment.
+/// Origins whose certificate this process could not verify -- `scheme`,
+/// host and port, as [`Url::origin`] serializes them. The request that
+/// discovered one is retried unverified; a later request for the same
+/// origin goes straight to the unverified client, so a stream pays the
+/// failed handshake once rather than once per range.
+///
+/// The whole origin, not the host: verification is a property of a TLS
+/// endpoint, and a host serving a broken certificate on `:8443` says
+/// nothing about the one it serves on `:443`. Keyed by host alone, a
+/// failure at either turned verification off for both -- and for the
+/// plain-HTTP `http://host` that is not even the same protocol.
 ///
 /// This route was built with `danger_accept_invalid_certs(true)` from its
 /// first commit, commented "Parity with rejectUnauthorized: false" -- it is
@@ -49,24 +56,60 @@ static INSECURE_HTTP_CLIENT: OnceLock<Option<Client>> = OnceLock::new();
 /// could not also trigger. What it buys is that the downgrade is per host,
 /// visible in the log, and enumerable: today's blanket silence cannot tell
 /// us which hosts to scope it to, and this can.
-static UNVERIFIED_HOSTS: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
+static UNVERIFIED_ORIGINS: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
 
-/// Every host this process has downgraded, for a test to assert against.
+/// Every origin this process has downgraded, for a test to assert against.
 ///
-/// [`UNVERIFIED_HOSTS`] is the only record that a downgrade happened at
+/// [`UNVERIFIED_ORIGINS`] is the only record that a downgrade happened at
 /// all: over plain HTTP the unverified client behaves identically to the
-/// verified one, so marking the wrong host is invisible from outside --
+/// verified one, so marking the wrong endpoint is invisible from outside --
 /// which is how a plain-HTTP host came to be marked at all. Exported
 /// doc-hidden so the test that pins it can see what was written down.
 #[doc(hidden)]
-pub fn unverified_hosts() -> Vec<String> {
-    UNVERIFIED_HOSTS.iter().map(|host| host.clone()).collect()
+pub fn unverified_origins() -> Vec<String> {
+    UNVERIFIED_ORIGINS
+        .iter()
+        .map(|origin| origin.clone())
+        .collect()
+}
+
+/// How [`UNVERIFIED_ORIGINS`] is keyed: `https://host:port`, with a default
+/// port left off, which is what [`Url::origin`] serializes.
+fn origin_key(url: &Url) -> String {
+    url.origin().ascii_serialization()
+}
+
+tokio::task_local! {
+    /// The URL the verifying client is about to connect to, for the
+    /// duration of one fetch.
+    ///
+    /// reqwest attributes a connect failure to the URL the request
+    /// *started* at -- `Error::url` is the one we handed it, however many
+    /// redirects it followed since -- so the error alone cannot say which
+    /// handshake failed. Its redirect policy can: it is asked before every
+    /// hop, and it writes the hop down here. A task local because the
+    /// policy belongs to the process-wide client while the answer belongs
+    /// to one request, and because the policy runs inside the very future
+    /// the handler awaits, on this task.
+    static ATTEMPTING: Arc<Mutex<Option<Url>>>;
 }
 
 fn http_client() -> Option<&'static Client> {
     HTTP_CLIENT
         .get_or_init(|| {
             Client::builder()
+                .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                    // Note where we are going before we go there (see
+                    // [`ATTEMPTING`]), then decide it the way the default
+                    // policy would -- the hop limit and the loop detection
+                    // are not ours to reinvent.
+                    let _ = ATTEMPTING.try_with(|attempting| {
+                        if let Ok(mut attempting) = attempting.lock() {
+                            *attempting = Some(attempt.url().clone());
+                        }
+                    });
+                    reqwest::redirect::Policy::default().redirect(attempt)
+                }))
                 .build()
                 .map_err(|e| tracing::error!("Failed to build proxy HTTP client: {e}"))
                 .ok()
@@ -472,10 +515,13 @@ async fn proxy(
             .into_response();
     }
 
-    // The host is fetched verified unless a previous request for it failed
-    // on its certificate (see [`UNVERIFIED_HOSTS`]).
-    let host = url.host_str().unwrap_or_default().to_string();
-    let known_unverified = UNVERIFIED_HOSTS.contains(&host);
+    // The origin is fetched verified unless a previous request for it
+    // failed on its certificate (see [`UNVERIFIED_ORIGINS`]). This asks
+    // about the URL we are about to fetch; a downgrade recorded for a
+    // redirect *target* is not visible from here, so such a chain pays its
+    // one failed handshake again on every request rather than once. That is
+    // the honest cost of not guessing where a redirect will go.
+    let known_unverified = UNVERIFIED_ORIGINS.contains(&origin_key(&url));
     let client = match if known_unverified {
         insecure_http_client()
     } else {
@@ -531,41 +577,51 @@ async fn proxy(
         req_builder
     };
 
-    let response = match build_request(client).send().await {
+    // The fetch, with a place for the redirect policy to write down where it
+    // went (see [`ATTEMPTING`]); the initial URL is the answer when it wrote
+    // nothing, because then there was no redirect to move it.
+    let attempting: Arc<Mutex<Option<Url>>> = Arc::new(Mutex::new(None));
+    let sent = ATTEMPTING
+        .scope(attempting.clone(), build_request(client).send())
+        .await;
+    let response = match sent {
         Ok(resp) => resp,
         Err(e) if !known_unverified && is_certificate_error(&e) => {
-            // Only a host we asked for over `https` is a host we can name.
-            // reqwest attributes a connect failure to the URL the request
-            // *started* at -- measured through a plain-HTTP redirect to a
-            // self-signed origin, where the error still named the http URL
-            // -- so when we did not ask for https ourselves, the
-            // certificate that failed belongs to some redirect target we
-            // cannot identify from here. A host we cannot identify is not
-            // one to write down: this used to mark the redirecting
-            // plain-HTTP host unverified, which downgrades a host whose
-            // certificate was never even looked at, and leaves the one that
-            // actually failed unmarked. Better to fail the fetch and say
-            // why. (A chain that starts at https and redirects to another
-            // https host has the same blind spot in miniature: the host
-            // named is the first, which is the failing one unless the
-            // redirect intervened.)
-            if url.scheme() != "https" {
+            // The host whose handshake failed, which is not necessarily the
+            // one we asked for. This used to mark the URL the request
+            // started at, so an `https` -> `https` redirect to a bad
+            // certificate permanently downgraded the *good* host and left
+            // the bad one verified, and a plain-HTTP host that redirected to
+            // one was downgraded for a certificate it never presented. The
+            // redirect policy knows better, and says so.
+            let failed_at = attempting
+                .lock()
+                .ok()
+                .and_then(|attempting| attempting.clone())
+                .unwrap_or_else(|| url.clone());
+            // Only a TLS endpoint has a certificate to waive. Nothing else
+            // can produce this error, so this is a guard rather than a
+            // case: if it ever fires, the note above was not written and
+            // the honest answer is to fail rather than downgrade a guess.
+            if failed_at.scheme() != "https" {
                 tracing::warn!(
-                    url = %url,
+                    url = %failed_at,
                     error = %e,
-                    "a certificate failed verification behind a redirect; not retrying, \
-                     because the host it belongs to cannot be named from here"
+                    "a certificate failed verification, but not at an https URL we can \
+                     name; not retrying"
                 );
                 return (StatusCode::BAD_GATEWAY, format!("Proxy error: {}", e)).into_response();
             }
-            // One retry, for this host only, and say so once per process.
+            // One retry, for this endpoint only, and say so once per
+            // process.
+            let downgraded = origin_key(&failed_at);
             tracing::warn!(
-                host = %host,
+                origin = %downgraded,
                 error = %e,
-                "certificate verification failed; retrying this host unverified for \
+                "certificate verification failed; retrying this origin unverified for \
                  the life of the process"
             );
-            UNVERIFIED_HOSTS.insert(host);
+            UNVERIFIED_ORIGINS.insert(downgraded);
             let Some(client) = insecure_http_client() else {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
