@@ -1922,17 +1922,16 @@ fn a_3xx_that_does_not_move_the_resource_is_not_followed() -> anyhow::Result<()>
     Ok(())
 }
 
-/// A `.m3u8` URL that answers with an error, and a `HEAD` for one that does
-/// not. Neither has a playlist in it, and rewriting them said otherwise.
+/// A `.m3u8` URL that answers with an error. There is no playlist in a
+/// 404, and rewriting it said otherwise: the error page came back as a
+/// playlist of proxy URLs built out of the words in it, a fabricated
+/// segment list an HLS player would dutifully try to fetch.
 ///
-/// The 404's error page came back as a playlist of proxy URLs built out of
-/// the words in it -- a fabricated segment list an HLS player would
-/// dutifully try to fetch. The `HEAD` was worse in a quieter way: the
-/// rewrite measured the empty body it had been handed and declared
-/// `Content-Length: 0`, so a player sizing the resource before playing it
-/// was told there was nothing there.
+/// (The other half of this used to be a `HEAD`, on the grounds that it has
+/// no body to rewrite either. It has its own test now, because what a
+/// `HEAD` must answer is a longer story than "not that".)
 #[test]
-fn only_a_2xx_get_at_a_playlist_url_is_rewritten_as_a_playlist() -> anyhow::Result<()> {
+fn an_error_page_at_a_playlist_url_is_not_rewritten_as_a_playlist() -> anyhow::Result<()> {
     const MISSING: &str = "no such stream\n";
 
     let origin = Origin::start_with(|request: &Request, socket: &mut TcpStream| {
@@ -1979,16 +1978,85 @@ fn only_a_2xx_get_at_a_playlist_url_is_rewritten_as_a_playlist() -> anyhow::Resu
         "the origin's own error body, not a playlist made out of it"
     );
 
-    let head = client.head(proxied("master.m3u8")).send()?;
-    assert_eq!(head.status(), reqwest::StatusCode::OK);
+    drop(fixture.handle);
+    Ok(())
+}
+
+/// A `HEAD` and a `GET` at the same playlist URL, field by field.
+///
+/// The `HEAD` is not rewritten -- there is no body to rewrite -- but it
+/// used to fall through to the plain relay along with that, and so
+/// advertised the origin's framing for a body this proxy would never
+/// serve. Measured: the `HEAD` said `Content-Length: 67` and
+/// `Accept-Ranges: bytes` where the `GET` returned 199 chunked bytes and
+/// `Accept-Ranges: none`, so a client that sized the resource and then
+/// asked for `Range: bytes=0-66` got a `200` carrying 199 of them.
+///
+/// What a `HEAD` describes is the response a `GET` would get, so every
+/// field but the body is now the same for both: no length, because the
+/// length is not known until the rewrite has been written, and no claim to
+/// ranges.
+#[test]
+fn a_head_and_a_get_at_a_playlist_url_describe_the_same_response() -> anyhow::Result<()> {
+    let origin = Origin::start_with(|request: &Request, socket: &mut TcpStream| {
+        let _ = socket.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\n\
+                 Accept-Ranges: bytes\r\nETag: \"the-playlist\"\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                ORIGIN_PLAYLIST.len()
+            )
+            .as_bytes(),
+        );
+        // A HEAD gets the headers and no body, as any origin would answer.
+        if !request.line.starts_with("HEAD") {
+            let _ = socket.write_all(ORIGIN_PLAYLIST.as_bytes());
+        }
+        let _ = socket.flush();
+    })?;
+
+    let fixture = fixture_with(origin)?;
+    let client = reqwest::blocking::Client::new();
+    let url = format!(
+        "{}/proxy/?d={}",
+        fixture.base,
+        encode(&format!("http://{}/live/master.m3u8", fixture.origin.addr))
+    );
+    let head = client.head(&url).send()?;
+    let get = client.get(&url).send()?;
+
+    assert_eq!(head.status(), get.status());
+    for field in [
+        "content-type",
+        "accept-ranges",
+        "content-length",
+        "content-range",
+        "etag",
+        "last-modified",
+    ] {
+        assert_eq!(
+            head.headers().get(field),
+            get.headers().get(field),
+            "the HEAD and the GET disagree about {field}"
+        );
+    }
     assert_eq!(
         head.headers()
-            .get(reqwest::header::CONTENT_LENGTH)
+            .get(reqwest::header::ACCEPT_RANGES)
             .and_then(|value| value.to_str().ok()),
-        Some(ORIGIN_PLAYLIST.len().to_string().as_str()),
-        "how big the resource is, which is the only thing a HEAD is for"
+        Some("none"),
+        "neither of them offers a range into a body written as it is read"
     );
-    assert!(head.bytes()?.is_empty());
+    assert!(
+        head.headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .is_none(),
+        "and neither declares a length for it -- the origin's 67 describes a body \
+         nobody is going to be sent"
+    );
+
+    assert!(head.bytes()?.is_empty(), "a HEAD is still bodiless");
+    assert_eq!(get.text()?, expected_playlist(fixture.origin.addr));
 
     drop(fixture.handle);
     Ok(())

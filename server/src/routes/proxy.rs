@@ -911,11 +911,8 @@ async fn proxy(
     // status code is half of what says so. A 404's error page served at a
     // `.m3u8` URL was being rewritten line by line and handed back as a
     // playlist of fabricated proxy URLs -- an origin's "Not found" became a
-    // segment list. And a `HEAD` has no body to rewrite at all: the rewrite
-    // measured the empty one and answered `Content-Length: 0`, so a player
-    // asking how big the resource is was told nothing is there. Both fall
-    // through to the plain relay, which is what they always should have
-    // been.
+    // segment list. It falls through to the plain relay, which is what it
+    // always should have been.
     // A rewritten body replaces the origin's, so the response has to be one
     // that *is* the whole body. `status.is_success()` was not that test: a
     // `206` passed it, and a rewritten fragment of a playlist is a body
@@ -932,7 +929,22 @@ async fn proxy(
                 .get(header::CONTENT_RANGE)
                 .and_then(|value| value.to_str().ok())
                 .is_some_and(covers_the_whole_entity));
-    let rewriting_playlist = is_playlist && !encoded_body && whole_body && method != Method::HEAD;
+    // Whether the body this response describes is one we would replace.
+    // Not the same question as whether we are writing one now: a `HEAD`
+    // has no body to rewrite, so it is not rewritten -- but it still
+    // *describes* the resource a `GET` would be answered with, and that is
+    // a rewritten playlist.
+    //
+    // Answering it from the relay branch instead had `HEAD` and `GET`
+    // disagree about the same URL: measured, the `HEAD` advertised the
+    // origin's `Content-Length: 67` and `Accept-Ranges: bytes` while the
+    // `GET` returned 199 chunked bytes and `Accept-Ranges: none`, so a
+    // player that sized the resource and then sent `Range: bytes=0-66` got
+    // a `200` carrying 199. Framing headers for a body we would not serve
+    // are worse than none: every field below is now decided by what the
+    // resource *is*, and only the body itself by the method.
+    let rewritable_body = is_playlist && !encoded_body && whole_body;
+    let rewriting_playlist = rewritable_body && method != Method::HEAD;
     if is_playlist && encoded_body {
         tracing::warn!(
             content_encoding = %content_encoding,
@@ -949,8 +961,10 @@ async fn proxy(
     }
 
     // A rewritten playlist is the whole resource however it was asked for,
-    // so it is answered `200` even when the origin said `206`.
-    let mut res_builder = Response::builder().status(if rewriting_playlist {
+    // so it is answered `200` even when the origin said `206` -- and a
+    // `HEAD` for it says the same, since what it describes is that same
+    // response.
+    let mut res_builder = Response::builder().status(if rewritable_body {
         StatusCode::OK
     } else {
         status
@@ -1008,13 +1022,17 @@ async fn proxy(
         "last-modified",
         "etag",
     ];
-    if rewriting_playlist {
+    if rewritable_body {
         // And ranging into a body we wrote is ranging into the wrong
         // entity, so say so rather than leave a player to infer it from a
         // missing header. The reference sets this too
         // (`responseHeaders["accept-ranges"]="none"`), which is the one
         // thing it does with a rewritten playlist's headers that we did
         // not.
+        //
+        // A `HEAD` takes this branch as well, and so answers with no length
+        // and no claim to ranges: the only honest thing to say about a body
+        // whose length is not known until it has been written.
         res_builder = res_builder.header(header::ACCEPT_RANGES, "none");
     } else {
         for name in relayed_body_res_headers {
