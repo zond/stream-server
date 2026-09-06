@@ -314,7 +314,7 @@ An embedder holds a `ServerHandle` (from `stream_server::start`) and never needs
 | `clean_cache_now() -> Result<EvictionReport>` | `POST /cache/clean` — run one eviction pass immediately and report what it freed, with the same protections as the scheduled sweep. See [Cache usage and cleaning](#cache-usage-and-cleaning) |
 | `set_lan_media(enabled: bool) -> Result<Option<SocketAddr>>` | start/stop the [LAN media listener](#lan-media-listener); returns its bound address afterwards. Refused while the `lanMediaEnabled` setting is false or `ServerConfig::lan_media_addr` is unset |
 | `lan_media_addr() -> Option<SocketAddr>` / `lan_media_running() -> bool` | where that listener is bound right now, and whether it is running at all |
-| `lan_media_requests_served() -> u64` | how many requests have reached that listener since it last started — per cast session, reset by every start. Zero after a load is the receiver never having asked for the stream. See [LAN media listener](#lan-media-listener) |
+| `lan_media_requests_served() -> u64` | how many requests have reached that listener since the current cast session began — per session, reset by every start (an already-running listener included) and by every stop. Zero after a load is the receiver never having asked for the stream. See [LAN media listener](#lan-media-listener) |
 | `lan_media_base_url(for_peer: IpAddr) -> Option<Url>` | the base URL to hand a receiver at `for_peer` — host = the local interface on its subnet, or the best-ranked one when nothing matches. `None` while the listener is off |
 
 The HTTP handlers and these methods call the same functions (`routes::system::{engine_stats, file_stats, update_settings}`, `routes::downloads::{pin_download, unpin_download, downloads, download_path}`, `routes::cache::{cache_usage, clean_cache_now}`), so they cannot drift; `server/tests/embed.rs` compares them.
@@ -385,9 +385,12 @@ listener reports on itself. Every answer `lan_media_base_url` gives is logged
 at INFO — the peer, the interface picked and the URL — as is each of the ways
 it can answer `None`, and so is every request that reaches the listener
 (method, path, peer). `ServerHandle::lan_media_requests_served()` is the same
-arrival count as a number: it starts at zero on every start, counts each
+arrival count as a number: it starts at zero on every start — whether or not
+a listener was already running, since starting a cast to a second receiver
+mid-session asks about that cast and not the one before it — counts each
 request the listener receives (a `404` from the fallbacks included — the
-receiver still got here), and never carries over from the previous session.
+receiver still got here), never carries over from the previous session, and
+is back to zero once the listener has been stopped.
 A receiver told an address it cannot route to reports no error at all, because
 a TCP connect to an unroutable host hangs rather than failing; from the sofa
 that is indistinguishable from buffering. A count still at zero well after a

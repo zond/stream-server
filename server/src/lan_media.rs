@@ -43,8 +43,10 @@ pub struct LanMedia {
     /// The running listener, if any. A single mutex serialises start and
     /// stop, so two concurrent toggles cannot both bind.
     running: tokio::sync::Mutex<Option<Running>>,
-    /// Requests that have reached the listener since it last started -- see
-    /// [`LanMedia::requests_served`]. Not behind the mutex: it is written
+    /// Requests that have reached the listener since the cast session it is
+    /// serving began -- see [`LanMedia::requests_served`]. Not behind the
+    /// mutex, though both [`LanMedia::start`] and [`LanMedia::stop`] reset
+    /// it while holding it: it is written
     /// from the serving task on every request and read from whatever thread
     /// asks, and neither cares to be ordered against anything else.
     requests: AtomicU64,
@@ -83,10 +85,20 @@ impl LanMedia {
 
     /// Bind the listener and start serving media routes on it. Idempotent:
     /// an already-running listener is left alone and its address returned.
+    /// The request count is reset either way -- see below.
     ///
     /// Fails when no address is configured, or when the bind fails.
     pub async fn start(&self, state: &AppState) -> anyhow::Result<SocketAddr> {
         let mut running = self.running.lock().await;
+        // The count belongs to this session, not to the process or to the
+        // listener: a caller asking "has the receiver fetched anything yet?"
+        // is asking about the cast it just started, and a count left over
+        // from the previous one would answer yes for a receiver that never
+        // connected. That is why this is above the already-running return
+        // rather than beside the bind -- casting to a second receiver
+        // mid-session starts a cast on a listener that is already up, and
+        // that cast is the one being asked about.
+        self.requests.store(0, Ordering::Relaxed);
         if let Some(running) = running.as_ref() {
             return Ok(running.bound);
         }
@@ -100,11 +112,6 @@ impl LanMedia {
             .await
             .with_context(|| format!("failed to bind the LAN media listener on {addr}"))?;
         let bound = listener.local_addr()?;
-        // The count belongs to this session, not to the process: a caller
-        // asking "has the receiver fetched anything yet?" is asking about
-        // the cast it just started, and a count left over from the previous
-        // one would answer yes for a receiver that never connected.
-        self.requests.store(0, Ordering::Relaxed);
         let app = crate::build_lan_media_router(state.clone());
         let task = tokio::spawn(async move {
             if let Err(error) = axum::serve(
@@ -142,6 +149,11 @@ impl LanMedia {
     /// modified.
     pub async fn stop(&self) {
         let mut running = self.running.lock().await;
+        // Nothing is listening once this returns, so nothing can have
+        // reached us: leaving the last session's count standing would have
+        // [`LanMedia::requests_served`] report a receiver fetching from a
+        // listener that no longer exists.
+        self.requests.store(0, Ordering::Relaxed);
         if let Some(running) = running.take() {
             running.task.abort();
             // Awaiting the aborted task is what makes the stop observable:
@@ -161,7 +173,11 @@ impl LanMedia {
         self.requests.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// How many requests have reached the listener since it last started.
+    /// How many requests have reached the listener since the current cast
+    /// session began. Every [`LanMedia::start`] resets it, running listener
+    /// or not, so a second receiver never inherits the first one's count;
+    /// [`LanMedia::stop`] resets it too, so it reads zero whenever nothing
+    /// is listening.
     ///
     /// Zero is the diagnosis a caller cannot make any other way. A receiver
     /// that never fetched the stream and one that fetched it and failed to

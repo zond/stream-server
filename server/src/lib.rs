@@ -467,9 +467,13 @@ impl ServerHandle {
         self.lan_media_addr().is_some()
     }
 
-    /// How many requests have reached the LAN media listener since it last
-    /// started -- per cast session, not per process, since
-    /// [`ServerHandle::set_lan_media`] resets it on every start.
+    /// How many requests have reached the LAN media listener since the
+    /// current cast session began -- per session, not per process. Every
+    /// [`ServerHandle::set_lan_media`] start resets it, including one that
+    /// finds the listener already running (casting to a second receiver
+    /// mid-session does exactly that, and the count it wants is its own),
+    /// and a stop resets it too, so this reads zero while nothing is
+    /// listening.
     ///
     /// It answers one question nothing else can: whether the receiver ever
     /// came back for the stream. A receiver told an address it cannot route

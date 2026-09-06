@@ -2444,7 +2444,9 @@ fn set_lan_media_toggles_the_listener_and_the_setting_can_forbid_it() -> anyhow:
 /// A receiver told an unroutable address raises no error -- the connect
 /// hangs -- so nothing else distinguishes them.
 ///
-/// The count is therefore per session and not cumulative: a start resets it,
+/// The count is therefore per session and not cumulative: every start
+/// resets it -- including one that finds the listener already up, which is
+/// what casting to a second receiver mid-session does -- and so does a stop,
 /// or the previous cast would answer for this one. Only the LAN listener
 /// counts; loopback traffic is this host's own client, not a receiver.
 #[test]
@@ -2458,7 +2460,8 @@ fn the_lan_listener_counts_the_requests_that_reach_it() -> anyhow::Result<()> {
         src.path(),
         Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
     )?;
-    let lan = format!("http://{}", handle.lan_media_addr().expect("LAN bound"));
+    let lan_addr = handle.lan_media_addr().expect("LAN bound");
+    let lan = format!("http://{lan_addr}");
     let anonymous = reqwest::blocking::Client::new();
 
     assert_eq!(
@@ -2505,12 +2508,41 @@ fn the_lan_listener_counts_the_requests_that_reach_it() -> anyhow::Result<()> {
     );
     assert_eq!(handle.lan_media_requests_served(), 3);
 
+    // Tapping a second receiver starts a cast on a listener that is already
+    // bound, and the question that cast asks is about itself: the first
+    // receiver's requests must not answer for it.
+    // A configured address is bound at startup whatever the setting says;
+    // starting one by hand needs the operator's permission first.
+    handle.update_settings(serde_json::json!({ "lanMediaEnabled": true }))?;
+    assert_eq!(
+        handle.set_lan_media(true)?,
+        Some(lan_addr),
+        "an already-running listener keeps the socket it has"
+    );
+    assert_eq!(
+        handle.lan_media_requests_served(),
+        0,
+        "a start resets the count whether or not it had to bind"
+    );
+    anonymous
+        .head(format!("{lan}/{info_hash}/{idx}"))
+        .send()?
+        .error_for_status()?;
+    assert_eq!(handle.lan_media_requests_served(), 1);
+
+    // Nothing is listening once a stop returns, so nothing can have reached
+    // us: a count left standing would report a receiver fetching from a
+    // socket that is closed.
+    handle.set_lan_media(false)?;
+    assert!(!handle.lan_media_running());
+    assert_eq!(
+        handle.lan_media_requests_served(),
+        0,
+        "zero whenever nothing is listening"
+    );
+
     // A new session starts from nothing, so a cast that is never fetched
     // from reads zero however busy the one before it was.
-    handle.set_lan_media(false)?;
-    // A configured address is bound at startup whatever the setting says;
-    // restarting one by hand needs the operator's permission first.
-    handle.update_settings(serde_json::json!({ "lanMediaEnabled": true }))?;
     let restarted = handle.set_lan_media(true)?.expect("bound again");
     assert_eq!(
         handle.lan_media_requests_served(),
