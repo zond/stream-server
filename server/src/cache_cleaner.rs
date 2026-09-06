@@ -1727,6 +1727,37 @@ mod tests {
         assert!(recovery.has_new_work(&only_b));
     }
 
+    /// The shape the two sentinels cross the wire in. `POST /cache/clean`,
+    /// `ServerHandle::clean_cache_now` and the FFI call behind the app's
+    /// storage screen all read this JSON, and the app distinguishes "no cap"
+    /// from "a cap of nothing" by exactly this difference -- so it is pinned
+    /// here rather than left to serde's defaults being what one assumes.
+    #[test]
+    fn the_reported_limit_crosses_as_null_or_a_number_never_a_sentinel() {
+        let json = |limit| {
+            serde_json::to_value(EvictionReport {
+                limit,
+                ..EvictionReport::default()
+            })
+            .unwrap()["limit"]
+                .clone()
+        };
+        assert_eq!(json(None), serde_json::Value::Null, "no cap at all");
+        assert_eq!(json(Some(0)), serde_json::json!(0), "a cap of nothing");
+        assert_eq!(json(Some(1024)), serde_json::json!(1024));
+
+        // And back, since the same type is what a library embedder reads.
+        for limit in [None, Some(0), Some(1024)] {
+            let report = EvictionReport {
+                limit,
+                ..EvictionReport::default()
+            };
+            let round_tripped: EvictionReport =
+                serde_json::from_value(serde_json::to_value(&report).unwrap()).unwrap();
+            assert_eq!(round_tripped, report);
+        }
+    }
+
     /// The cap is the smaller of the two, and which one binds depends only
     /// on the numbers: plenty of room and `cacheSize` governs; a nearly full
     /// volume and the filesystem does, whatever `cacheSize` says -- including
