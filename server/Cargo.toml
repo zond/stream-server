@@ -34,6 +34,10 @@ hex = "0.4"
 getrandom = "0.4"
 subtle = "2.6"
 if-addrs = "0.15.0"
+# Free-space probe (`available_space` -> statvfs) for the cache cleaner's
+# effective limit. The same crate enginefs uses for the pin margin, so the
+# two readers of "how much room is left" cannot disagree.
+fs4 = "1.1.0"
 urlencoding = "2.1"
 regex = "1.11"
 reqwest = { version = "0.13", features = ["blocking", "json", "stream"] }

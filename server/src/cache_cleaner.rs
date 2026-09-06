@@ -46,6 +46,117 @@ impl CleanSchedule {
     }
 }
 
+/// Free space on the cache's volume that the app never eats into.
+///
+/// Not a fresh guess: `routes::stream::ensure_download_disk_ready` already
+/// refuses to stream to disk unless this much is free on top of what the
+/// request needs, and degrades that request to memory-only when it is not.
+/// Below this line the server has therefore already decided the disk is
+/// unusable, so it is exactly the line the cleaner must keep the cache out
+/// of -- one number, read by the check that gives up on the disk and by the
+/// cleaner whose job is to stop it coming to that.
+pub(crate) const CACHE_FREE_SPACE_FLOOR: u64 = 512 * 1024 * 1024;
+
+/// What caps the cache on one run: what the operator configured and what the
+/// filesystem can still give.
+///
+/// `settings.cacheSize` on its own is `u64::MAX` unless somebody set a number
+/// (`routes::system::cache_size_bytes`), so on a 4 GB television the cleaner
+/// evicted nothing and librqbit wrote until the filesystem refused -- and
+/// that refusal arrives as a fatal torrent error, mid-film. The enforced cap
+/// is therefore the smaller of the two, which is a number even when
+/// `cacheSize` is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CacheLimit {
+    /// `settings.cacheSize` in bytes: `u64::MAX` when unset, and 0 for the
+    /// "no limit" the eviction rule has always read it as.
+    configured: u64,
+    /// Bytes the volume holding the cache will still give an unprivileged
+    /// writer, or `None` when it could not be read.
+    available: Option<u64>,
+}
+
+impl CacheLimit {
+    /// A limit with no filesystem reading behind it: what the cleaner
+    /// enforced before it had one, and what it falls back to when the volume
+    /// cannot be probed. Written that way only by the tests -- `cache_roots`
+    /// always carries whatever the probe returned, `None` included.
+    #[cfg(test)]
+    const fn configured(configured: u64) -> Self {
+        Self {
+            configured,
+            available: None,
+        }
+    }
+
+    /// The cap to enforce against `occupied` bytes of cache, or `None` for no
+    /// cap at all.
+    ///
+    /// `occupied + available` is what the volume would offer if the cache
+    /// were empty, so holding [`CACHE_FREE_SPACE_FLOOR`] of that back leaves
+    /// the most the cache may occupy without the free space crossing the
+    /// floor. Saturating throughout: a volume already under the floor yields
+    /// a cap below current occupancy, which is exactly the case where
+    /// something has to be evicted -- and where an unsaturated subtraction
+    /// would have wrapped to a cap of "everything".
+    fn effective(&self, occupied: u64) -> Option<u64> {
+        let configured = (self.configured != 0).then_some(self.configured);
+        let from_disk = self.available.map(|available| {
+            occupied
+                .saturating_add(available)
+                .saturating_sub(CACHE_FREE_SPACE_FLOOR)
+        });
+        match (configured, from_disk) {
+            (Some(configured), Some(from_disk)) => Some(configured.min(from_disk)),
+            (Some(only), None) | (None, Some(only)) => Some(only),
+            (None, None) => None,
+        }
+    }
+
+    /// Whether the filesystem, rather than the operator, is what caps the
+    /// cache at `occupied` bytes -- the fact worth a log line, since it is
+    /// the device overruling a setting.
+    fn disk_bound(&self, occupied: u64) -> bool {
+        match (self.effective(occupied), self.configured) {
+            (Some(effective), 0) => effective < u64::MAX,
+            (Some(effective), configured) => effective < configured,
+            (None, _) => false,
+        }
+    }
+}
+
+/// Bytes the volume holding `path` will still give an unprivileged writer, or
+/// `None` when that cannot be read.
+///
+/// `fs4::available_space` -> `rustix::fs::statvfs` -> `f_frsize * f_bavail`,
+/// the "Available" column of `df` (which excludes the blocks reserved for
+/// root, so it is what this process may actually write). One syscall against
+/// the path itself, no mount table to parse. rustix reaches it two ways and
+/// both are shipped here: on Linux its `linux_raw` backend issues the
+/// `statfs` syscall and converts, and on Android its build script picks the
+/// `libc` backend, which calls bionic's `statvfs` -- verified by building
+/// this call for `aarch64-linux-android` and by running a bionic-linked
+/// `statvfs` probe against a real directory, which agreed with glibc and with
+/// `df` to the block.
+///
+/// Failure -- a root that does not exist yet, a filesystem that refuses the
+/// call -- is `None`, never 0: an unreadable volume must not be read as "no
+/// room" and evict a healthy cache. The configured `cacheSize` then stands
+/// alone, exactly as it did before any of this existed.
+fn available_space(path: &std::path::Path) -> Option<u64> {
+    match fs4::available_space(path) {
+        Ok(available) => Some(available),
+        Err(e) => {
+            debug!(
+                path = %path.display(),
+                error = %e,
+                "could not read the cache volume's free space; enforcing the configured cacheSize alone"
+            );
+            None
+        }
+    }
+}
+
 pub fn start(state: Arc<AppState>) -> JoinHandle<()> {
     tokio::spawn(async move {
         debug!("Cache cleaner started");
@@ -151,7 +262,7 @@ struct CacheRoots {
     download_dirs: Vec<std::path::PathBuf>,
     protected_paths: HashSet<std::path::PathBuf>,
     downloads_dirs: Vec<std::path::PathBuf>,
-    limit: u64,
+    limit: CacheLimit,
 }
 
 async fn cache_roots(state: &AppState) -> CacheRoots {
@@ -188,11 +299,24 @@ async fn cache_roots(state: &AppState) -> CacheRoots {
     downloads_dirs.sort();
     downloads_dirs.dedup();
 
+    // The volume's free space, read per walked root and taken at its
+    // tightest. The two engines normally share one directory; when they do
+    // not and the volumes differ, the cache has to fit inside the smaller.
+    // Roots that do not exist yet cannot be probed and are skipped rather
+    // than counted as full.
+    let available = download_dirs
+        .iter()
+        .filter_map(|download_dir| available_space(download_dir))
+        .min();
+
     CacheRoots {
         download_dirs,
         protected_paths,
         downloads_dirs,
-        limit,
+        limit: CacheLimit {
+            configured: limit,
+            available,
+        },
     }
 }
 
@@ -209,7 +333,7 @@ pub(crate) async fn clean_cache(state: &AppState) -> anyhow::Result<EvictionRepo
         .all(|download_dir| !download_dir.exists())
     {
         return Ok(EvictionReport {
-            limit: roots.limit,
+            limit: roots.limit.effective(0).unwrap_or(0),
             ..EvictionReport::default()
         });
     }
@@ -278,9 +402,11 @@ pub(crate) fn occupied_bytes(metadata: &std::fs::Metadata) -> u64 {
 pub struct CacheUsage {
     /// Occupancy of the walked cache roots right now.
     pub total_bytes: u64,
-    /// The configured limit, in the same accounting; `None` when
-    /// `settings.cacheSize` is unlimited (JSON `null`), matching the
-    /// distinction `ServerSettings.cache_size` itself makes.
+    /// The limit actually enforced, in the same accounting: the smaller of
+    /// `settings.cacheSize` and what the volume can give while keeping
+    /// [`CACHE_FREE_SPACE_FLOOR`] free. `None` only when neither caps
+    /// anything -- `cacheSize` unlimited (JSON `null`) *and* the volume's
+    /// free space unreadable.
     pub limit_bytes: Option<u64>,
     /// How much of `total_bytes` a clean pass may never touch right now: a
     /// live engine is writing it, or a pinned download keeps it. When this
@@ -300,7 +426,7 @@ pub struct CacheUsage {
 fn scan_usage(
     download_dirs: &[std::path::PathBuf],
     protected_paths: &HashSet<std::path::PathBuf>,
-    limit: u64,
+    limit: CacheLimit,
     downloads_dirs: &[std::path::PathBuf],
 ) -> CacheUsage {
     let mut total = 0u64;
@@ -354,7 +480,7 @@ fn scan_usage(
 
     CacheUsage {
         total_bytes: total,
-        limit_bytes: (limit != u64::MAX).then_some(limit),
+        limit_bytes: limit.effective(total).filter(|limit| *limit != u64::MAX),
         protected_bytes: protected,
         protected_files,
     }
@@ -378,7 +504,10 @@ pub struct EvictionReport {
     pub freed: u64,
     /// How many files that took.
     pub deleted: usize,
-    /// The limit this run was given (0 = none).
+    /// The limit this run enforced (0 = none): the smaller of
+    /// `settings.cacheSize` and what the volume could give while keeping
+    /// [`CACHE_FREE_SPACE_FLOOR`] free, so on a device with no `cacheSize`
+    /// set this is still a number.
     pub limit: u64,
 }
 
@@ -403,7 +532,8 @@ impl EvictionReport {
 
 /// Walk `download_dirs` and evict what is neither protected nor a session
 /// artefact: first every file older than 30 days, then -- while the rest
-/// exceeds `limit` (0 = no limit) -- the least recently modified files.
+/// exceeds what [`CacheLimit::effective`] allows for the occupancy found --
+/// the least recently modified files.
 /// Sizes are occupancy, not apparent length (see [`occupied_bytes`]).
 /// Nothing under `downloads_dirs` is walked at all: those files are
 /// offline downloads, not cache, so they are neither evicted nor counted
@@ -416,7 +546,7 @@ impl EvictionReport {
 async fn evict(
     download_dirs: &[std::path::PathBuf],
     protected_paths: &HashSet<std::path::PathBuf>,
-    limit: u64,
+    limit: CacheLimit,
     downloads_dirs: &[std::path::PathBuf],
 ) -> anyhow::Result<EvictionReport> {
     // 2. Scan and Evict immediately based on age (30 days)
@@ -523,10 +653,25 @@ async fn evict(
         }
     }
 
-    // 3. Size-based Eviction
+    // 3. Size-based Eviction, against the cap the device actually allows.
+    // The walk above may have deleted aged-out files, so the volume now has
+    // a little more room than the probe behind `limit` recorded; that only
+    // makes the cap tighter than it needs to be, which errs towards cleaning.
+    if limit.disk_bound(total_size) {
+        info!(
+            configured = limit.configured,
+            available = ?limit.available,
+            floor = CACHE_FREE_SPACE_FLOOR,
+            effective = ?limit.effective(total_size),
+            "the cache volume's free space, not cacheSize, is what caps the cache"
+        );
+    }
+    let limit = limit.effective(total_size);
     let mut deleted_count = 0usize;
     let mut freed_space = 0u64;
-    if limit > 0 && total_size > limit {
+    if let Some(limit) = limit
+        && total_size > limit
+    {
         info!(
             "Cache size {} exceeds limit {}. Cleaning up...",
             total_size, limit
@@ -576,7 +721,7 @@ async fn evict(
         protected_files,
         freed: freed_space,
         deleted: deleted_count,
-        limit,
+        limit: limit.unwrap_or(0),
     };
     if let Some(message) = report.shortfall_message() {
         warn!("{message}");
@@ -658,8 +803,8 @@ async fn remove_empty_parents(mut dir: &std::path::Path, root: &std::path::Path)
 #[cfg(test)]
 mod tests {
     use super::{
-        CleanSchedule, EvictionReport, evict, is_path_protected, is_session_artifact,
-        occupied_bytes, remove_empty_parents, scan_usage,
+        CACHE_FREE_SPACE_FLOOR, CacheLimit, CleanSchedule, EvictionReport, available_space, evict,
+        is_path_protected, is_session_artifact, occupied_bytes, remove_empty_parents, scan_usage,
     };
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
@@ -754,9 +899,14 @@ mod tests {
         let recent = root.join("recent.mkv");
         write_aged(&recent, &[0u8; 4096], Duration::from_secs(60));
 
-        evict(std::slice::from_ref(&root), &HashSet::new(), 0, &[])
-            .await
-            .unwrap();
+        evict(
+            std::slice::from_ref(&root),
+            &HashSet::new(),
+            CacheLimit::configured(0),
+            &[],
+        )
+        .await
+        .unwrap();
         for record in &records {
             assert!(
                 record.is_file(),
@@ -772,9 +922,14 @@ mod tests {
         let newer = root.join("newer.mkv");
         write_aged(&newer, &[0u8; 4096], Duration::from_secs(1));
         let limit = limit_between(&newer, &recent);
-        evict(std::slice::from_ref(&root), &HashSet::new(), limit, &[])
-            .await
-            .unwrap();
+        evict(
+            std::slice::from_ref(&root),
+            &HashSet::new(),
+            CacheLimit::configured(limit),
+            &[],
+        )
+        .await
+        .unwrap();
         for record in &records {
             assert!(
                 record.is_file(),
@@ -870,7 +1025,7 @@ mod tests {
         evict(
             std::slice::from_ref(&root),
             &HashSet::new(),
-            0,
+            CacheLimit::configured(0),
             &downloads_dirs,
         )
         .await
@@ -886,7 +1041,7 @@ mod tests {
         evict(
             std::slice::from_ref(&root),
             &HashSet::new(),
-            occupancy(&fresh),
+            CacheLimit::configured(occupancy(&fresh)),
             &downloads_dirs,
         )
         .await
@@ -926,7 +1081,7 @@ mod tests {
             evict(
                 std::slice::from_ref(&root),
                 &HashSet::new(),
-                0,
+                CacheLimit::configured(0),
                 &downloads_dirs,
             )
             .await
@@ -939,7 +1094,7 @@ mod tests {
             evict(
                 std::slice::from_ref(&root),
                 &HashSet::new(),
-                limit_between(&fresh, &older),
+                CacheLimit::configured(limit_between(&fresh, &older)),
                 &downloads_dirs,
             )
             .await
@@ -967,15 +1122,25 @@ mod tests {
         write_aged(&stale, &[0u8; 4096], forty_days);
         let protected: HashSet<PathBuf> = HashSet::from([pinned.clone()]);
 
-        evict(std::slice::from_ref(&root), &protected, 0, &[])
-            .await
-            .unwrap();
+        evict(
+            std::slice::from_ref(&root),
+            &protected,
+            CacheLimit::configured(0),
+            &[],
+        )
+        .await
+        .unwrap();
         assert!(pinned.is_file(), "the pinned file survives the age rule");
         assert!(!stale.exists(), "its unpinned neighbour does not");
 
-        evict(std::slice::from_ref(&root), &protected, 1024, &[])
-            .await
-            .unwrap();
+        evict(
+            std::slice::from_ref(&root),
+            &protected,
+            CacheLimit::configured(1024),
+            &[],
+        )
+        .await
+        .unwrap();
         assert!(pinned.is_file(), "and the size rule");
     }
 
@@ -1027,9 +1192,14 @@ mod tests {
         // the single-file-larger-than-the-limit rule, so the eviction fell
         // on the only other candidate and freed nothing that mattered.
         let limit = 1u64 << 30;
-        let report = evict(std::slice::from_ref(&root), &HashSet::new(), limit, &[])
-            .await
-            .unwrap();
+        let report = evict(
+            std::slice::from_ref(&root),
+            &HashSet::new(),
+            CacheLimit::configured(limit),
+            &[],
+        )
+        .await
+        .unwrap();
 
         assert!(
             report.total < 1 << 20,
@@ -1074,7 +1244,12 @@ mod tests {
             return;
         }
 
-        let usage = scan_usage(std::slice::from_ref(&root), &HashSet::new(), 0, &[]);
+        let usage = scan_usage(
+            std::slice::from_ref(&root),
+            &HashSet::new(),
+            CacheLimit::configured(0),
+            &[],
+        );
 
         assert_eq!(usage.total_bytes, allocated, "occupancy, not len()");
         assert!(
@@ -1107,7 +1282,12 @@ mod tests {
         // a distinct, explicit zero-size cap, per `ServerSettings.cache_size`
         // -- `Some(0.0)`, not `None` -- and `CacheUsage` must not blur the
         // two the way `EvictionReport::shortfall_message` does).
-        let usage = scan_usage(std::slice::from_ref(&root), &protected, u64::MAX, &[]);
+        let usage = scan_usage(
+            std::slice::from_ref(&root),
+            &protected,
+            CacheLimit::configured(u64::MAX),
+            &[],
+        );
 
         assert_eq!(usage.total_bytes, pinned_bytes + free_bytes);
         assert_eq!(usage.protected_bytes, pinned_bytes);
@@ -1151,9 +1331,14 @@ mod tests {
         let cold_bytes = occupancy(&cold);
         let limit = protected_bytes + limit_between(&warm, &cold);
 
-        let report = evict(std::slice::from_ref(&root), &protected, limit, &[])
-            .await
-            .unwrap();
+        let report = evict(
+            std::slice::from_ref(&root),
+            &protected,
+            CacheLimit::configured(limit),
+            &[],
+        )
+        .await
+        .unwrap();
 
         assert!(
             !cold.exists(),
@@ -1185,9 +1370,14 @@ mod tests {
         let protected_bytes = occupancy(&pinned) + occupancy(&live);
         let limit = protected_bytes / 2;
 
-        let report = evict(std::slice::from_ref(&root), &protected, limit, &[])
-            .await
-            .unwrap();
+        let report = evict(
+            std::slice::from_ref(&root),
+            &protected,
+            CacheLimit::configured(limit),
+            &[],
+        )
+        .await
+        .unwrap();
 
         assert!(pinned.is_file());
         assert!(live.is_file());
@@ -1251,5 +1441,175 @@ mod tests {
             deleted: 1,
         };
         assert!(over.shortfall_message().is_some());
+    }
+
+    /// The cap is the smaller of the two, and which one binds depends only
+    /// on the numbers: plenty of room and `cacheSize` governs; a nearly full
+    /// volume and the filesystem does, whatever `cacheSize` says -- including
+    /// the unset `u64::MAX` that let a 4 GB television fill up.
+    #[test]
+    fn the_effective_limit_is_the_smaller_of_the_setting_and_the_volume() {
+        let gib = 1024 * 1024 * 1024;
+
+        // Room to spare: 8 GiB free, so the disk would allow occupancy up to
+        // 1 + 8 - 0.5 = 8.5 GiB and the 2 GiB setting is what bites.
+        let roomy = CacheLimit {
+            configured: 2 * gib,
+            available: Some(8 * gib),
+        };
+        assert_eq!(roomy.effective(gib), Some(2 * gib));
+        assert!(!roomy.disk_bound(gib));
+
+        // The owner's box: nothing configured, 3 GiB of cache and 523 MiB
+        // free. The cache may keep what it has plus the free space above the
+        // floor -- 11 MiB of headroom, not the 1.4 GiB film.
+        let television = CacheLimit {
+            configured: u64::MAX,
+            available: Some(523 * 1024 * 1024),
+        };
+        assert_eq!(
+            television.effective(3 * gib),
+            Some(3 * gib + 523 * 1024 * 1024 - CACHE_FREE_SPACE_FLOOR)
+        );
+        assert!(television.disk_bound(3 * gib));
+
+        // A generous setting on the same box does not buy room the device
+        // does not have.
+        let configured_too_high = CacheLimit {
+            configured: 10 * gib,
+            ..television
+        };
+        assert_eq!(
+            configured_too_high.effective(3 * gib),
+            television.effective(3 * gib)
+        );
+        assert!(configured_too_high.disk_bound(3 * gib));
+    }
+
+    /// The floor is never eaten into, and the arithmetic that keeps it out of
+    /// reach saturates rather than wrapping: a volume already below the floor
+    /// asks for eviction below current occupancy, and one with no room at all
+    /// asks for everything -- neither may come out as "no limit".
+    #[test]
+    fn the_free_space_floor_is_never_eaten_into() {
+        // Whatever occupancy the cache is at, the cap leaves the floor free.
+        for occupied in [0u64, 1, 4096, 1_000_000_000] {
+            for available in [0u64, 1, CACHE_FREE_SPACE_FLOOR, 5_000_000_000] {
+                let limit = CacheLimit {
+                    configured: u64::MAX,
+                    available: Some(available),
+                };
+                let effective = limit.effective(occupied).unwrap();
+                let free_at_the_cap = occupied + available - effective.min(occupied + available);
+                assert!(
+                    free_at_the_cap >= CACHE_FREE_SPACE_FLOOR.min(occupied + available),
+                    "occupied={occupied} available={available} effective={effective}"
+                );
+            }
+        }
+
+        // Below the floor: the cap is under what is there, so the size rule
+        // has work to do rather than seeing "already under the limit".
+        let squeezed = CacheLimit {
+            configured: u64::MAX,
+            available: Some(1024),
+        };
+        assert!(squeezed.effective(4096).unwrap() < 4096);
+
+        // Nothing left at all: a cap of 0 that must still read as a cap.
+        let full = CacheLimit {
+            configured: u64::MAX,
+            available: Some(0),
+        };
+        assert_eq!(full.effective(0), Some(0));
+        assert!(full.disk_bound(0));
+    }
+
+    /// An unreadable volume leaves the configured limit exactly as it was --
+    /// never 0 free space, which would evict a healthy cache on the strength
+    /// of a failed syscall.
+    #[test]
+    fn an_unreadable_volume_leaves_the_configured_limit_alone() {
+        assert_eq!(CacheLimit::configured(1024).effective(4096), Some(1024));
+        assert_eq!(
+            CacheLimit::configured(u64::MAX).effective(4096),
+            Some(u64::MAX)
+        );
+        assert_eq!(CacheLimit::configured(0).effective(4096), None);
+        assert!(!CacheLimit::configured(0).disk_bound(4096));
+
+        // And that is what the probe reports for a path there is no volume
+        // to ask about, while a real directory answers with a real number.
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(available_space(&tmp.path().join("not-created-yet")), None);
+        assert!(available_space(tmp.path()).unwrap() > 0);
+    }
+
+    /// The whole point, end to end: with `cacheSize` unset -- the setting the
+    /// owner's device was running -- a cache on a volume with barely any room
+    /// left is evicted down to the floor, where before it was left alone
+    /// until librqbit hit ENOSPC. Protection still wins.
+    #[tokio::test]
+    async fn a_nearly_full_volume_caps_a_cache_with_no_cache_size_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("rqbit-downloads");
+        let stale = root.join("old-show").join("e1.mkv");
+        write_aged(&stale, &[0u8; 4096], Duration::from_secs(7200));
+        let recent = root.join("recent.mkv");
+        write_aged(&recent, &[0u8; 4096], Duration::from_secs(60));
+        let stale_occupancy = occupancy(&stale);
+        let occupied = stale_occupancy + occupancy(&recent);
+
+        // Unlimited by setting, and the walk found nothing to age out.
+        let unlimited = CacheLimit::configured(u64::MAX);
+        let report = evict(std::slice::from_ref(&root), &HashSet::new(), unlimited, &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            report.deleted, 0,
+            "nothing caps it without a free-space reading"
+        );
+        assert_eq!(report.total, occupied);
+
+        // Now put the volume half a file *below* the floor -- which is what
+        // a film streaming onto a nearly full device does. The cap lands
+        // between the two files, so the older one has to go to buy the floor
+        // back.
+        let squeezed = CacheLimit {
+            configured: u64::MAX,
+            available: Some(CACHE_FREE_SPACE_FLOOR - stale_occupancy / 2),
+        };
+        let report = evict(std::slice::from_ref(&root), &HashSet::new(), squeezed, &[])
+            .await
+            .unwrap();
+        assert!(
+            !stale.exists(),
+            "the least recently modified file goes first"
+        );
+        assert!(recent.is_file(), "and only as much as the cap needs");
+        assert_eq!(report.freed, stale_occupancy);
+        assert!(
+            report.limit < u64::MAX && report.limit >= report.total,
+            "the run reports the cap it enforced, and ended under it"
+        );
+
+        // A live torrent's file is still untouchable, whatever the volume
+        // says: a full disk may not delete what is being written, and the run
+        // reports what protection held rather than a clean that did nothing.
+        let protected: HashSet<_> = [recent.clone()].into_iter().collect();
+        let report = evict(
+            std::slice::from_ref(&root),
+            &protected,
+            CacheLimit {
+                configured: u64::MAX,
+                available: Some(CACHE_FREE_SPACE_FLOOR - occupancy(&recent) / 4),
+            },
+            &[],
+        )
+        .await
+        .unwrap();
+        assert!(recent.is_file(), "protection outranks a full volume");
+        assert_eq!(report.protected_files, 1);
+        assert!(report.shortfall_message().is_some());
     }
 }

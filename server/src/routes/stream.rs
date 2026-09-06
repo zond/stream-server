@@ -490,7 +490,10 @@ fn ensure_download_disk_ready(
         .map(|metadata| metadata.len().min(file_size))
         .unwrap_or(0);
     let remaining = file_size.saturating_sub(existing_len);
-    let safety_margin = 512 * 1024 * 1024u64;
+    // The same floor the cache cleaner keeps free (`CacheLimit::effective`):
+    // below it this check gives up on the disk, so it is the line the cleaner
+    // must keep the cache out of.
+    let safety_margin = crate::cache_cleaner::CACHE_FREE_SPACE_FLOOR;
     let required = if is_partial {
         requested_len.min(safety_margin)
     } else {

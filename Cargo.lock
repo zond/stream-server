@@ -4070,6 +4070,7 @@ dependencies = [
  "dirs",
  "enginefs",
  "flate2",
+ "fs4",
  "fslock",
  "futures-util",
  "getrandom 0.4.3",
