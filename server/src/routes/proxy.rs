@@ -852,7 +852,15 @@ async fn proxy(
         "last-modified",
         "etag",
     ];
-    if !rewriting_playlist {
+    if rewriting_playlist {
+        // And ranging into a body we wrote is ranging into the wrong
+        // entity, so say so rather than leave a player to infer it from a
+        // missing header. The reference sets this too
+        // (`responseHeaders["accept-ranges"]="none"`), which is the one
+        // thing it does with a rewritten playlist's headers that we did
+        // not.
+        res_builder = res_builder.header(header::ACCEPT_RANGES, "none");
+    } else {
         for name in relayed_body_res_headers {
             if let Some(value) = res_headers.get(name) {
                 res_builder = res_builder.header(name, value);
@@ -871,19 +879,22 @@ async fn proxy(
         .header(header::ACCESS_CONTROL_ALLOW_HEADERS, "*");
 
     if rewriting_playlist {
-        // Every line of the playlist is rewritten to come back through this
-        // proxy, so the whole body has to be in hand before any of it is
-        // sent. A body we could not read is a playlist we cannot rewrite:
-        // saying so beats handing the player an empty one that parses as a
-        // stream with no segments.
+        // The playlist is rewritten as it arrives, a line at a time, and
+        // handed to hyper as a stream. Nothing measures it: the whole of
+        // the framing trouble this route has had came of buffering the body
+        // so a `Content-Length` could be declared for it, and a body hyper
+        // frames from what is actually written cannot disagree with its own
+        // headers.
         //
         // It is read through the registry, exactly as a media body is, and
         // that is the point: a live-HLS player refreshing its playlist
         // against an origin that has stopped answering is a read wedged in
         // here, and this branch used to return before `attach` ever ran --
         // so the one read this feature exists for was the one read it could
-        // not reach. Closing the player's token now breaks this read too.
-        let Some(mut chunks) = state
+        // not reach. Streaming it makes the close plainer still: the
+        // registry's stream *is* the body now, so a close breaks the
+        // player's read directly rather than a drain it is waiting behind.
+        let Some(chunks) = state
             .proxy_streams
             .attach(player_token.clone(), response.bytes_stream())
         else {
@@ -897,26 +908,8 @@ async fn proxy(
             )
                 .into_response();
         };
-        let mut body = Vec::new();
-        while let Some(chunk) = chunks.next().await {
-            match chunk {
-                Ok(chunk) => body.extend_from_slice(&chunk),
-                Err(e) => {
-                    return (
-                        StatusCode::BAD_GATEWAY,
-                        format!("Proxy could not read the playlist: {e}"),
-                    )
-                        .into_response();
-                }
-            }
-        }
-        // A playlist is UTF-8 by specification, and a byte that is not is a
-        // byte we cannot rewrite around either way.
-        let body = String::from_utf8_lossy(&body);
-        let rewritten = rewrite_playlist(&body, &fetched_url, &params.carried());
-        // The framing of the body we built, measured on that body.
-        res_builder = res_builder.header(header::CONTENT_LENGTH, rewritten.len().to_string());
-        return finalize_response(res_builder, axum::body::Body::from(rewritten));
+        let rewritten = rewritten_playlist_body(chunks, fetched_url, params.carried());
+        return finalize_response(res_builder, axum::body::Body::from_stream(rewritten));
     }
 
     // Registered under the client's token, so the client can end this exact
@@ -965,7 +958,26 @@ pub async fn close_proxy_streams(
 }
 
 /// One line of a rewritten playlist, or the line unchanged when there is
-/// nothing in it to rewrite.
+/// nothing in it to rewrite. `carried` is [`ProxyParams::carried`] -- the
+/// `h=`/`p=` the playlist's own URL arrived with, which every line it names
+/// needs too: a segment of an authenticated stream needs the same
+/// authorization the playlist needed, and closing an HLS player has to
+/// break the read in flight, which is a segment. What a segment does *not*
+/// need is the caller's `r=`; see [`ProxyParams::carried`].
+///
+/// **Every line that names a resource is rewritten, relative ones
+/// included.** The reference leaves those alone, correctly for itself: a
+/// relative line is resolved by the player against the URL the player asked
+/// for, which under the path format already points back through the proxy.
+/// Two things stop us inheriting that. A redirect moves the directory the
+/// lines are relative to and the player cannot know -- the URL it asked for
+/// is the CDN's, the one the playlist came from is the edge's, and `base`
+/// here is the second (see
+/// `a_playlist_reached_through_a_redirect_is_rewritten_against_the_edge`).
+/// And the URL the player asked for carries the caller's `r=`, so a line
+/// left alone would re-acquire on the segment the very label this rewrite
+/// exists to keep off it. Resolving every line costs bytes in the playlist
+/// and buys both.
 ///
 /// A line is one of three things and the reference reads them the same way:
 /// a tag (`#…`), where only a `URI="…"` attribute names a resource; an
@@ -1064,35 +1076,175 @@ fn proxied_uri(uri: &str, base: &Url, carried: &str) -> Option<String> {
     Some(proxied)
 }
 
-/// Rewrites every URI in a playlist to come back through this proxy,
-/// carrying `carried` -- [`ProxyParams::carried`], the `h=`/`p=` the
-/// playlist's own URL arrived with -- into each one.
+/// The longest line the rewriter will hold before deciding the body it is
+/// reading is not line-oriented after all.
 ///
-/// Both of them, because a segment is not a different stream: it needs the
-/// same request headers to be allowed at the origin, and the same player
-/// token, since closing an HLS player has to close the segment read that is
-/// actually in flight rather than the playlist read that is not. What it
-/// does *not* need is the caller's `r=`; see [`ProxyParams::carried`].
+/// A streaming rewrite has to keep the bytes since the last `\n` until a
+/// `\n` arrives to complete them, and nothing about a response guarantees
+/// one ever does: a `.m3u8` URL that answers with a megabyte of MPEG-TS is
+/// enough to make that buffer the whole body. A playlist line is a tag or a
+/// URI, so 64 KiB is orders of magnitude more than any real one; past it,
+/// the bytes are handed on as they came and the rest of that line with
+/// them.
+const LONGEST_REWRITABLE_LINE: usize = 64 * 1024;
+
+/// A playlist rewriter that takes the body a chunk at a time.
 ///
-/// Every line that names a resource is rewritten, relative ones included.
-/// The reference leaves those alone -- correctly, for itself: a relative
-/// line is resolved by the player against the URL the player asked for,
-/// which under the path format already points back here. Two things stop us
-/// inheriting that. A redirect moves the directory the lines are relative
-/// to, and the player cannot know: the URL it asked for is the CDN's, the
-/// one the playlist came from is the edge's, and `base` here is the second
-/// (see `a_playlist_reached_through_a_redirect_is_rewritten_against_the_edge`).
-/// And the URL the player asked for carries the caller's `r=`, so a line
-/// left alone re-acquires on the segment the very label this rewrite exists
-/// to keep off it. Resolving every line and writing it out costs bytes in
-/// the playlist and buys both.
-fn rewrite_playlist(body: &str, base: &Url, carried: &str) -> String {
-    let mut rewritten = String::new();
-    for line in body.lines() {
-        rewritten.push_str(&rewrite_line(line, base, carried));
-        rewritten.push('\n');
+/// The reference streams too, through a `stream.Transform` that keeps the
+/// tail after the last separator in a `partialLine` and prepends it to the
+/// next chunk; this is that, and the reason for it is the same. Buffering
+/// the whole body to measure it was where our framing bugs came from: the
+/// rewritten length had to be declared, so a `Content-Length` had to be
+/// written, and a `206` or a `HEAD` measured the wrong thing. A body handed
+/// to hyper as a stream is framed by hyper from what it actually writes.
+///
+/// **Line endings are preserved per line**, which is better than the
+/// reference and cheaper. It detects the ending once, from the first chunk
+/// that contains one, and re-emits that for the whole body -- and its
+/// detection has three faults worth naming so nobody ports them back: with
+/// both characters present and `\n` first it returns the literal `"\n\r"`,
+/// an ending that does not exist; it scans the whole buffered chunk, so a
+/// stray `\r` anywhere in a large first chunk mis-detects the body; and
+/// with no terminator in the first chunk at all it splits on `null`, which
+/// JavaScript coerces to the string `"null"`. Splitting on `\n` and putting
+/// back whatever `\r` the line already carried needs none of that, and a
+/// body with mixed endings comes out as it went in. A lone `\r` is not a
+/// line ending here; the HLS specification says lines end `\n` or `\r\n`.
+struct PlaylistRewriter {
+    /// The URL the playlist came from -- what its lines are relative to.
+    base: Url,
+    /// [`ProxyParams::carried`]: the `h=`/`p=` every line it writes carries.
+    carried: String,
+    /// Bytes since the last `\n`, waiting for the one that completes them.
+    pending: Vec<u8>,
+    /// Set when [`pending`](Self::pending) outgrew
+    /// [`LONGEST_REWRITABLE_LINE`] and its head has already gone out
+    /// unrewritten: the rest of that one line follows it verbatim.
+    passing_through: bool,
+}
+
+impl PlaylistRewriter {
+    fn new(base: Url, carried: String) -> Self {
+        Self {
+            base,
+            carried,
+            pending: Vec::new(),
+            passing_through: false,
+        }
     }
-    rewritten
+
+    /// Every line `chunk` completes, rewritten; the rest is held for the
+    /// chunk that completes it.
+    fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
+        self.pending.extend_from_slice(chunk);
+        let mut rewritten = Vec::new();
+        while let Some(end) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = self.pending.drain(..=end).collect();
+            self.write_line(&line[..end], &mut rewritten);
+            rewritten.push(b'\n');
+        }
+        if self.passing_through || self.pending.len() > LONGEST_REWRITABLE_LINE {
+            self.passing_through = true;
+            rewritten.append(&mut self.pending);
+        }
+        rewritten
+    }
+
+    /// What is left when the origin's body ends: the tail after the last
+    /// `\n`, rewritten, with **no** terminator added.
+    ///
+    /// Which is how the presence or absence of a final newline survives the
+    /// rewrite -- `body.lines()`, which this replaced, could not tell
+    /// `"a\nb"` from `"a\nb\n"` and invented one for both. The reference's
+    /// `flush` does the same thing for the same reason.
+    fn finish(&mut self) -> Vec<u8> {
+        let pending = std::mem::take(&mut self.pending);
+        let mut rewritten = Vec::new();
+        self.write_line(&pending, &mut rewritten);
+        rewritten
+    }
+
+    fn write_line(&mut self, line: &[u8], rewritten: &mut Vec<u8>) {
+        if self.passing_through {
+            rewritten.extend_from_slice(line);
+            self.passing_through = false;
+            return;
+        }
+        let (line, carriage_return) = match line.strip_suffix(b"\r") {
+            Some(line) => (line, true),
+            None => (line, false),
+        };
+        match std::str::from_utf8(line) {
+            Ok(text) => rewritten
+                .extend_from_slice(rewrite_line(text, &self.base, &self.carried).as_bytes()),
+            // A playlist is UTF-8 by specification, so a line that is not
+            // holds no URI to rewrite. It is passed on as it came rather
+            // than through `from_utf8_lossy`, which this used to do to the
+            // whole body: replacing bytes we cannot read with U+FFFD
+            // corrupts them on their way to a player that might have
+            // understood them.
+            Err(_) => rewritten.extend_from_slice(line),
+        }
+        if carriage_return {
+            rewritten.push(b'\r');
+        }
+    }
+}
+
+/// The origin's playlist as a stream of rewritten chunks.
+///
+/// Nothing here measures anything, which is the point: the response is
+/// framed by hyper from the bytes actually written. The reference reaches
+/// the same place by hand, deleting `content-length` and forcing
+/// `transfer-encoding: chunked` -- a header we must not set ourselves, and
+/// do not need to.
+fn rewritten_playlist_body<S, C, E>(
+    chunks: S,
+    base: Url,
+    carried: String,
+) -> impl futures_util::Stream<Item = Result<Vec<u8>, E>>
+where
+    S: futures_util::Stream<Item = Result<C, E>> + Unpin,
+    C: AsRef<[u8]>,
+{
+    futures_util::stream::unfold(
+        Some((chunks, PlaylistRewriter::new(base, carried))),
+        |state| async move {
+            let (mut chunks, mut rewriter) = state?;
+            loop {
+                match chunks.next().await {
+                    Some(Ok(chunk)) => {
+                        let rewritten = rewriter.push(chunk.as_ref());
+                        // A chunk that completes no line has nothing to
+                        // send yet; an empty one on the wire would be a
+                        // frame that says nothing.
+                        if rewritten.is_empty() {
+                            continue;
+                        }
+                        return Some((Ok(rewritten), Some((chunks, rewriter))));
+                    }
+                    // The read failed part-way. The error ends the body,
+                    // which is what a player has to see: half a playlist
+                    // delivered cleanly would parse as a stream that stops.
+                    Some(Err(error)) => return Some((Err(error), None)),
+                    None => {
+                        let tail = rewriter.finish();
+                        return (!tail.is_empty()).then_some((Ok(tail), None));
+                    }
+                }
+            }
+        },
+    )
+}
+
+/// A whole playlist through the rewriter in one call, for the tests that
+/// are about the lines rather than about the chunking.
+#[cfg(test)]
+fn rewrite_playlist(body: &str, base: &Url, carried: &str) -> String {
+    let mut rewriter = PlaylistRewriter::new(base.clone(), carried.to_string());
+    let mut rewritten = rewriter.push(body.as_bytes());
+    rewritten.append(&mut rewriter.finish());
+    String::from_utf8(rewritten).expect("text in, text out")
 }
 
 #[cfg(test)]
@@ -1315,6 +1467,95 @@ mod tests {
             proxied_with("http://example.com/streams/seg-0.ts", "&p=player%20one")
         );
         assert_eq!(rewritten, expected);
+    }
+
+    /// The body arriving in chunks that fall wherever the network puts
+    /// them, including inside a URI and between the `\r` and the `\n`. What
+    /// comes out is what the whole body would have produced -- that is the
+    /// whole contract of a streaming rewrite.
+    #[test]
+    fn a_body_split_across_chunks_rewrites_to_the_same_bytes() {
+        let body = "#EXTM3U\r\n#EXTINF:10,\r\nseg-0.ts\r\nhttps://cdn.example.org/s/1.ts\r\n";
+        let whole = rewrite_playlist(body, &base(), "&p=one");
+
+        for split in 1..body.len() {
+            let mut rewriter = PlaylistRewriter::new(base(), "&p=one".to_string());
+            let mut streamed = rewriter.push(&body.as_bytes()[..split]);
+            streamed.append(&mut rewriter.push(&body.as_bytes()[split..]));
+            streamed.append(&mut rewriter.finish());
+            assert_eq!(
+                String::from_utf8(streamed).expect("text in, text out"),
+                whole,
+                "split at {split}"
+            );
+        }
+    }
+
+    /// Line endings survive per line, `\r\n` and `\n` alike, and a body that
+    /// ended without one still does. `body.lines()`, which this replaced,
+    /// turned a CRLF playlist into an LF one and invented a final newline
+    /// for a body that had none.
+    #[test]
+    fn line_endings_come_out_the_way_they_went_in() {
+        assert_eq!(
+            rewrite_playlist("#EXTM3U\r\n#EXT-X-ENDLIST\r\n", &base(), ""),
+            "#EXTM3U\r\n#EXT-X-ENDLIST\r\n"
+        );
+        assert_eq!(
+            rewrite_playlist("#EXTM3U\n#EXT-X-ENDLIST", &base(), ""),
+            "#EXTM3U\n#EXT-X-ENDLIST",
+            "no terminator invented for a body that ended without one"
+        );
+        assert_eq!(
+            rewrite_playlist("#EXTM3U\r\n#EXTINF:10,\nseg-0.ts\r\n", &base(), ""),
+            format!(
+                "#EXTM3U\r\n#EXTINF:10,\n{}\r\n",
+                proxied("http://example.com/streams/seg-0.ts")
+            ),
+            "mixed endings are the origin's business, not something to normalise"
+        );
+    }
+
+    /// A line that is not UTF-8 holds no URI, and replacing the bytes we
+    /// cannot read with U+FFFD -- which `from_utf8_lossy` over the whole
+    /// body used to do -- corrupts them on their way to a player that might
+    /// have understood them.
+    #[test]
+    fn a_line_that_is_not_text_is_passed_on_as_it_came() {
+        let mut rewriter = PlaylistRewriter::new(base(), String::new());
+        let mut out = rewriter.push(b"#EXTM3U\n\xff\xfe not text\nseg-0.ts\n");
+        out.append(&mut rewriter.finish());
+
+        let mut expected = b"#EXTM3U\n\xff\xfe not text\n".to_vec();
+        expected.extend_from_slice(proxied("http://example.com/streams/seg-0.ts").as_bytes());
+        expected.push(b'\n');
+        assert_eq!(out, expected, "the bytes as the origin wrote them");
+    }
+
+    /// A body that is not line-oriented at all -- a `.m3u8` URL answering
+    /// with megabytes of MPEG-TS -- must not be held in memory waiting for
+    /// a newline that never comes. Past
+    /// [`LONGEST_REWRITABLE_LINE`] the bytes are handed on as they came,
+    /// and the rest of that line with them.
+    #[test]
+    fn a_line_too_long_to_be_one_is_handed_on_rather_than_held() {
+        let mut rewriter = PlaylistRewriter::new(base(), String::new());
+        let overlong = vec![b'x'; LONGEST_REWRITABLE_LINE + 1];
+        assert_eq!(
+            rewriter.push(&overlong),
+            overlong,
+            "nothing is held back once the line cannot be one"
+        );
+        let mut out = rewriter.push(b"more of it\nseg-0.ts\n");
+        out.append(&mut rewriter.finish());
+        assert_eq!(
+            String::from_utf8(out).expect("text in, text out"),
+            format!(
+                "more of it\n{}\n",
+                proxied("http://example.com/streams/seg-0.ts")
+            ),
+            "the rest of that line follows it verbatim, and the next line is a line again"
+        );
     }
 
     /// Both URL shapes carry the same four parameters, and one parser reads

@@ -605,8 +605,9 @@ enum Framing {
 }
 
 /// Fetches the playlist through the proxy and asserts the player got the
-/// whole rewritten thing, framed by its own length rather than the origin's.
-fn assert_playlist_is_reframed(framing: Framing) -> anyhow::Result<()> {
+/// whole rewritten thing, framed by hyper from the bytes we actually wrote
+/// rather than by anything either end declared.
+fn assert_playlist_arrives_whole(framing: Framing) -> anyhow::Result<()> {
     let fixture = fixture_with(playlist_origin(framing)?)?;
     let target = format!("http://{}/live/master.m3u8", fixture.origin.addr);
     let response = reqwest::blocking::Client::new()
@@ -627,9 +628,9 @@ fn assert_playlist_is_reframed(framing: Framing) -> anyhow::Result<()> {
         "the whole playlist arrives, every line rewritten"
     );
     assert_eq!(
-        declared.as_deref(),
-        Some(body.len().to_string().as_str()),
-        "and the length we declare is the length of what we sent, not what we fetched"
+        declared, None,
+        "and nothing declares a length for it: the body is written as it is read, and \
+         hyper frames what it writes"
     );
     assert_ne!(
         body.len(),
@@ -645,24 +646,22 @@ fn assert_playlist_is_reframed(framing: Framing) -> anyhow::Result<()> {
 /// task: `payload claims content-length of 180, custom content-length header
 /// claims 82`.
 #[test]
-fn a_playlist_from_a_content_length_origin_is_framed_by_its_rewritten_length() -> anyhow::Result<()>
-{
-    assert_playlist_is_reframed(Framing::ContentLength)
+fn a_playlist_from_a_content_length_origin_arrives_whole() -> anyhow::Result<()> {
+    assert_playlist_arrives_whole(Framing::ContentLength)
 }
 
 /// With the origin's `Transfer-Encoding: chunked` relayed, the response
 /// closed having written nothing at all.
 #[test]
-fn a_playlist_from_a_chunked_origin_is_framed_by_its_rewritten_length() -> anyhow::Result<()> {
-    assert_playlist_is_reframed(Framing::Chunked)
+fn a_playlist_from_a_chunked_origin_arrives_whole() -> anyhow::Result<()> {
+    assert_playlist_arrives_whole(Framing::Chunked)
 }
 
 /// The one framing that worked before, by accident -- a close-delimited
 /// origin gave the proxy nothing to relay. It must keep working.
 #[test]
-fn a_playlist_from_a_close_delimited_origin_is_framed_by_its_rewritten_length() -> anyhow::Result<()>
-{
-    assert_playlist_is_reframed(Framing::CloseDelimited)
+fn a_playlist_from_a_close_delimited_origin_arrives_whole() -> anyhow::Result<()> {
+    assert_playlist_arrives_whole(Framing::CloseDelimited)
 }
 
 /// An origin that serves [`ORIGIN_PLAYLIST`] under `content_type`, whatever
@@ -1778,6 +1777,11 @@ fn a_closed_token_is_refused_a_new_stream_and_the_origin_is_never_asked() -> any
 /// precisely the wedge this feature exists for -- and precisely the one it
 /// could not reach, because that branch returned before the read was ever
 /// registered.
+///
+/// What the close ends is the body, not the headers. The rewrite streams,
+/// so the player has its `200` as soon as the origin's own headers arrive
+/// and is then waiting on bytes that never come -- exactly the shape a
+/// wedged media read has, and it fails the same way.
 #[test]
 fn a_playlist_read_is_registered_and_can_be_closed() -> anyhow::Result<()> {
     // Headers, then nothing, ever. The socket stays open: no FIN, no reset,
@@ -1798,10 +1802,9 @@ fn a_playlist_read_is_registered_and_can_be_closed() -> anyhow::Result<()> {
     let target = format!("http://{}/live/master.m3u8", fixture.origin.addr);
     let url = format!("{}/proxy/?d={}&p=player-hls", fixture.base, encode(&target));
     let reader = std::thread::spawn(move || {
-        reqwest::blocking::Client::new()
-            .get(url)
-            .send()
-            .map(|response| response.status())
+        let response = reqwest::blocking::Client::new().get(url).send()?;
+        let status = response.status();
+        Ok::<_, reqwest::Error>((status, response.text().is_err()))
     });
 
     // The read is registered while it is stuck, which is what makes it
@@ -1818,7 +1821,7 @@ fn a_playlist_read_is_registered_and_can_be_closed() -> anyhow::Result<()> {
     assert_eq!(fixture.handle.close_proxy_streams("player-hls"), 1);
     assert_eq!(
         reader.join().expect("the reader thread")?,
-        reqwest::StatusCode::BAD_GATEWAY,
+        (reqwest::StatusCode::OK, true),
         "the wedged playlist read ends now, rather than at a timeout"
     );
 
