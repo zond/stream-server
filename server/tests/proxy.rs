@@ -7,10 +7,14 @@
 //! client sending every remote stream through this server gets the header
 //! rewriting and the single egress point, and does *not* get caching.
 //!
-//! Both URL shapes are exercised, because the server writes one of them
-//! itself: stremio-core builds the Core path format
-//! (`/proxy/d=<origin>&h=.../<path>`), and `rewrite_playlist` rewrites every
-//! line of an HLS playlist into the query format (`/proxy/?d=<url>`).
+//! Both URL shapes are exercised. The Core path format
+//! (`/proxy/d=<origin>&h=.../<path>`) is the one stremio-core builds and
+//! the one this server writes itself: every line of a rewritten HLS
+//! playlist comes back in it, because only a path format leaves a nested
+//! playlist a directory of its own to resolve *its* lines against. The
+//! query format (`/proxy/?d=<url>`) is read and not written -- callers
+//! still send it, and most tests below use it because a whole target in
+//! one parameter is the shorter thing to write.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -24,7 +28,7 @@ fn offline_config() -> stream_server::ServerConfig {
     }
 }
 
-/// One byte of the body at [`offset`]: a cheap pattern, so a range response
+/// One byte of the body at `offset`: a cheap pattern, so a range response
 /// can be checked to have come from the offset it claims rather than merely
 /// to have the right length.
 fn byte_at(offset: usize) -> u8 {
@@ -261,9 +265,11 @@ fn the_core_path_format_relays_the_target() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The query format, which is what [`rewrite_playlist`] writes into every
-/// HLS playlist the route rewrites -- so a 404 here is every segment of a
-/// proxied HLS stream 404ing.
+/// The query format. Not what the playlist rewrite writes any more -- that
+/// has been the path format since a rewritten line needed a directory of
+/// its own -- but callers still send it, so the route still reads it, and
+/// the whole target in one parameter has to say everything a target named
+/// by path can.
 #[test]
 fn the_query_format_relays_the_target() -> anyhow::Result<()> {
     let fixture = fixture()?;
@@ -1132,7 +1138,7 @@ fn a_nested_playlist_resolves_its_own_relative_lines_through_the_proxy() -> anyh
 /// need the same `Authorization` the addon put in `h=`, and only the
 /// playlist's own URL was carrying it.
 ///
-/// `rewrite_playlist` used to write `d=` and `p=` and nothing else, so the
+/// A rewritten line used to carry `d=` and `p=` and nothing else, so the
 /// segments came back through the proxy stripped of the header that made
 /// them fetchable. Measured before the fix: playlist `200`, every segment
 /// `403`, the origin logging `auth=[]`.
@@ -1222,10 +1228,14 @@ fn an_authenticated_playlist_carries_its_headers_into_every_segment() -> anyhow:
 /// corner.
 ///
 /// The reference copies it (its virtual root is the caller's whole opts
-/// string) and is worse off for it: it decides `isPlaylist` *after*
-/// merging `r=` in, so a segment reached through such a line is classified
-/// a playlist and run through the line rewriter -- MPEG-TS, rewritten as
-/// text. Its cross-origin branch drops `r=`, and that is the half ported.
+/// string) and compounds it: it classifies a response by the content type
+/// it has already merged `r=` into, so a segment reached through such a
+/// line is called a playlist and run through the line rewriter -- MPEG-TS,
+/// rewritten as text. We ask the merged type too, deliberately, since that
+/// is how `r=` corrects an origin that mislabels; what keeps the same
+/// thing from happening here is this test's subject, that `r=` never
+/// reaches the line. Its cross-origin branch drops `r=`, and that is the
+/// half ported.
 #[test]
 fn a_segment_named_by_a_rewritten_line_does_not_carry_the_playlist_s_r() -> anyhow::Result<()> {
     let origin = Origin::start_with(|request: &Request, socket: &mut TcpStream| {
