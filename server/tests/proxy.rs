@@ -1005,6 +1005,78 @@ fn a_playlist_reached_through_a_redirect_is_rewritten_against_the_edge() -> anyh
     Ok(())
 }
 
+/// A `.m3u8` URL that answers with an error, and a `HEAD` for one that does
+/// not. Neither has a playlist in it, and rewriting them said otherwise.
+///
+/// The 404's error page came back as a playlist of proxy URLs built out of
+/// the words in it -- a fabricated segment list an HLS player would
+/// dutifully try to fetch. The `HEAD` was worse in a quieter way: the
+/// rewrite measured the empty body it had been handed and declared
+/// `Content-Length: 0`, so a player sizing the resource before playing it
+/// was told there was nothing there.
+#[test]
+fn only_a_2xx_get_at_a_playlist_url_is_rewritten_as_a_playlist() -> anyhow::Result<()> {
+    const MISSING: &str = "no such stream\n";
+
+    let origin = Origin::start_with(|request: &Request, socket: &mut TcpStream| {
+        let missing = request.target().contains("missing");
+        let (head, content_type, body) = if missing {
+            ("HTTP/1.1 404 Not Found", "text/plain", MISSING)
+        } else {
+            (
+                "HTTP/1.1 200 OK",
+                "application/vnd.apple.mpegurl",
+                ORIGIN_PLAYLIST,
+            )
+        };
+        let _ = socket.write_all(
+            format!(
+                "{head}\r\nContent-Type: {content_type}\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        // A HEAD gets the headers and no body, as any origin would answer.
+        if !request.line.starts_with("HEAD") {
+            let _ = socket.write_all(body.as_bytes());
+        }
+        let _ = socket.flush();
+    })?;
+
+    let fixture = fixture_with(origin)?;
+    let client = reqwest::blocking::Client::new();
+    let proxied = |path: &str| {
+        format!(
+            "{}/proxy/?d={}",
+            fixture.base,
+            encode(&format!("http://{}/live/{path}", fixture.origin.addr))
+        )
+    };
+
+    let missing = client.get(proxied("missing.m3u8")).send()?;
+    assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(
+        missing.text()?,
+        MISSING,
+        "the origin's own error body, not a playlist made out of it"
+    );
+
+    let head = client.head(proxied("master.m3u8")).send()?;
+    assert_eq!(head.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        head.headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok()),
+        Some(ORIGIN_PLAYLIST.len().to_string().as_str()),
+        "how big the resource is, which is the only thing a HEAD is for"
+    );
+    assert!(head.bytes()?.is_empty());
+
+    drop(fixture.handle);
+    Ok(())
+}
+
 /// An origin that never stops sending: a long film, a live stream, the
 /// swarm that `network-timeout` is generous for. Closing has to be visible
 /// against *this*, not against a body that was about to end anyway.

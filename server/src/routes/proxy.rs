@@ -610,7 +610,17 @@ async fn proxy(
         .unwrap_or("");
     let encoded_body =
         !content_encoding.is_empty() && !content_encoding.eq_ignore_ascii_case("identity");
-    let rewriting_playlist = is_playlist && !encoded_body;
+    // Only a body that is actually a playlist is rewritten as one, and a
+    // status code is half of what says so. A 404's error page served at a
+    // `.m3u8` URL was being rewritten line by line and handed back as a
+    // playlist of fabricated proxy URLs -- an origin's "Not found" became a
+    // segment list. And a `HEAD` has no body to rewrite at all: the rewrite
+    // measured the empty one and answered `Content-Length: 0`, so a player
+    // asking how big the resource is was told nothing is there. Both fall
+    // through to the plain relay, which is what they always should have
+    // been.
+    let rewriting_playlist =
+        is_playlist && !encoded_body && status.is_success() && method != Method::HEAD;
     if is_playlist && encoded_body {
         tracing::warn!(
             content_encoding = %content_encoding,
