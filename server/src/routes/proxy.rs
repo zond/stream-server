@@ -9,6 +9,7 @@ use axum::{
 use dashmap::DashSet;
 use futures_util::StreamExt;
 use reqwest::{Client, Method};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use url::Url;
@@ -904,7 +905,107 @@ pub async fn close_proxy_streams(
     Json(serde_json::json!({ "closed": closed }))
 }
 
-/// Rewrites every URL in a playlist to come back through this proxy,
+/// One line of a rewritten playlist, or the line unchanged when there is
+/// nothing in it to rewrite.
+///
+/// A line is one of three things and the reference reads them the same way:
+/// a tag (`#…`), where only a `URI="…"` attribute names a resource; an
+/// empty line; or a URI. Where we differ is in *finding* the URI inside a
+/// tag. The reference matches `URI="([^"]+)"` and splices the result back
+/// with `line.replace(uri[1], …)`, which replaces the first occurrence of
+/// that *substring* anywhere in the line -- so
+/// `#EXT-X-KEY:METHOD=AES-128,IV=0xabc,URI="0xabc"` rewrites the IV and
+/// leaves the key URI alone. The value is spliced by index here, so it is
+/// the attribute that moves and nothing else.
+///
+/// Like the reference, only the first `URI="…"` on a line is rewritten. No
+/// HLS tag carries two, but say so rather than leave it looking exhaustive.
+fn rewrite_line<'a>(line: &'a str, base: &Url, carried: &str) -> Cow<'a, str> {
+    const URI_ATTRIBUTE: &str = "URI=\"";
+
+    if line.starts_with('#') {
+        let Some(start) = line.find(URI_ATTRIBUTE) else {
+            return Cow::Borrowed(line);
+        };
+        let value = start + URI_ATTRIBUTE.len();
+        let Some(end) = line[value..].find('"').map(|end| value + end) else {
+            return Cow::Borrowed(line);
+        };
+        match proxied_uri(&line[value..end], base, carried) {
+            Some(proxied) => Cow::Owned(format!("{}{proxied}{}", &line[..value], &line[end..])),
+            None => Cow::Borrowed(line),
+        }
+    } else if line.is_empty() {
+        Cow::Borrowed(line)
+    } else {
+        match proxied_uri(line, base, carried) {
+            Some(proxied) => Cow::Owned(proxied),
+            None => Cow::Borrowed(line),
+        }
+    }
+}
+
+/// The path one URI named by a playlist takes back through this proxy:
+/// `/proxy/d=<origin>&h=…&p=…/<path on that origin>[?<query>]`, with `uri`
+/// resolved against `base` -- the URL the playlist itself came from.
+///
+/// **The path format, not the `/proxy/?d=<whole url>` query format this
+/// used to write**, and that is the load-bearing half of the port. A
+/// query-format URL has no directory. A media playlist named by a master
+/// one is rewritten like everything else, so the player fetches it at
+/// `/proxy/?d=…media.m3u8` -- and then resolves *its* relative lines
+/// against that, where `seg-0.ts` becomes `/proxy/seg-0.ts` and 404s at
+/// our own router before it ever becomes a request to the origin. The path
+/// format mirrors the origin's path structure underneath the proxy's
+/// mount, so a nested playlist's own relative lines land back here at the
+/// right origin. It is what the reference builds its `virtualRoot` for,
+/// and the reason its rewritten lines have no query format to be written
+/// in.
+///
+/// All four line forms -- absolute URL, absolute path, protocol-relative
+/// and relative -- go through this one call, because [`Url::join`] already
+/// distinguishes them. The reference spells out three branches and gets two
+/// of them wrong: it tests for an absolute URL with
+/// `startsWith("http://")`, so `HTTP://host/…` falls through to its
+/// absolute-path branch untouched, and `//host/path` hits that branch too
+/// and is mangled into `/proxy/<opts>/host/path`. Our own `contains("://")`
+/// test had the mirror-image fault, reading a relative line whose query
+/// carries `?u=http://x` as absolute.
+///
+/// `None` when the line does not resolve to an `http(s)` URL at all -- a
+/// `data:` URI, or something that is not a URL. Such a line is left exactly
+/// as the origin wrote it, since there is nothing this proxy could fetch
+/// for it.
+fn proxied_uri(uri: &str, base: &Url, carried: &str) -> Option<String> {
+    let target = base.join(uri).ok()?;
+    if !matches!(target.scheme(), "http" | "https") {
+        return None;
+    }
+    // `d=` is the bare origin and the path rides in the URL's own path,
+    // which is the invariant the path format's handler depends on: it
+    // *appends* the request path to `d=`. (The reference instead
+    // *replaces* `d=`'s pathname with the request path, which comes to the
+    // same thing only because its `d=` is always a bare origin too.)
+    let mut proxied = format!(
+        "/proxy/d={}{carried}{}",
+        urlencoding::encode(&target.origin().ascii_serialization()),
+        target.path()
+    );
+    // The target's own query travels in the rewritten URL's query, where
+    // this route reads it back off the wire and puts it on the origin
+    // request -- a signed CDN URL is a path plus a token, and it is the
+    // token that makes it fetchable. (The reference writes the query into
+    // the line too, and then drops it on the next hop: it assigns
+    // `dest.search = req.search || ""`, and nothing in its server ever sets
+    // `req.search`.)
+    if let Some(query) = target.query() {
+        proxied.push('?');
+        proxied.push_str(query);
+    }
+    Some(proxied)
+}
+
+/// Rewrites every URI in a playlist to come back through this proxy,
 /// carrying `carried` -- [`ProxyParams::carried`], the `h=`/`p=` the
 /// playlist's own URL arrived with -- into each one.
 ///
@@ -913,52 +1014,24 @@ pub async fn close_proxy_streams(
 /// token, since closing an HLS player has to close the segment read that is
 /// actually in flight rather than the playlist read that is not. What it
 /// does *not* need is the caller's `r=`; see [`ProxyParams::carried`].
-fn rewrite_playlist(body: &str, base_url: &Url, carried: &str) -> String {
+///
+/// Every line that names a resource is rewritten, relative ones included.
+/// The reference leaves those alone -- correctly, for itself: a relative
+/// line is resolved by the player against the URL the player asked for,
+/// which under the path format already points back here. Two things stop us
+/// inheriting that. A redirect moves the directory the lines are relative
+/// to, and the player cannot know: the URL it asked for is the CDN's, the
+/// one the playlist came from is the edge's, and `base` here is the second
+/// (see `a_playlist_reached_through_a_redirect_is_rewritten_against_the_edge`).
+/// And the URL the player asked for carries the caller's `r=`, so a line
+/// left alone re-acquires on the segment the very label this rewrite exists
+/// to keep off it. Resolving every line and writing it out costs bytes in
+/// the playlist and buys both.
+fn rewrite_playlist(body: &str, base: &Url, carried: &str) -> String {
     let mut rewritten = String::new();
     for line in body.lines() {
-        if line.is_empty() {
-            rewritten.push('\n');
-            continue;
-        }
-        if line.starts_with("#") {
-            // Handle URI="url" in tags like #EXT-X-MEDIA
-            if let Some(start) = line.find("URI=\"") {
-                let rest = &line[start + 5..];
-                if let Some(end) = rest.find("\"") {
-                    let uri = &rest[..end];
-                    let absolute_uri = if uri.contains("://") {
-                        uri.to_string()
-                    } else {
-                        base_url
-                            .join(uri)
-                            .map(|u: Url| u.to_string())
-                            .unwrap_or_else(|_| uri.to_string())
-                    };
-                    let proxy_uri =
-                        format!("/proxy/?d={}{carried}", urlencoding::encode(&absolute_uri));
-                    rewritten.push_str(&line[..start + 5]);
-                    rewritten.push_str(&proxy_uri);
-                    rewritten.push_str(&rest[end..]);
-                    rewritten.push('\n');
-                    continue;
-                }
-            }
-            rewritten.push_str(line);
-            rewritten.push('\n');
-        } else {
-            // It's a URL
-            let absolute_uri = if line.contains("://") {
-                line.to_string()
-            } else {
-                base_url
-                    .join(line)
-                    .map(|u: Url| u.to_string())
-                    .unwrap_or_else(|_| line.to_string())
-            };
-            let proxy_uri = format!("/proxy/?d={}{carried}", urlencoding::encode(&absolute_uri));
-            rewritten.push_str(&proxy_uri);
-            rewritten.push('\n');
-        }
+        rewritten.push_str(&rewrite_line(line, base, carried));
+        rewritten.push('\n');
     }
     rewritten
 }
@@ -971,8 +1044,25 @@ mod tests {
         Url::parse("http://example.com/streams/master.m3u8").unwrap()
     }
 
+    /// A rewritten line, spelled the way the path format spells it: the
+    /// proxy's mount, the target's origin in `d=`, the `h=`/`p=` the
+    /// request carried, and then the target's own path and query.
     fn proxied(target: &str) -> String {
-        format!("/proxy/?d={}", urlencoding::encode(target))
+        proxied_with(target, "")
+    }
+
+    fn proxied_with(target: &str, carried: &str) -> String {
+        let target = Url::parse(target).expect("a test names a target it can parse");
+        let mut proxied = format!(
+            "/proxy/d={}{carried}{}",
+            urlencoding::encode(&target.origin().ascii_serialization()),
+            target.path()
+        );
+        if let Some(query) = target.query() {
+            proxied.push('?');
+            proxied.push_str(query);
+        }
+        proxied
     }
 
     #[test]
@@ -1061,6 +1151,96 @@ mod tests {
         );
     }
 
+    /// A protocol-relative line, which the reference's `startsWith("/")`
+    /// branch mangles into `/proxy/<opts>/host/path` -- a path on the
+    /// playlist's own origin, named after the host that was meant to serve
+    /// it. [`Url::join`] knows the form, so it costs us nothing to get
+    /// right.
+    #[test]
+    fn a_protocol_relative_line_keeps_the_host_it_names() {
+        let rewritten = rewrite_playlist("//cdn.example.org/other/seg-0.ts\n", &base(), "");
+        assert_eq!(
+            rewritten,
+            format!("{}\n", proxied("http://cdn.example.org/other/seg-0.ts"))
+        );
+    }
+
+    /// A relative line whose *query* contains a scheme. The absolute test
+    /// used to be `line.contains("://")`, which read this as an absolute
+    /// URL and handed `Url::parse` a relative path.
+    #[test]
+    fn a_query_that_looks_like_a_url_does_not_make_the_line_absolute() {
+        let rewritten = rewrite_playlist("seg-0.ts?u=http://origin/x\n", &base(), "");
+        assert_eq!(
+            rewritten,
+            format!(
+                "{}\n",
+                proxied("http://example.com/streams/seg-0.ts?u=http://origin/x")
+            )
+        );
+    }
+
+    /// The signed URL's whole point: the token in the query is what makes
+    /// the segment fetchable, so it has to survive into the line we write
+    /// and be there again when the player comes back through it.
+    #[test]
+    fn a_segment_s_own_query_survives_the_rewrite() {
+        let rewritten = rewrite_playlist("seg-0.ts?token=abc&e=1700\n", &base(), "&p=one");
+        assert_eq!(
+            rewritten,
+            format!(
+                "{}\n",
+                proxied_with(
+                    "http://example.com/streams/seg-0.ts?token=abc&e=1700",
+                    "&p=one"
+                )
+            )
+        );
+    }
+
+    /// The whole reason the lines are written in the path format: a media
+    /// playlist named by a master one keeps its directory under the proxy's
+    /// mount, so the relative lines *it* contains resolve to a URL this
+    /// route serves. Under the query format they resolved to
+    /// `/proxy/seg-0.ts` and 404ed at our own router.
+    #[test]
+    fn a_nested_playlist_keeps_a_directory_for_its_own_relative_lines() {
+        let rewritten = rewrite_playlist("v/720p/media.m3u8\n", &base(), "&p=one");
+        let line = rewritten.trim_end();
+        let (directory, _) = line.rsplit_once('/').expect("a path format line has one");
+        assert_eq!(
+            format!("{directory}/seg-0.ts"),
+            proxied_with("http://example.com/streams/v/720p/seg-0.ts", "&p=one"),
+            "what the player will resolve `seg-0.ts` to is the segment beside the media playlist"
+        );
+    }
+
+    /// The reference splices a rewritten `URI="…"` back with
+    /// `line.replace(uri[1], …)`, which replaces the first occurrence of
+    /// that *substring* anywhere in the line. Here the IV happens to equal
+    /// the URI, so the reference rewrites the IV and leaves the key alone.
+    /// The value is spliced by index, so only the attribute moves.
+    #[test]
+    fn a_tag_attribute_that_repeats_the_uri_is_left_where_it_is() {
+        let body = "#EXT-X-KEY:METHOD=AES-128,IV=0xabc,URI=\"0xabc\"\n";
+        let rewritten = rewrite_playlist(body, &base(), "");
+        assert_eq!(
+            rewritten,
+            format!(
+                "#EXT-X-KEY:METHOD=AES-128,IV=0xabc,URI=\"{}\"\n",
+                proxied("http://example.com/streams/0xabc")
+            )
+        );
+    }
+
+    /// A line this proxy could not fetch anything for is a line to leave
+    /// alone rather than to invent a `d=` for.
+    #[test]
+    fn a_line_that_is_not_an_http_url_is_left_as_the_origin_wrote_it() {
+        let body = "#EXT-X-KEY:METHOD=AES-128,URI=\"data:text/plain;base64,AAAA\"\n";
+        assert_eq!(rewrite_playlist(body, &base(), ""), body);
+    }
+
     /// The player's token travels into every line the rewrite writes, so a
     /// segment fetch belongs to the same player as the playlist that named
     /// it -- otherwise closing an HLS player would close its playlist read
@@ -1071,9 +1251,9 @@ mod tests {
         let params = ProxyParams::parse("d=whatever&p=player+one");
         let rewritten = rewrite_playlist(body, &base(), &params.carried());
         let expected = format!(
-            "#EXT-X-KEY:METHOD=AES-128,URI=\"{}&p=player%20one\"\n{}&p=player%20one\n",
-            proxied("http://example.com/streams/key/enc.key"),
-            proxied("http://example.com/streams/seg-0.ts")
+            "#EXT-X-KEY:METHOD=AES-128,URI=\"{}\"\n{}\n",
+            proxied_with("http://example.com/streams/key/enc.key", "&p=player%20one"),
+            proxied_with("http://example.com/streams/seg-0.ts", "&p=player%20one")
         );
         assert_eq!(rewritten, expected);
     }
@@ -1127,8 +1307,11 @@ mod tests {
         assert_eq!(
             rewritten,
             format!(
-                "{}&h=Authorization%3ABearer%20abc&p=one\n",
-                proxied("http://example.com/streams/seg-0.ts")
+                "{}\n",
+                proxied_with(
+                    "http://example.com/streams/seg-0.ts",
+                    "&h=Authorization%3ABearer%20abc&p=one"
+                )
             )
         );
     }

@@ -544,17 +544,20 @@ fn expected_playlist(origin: SocketAddr) -> String {
 
 /// [`ORIGIN_PLAYLIST`] rewritten with every segment resolved against
 /// `directory` -- the directory of the URL the playlist *came from*, which
-/// a redirect can move.
+/// a redirect can move -- and spelled in the path format the rewrite
+/// writes: the proxy's mount, the origin in `d=`, then the segment's own
+/// path on it. The path format is what leaves a rewritten line a directory
+/// of its own, which is what a nested playlist's relative lines need.
 fn expected_playlist_at(directory: &str) -> String {
+    let directory = url::Url::parse(&format!("{directory}/")).expect("a directory URL");
+    let origin = encode(&directory.origin().ascii_serialization());
     let mut expected = String::new();
     for line in ORIGIN_PLAYLIST.lines() {
         if line.starts_with('#') {
             expected.push_str(line);
         } else {
-            expected.push_str(&format!(
-                "/proxy/?d={}",
-                encode(&format!("{directory}/{line}"))
-            ));
+            let segment = directory.join(line).expect("a segment URL");
+            expected.push_str(&format!("/proxy/d={origin}{}", segment.path()));
         }
         expected.push('\n');
     }
@@ -753,6 +756,193 @@ fn a_playlist_is_recognised_by_the_url_the_caller_named() -> anyhow::Result<()> 
     assert!(
         body.contains("/proxy/"),
         "the URL the caller named ends .m3u8, and nothing else here says so: {body}"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
+/// The four forms a playlist line can take, all four through the proxy,
+/// asserted on what the origin was actually asked for.
+///
+/// An absolute URL on the playlist's own origin, an absolute URL on
+/// another, an absolute path and a relative one. The reference reads all
+/// four and this is the port of that; before it, an absolute path resolved
+/// against the origin the same way a relative one did (right answer, by
+/// accident of `Url::join`) and every line came back in the query format,
+/// which has no directory for a nested playlist to hang its own lines off.
+#[test]
+fn every_form_a_playlist_line_can_take_comes_back_through_the_proxy() -> anyhow::Result<()> {
+    fn serve(name: &'static str) -> impl Fn(&Request, &mut TcpStream) + Send + Sync + 'static {
+        move |request: &Request, socket: &mut TcpStream| {
+            let body = format!("{name} {}", request.target());
+            let _ = socket.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            let _ = socket.flush();
+        }
+    }
+
+    let other = Origin::start_with(serve("other"))?;
+    let other_addr = other.addr;
+    let playlist = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let served = playlist.clone();
+    let origin = Origin::start_with(move |request: &Request, socket: &mut TcpStream| {
+        if !request.target().ends_with(".m3u8") {
+            serve("home")(request, socket);
+            return;
+        }
+        let body = served
+            .lock()
+            .expect("the playlist is set before it is asked for");
+        let _ = socket.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        let _ = socket.flush();
+    })?;
+
+    let fixture = fixture_with(origin)?;
+    let home = fixture.origin.addr;
+    *playlist.lock().expect("nothing is reading it yet") = format!(
+        "#EXTM3U\n\
+         http://{home}/live/same-origin.ts\n\
+         http://{other_addr}/other/cross-origin.ts\n\
+         /root/absolute-path.ts\n\
+         relative.ts\n"
+    );
+
+    let client = reqwest::blocking::Client::new();
+    let target = format!("http://{home}/live/master.m3u8");
+    let body = client
+        .get(format!("{}/proxy/?d={}", fixture.base, encode(&target)))
+        .send()?
+        .text()?;
+    assert_eq!(fixture.origin.next_request().target(), "/live/master.m3u8");
+
+    let lines: Vec<String> = body
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    assert_eq!(lines.len(), 4, "one rewritten line per URI: {body}");
+
+    // Each rewritten line, fetched the way the player would fetch it, and
+    // then the request the origin it names actually received.
+    let expected = [
+        (&fixture.origin, "home", "/live/same-origin.ts"),
+        (&other, "other", "/other/cross-origin.ts"),
+        (&fixture.origin, "home", "/root/absolute-path.ts"),
+        (&fixture.origin, "home", "/live/relative.ts"),
+    ];
+    for (line, (origin, name, path)) in lines.iter().zip(expected) {
+        assert!(
+            line.starts_with("/proxy/d="),
+            "the path format, so a line has a directory of its own: {line}"
+        );
+        let fetched = client.get(format!("{}{line}", fixture.base)).send()?;
+        assert_eq!(fetched.status(), reqwest::StatusCode::OK, "fetching {line}");
+        assert_eq!(fetched.text()?, format!("{name} {path}"));
+        assert_eq!(origin.next_request().target(), path);
+    }
+
+    drop(fixture.handle);
+    Ok(())
+}
+
+/// Master playlist, media playlist, segments -- the ordinary shape of an
+/// HLS stream, and the one the query format could not serve. A rewritten
+/// line has to keep a directory of its own, because the media playlist's
+/// own relative lines are resolved by the player against the URL it fetched
+/// the media playlist at: under `/proxy/?d=<whole url>` that made
+/// `/proxy/seg-0.ts`, a 404 from our own router before the origin was ever
+/// asked.
+#[test]
+fn a_nested_playlist_resolves_its_own_relative_lines_through_the_proxy() -> anyhow::Result<()> {
+    let origin = Origin::start_with(|request: &Request, socket: &mut TcpStream| {
+        let target = request.target();
+        let (content_type, body) = if target.ends_with("master.m3u8") {
+            (
+                "application/vnd.apple.mpegurl",
+                "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nv/720p/media.m3u8\n".to_string(),
+            )
+        } else if target.ends_with("media.m3u8") {
+            (
+                "application/vnd.apple.mpegurl",
+                "#EXTM3U\n#EXTINF:10,\nseg-0.ts\n".to_string(),
+            )
+        } else {
+            ("video/mp2t", format!("bytes of {target}"))
+        };
+        let _ = socket.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        let _ = socket.flush();
+    })?;
+
+    let fixture = fixture_with(origin)?;
+    let client = reqwest::blocking::Client::new();
+    let named = |body: &str| {
+        body.lines()
+            .find(|line| !line.starts_with('#') && !line.is_empty())
+            .expect("the rewritten playlist names something")
+            .to_string()
+    };
+
+    let target = format!("http://{}/live/master.m3u8", fixture.origin.addr);
+    let master = client
+        .get(format!("{}/proxy/?d={}", fixture.base, encode(&target)))
+        .send()?
+        .text()?;
+    let media_url = named(&master);
+
+    let media = client
+        .get(format!("{}{media_url}", fixture.base))
+        .send()?
+        .text()?;
+    let segment_url = named(&media);
+    assert!(
+        segment_url.starts_with(
+            media_url
+                .rsplit_once('/')
+                .expect("a path format line has a directory")
+                .0
+        ),
+        "the segment sits in the media playlist's own directory: {segment_url}"
+    );
+
+    let segment = client
+        .get(format!("{}{segment_url}", fixture.base))
+        .send()?;
+    assert_eq!(segment.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        segment.text()?,
+        "bytes of /live/v/720p/seg-0.ts",
+        "the segment beside the media playlist, not beside the master one"
+    );
+
+    assert_eq!(fixture.origin.next_request().target(), "/live/master.m3u8");
+    assert_eq!(
+        fixture.origin.next_request().target(),
+        "/live/v/720p/media.m3u8"
+    );
+    assert_eq!(
+        fixture.origin.next_request().target(),
+        "/live/v/720p/seg-0.ts"
     );
 
     drop(fixture.handle);
