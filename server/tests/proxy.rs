@@ -947,6 +947,72 @@ fn a_content_type_override_still_forces_the_playlist_path() -> anyhow::Result<()
     Ok(())
 }
 
+/// The other direction of the same escape hatch, and the one it must not
+/// have: `r=` may *force* the playlist path and may never veto it.
+///
+/// A caller labelling the stream it is describing `video/mp4` is an
+/// ordinary thing for an addon to do, and it says nothing about the bytes
+/// -- the origin here serves a real `application/x-mpegURL` playlist. While
+/// `r=` was merged over the origin's own type before the classification
+/// asked, that label suppressed the rewrite: measured, the playlist came
+/// back verbatim, so the player resolved every segment against the origin
+/// and fetched it direct -- without the `h=` an authenticated stream needs
+/// and without the `p=` a close is addressed by. The whole feature falls
+/// out of the response.
+///
+/// An empty `r=Content-Type:` did it by shadowing the origin's type with
+/// nothing at all, which is the same bug with no label to blame it on. The
+/// URL names no playlist in either case, so the origin's own header is the
+/// only evidence there is -- and it is evidence `r=` does not get to erase.
+#[test]
+fn an_r_content_type_cannot_suppress_the_rewrite_of_a_real_playlist() -> anyhow::Result<()> {
+    for forced in ["Content-Type:video/mp4", "Content-Type:"] {
+        let fixture = fixture_with(playlist_origin_typed("application/x-mpegURL")?)?;
+        let target = format!("http://{}/live/stream", fixture.origin.addr);
+        let response = reqwest::blocking::Client::new()
+            .get(format!(
+                "{}/proxy/?d={}&r={}",
+                fixture.base,
+                encode(&target),
+                encode(forced)
+            ))
+            .send()?;
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response.text()?,
+            expected_playlist(fixture.origin.addr),
+            "{forced} does not unsay the origin's application/x-mpegURL"
+        );
+
+        drop(fixture.handle);
+    }
+
+    // And the override still reaches the player, which is what `r=` is for:
+    // forcing the rewrite is not the same as ignoring the header.
+    let fixture = fixture_with(playlist_origin_typed("application/x-mpegURL")?)?;
+    let target = format!("http://{}/live/stream", fixture.origin.addr);
+    let response = reqwest::blocking::Client::new()
+        .get(format!(
+            "{}/proxy/?d={}&r={}",
+            fixture.base,
+            encode(&target),
+            encode("Content-Type:video/mp4")
+        ))
+        .send()?;
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("video/mp4"),
+        "the caller's label is what the player is told; only the classification ignores it"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
 /// The four forms a playlist line can take, all four through the proxy,
 /// asserted on what the origin was actually asked for.
 ///

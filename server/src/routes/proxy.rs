@@ -179,35 +179,38 @@ fn names_a_playlist(url: &Url) -> bool {
     path.ends_with(".m3u8") || path.ends_with(".m3u")
 }
 
-/// The content type this response will be *served* under, folded to lower
-/// case: the caller's `r=Content-Type` when it sent one, the origin's own
-/// value otherwise.
+/// The content type the caller *forced* with `r=Content-Type`, folded to
+/// lower case -- `None` when it sent none, which is every request but the
+/// HLS one stremio-core builds.
 ///
-/// After `r=`, deliberately, and the reference does the same (it computes
-/// `isPlaylist` from headers it has already merged `r=` into). `r=` is how
-/// a caller corrects an origin that mislabels -- stremio-core sends
-/// `r=Content-Type:application/x-mpegurl` for an HLS stream -- so the label
-/// the *player* will act on is the one that has to decide what this body
-/// is. Without that, the veto below would refuse to rewrite the very
-/// playlists `r=` exists to rescue.
+/// Kept apart from the origin's own value rather than merged over it,
+/// because the two are not interchangeable evidence about what this body
+/// is. `r=` is addon metadata describing the resource the caller meant;
+/// the origin's header describes the bytes that actually arrived. Merged,
+/// `r=` *shadowed* the origin, and the classification in [`proxy`] then
+/// read a forced `video/mp4` as proof that a genuine
+/// `application/x-mpegURL` playlist was not a playlist. Split, `r=` can
+/// only add to the verdict -- which is the property the reference has (its
+/// two arms are OR'd) and the one the merge lost.
 ///
 /// Folded because the spelling that matters most is not lower case: Apple
 /// writes `application/x-mpegURL`, that is what stremio-core sends and what
 /// this repo's README uses, and a case-sensitive `contains("mpegurl")` sees
 /// none of it.
-fn effective_content_type(
-    res_headers: &HeaderMap,
-    response_header_overrides: &BTreeMap<String, String>,
-) -> String {
+fn forced_content_type(response_header_overrides: &BTreeMap<String, String>) -> Option<String> {
     response_header_overrides
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-        .map(|(_, value)| value.as_str())
-        .or_else(|| {
-            res_headers
-                .get(header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-        })
+        .map(|(_, value)| value.to_ascii_lowercase())
+}
+
+/// What the *origin* labelled its own body with, folded the same way --
+/// the empty string when it said nothing, which neither forces the
+/// playlist path nor vetoes it.
+fn origin_content_type(res_headers: &HeaderMap) -> String {
+    res_headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_ascii_lowercase()
 }
@@ -520,8 +523,8 @@ impl ProxyParams {
     /// string -- and there it compounds: it classifies a response by the
     /// content type it has already merged `r=` into, so a segment fetched
     /// through such a line is itself called a playlist and run through the
-    /// line rewriter. We ask the merged type too, and for a good reason
-    /// (see [`effective_content_type`]); what keeps the same thing from
+    /// line rewriter. We ask the caller's forced type too, and for a good
+    /// reason (see [`forced_content_type`]); what keeps the same thing from
     /// happening here is exactly this -- `r=` is not on the line, so a
     /// segment inherits no label. Its own cross-origin branch drops `r=`
     /// (`newOpts` has only `d` and `h`), which is the half worth keeping.
@@ -866,7 +869,11 @@ async fn proxy(
     let status = response.status();
     let res_headers = response.headers().clone();
 
-    let content_type = effective_content_type(&res_headers, &params.response_headers);
+    // The caller's forced type and the origin's own, asked separately: see
+    // the three arms below, and [`forced_content_type`] for why merging
+    // them was the bug.
+    let forced_content_type = forced_content_type(&params.response_headers);
+    let origin_content_type = origin_content_type(&res_headers);
     // Both URLs are asked, because either one alone has a blind spot. The
     // URL the *caller* named is the one an HLS player knows it asked for,
     // and it is the only evidence left when a redirect lands on an
@@ -889,12 +896,27 @@ async fn proxy(
     // deliberately not keeping it**: its `path.extname(dest.pathname)` is
     // the pre-redirect, caller-named path, so nothing there stops a named
     // `.m3u8` that serves a film. See [`cannot_be_a_playlist`] for what
-    // counts as a veto -- and note that the type a caller *forces* with
-    // `r=Content-Type` is the one asked, so an origin that mislabels its
-    // playlist can still be corrected.
-    let is_playlist = content_type.contains("mpegurl")
+    // counts as a veto.
+    //
+    // Only the *origin's* type vetoes, because only the origin has seen the
+    // bytes. What a caller forces with `r=Content-Type` may add the
+    // playlist verdict and may never take it away -- which is exactly what
+    // the reference's OR of two arms buys, and what merging `r=` into one
+    // effective type here threw away. Measured: an origin serving
+    // `application/x-mpegURL` and a caller sending
+    // `r=Content-Type:video/mp4` -- a perfectly ordinary thing for an addon
+    // to say about the stream it describes -- had the playlist relayed
+    // verbatim, so the player then fetched every segment straight from the
+    // origin, without the `h=` those segments needed and without the `p=` a
+    // close is addressed by. An empty `r=Content-Type:` did the same, by
+    // shadowing the origin's type with nothing at all. `r=` is an escape
+    // hatch *into* the rewrite; it was acting as an escape hatch out of it.
+    let is_playlist = origin_content_type.contains("mpegurl")
+        || forced_content_type
+            .as_deref()
+            .is_some_and(|forced| forced.contains("mpegurl"))
         || ((names_a_playlist(&url) || names_a_playlist(&fetched_url))
-            && !cannot_be_a_playlist(&content_type));
+            && !cannot_be_a_playlist(&origin_content_type));
 
     // A body under a content coding we cannot decode is a body we must not
     // rewrite: the lines are not text yet. We relay it whole instead --
