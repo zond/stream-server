@@ -183,7 +183,7 @@ pub async fn proxy_root_handler(
 /// fragment and lost. Measured end to end, `https://host/a%2Fb/film.mkv`
 /// reached the origin as `GET /a/b/film.mkv` -- a signed link whose path
 /// segment carries a base64 signature gets a 403, and a file named with a
-/// `#` gets a 404. [`Uri::path`] is the target as it came off the wire, so
+/// `#` gets a 404. The URI's own path is the target as it came off the wire, so
 /// what the caller encoded is what the origin is asked for. It also means
 /// the `d=`/`h=`/`r=` segment is decoded exactly once, by
 /// `form_urlencoded` -- a header value carrying a `%` or a `&` used to be
