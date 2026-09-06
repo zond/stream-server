@@ -1,7 +1,7 @@
 use crate::state::AppState;
 use axum::{
-    Router,
-    extract::Query,
+    Json, Router,
+    extract::{Path, Query, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header, response::Builder},
     response::{IntoResponse, Response},
     routing::any,
@@ -163,12 +163,13 @@ pub fn router() -> Router<AppState> {
 /// pairs (those live in the path segment of the Core format), so everything
 /// it needs is the `d=` the shared handler reads out of `params`.
 pub async fn proxy_root_handler(
+    State(state): State<AppState>,
     raw_query: axum::extract::RawQuery,
     params: Query<HashMap<String, String>>,
     headers: HeaderMap,
     method: Method,
 ) -> impl IntoResponse {
-    proxy(None, raw_query.0, params.0, headers, method).await
+    proxy(state, None, raw_query.0, params.0, headers, method).await
 }
 
 /// The Core path format, read from the URI rather than from the router's
@@ -186,6 +187,7 @@ pub async fn proxy_root_handler(
 /// `form_urlencoded` -- a header value carrying a `%` or a `&` used to be
 /// decoded twice and lose its meaning.
 pub async fn proxy_handler(
+    State(state): State<AppState>,
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     Query(params): Query<HashMap<String, String>>,
@@ -196,7 +198,15 @@ pub async fn proxy_handler(
     // always there; an empty rest could only come of a router change, and it
     // answers 400 the way any unparseable target does.
     let rest = uri.path().strip_prefix("/proxy/").unwrap_or_default();
-    proxy(Some(rest.to_string()), raw_query, params, headers, method).await
+    proxy(
+        state,
+        Some(rest.to_string()),
+        raw_query,
+        params,
+        headers,
+        method,
+    )
+    .await
 }
 
 /// `rest` is what the path held after `/proxy/`, and *that is what decides
@@ -212,6 +222,7 @@ pub async fn proxy_handler(
 /// fetched *instead of* the target the caller named. The path shape cannot
 /// be spoofed by the target's own query, so the path shape decides.
 async fn proxy(
+    state: AppState,
     rest: Option<String>,
     raw_query: Option<String>,
     params: HashMap<String, String>,
@@ -225,6 +236,11 @@ async fn proxy(
     let mut target_url = String::new();
     let mut custom_headers = HashMap::new();
     let mut custom_response_headers = HashMap::new();
+    // The client's name for the player this stream is for, if it minted one
+    // (`p=`). It is ours, not the target's: it never travels to the origin,
+    // and it is what `POST /proxy-streams/{token}/close` addresses. See
+    // [`crate::proxy_streams`].
+    let mut player_token = None;
     let is_path_format = rest.is_some();
 
     match rest {
@@ -232,6 +248,7 @@ async fn proxy(
             if let Some(d) = params.get("d") {
                 target_url = d.clone();
             }
+            player_token = params.get("p").filter(|t| !t.is_empty()).cloned();
         }
         Some(rest) => {
             // Handle path-based format: /proxy/d=...&h=.../path/to/file
@@ -259,6 +276,7 @@ async fn proxy(
                                 .insert(name.trim().to_string(), value.trim().to_string());
                         }
                     }
+                    "p" if !val.is_empty() => player_token = Some(val.into_owned()),
                     _ => {}
                 }
             }
@@ -477,17 +495,45 @@ async fn proxy(
                     .into_response();
             }
         };
-        let rewritten = rewrite_playlist(&body, &url);
+        let rewritten = rewrite_playlist(&body, &url, player_token.as_deref());
         // The framing of the body we built, measured on that body.
         res_builder = res_builder.header(header::CONTENT_LENGTH, rewritten.len().to_string());
         return finalize_response(res_builder, axum::body::Body::from(rewritten));
     }
 
-    let stream = response.bytes_stream();
+    // Registered under the client's token, so the client can end this exact
+    // read rather than waiting out a timeout meant for a slow swarm.
+    let stream = state
+        .proxy_streams
+        .attach(player_token, response.bytes_stream());
     finalize_response(res_builder, axum::body::Body::from_stream(stream))
 }
 
-fn rewrite_playlist(body: &str, base_url: &Url) -> String {
+/// Rewrites every URL in a playlist to come back through this proxy, and
+/// carries `player_token` into each one: a segment fetched by the same
+/// player is part of the same stream, and closing that player has to close
+/// the segment read that is actually in flight.
+/// `POST /proxy-streams/{token}/close`: end every proxied stream the client
+/// marked with `token`, and say how many that was.
+///
+/// A **control** route -- bearer token, loopback listener, and never on the
+/// LAN media listener, which serves no control route at all: the ability to
+/// cut another device's playback is not something to hand the network. The
+/// same operation is [`crate::ServerHandle::close_proxy_streams`], through
+/// this same function, so an embedder needs no HTTP client for it.
+pub async fn close_proxy_streams(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+) -> impl IntoResponse {
+    let closed = state.proxy_streams.close(&token);
+    tracing::debug!(closed, "closing proxied streams by player token");
+    Json(serde_json::json!({ "closed": closed }))
+}
+
+fn rewrite_playlist(body: &str, base_url: &Url, player_token: Option<&str>) -> String {
+    let token_param = player_token
+        .map(|token| format!("&p={}", urlencoding::encode(token)))
+        .unwrap_or_default();
     let mut rewritten = String::new();
     for line in body.lines() {
         if line.is_empty() {
@@ -508,7 +554,10 @@ fn rewrite_playlist(body: &str, base_url: &Url) -> String {
                             .map(|u: Url| u.to_string())
                             .unwrap_or_else(|_| uri.to_string())
                     };
-                    let proxy_uri = format!("/proxy/?d={}", urlencoding::encode(&absolute_uri));
+                    let proxy_uri = format!(
+                        "/proxy/?d={}{token_param}",
+                        urlencoding::encode(&absolute_uri)
+                    );
                     rewritten.push_str(&line[..start + 5]);
                     rewritten.push_str(&proxy_uri);
                     rewritten.push_str(&rest[end..]);
@@ -528,7 +577,10 @@ fn rewrite_playlist(body: &str, base_url: &Url) -> String {
                     .map(|u: Url| u.to_string())
                     .unwrap_or_else(|_| line.to_string())
             };
-            let proxy_uri = format!("/proxy/?d={}", urlencoding::encode(&absolute_uri));
+            let proxy_uri = format!(
+                "/proxy/?d={}{token_param}",
+                urlencoding::encode(&absolute_uri)
+            );
             rewritten.push_str(&proxy_uri);
             rewritten.push('\n');
         }
@@ -551,7 +603,7 @@ mod tests {
     #[test]
     fn relative_segment_is_joined_against_base_and_wrapped() {
         let body = "seg-0.ts\n";
-        let rewritten = rewrite_playlist(body, &base());
+        let rewritten = rewrite_playlist(body, &base(), None);
         assert_eq!(
             rewritten,
             format!("{}\n", proxied("http://example.com/streams/seg-0.ts"))
@@ -561,7 +613,7 @@ mod tests {
     #[test]
     fn absolute_http_line_is_wrapped_without_double_joining() {
         let body = "http://cdn.example.org/other/seg-0.ts\n";
-        let rewritten = rewrite_playlist(body, &base());
+        let rewritten = rewrite_playlist(body, &base(), None);
         assert_eq!(
             rewritten,
             format!("{}\n", proxied("http://cdn.example.org/other/seg-0.ts"))
@@ -571,7 +623,7 @@ mod tests {
     #[test]
     fn absolute_https_line_is_wrapped_without_double_joining() {
         let body = "https://cdn.example.org/other/seg-0.ts\n";
-        let rewritten = rewrite_playlist(body, &base());
+        let rewritten = rewrite_playlist(body, &base(), None);
         assert_eq!(
             rewritten,
             format!("{}\n", proxied("https://cdn.example.org/other/seg-0.ts"))
@@ -584,7 +636,7 @@ mod tests {
             "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"English\",",
             "URI=\"audio/en.m3u8\",DEFAULT=YES,AUTOSELECT=YES\n"
         );
-        let rewritten = rewrite_playlist(body, &base());
+        let rewritten = rewrite_playlist(body, &base(), None);
         let expected = format!(
             concat!(
                 "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"English\",",
@@ -601,7 +653,7 @@ mod tests {
             "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"English\",",
             "URI=\"https://cdn.example.org/audio/en.m3u8\"\n"
         );
-        let rewritten = rewrite_playlist(body, &base());
+        let rewritten = rewrite_playlist(body, &base(), None);
         let expected = format!(
             "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"English\",URI=\"{}\"\n",
             proxied("https://cdn.example.org/audio/en.m3u8")
@@ -616,7 +668,7 @@ mod tests {
     #[test]
     fn ext_x_key_uri_is_proxied_like_other_uri_attributes() {
         let body = "#EXT-X-KEY:METHOD=AES-128,URI=\"key/enc.key\",IV=0x0123456789abcdef\n";
-        let rewritten = rewrite_playlist(body, &base());
+        let rewritten = rewrite_playlist(body, &base(), None);
         let expected = format!(
             "#EXT-X-KEY:METHOD=AES-128,URI=\"{}\",IV=0x0123456789abcdef\n",
             proxied("http://example.com/streams/key/enc.key")
@@ -627,17 +679,33 @@ mod tests {
     #[test]
     fn root_relative_path_resolves_against_origin() {
         let body = "/videos/seg-0.ts\n";
-        let rewritten = rewrite_playlist(body, &base());
+        let rewritten = rewrite_playlist(body, &base(), None);
         assert_eq!(
             rewritten,
             format!("{}\n", proxied("http://example.com/videos/seg-0.ts"))
         );
     }
 
+    /// The player's token travels into every line the rewrite writes, so a
+    /// segment fetch belongs to the same player as the playlist that named
+    /// it -- otherwise closing an HLS player would close its playlist read
+    /// and leave the segment in flight, which is the read that matters.
+    #[test]
+    fn the_player_token_is_carried_into_every_rewritten_line() {
+        let body = "#EXT-X-KEY:METHOD=AES-128,URI=\"key/enc.key\"\nseg-0.ts\n";
+        let rewritten = rewrite_playlist(body, &base(), Some("player one"));
+        let expected = format!(
+            "#EXT-X-KEY:METHOD=AES-128,URI=\"{}&p=player%20one\"\n{}&p=player%20one\n",
+            proxied("http://example.com/streams/key/enc.key"),
+            proxied("http://example.com/streams/seg-0.ts")
+        );
+        assert_eq!(rewritten, expected);
+    }
+
     #[test]
     fn comment_and_blank_lines_are_left_unchanged() {
         let body = "#EXTM3U\n#EXT-X-VERSION:3\n\n#EXT-X-TARGETDURATION:10\n";
-        let rewritten = rewrite_playlist(body, &base());
+        let rewritten = rewrite_playlist(body, &base(), None);
         assert_eq!(rewritten, body);
     }
 

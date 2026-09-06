@@ -266,6 +266,7 @@ The HTTP surface is deliberately small and split in two by `build_router()` (`se
 | GET | `/downloads.json` | TOKEN | offline downloads — every pinned file |
 | GET | `/cache.json` | TOKEN | cache usage against `settings.cacheSize` — see [Cache usage and cleaning](#cache-usage-and-cleaning) |
 | POST | `/cache/clean` | TOKEN | run one eviction pass now and report what it freed — see [Cache usage and cleaning](#cache-usage-and-cleaning) |
+| POST | `/proxy-streams/{token}/close` | TOKEN | end every `/proxy` stream carrying the client's own `p=` token; answers `{"closed": n}` — see [Ending a proxied stream](#ending-a-proxied-stream) |
 
 Unknown paths get `404`, a wrong method on a known path `405` (or `401` first, on a control route).
 
@@ -312,12 +313,14 @@ An embedder holds a `ServerHandle` (from `stream_server::start`) and never needs
 | `download_path(info_hash, file_idx: usize) -> Result<Option<String>>` | the `path` of that file's `downloads()` entry on its own — where to hand a finished download to a local player. Never creates an engine |
 | `cache_usage() -> Result<CacheUsage>` | `GET /cache.json` — what the cache occupies against its limit right now, without evicting anything. See [Cache usage and cleaning](#cache-usage-and-cleaning) |
 | `clean_cache_now() -> Result<EvictionReport>` | `POST /cache/clean` — run one eviction pass immediately and report what it freed, with the same protections as the scheduled sweep. See [Cache usage and cleaning](#cache-usage-and-cleaning) |
+| `close_proxy_streams(token: &str) -> usize` | `POST /proxy-streams/{token}/close` — end every proxied stream the client marked with `token`, and how many that was. See [Ending a proxied stream](#ending-a-proxied-stream) |
+| `proxy_streams_live() -> usize` | how many proxied streams are being read right now, over all tokens — the number of players attached through `/proxy` |
 | `set_lan_media(enabled: bool) -> Result<Option<SocketAddr>>` | start/stop the [LAN media listener](#lan-media-listener); returns its bound address afterwards. Refused while the `lanMediaEnabled` setting is false or `ServerConfig::lan_media_addr` is unset |
 | `lan_media_addr() -> Option<SocketAddr>` / `lan_media_running() -> bool` | where that listener is bound right now, and whether it is running at all |
 | `lan_media_requests_served() -> u64` | how many requests have reached that listener since the current cast session began — per session, reset by every start (an already-running listener included) and by every stop. Zero after a load is the receiver never having asked for the stream. See [LAN media listener](#lan-media-listener) |
 | `lan_media_base_url(for_peer: IpAddr) -> Option<Url>` | the base URL to hand a receiver at `for_peer` — host = the local interface on its subnet, or the best-ranked one when nothing matches. `None` while the listener is off |
 
-The HTTP handlers and these methods call the same functions (`routes::system::{engine_stats, file_stats, update_settings}`, `routes::downloads::{pin_download, unpin_download, downloads, download_path}`, `routes::cache::{cache_usage, clean_cache_now}`), so they cannot drift; `server/tests/embed.rs` compares them.
+The HTTP handlers and these methods call the same functions (`routes::system::{engine_stats, file_stats, update_settings}`, `routes::downloads::{pin_download, unpin_download, downloads, download_path}`, `routes::cache::{cache_usage, clean_cache_now}`, `proxy_streams::ProxyStreams::close`), so they cannot drift; `server/tests/embed.rs` compares them.
 
 ### Offline downloads
 
@@ -341,6 +344,25 @@ The cache cleaner (above) runs on its own schedule and had no way to be asked ab
 Both share their functions with `ServerHandle::{cache_usage, clean_cache_now}` (`routes::cache`), token-protected control routes, absent from the LAN media listener like every other control route.
 
 `ServerConfig::embedded()` (the `Default`) is tuned for a host process: loopback HTTP on 11470, no logging/TUI/SSDP, a generated token, and `torrent_listen_port: TorrentListenPort::Ephemeral` — librqbit's incoming BitTorrent listener takes an OS-assigned port, so any number of embedded servers (and the tests) coexist with a desktop instance. `ServerConfig::binary_default()` keeps `TorrentListenPort::Fixed(42000..42010)`: the first free port of the range, stable and forwardable. Set the field explicitly if an embedder needs a fixed port.
+
+### Ending a proxied stream
+
+A client that tears a player down has, until now, had to wait for the player's read to time out, and `network-timeout` is deliberately generous — a slow swarm must not be mistaken for a dead connection. The server can end the read instead, but only if it can be told *which* stream: it knows its streams by ids it minted, and the client cannot map those to its player.
+
+So the client names them. It mints a token per player and puts it in the `/proxy` URL that player is given:
+
+| URL shape | Where the token goes |
+|---|---|
+| query format | `/proxy/?d=<encoded target>&p=<token>` |
+| Core path format | `/proxy/d=<encoded origin>&h=…&p=<token>/<path>` — inside the `d=`/`h=` segment, beside the other proxy parameters |
+
+The token is the proxy's own parameter, like `d=`, `h=` and `r=`: it is never sent to the origin. Any string the client can generate works — it is a name, not a credential, and the call that uses it is token-protected. Every playlist this proxy rewrites carries the token into the segment URLs it writes, so an HLS player's segment fetches belong to the same token as its playlist.
+
+Then `POST /proxy-streams/{token}/close` (`ServerHandle::close_proxy_streams`) ends every live stream carrying that token and answers `{"closed": n}`. Zero is an ordinary answer — the player may already have finished — and closing twice is harmless. It is a **control** route: bearer token, loopback listener, and absent from the LAN media listener like every other control route, because the ability to cut playback is not something to hand the network.
+
+**What it ends, and what it does not.** The closed stream's body yields an error, so the connection drops and the player's demuxer sees its source fail at once rather than at timeout. A demuxer wedged on something *other* than the read — a texture handoff, an audio device — is not waiting on this and is unaffected. A player that has stopped reading altogether is not polling the body either, so it observes the close when it next reads, or when it goes away.
+
+`ServerHandle::proxy_streams_live()` is the same registry counted: how many players are attached through `/proxy` right now.
 
 ### LAN media listener
 

@@ -203,6 +203,10 @@ struct Fixture {
 }
 
 fn fixture() -> anyhow::Result<Fixture> {
+    fixture_with(Origin::start()?)
+}
+
+fn fixture_with(origin: Origin) -> anyhow::Result<Fixture> {
     let config_dir = tempfile::tempdir()?;
     let cache_root = tempfile::tempdir()?;
     let handle = stream_server::start(stream_server::ServerConfig {
@@ -215,7 +219,7 @@ fn fixture() -> anyhow::Result<Fixture> {
     Ok(Fixture {
         handle,
         base,
-        origin: Origin::start()?,
+        origin,
         cache_root,
         _config_dir: config_dir,
     })
@@ -495,21 +499,10 @@ fn a_compressed_origin_response_keeps_the_header_that_names_its_coding() -> anyh
         let _ = socket.flush();
     })?;
 
-    let config_dir = tempfile::tempdir()?;
-    let cache_root = tempfile::tempdir()?;
-    let handle = stream_server::start(stream_server::ServerConfig {
-        http_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
-        config_dir: Some(config_dir.path().join("config")),
-        cache_dir: Some(cache_root.path().join("cache")),
-        ..offline_config()
-    })?;
-    let target = format!("http://{}/live/master.m3u8", origin.addr);
+    let fixture = fixture_with(origin)?;
+    let target = format!("http://{}/live/master.m3u8", fixture.origin.addr);
     let response = reqwest::blocking::Client::new()
-        .get(format!(
-            "http://{}/proxy/?d={}",
-            handle.http_addr(),
-            encode(&target)
-        ))
+        .get(format!("{}/proxy/?d={}", fixture.base, encode(&target)))
         .header(reqwest::header::ACCEPT_ENCODING, "gzip, deflate, br")
         .send()?;
 
@@ -528,12 +521,12 @@ fn a_compressed_origin_response_keeps_the_header_that_names_its_coding() -> anyh
     );
 
     assert_eq!(
-        origin.next_request().header("accept-encoding"),
+        fixture.origin.next_request().header("accept-encoding"),
         Some("identity"),
         "the player's gzip is not forwarded by a proxy that cannot decode it"
     );
 
-    drop(handle);
+    drop(fixture.handle);
     Ok(())
 }
 
@@ -604,22 +597,10 @@ enum Framing {
 /// Fetches the playlist through the proxy and asserts the player got the
 /// whole rewritten thing, framed by its own length rather than the origin's.
 fn assert_playlist_is_reframed(framing: Framing) -> anyhow::Result<()> {
-    let config_dir = tempfile::tempdir()?;
-    let cache_root = tempfile::tempdir()?;
-    let handle = stream_server::start(stream_server::ServerConfig {
-        http_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
-        config_dir: Some(config_dir.path().join("config")),
-        cache_dir: Some(cache_root.path().join("cache")),
-        ..offline_config()
-    })?;
-    let origin = playlist_origin(framing)?;
-    let target = format!("http://{}/live/master.m3u8", origin.addr);
+    let fixture = fixture_with(playlist_origin(framing)?)?;
+    let target = format!("http://{}/live/master.m3u8", fixture.origin.addr);
     let response = reqwest::blocking::Client::new()
-        .get(format!(
-            "http://{}/proxy/?d={}",
-            handle.http_addr(),
-            encode(&target)
-        ))
+        .get(format!("{}/proxy/?d={}", fixture.base, encode(&target)))
         .send()?;
 
     assert_eq!(response.status(), reqwest::StatusCode::OK);
@@ -632,7 +613,7 @@ fn assert_playlist_is_reframed(framing: Framing) -> anyhow::Result<()> {
 
     assert_eq!(
         body,
-        expected_playlist(origin.addr),
+        expected_playlist(fixture.origin.addr),
         "the whole playlist arrives, every line rewritten"
     );
     assert_eq!(
@@ -646,7 +627,7 @@ fn assert_playlist_is_reframed(framing: Framing) -> anyhow::Result<()> {
         "the rewrite really did change the length -- otherwise this test proves nothing"
     );
 
-    drop(handle);
+    drop(fixture.handle);
     Ok(())
 }
 
@@ -672,6 +653,120 @@ fn a_playlist_from_a_chunked_origin_is_framed_by_its_rewritten_length() -> anyho
 fn a_playlist_from_a_close_delimited_origin_is_framed_by_its_rewritten_length() -> anyhow::Result<()>
 {
     assert_playlist_is_reframed(Framing::CloseDelimited)
+}
+
+/// An origin that never stops sending: a long film, a live stream, the
+/// swarm that `network-timeout` is generous for. Closing has to be visible
+/// against *this*, not against a body that was about to end anyway.
+fn endless_origin() -> anyhow::Result<Origin> {
+    Origin::start_with(|_request: &Request, socket: &mut TcpStream| {
+        let head = "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\n\
+                    Content-Length: 1099511627776\r\n\r\n";
+        if socket.write_all(head.as_bytes()).is_err() {
+            return;
+        }
+        // Until the far end goes away. The pause is not sequencing
+        // anything -- every assertion below waits on a read -- it just
+        // keeps this thread from spinning.
+        while socket.write_all(&[0u8; 4096]).is_ok() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    })
+}
+
+/// The whole point of the token: one player's stream ends when the client
+/// asks for it, at once, and the other player never notices.
+///
+/// Both URL shapes carry the token, so one player is given each: the query
+/// format's `p=` sits beside `d=`, the Core format's inside the `d=`/`h=`
+/// path segment -- where, unlike the request's own query, it cannot leak to
+/// the origin.
+#[test]
+fn closing_one_player_token_ends_that_stream_and_leaves_the_other_playing() -> anyhow::Result<()> {
+    use std::io::Read as _;
+
+    let fixture = fixture_with(endless_origin()?)?;
+    let origin = format!("http://{}", fixture.origin.addr);
+    let client = reqwest::blocking::Client::new();
+
+    let mut watching = client
+        .get(format!(
+            "{}/proxy/?d={}&p=player-one",
+            fixture.base,
+            encode(&format!("{origin}/film.mkv"))
+        ))
+        .send()?;
+    let mut other = client
+        .get(format!(
+            "{}/proxy/d={}&p=player-two/other.mkv",
+            fixture.base,
+            encode(&origin)
+        ))
+        .send()?;
+
+    // Both are reading before anything is closed.
+    let mut byte = [0u8; 1];
+    watching.read_exact(&mut byte)?;
+    other.read_exact(&mut byte)?;
+    assert_eq!(
+        fixture.handle.proxy_streams_live(),
+        2,
+        "two players attached, which is the accounting this makes possible"
+    );
+    assert_eq!(
+        fixture.origin.next_request().line,
+        "GET /film.mkv HTTP/1.1",
+        "the token is ours and never travels to the origin"
+    );
+    assert_eq!(
+        fixture.origin.next_request().line,
+        "GET /other.mkv HTTP/1.1"
+    );
+
+    // Close the first player's stream over the control API, with the bearer
+    // token that API requires.
+    let control = reqwest::blocking::Client::new()
+        .post(format!("{}/proxy-streams/player-one/close", fixture.base))
+        .bearer_auth(fixture.handle.auth_token().expect("a generated token"))
+        .send()?;
+    assert_eq!(control.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        control.json::<serde_json::Value>()?,
+        serde_json::json!({ "closed": 1 })
+    );
+
+    // The closed player's read fails now rather than in a minute's time...
+    std::io::copy(&mut watching, &mut std::io::sink())
+        .expect_err("the closed stream must break, not end tidily");
+    // ...and the other player is still being served.
+    other.read_exact(&mut byte)?;
+    assert_eq!(fixture.handle.proxy_streams_live(), 1);
+
+    // The library method is the same operation, so an embedder needs no
+    // HTTP client for it.
+    assert_eq!(fixture.handle.close_proxy_streams("player-two"), 1);
+    std::io::copy(&mut other, &mut std::io::sink())
+        .expect_err("the second stream is closed the same way");
+
+    // Closing again closes nothing, and says so.
+    assert_eq!(fixture.handle.close_proxy_streams("player-two"), 0);
+    assert_eq!(fixture.handle.proxy_streams_live(), 0);
+
+    drop(fixture.handle);
+    Ok(())
+}
+
+/// The control route is a control route: no token, no close.
+#[test]
+fn closing_a_stream_needs_the_control_token() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let response = reqwest::blocking::Client::new()
+        .post(format!("{}/proxy-streams/player-one/close", fixture.base))
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    drop(fixture.handle);
+    Ok(())
 }
 
 fn walk(directory: &std::path::Path) -> Vec<std::path::PathBuf> {

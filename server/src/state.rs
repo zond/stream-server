@@ -21,6 +21,9 @@ pub struct AppState {
     pub archive_cache: Arc<dashmap::DashMap<String, crate::archives::ArchiveSession>>,
     pub nzb_sessions: Arc<dashmap::DashMap<String, crate::archives::nzb::session::NzbSession>>,
     pub devices: Arc<RwLock<Vec<crate::ssdp::Device>>>,
+    /// The proxied streams players are reading right now, so a client can
+    /// end its own player's (see `crate::proxy_streams`).
+    pub proxy_streams: Arc<crate::proxy_streams::ProxyStreams>,
     /// The optional LAN media listener shared by `run` and `ServerHandle`
     /// (see `crate::lan_media`). Constructed disabled; `run` replaces it with
     /// one carrying `ServerConfig::lan_media_addr`.
@@ -101,6 +104,7 @@ impl AppState {
             archive_cache: Arc::new(dashmap::DashMap::new()),
             nzb_sessions: Arc::new(dashmap::DashMap::new()),
             devices: Arc::new(RwLock::new(Vec::new())),
+            proxy_streams: Arc::new(crate::proxy_streams::ProxyStreams::new()),
             lan_media: Arc::new(crate::lan_media::LanMedia::new(None)),
         }
     }

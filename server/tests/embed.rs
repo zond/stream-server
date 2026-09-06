@@ -2177,6 +2177,17 @@ fn lan_media_listener_serves_media_but_no_control_route() -> anyhow::Result<()> 
             .status(),
         reqwest::StatusCode::METHOD_NOT_ALLOWED
     );
+    // `POST /proxy-streams/{token}/close` ends a player's proxied stream.
+    // The LAN listener serves no `/proxy` and no control route, so there is
+    // nothing there to close and no route to ask: cutting another device's
+    // playback is not something to hand the network.
+    assert_eq!(
+        anonymous
+            .post(format!("{lan}/proxy-streams/player-one/close"))
+            .send()?
+            .status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
     // `POST /{infoHash}/create` collides with the two-segment media route's
     // pattern, so it answers as that route would (`405`, GET and HEAD only)
     // rather than 404 -- but it still never reaches the control handler, and

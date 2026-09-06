@@ -73,6 +73,7 @@ mod auth;
 mod cache_cleaner;
 mod diagnostics;
 mod lan_media;
+mod proxy_streams;
 mod routes;
 mod ssdp;
 mod state;
@@ -414,6 +415,30 @@ impl ServerHandle {
     pub fn clean_cache_now(&self) -> anyhow::Result<EvictionReport> {
         let state = self.state.clone();
         self.block_on_server(async move { routes::cache::clean_cache_now(&state).await })?
+    }
+
+    /// End every proxied stream the client marked with `token`, and answer
+    /// how many that was -- exactly what
+    /// `POST /proxy-streams/{token}/close` does, through the same function.
+    ///
+    /// The token is the client's own: it mints one per player, puts it in
+    /// the `/proxy` URL that player is given (`p=`), and closing it here
+    /// makes that player's read fail at once instead of waiting out
+    /// `network-timeout`, which is generous on purpose. Zero is an ordinary
+    /// answer -- the player may already have finished -- and closing twice
+    /// is harmless. See [`crate::proxy_streams`] for what this does not end:
+    /// a demuxer wedged on something other than the read.
+    pub fn close_proxy_streams(&self, token: &str) -> usize {
+        self.state.proxy_streams.close(token)
+    }
+
+    /// How many proxied streams are being read right now, over all tokens:
+    /// the number of players actually attached to this server through
+    /// `/proxy`, which nothing outside the process could work out before.
+    ///
+    /// Cheap: one map length, no runtime hop.
+    pub fn proxy_streams_live(&self) -> usize {
+        self.state.proxy_streams.live()
     }
 
     /// Start or stop the LAN media listener (see [`crate::lan_media`]): a
@@ -1361,6 +1386,10 @@ fn control_router() -> Router<AppState> {
         .route(
             "/{infoHash}/{fileIdx}/download",
             post(routes::downloads::post_download).delete(routes::downloads::delete_download),
+        )
+        .route(
+            "/proxy-streams/{token}/close",
+            post(routes::proxy::close_proxy_streams),
         )
         .route("/cache.json", get(routes::cache::get_cache_usage))
         .route("/cache/clean", post(routes::cache::post_clean_cache))
