@@ -6,12 +6,15 @@ use axum::{
     response::{IntoResponse, Response},
     routing::any,
 };
+use dashmap::DashSet;
 use reqwest::{Client, Method};
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 use url::Url;
 
-/// Lazily-built, process-wide reqwest client for the proxy route.
+/// Lazily-built, process-wide reqwest client for the proxy route: the one
+/// that **verifies** the origin's certificate, which is every request until
+/// one fails.
 ///
 /// `Client::builder().build()` can fail (e.g. if the TLS backend can't be
 /// initialized), so building it once at startup-on-first-use and reusing it
@@ -19,16 +22,77 @@ use url::Url;
 /// client for every proxied request.
 static HTTP_CLIENT: OnceLock<Option<Client>> = OnceLock::new();
 
+/// The same client with verification off, built only if some host actually
+/// needs it. See [`UNVERIFIED_HOSTS`] for why it exists at all.
+static INSECURE_HTTP_CLIENT: OnceLock<Option<Client>> = OnceLock::new();
+
+/// Hosts whose certificate this process could not verify, and which are
+/// therefore fetched unverified from the second failure on.
+///
+/// This route was built with `danger_accept_invalid_certs(true)` from its
+/// first commit, commented "Parity with rejectUnauthorized: false" -- it is
+/// inherited from the closed-source `server.js` proxy this file was ported
+/// from, not a response to any host we ever measured. Nothing in the history
+/// names a host that needs it. Meanwhile the client that used to fetch a
+/// remote stream was mpv; now it is this, so the flag stopped being about a
+/// rarely-used route and became how every remote stream is fetched.
+///
+/// Verifying everything and letting the broken hosts fail would break
+/// streams that play today, and we cannot say which ones. So: verify, and
+/// when a certificate is the reason a fetch failed, retry that host once
+/// without verification and remember it, at WARN, by name. Be plain about
+/// what that is worth -- an on-path attacker can produce a certificate
+/// error as easily as a misconfigured CDN can, so this stops nothing it
+/// could not also trigger. What it buys is that the downgrade is per host,
+/// visible in the log, and enumerable: today's blanket silence cannot tell
+/// us which hosts to scope it to, and this can.
+static UNVERIFIED_HOSTS: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
+
 fn http_client() -> Option<&'static Client> {
     HTTP_CLIENT
         .get_or_init(|| {
             Client::builder()
-                .danger_accept_invalid_certs(true) // Parity with rejectUnauthorized: false
                 .build()
                 .map_err(|e| tracing::error!("Failed to build proxy HTTP client: {e}"))
                 .ok()
         })
         .as_ref()
+}
+
+fn insecure_http_client() -> Option<&'static Client> {
+    INSECURE_HTTP_CLIENT
+        .get_or_init(|| {
+            Client::builder()
+                .danger_accept_invalid_certs(true)
+                .build()
+                .map_err(|e| tracing::error!("Failed to build unverified proxy HTTP client: {e}"))
+                .ok()
+        })
+        .as_ref()
+}
+
+/// Whether a failed fetch failed *because of the certificate*, which is the
+/// only failure the unverified retry can help with -- a refused connection
+/// or a DNS miss must stay an error.
+///
+/// reqwest exposes no typed predicate for this, and the rustls error that
+/// carries the detail is several `source()`s down (`invalid peer
+/// certificate: UnknownIssuer`), so the chain is walked and read. A false
+/// positive costs one extra request that fails the same way; a false
+/// negative costs a stream that a retry would have played.
+fn is_certificate_error(error: &reqwest::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(error) = source {
+        if error
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("certificate")
+        {
+            return true;
+        }
+        source = error.source();
+    }
+    false
 }
 
 /// Applies the `r=` (Core-format) custom response headers to a response
@@ -226,7 +290,15 @@ async fn proxy(
         url.set_query(Some(&q));
     }
 
-    let client = match http_client() {
+    // The host is fetched verified unless a previous request for it failed
+    // on its certificate (see [`UNVERIFIED_HOSTS`]).
+    let host = url.host_str().unwrap_or_default().to_string();
+    let known_unverified = UNVERIFIED_HOSTS.contains(&host);
+    let client = match if known_unverified {
+        insecure_http_client()
+    } else {
+        http_client()
+    } {
         Some(c) => c,
         None => {
             return (
@@ -237,43 +309,71 @@ async fn proxy(
         }
     };
 
-    let mut req_builder = client.request(method, url.clone());
+    let build_request = |client: &Client| {
+        let mut req_builder = client.request(method.clone(), url.clone());
 
-    // What the player asked for, forwarded as it asked for it. `connection`
-    // and `transfer-encoding` are deliberately absent: both describe the
-    // framing of one hop, and this is a new hop -- reqwest frames its own
-    // request, and a `transfer-encoding: chunked` copied from a bodyless
-    // player request describes a body that is not there.
-    let allowed_req_headers = [
-        "accept",
-        "accept-language",
-        "range",
-        "if-range",
-        "user-agent",
-    ];
+        // What the player asked for, forwarded as it asked for it.
+        // `connection` and `transfer-encoding` are deliberately absent: both
+        // describe the framing of one hop, and this is a new hop -- reqwest
+        // frames its own request, and a `transfer-encoding: chunked` copied
+        // from a bodyless player request describes a body that is not there.
+        let allowed_req_headers = [
+            "accept",
+            "accept-language",
+            "range",
+            "if-range",
+            "user-agent",
+        ];
 
-    for name in allowed_req_headers {
-        if let Some(value) = headers.get(name) {
+        for name in allowed_req_headers {
+            if let Some(value) = headers.get(name) {
+                req_builder = req_builder.header(name, value);
+            }
+        }
+
+        // `accept-encoding` is answered here rather than forwarded. This
+        // client has no gzip/brotli/deflate feature, so it decodes nothing,
+        // and a playlist arrives as bytes we cannot rewrite -- while the
+        // player's own `accept-encoding: gzip` invited exactly that. Asking
+        // for `identity` says what we can actually take. An origin that
+        // compresses anyway is still relayed honestly: `content-encoding`
+        // travels back with the body it describes (see the relayed-body
+        // headers below).
+        req_builder = req_builder.header(header::ACCEPT_ENCODING, "identity");
+
+        // Apply custom headers from query params (Core format)
+        for (name, value) in &custom_headers {
             req_builder = req_builder.header(name, value);
         }
-    }
+        req_builder
+    };
 
-    // `accept-encoding` is answered here rather than forwarded. This client
-    // has no gzip/brotli/deflate feature, so it decodes nothing, and a
-    // playlist arrives as bytes we cannot rewrite -- while the player's own
-    // `accept-encoding: gzip` invited exactly that. Asking for `identity`
-    // says what we can actually take. An origin that compresses anyway is
-    // still relayed honestly: `content-encoding` travels back with the body
-    // it describes (see the relayed-body headers below).
-    req_builder = req_builder.header(header::ACCEPT_ENCODING, "identity");
-
-    // Apply custom headers from query params (Core format)
-    for (name, value) in custom_headers {
-        req_builder = req_builder.header(name, value);
-    }
-
-    let response = match req_builder.send().await {
+    let response = match build_request(client).send().await {
         Ok(resp) => resp,
+        Err(e) if !known_unverified && is_certificate_error(&e) => {
+            // One retry, for this host only, and say so once per process.
+            tracing::warn!(
+                host = %host,
+                error = %e,
+                "certificate verification failed; retrying this host unverified for \
+                 the life of the process"
+            );
+            UNVERIFIED_HOSTS.insert(host);
+            let Some(client) = insecure_http_client() else {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Proxy client unavailable",
+                )
+                    .into_response();
+            };
+            match build_request(client).send().await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    return (StatusCode::BAD_GATEWAY, format!("Proxy error: {}", e))
+                        .into_response();
+                }
+            }
+        }
         Err(e) => return (StatusCode::BAD_GATEWAY, format!("Proxy error: {}", e)).into_response(),
     };
 
@@ -596,7 +696,29 @@ mod tests {
     }
 
     #[test]
-    fn http_client_builds_successfully() {
+    fn both_clients_build_successfully() {
         assert!(http_client().is_some());
+        assert!(insecure_http_client().is_some());
+    }
+
+    /// The retry is for a certificate and nothing else: a refused connection
+    /// or a DNS miss must not be retried unverified, because verification is
+    /// not what stopped it.
+    #[test]
+    fn only_a_certificate_failure_is_read_as_one() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // Nothing listens on this port, so the failure is a refused
+        // connection with no certificate anywhere in its chain.
+        let refused = rt.block_on(async {
+            reqwest::Client::new()
+                .get("http://127.0.0.1:1/")
+                .send()
+                .await
+                .expect_err("nothing is listening there")
+        });
+        assert!(!is_certificate_error(&refused));
     }
 }

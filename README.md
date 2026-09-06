@@ -434,8 +434,8 @@ exists as an operator veto that no embedder call can override.
 
 **`/proxy` and `/ftp` do not travel with it.** Both fetch an arbitrary
 caller-supplied remote URL rather than media bytes from this server — `/proxy`
-with `danger_accept_invalid_certs`, `/ftp` over HTTP(S) or a spawned `curl`
-for FTP/FTPS — which makes either an open proxy for whoever can reach it.
+over HTTP(S), `/ftp` over HTTP(S) or a spawned `curl` for FTP/FTPS — which
+makes either an open proxy for whoever can reach it.
 That is fine on the loopback listener, where only this host's own
 stremio-core can reach it, but not on a listener the whole LAN can reach, so
 neither is on the LAN allow-list. The consequence is deliberate, not an
