@@ -761,7 +761,12 @@ async fn evict(
     // The walk above may have deleted aged-out files, so the volume now has
     // a little more room than the probe behind `limit` recorded; that only
     // makes the cap tighter than it needs to be, which errs towards cleaning.
-    if limit.disk_bound(total_size) {
+    //
+    // Whether the *device* is what caps decides how the single-file rule
+    // below is read, so it is asked once, against the occupancy the walk
+    // actually found.
+    let disk_bound = limit.disk_bound(total_size);
+    if disk_bound {
         info!(
             configured = limit.configured,
             available = ?limit.available,
@@ -789,7 +794,23 @@ async fn evict(
                 break;
             }
 
-            if size > limit {
+            // A file bigger than the whole cap is kept -- but only while
+            // the cap is the operator's. `cacheSize` is a preference, and
+            // an operator who set one smaller than the film they are
+            // watching meant "do not hoard", not "re-fetch this from the
+            // swarm after every pass"; that is the soft limit this rule
+            // has always served.
+            //
+            // A cap the filesystem imposes is not soft: the bytes are not
+            // there. And it is `occupied + available - floor`, so a single
+            // cached film is routinely larger than the whole of it -- on
+            // the device this was written for, the only evictable file was
+            // 700 MB against a 463 MB cap. Skipping it freed nothing,
+            // `made_room` was therefore false, and the torrent ENOSPC had
+            // stopped was never restarted: the rule refused to evict
+            // exactly when the disk-derived cap is the one that binds,
+            // which is the whole case the cap exists for.
+            if size > limit && !disk_bound {
                 info!(
                     "cache soft limit exceeded by single retained file: {:?} size={} limit={}",
                     path, size, limit
@@ -1715,6 +1736,60 @@ mod tests {
         assert!(recent.is_file(), "protection outranks a full volume");
         assert_eq!(report.protected_files, 1);
         assert!(report.shortfall_message().is_some());
+    }
+
+    /// The single-file rule is a concession to a *soft* limit, and the
+    /// disk-derived cap is not one. Every cached film is bigger than
+    /// `occupied + available - floor` on a device that is nearly full, so
+    /// keeping the rule there refused to evict the only candidate there was
+    /// -- freeing nothing, on the exact volume the cap was added for.
+    ///
+    /// Written with the cap between the two files rather than with real film
+    /// sizes: what matters is that the evictable file is larger than the
+    /// whole cap, which is what a 700 MB film against 463 MB of headroom is.
+    #[tokio::test]
+    async fn a_file_bigger_than_the_whole_cap_still_goes_when_the_disk_is_the_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("rqbit-downloads");
+        let stale = root.join("last-week").join("film.mkv");
+        write_aged(&stale, &[0u8; 4096], Duration::from_secs(20 * 24 * 60 * 60));
+        let live = root.join("tonight").join("film.mkv");
+        write_aged(&live, &[0u8; 4096], Duration::from_secs(60));
+        let occupied = occupancy(&stale) + occupancy(&live);
+
+        // Free space chosen so the cap lands *below* either file: the volume
+        // is 1 KiB short of what it would need for the floor to hold with
+        // the cache as it stands.
+        let cap = 1024;
+        let squeezed = CacheLimit {
+            configured: u64::MAX,
+            available: Some(CACHE_FREE_SPACE_FLOOR + cap - occupied),
+        };
+        assert_eq!(squeezed.effective(occupied), Some(cap));
+        assert!(
+            occupancy(&stale) > cap,
+            "the point of the test is a file larger than the whole cap"
+        );
+
+        let protected: HashSet<_> = [live.clone()].into_iter().collect();
+        let report = evict(std::slice::from_ref(&root), &protected, squeezed, &[])
+            .await
+            .unwrap();
+
+        assert!(
+            !stale.exists(),
+            "the stale film is what there is to reclaim"
+        );
+        assert!(live.is_file(), "and a live torrent's file is still not it");
+        assert_eq!(report.freed, occupancy(&live));
+        assert!(
+            report.made_room(),
+            "so the torrent a full disk stopped can be restarted"
+        );
+        assert!(
+            report.shortfall_message().is_some(),
+            "the run still ends over the cap, and says what held"
+        );
     }
 
     /// A stopped torrent is restarted only when the clean actually reclaimed
