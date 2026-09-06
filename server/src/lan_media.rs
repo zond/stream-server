@@ -147,12 +147,38 @@ impl LanMedia {
     /// [`pick_host`]), because a receiver is told a URL it has to connect
     /// back to: on a host with a LAN and a VPN or container bridge, the
     /// first interface in the list is regularly the wrong one.
+    ///
+    /// Every answer is logged at INFO, each way of returning `None`
+    /// distinctly. Naming the wrong address leaves no other trace anywhere:
+    /// a receiver told an address it cannot route to hangs on the TCP
+    /// connect rather than failing, so the cast simply never starts and
+    /// nothing on either side says why. The address is a private one on the
+    /// user's own LAN, not a secret.
     pub async fn base_url_for(&self, peer: IpAddr) -> Option<Url> {
-        let bound = self.bound_addr().await?;
-        let host = host_for_peer(bound, peer)?;
+        let Some(bound) = self.bound_addr().await else {
+            tracing::info!(%peer, "no LAN media URL: the listener is not running");
+            return None;
+        };
+        let Some(host) = host_for_peer(bound, peer) else {
+            tracing::info!(
+                %peer,
+                %bound,
+                "no LAN media URL: no local interface for this receiver"
+            );
+            return None;
+        };
         // `SocketAddr`'s Display brackets an IPv6 host, which is the spelling
         // a URL authority needs.
-        Url::parse(&format!("http://{}/", SocketAddr::new(host, bound.port()))).ok()
+        match Url::parse(&format!("http://{}/", SocketAddr::new(host, bound.port()))) {
+            Ok(url) => {
+                tracing::info!(%peer, %host, %url, "LAN media URL for the receiver");
+                Some(url)
+            }
+            Err(error) => {
+                tracing::warn!(%peer, %host, %error, "no LAN media URL: unparsable authority");
+                None
+            }
+        }
     }
 }
 

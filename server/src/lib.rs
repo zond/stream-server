@@ -1177,13 +1177,30 @@ fn build_lan_media_router(state: AppState) -> Router {
         .fallback(fallback_handler)
         .method_not_allowed_fallback(method_not_allowed_handler)
         .layer(
-            TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
-                tracing::info_span!(
-                    "lan-request",
-                    method = %request.method(),
-                    path = request.uri().path(),
-                )
-            }),
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &axum::http::Request<_>| {
+                    tracing::info_span!(
+                        "lan-request",
+                        method = %request.method(),
+                        path = request.uri().path(),
+                    )
+                })
+                // A span alone is not an event: it decorates the lines a
+                // handler writes and emits none of its own, so a receiver
+                // that fetches and a receiver that never connects looked
+                // exactly alike in the log -- a listener that starts, runs
+                // and stops with nothing in between. This is the line that
+                // tells the two apart, and the peer is the one field that
+                // says whether the address we handed out was reachable.
+                .on_request(|request: &axum::extract::Request, _: &tracing::Span| {
+                    tracing::info!(
+                        method = %request.method(),
+                        path = %request.uri().path(),
+                        peer = %peer_from_request(request)
+                            .map_or_else(|| "unknown".to_string(), |peer| peer.to_string()),
+                        "LAN media request"
+                    );
+                }),
         )
         .layer(cors_layer())
         .with_state(state)
