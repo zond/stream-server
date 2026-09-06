@@ -394,6 +394,18 @@ fn same_subnet(iface: &LocalIpv4Interface, peer: Ipv4Addr) -> bool {
     // all, taking the ranking and the loopback exclusion with it. An
     // interface with no netmask cannot be subnet-matched; let the ranking
     // have it.
+    //
+    // The cost was weighed, not overlooked: this also refuses an interface
+    // that genuinely *is* on the peer's subnet and merely lost its netmask,
+    // dropping a real match down into the ranking with the guesses. That is
+    // the cheaper of the two mistakes by a distance. A demoted real match
+    // still usually wins, because an interface that shares a receiver's
+    // subnet is an ordinary private one and that is the ranking's top rank;
+    // and when it loses, the answer is another address on this host, which
+    // the receiver may well reach anyway. A zero mask honoured is the
+    // opposite: it beats the interface that really shares the subnet, every
+    // call, for every receiver, and hands out an address chosen by nothing
+    // at all. Guessing is recoverable; a false match is not.
     if mask == 0 {
         return false;
     }
