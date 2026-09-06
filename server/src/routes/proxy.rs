@@ -26,8 +26,10 @@ static HTTP_CLIENT: OnceLock<Option<Client>> = OnceLock::new();
 /// needs it. See [`UNVERIFIED_HOSTS`] for why it exists at all.
 static INSECURE_HTTP_CLIENT: OnceLock<Option<Client>> = OnceLock::new();
 
-/// Hosts whose certificate this process could not verify, and which are
-/// therefore fetched unverified from the second failure on.
+/// Hosts whose certificate this process could not verify. The request that
+/// discovered it is retried unverified; every later request for that host
+/// goes straight to the unverified client, so a stream pays the failed
+/// handshake once rather than once per segment.
 ///
 /// This route was built with `danger_accept_invalid_certs(true)` from its
 /// first commit, commented "Parity with rejectUnauthorized: false" -- it is
