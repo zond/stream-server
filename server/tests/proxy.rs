@@ -1860,6 +1860,282 @@ fn a_redirect_that_steps_down_to_http_does_not_carry_the_h_credentials() -> anyh
     Ok(())
 }
 
+/// What a header echo looks like when an origin is asked to report the
+/// three things this pair of tests is about: the two credentials, and the
+/// `h=` header that is not one.
+const ECHOED_HEADERS: [&str; 3] = ["authorization", "cookie", "user-agent"];
+
+fn echo_headers(request: &Request) -> String {
+    ECHOED_HEADERS
+        .iter()
+        .map(|name| format!("{name}={:?}", request.header(name)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The same, from inside an axum handler.
+fn echo_header_map(headers: &axum::http::HeaderMap) -> String {
+    ECHOED_HEADERS
+        .iter()
+        .map(|name| {
+            format!(
+                "{name}={:?}",
+                headers
+                    .get(*name)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// An origin that answers every request with a report of what it was asked
+/// with -- so a test can assert on what reached the wire rather than on
+/// what it believes was sent.
+fn echoing_origin() -> anyhow::Result<Origin> {
+    Origin::start_with(|request: &Request, socket: &mut TcpStream| {
+        let body = echo_headers(request);
+        let _ = socket.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        let _ = socket.flush();
+    })
+}
+
+/// The lines of a rewritten playlist that name something, in order.
+fn rewritten_lines(body: &str) -> Vec<&str> {
+    body.lines()
+        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+        .collect()
+}
+
+/// The redirect guard above, defeated in one line by the playlist rewrite:
+/// an `https` origin whose playlist names an `http://` segment.
+///
+/// `h=` travels into every rewritten line, deliberately -- that is what
+/// keeps an authenticated stream's segments fetchable. But a rewritten line
+/// is the *player's* next request, made automatically, and it is written by
+/// us: putting the caller's `Authorization` into a line that names cleartext
+/// is walking the credential onto a cleartext hop with the redirect loop's
+/// guard bypassed. Measured before the fix, with the line fetched exactly as
+/// a player fetches it: the cleartext origin logged
+/// `authorization=Some("Bearer s3cret") cookie=Some("session=abc")`.
+///
+/// The positive halves are here too, because a rule that drops everything
+/// passes the negative one: the line naming the `https` origin still
+/// carries the credential, and the cleartext line still carries the
+/// `User-Agent` that is a description rather than a secret.
+#[test]
+fn a_rewritten_line_that_steps_down_to_cleartext_carries_no_credential() -> anyhow::Result<()> {
+    const SECRET: &str = "Bearer s3cret";
+
+    let cleartext = echoing_origin()?;
+    let cleartext_addr = cleartext.addr;
+
+    // The TLS origin: the playlist under `.m3u8`, an echo of what it was
+    // asked with anywhere else -- so the `https` line can be fetched and
+    // shown to have kept the credential.
+    let tls = TlsOrigin::start_with(axum::Router::new().fallback(axum::routing::any(
+        move |uri: axum::http::Uri, headers: axum::http::HeaderMap| async move {
+            let (content_type, body) = if uri.path().ends_with(".m3u8") {
+                (
+                    "application/x-mpegURL",
+                    format!(
+                        "#EXTM3U\n#EXTINF:10,\nhttp://{cleartext_addr}/seg-0.ts\n\
+                         #EXTINF:10,\nseg-1.ts\n"
+                    ),
+                )
+            } else {
+                ("video/mp2t", echo_header_map(&headers))
+            };
+            ([(axum::http::header::CONTENT_TYPE, content_type)], body)
+        },
+    )))?;
+
+    let fixture = fixture_with(cleartext)?;
+    let client = reqwest::blocking::Client::new();
+    let credentials = format!(
+        "&h={}&h={}&h={}",
+        encode(&format!("Authorization:{SECRET}")),
+        encode("Cookie:session=abc"),
+        encode("User-Agent:addon/1")
+    );
+    let playlist = client
+        .get(format!(
+            "{}/proxy/?d={}{credentials}",
+            fixture.base,
+            encode(&format!(
+                "https://127.0.0.1:{}/live/master.m3u8",
+                tls.addr.port()
+            ))
+        ))
+        .send()?;
+    assert_eq!(playlist.status(), reqwest::StatusCode::OK);
+    let body = playlist.text()?;
+    let lines = rewritten_lines(&body);
+    let (cleartext_line, tls_line) = (lines[0], lines[1]);
+
+    assert!(
+        !cleartext_line.contains("Authorization") && !cleartext_line.contains("Cookie"),
+        "the line naming http carries neither credential: {cleartext_line}"
+    );
+    assert!(
+        cleartext_line.contains(&format!("&h={}", encode("User-Agent:addon/1"))),
+        "but it does carry the h= that is a description: {cleartext_line}"
+    );
+    assert!(
+        tls_line.contains(&format!(
+            "&h={}",
+            encode(&format!("Authorization:{SECRET}"))
+        )) && tls_line.contains(&format!("&h={}", encode("Cookie:session=abc"))),
+        "the line that stays on https carries them: {tls_line}"
+    );
+
+    // And what a player does with those lines, which is the measurement
+    // that matters: it fetches them.
+    let segment = client
+        .get(format!("{}{cleartext_line}", fixture.base))
+        .send()?;
+    assert_eq!(segment.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        segment.text()?,
+        "authorization=None cookie=None user-agent=Some(\"addon/1\")",
+        "the cleartext origin is asked without the credentials"
+    );
+    let segment = client.get(format!("{}{tls_line}", fixture.base)).send()?;
+    assert_eq!(segment.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        segment.text()?,
+        format!(
+            "authorization=Some({SECRET:?}) cookie=Some(\"session=abc\") user-agent=Some(\"addon/1\")"
+        ),
+        "and the https one with them -- an authenticated stream still plays"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
+/// The chain the redirect guard was written for, defeated end to end: an
+/// `https` origin redirecting to a plain-`http` playlist.
+///
+/// The playlist hop is asked with no credentials -- that is the guard
+/// working. What the guard cannot reach on its own is the body that comes
+/// back over that cleartext hop: rewritten with `h=` re-armed, it handed the
+/// player a segment URL carrying the caller's `Authorization` to the very
+/// host the credential had just been withheld from, one line later.
+///
+/// So the drop is sticky through the rewrite as well, `https` lines
+/// included: a playlist fetched over cleartext was told what to name in the
+/// clear too, and an `https` line in it is not the caller's origin talking.
+#[test]
+fn a_playlist_fetched_over_a_downgraded_chain_arms_no_line_with_the_credential()
+-> anyhow::Result<()> {
+    const SECRET: &str = "Bearer s3cret";
+
+    // Filled in once the TLS origin is up, which is before anything is
+    // fetched from either of them.
+    let tls_addr: std::sync::Arc<std::sync::OnceLock<SocketAddr>> = Default::default();
+    let for_playlist = tls_addr.clone();
+    let cleartext = Origin::start_with(move |request: &Request, socket: &mut TcpStream| {
+        let tls = for_playlist.get().expect("the TLS origin is up");
+        let (content_type, body) = if request.target().contains(".m3u8") {
+            (
+                "application/x-mpegURL",
+                format!("#EXTM3U\n#EXTINF:10,\nseg-0.ts\n#EXTINF:10,\nhttps://{tls}/seg-1.ts\n"),
+            )
+        } else {
+            ("video/mp2t", echo_headers(request))
+        };
+        let _ = socket.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        let _ = socket.flush();
+    })?;
+    let location = format!("http://{}/live/master.m3u8", cleartext.addr);
+
+    let tls = TlsOrigin::start_with(axum::Router::new().fallback(axum::routing::any(
+        move |uri: axum::http::Uri, headers: axum::http::HeaderMap| {
+            let location = location.clone();
+            async move {
+                if uri.path().ends_with("master.m3u8") {
+                    return (
+                        axum::http::StatusCode::FOUND,
+                        [(axum::http::header::LOCATION, location)],
+                        String::new(),
+                    );
+                }
+                (
+                    axum::http::StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "video/mp2t".to_string())],
+                    echo_header_map(&headers),
+                )
+            }
+        },
+    )))?;
+    tls_addr
+        .set(tls.addr)
+        .expect("set once, before any request");
+
+    let fixture = fixture_with(cleartext)?;
+    let client = reqwest::blocking::Client::new();
+    let playlist = client
+        .get(format!(
+            "{}/proxy/?d={}&h={}&h={}&h={}",
+            fixture.base,
+            encode(&format!(
+                "https://127.0.0.1:{}/live/master.m3u8",
+                tls.addr.port()
+            )),
+            encode(&format!("Authorization:{SECRET}")),
+            encode("Cookie:session=abc"),
+            encode("User-Agent:addon/1")
+        ))
+        .send()?;
+    assert_eq!(playlist.status(), reqwest::StatusCode::OK);
+    let body = playlist.text()?;
+
+    assert_eq!(
+        fixture.origin.next_request().header("authorization"),
+        None,
+        "the playlist hop itself is asked with no credential -- the guard working"
+    );
+    for line in rewritten_lines(&body) {
+        assert!(
+            !line.contains("Authorization") && !line.contains("Cookie"),
+            "and nothing it named is armed with one, https lines included: {line}"
+        );
+        assert!(
+            line.contains(&format!("&h={}", encode("User-Agent:addon/1"))),
+            "while the rest of h= still travels: {line}"
+        );
+    }
+
+    // The segment fetch that used to carry it to the cleartext host.
+    let segment = client
+        .get(format!("{}{}", fixture.base, rewritten_lines(&body)[0]))
+        .send()?;
+    assert_eq!(segment.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        segment.text()?,
+        "authorization=None cookie=None user-agent=Some(\"addon/1\")"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
 /// A relative `Location`, resolved against the URL that sent it rather than
 /// against the origin. The reference resolves against `dest.href` with the
 /// path cut off, which turns `Location: v2/film.mkv` beside

@@ -129,7 +129,9 @@ const FOLLOWED_REDIRECTS: [StatusCode; 5] = [
 /// The target's scheme is not compared with the one it came from, so an
 /// `https` hop may legitimately end at an `http` one -- what such a step
 /// down costs is decided where the request is built, not here: the caller's
-/// `h=` credentials stop travelling (see the loop in [`proxy`]).
+/// `h=` credentials stop travelling (see the loop in [`proxy`], and
+/// [`CarriedParams`] for the rewritten playlist lines that continue the
+/// chain after it).
 fn redirect_target(response: &reqwest::Response, from: &Url) -> Option<Url> {
     if !FOLLOWED_REDIRECTS.contains(&response.status()) {
         return None;
@@ -473,6 +475,10 @@ const CREDENTIAL_REQUEST_HEADERS: [&str; 3] = ["authorization", "cookie", "proxy
 /// The rest of `h=` still goes: a `User-Agent`, a `Referer` or an
 /// addon's own `X-` header describes the request and is not a secret to
 /// spend, and dropping those would break the stream for no gain.
+///
+/// [`ProxyParams::carried`] does the same filtering to the `h=` it writes
+/// into a rewritten playlist line, where the names are the caller's own
+/// strings rather than a header map's.
 fn without_credentials(headers: &HeaderMap) -> HeaderMap {
     headers
         .iter()
@@ -588,18 +594,109 @@ impl ProxyParams {
     /// happening here is exactly this -- `r=` is not on the line, so a
     /// segment inherits no label. Its own cross-origin branch drops `r=`
     /// (`newOpts` has only `d` and `h`), which is the half worth keeping.
-    fn carried(&self) -> String {
-        let mut carried = String::new();
+    ///
+    /// **Nor is all of `h=` on every line.** `base` is the URL the playlist
+    /// actually came from and `carry_credentials` is what the redirect loop
+    /// had left of the caller's secrets when it got there; together they
+    /// decide, per line, whether [`CREDENTIAL_REQUEST_HEADERS`] may be
+    /// written into it at all. See [`CarriedParams`], which is where that
+    /// rule lives.
+    fn carried(&self, base: &Url, carry_credentials: bool) -> CarriedParams {
+        let mut all = String::new();
+        let mut uncredentialed = String::new();
         for (name, value) in &self.request_headers {
-            carried.push_str(&format!(
-                "&h={}",
-                urlencoding::encode(&format!("{name}:{value}"))
-            ));
+            let parameter = format!("&h={}", urlencoding::encode(&format!("{name}:{value}")));
+            // `h=` names are the caller's spelling, not a `HeaderMap`'s, so
+            // the comparison has to do the lowercasing the header map would
+            // have done: `h=AUTHORIZATION:...` is the same credential.
+            if !CREDENTIAL_REQUEST_HEADERS.contains(&name.to_ascii_lowercase().as_str()) {
+                uncredentialed.push_str(&parameter);
+            }
+            all.push_str(&parameter);
         }
         if let Some(token) = &self.player_token {
-            carried.push_str(&format!("&p={}", urlencoding::encode(token)));
+            let parameter = format!("&p={}", urlencoding::encode(token));
+            all.push_str(&parameter);
+            uncredentialed.push_str(&parameter);
         }
-        carried
+        CarriedParams {
+            to_https: if carry_credentials {
+                all.clone()
+            } else {
+                uncredentialed.clone()
+            },
+            // A line naming `http` is a step down unless the playlist came
+            // over cleartext itself, in which case the caller has already
+            // spent the credential on that wire.
+            to_http: if carry_credentials && base.scheme() != "https" {
+                all
+            } else {
+                uncredentialed
+            },
+        }
+    }
+}
+
+/// What a rewritten playlist line carries, in the two spellings a line may
+/// need. [`ProxyParams::carried`] builds both; the line's own target picks
+/// between them.
+///
+/// **A rewritten line is a hop of the same chain** -- the last one this
+/// route has any say over. What it writes into the line is what the player
+/// hands straight back to us as its own `h=`, and what we then spend on
+/// whatever that line named, without a caller ever having decided to. So
+/// the rule that governs the redirect loop governs the line too (see the
+/// loop in [`proxy`]): a line that steps down from an `https` playlist to
+/// an `http` target does not carry [`CREDENTIAL_REQUEST_HEADERS`], and a
+/// chain that has already stepped down carries them onto no line at all,
+/// an `https` one included.
+///
+/// Without this the loop's guard was one line deep. Measured: an `https`
+/// origin serving a playlist that names `http://…/seg-0.ts` had the
+/// caller's `Authorization` and `Cookie` written into the segment's URL,
+/// and the player -- which fetches segments by itself, that being what a
+/// playlist is for -- delivered them to the cleartext origin the loop's
+/// guard exists to keep them from. The same one line defeated the guard
+/// end to end for a chain that *had* downgraded: the playlist hop was
+/// correctly asked with no credential, and the playlist it returned
+/// re-armed `h=` for every segment.
+///
+/// A playlist that arrived over cleartext to begin with is **not** a step
+/// down, and its `http` lines still carry everything: that is the same
+/// exception the loop makes for the target the caller named itself, and
+/// the credential has already travelled that wire. Nothing is bought by
+/// making the line stricter than the hop -- an origin that wants the
+/// secret over cleartext from there can answer `302` to `http` instead,
+/// which the loop carries for the same reason -- and an authenticated
+/// stream that is served over plain `http` would lose every segment for
+/// it.
+struct CarriedParams {
+    /// What a line naming an `https` target carries.
+    to_https: String,
+    /// What a line naming anything else carries: the credentials dropped,
+    /// unless the playlist itself came over cleartext.
+    to_http: String,
+}
+
+impl CarriedParams {
+    /// The spelling `target`'s scheme has earned.
+    fn for_target(&self, target: &Url) -> &str {
+        if target.scheme() == "https" {
+            &self.to_https
+        } else {
+            &self.to_http
+        }
+    }
+
+    /// The same parameters whatever a line names -- what the line tests
+    /// below are written against, since they are about the rewriting and
+    /// not about the credential rule.
+    #[cfg(test)]
+    fn everywhere(carried: &str) -> Self {
+        Self {
+            to_https: carried.to_string(),
+            to_http: carried.to_string(),
+        }
     }
 }
 
@@ -846,6 +943,14 @@ async fn proxy(
     // downgrades is unchanged: a caller who names an `http://` target
     // itself has made that choice, and its first hop carries what it asked
     // for.
+    //
+    // "Every hop after it" has to include the ones this route does not make
+    // itself. A playlist is rewritten line by line into `/proxy/` URLs the
+    // player then fetches, and each of those lines is written with `h=` on
+    // it -- so a chain that ended here was continued, credentials and all,
+    // by the very next request the player made. [`CarriedParams`] applies
+    // this same rule to the lines, which is what makes the drop stick past
+    // the end of this loop.
     //
     // The method is kept across hops, as the reference keeps it. A `303`
     // asks for a `GET` and a browser would give it one, but this route is
@@ -1220,7 +1325,13 @@ async fn proxy(
             )
                 .into_response();
         };
-        let rewritten = rewritten_playlist_body(chunks, fetched_url, params.carried());
+        // `fetched_url` is where the playlist came from, and
+        // `carry_credentials` what the chain that fetched it had left of
+        // the caller's secrets -- between them they decide which lines may
+        // be written with the credentials in `h=` and which may not (see
+        // [`CarriedParams`]).
+        let carried = params.carried(&fetched_url, carry_credentials);
+        let rewritten = rewritten_playlist_body(chunks, fetched_url, carried);
         return finalize_response(res_builder, axum::body::Body::from_stream(rewritten));
     }
 
@@ -1275,7 +1386,10 @@ pub async fn close_proxy_streams(
 /// needs too: a segment of an authenticated stream needs the same
 /// authorization the playlist needed, and closing an HLS player has to
 /// break the read in flight, which is a segment. What a segment does *not*
-/// need is the caller's `r=`; see [`ProxyParams::carried`].
+/// need is the caller's `r=`; see [`ProxyParams::carried`]. It is
+/// [`CarriedParams`] rather than a string because the credentials in `h=`
+/// depend on where the line points -- the choice is made in
+/// [`proxied_uri`], which is where the target is known.
 ///
 /// **Every line that names a resource is rewritten, relative ones
 /// included.** The reference leaves those alone, correctly for itself: a
@@ -1303,7 +1417,7 @@ pub async fn close_proxy_streams(
 ///
 /// Like the reference, only the first `URI="…"` on a line is rewritten. No
 /// HLS tag carries two, but say so rather than leave it looking exhaustive.
-fn rewrite_line<'a>(line: &'a str, base: &Url, carried: &str) -> Cow<'a, str> {
+fn rewrite_line<'a>(line: &'a str, base: &Url, carried: &CarriedParams) -> Cow<'a, str> {
     const URI_ATTRIBUTE: &str = "URI=\"";
 
     if line.starts_with('#') {
@@ -1359,7 +1473,7 @@ fn rewrite_line<'a>(line: &'a str, base: &Url, carried: &str) -> Cow<'a, str> {
 /// `data:` URI, or something that is not a URL. Such a line is left exactly
 /// as the origin wrote it, since there is nothing this proxy could fetch
 /// for it.
-fn proxied_uri(uri: &str, base: &Url, carried: &str) -> Option<String> {
+fn proxied_uri(uri: &str, base: &Url, carried: &CarriedParams) -> Option<String> {
     // A blank URI names nothing. [`Url::join`] disagrees -- it strips the
     // whitespace and hands back `base` itself -- so a line of spaces, or an
     // `URI=""`, would otherwise be rewritten into a proxy URL for the
@@ -1373,6 +1487,10 @@ fn proxied_uri(uri: &str, base: &Url, carried: &str) -> Option<String> {
     if !matches!(target.scheme(), "http" | "https") {
         return None;
     }
+    // This is where the line's target -- and so its scheme -- is finally
+    // known, which makes it where the caller's credentials are either
+    // written into the line or left out of it.
+    let carried = carried.for_target(&target);
     // `d=` is the bare origin and the path rides in the URL's own path,
     // which is the invariant the path format's handler depends on: it
     // *appends* the request path to `d=`. (The reference instead
@@ -1434,8 +1552,9 @@ const LONGEST_REWRITABLE_LINE: usize = 64 * 1024;
 struct PlaylistRewriter {
     /// The URL the playlist came from -- what its lines are relative to.
     base: Url,
-    /// [`ProxyParams::carried`]: the `h=`/`p=` every line it writes carries.
-    carried: String,
+    /// [`ProxyParams::carried`]: the `h=`/`p=` every line it writes
+    /// carries, in the two spellings a line may have earned.
+    carried: CarriedParams,
     /// Bytes since the last `\n`, waiting for the one that completes them.
     pending: Vec<u8>,
     /// Set when [`pending`](Self::pending) outgrew
@@ -1445,7 +1564,7 @@ struct PlaylistRewriter {
 }
 
 impl PlaylistRewriter {
-    fn new(base: Url, carried: String) -> Self {
+    fn new(base: Url, carried: CarriedParams) -> Self {
         Self {
             base,
             carried,
@@ -1522,7 +1641,7 @@ impl PlaylistRewriter {
 fn rewritten_playlist_body<S, C, E>(
     chunks: S,
     base: Url,
-    carried: String,
+    carried: CarriedParams,
 ) -> impl futures_util::Stream<Item = Result<Vec<u8>, E>>
 where
     S: futures_util::Stream<Item = Result<C, E>> + Unpin,
@@ -1562,7 +1681,14 @@ where
 /// are about the lines rather than about the chunking.
 #[cfg(test)]
 fn rewrite_playlist(body: &str, base: &Url, carried: &str) -> String {
-    let mut rewriter = PlaylistRewriter::new(base.clone(), carried.to_string());
+    rewrite_playlist_carrying(body, base, CarriedParams::everywhere(carried))
+}
+
+/// The same, for the tests that are about which lines carry the caller's
+/// credentials and which do not.
+#[cfg(test)]
+fn rewrite_playlist_carrying(body: &str, base: &Url, carried: CarriedParams) -> String {
+    let mut rewriter = PlaylistRewriter::new(base.clone(), carried);
     let mut rewritten = rewriter.push(body.as_bytes());
     rewritten.append(&mut rewriter.finish());
     String::from_utf8(rewritten).expect("text in, text out")
@@ -1795,7 +1921,7 @@ mod tests {
     fn the_player_token_is_carried_into_every_rewritten_line() {
         let body = "#EXT-X-KEY:METHOD=AES-128,URI=\"key/enc.key\"\nseg-0.ts\n";
         let params = ProxyParams::parse("d=whatever&p=player+one");
-        let rewritten = rewrite_playlist(body, &base(), &params.carried());
+        let rewritten = rewrite_playlist_carrying(body, &base(), params.carried(&base(), true));
         let expected = format!(
             "#EXT-X-KEY:METHOD=AES-128,URI=\"{}\"\n{}\n",
             proxied_with("http://example.com/streams/key/enc.key", "&p=player%20one"),
@@ -1814,7 +1940,7 @@ mod tests {
         let whole = rewrite_playlist(body, &base(), "&p=one");
 
         for split in 1..body.len() {
-            let mut rewriter = PlaylistRewriter::new(base(), "&p=one".to_string());
+            let mut rewriter = PlaylistRewriter::new(base(), CarriedParams::everywhere("&p=one"));
             let mut streamed = rewriter.push(&body.as_bytes()[..split]);
             streamed.append(&mut rewriter.push(&body.as_bytes()[split..]));
             streamed.append(&mut rewriter.finish());
@@ -1857,7 +1983,7 @@ mod tests {
     /// have understood them.
     #[test]
     fn a_line_that_is_not_text_is_passed_on_as_it_came() {
-        let mut rewriter = PlaylistRewriter::new(base(), String::new());
+        let mut rewriter = PlaylistRewriter::new(base(), CarriedParams::everywhere(""));
         let mut out = rewriter.push(b"#EXTM3U\n\xff\xfe not text\nseg-0.ts\n");
         out.append(&mut rewriter.finish());
 
@@ -1874,7 +2000,7 @@ mod tests {
     /// and the rest of that line with them.
     #[test]
     fn a_line_too_long_to_be_one_is_handed_on_rather_than_held() {
-        let mut rewriter = PlaylistRewriter::new(base(), String::new());
+        let mut rewriter = PlaylistRewriter::new(base(), CarriedParams::everywhere(""));
         let overlong = vec![b'x'; LONGEST_REWRITABLE_LINE + 1];
         assert_eq!(
             rewriter.push(&overlong),
@@ -1938,7 +2064,8 @@ mod tests {
         let params = ProxyParams::parse(
             "d=whatever&h=Authorization%3ABearer+abc&r=Content-Type%3Avideo%2Fmp4&p=one",
         );
-        let rewritten = rewrite_playlist("seg-0.ts\n", &base(), &params.carried());
+        let rewritten =
+            rewrite_playlist_carrying("seg-0.ts\n", &base(), params.carried(&base(), true));
         assert_eq!(
             rewritten,
             format!(
@@ -1951,13 +2078,94 @@ mod tests {
         );
     }
 
+    /// The same rule the redirect loop follows, one hop further on: a line
+    /// that steps down from an `https` playlist to an `http` target is
+    /// written without the caller's credentials, and one that stays on
+    /// `https` keeps them.
+    ///
+    /// A rewritten line is where the loop's guard was being defeated. The
+    /// player fetches what the playlist names, by itself, so an
+    /// `Authorization` written into an `http` line is an `Authorization`
+    /// delivered in the clear -- to an origin the caller never named, on a
+    /// line the origin chose.
+    #[test]
+    fn a_line_that_steps_down_to_cleartext_is_written_without_the_credentials() {
+        let secure = Url::parse("https://example.com/streams/master.m3u8").expect("a base URL");
+        let params = ProxyParams::parse(
+            "d=whatever&h=Authorization%3ABearer+abc&h=Cookie%3Asession%3Dxyz\
+             &h=User-Agent%3Aaddon%2F1&p=one",
+        );
+        let rewritten = rewrite_playlist_carrying(
+            "https://cdn.example.org/s/1.ts\nhttp://plain.example.org/s/2.ts\n",
+            &secure,
+            params.carried(&secure, true),
+        );
+        assert_eq!(
+            rewritten,
+            format!(
+                "{}\n{}\n",
+                proxied_with(
+                    "https://cdn.example.org/s/1.ts",
+                    "&h=Authorization%3ABearer%20abc&h=Cookie%3Asession%3Dxyz\
+                     &h=User-Agent%3Aaddon%2F1&p=one"
+                ),
+                proxied_with(
+                    "http://plain.example.org/s/2.ts",
+                    "&h=User-Agent%3Aaddon%2F1&p=one"
+                )
+            ),
+            "the credentials stay on the TLS line; the rest of h= goes on both"
+        );
+    }
+
+    /// And once the chain has stepped down, no line gets them back --
+    /// including one naming `https`. A playlist fetched over cleartext was
+    /// told what to name in the clear too, so an `https` line in it is not
+    /// the caller's `https` origin talking.
+    #[test]
+    fn a_playlist_reached_over_cleartext_arms_no_line_with_the_credentials() {
+        let params =
+            ProxyParams::parse("d=whatever&h=Authorization%3ABearer+abc&h=User-Agent%3Aaddon%2F1");
+        let rewritten = rewrite_playlist_carrying(
+            "https://cdn.example.org/s/1.ts\nseg-0.ts\n",
+            &base(),
+            // `false`: the loop dropped them on a hop before this one.
+            params.carried(&base(), false),
+        );
+        assert_eq!(
+            rewritten,
+            format!(
+                "{}\n{}\n",
+                proxied_with(
+                    "https://cdn.example.org/s/1.ts",
+                    "&h=User-Agent%3Aaddon%2F1"
+                ),
+                proxied_with(
+                    "http://example.com/streams/seg-0.ts",
+                    "&h=User-Agent%3Aaddon%2F1"
+                )
+            )
+        );
+    }
+
+    /// However the caller spelled the name. `h=` values are the caller's
+    /// text, not a header map's, so nothing has lowercased them for us.
+    #[test]
+    fn a_credential_named_in_any_case_is_still_one() {
+        let secure = Url::parse("https://example.com/streams/master.m3u8").expect("a base URL");
+        let params = ProxyParams::parse("d=whatever&h=AUTHORIZATION%3ABearer+abc");
+        assert_eq!(params.carried(&secure, true).to_http, "");
+    }
+
     /// Several of them, and the order is the same every time: the rewritten
     /// playlist is a body a player may cache and re-fetch, and two spellings
     /// of the same playlist would be two.
     #[test]
     fn carried_parameters_come_out_in_a_stable_order() {
         let params = ProxyParams::parse("d=whatever&h=B%3A2&h=A%3A1&r=Y%3Ayes&r=X%3Ano&p=t");
-        assert_eq!(params.carried(), "&h=A%3A1&h=B%3A2&p=t");
+        let carried = params.carried(&base(), true);
+        assert_eq!(carried.to_https, "&h=A%3A1&h=B%3A2&p=t");
+        assert_eq!(carried.to_http, "&h=A%3A1&h=B%3A2&p=t");
     }
 
     #[test]
