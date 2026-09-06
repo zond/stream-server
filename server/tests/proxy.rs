@@ -1426,6 +1426,152 @@ fn a_playlist_reached_through_a_redirect_is_rewritten_against_the_edge() -> anyh
     Ok(())
 }
 
+/// An authenticated stream behind a redirect, which is the shape reqwest's
+/// default policy silently broke: it strips `Authorization`, `Cookie` and
+/// `Proxy-Authorization` on any cross-host *or cross-port* redirect, and a
+/// CDN handing off to an edge is exactly that. The playlist fetched `200`
+/// from the CDN, the edge saw no credential at all and answered `403`, and
+/// nothing in the log said a header had been dropped.
+///
+/// The redirect chain is walked here now, so `h=` is applied to every hop
+/// -- which is the reference's answer too (`redirect: "manual"`, its own
+/// loop, and `opts.h.forEach(headers.set(...))` re-applied per hop). Both
+/// origins are on loopback, so this is a same-host, cross-*port* redirect:
+/// the case that reads as safe and is stripped just the same.
+#[test]
+fn a_header_from_h_survives_the_redirect_the_origin_chose() -> anyhow::Result<()> {
+    const SECRET: &str = "Bearer s3cret";
+
+    let edge = Origin::start_with(|request: &Request, socket: &mut TcpStream| {
+        let body = match request.header("authorization") {
+            Some(SECRET) => "the edge served it",
+            _ => {
+                let _ = socket.write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                return;
+            }
+        };
+        let _ = socket.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        let _ = socket.flush();
+    })?;
+    let edge_addr = edge.addr;
+    let cdn = Origin::start_with(move |_request: &Request, socket: &mut TcpStream| {
+        let _ = socket.write_all(
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{edge_addr}/edge/film.mkv\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        let _ = socket.flush();
+    })?;
+
+    let fixture = fixture_with(cdn)?;
+    let response = reqwest::blocking::Client::new()
+        .get(format!(
+            "{}/proxy/d={}&h={}/cdn/film.mkv",
+            fixture.base,
+            encode(&format!("http://{}", fixture.origin.addr)),
+            encode(&format!("Authorization:{SECRET}"))
+        ))
+        .send()?;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.text()?, "the edge served it");
+    assert_eq!(
+        fixture.origin.next_request().header("authorization"),
+        Some(SECRET),
+        "the first hop carried it"
+    );
+    assert_eq!(
+        edge.next_request().header("authorization"),
+        Some(SECRET),
+        "and so did the hop the origin sent us to"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
+/// A relative `Location`, resolved against the URL that sent it rather than
+/// against the origin. The reference resolves against `dest.href` with the
+/// path cut off, which turns `Location: v2/film.mkv` beside
+/// `/cdn/2024/film.mkv` into `/v2/film.mkv` at the host root.
+#[test]
+fn a_relative_location_resolves_beside_the_resource_that_sent_it() -> anyhow::Result<()> {
+    let origin = Origin::start_with(|request: &Request, socket: &mut TcpStream| {
+        if request.target() == "/cdn/2024/film.mkv" {
+            let _ = socket.write_all(
+                b"HTTP/1.1 302 Found\r\nLocation: v2/film.mkv\r\n\
+                  Content-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+            let _ = socket.flush();
+            return;
+        }
+        let body = format!("served {}", request.target());
+        let _ = socket.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        let _ = socket.flush();
+    })?;
+
+    let fixture = fixture_with(origin)?;
+    let target = format!("http://{}/cdn/2024/film.mkv", fixture.origin.addr);
+    let response = reqwest::blocking::Client::new()
+        .get(format!("{}/proxy/?d={}", fixture.base, encode(&target)))
+        .send()?;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.text()?, "served /cdn/2024/v2/film.mkv");
+    assert_eq!(fixture.origin.next_request().target(), "/cdn/2024/film.mkv");
+    assert_eq!(
+        fixture.origin.next_request().target(),
+        "/cdn/2024/v2/film.mkv"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
+/// A redirect that never ends. The hop count is the loop detection: a ring
+/// is a chain that does not stop, and a player has to be told so rather
+/// than left waiting.
+#[test]
+fn a_redirect_ring_is_given_up_on_rather_than_followed_forever() -> anyhow::Result<()> {
+    let origin = Origin::start_with(|_request: &Request, socket: &mut TcpStream| {
+        let _ = socket.write_all(
+            b"HTTP/1.1 302 Found\r\nLocation: /round/again\r\n\
+              Content-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let _ = socket.flush();
+    })?;
+
+    let fixture = fixture_with(origin)?;
+    let target = format!("http://{}/round/again", fixture.origin.addr);
+    let response = reqwest::blocking::Client::new()
+        .get(format!("{}/proxy/?d={}", fixture.base, encode(&target)))
+        .send()?;
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+    assert!(response.text()?.contains("too many redirects"));
+
+    drop(fixture.handle);
+    Ok(())
+}
+
 /// A `.m3u8` URL that answers with an error, and a `HEAD` for one that does
 /// not. Neither has a playlist in it, and rewriting them said otherwise.
 ///

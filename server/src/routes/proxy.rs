@@ -11,7 +11,7 @@ use futures_util::StreamExt;
 use reqwest::{Client, Method};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{LazyLock, OnceLock};
 use url::Url;
 
 /// Lazily-built, process-wide reqwest client for the proxy route: the one
@@ -80,6 +80,35 @@ fn origin_key(url: &Url) -> String {
     url.origin().ascii_serialization()
 }
 
+/// How many redirects one proxied fetch follows before giving up.
+///
+/// Ten, which is what reqwest's default policy allowed before this route
+/// walked the chain itself: a chain that plays today keeps playing. (The
+/// reference allows five.) The limit is also the loop detection -- a
+/// redirect ring is a chain that never ends, and counting hops ends it.
+const MAX_REDIRECTS: usize = 10;
+
+/// Where a response says to go next, resolved against the URL it came
+/// *from* -- `None` when it is not a redirect this proxy follows.
+///
+/// Against the current URL, not the origin. The reference resolves
+/// `Location` against `dest.href` with the path and fragment cut off, so a
+/// relative `Location: seg/2.m3u8` lands at `/seg/2.m3u8` on the host root
+/// instead of beside the resource that sent it.
+///
+/// A `Location` naming any scheme but `http`/`https` is not followed. This
+/// route fetches whatever a caller names, so the one thing it must not do
+/// is let an *origin* redirect it somewhere a caller could not have asked
+/// for.
+fn redirect_target(response: &reqwest::Response, from: &Url) -> Option<Url> {
+    if !response.status().is_redirection() {
+        return None;
+    }
+    let location = response.headers().get(header::LOCATION)?.to_str().ok()?;
+    let target = from.join(location).ok()?;
+    matches!(target.scheme(), "http" | "https").then_some(target)
+}
+
 /// Whether a `206`'s `Content-Range` says the part it carries is the whole
 /// entity -- `bytes 0-<len-1>/<len>`.
 ///
@@ -123,37 +152,11 @@ fn names_a_playlist(url: &Url) -> bool {
     path.ends_with(".m3u8") || path.ends_with(".m3u")
 }
 
-tokio::task_local! {
-    /// The URL the verifying client is about to connect to, for the
-    /// duration of one fetch.
-    ///
-    /// reqwest attributes a connect failure to the URL the request
-    /// *started* at -- `Error::url` is the one we handed it, however many
-    /// redirects it followed since -- so the error alone cannot say which
-    /// handshake failed. Its redirect policy can: it is asked before every
-    /// hop, and it writes the hop down here. A task local because the
-    /// policy belongs to the process-wide client while the answer belongs
-    /// to one request, and because the policy runs inside the very future
-    /// the handler awaits, on this task.
-    static ATTEMPTING: Arc<Mutex<Option<Url>>>;
-}
-
 fn http_client() -> Option<&'static Client> {
     HTTP_CLIENT
         .get_or_init(|| {
             Client::builder()
-                .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                    // Note where we are going before we go there (see
-                    // [`ATTEMPTING`]), then decide it the way the default
-                    // policy would -- the hop limit and the loop detection
-                    // are not ours to reinvent.
-                    let _ = ATTEMPTING.try_with(|attempting| {
-                        if let Ok(mut attempting) = attempting.lock() {
-                            *attempting = Some(attempt.url().clone());
-                        }
-                    });
-                    reqwest::redirect::Policy::default().redirect(attempt)
-                }))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|e| tracing::error!("Failed to build proxy HTTP client: {e}"))
                 .ok()
@@ -165,6 +168,7 @@ fn insecure_http_client() -> Option<&'static Client> {
     INSECURE_HTTP_CLIENT
         .get_or_init(|| {
             Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
                 .danger_accept_invalid_certs(true)
                 .build()
                 .map_err(|e| tracing::error!("Failed to build unverified proxy HTTP client: {e}"))
@@ -597,30 +601,8 @@ async fn proxy(
             .into_response();
     }
 
-    // The origin is fetched verified unless a previous request for it
-    // failed on its certificate (see [`UNVERIFIED_ORIGINS`]). This asks
-    // about the URL we are about to fetch; a downgrade recorded for a
-    // redirect *target* is not visible from here, so such a chain pays its
-    // one failed handshake again on every request rather than once. That is
-    // the honest cost of not guessing where a redirect will go.
-    let known_unverified = UNVERIFIED_ORIGINS.contains(&origin_key(&url));
-    let client = match if known_unverified {
-        insecure_http_client()
-    } else {
-        http_client()
-    } {
-        Some(c) => c,
-        None => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Proxy client unavailable",
-            )
-                .into_response();
-        }
-    };
-
     let custom_request_headers = custom_request_headers(&params.request_headers);
-    let build_request = |client: &Client| {
+    let build_request = |client: &Client, url: &Url| {
         let mut req_builder = client.request(method.clone(), url.clone());
 
         // What the player asked for, forwarded as it asked for it.
@@ -654,84 +636,132 @@ async fn proxy(
 
         // The `h=` overrides last, and replacing rather than adding to what
         // the player sent: an override that leaves the original in place
-        // is not one.
+        // is not one. Every hop of a redirect chain is built through here,
+        // so every hop gets them (see the loop below).
         req_builder = req_builder.headers(custom_request_headers.clone());
         req_builder
     };
 
-    // The fetch, with a place for the redirect policy to write down where it
-    // went (see [`ATTEMPTING`]); the initial URL is the answer when it wrote
-    // nothing, because then there was no redirect to move it.
-    let attempting: Arc<Mutex<Option<Url>>> = Arc::new(Mutex::new(None));
-    let sent = ATTEMPTING
-        .scope(attempting.clone(), build_request(client).send())
-        .await;
-    let response = match sent {
-        Ok(resp) => resp,
-        Err(e) if !known_unverified && is_certificate_error(&e) => {
-            // The host whose handshake failed, which is not necessarily the
-            // one we asked for. This used to mark the URL the request
-            // started at, so an `https` -> `https` redirect to a bad
-            // certificate permanently downgraded the *good* host and left
-            // the bad one verified, and a plain-HTTP host that redirected to
-            // one was downgraded for a certificate it never presented. The
-            // redirect policy knows better, and says so.
-            let failed_at = attempting
-                .lock()
-                .ok()
-                .and_then(|attempting| attempting.clone())
-                .unwrap_or_else(|| url.clone());
-            // Only a TLS endpoint has a certificate to waive. Nothing else
-            // can produce this error, so this is a guard rather than a
-            // case: if it ever fires, the note above was not written and
-            // the honest answer is to fail rather than downgrade a guess.
-            if failed_at.scheme() != "https" {
-                tracing::warn!(
-                    url = %failed_at,
-                    error = %e,
-                    "a certificate failed verification, but not at an https URL we can \
-                     name; not retrying"
-                );
-                return (StatusCode::BAD_GATEWAY, format!("Proxy error: {}", e)).into_response();
-            }
-            // One retry, for this endpoint only, and say so once per
-            // process.
-            let downgraded = origin_key(&failed_at);
-            tracing::warn!(
-                origin = %downgraded,
-                error = %e,
-                "certificate verification failed; retrying this origin unverified for \
-                 the life of the process"
-            );
-            UNVERIFIED_ORIGINS.insert(downgraded);
-            let Some(client) = insecure_http_client() else {
+    // The redirect chain is walked here, one hop at a time, rather than
+    // left to reqwest -- and the reason is `h=`. reqwest's default policy
+    // strips `Authorization`, `Cookie` and `Proxy-Authorization` on any
+    // cross-host *or cross-port* redirect, which is exactly the shape of an
+    // authenticated stream behind a CDN that hands off to an edge: the
+    // playlist fetched `200` and everything it named `403`, with the origin
+    // logging no credential at all. The reference's answer is structural --
+    // `redirect: "manual"`, its own loop, and
+    // `opts.h.forEach(headers.set(...))` re-applied on every hop -- and this
+    // is that: each hop is built by `build_request`, so each hop carries the
+    // headers the caller asked for.
+    //
+    // The header is the addon's, and it travels with the redirect the
+    // origin itself chose. That is the trade the caller made by naming a
+    // header for a stream; the alternative is the `403`.
+    //
+    // The method is kept across hops, as the reference keeps it. A `303`
+    // asks for a `GET` and a browser would give it one, but this route is
+    // reached with a `GET`, a `HEAD` or an `OPTIONS` from a player and
+    // never with a body, so there is nothing for the distinction to change.
+    let mut fetched_url = url.clone();
+    let mut hops = 0usize;
+    let response = loop {
+        // The origin is fetched verified unless a previous request for this
+        // endpoint failed on its certificate (see [`UNVERIFIED_ORIGINS`]).
+        // Asked per hop, which it could not be while reqwest owned the
+        // chain: a downgrade recorded for a redirect *target* used to be
+        // invisible here, so such a chain paid its failed handshake again
+        // on every request rather than once.
+        let known_unverified = UNVERIFIED_ORIGINS.contains(&origin_key(&fetched_url));
+        let client = match if known_unverified {
+            insecure_http_client()
+        } else {
+            http_client()
+        } {
+            Some(c) => c,
+            None => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Proxy client unavailable",
                 )
                     .into_response();
-            };
-            match build_request(client).send().await {
-                Ok(resp) => resp,
-                Err(e) => {
+            }
+        };
+
+        let response = match build_request(client, &fetched_url).send().await {
+            Ok(resp) => resp,
+            Err(e) if !known_unverified && is_certificate_error(&e) => {
+                // The endpoint whose handshake failed, which is this hop and
+                // no other -- walking the chain ourselves is what makes that
+                // simply true. It used to be inferred from a task-local the
+                // redirect policy wrote, because reqwest attributes a
+                // connect failure to the URL the request *started* at: an
+                // `https` -> `https` chain permanently downgraded the *good*
+                // host and left the bad one verified.
+                //
+                // Only a TLS endpoint has a certificate to waive. Nothing
+                // else can produce this error, so this is a guard rather
+                // than a case: if it ever fires, the honest answer is to
+                // fail rather than downgrade a guess.
+                if fetched_url.scheme() != "https" {
+                    tracing::warn!(
+                        url = %fetched_url,
+                        error = %e,
+                        "a certificate failed verification, but not at an https URL we can \
+                         name; not retrying"
+                    );
                     return (StatusCode::BAD_GATEWAY, format!("Proxy error: {}", e))
                         .into_response();
                 }
+                // One retry, for this endpoint only, and say so once per
+                // process.
+                let downgraded = origin_key(&fetched_url);
+                tracing::warn!(
+                    origin = %downgraded,
+                    error = %e,
+                    "certificate verification failed; retrying this origin unverified for \
+                     the life of the process"
+                );
+                UNVERIFIED_ORIGINS.insert(downgraded);
+                let Some(client) = insecure_http_client() else {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Proxy client unavailable",
+                    )
+                        .into_response();
+                };
+                match build_request(client, &fetched_url).send().await {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        return (StatusCode::BAD_GATEWAY, format!("Proxy error: {}", e))
+                            .into_response();
+                    }
+                }
             }
+            Err(e) => {
+                return (StatusCode::BAD_GATEWAY, format!("Proxy error: {}", e)).into_response();
+            }
+        };
+
+        let Some(location) = redirect_target(&response, &fetched_url) else {
+            break response;
+        };
+        if hops >= MAX_REDIRECTS {
+            tracing::warn!(url = %url, "too many redirects; giving up");
+            return (StatusCode::BAD_GATEWAY, "Proxy error: too many redirects").into_response();
         }
-        Err(e) => return (StatusCode::BAD_GATEWAY, format!("Proxy error: {}", e)).into_response(),
+        hops += 1;
+        tracing::debug!(from = %fetched_url, to = %location, "following a proxied redirect");
+        fetched_url = location;
     };
 
+    // `fetched_url` is where the body actually came from, `url` where the
+    // caller pointed us. A playlist's relative lines are relative to the URL
+    // it *arrived* at: rewriting against the URL we asked for sends every
+    // segment back to the host that redirected us, and to its directory,
+    // which for a CDN-to-edge `302` -- the ordinary HLS deployment -- is
+    // every segment of every stream served that way.
     let status = response.status();
     let res_headers = response.headers().clone();
-    // Where the body actually came from. reqwest follows redirects, and a
-    // playlist's relative lines are relative to the URL it *arrived* at:
-    // rewriting against the URL we asked for sends every segment back to
-    // the host that redirected us, and to its directory, which is a
-    // CDN-to-edge `302` -- the ordinary HLS deployment -- breaking every
-    // segment of every stream served that way. It is also the honest name
-    // for what we fetched, so the playlist test below asks it too.
-    let fetched_url = response.url().clone();
 
     let content_type = res_headers
         .get(header::CONTENT_TYPE)
