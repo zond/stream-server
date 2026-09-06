@@ -595,7 +595,12 @@ pub struct EvictionReport {
     pub protected: u64,
     /// How many files that is.
     pub protected_files: usize,
-    /// Occupancy reclaimed by the size rule.
+    /// Occupancy this run reclaimed, by either rule: the 30-day sweep and
+    /// the size rule both count here. They were the size rule's alone until
+    /// [`Self::made_room`] started deciding whether a torrent a full disk
+    /// stopped goes back to work -- a pass that aged out a stale film has
+    /// made room for it, and reporting 0 left the torrent stopped on a
+    /// device that had just gained a gigabyte.
     pub freed: u64,
     /// How many files that took.
     pub deleted: usize,
@@ -661,6 +666,12 @@ async fn evict(
     let mut total_size = 0u64;
     let mut protected_size = 0u64;
     let mut protected_files = 0usize;
+    // What the age rule reclaims counts towards what the run freed, exactly
+    // as the size rule's does: `EvictionReport::made_room` is what decides
+    // whether a torrent ENOSPC stopped goes back to work, and a pass that
+    // took a gigabyte off the disk has made room whichever rule took it.
+    let mut aged_out_bytes = 0u64;
+    let mut aged_out_files = 0usize;
 
     for download_dir in download_dirs {
         if !download_dir.exists() {
@@ -731,6 +742,8 @@ async fn evict(
                                         total_size += size;
                                     } else {
                                         // Successfully deleted, do not add to total_size
+                                        aged_out_bytes += size;
+                                        aged_out_files += 1;
                                         // Try to clean empty parent dir
                                         if let Some(parent) = path.parent() {
                                             remove_empty_parents(parent, download_dir).await;
@@ -844,8 +857,8 @@ async fn evict(
         total: total_size,
         protected: protected_size,
         protected_files,
-        freed: freed_space,
-        deleted: deleted_count,
+        freed: freed_space + aged_out_bytes,
+        deleted: deleted_count + aged_out_files,
         limit: limit.unwrap_or(0),
     };
     if let Some(message) = report.shortfall_message() {
@@ -1789,6 +1802,44 @@ mod tests {
         assert!(
             report.shortfall_message().is_some(),
             "the run still ends over the cap, and says what held"
+        );
+    }
+
+    /// The 30-day rule reclaims space too, and `made_room` has to see it.
+    /// Otherwise a pass that deleted a stale film reported `freed: 0`, the
+    /// torrent a full disk had stopped was left stopped, and the next tick
+    /// had nothing left to age out and a cache now under its cap -- so the
+    /// torrent stayed dead on a volume the cleaner had just emptied for it.
+    #[tokio::test]
+    async fn what_the_age_rule_reclaimed_counts_as_room_made() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("rqbit-downloads");
+        let ancient = root.join("last-month").join("film.mkv");
+        write_aged(
+            &ancient,
+            &[0u8; 4096],
+            Duration::from_secs(40 * 24 * 60 * 60),
+        );
+        let reclaimable = occupancy(&ancient);
+
+        // No cap of any kind: the size rule cannot run, so whatever this
+        // pass reports having freed came from the age rule alone.
+        let report = evict(
+            std::slice::from_ref(&root),
+            &HashSet::new(),
+            CacheLimit::configured(0),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert!(!ancient.exists());
+        assert_eq!(report.freed, reclaimable);
+        assert_eq!(report.deleted, 1);
+        assert_eq!(report.total, 0);
+        assert!(
+            report.made_room(),
+            "so the torrent a full disk stopped is restarted"
         );
     }
 
