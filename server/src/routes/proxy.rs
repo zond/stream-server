@@ -597,10 +597,11 @@ impl ProxyParams {
     ///
     /// **Nor is all of `h=` on every line.** `base` is the URL the playlist
     /// actually came from and `carry_credentials` is what the redirect loop
-    /// had left of the caller's secrets when it got there; together they
-    /// decide, per line, whether [`CREDENTIAL_REQUEST_HEADERS`] may be
-    /// written into it at all. See [`CarriedParams`], which is where that
-    /// rule lives.
+    /// had left of the caller's secrets when it got there; between them
+    /// they fix which lines [`CREDENTIAL_REQUEST_HEADERS`] may be written
+    /// into at all -- and for a cleartext line that is a question about
+    /// `base`'s *host*, not its scheme. See [`CarriedParams`], which is
+    /// where that rule lives.
     fn carried(&self, base: &Url, carry_credentials: bool) -> CarriedParams {
         let mut all = String::new();
         let mut uncredentialed = String::new();
@@ -620,19 +621,27 @@ impl ProxyParams {
             uncredentialed.push_str(&parameter);
         }
         CarriedParams {
-            to_https: if carry_credentials {
-                all.clone()
+            credentialed: if carry_credentials {
+                all
             } else {
                 uncredentialed.clone()
             },
+            uncredentialed,
+            over_tls: carry_credentials,
             // A line naming `http` is a step down unless the playlist came
-            // over cleartext itself, in which case the caller has already
-            // spent the credential on that wire.
-            to_http: if carry_credentials && base.scheme() != "https" {
-                all
-            } else {
-                uncredentialed
-            },
+            // over cleartext itself -- and then only back to the very host
+            // it came from, which is the one this credential has already
+            // been spent on. `Url::origin` is the comparison because it is
+            // the value the line is written with (`d=` is an origin), and
+            // because it says the two things a host comparison here has to
+            // say: `a.example` and `cdn.a.example` are different hosts, and
+            // so are two ports on one host -- a listener on `:8080` is not
+            // the one the credential was handed to, and on a shared host it
+            // is often not even the same party's. The
+            // scheme in it is no extra condition: `base` is cleartext here
+            // and so is every target this is compared against.
+            over_cleartext_at: (carry_credentials && base.scheme() != "https")
+                .then(|| base.origin()),
         }
     }
 }
@@ -645,11 +654,11 @@ impl ProxyParams {
 /// route has any say over. What it writes into the line is what the player
 /// hands straight back to us as its own `h=`, and what we then spend on
 /// whatever that line named, without a caller ever having decided to. So
-/// the rule that governs the redirect loop governs the line too (see the
-/// loop in [`proxy`]): a line that steps down from an `https` playlist to
-/// an `http` target does not carry [`CREDENTIAL_REQUEST_HEADERS`], and a
-/// chain that has already stepped down carries them onto no line at all,
-/// an `https` one included.
+/// the rule that governs the redirect loop reaches the line as well (see
+/// the loop in [`proxy`]), and then some: a line that steps down from an
+/// `https` playlist to an `http` target does not carry
+/// [`CREDENTIAL_REQUEST_HEADERS`], and a chain that has already stepped
+/// down carries them onto no line at all, an `https` one included.
 ///
 /// Without this the loop's guard was one line deep. Measured: an `https`
 /// origin serving a playlist that names `http://…/seg-0.ts` had the
@@ -662,29 +671,71 @@ impl ProxyParams {
 /// re-armed `h=` for every segment.
 ///
 /// A playlist that arrived over cleartext to begin with is **not** a step
-/// down, and its `http` lines still carry everything: that is the same
-/// exception the loop makes for the target the caller named itself, and
-/// the credential has already travelled that wire. Nothing is bought by
-/// making the line stricter than the hop -- an origin that wants the
-/// secret over cleartext from there can answer `302` to `http` instead,
-/// which the loop carries for the same reason -- and an authenticated
-/// stream that is served over plain `http` would lose every segment for
-/// it.
+/// down, and its `http` lines still carry everything -- **but only the ones
+/// naming the origin it came from itself**. That is the whole of the
+/// exception: this credential has already been spent, in the clear, on
+/// exactly one origin, so writing it into a line pointing back at that
+/// origin publishes nothing that is not published already, and an
+/// authenticated stream served over plain `http` would lose every segment
+/// without it. A line naming anywhere else is a fresh disclosure, and the
+/// playlist naming it is not the caller: it is whatever the origin wrote.
+///
+/// Keyed on the playlist's *scheme* instead, which is how this shipped
+/// first, the exception armed every `http` line in a cleartext playlist.
+/// Measured: a caller naming `http://A/master.m3u8` with
+/// `h=Authorization:Bearer s3cret` got a playlist naming `http://B/seg-0.ts`,
+/// and B logged `authorization=Some("Bearer s3cret")` when the line was
+/// fetched. It re-armed at each nesting level, too -- A naming B's
+/// playlist, B naming `http://C/seg-c.ts`, C getting the credential --
+/// because a rewritten line is not a hop of the request that wrote it but a
+/// fresh one the player makes, so `MAX_REDIRECTS` bounds none of it. Scoped
+/// by origin it stops at the first line and stays stopped: the line to B is
+/// written unarmed, so the request for B's playlist has no credential to
+/// re-arm and nothing B names can inherit one.
+///
+/// This is deliberately stricter than the hop rule the loop follows: the
+/// loop lets a cleartext chain carry the credential across a `302` to
+/// another host, because there the *origin the caller named* said the
+/// resource had moved and the credential goes where the resource went. A
+/// playlist line says no such thing -- it names a resource that is part of
+/// this one, not its new home -- and the player fetches every one of them
+/// without asking.
+///
+/// An `https` line is unchanged by all this: it carries the credentials
+/// whenever the chain still has them to give, whatever host it names, which
+/// is the same trade the loop makes for a hop nobody on the path can read.
 struct CarriedParams {
-    /// What a line naming an `https` target carries.
-    to_https: String,
-    /// What a line naming anything else carries: the credentials dropped,
-    /// unless the playlist itself came over cleartext.
-    to_http: String,
+    /// What a line the credentials may travel on carries.
+    credentialed: String,
+    /// What every other line carries: the same, with
+    /// [`CREDENTIAL_REQUEST_HEADERS`] left out.
+    uncredentialed: String,
+    /// Whether a line naming `https` is one of the former: false once the
+    /// chain that fetched the playlist has stepped down to cleartext.
+    over_tls: bool,
+    /// The one cleartext origin a line may name and still be armed -- the
+    /// playlist's own, when the playlist itself arrived over cleartext with
+    /// the credentials on it. `None` whenever no `http` line may carry
+    /// them.
+    over_cleartext_at: Option<url::Origin>,
 }
 
 impl CarriedParams {
-    /// The spelling `target`'s scheme has earned.
+    /// The spelling `target` has earned -- by its scheme, and, when that is
+    /// not `https`, by naming the origin the credential was already spent
+    /// on.
     fn for_target(&self, target: &Url) -> &str {
-        if target.scheme() == "https" {
-            &self.to_https
+        let credentialed = if target.scheme() == "https" {
+            self.over_tls
         } else {
-            &self.to_http
+            self.over_cleartext_at
+                .as_ref()
+                .is_some_and(|spent_on| *spent_on == target.origin())
+        };
+        if credentialed {
+            &self.credentialed
+        } else {
+            &self.uncredentialed
         }
     }
 
@@ -694,8 +745,10 @@ impl CarriedParams {
     #[cfg(test)]
     fn everywhere(carried: &str) -> Self {
         Self {
-            to_https: carried.to_string(),
-            to_http: carried.to_string(),
+            credentialed: carried.to_string(),
+            uncredentialed: carried.to_string(),
+            over_tls: true,
+            over_cleartext_at: None,
         }
     }
 }
@@ -948,9 +1001,12 @@ async fn proxy(
     // itself. A playlist is rewritten line by line into `/proxy/` URLs the
     // player then fetches, and each of those lines is written with `h=` on
     // it -- so a chain that ended here was continued, credentials and all,
-    // by the very next request the player made. [`CarriedParams`] applies
-    // this same rule to the lines, which is what makes the drop stick past
-    // the end of this loop.
+    // by the very next request the player made. [`CarriedParams`] carries
+    // this rule onto the lines -- and tightens it, since a line names a
+    // part of the resource rather than its new home, so the credential goes
+    // on a cleartext line only when that line names the very origin it has
+    // already been spent on. That is what makes the drop stick past the end
+    // of this loop.
     //
     // The method is kept across hops, as the reference keeps it. A `303`
     // asks for a `GET` and a browser would give it one, but this route is
@@ -1487,9 +1543,9 @@ fn proxied_uri(uri: &str, base: &Url, carried: &CarriedParams) -> Option<String>
     if !matches!(target.scheme(), "http" | "https") {
         return None;
     }
-    // This is where the line's target -- and so its scheme -- is finally
-    // known, which makes it where the caller's credentials are either
-    // written into the line or left out of it.
+    // This is where the line's target -- and so its scheme and its origin
+    // -- is finally known, which makes it where the caller's credentials
+    // are either written into the line or left out of it.
     let carried = carried.for_target(&target);
     // `d=` is the bare origin and the path rides in the URL's own path,
     // which is the invariant the path format's handler depends on: it
@@ -2148,13 +2204,70 @@ mod tests {
         );
     }
 
+    /// The cleartext exception is one origin's, not the scheme's. A
+    /// playlist that came over `http` has spent the caller's credential on
+    /// exactly one origin, and that is the only cleartext line that may
+    /// carry it -- at whatever depth, since every line is a fresh request
+    /// and re-arms `h=` from what it was written with.
+    ///
+    /// Two decisions are pinned here rather than only argued in
+    /// [`CarriedParams`]: a subdomain is a different host, and a different
+    /// port is a different listener. Both are what [`Url::origin`] already
+    /// says, which is also what `d=` is written with -- and the default
+    /// port spelled out is *not* a different listener.
+    #[test]
+    fn a_cleartext_line_carries_the_credentials_only_back_to_its_own_origin() {
+        let params =
+            ProxyParams::parse("d=whatever&h=Authorization%3ABearer+abc&h=User-Agent%3Aaddon%2F1");
+        // `base()` is `http://example.com/streams/master.m3u8`.
+        let carried = params.carried(&base(), true);
+        let armed = "&h=Authorization%3ABearer%20abc&h=User-Agent%3Aaddon%2F1";
+        let unarmed = "&h=User-Agent%3Aaddon%2F1";
+        for (target, expected, why) in [
+            (
+                "http://example.com/streams/seg-0.ts",
+                armed,
+                "the origin the playlist came from, which already has it",
+            ),
+            (
+                "http://example.com:80/seg-0.ts",
+                armed,
+                "the same origin with its default port spelled out",
+            ),
+            (
+                "http://example.com:8080/seg-0.ts",
+                unarmed,
+                "another port is another listener, and may be another party",
+            ),
+            (
+                "http://cdn.example.com/seg-0.ts",
+                unarmed,
+                "a subdomain is a different host",
+            ),
+            (
+                "http://example.org/seg-0.ts",
+                unarmed,
+                "and a different host plainly is",
+            ),
+            (
+                "https://cdn.example.org/seg-0.ts",
+                armed,
+                "while an https line carries them wherever it points -- \
+                 the same trade the redirect loop makes",
+            ),
+        ] {
+            let target = Url::parse(target).expect("a target URL");
+            assert_eq!(carried.for_target(&target), expected, "{target}: {why}");
+        }
+    }
+
     /// However the caller spelled the name. `h=` values are the caller's
     /// text, not a header map's, so nothing has lowercased them for us.
     #[test]
     fn a_credential_named_in_any_case_is_still_one() {
         let secure = Url::parse("https://example.com/streams/master.m3u8").expect("a base URL");
         let params = ProxyParams::parse("d=whatever&h=AUTHORIZATION%3ABearer+abc");
-        assert_eq!(params.carried(&secure, true).to_http, "");
+        assert_eq!(params.carried(&secure, true).for_target(&base()), "");
     }
 
     /// Several of them, and the order is the same every time: the rewritten
@@ -2164,8 +2277,9 @@ mod tests {
     fn carried_parameters_come_out_in_a_stable_order() {
         let params = ProxyParams::parse("d=whatever&h=B%3A2&h=A%3A1&r=Y%3Ayes&r=X%3Ano&p=t");
         let carried = params.carried(&base(), true);
-        assert_eq!(carried.to_https, "&h=A%3A1&h=B%3A2&p=t");
-        assert_eq!(carried.to_http, "&h=A%3A1&h=B%3A2&p=t");
+        let https = Url::parse("https://example.com/s/1.ts").expect("an https target");
+        assert_eq!(carried.for_target(&https), "&h=A%3A1&h=B%3A2&p=t");
+        assert_eq!(carried.for_target(&base()), "&h=A%3A1&h=B%3A2&p=t");
     }
 
     #[test]

@@ -2136,6 +2136,222 @@ fn a_playlist_fetched_over_a_downgraded_chain_arms_no_line_with_the_credential()
     Ok(())
 }
 
+/// The cleartext exception at the scope it actually earns: a playlist that
+/// arrived over `http` arms the lines naming **its own** origin, and no
+/// others.
+///
+/// A caller that names an `http://` target has spent the credential on that
+/// wire itself, which is why such a playlist's own segments still carry it
+/// -- an authenticated plain-`http` stream would lose every segment
+/// otherwise. But a wire belongs to one host. Keyed on the playlist's
+/// *scheme*, the exception armed every `http` line in it whoever it named:
+/// measured, a caller naming `http://A/live/master.m3u8` with
+/// `h=Authorization:Bearer s3cret` got back a playlist naming
+/// `http://B/seg-0.ts`, and B -- a host nothing in this chain had
+/// authenticated to -- logged `authorization=Some("Bearer s3cret")` when
+/// the line was fetched the way a player fetches it.
+///
+/// The positive halves are here because a rule that drops everything passes
+/// the negative one: the line back to A still carries the credential, and
+/// B's line still carries the `User-Agent` that is a description rather
+/// than a secret.
+#[test]
+fn a_cleartext_line_naming_another_host_carries_no_credential() -> anyhow::Result<()> {
+    const SECRET: &str = "Bearer s3cret";
+
+    let elsewhere = echoing_origin()?;
+    let elsewhere_addr = elsewhere.addr;
+    // The host the caller names: the playlist at a `.m3u8` URL, an echo of
+    // what it was asked with anywhere else, so its own segment line can be
+    // fetched and reported on too.
+    let named = Origin::start_with(move |request: &Request, socket: &mut TcpStream| {
+        let (content_type, body) = if request.target().ends_with(".m3u8") {
+            (
+                "application/x-mpegURL",
+                format!(
+                    "#EXTM3U\n#EXTINF:10,\nhttp://{elsewhere_addr}/seg-0.ts\n\
+                     #EXTINF:10,\nseg-1.ts\n"
+                ),
+            )
+        } else {
+            ("video/mp2t", echo_headers(request))
+        };
+        let _ = socket.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        let _ = socket.flush();
+    })?;
+
+    let fixture = fixture_with(named)?;
+    let client = reqwest::blocking::Client::new();
+    let playlist = client
+        .get(format!(
+            "{}/proxy/?d={}&h={}&h={}&h={}",
+            fixture.base,
+            encode(&format!("http://{}/live/master.m3u8", fixture.origin.addr)),
+            encode(&format!("Authorization:{SECRET}")),
+            encode("Cookie:session=abc"),
+            encode("User-Agent:addon/1")
+        ))
+        .send()?;
+    assert_eq!(playlist.status(), reqwest::StatusCode::OK);
+    let body = playlist.text()?;
+    let lines = rewritten_lines(&body);
+    let (other_host, same_host) = (lines[0], lines[1]);
+
+    assert!(
+        !other_host.contains("Authorization") && !other_host.contains("Cookie"),
+        "the line naming a host the caller never named carries neither \
+         credential: {other_host}"
+    );
+    assert!(
+        other_host.contains(&format!("&h={}", encode("User-Agent:addon/1"))),
+        "but it does carry the h= that is a description: {other_host}"
+    );
+    assert!(
+        same_host.contains(&format!(
+            "&h={}",
+            encode(&format!("Authorization:{SECRET}"))
+        )) && same_host.contains(&format!("&h={}", encode("Cookie:session=abc"))),
+        "while the line back to the host the caller named keeps them -- that \
+         is the stream this exception exists for: {same_host}"
+    );
+
+    // And what a player does with those lines, which is the measurement
+    // that matters: it fetches them.
+    let segment = client.get(format!("{}{other_host}", fixture.base)).send()?;
+    assert_eq!(segment.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        segment.text()?,
+        "authorization=None cookie=None user-agent=Some(\"addon/1\")",
+        "the third-party host is asked without the credentials"
+    );
+    let segment = client.get(format!("{}{same_host}", fixture.base)).send()?;
+    assert_eq!(segment.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        segment.text()?,
+        format!(
+            "authorization=Some({SECRET:?}) cookie=Some(\"session=abc\") user-agent=Some(\"addon/1\")"
+        ),
+        "and its own host with them -- an authenticated plain-http stream still plays"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
+/// Nothing bounds the depth while the exception is keyed on the scheme,
+/// because a rewritten line is not a hop of the request that wrote it: it
+/// is a fresh `/proxy` request the player makes, and it re-arms `h=` from
+/// scratch. Measured: A's playlist names `http://B/b.m3u8`, B's names
+/// `http://C/seg-c.ts`, and C -- two origins removed from anything the
+/// caller named -- logged `authorization=Some("Bearer s3cret")`.
+/// `MAX_REDIRECTS` has nothing to say about this; it counts the hops inside
+/// one request.
+///
+/// Scoped by host it stops at the first line and stays stopped: B's line is
+/// written without the credential, so the request for B's playlist has none
+/// to re-arm, and what B names cannot inherit what B was never given.
+#[test]
+fn a_nested_playlist_on_another_host_arms_none_of_its_own_lines() -> anyhow::Result<()> {
+    const SECRET: &str = "Bearer s3cret";
+
+    // C, the far end: it reports whatever it was asked with.
+    let last = echoing_origin()?;
+    let last_addr = last.addr;
+    // B, which the caller never named either -- a playlist naming C.
+    let middle = Origin::start_with(move |request: &Request, socket: &mut TcpStream| {
+        let (content_type, body) = if request.target().ends_with(".m3u8") {
+            (
+                "application/x-mpegURL",
+                format!("#EXTM3U\n#EXTINF:10,\nhttp://{last_addr}/seg-c.ts\n"),
+            )
+        } else {
+            ("video/mp2t", echo_headers(request))
+        };
+        let _ = socket.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        let _ = socket.flush();
+    })?;
+    let middle_addr = middle.addr;
+    // A, the one the caller does name: a master playlist naming B's.
+    let first = Origin::start_with(move |_request: &Request, socket: &mut TcpStream| {
+        let body =
+            format!("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nhttp://{middle_addr}/live/b.m3u8\n");
+        let _ = socket.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/x-mpegURL\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        let _ = socket.flush();
+    })?;
+
+    // The fixture's origin is B, so the request it was asked with can be
+    // read back directly.
+    let fixture = fixture_with(middle)?;
+    let client = reqwest::blocking::Client::new();
+    let master = client
+        .get(format!(
+            "{}/proxy/?d={}&h={}&h={}&h={}",
+            fixture.base,
+            encode(&format!("http://{}/live/master.m3u8", first.addr)),
+            encode(&format!("Authorization:{SECRET}")),
+            encode("Cookie:session=abc"),
+            encode("User-Agent:addon/1")
+        ))
+        .send()?;
+    assert_eq!(master.status(), reqwest::StatusCode::OK);
+    let master = master.text()?;
+    let to_middle = rewritten_lines(&master)[0].to_string();
+    assert!(
+        !to_middle.contains("Authorization") && !to_middle.contains("Cookie"),
+        "the nested playlist is on another host, so its line is unarmed: {to_middle}"
+    );
+
+    let nested = client.get(format!("{}{to_middle}", fixture.base)).send()?;
+    assert_eq!(nested.status(), reqwest::StatusCode::OK);
+    let nested = nested.text()?;
+    assert_eq!(
+        fixture.origin.next_request().header("authorization"),
+        None,
+        "and B was asked for it without the credential"
+    );
+    let to_last = rewritten_lines(&nested)[0].to_string();
+    assert!(
+        !to_last.contains("Authorization") && !to_last.contains("Cookie"),
+        "so nothing B names is armed either, at any depth: {to_last}"
+    );
+    assert!(
+        to_last.contains(&format!("&h={}", encode("User-Agent:addon/1"))),
+        "while the rest of h= still travels the whole way: {to_last}"
+    );
+
+    let segment = client.get(format!("{}{to_last}", fixture.base)).send()?;
+    assert_eq!(segment.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        segment.text()?,
+        "authorization=None cookie=None user-agent=Some(\"addon/1\")",
+        "which is what C is asked with -- the fetch that used to carry it"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
 /// A relative `Location`, resolved against the URL that sent it rather than
 /// against the origin. The reference resolves against `dest.href` with the
 /// path cut off, which turns `Location: v2/film.mkv` beside
