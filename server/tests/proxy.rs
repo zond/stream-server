@@ -1355,6 +1355,10 @@ fn a_playlist_read_is_registered_and_can_be_closed() -> anyhow::Result<()> {
         "the wedged playlist read ends now, rather than at a timeout"
     );
 
+    drop(fixture.handle);
+    Ok(())
+}
+
 /// The close arriving during the origin's time-to-first-byte. The token was
 /// live when `/proxy` checked it, before the fetch, and retired by the time
 /// the origin's headers came back -- so the check that costs the origin

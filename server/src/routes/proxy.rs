@@ -779,9 +779,20 @@ async fn proxy(
         // here, and this branch used to return before `attach` ever ran --
         // so the one read this feature exists for was the one read it could
         // not reach. Closing the player's token now breaks this read too.
-        let mut chunks = state
+        let Some(mut chunks) = state
             .proxy_streams
-            .attach(player_token.clone(), response.bytes_stream());
+            .attach(player_token.clone(), response.bytes_stream())
+        else {
+            tracing::debug!(
+                token = player_token.as_deref().unwrap_or_default(),
+                "a player token was closed while its playlist was being fetched"
+            );
+            return (
+                StatusCode::GONE,
+                "This player's stream was closed by its client",
+            )
+                .into_response();
+        };
         let mut body = Vec::new();
         while let Some(chunk) = chunks.next().await {
             match chunk {
