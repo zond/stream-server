@@ -360,7 +360,7 @@ Two URL shapes, and both carry the same four parameters of the proxy's own:
 |---|---|
 | `d=` | the target. In the Core format it is the origin, and the request's path after the segment is appended to it |
 | `h=Name:Value` | a request header to send to the origin, **replacing** what the player sent under that name. Repeatable |
-| `r=Name:Value` | a response header to send back to the player, **replacing** what the origin said under that name. Repeatable — `Content-Type` is the usual one, and correcting it is what the parameter exists for |
+| `r=Name:Value` | a response header to send back to the player, **replacing** what the origin said under that name. Repeatable — `Content-Type` is the usual one, and correcting it is what the parameter exists for. `content-length`, `transfer-encoding` and `connection` are refused: they frame the response this hop is writing, which is hyper's business, and an addon saying `r=Content-Length:1` in front of a film panics the connection task in a debug build and hangs the player in a release one |
 | `p=<token>` | the client's name for the player reading this stream — see [Ending a proxied stream](#ending-a-proxied-stream) |
 
 None of the four is sent to the origin.

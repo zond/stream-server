@@ -748,6 +748,45 @@ fn an_authenticated_playlist_carries_its_headers_into_every_segment() -> anyhow:
     Ok(())
 }
 
+/// `r=` comes from addon metadata, and one of its names is a loaded gun:
+/// `r=Content-Length:1` in front of a megabyte is a response hyper will not
+/// write. In a debug build the connection task panics on it; in a release
+/// build the player is told the film is one byte long and waits for the
+/// rest of a body that has already been sent. The framing of this hop is
+/// dropped from `r=` exactly as it is dropped from the origin's own
+/// headers.
+#[test]
+fn a_custom_response_header_cannot_reframe_the_response() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let response = reqwest::blocking::Client::new()
+        .get(format!(
+            "{}/proxy/d={}&r={}&r={}/movie.mp4",
+            fixture.base,
+            encode(&format!("http://{}", fixture.origin.addr)),
+            encode("Content-Length:1"),
+            encode("Transfer-Encoding:chunked")
+        ))
+        .send()?;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok()),
+        Some(ORIGIN_LENGTH.to_string().as_str()),
+        "the length of the body actually being sent, which the addon does not get to name"
+    );
+    assert_eq!(
+        response.bytes()?.len(),
+        ORIGIN_LENGTH,
+        "and the whole of it arrives"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
 /// A TLS origin with a certificate nothing will verify: self-signed, and a
 /// CA certificate used as an end entity at that, so rustls rejects it
 /// whatever the hostname. The PEMs beside this file are throwaways for

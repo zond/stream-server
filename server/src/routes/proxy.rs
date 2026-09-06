@@ -187,10 +187,25 @@ fn is_certificate_error(error: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
+/// The header names `r=` may not set, because they describe how *this*
+/// response is framed rather than what it contains -- and framing it is
+/// hyper's business, decided from the body actually being written.
+///
+/// They are the same three the origin's own values are never relayed
+/// under, for the same reason, and `r=` is if anything the more dangerous
+/// source: it is addon metadata, and an addon that says
+/// `r=Content-Length:1` in front of a two-gigabyte film panics the
+/// connection task in a debug build ("payload claims content-length of ...,
+/// custom content-length header claims 1") and, in a release build, leaves
+/// the player waiting for bytes that will never come.
+const UNFRAMEABLE_RESPONSE_HEADERS: [&str; 3] =
+    ["content-length", "transfer-encoding", "connection"];
+
 /// Applies the `r=` custom response headers to a response builder,
 /// validating each name/value pair first so that a malicious or malformed
 /// header (e.g. containing a newline) can never poison the builder's
-/// internal error state. Invalid pairs are skipped and logged at debug
+/// internal error state. Invalid pairs -- and every name in
+/// [`UNFRAMEABLE_RESPONSE_HEADERS`] -- are skipped and logged at debug
 /// level rather than propagated.
 ///
 /// They **replace**, which is the whole of what `r=` is for. Appending
@@ -212,6 +227,15 @@ fn apply_custom_response_headers(
             HeaderValue::from_str(value),
         ) {
             (Ok(header_name), Ok(header_value)) => {
+                if UNFRAMEABLE_RESPONSE_HEADERS.contains(&header_name.as_str()) {
+                    tracing::debug!(
+                        name = %header_name,
+                        value = %value,
+                        "Skipping a framing header from r= proxy param: this response is \
+                         framed by the body being written, not by the addon"
+                    );
+                    continue;
+                }
                 if let Some(headers) = builder.headers_mut() {
                     headers.insert(header_name, header_value);
                 }
@@ -1102,6 +1126,36 @@ mod tests {
         }
         assert_eq!(request.get_all("user-agent").iter().count(), 1);
         assert_eq!(request.get("user-agent").unwrap(), "addon/1");
+    }
+
+    /// `r=` names a header on the resource, not on the hop. The three that
+    /// frame the hop are dropped from it exactly as they are dropped from
+    /// the origin's own headers -- an addon that says its film is one byte
+    /// long panics hyper in debug and hangs the player in release.
+    #[test]
+    fn a_custom_response_header_cannot_reframe_the_response() {
+        let overrides = BTreeMap::from([
+            ("Content-Length".to_string(), "1".to_string()),
+            ("Transfer-Encoding".to_string(), "chunked".to_string()),
+            ("Connection".to_string(), "close".to_string()),
+            ("Content-Type".to_string(), "video/mp4".to_string()),
+        ]);
+        let response = finalize_response(
+            apply_custom_response_headers(Response::builder().status(200), &overrides),
+            axum::body::Body::empty(),
+        );
+
+        for name in UNFRAMEABLE_RESPONSE_HEADERS {
+            assert!(
+                !response.headers().contains_key(name),
+                "{name} frames the response, and r= does not get to say"
+            );
+        }
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "video/mp4",
+            "and the header r= exists for still arrives"
+        );
     }
 
     #[test]
