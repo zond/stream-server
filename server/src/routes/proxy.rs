@@ -97,14 +97,14 @@ pub fn router() -> Router<AppState> {
 ///
 /// The one format the wildcard above cannot express. It carries no `h=`/`r=`
 /// pairs (those live in the path segment of the Core format), so everything
-/// it needs is the `d=` the shared handler already reads out of `params`.
+/// it needs is the `d=` the shared handler reads out of `params`.
 pub async fn proxy_root_handler(
     raw_query: axum::extract::RawQuery,
     params: Query<HashMap<String, String>>,
     headers: HeaderMap,
     method: Method,
 ) -> impl IntoResponse {
-    proxy(String::new(), raw_query.0, params.0, headers, method).await
+    proxy(None, raw_query.0, params.0, headers, method).await
 }
 
 pub async fn proxy_handler(
@@ -114,11 +114,23 @@ pub async fn proxy_handler(
     headers: HeaderMap,
     method: Method,
 ) -> impl IntoResponse {
-    proxy(rest, raw_query, params, headers, method).await
+    proxy(Some(rest), raw_query, params, headers, method).await
 }
 
+/// `rest` is what the path held after `/proxy/`, and *that is what decides
+/// the format*: `None` -- nothing in the path -- is the query format
+/// (`/proxy/?d=<url>`), anything else is the Core path format
+/// (`/proxy/d=<origin>&h=.../<path>`).
+///
+/// It used to be decided by asking whether the request's query had a `d`
+/// parameter, which is a name the target URL may own too. A Core-format
+/// request for `/proxy/d=<encoded>/film.mkv?d=1&t=2` took `d="1"` as the
+/// whole target, failed to parse it and answered `400 Invalid target URL`;
+/// worse, a `d` value that happened to parse as a URL would have been
+/// fetched *instead of* the target the caller named. The path shape cannot
+/// be spoofed by the target's own query, so the path shape decides.
 async fn proxy(
-    rest: String,
+    rest: Option<String>,
     raw_query: Option<String>,
     params: HashMap<String, String>,
     headers: HeaderMap,
@@ -131,57 +143,59 @@ async fn proxy(
     let mut target_url = String::new();
     let mut custom_headers = HashMap::new();
     let mut custom_response_headers = HashMap::new();
-    let mut is_path_format = false;
+    let is_path_format = rest.is_some();
 
-    // Check for standard query param '?d='
-    if let Some(d) = params.get("d") {
-        target_url = d.clone();
-        // Fallback: If rest is not empty and d is just origin, we might need to append rest?
-        // But usually ?d=FULL_URL
-    } else {
-        is_path_format = true;
-        // Handle path-based format: /proxy/d=...&h=.../path/to/file
-        // Split rest by first slash to get query_segment and path
-        let (query_seg, path_seg) = match rest.split_once('/') {
-            Some((q, p)) => (q, p),
-            None => (rest.as_str(), ""),
-        };
-
-        // Parse the query segment
-        for (key, val) in url::form_urlencoded::parse(query_seg.as_bytes()) {
-            match key.as_ref() {
-                "d" => target_url = val.into_owned(),
-                "h" => {
-                    // Header format "Name:Value"
-                    if let Some((name, value)) = val.split_once(':') {
-                        custom_headers.insert(name.trim().to_string(), value.trim().to_string());
-                    }
-                }
-                "r" => {
-                    // Response header format "Name:Value"
-                    if let Some((name, value)) = val.split_once(':') {
-                        custom_response_headers
-                            .insert(name.trim().to_string(), value.trim().to_string());
-                    }
-                }
-                _ => {}
+    match rest {
+        None => {
+            if let Some(d) = params.get("d") {
+                target_url = d.clone();
             }
         }
+        Some(rest) => {
+            // Handle path-based format: /proxy/d=...&h=.../path/to/file
+            // Split rest by first slash to get query_segment and path
+            let (query_seg, path_seg) = match rest.split_once('/') {
+                Some((q, p)) => (q, p),
+                None => (rest.as_str(), ""),
+            };
 
-        // If we found 'd', construct the full URL
-        if !target_url.is_empty() {
-            // target_url is the origin (e.g. http://example.com)
-            // path_seg is the relative path (e.g. video.mp4)
-            // Join them carefully
-            if !path_seg.is_empty() {
-                if !target_url.ends_with('/') {
-                    target_url.push('/');
+            // Parse the query segment
+            for (key, val) in url::form_urlencoded::parse(query_seg.as_bytes()) {
+                match key.as_ref() {
+                    "d" => target_url = val.into_owned(),
+                    "h" => {
+                        // Header format "Name:Value"
+                        if let Some((name, value)) = val.split_once(':') {
+                            custom_headers
+                                .insert(name.trim().to_string(), value.trim().to_string());
+                        }
+                    }
+                    "r" => {
+                        // Response header format "Name:Value"
+                        if let Some((name, value)) = val.split_once(':') {
+                            custom_response_headers
+                                .insert(name.trim().to_string(), value.trim().to_string());
+                        }
+                    }
+                    _ => {}
                 }
-                target_url.push_str(path_seg);
             }
-        } else {
-            // Fallback: assume whole rest is the URL (legacy/simple proxy)
-            target_url = rest.clone();
+
+            // If we found 'd', construct the full URL
+            if !target_url.is_empty() {
+                // target_url is the origin (e.g. http://example.com)
+                // path_seg is the relative path (e.g. video.mp4)
+                // Join them carefully
+                if !path_seg.is_empty() {
+                    if !target_url.ends_with('/') {
+                        target_url.push('/');
+                    }
+                    target_url.push_str(path_seg);
+                }
+            } else {
+                // Fallback: assume whole rest is the URL (legacy/simple proxy)
+                target_url = rest;
+            }
         }
     }
 

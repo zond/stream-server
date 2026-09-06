@@ -366,6 +366,65 @@ fn nothing_the_proxy_fetched_is_cached() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A Core-format target whose own query carries a `d` -- a name the proxy
+/// URL format uses too. Reading `d` out of the *request's* query took
+/// `d="1"` for the whole target and answered `400 Invalid target URL`; the
+/// format is decided by the path shape now, so the parameter goes to the
+/// origin like any other.
+#[test]
+fn a_target_query_may_carry_its_own_d_parameter() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let origin = format!("http://{}", fixture.origin.addr);
+    let response = reqwest::blocking::Client::new()
+        .get(format!(
+            "{}/proxy/d={}/film.mkv?d=1&t=2",
+            fixture.base,
+            encode(&origin)
+        ))
+        .send()?;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        fixture.origin.next_request().line,
+        "GET /film.mkv?d=1&t=2 HTTP/1.1"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
+/// The same, with a `d` the old code would have *parsed*: a URL-shaped value
+/// was fetched instead of the target the caller named, which is a worse
+/// answer than the 400 -- an addon's own `d=` could redirect the whole
+/// stream. Here it must reach the origin as a query parameter and nothing
+/// else.
+#[test]
+fn a_url_shaped_d_in_the_target_query_is_not_fetched_instead_of_the_target() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let origin = format!("http://{}", fixture.origin.addr);
+    let response = reqwest::blocking::Client::new()
+        .get(format!(
+            "{}/proxy/d={}/film.mkv?d={}",
+            fixture.base,
+            encode(&origin),
+            encode("http://not-the-target.invalid/other.mkv")
+        ))
+        .send()?;
+
+    // Answered from the origin the path named, not from the `d=` in its
+    // query -- which does not resolve at all, so a fetch of it would have
+    // been a 502 rather than these bytes.
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.bytes()?.len(), ORIGIN_LENGTH);
+    assert_eq!(
+        fixture.origin.next_request().line,
+        "GET /film.mkv?d=http%3A%2F%2Fnot-the-target.invalid%2Fother.mkv HTTP/1.1"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
 /// The playlist an HLS origin serves, and what the proxy must hand the
 /// player instead: every line pointing back through the proxy, which makes
 /// the body *longer* than the one the origin sent. That length difference is
