@@ -230,6 +230,42 @@ type StreamPositions = Arc<Mutex<HashMap<(String, usize), u64>>>;
 /// `PinDownloadError::client_message`, the chain itself is for the log.
 pub const TORRENT_ERROR_MESSAGE: &str = "the torrent is in an error state (its download folder may be unwritable, full or gone); see server logs";
 
+/// Whether a torrent's error is the volume running out of space.
+///
+/// The needles are not guesses. librqbit e314d8b writes payload through
+/// `nix::sys::uio::pwritev` (`storage/filesystem/opened_file.rs`), so on Linux
+/// and Android the cause in the chain is a `nix::errno::Errno`, **not** a
+/// `std::io::Error` -- downcasting to the latter would silently never match.
+/// `Errno`'s `Display` is nix's own static table (`ENOSPC => "No space left on
+/// device"`), rendered `"ENOSPC: No space left on device"`, which is verbatim
+/// what the field log that prompted this shows. Reproduced here by driving
+/// that exact call chain at `/dev/full` and printing the `{e:?}` librqbit
+/// stores in `TorrentStats.error`:
+///
+/// ```text
+/// error writing to file 0 ("movie.mkv")
+///
+/// Caused by:
+///     0: error calling pwritev
+///     1: ENOSPC: No space left on device
+/// ```
+///
+/// Windows takes the `std::fs` path instead (`seek_write`), where the message
+/// is "There is not enough space on the disk." and shares no words with the
+/// unix one -- so that half is matched by kind, `ErrorKind::StorageFull`,
+/// which is what `std` decodes both `ENOSPC` and `ERROR_DISK_FULL` to.
+///
+/// Anything else is a torrent problem, not a device problem, and must stay
+/// fatal: reclaiming space and restarting would be a loop.
+fn is_out_of_space(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::StorageFull)
+            || cause.to_string().contains("No space left on device")
+    })
+}
+
 /// A selection op parked until the torrent initializes.
 #[derive(Debug, Clone, Copy)]
 struct DeferredOp {
@@ -1456,6 +1492,25 @@ impl TorrentHandle for LibrqbitHandle {
     /// be supplied to `add_torrent` by whichever request creates the engine
     /// (see `routes::compat::get_or_create_engine` in the server crate), and
     /// `stats().sources` reports the set that was actually used.
+    /// Reads the state librqbit already holds behind one lock: no stats
+    /// rebuild, no syscall, cheap enough for the cleaner to ask on a timer.
+    async fn is_out_of_space(&self) -> bool {
+        self.handle.with_state(|state| match state {
+            ManagedTorrentState::Error(error) => is_out_of_space(error),
+            _ => false,
+        })
+    }
+
+    /// `Session::unpause` -> `ManagedTorrent::start`, whose `Error(_)` arm
+    /// rebuilds the storage, re-checks what is on disk and goes live again
+    /// (librqbit e314d8b, `torrent_state/mod.rs`). The re-check is what makes
+    /// this safe after an eviction took files out from under the torrent: it
+    /// discovers what is actually there rather than trusting the piece map it
+    /// died with.
+    async fn restart_after_error(&self) -> Result<()> {
+        self.session.unpause(&self.handle).await
+    }
+
     async fn add_trackers(&self, _trackers: Vec<String>) -> Result<()> {
         Ok(())
     }
@@ -2403,6 +2458,23 @@ mod tests {
         (backend, handle)
     }
 
+    /// Against the shipped librqbit, a torrent that is fine is not reported
+    /// out of space -- the check reads the real `ManagedTorrentState`, so a
+    /// classifier that matched everything (or a state read that never fired)
+    /// would show up here rather than in production as a restart loop.
+    #[tokio::test]
+    async fn a_healthy_torrent_is_not_reported_out_of_space() {
+        use crate::backend::TorrentHandle;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let payload = dir.join("payload.bin");
+        write_payload(&payload, 16 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+
+        let (_backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
+        assert!(!handle.is_out_of_space().await);
+    }
+
     /// `stats().sources` must list the trackers the torrent was added with:
     /// it is the only place a client can confirm its `tr=` trackers reached
     /// the engine, since librqbit cannot add trackers after the fact.
@@ -2771,6 +2843,48 @@ mod tests {
         assert_eq!(file_progress_fields(0, 0), (0, 1.0));
         // Initializing torrents report an empty file_progress vec -> have = 0.
         assert_eq!(file_progress_fields(100, 0), (0, 0.0));
+    }
+
+    /// The classifier is fed the exact chain librqbit e314d8b builds, in the
+    /// exact shape `TorrentStats.error` renders it. The unix arm is text --
+    /// there is no `std::io::Error` in that chain at all, because the write
+    /// goes through `nix::sys::uio::pwritev` and the cause is a
+    /// `nix::errno::Errno` -- and the string below is what that `Errno`'s
+    /// `Display` produces, reproduced by driving the same call chain at
+    /// `/dev/full` and matching the field log verbatim. The Windows arm is
+    /// the kind, since `std`'s message there shares no words with the unix
+    /// one.
+    #[test]
+    fn out_of_space_is_told_apart_from_every_other_torrent_error() {
+        let field_log = anyhow::anyhow!("ENOSPC: No space left on device")
+            .context("error calling pwritev")
+            .context("error writing to file 0 (\"movie.mkv\")");
+        assert!(is_out_of_space(&field_log));
+
+        // The same errno arriving as a `std::io::Error` -- the path Windows
+        // takes, and what any other caller in the chain would produce.
+        let by_kind = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::StorageFull))
+            .context("error writing to file 0");
+        assert!(is_out_of_space(&by_kind));
+
+        // A bare cause, no context wrapped around it.
+        assert!(is_out_of_space(&anyhow::anyhow!(
+            "ENOSPC: No space left on device"
+        )));
+
+        // Everything else stays fatal: reclaiming space would not help, and
+        // restarting would loop.
+        for other in [
+            "error writing to file 0: Permission denied",
+            "ENOENT: No such file or directory",
+            "checksum mismatch for piece 12",
+            "error opening /data/cache/movie.mkv",
+        ] {
+            assert!(
+                !is_out_of_space(&anyhow::anyhow!("{other}").context("error writing to file 0")),
+                "{other}"
+            );
+        }
     }
 
     #[test]

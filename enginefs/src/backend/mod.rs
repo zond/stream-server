@@ -130,6 +130,21 @@ pub trait TorrentHandle: Send + Sync + Clone {
     async fn resume_torrent(&self) -> Result<()> {
         Ok(())
     }
+    /// Whether the backend stopped this torrent because the volume it writes
+    /// to ran out of space -- the one torrent error that is a statement about
+    /// the device rather than about the torrent, and the one worth reclaiming
+    /// space for and retrying. Must be cheap: it is polled while the process
+    /// runs, so it reads the state the backend already holds and does no I/O.
+    /// `false` for backends that cannot tell one error from another.
+    async fn is_out_of_space(&self) -> bool {
+        false
+    }
+    /// Put a torrent the backend stopped with an error back to work, after
+    /// whatever caused the error has been dealt with. Errs for a backend that
+    /// cannot restart one, so a caller never mistakes silence for recovery.
+    async fn restart_after_error(&self) -> Result<()> {
+        anyhow::bail!("this backend cannot restart a stopped torrent")
+    }
     /// Pause torrent activity when no stream is currently using it.
     async fn pause_torrent(&self) -> Result<()> {
         Ok(())

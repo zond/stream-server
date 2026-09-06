@@ -12,6 +12,16 @@ use tokio::sync::mpsc;
 /// walks the cache.
 const CLEAN_DEBOUNCE: Duration = Duration::from_secs(60);
 
+/// How often the cleaner looks for a torrent the backend stopped because the
+/// volume ran out of space.
+///
+/// It cannot wait for [`CLEAN_DEBOUNCE`]: a stopped torrent writes nothing, so
+/// there is no filesystem event left to arm the debounce with, and the hourly
+/// fallback is ninety minutes of black screen. The check itself is one lock
+/// read per live engine and no I/O (`EngineFS::out_of_space_torrents`), which
+/// is what makes a short interval affordable.
+const DISK_FULL_POLL_INTERVAL: Duration = Duration::from_secs(15);
+
 /// Fallback sweep for a cache nothing is writing to. Long on purpose: with
 /// the debounce bounded, anything that touches the cache schedules a clean
 /// within [`CLEAN_DEBOUNCE`], so this only has to catch a server that has
@@ -212,6 +222,11 @@ pub fn start(state: Arc<AppState>) -> JoinHandle<()> {
         // fires immediately, so startup always gets a sweep).
         let mut poll_interval = tokio::time::interval(CLEAN_FALLBACK_INTERVAL);
 
+        // Looks for torrents a full disk stopped; the first tick fires
+        // immediately, so a server started while the disk is full recovers
+        // them rather than waiting out the interval first.
+        let mut disk_full_poll = tokio::time::interval(DISK_FULL_POLL_INTERVAL);
+
         let mut schedule = CleanSchedule::default();
         let mut active_cleaning_timer = Box::pin(tokio::time::sleep(Duration::MAX)); // Inactive initially
 
@@ -240,7 +255,12 @@ pub fn start(state: Arc<AppState>) -> JoinHandle<()> {
                     }
                 }
 
-                // 3. Debounce Timer Fired
+                // 3. A torrent the backend stopped for want of disk space
+                _ = disk_full_poll.tick() => {
+                    recover_out_of_space_torrents(&state).await;
+                }
+
+                // 4. Debounce Timer Fired
                 _ = &mut active_cleaning_timer => {
                     debug!("Debounced cache clean trigger");
                     schedule.on_clean();
@@ -253,6 +273,81 @@ pub fn start(state: Arc<AppState>) -> JoinHandle<()> {
             }
         }
     })
+}
+
+/// A full disk is a signal to clean, not to stop.
+///
+/// librqbit treats a write that hits ENOSPC as fatal: it stops the torrent and
+/// leaves it in an error state. That is what killed a film ninety minutes in
+/// against a swarm of 459 seeds -- nothing was wrong with the swarm, the
+/// device was simply out of room. So when a torrent is stopped for that
+/// reason, evict what the cleaner would have evicted anyway and put it back to
+/// work.
+///
+/// The restart is conditional on the clean actually reclaiming something. A
+/// torrent restarted onto a disk that is still full errors again within
+/// seconds, and that is a loop rather than a recovery; when there is nothing
+/// left to evict, [`EvictionReport::shortfall_message`] has already said what
+/// protection is holding, and the torrent stays stopped where a client can
+/// report it honestly.
+async fn recover_out_of_space_torrents(state: &AppState) {
+    // The stream and download engines are often the same `Arc`; asking one
+    // twice would restart a torrent that is already live again and log the
+    // backend's complaint about it.
+    let engines: Vec<Arc<enginefs::EngineFS>> =
+        if Arc::ptr_eq(&state.engine, &state.download_engine) {
+            vec![state.engine.clone()]
+        } else {
+            vec![state.engine.clone(), state.download_engine.clone()]
+        };
+
+    let mut stopped = Vec::new();
+    for engine in &engines {
+        for info_hash in engine.out_of_space_torrents().await {
+            stopped.push((engine.clone(), info_hash));
+        }
+    }
+    if stopped.is_empty() {
+        return;
+    }
+
+    warn!(
+        torrents = stopped.len(),
+        "a torrent stopped for want of disk space; cleaning the cache to make room"
+    );
+    let report = match clean_cache(state).await {
+        Ok(report) => report,
+        Err(e) => {
+            error!("Cache cleaner error: {}", e);
+            return;
+        }
+    };
+    if !report.made_room() {
+        warn!(
+            torrents = stopped.len(),
+            "nothing could be evicted, so the stopped torrents stay stopped rather than failing again"
+        );
+        return;
+    }
+
+    for (engine, info_hash) in stopped {
+        match engine.restart_after_error(&info_hash).await {
+            Ok(true) => info!(
+                info_hash = %info_hash,
+                freed = report.freed,
+                "restarted a torrent a full disk had stopped"
+            ),
+            Ok(false) => debug!(
+                info_hash = %info_hash,
+                "the torrent was gone by the time space had been reclaimed"
+            ),
+            Err(e) => warn!(
+                info_hash = %info_hash,
+                error = %format!("{e:#}"),
+                "could not restart a torrent a full disk had stopped"
+            ),
+        }
+    }
 }
 
 /// The cache roots, protections and limit both [`clean_cache`] and [`usage`]
@@ -512,6 +607,15 @@ pub struct EvictionReport {
 }
 
 impl EvictionReport {
+    /// Whether this run reclaimed anything -- the condition
+    /// [`recover_out_of_space_torrents`] restarts a stopped torrent on. A
+    /// clean that freed nothing has not changed the device's mind, so
+    /// restarting into it would only reproduce the error the torrent already
+    /// has.
+    pub fn made_room(&self) -> bool {
+        self.freed > 0
+    }
+
     /// The line to log when the run ended still over the limit, naming what
     /// protection kept -- "cleaned up 0 files, freed 0 bytes" on a phone
     /// that is filling up says nothing about *why*, and the why is always
@@ -1611,5 +1715,35 @@ mod tests {
         assert!(recent.is_file(), "protection outranks a full volume");
         assert_eq!(report.protected_files, 1);
         assert!(report.shortfall_message().is_some());
+    }
+
+    /// A stopped torrent is restarted only when the clean actually reclaimed
+    /// something. Restarting onto a disk that is still full reproduces the
+    /// same ENOSPC within seconds, and a loop is worse than a stopped torrent
+    /// a client can report honestly.
+    #[test]
+    fn a_torrent_is_restarted_only_when_the_clean_made_room() {
+        let freed_nothing = EvictionReport {
+            total: 4096,
+            protected: 4096,
+            protected_files: 1,
+            limit: 1024,
+            ..EvictionReport::default()
+        };
+        assert!(!freed_nothing.made_room());
+        assert!(
+            freed_nothing.shortfall_message().is_some(),
+            "and the run says what protection held instead"
+        );
+
+        let freed_something = EvictionReport {
+            total: 1024,
+            freed: 4096,
+            deleted: 1,
+            limit: 2048,
+            ..EvictionReport::default()
+        };
+        assert!(freed_something.made_room());
+        assert!(freed_something.shortfall_message().is_none());
     }
 }

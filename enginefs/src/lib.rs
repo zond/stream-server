@@ -1402,6 +1402,39 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         paths
     }
 
+    /// Info hashes of torrents the backend stopped because the volume they
+    /// write to ran out of space.
+    ///
+    /// A full disk is the one torrent error worth acting on rather than
+    /// reporting: the swarm is fine, the torrent is fine, the device is out
+    /// of room. The caller that can do something about it is the server's
+    /// cache cleaner, which evicts and then calls
+    /// [`Self::restart_after_error`] -- this is how it finds out there is
+    /// anything to evict *for*. Cheap on purpose (one lock read per engine,
+    /// no I/O), because it is asked on a timer.
+    pub async fn out_of_space_torrents(&self) -> Vec<String> {
+        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
+        let mut hashes = Vec::new();
+        for engine in engines {
+            if engine.handle.is_out_of_space().await {
+                hashes.push(engine.handle.info_hash());
+            }
+        }
+        hashes
+    }
+
+    /// Put the torrent `info_hash` back to work after the backend stopped it
+    /// with an error. `false` when no engine holds that hash any more (it was
+    /// swept while space was being reclaimed), which is not a failure.
+    pub async fn restart_after_error(&self, info_hash: &str) -> Result<bool> {
+        let engine = self.engines.read().await.get(info_hash).cloned();
+        let Some(engine) = engine else {
+            return Ok(false);
+        };
+        engine.handle.restart_after_error().await?;
+        Ok(true)
+    }
+
     /// The backend's view of the DHT -- see [`crate::backend::DhtStatus`].
     /// Cheap enough to call per request; the sticky `ever_bootstrapped` bit
     /// is latched by the backend on every observation.
@@ -3316,6 +3349,11 @@ mod tests {
         /// What `output_folder()` reports; set by the fake backend's
         /// placed add and relocate.
         output_folder: Mutex<Option<std::path::PathBuf>>,
+        /// Test knob: the backend stopped this torrent because the volume is
+        /// full, as librqbit does on an ENOSPC write.
+        out_of_space: AtomicBool,
+        /// How many times the torrent was put back to work after that.
+        restart_after_error: AtomicUsize,
     }
 
     /// Simulates librqbit's `Initializing` state for the fake torrent: the
@@ -3683,6 +3721,18 @@ mod tests {
 
         async fn resume_torrent(&self) -> Result<()> {
             self.counters.resume_torrent.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn is_out_of_space(&self) -> bool {
+            self.counters.out_of_space.load(Ordering::SeqCst)
+        }
+
+        async fn restart_after_error(&self) -> Result<()> {
+            self.counters
+                .restart_after_error
+                .fetch_add(1, Ordering::SeqCst);
+            self.counters.out_of_space.store(false, Ordering::SeqCst);
             Ok(())
         }
 
@@ -5228,6 +5278,42 @@ mod tests {
             enginefs.get_or_begin_add_magnet(TEST_HASH, None).await,
             EngineLookup::Adding(_)
         ));
+    }
+
+    /// A torrent the backend stopped for want of disk space is listed for the
+    /// cleaner, and restarting it is what takes it off the list -- so the
+    /// cleaner can find it, reclaim space, and put it back to work instead of
+    /// leaving playback dead against a healthy swarm.
+    #[tokio::test]
+    async fn out_of_space_torrents_are_listed_and_can_be_restarted() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+
+        // A healthy torrent is nobody's business.
+        assert!(enginefs.out_of_space_torrents().await.is_empty());
+        assert_eq!(counters.restart_after_error.load(Ordering::SeqCst), 0);
+
+        counters.out_of_space.store(true, Ordering::SeqCst);
+        assert_eq!(
+            enginefs.out_of_space_torrents().await,
+            vec![TEST_HASH.to_string()]
+        );
+
+        assert!(enginefs.restart_after_error(TEST_HASH).await.unwrap());
+        assert_eq!(counters.restart_after_error.load(Ordering::SeqCst), 1);
+        assert!(
+            enginefs.out_of_space_torrents().await.is_empty(),
+            "a restarted torrent is no longer stopped"
+        );
+
+        // A hash no engine holds any more -- swept while space was being
+        // reclaimed -- is not an error, and restarts nothing.
+        assert!(
+            !enginefs
+                .restart_after_error("ffffffffffffffffffffffffffffffffffffffff")
+                .await
+                .unwrap()
+        );
+        assert_eq!(counters.restart_after_error.load(Ordering::SeqCst), 1);
     }
 
     /// The cleaner's protected paths are where the files really are: the
