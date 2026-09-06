@@ -428,7 +428,7 @@ pub(crate) async fn clean_cache(state: &AppState) -> anyhow::Result<EvictionRepo
         .all(|download_dir| !download_dir.exists())
     {
         return Ok(EvictionReport {
-            limit: roots.limit.effective(0).unwrap_or(0),
+            limit: roots.limit.effective(0),
             ..EvictionReport::default()
         });
     }
@@ -604,11 +604,19 @@ pub struct EvictionReport {
     pub freed: u64,
     /// How many files that took.
     pub deleted: usize,
-    /// The limit this run enforced (0 = none): the smaller of
-    /// `settings.cacheSize` and what the volume could give while keeping
-    /// [`CACHE_FREE_SPACE_FLOOR`] free, so on a device with no `cacheSize`
-    /// set this is still a number.
-    pub limit: u64,
+    /// The limit this run enforced: the smaller of `settings.cacheSize` and
+    /// what the volume could give while keeping [`CACHE_FREE_SPACE_FLOOR`]
+    /// free, so on a device with no `cacheSize` set this is still a number.
+    /// `None` only when neither caps anything -- `cacheSize` unlimited *and*
+    /// the volume's free space unreadable, matching
+    /// [`CacheUsage::limit_bytes`].
+    ///
+    /// Not a `u64` with 0 for "none": a cap of exactly 0 is reachable -- any
+    /// volume whose occupancy plus free space is under the floor gets one --
+    /// and it is the tightest cap there is, the opposite of no cap. Read as
+    /// the sentinel it silenced [`Self::shortfall_message`] on the one
+    /// device that needed it and told a client the cache was unlimited.
+    pub limit: Option<u64>,
 }
 
 impl EvictionReport {
@@ -627,14 +635,15 @@ impl EvictionReport {
     /// that the rest of the cache belongs to a live or pinned torrent.
     /// `None` when the run got under the limit (or had none).
     pub fn shortfall_message(&self) -> Option<String> {
-        if self.limit == 0 || self.total <= self.limit {
+        let limit = self.limit?;
+        if self.total <= limit {
             return None;
         }
         Some(format!(
             "Cache size {} still exceeds limit {} after freeing {} bytes from {} files: \
              {} bytes in {} files are protected (a live torrent is writing them, or a pinned \
              download keeps them) and cannot be evicted",
-            self.total, self.limit, self.freed, self.deleted, self.protected, self.protected_files,
+            self.total, limit, self.freed, self.deleted, self.protected, self.protected_files,
         ))
     }
 }
@@ -859,7 +868,7 @@ async fn evict(
         protected_files,
         freed: freed_space + aged_out_bytes,
         deleted: deleted_count + aged_out_files,
-        limit: limit.unwrap_or(0),
+        limit,
     };
     if let Some(message) = report.shortfall_message() {
         warn!("{message}");
@@ -1560,25 +1569,41 @@ mod tests {
     fn shortfall_message_is_only_for_a_run_that_stayed_over_the_limit() {
         let under = EvictionReport {
             total: 10,
-            limit: 20,
+            limit: Some(20),
             ..EvictionReport::default()
         };
         assert_eq!(under.shortfall_message(), None);
         let unlimited = EvictionReport {
             total: u64::MAX,
-            limit: 0,
+            limit: None,
             ..EvictionReport::default()
         };
-        assert_eq!(unlimited.shortfall_message(), None, "0 = no limit");
+        assert_eq!(unlimited.shortfall_message(), None, "nothing caps it");
         let over = EvictionReport {
             total: 30,
-            limit: 20,
+            limit: Some(20),
             protected: 25,
             protected_files: 3,
             freed: 5,
             deleted: 1,
         };
         assert!(over.shortfall_message().is_some());
+
+        // A cap of exactly 0 is the tightest cap there is, not the absence
+        // of one: any volume whose occupancy plus free space is under the
+        // floor gets one, and that is the device most in need of the line
+        // that says what is holding the cache up.
+        let capped_at_nothing = EvictionReport {
+            total: 4096,
+            protected: 4096,
+            protected_files: 1,
+            limit: Some(0),
+            ..EvictionReport::default()
+        };
+        assert!(
+            capped_at_nothing.shortfall_message().is_some(),
+            "a cap of 0 is a cap, and this run is over it"
+        );
     }
 
     /// The cap is the smaller of the two, and which one binds depends only
@@ -1727,7 +1752,7 @@ mod tests {
         assert!(recent.is_file(), "and only as much as the cap needs");
         assert_eq!(report.freed, stale_occupancy);
         assert!(
-            report.limit < u64::MAX && report.limit >= report.total,
+            report.limit.is_some_and(|limit| limit >= report.total),
             "the run reports the cap it enforced, and ended under it"
         );
 
@@ -1853,7 +1878,7 @@ mod tests {
             total: 4096,
             protected: 4096,
             protected_files: 1,
-            limit: 1024,
+            limit: Some(1024),
             ..EvictionReport::default()
         };
         assert!(!freed_nothing.made_room());
@@ -1866,7 +1891,7 @@ mod tests {
             total: 1024,
             freed: 4096,
             deleted: 1,
-            limit: 2048,
+            limit: Some(2048),
             ..EvictionReport::default()
         };
         assert!(freed_something.made_room());
