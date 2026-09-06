@@ -1801,6 +1801,51 @@ fn a_redirect_chain_longer_than_the_hop_bound_is_given_up_on() -> anyhow::Result
     Ok(())
 }
 
+/// A `302` this proxy will not follow because of where it points: only
+/// `http`/`https` is fetched, since the one thing a route that fetches
+/// whatever a caller names must not do is let an *origin* send it somewhere
+/// no caller could have asked for.
+///
+/// What the player used to get for that was `302 Found`, the CORS headers
+/// and `content-length: 0` -- an unfollowable redirect and a headerless one
+/// spelled the same way, and nothing in either saying what happened. The
+/// `Location` comes back now, exactly as the origin wrote it.
+#[test]
+fn an_unfollowed_redirect_still_says_where_it_pointed() -> anyhow::Result<()> {
+    let origin = Origin::start_with(|_request: &Request, socket: &mut TcpStream| {
+        let _ = socket.write_all(
+            b"HTTP/1.1 302 Found\r\nLocation: ftp://files.example.com/film.mkv\r\n\
+              Content-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let _ = socket.flush();
+    })?;
+
+    let fixture = fixture_with(origin)?;
+    let target = format!("http://{}/cdn/film.mkv", fixture.origin.addr);
+    // A client that does not follow it either, which is the only way to
+    // look at the `302` itself -- reqwest's default policy would chase the
+    // `Location` and fail on the scheme, which is a fair account of what
+    // this header is worth to whoever reads it.
+    let response = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?
+        .get(format!("{}/proxy/?d={}", fixture.base, encode(&target)))
+        .send()?;
+
+    assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("ftp://files.example.com/film.mkv"),
+        "the origin's own value, not one resolved or rewritten through the proxy"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
 /// The statuses in `300..400` that are not "the resource is over there".
 /// Following any status with a `Location` -- what the reference does -- had
 /// the proxy fetch and serve the `Location` of a `300`, a `304`, a `305`
@@ -1849,6 +1894,14 @@ fn a_3xx_that_does_not_move_the_resource_is_not_followed() -> anyhow::Result<()>
             response.status().as_u16(),
             status,
             "the origin's own status is relayed, not resolved into a fetch"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("/elsewhere"),
+            "with the Location it named, so the player can see where it was sent"
         );
         assert_ne!(
             response.text()?,

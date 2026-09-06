@@ -965,6 +965,25 @@ async fn proxy(
         }
     }
 
+    // A `3xx` still here is one the loop above declined to follow -- a
+    // status outside [`FOLLOWED_REDIRECTS`], a `Location` naming a scheme
+    // this proxy will not fetch, or none at all -- and it is relayed with
+    // its status. Without its `Location` it was relayed with nothing else:
+    // measured, a player got `302 Found`, the CORS headers and
+    // `content-length: 0`, which makes an unfollowable redirect and a
+    // headerless one the same dead end, and neither one diagnosable.
+    //
+    // Relayed exactly as the origin wrote it, not resolved and not
+    // rewritten into a proxy URL of our own. We are declining to follow it;
+    // handing the player a `/proxy/` link to the same place would be making
+    // the request anyway with extra steps, and for a `305` that is the
+    // whole of what must not happen.
+    if status.is_redirection()
+        && let Some(location) = res_headers.get(header::LOCATION)
+    {
+        res_builder = res_builder.header(header::LOCATION, location);
+    }
+
     // What the origin said about *its own body*: only true of a body we hand
     // on byte for byte. A rewritten playlist is a different body, and the
     // origin's framing copied onto it is a lie hyper catches -- with
