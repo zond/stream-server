@@ -469,13 +469,21 @@ async fn proxy(
 
     let status = response.status();
     let res_headers = response.headers().clone();
+    // Where the body actually came from. reqwest follows redirects, and a
+    // playlist's relative lines are relative to the URL it *arrived* at:
+    // rewriting against the URL we asked for sends every segment back to
+    // the host that redirected us, and to its directory, which is a
+    // CDN-to-edge `302` -- the ordinary HLS deployment -- breaking every
+    // segment of every stream served that way. It is also the honest name
+    // for what we fetched, so the playlist test below asks it too.
+    let fetched_url = response.url().clone();
 
     let content_type = res_headers
         .get(header::CONTENT_TYPE)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
-    let is_playlist = url.path().ends_with(".m3u8")
-        || url.path().ends_with(".m3u")
+    let is_playlist = fetched_url.path().ends_with(".m3u8")
+        || fetched_url.path().ends_with(".m3u")
         || content_type.contains("mpegurl");
 
     // A body under a content coding we cannot decode is a body we must not
@@ -493,7 +501,7 @@ async fn proxy(
     if is_playlist && encoded_body {
         tracing::warn!(
             content_encoding = %content_encoding,
-            url = %url,
+            url = %fetched_url,
             "relaying a compressed playlist unrewritten; its segments will bypass the proxy"
         );
     }
@@ -567,7 +575,7 @@ async fn proxy(
                     .into_response();
             }
         };
-        let rewritten = rewrite_playlist(&body, &url, &params.carried());
+        let rewritten = rewrite_playlist(&body, &fetched_url, &params.carried());
         // The framing of the body we built, measured on that body.
         res_builder = res_builder.header(header::CONTENT_LENGTH, rewritten.len().to_string());
         return finalize_response(res_builder, axum::body::Body::from(rewritten));

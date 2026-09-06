@@ -539,6 +539,13 @@ const ORIGIN_PLAYLIST: &str =
     "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:10,\nseg-0.ts\n#EXTINF:10,\nseg-1.ts\n";
 
 fn expected_playlist(origin: SocketAddr) -> String {
+    expected_playlist_at(&format!("http://{origin}/live"))
+}
+
+/// [`ORIGIN_PLAYLIST`] rewritten with every segment resolved against
+/// `directory` -- the directory of the URL the playlist *came from*, which
+/// a redirect can move.
+fn expected_playlist_at(directory: &str) -> String {
     let mut expected = String::new();
     for line in ORIGIN_PLAYLIST.lines() {
         if line.starts_with('#') {
@@ -546,7 +553,7 @@ fn expected_playlist(origin: SocketAddr) -> String {
         } else {
             expected.push_str(&format!(
                 "/proxy/?d={}",
-                encode(&format!("http://{origin}/live/{line}"))
+                encode(&format!("{directory}/{line}"))
             ));
         }
         expected.push('\n');
@@ -735,6 +742,63 @@ fn an_authenticated_playlist_carries_its_headers_into_every_segment() -> anyhow:
     assert_eq!(
         fixture.origin.next_request().header("authorization"),
         Some(SECRET)
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
+/// A CDN that redirects to an edge, which is what an ordinary HLS
+/// deployment looks like. The playlist's relative lines are relative to
+/// where it *came from*, so they have to be resolved against the edge and
+/// its directory -- rewriting against the URL we asked for pointed every
+/// segment back at the CDN, which does not serve them.
+#[test]
+fn a_playlist_reached_through_a_redirect_is_rewritten_against_the_edge() -> anyhow::Result<()> {
+    let edge = Origin::start_with(|_request: &Request, socket: &mut TcpStream| {
+        let _ = socket.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{ORIGIN_PLAYLIST}",
+                ORIGIN_PLAYLIST.len()
+            )
+            .as_bytes(),
+        );
+        let _ = socket.flush();
+    })?;
+    let edge_addr = edge.addr;
+    let cdn = Origin::start_with(move |_request: &Request, socket: &mut TcpStream| {
+        let _ = socket.write_all(
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{edge_addr}/edge/v2/master.m3u8\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        let _ = socket.flush();
+    })?;
+
+    let fixture = fixture_with(cdn)?;
+    let target = format!("http://{}/cdn/master.m3u8", fixture.origin.addr);
+    let response = reqwest::blocking::Client::new()
+        .get(format!("{}/proxy/?d={}", fixture.base, encode(&target)))
+        .send()?;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.text()?,
+        expected_playlist_at(&format!("http://{edge_addr}/edge/v2")),
+        "every segment resolves against the edge that served the playlist"
+    );
+
+    assert_eq!(
+        fixture.origin.next_request().line,
+        "GET /cdn/master.m3u8 HTTP/1.1"
+    );
+    assert_eq!(
+        edge.next_request().line,
+        "GET /edge/v2/master.m3u8 HTTP/1.1",
+        "and the redirect was followed, which is what makes the base wrong"
     );
 
     drop(fixture.handle);
