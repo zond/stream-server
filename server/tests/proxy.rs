@@ -1250,6 +1250,59 @@ fn a_closed_token_is_refused_a_new_stream_and_the_origin_is_never_asked() -> any
     Ok(())
 }
 
+/// A live-HLS player refreshing its playlist against an origin that has
+/// stopped answering: the read is wedged in the playlist branch, which is
+/// precisely the wedge this feature exists for -- and precisely the one it
+/// could not reach, because that branch returned before the read was ever
+/// registered.
+#[test]
+fn a_playlist_read_is_registered_and_can_be_closed() -> anyhow::Result<()> {
+    // Headers, then nothing, ever. The socket stays open: no FIN, no reset,
+    // nothing for a timeout to notice quickly.
+    let origin = Origin::start_with(|_request: &Request, socket: &mut TcpStream| {
+        let _ = socket.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\n\
+              Content-Length: 4096\r\n\r\n",
+        );
+        let _ = socket.flush();
+        // Until the far end goes away.
+        let mut byte = [0u8; 1];
+        use std::io::Read as _;
+        let _ = socket.read(&mut byte);
+    })?;
+
+    let fixture = fixture_with(origin)?;
+    let target = format!("http://{}/live/master.m3u8", fixture.origin.addr);
+    let url = format!("{}/proxy/?d={}&p=player-hls", fixture.base, encode(&target));
+    let reader = std::thread::spawn(move || {
+        reqwest::blocking::Client::new()
+            .get(url)
+            .send()
+            .map(|response| response.status())
+    });
+
+    // The read is registered while it is stuck, which is what makes it
+    // addressable. Bounded so a regression fails instead of hanging.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while fixture.handle.proxy_streams_live() == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the playlist read was never registered"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    assert_eq!(fixture.handle.close_proxy_streams("player-hls"), 1);
+    assert_eq!(
+        reader.join().expect("the reader thread")?,
+        reqwest::StatusCode::BAD_GATEWAY,
+        "the wedged playlist read ends now, rather than at a timeout"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
 /// The control route is a control route: no token, no close.
 #[test]
 fn closing_a_stream_needs_the_control_token() -> anyhow::Result<()> {

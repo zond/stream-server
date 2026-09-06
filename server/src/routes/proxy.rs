@@ -7,6 +7,7 @@ use axum::{
     routing::any,
 };
 use dashmap::DashSet;
+use futures_util::StreamExt;
 use reqwest::{Client, Method};
 use std::collections::BTreeMap;
 use std::sync::{LazyLock, OnceLock};
@@ -688,16 +689,32 @@ async fn proxy(
         // sent. A body we could not read is a playlist we cannot rewrite:
         // saying so beats handing the player an empty one that parses as a
         // stream with no segments.
-        let body = match response.text().await {
-            Ok(body) => body,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    format!("Proxy could not read the playlist: {e}"),
-                )
-                    .into_response();
+        //
+        // It is read through the registry, exactly as a media body is, and
+        // that is the point: a live-HLS player refreshing its playlist
+        // against an origin that has stopped answering is a read wedged in
+        // here, and this branch used to return before `attach` ever ran --
+        // so the one read this feature exists for was the one read it could
+        // not reach. Closing the player's token now breaks this read too.
+        let mut chunks = state
+            .proxy_streams
+            .attach(player_token.clone(), response.bytes_stream());
+        let mut body = Vec::new();
+        while let Some(chunk) = chunks.next().await {
+            match chunk {
+                Ok(chunk) => body.extend_from_slice(&chunk),
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        format!("Proxy could not read the playlist: {e}"),
+                    )
+                        .into_response();
+                }
             }
-        };
+        }
+        // A playlist is UTF-8 by specification, and a byte that is not is a
+        // byte we cannot rewrite around either way.
+        let body = String::from_utf8_lossy(&body);
         let rewritten = rewrite_playlist(&body, &fetched_url, &params.carried());
         // The framing of the body we built, measured on that body.
         res_builder = res_builder.header(header::CONTENT_LENGTH, rewritten.len().to_string());
