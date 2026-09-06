@@ -7,9 +7,10 @@
 //! client sending every remote stream through this server gets the header
 //! rewriting and the single egress point, and does *not* get caching.
 //!
-//! The URL shape exercised here is the Core path format
-//! (`/proxy/d=<origin>&h=.../<path>`), which is what stremio-core hands a
-//! player.
+//! Both URL shapes are exercised, because the server writes one of them
+//! itself: stremio-core builds the Core path format
+//! (`/proxy/d=<origin>&h=.../<path>`), and `rewrite_playlist` rewrites every
+//! line of an HLS playlist into the query format (`/proxy/?d=<url>`).
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener};
@@ -195,6 +196,31 @@ fn the_core_path_format_relays_the_target() -> anyhow::Result<()> {
 
     // The path after the `d=` segment, and the proxy URL's own query, both
     // reach the origin: a signed URL loses neither.
+    let (request_line, _) = fixture.origin.next_request();
+    assert_eq!(request_line, "GET /dir/movie.mp4?token=abc HTTP/1.1");
+
+    drop(fixture.handle);
+    Ok(())
+}
+
+/// The query format, which is what [`rewrite_playlist`] writes into every
+/// HLS playlist the route rewrites -- so a 404 here is every segment of a
+/// proxied HLS stream 404ing.
+#[test]
+fn the_query_format_relays_the_target() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let target = format!("http://{}/dir/movie.mp4?token=abc", fixture.origin.addr);
+    let response = reqwest::blocking::Client::new()
+        .get(format!("{}/proxy/?d={}", fixture.base, encode(&target)))
+        .send()?;
+
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::OK,
+        "/proxy/?d= is a format this server writes itself"
+    );
+    assert_eq!(response.bytes()?.len(), ORIGIN_LENGTH);
+
     let (request_line, _) = fixture.origin.next_request();
     assert_eq!(request_line, "GET /dir/movie.mp4?token=abc HTTP/1.1");
 

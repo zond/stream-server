@@ -1292,7 +1292,7 @@ fn media_router() -> Router<AppState> {
         .merge(stream_routes())
         .merge(archive_routes())
         .merge(nzb_routes())
-        .nest("/proxy", routes::proxy::router())
+        .merge(routes::proxy::router())
         .nest("/ftp", routes::ftp::router())
         .merge(local_addon_routes())
 }

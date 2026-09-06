@@ -73,11 +73,38 @@ fn finalize_response(builder: Builder, body: axum::body::Body) -> Response {
     }
 }
 
+/// Every shape `/proxy` answers, at absolute paths and merged rather than
+/// nested under the prefix.
+///
+/// `nest("/proxy", ...)` cannot express all three. It registers the prefix
+/// itself plus a `{*tail}` wildcard beneath it, and a wildcard matches at
+/// least one character -- so `/proxy/` matches neither and is a router-level
+/// `404` before any handler runs. That is exactly the URL the query format
+/// has, and exactly the URL [`rewrite_playlist`] writes into every line of
+/// every playlist this route rewrites: an HLS stream fetched through the
+/// proxy handed the player a playlist whose every segment 404ed.
 pub fn router() -> Router<AppState> {
     Router::new()
         // The original JS uses /proxy/:opts/:pathname*
         // We can use a wildcard capturing the whole path.
-        .route("/{*rest}", any(proxy_handler))
+        .route("/proxy/{*rest}", any(proxy_handler))
+        // The query format, with or without the trailing slash.
+        .route("/proxy", any(proxy_root_handler))
+        .route("/proxy/", any(proxy_root_handler))
+}
+
+/// `/proxy/?d=<url>`: the whole target in the query, nothing in the path.
+///
+/// The one format the wildcard above cannot express. It carries no `h=`/`r=`
+/// pairs (those live in the path segment of the Core format), so everything
+/// it needs is the `d=` the shared handler already reads out of `params`.
+pub async fn proxy_root_handler(
+    raw_query: axum::extract::RawQuery,
+    params: Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    method: Method,
+) -> impl IntoResponse {
+    proxy(String::new(), raw_query.0, params.0, headers, method).await
 }
 
 pub async fn proxy_handler(
@@ -87,6 +114,16 @@ pub async fn proxy_handler(
     headers: HeaderMap,
     method: Method,
 ) -> impl IntoResponse {
+    proxy(rest, raw_query, params, headers, method).await
+}
+
+async fn proxy(
+    rest: String,
+    raw_query: Option<String>,
+    params: HashMap<String, String>,
+    headers: HeaderMap,
+    method: Method,
+) -> Response {
     // Porting the logic from express_805.js
     // Format 1: ?d=URL (standard)
     // Format 2: /<query_params>/<path> (Core) where query_params contains d=ORIGIN&h=HEADER&r=RESPONSE_HEADER
