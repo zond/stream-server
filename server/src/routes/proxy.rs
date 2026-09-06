@@ -88,6 +88,31 @@ fn origin_key(url: &Url) -> String {
 /// redirect ring is a chain that never ends, and counting hops ends it.
 const MAX_REDIRECTS: usize = 10;
 
+/// The statuses that mean "the resource is over there": the five reqwest's
+/// default policy follows, and the only ones this loop follows either.
+///
+/// It used to be every status in `300..400` carrying a `Location`, which is
+/// what the reference tests (`result.status>=300&&result.status<400&&
+/// result.headers.has("location")`). Measured, that followed `300`, `304`,
+/// `305` and `306` as well, answering `200` with the body of wherever the
+/// `Location` pointed where the client this route replaced relayed the
+/// status untouched -- a `304 Not Modified` became a fetch, which is the
+/// opposite of what it says.
+///
+/// `305 Use Proxy` is the one that makes this a security fix rather than a
+/// tidy-up. It never named a new location for the resource; it named a
+/// *proxy to send the request through*. Following it, with `h=` re-applied
+/// on every hop (see the loop in [`proxy`]), let any origin that answers
+/// `305` choose the host our credentialed request goes to. Browsers stopped
+/// honouring it decades ago for exactly this reason.
+const FOLLOWED_REDIRECTS: [StatusCode; 5] = [
+    StatusCode::MOVED_PERMANENTLY,
+    StatusCode::FOUND,
+    StatusCode::SEE_OTHER,
+    StatusCode::TEMPORARY_REDIRECT,
+    StatusCode::PERMANENT_REDIRECT,
+];
+
 /// Where a response says to go next, resolved against the URL it came
 /// *from* -- `None` when it is not a redirect this proxy follows.
 ///
@@ -101,7 +126,7 @@ const MAX_REDIRECTS: usize = 10;
 /// is let an *origin* redirect it somewhere a caller could not have asked
 /// for.
 fn redirect_target(response: &reqwest::Response, from: &Url) -> Option<Url> {
-    if !response.status().is_redirection() {
+    if !FOLLOWED_REDIRECTS.contains(&response.status()) {
         return None;
     }
     let location = response.headers().get(header::LOCATION)?.to_str().ok()?;
@@ -723,9 +748,18 @@ async fn proxy(
     // is that: each hop is built by `build_request`, so each hop carries the
     // headers the caller asked for.
     //
-    // The header is the addon's, and it travels with the redirect the
-    // origin itself chose. That is the trade the caller made by naming a
-    // header for a stream; the alternative is the `403`.
+    // Say plainly what that costs, because it was chosen and not
+    // overlooked: reqwest's policy calls those three headers sensitive and
+    // drops them across hosts (`remove_sensitive_headers`) precisely so a
+    // redirect cannot walk a credential to a host the caller never named,
+    // and re-applying `h=` per hop gives that protection up. What is left
+    // holding the line is the set of statuses we follow
+    // ([`FOLLOWED_REDIRECTS`]) and the hop bound ([`MAX_REDIRECTS`]): the
+    // credential travels only where the *resource* moved, only a bounded
+    // number of times, and never to a host an origin nominated as a proxy
+    // to route us through. The header is the addon's and it goes where the
+    // origin sent the resource; that is the trade the caller made by naming
+    // a header for a stream, and the alternative is the `403`.
     //
     // The method is kept across hops, as the reference keeps it. A `303`
     // asks for a `GET` and a browser would give it one, but this route is

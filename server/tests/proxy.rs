@@ -1752,6 +1752,123 @@ fn a_redirect_ring_is_given_up_on_rather_than_followed_forever() -> anyhow::Resu
     Ok(())
 }
 
+/// A chain that goes somewhere new every time, which a ring does not: the
+/// hop bound is what ends it, and this is what pins the number. Ten
+/// redirects followed (`MAX_REDIRECTS`), so eleven requests, and the
+/// eleventh's `Location` is where we stop.
+#[test]
+fn a_redirect_chain_longer_than_the_hop_bound_is_given_up_on() -> anyhow::Result<()> {
+    let origin = Origin::start_with(|request: &Request, socket: &mut TcpStream| {
+        let hop: usize = request
+            .target()
+            .trim_start_matches("/hop/")
+            .parse()
+            .unwrap_or(0);
+        let _ = socket.write_all(
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: /hop/{}\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n",
+                hop + 1
+            )
+            .as_bytes(),
+        );
+        let _ = socket.flush();
+    })?;
+
+    let fixture = fixture_with(origin)?;
+    let target = format!("http://{}/hop/0", fixture.origin.addr);
+    let response = reqwest::blocking::Client::new()
+        .get(format!("{}/proxy/?d={}", fixture.base, encode(&target)))
+        .send()?;
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+    assert!(response.text()?.contains("too many redirects"));
+
+    for hop in 0..=10 {
+        assert_eq!(
+            fixture.origin.next_request().target(),
+            format!("/hop/{hop}"),
+            "every hop up to the bound was walked"
+        );
+    }
+    assert!(
+        fixture.origin.requests.try_recv().is_err(),
+        "and the eleventh redirect was not followed: the response is already back, so \
+         anything further would be here by now"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
+/// The statuses in `300..400` that are not "the resource is over there".
+/// Following any status with a `Location` -- what the reference does -- had
+/// the proxy fetch and serve the `Location` of a `300`, a `304`, a `305`
+/// and a `306`, answering `200` where the HTTP client this loop replaced
+/// relays the status untouched.
+///
+/// `305 Use Proxy` is the one that matters: it names a proxy to send the
+/// request *through*, not a new home for the resource, so an origin that
+/// answers it was choosing the host our `h=` credentials get sent to.
+#[test]
+fn a_3xx_that_does_not_move_the_resource_is_not_followed() -> anyhow::Result<()> {
+    const ELSEWHERE: &str = "the resource we must not have fetched";
+
+    let origin = Origin::start_with(|request: &Request, socket: &mut TcpStream| {
+        if request.target() == "/elsewhere" {
+            let _ = socket.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{ELSEWHERE}",
+                    ELSEWHERE.len()
+                )
+                .as_bytes(),
+            );
+            let _ = socket.flush();
+            return;
+        }
+        let status = request.target().trim_start_matches("/status/");
+        let _ = socket.write_all(
+            format!(
+                "HTTP/1.1 {status} Something\r\nLocation: /elsewhere\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        let _ = socket.flush();
+    })?;
+
+    let fixture = fixture_with(origin)?;
+    let client = reqwest::blocking::Client::new();
+    for status in [300u16, 304, 305, 306] {
+        let target = format!("http://{}/status/{status}", fixture.origin.addr);
+        let response = client
+            .get(format!("{}/proxy/?d={}", fixture.base, encode(&target)))
+            .send()?;
+
+        assert_eq!(
+            response.status().as_u16(),
+            status,
+            "the origin's own status is relayed, not resolved into a fetch"
+        );
+        assert_ne!(
+            response.text()?,
+            ELSEWHERE,
+            "and the body it pointed at was never asked for"
+        );
+        assert_eq!(
+            fixture.origin.next_request().target(),
+            format!("/status/{status}")
+        );
+        assert!(
+            fixture.origin.requests.try_recv().is_err(),
+            "one request, not two"
+        );
+    }
+
+    drop(fixture.handle);
+    Ok(())
+}
+
 /// A `.m3u8` URL that answers with an error, and a `HEAD` for one that does
 /// not. Neither has a playlist in it, and rewriting them said otherwise.
 ///
