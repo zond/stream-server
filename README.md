@@ -245,7 +245,7 @@ The HTTP surface is deliberately small and split in two by `build_router()` (`se
 | GET, POST | `/nzb/create`, `/nzb/create/{key}` | OPEN | players |
 | GET | `/nzb/stream`, `/nzb/stream/{key}/{*file}` | OPEN | players |
 | GET | `/ftp/{filename}?lz=…` | OPEN | players (HTTP/FTP passthrough) |
-| any | `/proxy/{*rest}` | OPEN | players — proxied HTTP streams with injected headers |
+| any | `/proxy/{*rest}`, `/proxy`, `/proxy/` | OPEN | players — a remote stream fetched on their behalf, with the headers the addon asked for. See [Proxied remote streams](#proxied-remote-streams) |
 | GET | `/local-addon/manifest.json` | OPEN | stremio-core default profile — **stub**: a valid manifest (`org.stremio.local`, "Local Files") declaring no types, resources or catalogs |
 | GET | `/local-addon/stream/{type}/{id}`, `/local-addon/stream/{type}/{id}.json` | OPEN | stremio-core default profile — **stub**: always `{"streams": []}` |
 | GET | `/local-addon/catalog/{type}/{id}`, `/local-addon/catalog/{type}/{id}/{extra}` (with or without `.json`) | OPEN | stremio-core profiles that carry the catalog-declaring descriptor — **stub**: always `{"metas": []}` |
@@ -344,6 +344,30 @@ The cache cleaner (above) runs on its own schedule and had no way to be asked ab
 Both share their functions with `ServerHandle::{cache_usage, clean_cache_now}` (`routes::cache`), token-protected control routes, absent from the LAN media listener like every other control route.
 
 `ServerConfig::embedded()` (the `Default`) is tuned for a host process: loopback HTTP on 11470, no logging/TUI/SSDP, a generated token, and `torrent_listen_port: TorrentListenPort::Ephemeral` — librqbit's incoming BitTorrent listener takes an OS-assigned port, so any number of embedded servers (and the tests) coexist with a desktop instance. `ServerConfig::binary_default()` keeps `TorrentListenPort::Fixed(42000..42010)`: the first free port of the range, stable and forwardable. Set the field explicitly if an embedder needs a fixed port.
+
+### Proxied remote streams
+
+`/proxy` fetches a URL the caller names and relays it to the player, adding the headers the addon said it needs. It is how an addon stream that is not a torrent reaches the player at all, and it is open (players cannot send a bearer header) but loopback-only — deliberately absent from the [LAN media listener](#lan-media-listener), because it will fetch any URL whoever reaches it names.
+
+Two URL shapes, and both carry the same four parameters of the proxy's own:
+
+| Shape | Example |
+|---|---|
+| Core path format | `/proxy/d=<encoded origin>&h=…&r=…&p=…/<path on the origin>` — what stremio-core builds |
+| query format | `/proxy/?d=<encoded target>&h=…&r=…&p=…` — what this server writes into a rewritten playlist |
+
+| Parameter | What it does |
+|---|---|
+| `d=` | the target. In the Core format it is the origin, and the request's path after the segment is appended to it |
+| `h=Name:Value` | a request header to send to the origin, **replacing** what the player sent under that name. Repeatable |
+| `r=Name:Value` | a response header to send back to the player, **replacing** what the origin said under that name. Repeatable — `Content-Type` is the usual one, and correcting it is what the parameter exists for |
+| `p=<token>` | the client's name for the player reading this stream — see [Ending a proxied stream](#ending-a-proxied-stream) |
+
+None of the four is sent to the origin.
+
+**Certificates are verified, and a host that fails is downgraded by name.** This route was built with verification off from its first commit — inherited from the closed-source proxy it was ported from, and nothing in the history names a host that needed it. But the client fetching a remote stream used to be mpv and is now this, so that flag stopped being about a rarely-used route and became how every remote stream is fetched. So: verify everything, and when a fetch fails *because the certificate would not verify*, retry that one host once with verification off, remember it for the life of the process, and say so at WARN by name — a stream then pays the failed handshake once rather than once per segment. Be plain about what that is worth: an on-path attacker can produce a certificate error as easily as a misconfigured CDN can, so it stops nothing it could not also trigger. What it buys is that the downgrade is per host, visible in the log, and enumerable — the blanket silence it replaced could not tell you which hosts to scope it to. A failure is read from the TLS error's *type*, never from its text (a URL ending `certificate-of-authenticity.mkv` used to be enough), and only a host we asked for over `https` ourselves is ever written down: a certificate that fails behind a redirect belongs to a host this end cannot name, so that fetch fails with `502` rather than downgrade the wrong one.
+
+**Playlists are rewritten.** A `2xx` `GET` whose URL ends `.m3u8`/`.m3u` or whose content type says `mpegurl` has every line rewritten to come back through this proxy, so the segments of an HLS stream are fetched the same way the playlist was — and every rewritten line carries `h=`, `r=` and `p=` as well as `d=`, because a segment needs the same authorization the playlist needed, the same corrected headers, and the same player token. Lines are resolved against **the URL the playlist came from**, redirects followed, not the one we asked for: an ordinary CDN-to-edge `302` otherwise sent every relative segment back to the redirecting host. A compressed playlist is relayed unrewritten (this client decodes nothing) with a WARN saying so, and the rewritten body is framed by its own length, never the origin's.
 
 ### Ending a proxied stream
 
