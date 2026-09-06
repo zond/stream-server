@@ -25,7 +25,7 @@ use url::Url;
 static HTTP_CLIENT: OnceLock<Option<Client>> = OnceLock::new();
 
 /// The same client with verification off, built only if some host actually
-/// needs it. See [`UNVERIFIED_HOSTS`] for why it exists at all.
+/// needs it. See [`UNVERIFIED_ORIGINS`] for why it exists at all.
 static INSECURE_HTTP_CLIENT: OnceLock<Option<Client>> = OnceLock::new();
 
 /// Origins whose certificate this process could not verify -- `scheme`,
@@ -188,7 +188,7 @@ fn insecure_http_client() -> Option<&'static Client> {
 /// reqwest writes the request URL into that text: measured with no TLS
 /// anywhere in the picture, one request for
 /// `http://127.0.0.1:1/certificate-of-authenticity.mkv` -- a refused
-/// connection -- put `127.0.0.1` into [`UNVERIFIED_HOSTS`] for the life of
+/// connection -- put `127.0.0.1` into [`UNVERIFIED_ORIGINS`] for the life of
 /// the process. A filename could turn certificate verification off.
 ///
 /// The error that actually says so is a
