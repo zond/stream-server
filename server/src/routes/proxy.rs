@@ -679,9 +679,17 @@ async fn proxy(
         .get(header::CONTENT_TYPE)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
+    // The content type is matched with the case folded away, because the
+    // spelling that matters most is not lowercase: Apple writes
+    // `application/x-mpegURL`, it is the spelling stremio-core sends in
+    // `r=` and the one this repo's README uses, and a case-sensitive
+    // `contains("mpegurl")` sees none of it. The reference lowercases here
+    // too (`(responseHeaders["content-type"]||"").toLowerCase()
+    // .includes("mpegurl")`) -- and that arm is the only reason it copes
+    // with a playlist whose URL does not end `.m3u8`.
     let is_playlist = fetched_url.path().ends_with(".m3u8")
         || fetched_url.path().ends_with(".m3u")
-        || content_type.contains("mpegurl");
+        || content_type.to_ascii_lowercase().contains("mpegurl");
 
     // A body under a content coding we cannot decode is a body we must not
     // rewrite: the lines are not text yet. We relay it whole instead --

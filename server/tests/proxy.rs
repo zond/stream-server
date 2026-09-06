@@ -662,6 +662,54 @@ fn a_playlist_from_a_close_delimited_origin_is_framed_by_its_rewritten_length() 
     assert_playlist_is_reframed(Framing::CloseDelimited)
 }
 
+/// An origin that serves [`ORIGIN_PLAYLIST`] under `content_type`, whatever
+/// path it is asked for -- so a test can name a URL with no extension to
+/// fall back on and see whether the content type alone was enough.
+fn playlist_origin_typed(content_type: &'static str) -> anyhow::Result<Origin> {
+    Origin::start_with(move |_request: &Request, socket: &mut TcpStream| {
+        let _ = socket.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{ORIGIN_PLAYLIST}",
+                ORIGIN_PLAYLIST.len()
+            )
+            .as_bytes(),
+        );
+        let _ = socket.flush();
+    })
+}
+
+/// The content type that says "playlist" is matched with its case folded
+/// away. Apple writes `application/x-mpegURL`; so does this repo's README,
+/// and so does the `r=` stremio-core sends for an HLS stream. A
+/// case-sensitive `contains("mpegurl")` saw none of them, and the URL here
+/// has no `.m3u8` to fall back on -- which is exactly the shape a playlist
+/// behind a redirect arrives in.
+#[test]
+fn a_playlist_is_recognised_however_its_content_type_is_capitalised() -> anyhow::Result<()> {
+    for content_type in ["application/x-mpegURL", "application/X-MPEGURL"] {
+        let fixture = fixture_with(playlist_origin_typed(content_type)?)?;
+        let target = format!("http://{}/live/stream", fixture.origin.addr);
+        let response = reqwest::blocking::Client::new()
+            .get(format!("{}/proxy/?d={}", fixture.base, encode(&target)))
+            .send()?;
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body = response.text()?;
+        assert!(
+            body.contains("/proxy/"),
+            "{content_type} names a playlist, so its lines come back through the proxy: {body}"
+        );
+        assert!(
+            !body.contains("\nseg-0.ts"),
+            "and none of them is left pointing straight at the origin: {body}"
+        );
+
+        drop(fixture.handle);
+    }
+    Ok(())
+}
+
 /// An authenticated HLS stream, end to end: the playlist and every segment
 /// need the same `Authorization` the addon put in `h=`, and only the
 /// playlist's own URL was carrying it.
