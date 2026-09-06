@@ -351,10 +351,10 @@ fn finalize_response(builder: Builder, body: axum::body::Body) -> Response {
 /// One parser for both shapes. The Core format spells them in the path
 /// segment before the target's path, the query format in the request's own
 /// query, and until this struct existed only the Core format could express
-/// `h=`/`r=` at all -- which meant [`rewrite_playlist`], which writes the
-/// query format, could not carry an authenticated playlist's headers into
-/// the segments it rewrote. Measured: the playlist fetched `200`, every
-/// segment `403`, the origin logging `auth=[]`.
+/// `h=`/`r=` at all -- which meant the playlist rewrite could not carry an
+/// authenticated playlist's headers into the segments it named. Measured:
+/// the playlist fetched `200`, every segment `403`, the origin logging
+/// `auth=[]`.
 ///
 /// `BTreeMap` rather than `HashMap` because the order the headers come back
 /// out in is written into every line of every rewritten playlist, and a
@@ -454,9 +454,11 @@ impl ProxyParams {
 /// itself plus a `{*tail}` wildcard beneath it, and a wildcard matches at
 /// least one character -- so `/proxy/` matches neither and is a router-level
 /// `404` before any handler runs. That is exactly the URL the query format
-/// has, and exactly the URL [`rewrite_playlist`] writes into every line of
-/// every playlist this route rewrites: an HLS stream fetched through the
-/// proxy handed the player a playlist whose every segment 404ed.
+/// has, and back when a playlist rewrite wrote that format into every line,
+/// an HLS stream fetched through the proxy handed the player a playlist
+/// whose every segment 404ed. Rewritten lines are in the path format now
+/// (see [`proxied_uri`]), but the query format is still read: callers
+/// write it.
 pub fn router() -> Router<AppState> {
     Router::new()
         // The original JS uses /proxy/:opts/:pathname*
@@ -469,12 +471,11 @@ pub fn router() -> Router<AppState> {
 
 /// `/proxy/?d=<url>`: the whole target in the query, nothing in the path.
 ///
-/// The one format the wildcard above cannot express, and the one this
-/// server writes itself -- [`rewrite_playlist`] turns every line of every
-/// playlist into it. Its query carries the same proxy parameters the Core
-/// format carries in its path segment (`d=`, `h=`, `r=`, `p=`), read by
-/// the same parser, because a rewritten segment URL has to be able to say
-/// everything the playlist's own URL said.
+/// The one format the wildcard above cannot express. Its query carries the
+/// same proxy parameters the Core format carries in its path segment
+/// (`d=`, `h=`, `r=`, `p=`), read by the same parser, because the whole
+/// target in one parameter has to be able to say everything a target named
+/// by path can.
 pub async fn proxy_root_handler(
     State(state): State<AppState>,
     raw_query: axum::extract::RawQuery,
