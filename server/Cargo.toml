@@ -101,7 +101,7 @@ sysinfo = "0.39.5"
 [dev-dependencies]
 # Real .torrent fixtures for the embed tests (`librqbit::create_torrent`);
 # the same git pin as enginefs, so nothing extra is compiled.
-librqbit = { git = "https://github.com/zond/rqbit", rev = "60b1d2461fab76679254bad17f6a5c995d29137f", default-features = false, features = [
+librqbit = { git = "https://github.com/zond/rqbit", rev = "cb9ef856953ade1d1c0a8accfb65074faba7a11d", default-features = false, features = [
     "rust-tls",
     "http-api-client",
 ] }
