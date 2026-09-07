@@ -23,7 +23,9 @@ pub struct AppState {
     /// Bearer token the control routes require; `None` leaves them open.
     pub auth_token: Option<Arc<str>>,
     pub archive_cache: Arc<dashmap::DashMap<String, crate::archives::ArchiveSession>>,
-    pub nzb_sessions: Arc<dashmap::DashMap<String, crate::archives::nzb::session::NzbSession>>,
+    /// NZB sessions, swept when idle (see `crate::archives::sessions`).
+    pub nzb_sessions:
+        crate::archives::sessions::Sessions<crate::archives::nzb::session::NzbSession>,
     pub devices: Arc<RwLock<Vec<crate::ssdp::Device>>>,
     /// The proxied streams players are reading right now, so a client can
     /// end its own player's (see `crate::proxy_streams`).
@@ -128,7 +130,9 @@ impl AppState {
             http_addr: SocketAddr::from(([127, 0, 0, 1], 11470)),
             auth_token: None,
             archive_cache: Arc::new(dashmap::DashMap::new()),
-            nzb_sessions: Arc::new(dashmap::DashMap::new()),
+            nzb_sessions: crate::archives::sessions::Sessions::new(
+                crate::archives::SESSION_IDLE_TIMEOUT,
+            ),
             devices: Arc::new(RwLock::new(Vec::new())),
             proxy_streams: Arc::new(crate::proxy_streams::ProxyStreams::new()),
             proxy_cache,

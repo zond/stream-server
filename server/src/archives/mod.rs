@@ -8,10 +8,26 @@ pub mod cache;
 pub mod nzb;
 #[cfg(feature = "rar")]
 pub mod rar;
+pub mod sessions;
 pub mod sevenz;
 pub mod tar;
 pub mod tgz;
 pub mod zip;
+
+/// How long an archive or NZB session outlives its last use before it is
+/// swept, with what it owns (see [`sessions`]).
+///
+/// A use is a request, or a response body still being read. The clock
+/// therefore starts when the player has closed every connection to the
+/// session, and what the timeout has to cover is the player that comes back
+/// after that: one that fetches by fixed-size range and closes between
+/// fetches, paused, or one restarting after an error. Its session key is in
+/// the URL it holds and nothing else can mint that key again, so a session
+/// swept under it is a failed resume. Ten minutes is long for a pause that
+/// stays paused and short against what a session costs while it waits --
+/// files under the cache root the cleaner may take anyway, and for NZB a
+/// pool of idle connections the news server is likelier to close first.
+pub const SESSION_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// Error message used when a RAR archive is requested but this binary was
 /// built without the "rar" cargo feature.

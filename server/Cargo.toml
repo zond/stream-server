@@ -99,6 +99,9 @@ chrono = "0.4.42"
 sysinfo = "0.39.5"
 
 [dev-dependencies]
+# Paused-clock machinery for `#[tokio::test(start_paused = true)]`, as in
+# enginefs; nothing in the shipped crate uses it.
+tokio = { version = "1.42", features = ["test-util"] }
 # Real .torrent fixtures for the embed tests (`librqbit::create_torrent`);
 # the same git pin as enginefs, so nothing extra is compiled.
 librqbit = { git = "https://github.com/zond/rqbit", rev = "cb9ef856953ade1d1c0a8accfb65074faba7a11d", default-features = false, features = [

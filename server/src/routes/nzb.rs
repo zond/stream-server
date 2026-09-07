@@ -7,9 +7,9 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
     routing::get,
 };
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-// use std::path::PathBuf;
 
 #[derive(Deserialize, Debug)]
 struct NzbServer {
@@ -273,9 +273,15 @@ async fn stream_nzb_file(
     Path((key, file)): Path<(String, String)>,
 ) -> Result<Response, StatusCode> {
     if let Some(session) = state.nzb_sessions.get(&key) {
-        match session.stream_file(&file) {
+        match session.shared().stream_file(&file) {
             Ok(stream) => {
-                let reader_stream = crate::routes::archive::media_body(stream);
+                // The lease rides inside the body: the session is in use
+                // for as long as the player reads, and its idle clock
+                // starts when the body is dropped (see `archives::sessions`).
+                let reader_stream = crate::routes::archive::media_body(stream).map(move |chunk| {
+                    let _in_use = &session;
+                    chunk
+                });
                 return Ok(Response::builder()
                     .header(
                         "transferMode.dlna.org",
