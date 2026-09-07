@@ -44,6 +44,10 @@ regex = "1.11"
 anyhow = "1.0"
 moka = { version = "0.12.11", features = ["future", "sync"] }
 reqwest = { version = "0.13", features = ["json", "rustls"] }
+# Mozilla's root program in DER form, for `http_client::http_client_builder`.
+# Already in the graph -- `rustls-platform-verifier`, which reqwest's rustls
+# feature pulls in, depends on it -- so naming it here compiles nothing new.
+webpki-root-certs = "1"
 urlencoding = "2.1"
 bumpalo = { version = "3.19", features = ["collections"] }
 memmap2 = "0.9.9"

@@ -216,7 +216,17 @@ async fn create_session_internal(
     };
 
     // 2. Fetch NZB content
-    let nzb_content = match reqwest::get(&config.nzb_url).await {
+    let nzb_client = match enginefs::http_client_builder().build() {
+        Ok(client) => client,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to build HTTP client: {}", e),
+            )
+                .into_response();
+        }
+    };
+    let nzb_content = match nzb_client.get(&config.nzb_url).send().await {
         Ok(resp) => match resp.text().await {
             Ok(text) => text,
             Err(e) => {

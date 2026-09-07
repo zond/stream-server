@@ -231,9 +231,16 @@ impl TrackerManager {
         Ok(())
     }
 
-    /// Fetch trackers from URL
+    /// Fetch trackers from URL.
+    ///
+    /// Through [`crate::http_client_builder`], like every other HTTPS client
+    /// here: the list is fetched from GitHub over TLS on every refresh.
     async fn fetch_trackers(&self, url: &str) -> anyhow::Result<Vec<String>> {
-        let response = reqwest::get(url).await?;
+        let response = crate::http_client_builder()
+            .build()?
+            .get(url)
+            .send()
+            .await?;
         let text = response.text().await?;
 
         let mut trackers = Vec::new();

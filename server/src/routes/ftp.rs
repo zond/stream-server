@@ -66,7 +66,16 @@ async fn stream_ftp(Path(filename): Path<String>, Query(params): Query<FtpQuery>
 }
 
 async fn stream_http(url: &str, filename: &str) -> Response {
-    let client = reqwest::Client::new();
+    let client = match enginefs::http_client_builder().build() {
+        Ok(client) => client,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to build HTTP client: {}", e),
+            )
+                .into_response();
+        }
+    };
     let response = match client.get(url).send().await {
         Ok(r) => r,
         Err(e) => {

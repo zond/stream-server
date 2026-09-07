@@ -276,7 +276,7 @@ fn http_client() -> Option<&'static reqwest::Client> {
     static CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
     CLIENT
         .get_or_init(|| {
-            reqwest::Client::builder()
+            crate::http_client_builder()
                 .timeout(HTTP_SCRAPE_TIMEOUT)
                 .build()
                 .ok()

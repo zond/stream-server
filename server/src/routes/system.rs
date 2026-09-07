@@ -1165,7 +1165,16 @@ pub async fn get_https(
             .into_response();
     }
 
-    let client = reqwest::Client::new();
+    let client = match enginefs::http_client_builder().build() {
+        Ok(client) => client,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to build HTTP client: {}", e),
+            )
+                .into_response();
+        }
+    };
     let api_url = "https://api.strem.io/api/certificateGet";
 
     let payload = json!({

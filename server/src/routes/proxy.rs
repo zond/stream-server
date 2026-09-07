@@ -366,7 +366,7 @@ fn is_a_playlist(
 fn http_client() -> Option<&'static Client> {
     HTTP_CLIENT
         .get_or_init(|| {
-            Client::builder()
+            enginefs::http_client_builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|e| tracing::error!("Failed to build proxy HTTP client: {e}"))
@@ -375,6 +375,12 @@ fn http_client() -> Option<&'static Client> {
         .as_ref()
 }
 
+/// The unverified retry client, for an origin whose chain will not verify --
+/// see [`is_certificate_error`]. Deliberately **not** built from
+/// [`enginefs::http_client_builder`]: `danger_accept_invalid_certs` takes
+/// reqwest's `NoVerifier` arm before any root store is consulted, so roots
+/// would change nothing here, and the point of this client is that it checks
+/// nothing.
 fn insecure_http_client() -> Option<&'static Client> {
     INSECURE_HTTP_CLIENT
         .get_or_init(|| {

@@ -177,7 +177,11 @@ async fn download_archive(
     cache_config: CacheConfig,
 ) -> Result<ArchiveSource, StatusCode> {
     tracing::info!("Downloading archive from URL: {}", url);
-    let response = reqwest::get(url).await.map_err(|e| {
+    let client = enginefs::http_client_builder().build().map_err(|e| {
+        tracing::error!("Failed to build HTTP client: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let response = client.get(url).send().await.map_err(|e| {
         tracing::error!("Failed to fetch URL {}: {}", url, e);
         StatusCode::BAD_REQUEST
     })?;

@@ -15,6 +15,7 @@ pub mod cache;
 pub mod disk_cache;
 pub mod engine;
 pub mod files;
+pub mod http_client;
 pub mod metadata_cache;
 pub mod metadata_pins;
 pub mod piece_cache;
@@ -26,6 +27,7 @@ pub mod trackers;
 pub mod traffic;
 
 // Re-export TrackerStorage for use by server crate
+pub use http_client::http_client_builder;
 pub use trackers::TrackerStorage;
 
 use crate::backend::librqbit::LibrqbitBackend;

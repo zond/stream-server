@@ -170,7 +170,7 @@ impl HttpsDohResolver {
     /// [`DOH_ENDPOINTS`]. `None` if the TLS stack will not build, in which
     /// case there simply is no DoH fallback -- not a start-up failure.
     pub fn new() -> Option<Self> {
-        let client = reqwest::Client::builder()
+        let client = crate::http_client_builder()
             .timeout(DOH_REQUEST_TIMEOUT)
             .build()
             .ok()?;

@@ -110,6 +110,10 @@ librqbit = { git = "https://github.com/zond/rqbit", rev = "c28095922bffc26e45a18
 ] }
 
 [target.'cfg(target_os = "android")'.dependencies]
+# Only to *arm* the Java verifier from `jni::init_android_tls_verifier`, as a
+# fallback for a client built without `enginefs::http_client_builder`. No
+# client this workspace or librqbit builds constructs it any more; see that
+# function's doc comment.
 rustls-platform-verifier = "0.7.0"
 
 [target.'cfg(windows)'.dependencies]

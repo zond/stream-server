@@ -10,6 +10,24 @@ use std::sync::Mutex;
 
 static SERVER_HANDLE: Lazy<Mutex<Option<ServerHandle>>> = Lazy::new(|| Mutex::new(None));
 
+/// Hands `rustls-platform-verifier` the JVM and the app `Context` it needs to
+/// call Java's `CertPathValidator`.
+///
+/// **Nothing in this workspace should ever reach that verifier any more.**
+/// Every HTTPS client either crate builds goes through
+/// [`enginefs::http_client_builder`], and librqbit's through its own
+/// `http_client_builder`; both call reqwest's `tls_certs_only`, which is the
+/// one builder state that takes the plain `with_root_certificates` arm and
+/// never names the platform verifier. That change exists because on this
+/// device the Java path cost about 400 MB of Java heap per tracker announce
+/// -- see `enginefs::http_client` for the measurement and the trust trade.
+///
+/// This call stays as the arming of a fallback, not as the policy: if some
+/// future client is built with a bare `reqwest::ClientBuilder`, it verifies
+/// slowly rather than failing every handshake outright. A handshake that
+/// actually goes through here on Android is the bug this whole arrangement
+/// exists to prevent, so treat one as a missed call site and not as
+/// business as usual.
 #[cfg(target_os = "android")]
 fn init_android_tls_verifier(env: &mut Env, context: JObject) -> jni::errors::Result<()> {
     rustls_platform_verifier::android::init_with_env(env, context)

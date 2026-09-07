@@ -51,7 +51,7 @@ impl TrackerProber {
     }
 
     async fn probe_http(url: &Url) -> Option<Duration> {
-        let client = reqwest::Client::builder()
+        let client = crate::http_client_builder()
             .timeout(HTTP_CONNECT_TIMEOUT)
             .build()
             .ok()?;
