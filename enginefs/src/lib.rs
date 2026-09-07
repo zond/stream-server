@@ -119,6 +119,22 @@ type EngineRegistry<H> = Arc<RwLock<HashMap<String, Arc<Engine<H>>>>>;
 /// [`BackendEngineFS::relocate_engine`].
 type RelocationRegistry = Arc<parking_lot::Mutex<HashMap<String, Vec<std::path::PathBuf>>>>;
 
+/// How the backend's half of a relocation ended, for the half that settles
+/// it ([`BackendEngineFS::relocate_engine`]).
+enum Relocated<H> {
+    /// The files are in their new home; this is the handle to them.
+    Moved(H),
+    /// The move failed. `still_managed` is the backend's handle for the
+    /// torrent if it kept it (its recovery usually leaves it where it was),
+    /// asked for in the same task rather than by the supervisor: the
+    /// supervisor is what settles this task's panic, which it can only do
+    /// while it is not the one making the calls that panic.
+    Failed {
+        error: anyhow::Error,
+        still_managed: Option<H>,
+    },
+}
+
 /// Why a shared magnet add ended without an engine. `Clone` (the backend
 /// error is `Arc`-wrapped) so it can be handed to every waiter of the shared
 /// add and kept as the add's failure record.
@@ -2773,11 +2789,25 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// the process -- so the trees it named, which by then no engine and no
     /// persisted pin named either, could never be evicted again.
     ///
-    /// So the copy is spawned and a supervisor settles it however it ends,
-    /// the same shape and for the same reason as [`Self::spawn_magnet_add`]'s:
-    /// the task that calls into the backend is the one that can be slow or
-    /// panic, and the task that puts the registries right touches nothing but
-    /// maps. The caller only waits for the result. A caller that goes away
+    /// So the whole of the move is spawned and a supervisor settles it
+    /// however it ends, the same shape and for the same reason as
+    /// [`Self::spawn_magnet_add`]'s: the task that calls into the backend is
+    /// the one that can be slow or panic, and the task that puts the
+    /// registries right touches nothing but maps, so it is still there to run
+    /// when the other one is not -- `end_relocation` happens on every outcome
+    /// of the move, a panic in it included.
+    ///
+    /// *The whole* of it: [`Self::begin_relocation`] is the spawned task's
+    /// own first act, not the caller's. It records both ends of the move in
+    /// `relocations` before the engine leaves the registry, and done on the
+    /// caller's side that record was made two lock acquisitions before
+    /// anything was spawned -- either of which pends whenever another task
+    /// holds the registry, which is where a hangup then left the entry, with
+    /// nothing spawned to remove it. Only the paths it records are read here,
+    /// before anything is recorded at all: a caller dropped in the middle of
+    /// that has begun nothing.
+    ///
+    /// The caller only waits for the result. A caller that goes away
     /// loses its answer and nothing else -- the move finishes, the engine is
     /// published in its new home carrying the pin that asked for it, and the
     /// waiters parked on the hash get it. What that caller no longer runs is
@@ -2805,20 +2835,44 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         );
         let (settle, pending) =
             PendingMagnetAdd::settled_later(engine.info_hash.clone(), trackers.clone().into());
-        self.begin_relocation(&engine, &folder, pending.clone())
-            .await;
+        // Asked of the backend here and recorded there: reading an engine's
+        // files starts nothing, so a caller dropped in the middle of it
+        // leaves no entry, no unprotected tree and no half-moved torrent.
+        let mut protected = self.engine_paths(&engine).await;
+        protected.push(folder.clone());
 
         let moving = {
             let backend = self.backend.clone();
-            let info_hash = engine.info_hash.clone();
+            let engines = self.engines.clone();
+            let adds = self.magnet_adds.clone();
+            let relocations = self.relocations.clone();
+            let clock = self.clock;
+            let engine = engine.clone();
+            let pending = pending.clone();
             tokio::spawn(async move {
-                backend
-                    .relocate_torrent(&info_hash, placement, trackers)
+                Self::begin_relocation(
+                    &engines,
+                    &adds,
+                    &relocations,
+                    clock,
+                    &engine,
+                    protected,
+                    pending,
+                )
+                .await;
+                match backend
+                    .relocate_torrent(&engine.info_hash, placement, trackers)
                     .await
+                {
+                    Ok(handle) => Relocated::Moved(handle),
+                    Err(error) => Relocated::Failed {
+                        error,
+                        still_managed: backend.get_torrent(&engine.info_hash).await,
+                    },
+                }
             })
         };
         let supervisor = {
-            let backend = self.backend.clone();
             let engines = self.engines.clone();
             let adds = self.magnet_adds.clone();
             let relocations = self.relocations.clone();
@@ -2829,22 +2883,30 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     // A panic only reaches here in a debug build; the release
                     // profile's `panic = "abort"` takes the process instead.
                     // Nothing aborts this handle, so cancellation is not a case.
-                    Err(join_error) => Err(anyhow::anyhow!(
-                        "the relocation task did not finish: {join_error}"
-                    )),
+                    // Settled like a move that failed with the torrent gone:
+                    // whatever the task had recorded of the relocation goes
+                    // with it, rather than parking the hash for the life of
+                    // the process behind an entry nothing retries or sweeps.
+                    Err(join_error) => Relocated::Failed {
+                        error: anyhow::anyhow!("the relocation task did not finish: {join_error}"),
+                        still_managed: None,
+                    },
                 };
                 let (result, settled) = match relocated {
-                    Ok(handle) => {
+                    Relocated::Moved(handle) => {
                         let engine = Self::replace_engine(&engines, clock, &engine, handle).await;
                         (Ok(engine.clone()), Ok(engine))
                     }
-                    Err(error) => {
+                    Relocated::Failed {
+                        error,
+                        still_managed,
+                    } => {
                         tracing::warn!(
                             info_hash = %engine.info_hash,
                             error = %format!("{error:#}"),
                             "download_relocate_failed"
                         );
-                        let settled = match backend.get_torrent(&engine.info_hash).await {
+                        let settled = match still_managed {
                             Some(handle) => {
                                 Ok(Self::replace_engine(&engines, clock, &engine, handle).await)
                             }
@@ -2886,28 +2948,36 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// registry, atomically for lookups: `lookup_or_begin_add_magnet` takes
     /// the add registry before the engines, as this does.
     ///
-    /// Records both ends of the move in `relocations` *first*, so there is no
-    /// instant in which the data is walkable and evictable: taking the engine
-    /// out of the registry takes it out of [`Self::protected_paths`] too, and
-    /// the new engine that would put it back does not exist until the backend
-    /// has finished copying. `destination` is the folder being written into;
-    /// the source paths come from the engine that is about to leave. The
-    /// entry goes with [`Self::end_relocation`], after the successor is
-    /// published.
+    /// Records `protected` -- both ends of the move, [`Self::engine_paths`]
+    /// of the engine that is about to leave plus the folder being written
+    /// into -- in `relocations` *first*, so there is no instant in which the
+    /// data is walkable and evictable: taking the engine out of the registry
+    /// takes it out of [`Self::protected_paths`] too, and the new engine that
+    /// would put it back does not exist until the backend has finished
+    /// copying. The entry goes with [`Self::end_relocation`], after the
+    /// successor is published.
+    ///
+    /// Over the registries rather than `&self`, and called from the spawned
+    /// half of [`Self::relocate_engine`] rather than from the request, for
+    /// [`Self::end_relocation`]'s reason and then one more: what this records
+    /// is undone by that, and a record made where a hangup can land between
+    /// the two is a tree protected for the life of the process. Everything
+    /// after the insert here awaits a lock some other task may be holding.
     async fn begin_relocation(
-        &self,
+        engines: &EngineRegistry<B::Handle>,
+        adds: &MagnetAddRegistry<B::Handle>,
+        relocations: &RelocationRegistry,
+        clock: Clock,
         engine: &Arc<Engine<B::Handle>>,
-        destination: &std::path::Path,
+        protected: Vec<std::path::PathBuf>,
         pending: PendingMagnetAdd<B::Handle>,
     ) {
-        let mut protected = self.engine_paths(engine).await;
-        protected.push(destination.to_path_buf());
-        self.relocations
+        relocations
             .lock()
             .insert(engine.info_hash.clone(), protected);
-        let now = self.clock.now_secs();
-        let mut adds = self.magnet_adds.write().await;
-        let mut engines = self.engines.write().await;
+        let now = clock.now_secs();
+        let mut adds = adds.write().await;
+        let mut engines = engines.write().await;
         if engines
             .get(&engine.info_hash)
             .is_some_and(|current| Arc::ptr_eq(current, engine))
@@ -5459,6 +5529,72 @@ mod tests {
         assert!(
             !protected.contains(&downloads.join(TEST_HASH)),
             "and the destination is the engine's to speak for, not a relocation's: {protected:?}"
+        );
+    }
+
+    /// The window a dropped request could still leave a relocation in.
+    ///
+    /// Detaching the move settled every relocation the backend was asked
+    /// for, but the bookkeeping that *precedes* the ask -- the `relocations`
+    /// entry the cache cleaner reads, put there before the engine leaves the
+    /// registry so the data is never unprotected for an instant -- was still
+    /// recorded by the request's own future, two lock acquisitions before
+    /// anything was spawned. Either lock pends whenever another task holds
+    /// it (every `get_engine` takes the engine registry to read, and the
+    /// seeding switch holds it across a resume per engine), so a client that
+    /// hung up right there dropped the whole call between the entry and the
+    /// task that removes it: both ends of a move that never happened,
+    /// protected for the life of the process.
+    ///
+    /// So the recording is the detached half's first act, and the half that
+    /// settles it runs whatever becomes of it.
+    #[tokio::test]
+    async fn a_relocation_the_request_never_lived_to_start_settles_too() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        let show = enginefs.download_dir.join("show");
+        *counters.output_folder.lock().unwrap() = Some(show.clone());
+        let downloads = enginefs.download_dir.join("offline");
+        enginefs.set_downloads_dir(Some(downloads.clone()));
+
+        // A reader is enough to hold the registry's next writer off, and a
+        // reader is what every concurrent request has.
+        let engines = enginefs.engines.read().await;
+        {
+            let mut pin = std::pin::pin!(enginefs.pin_download(TEST_HASH, 0, None));
+            tokio::select! {
+                _ = &mut pin => panic!("the registry is held; the pin cannot have finished"),
+                () = until(|| !enginefs.relocations.lock().is_empty()) => {}
+            }
+            // The client hangs up: the move is recorded and not yet asked
+            // for, which is the whole of the window under test.
+        }
+        assert!(
+            enginefs.backend.relocations.lock().unwrap().is_empty(),
+            "the backend has not been asked to move anything yet"
+        );
+        drop(engines);
+
+        assert!(
+            wait_until(TEST_WAIT_BOUND, || enginefs.relocations.lock().is_empty()).await,
+            "the relocation was settled by the half the client never held"
+        );
+        let engine = enginefs
+            .get_engine(TEST_HASH)
+            .await
+            .expect("the relocated engine is published");
+        assert_eq!(
+            engine.handle.output_folder(),
+            Some(downloads.join(TEST_HASH)),
+            "in its new home"
+        );
+        assert!(
+            enginefs.magnet_adds.read().await.is_empty(),
+            "and the hash is not left parked as an add nothing will ever retry"
+        );
+        let protected = enginefs.protected_paths().await;
+        assert!(
+            !protected.contains(&show.join("video-0.mkv")),
+            "the source it moved off is cache again: {protected:?}"
         );
     }
 
