@@ -2637,6 +2637,258 @@ fn a_cleartext_redirect_out_of_an_armed_line_reaches_the_next_host_without_the_c
     Ok(())
 }
 
+/// The other half of the same symmetry, and the one behaviour this round
+/// changed rather than restored: a `302` **home to the origin the caller
+/// named** carries the credentials again, even on a cleartext chain that
+/// has been away.
+///
+/// The rewriter has armed that line since the round that keyed the
+/// exception on `d=`: a playlist fetched from B may name `http://A/seg.ts`
+/// and A is asked with the credential, because the caller published it on A
+/// by naming A. A `302` to the same URL is the same request with the same
+/// recipient, so the loop refusing it was the two halves disagreeing --
+/// harmlessly this time, but by the same lack of a shared rule that leaked
+/// in the other direction. One predicate answers both, so it now carries in
+/// both, and an authenticated plain-`http` stream that bounces off a CDN
+/// and back home plays instead of `403`ing.
+///
+/// What has not changed is everything the bounce passes through: B, which
+/// only the redirect named, is asked with nothing.
+#[test]
+fn a_cleartext_redirect_home_to_the_origin_the_caller_named_carries_the_credential()
+-> anyhow::Result<()> {
+    const SECRET: &str = "Bearer s3cret";
+
+    // A and B name each other, so one address is only known after both
+    // listeners are up; nothing is fetched until the request below.
+    let a_addr: std::sync::Arc<std::sync::OnceLock<SocketAddr>> = Default::default();
+    let b_addr: std::sync::Arc<std::sync::OnceLock<SocketAddr>> = Default::default();
+    let b_for_a = b_addr.clone();
+    let a_for_b = a_addr.clone();
+    // A: the film is sent away to B, and whatever comes back home is
+    // answered with a report of what it was asked with.
+    let named = Origin::start_with(move |request: &Request, socket: &mut TcpStream| {
+        if request.target().ends_with("/film.mkv") {
+            let b = b_for_a.get().expect("B is up before anything is fetched");
+            let _ = socket.write_all(
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://{b}/hand-off\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+        } else {
+            let body = echo_headers(request);
+            let _ = socket.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        }
+        let _ = socket.flush();
+    })?;
+    a_addr.set(named.addr).expect("set once, before any fetch");
+    // B, which the caller never named: it sends us straight back to A.
+    let away = Origin::start_with(move |_request: &Request, socket: &mut TcpStream| {
+        let a = a_for_b.get().expect("A is up before anything is fetched");
+        let _ = socket.write_all(
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{a}/back-home.mkv\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        let _ = socket.flush();
+    })?;
+    b_addr.set(away.addr).expect("set once, before any fetch");
+
+    let fixture = fixture_with(named)?;
+    let response = reqwest::blocking::Client::new()
+        .get(format!(
+            "{}/proxy/?d={}&h={}&h={}&h={}",
+            fixture.base,
+            encode(&format!("http://{}/film.mkv", fixture.origin.addr)),
+            encode(&format!("Authorization:{SECRET}")),
+            encode("Cookie:session=abc"),
+            encode("User-Agent:addon/1")
+        ))
+        .send()?;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.text()?,
+        format!(
+            "authorization=Some({SECRET:?}) cookie=Some(\"session=abc\") user-agent=Some(\"addon/1\")"
+        ),
+        "the hop home to A is asked with the credential A already has"
+    );
+    assert_eq!(
+        fixture.origin.next_request().header("authorization"),
+        Some(SECRET),
+        "as was the hop the caller named"
+    );
+    assert_eq!(
+        away.next_request().header("authorization"),
+        None,
+        "while B, in between, was asked with none"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
+/// The direction the two halves had not been tested against each other in:
+/// a **cleartext** chain whose playlist names an `https` host.
+///
+/// The redirect loop refuses that hop -- a cleartext chain carries the
+/// credentials to the origin the caller named and nowhere else, an `https`
+/// target included, because a playlist named in the clear is not the
+/// caller's origin talking. The rewriter used to allow it: it asked only
+/// whether the chain had ever stepped off `https`, and a chain that started
+/// in the clear never had.
+///
+/// Measured against the code this fixes: a caller naming
+/// `http://A/live/master.m3u8` with `h=Authorization:Bearer s3cret` got back
+/// a playlist naming `https://C/live/master.m3u8` with the credential
+/// written into the line, C logged `authorization=Some("Bearer s3cret")`
+/// when the line was fetched the way a player fetches it, and C's own
+/// playlist -- now an `https` chain of its own -- armed `https://D/seg.ts`,
+/// so D logged it too. Two hosts the caller never named, from a chain the
+/// loop would not have carried one hop of.
+///
+/// The positives are here too: A, the origin the caller named and spent the
+/// credential on, is still asked with it, and every line still carries the
+/// `h=` that is a description rather than a secret.
+#[test]
+fn a_cleartext_playlist_naming_an_https_host_arms_no_line_with_the_credential() -> anyhow::Result<()>
+{
+    const SECRET: &str = "Bearer s3cret";
+
+    // D, the far end: it reports what it was asked with.
+    let deep = TlsOrigin::start_with(axum::Router::new().fallback(axum::routing::any(
+        move |headers: axum::http::HeaderMap| async move {
+            (
+                [(axum::http::header::CONTENT_TYPE, "video/mp2t")],
+                echo_header_map(&headers),
+            )
+        },
+    )))?;
+    let deep_addr = deep.addr;
+    // C, the `https` host A's playlist names: a playlist of its own naming
+    // D, with what C itself was asked with reported in a comment line --
+    // which the rewriter leaves alone, so it survives into the body we read.
+    let edge = TlsOrigin::start_with(axum::Router::new().fallback(axum::routing::any(
+        move |uri: axum::http::Uri, headers: axum::http::HeaderMap| async move {
+            if uri.path().ends_with(".m3u8") {
+                return (
+                    [(axum::http::header::CONTENT_TYPE, "application/x-mpegURL")],
+                    format!(
+                        "#EXTM3U\n# asked-with {}\n#EXTINF:10,\nhttps://{deep_addr}/deep/seg.ts\n",
+                        echo_header_map(&headers)
+                    ),
+                );
+            }
+            (
+                [(axum::http::header::CONTENT_TYPE, "video/mp2t")],
+                echo_header_map(&headers),
+            )
+        },
+    )))?;
+    let edge_addr = edge.addr;
+    // A, the cleartext host the caller does name: a playlist naming C, and
+    // an echo for its own segment line.
+    let named = Origin::start_with(move |request: &Request, socket: &mut TcpStream| {
+        let (content_type, body) = if request.target().ends_with(".m3u8") {
+            (
+                "application/x-mpegURL",
+                format!(
+                    "#EXTM3U\n#EXTINF:10,\nhttps://{edge_addr}/live/master.m3u8\n\
+                     #EXTINF:10,\nseg-a.ts\n"
+                ),
+            )
+        } else {
+            ("video/mp2t", echo_headers(request))
+        };
+        let _ = socket.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        let _ = socket.flush();
+    })?;
+
+    let fixture = fixture_with(named)?;
+    let client = reqwest::blocking::Client::new();
+    let playlist = client
+        .get(format!(
+            "{}/proxy/?d={}&h={}&h={}&h={}",
+            fixture.base,
+            encode(&format!("http://{}/live/master.m3u8", fixture.origin.addr)),
+            encode(&format!("Authorization:{SECRET}")),
+            encode("Cookie:session=abc"),
+            encode("User-Agent:addon/1")
+        ))
+        .send()?;
+    assert_eq!(playlist.status(), reqwest::StatusCode::OK);
+    let body = playlist.text()?;
+    let lines = rewritten_lines(&body);
+    let (to_edge, home) = (lines[0].to_string(), lines[1].to_string());
+
+    assert_eq!(
+        fixture.origin.next_request().header("authorization"),
+        Some(SECRET),
+        "A, which the caller named, is asked with the credential"
+    );
+    assert!(
+        home.contains(&format!(
+            "&h={}",
+            encode(&format!("Authorization:{SECRET}"))
+        )),
+        "and its own segment line keeps it: {home}"
+    );
+    assert!(
+        !to_edge.contains("Authorization") && !to_edge.contains("Cookie"),
+        "while the https line names a host the caller never did, on a chain \
+         that has never been https: {to_edge}"
+    );
+    assert!(
+        to_edge.contains(&format!("&h={}", encode("User-Agent:addon/1"))),
+        "though it still carries the h= that is a description: {to_edge}"
+    );
+
+    // What a player does with that line, which is the measurement that
+    // matters: it fetches it, and what comes back is another playlist.
+    let nested = client.get(format!("{}{to_edge}", fixture.base)).send()?;
+    assert_eq!(nested.status(), reqwest::StatusCode::OK);
+    let nested = nested.text()?;
+    assert!(
+        nested.contains("# asked-with authorization=None cookie=None"),
+        "C is asked without the credentials: {nested}"
+    );
+    let to_deep = rewritten_lines(&nested)[0].to_string();
+    assert!(
+        !to_deep.contains("Authorization") && !to_deep.contains("Cookie"),
+        "so nothing C names is armed either, https or not: {to_deep}"
+    );
+
+    let segment = client.get(format!("{}{to_deep}", fixture.base)).send()?;
+    assert_eq!(segment.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        segment.text()?,
+        "authorization=None cookie=None user-agent=Some(\"addon/1\")",
+        "and D, two hosts from anything the caller named, is asked with none"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
 /// A relative `Location`, resolved against the URL that sent it rather than
 /// against the origin. The reference resolves against `dest.href` with the
 /// path cut off, which turns `Location: v2/film.mkv` beside

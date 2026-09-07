@@ -129,9 +129,9 @@ const FOLLOWED_REDIRECTS: [StatusCode; 5] = [
 /// The target's scheme is not compared with the one it came from, so an
 /// `https` hop may legitimately end at an `http` one -- what such a step
 /// down costs is decided where the request is built, not here: the caller's
-/// `h=` credentials stop travelling (see the loop in [`proxy`], and
-/// [`CarriedParams`] for the rewritten playlist lines that continue the
-/// chain after it).
+/// `h=` credentials stop travelling ([`CredentialChain`], which the loop in
+/// [`proxy`] asks about each hop and [`CarriedParams`] about each line of a
+/// playlist that continues the chain after it).
 fn redirect_target(response: &reqwest::Response, from: &Url) -> Option<Url> {
     if !FOLLOWED_REDIRECTS.contains(&response.status()) {
         return None;
@@ -487,6 +487,120 @@ fn without_credentials(headers: &HeaderMap) -> HeaderMap {
         .collect()
 }
 
+/// The chain a request for the caller's resource has taken so far, and the
+/// **one predicate** that decides whether the next request in it may carry
+/// [`CREDENTIAL_REQUEST_HEADERS`].
+///
+/// There are two requests that decision has to be made for, and they are
+/// made in different places: the next hop of the redirect loop in
+/// [`proxy`], and the request a *player* makes for a line this route wrote
+/// into a rewritten playlist (see [`CarriedParams`], which asks this about
+/// every line). A rewritten line is as much a hop of this chain as a `302`
+/// is -- it is written by us, fetched automatically, and re-arms `h=` from
+/// whatever we wrote into it -- so the two must answer the same, and they
+/// answer the same by both calling [`CredentialChain::may_carry_to`].
+///
+/// **The rule it encodes**, which is the whole of the guarantee -- the
+/// credentials leave the origin the caller named only over `https`:
+///
+/// * an **`https` chain** -- one every URL of which, the caller's own
+///   included, is `https` -- carries them to any `https` target, across
+///   hosts. That is a deliberate trade, made against reqwest's
+///   `remove_sensitive_headers`, and it is what buys back the CDN-to-edge
+///   `403` (see the loop in [`proxy`]);
+/// * **any other chain** carries them to the origin the caller named in
+///   `d=` when the caller named it in the clear, and to nowhere else --
+///   whatever the target's scheme, at any depth. Such a caller published
+///   the credential on that origin itself, by naming it, so a request
+///   pointing back there publishes nothing that is not published already,
+///   and an authenticated plain-`http` stream would lose every segment
+///   without it. Anywhere else is a fresh disclosure somebody other than
+///   the caller chose: what named it was a `Location` or a playlist line
+///   that crossed a wire anyone on the path could read and rewrite.
+///
+/// Two things follow from the second arm that the rule needs, and neither
+/// is a case of its own. A chain that began at an `https` URL and stepped
+/// down has published nothing and has nowhere to spend anything: it carries
+/// the credentials to no target at all, an `https` one included, because an
+/// `https` URL named over a wire that was read is not the caller's `https`
+/// origin talking. And a chain that began in the clear does not reach the
+/// same host's TLS port either -- `https://a.example` is not the origin
+/// `http://a.example`, which is the same answer the loop gives a `302` from
+/// cleartext to `https`.
+///
+/// **Why this is one type and not two conditions that agree.** It is the
+/// fourth round on this rule. Each of the first three fixed a real
+/// asymmetry between the loop and the rewriter -- the loop dropping the
+/// credential on a cleartext hop while the rewriter re-armed it one line
+/// later; the rewriter's cleartext exception keyed on the scheme, so any
+/// cleartext host got it; then keyed on the origin the playlist came
+/// *from*, so a cleartext `302` disarmed the caller's own host and armed
+/// the redirect target -- and each time the two conditions were left as
+/// two. The fourth was the direction nobody had just tested: the loop
+/// refused a cleartext chain's `https` hop and the rewriter allowed the
+/// same chain's `https` line. Measured, a caller naming `http://A` with
+/// `h=Authorization:Bearer s3cret` and `h=Cookie:session=abc` got back a
+/// playlist naming `https://C`, armed; C logged both when the line was
+/// fetched the way a player fetches one; and C's own playlist -- an `https`
+/// chain of its own by then -- armed `https://D`, which logged them too.
+/// Two hosts the caller never named, from a chain the loop would not have
+/// carried one hop of. Two implementations of one policy agree only by
+/// discipline, and discipline has now failed four times.
+///
+/// `Url::origin` is the comparison because it is the value a rewritten line
+/// is written with (`d=` is an origin), and because it says the things a
+/// host comparison here has to say: `a.example` and `cdn.a.example` are
+/// different hosts; two ports on one host are different listeners -- one on
+/// `:8080` is not the one the credential was handed to, and on a shared
+/// host it is often not even the same party's; and a default port spelled
+/// out is neither.
+#[derive(Clone)]
+struct CredentialChain {
+    /// The origin the caller named in `d=`, when the caller named a
+    /// cleartext one: the single origin this chain has already published
+    /// the credentials to, and so the only one a chain that is not all
+    /// `https` may hand them to. `None` for a chain that began at an
+    /// `https` URL, which has published nothing.
+    spent_in_the_clear: Option<url::Origin>,
+    /// Whether every URL this chain has visited, the caller's own included,
+    /// was `https`.
+    all_tls: bool,
+}
+
+impl CredentialChain {
+    /// The chain as the caller named it, before a hop has been taken. The
+    /// caller's own URL is already part of it: naming an `http://` target
+    /// is the caller spending the credential on that origin, and naming an
+    /// `https` one is what an `https` chain is.
+    fn named_by(caller: &Url) -> Self {
+        let over_tls = caller.scheme() == "https";
+        Self {
+            spent_in_the_clear: (!over_tls).then(|| caller.origin()),
+            all_tls: over_tls,
+        }
+    }
+
+    /// Whether a request for `target` -- the next hop of the redirect loop,
+    /// or the fetch a player will make for a rewritten line -- may carry
+    /// [`CREDENTIAL_REQUEST_HEADERS`]. The rest of `h=` travels either way
+    /// (see [`without_credentials`]).
+    fn may_carry_to(&self, target: &Url) -> bool {
+        if self.all_tls {
+            target.scheme() == "https"
+        } else {
+            self.spent_in_the_clear
+                .as_ref()
+                .is_some_and(|spent_on| *spent_on == target.origin())
+        }
+    }
+
+    /// Records a hop the chain has taken. Only a chain every URL of which
+    /// is `https` is an `https` chain, and nothing turns one back into one.
+    fn stepped_to(&mut self, hop: &Url) {
+        self.all_tls &= hop.scheme() == "https";
+    }
+}
+
 /// Finishes building a response, turning a builder error (which can no
 /// longer happen for headers we control, but is handled defensively for any
 /// other builder failure) into a 502 instead of panicking via `.unwrap()`.
@@ -595,16 +709,15 @@ impl ProxyParams {
     /// segment inherits no label. Its own cross-origin branch drops `r=`
     /// (`newOpts` has only `d` and `h`), which is the half worth keeping.
     ///
-    /// **Nor is all of `h=` on every line.** `requested` is the URL the
-    /// *caller* named -- not the one the body came from -- and
-    /// `carry_credentials` is what the redirect loop had left of the
-    /// caller's secrets when it got there; between them they fix which
-    /// lines [`CREDENTIAL_REQUEST_HEADERS`] may be written into at all. A
-    /// cleartext line is armed only when it names `requested`'s own origin,
-    /// whichever origin actually served the playlist: on a cleartext chain
-    /// that is the one origin the credential has been spent on. See
-    /// [`CarriedParams`], which is where that rule lives.
-    fn carried(&self, requested: &Url, carry_credentials: bool) -> CarriedParams {
+    /// **Nor is all of `h=` on every line.** Which lines
+    /// [`CREDENTIAL_REQUEST_HEADERS`] may be written into is not this
+    /// function's decision at all: `chain` is the chain the playlist
+    /// arrived over -- what the caller named, and what has happened to it
+    /// since -- and every line asks [`CredentialChain::may_carry_to`] about
+    /// its own target, which is the same call the redirect loop makes about
+    /// its next hop. Both spellings are built here because the target is
+    /// not known until [`proxied_uri`] has resolved the line.
+    fn carried(&self, chain: &CredentialChain) -> CarriedParams {
         let mut all = String::new();
         let mut uncredentialed = String::new();
         for (name, value) in &self.request_headers {
@@ -625,62 +738,25 @@ impl ProxyParams {
         CarriedParams {
             credentialed: all,
             uncredentialed,
-            over_tls: carry_credentials,
-            // The one origin a cleartext line may name: the one the caller
-            // named. The first request of a chain is built with the whole
-            // of `h=` whatever its scheme, so a caller that named an
-            // `http://` target has spent the credential on that origin, in
-            // the clear, itself -- and because the credentials never cross
-            // a cleartext redirect, on no other. Writing them into a line
-            // pointing back there publishes nothing that is not published
-            // already, and an authenticated plain-`http` stream would lose
-            // every segment without them.
-            //
-            // Deliberately not the origin the *playlist* came from, which
-            // is a different origin the moment a cleartext `302` is in the
-            // chain: keyed that way this armed the redirect target, which
-            // the caller never named, and disarmed the caller's own origin,
-            // whose segments then `403`ed. Nor is it keyed on
-            // `carry_credentials`: that hop dropped the credential, but it
-            // did not un-spend it on the origin the caller named.
-            //
-            // `Url::origin` is the comparison because it is the value the
-            // line is written with (`d=` is an origin), and because it says
-            // the two things a host comparison here has to say: `a.example`
-            // and `cdn.a.example` are different hosts, and so are two ports
-            // on one host -- a listener on `:8080` is not the one the
-            // credential was handed to, and on a shared host it is often
-            // not even the same party's.
-            cleartext_origin: (requested.scheme() != "https").then(|| requested.origin()),
+            chain: chain.clone(),
         }
     }
 }
 
 /// What a rewritten playlist line carries, in the two spellings a line may
 /// need. [`ProxyParams::carried`] builds both; the line's own target picks
-/// between them.
+/// between them, by asking [`CredentialChain`] -- the same predicate, and
+/// the same call, the redirect loop makes about its next hop.
 ///
 /// **A rewritten line is a hop of the same chain** -- the last one this
 /// route has any say over. What it writes into the line is what the player
 /// hands straight back to us as its own `h=`, and what we then spend on
-/// whatever that line named, without a caller ever having decided to. So a
-/// line answers to the same rule the redirect loop follows (see the loop in
-/// [`proxy`]), and there is one rule:
-/// **[`CREDENTIAL_REQUEST_HEADERS`] leave the origin the caller named only
-/// over `https`.**
-///
-/// For a line that reads:
-///
-/// * an `https` line carries them wherever it points, as long as the chain
-///   that fetched the playlist still had them to give -- the same trade the
-///   loop makes for a hop nobody on the path can read;
-/// * an `http` line carries them only when it names the origin the
-///   **caller** named, which on a cleartext chain is the one origin they
-///   have been spent on;
-/// * and a chain that crossed a redirect that was not `https` to `https`
-///   gets nothing back, an `https` line included: such a playlist was told
-///   what to name over a wire that was read, so an `https` line in it is
-///   not the caller's `https` origin talking.
+/// whatever that line named, without a caller ever having decided to. That
+/// is why the rule cannot live here: a rule enforced on the lines and not
+/// in the loop, or the other way round, holds for one request and leaks on
+/// the next, and it has done so in all four directions the two could
+/// disagree in (see [`CredentialChain`] for the four). What is left here is
+/// the two strings and where a line's target is asked about.
 ///
 /// Without a rule on the lines the loop's guard was one line deep.
 /// Measured: an `https` origin serving a playlist that names
@@ -701,48 +777,37 @@ impl ProxyParams {
 /// `h=` at all, A logging `authorization=None`, so every segment of an
 /// authenticated stream `403`s, while B's own lines were armed and handed
 /// the credential to a host the caller never named. Keyed on `d=`'s own
-/// origin both halves come out right.
+/// origin, which is what [`CredentialChain`] holds, both halves come out
+/// right.
 ///
-/// **No cleartext origin but that one is ever armed, at any depth.** A line
-/// to A is fetched as `d=http://A`, so the origin it may arm is A again,
-/// and a cleartext `302` out of it carries no credential for anything
-/// further on to inherit. That bound is a cleartext bound only: an armed
-/// `https` line is a fresh request whose own redirects and own playlist may
-/// carry the credential onward to further `https` hosts, and nothing counts
-/// those -- `MAX_REDIRECTS` bounds the hops inside one request, and a
-/// rewritten line is not a hop of the request that wrote it but a new one
-/// the player makes. Every one of those hosts is reached over TLS, which is
-/// the whole of what the one rule promises.
+/// **A chain that is not all `https` arms that one origin and no other, at
+/// any depth, whatever a line's scheme.** A line to A is fetched as
+/// `d=http://A`, so the origin *it* may arm is A again, and nothing else in
+/// its playlist -- an `https` line included -- is written with a credential
+/// for anything further on to inherit. That bound is that chain's alone: an
+/// armed `https` line on an `https` chain is a fresh
+/// request whose own redirects and own playlist may carry the credential
+/// onward to further `https` hosts, and nothing counts those --
+/// `MAX_REDIRECTS` bounds the hops inside one request, and a rewritten line
+/// is not a hop of the request that wrote it but a new one the player
+/// makes. Every one of those hosts is reached over TLS, which is the whole
+/// of what the one rule promises.
 struct CarriedParams {
     /// What a line the credentials may travel on carries.
     credentialed: String,
     /// What every other line carries: the same, with
     /// [`CREDENTIAL_REQUEST_HEADERS`] left out.
     uncredentialed: String,
-    /// Whether a line naming `https` is one of the former: false once the
-    /// chain that fetched the playlist has crossed a hop that was not
-    /// `https` to `https`.
-    over_tls: bool,
-    /// The one cleartext origin a line may name and still be armed: the
-    /// origin the **caller** named, when the caller named a cleartext one.
-    /// `None` for every chain that began at an `https` URL, where no `http`
-    /// line may carry the credentials at all.
-    cleartext_origin: Option<url::Origin>,
+    /// The chain the playlist arrived over, which is what every line is
+    /// judged against -- and the only thing here that decides.
+    chain: CredentialChain,
 }
 
 impl CarriedParams {
-    /// The spelling `target` has earned -- by its scheme, and, when that is
-    /// not `https`, by naming the origin the caller named and the credential
-    /// was therefore already spent on.
+    /// The spelling `target` has earned, which is [`CredentialChain`]'s
+    /// answer and nothing of this type's own.
     fn for_target(&self, target: &Url) -> &str {
-        let credentialed = if target.scheme() == "https" {
-            self.over_tls
-        } else {
-            self.cleartext_origin
-                .as_ref()
-                .is_some_and(|spent_on| *spent_on == target.origin())
-        };
-        if credentialed {
+        if self.chain.may_carry_to(target) {
             &self.credentialed
         } else {
             &self.uncredentialed
@@ -751,14 +816,19 @@ impl CarriedParams {
 
     /// The same parameters whatever a line names -- what the line tests
     /// below are written against, since they are about the rewriting and
-    /// not about the credential rule.
+    /// not about the credential rule. Both spellings are one string, so
+    /// the chain cannot change the answer; it is here because the type has
+    /// one.
     #[cfg(test)]
     fn everywhere(carried: &str) -> Self {
         Self {
             credentialed: carried.to_string(),
             uncredentialed: carried.to_string(),
-            over_tls: true,
-            cleartext_origin: None,
+            // Any chain: with one string for both answers, what this
+            // says cannot be observed.
+            chain: CredentialChain::named_by(
+                &Url::parse("https://carried.invalid/").expect("a literal URL"),
+            ),
         }
     }
 }
@@ -994,37 +1064,39 @@ async fn proxy(
     // [`redirect_target`] takes any `http` or `https` target without
     // comparing it to the scheme it came from, and a `Location` that
     // arrived in the clear is not something the origin can be said to have
-    // written. So the credentials cross a redirect **only when both ends of
-    // it are `https`**. A `302` from `https` to `http` would have the
-    // caller's `Authorization` -- or `Cookie` -- re-applied on a hop anyone
-    // on the path can read: not "the credential goes where the resource
-    // went" but the origin choosing to publish it, and no `403` is avoided
-    // by obliging. A `302` sent *over* cleartext named its target in the
-    // clear too, so whoever could read the credential could also have
-    // chosen who receives it next -- which is why even a target on the very
-    // host that redirected us is not one this hop can trust the answer
-    // about. Either way this hop, and every hop after it, is built without
-    // [`CREDENTIAL_REQUEST_HEADERS`]; an upgrade back to `https` brings
-    // nothing back, having been named over a wire that was read.
+    // written. A `302` from `https` to `http` would have the caller's
+    // `Authorization` -- or `Cookie` -- re-applied on a hop anyone on the
+    // path can read: not "the credential goes where the resource went" but
+    // the origin choosing to publish it, and no `403` is avoided by
+    // obliging. A `302` sent *over* cleartext named its target in the clear
+    // too, so whoever could read the credential could also have chosen who
+    // receives it next -- which is why even a target on the very host that
+    // redirected us is not one this hop can trust the answer about, and why
+    // an upgrade back to `https` brings nothing back.
     //
-    // What is left is one rule, and it is the whole of the guarantee:
-    // **the credentials leave the origin the caller named only over
-    // `https`.** A cleartext chain spends them on `url` -- the origin the
-    // caller named, and by naming it chose to spend them on -- and on
-    // nobody else, at any depth. An `https` chain carries them across
-    // hosts, which is the trade that buys the `403` above back. The rest of
-    // `h=` still travels either way (see [`without_credentials`]).
+    // Which hops carry them is therefore not decided here. It is decided by
+    // [`CredentialChain::may_carry_to`], which this loop asks about every
+    // hop and which is asked again, unchanged, about every line of a
+    // playlist the chain comes back with. What it answers is one rule, and
+    // it is the whole of the guarantee: **the credentials leave the origin
+    // the caller named only over `https`.** An `https` chain carries them
+    // across `https` hosts, which is the trade that buys the `403` above
+    // back; any other chain spends them on `url` when the caller named
+    // `url` in the clear -- and by naming it chose to publish them there --
+    // and on nobody else, at any depth, an `https` target included. A chain
+    // that started `https` and stepped down has published nothing and so
+    // spends nothing anywhere. The rest of `h=` still travels either way
+    // (see [`without_credentials`]).
     //
-    // "Every hop after it" has to include the ones this route does not make
-    // itself. A playlist is rewritten line by line into `/proxy/` URLs the
-    // player then fetches, and each of those lines is written with `h=` on
-    // it -- so a chain that ended here was continued, credentials and all,
-    // by the very next request the player made. [`CarriedParams`] applies
-    // the same one rule there: an `https` line carries them while the chain
-    // still has them, a cleartext line only when it names the origin the
-    // caller named. The two have to agree -- a rule enforced in the loop
-    // and not on the lines is a rule that holds for one request and leaks
-    // on the next.
+    // "Every hop" has to include the ones this route does not make itself.
+    // A playlist is rewritten line by line into `/proxy/` URLs the player
+    // then fetches, and each of those lines is written with `h=` on it --
+    // so a chain that ended here is continued, credentials and all, by the
+    // very next request the player makes. That the two agree is no longer
+    // something this comment asks of whoever edits the other one: they are
+    // the same call ([`CarriedParams::for_target`] is the other caller),
+    // because for four rounds agreement was a discipline, and four times
+    // the discipline failed.
     //
     // The method is kept across hops, as the reference keeps it. A `303`
     // asks for a `GET` and a browser would give it one, but this route is
@@ -1032,12 +1104,13 @@ async fn proxy(
     // never with a body, so there is nothing for the distinction to change.
     let mut fetched_url = url.clone();
     let mut hops = 0usize;
-    // Set for the life of this chain the first time a redirect is anything
-    // but `https` to `https`. `true` until then, including for the URL the
-    // caller named whatever its scheme: naming an `http://` target is the
-    // caller spending the credential on it.
-    let mut carry_credentials = true;
+    // What the caller named, and what has happened to the chain since.
+    // Nothing else in this loop decides what a request carries.
+    let mut chain = CredentialChain::named_by(&url);
     let response = loop {
+        // Asked per hop, and the one question there is to ask: the same
+        // call decides every line of a playlist this chain returns.
+        let carry_credentials = chain.may_carry_to(&fetched_url);
         // The origin is fetched verified unless a previous request for this
         // endpoint failed on its certificate (see [`UNVERIFIED_ORIGINS`]).
         // Asked per hop, which it could not be while reqwest owned the
@@ -1128,12 +1201,14 @@ async fn proxy(
             tracing::warn!(url = %url, "too many redirects; giving up");
             return (StatusCode::BAD_GATEWAY, "Proxy error: too many redirects").into_response();
         }
-        if carry_credentials && (fetched_url.scheme() != "https" || location.scheme() != "https") {
-            carry_credentials = false;
+        chain.stepped_to(&location);
+        if carry_credentials && !chain.may_carry_to(&location) {
             // At WARN only when there was something to drop, and by header
             // name rather than value: a stream that now `403`s has to be
             // diagnosable, and a chain with no credential in it is not an
-            // event.
+            // event. Once per hop that loses them rather than once per
+            // chain, since a chain that is not all `https` may step back
+            // onto the origin the caller named and be carrying them again.
             let dropped: Vec<&str> = custom_request_headers
                 .keys()
                 .map(|name| name.as_str())
@@ -1144,8 +1219,8 @@ async fn proxy(
                     from = %fetched_url,
                     to = %location,
                     headers = ?dropped,
-                    "a redirect crosses cleartext; not carrying the caller's h= \
-                     credentials onto it, nor onto the rest of this chain"
+                    "a redirect leaves what this chain may spend the caller's h= \
+                     credentials on; not carrying them onto it"
                 );
             }
         }
@@ -1402,12 +1477,10 @@ async fn proxy(
         };
         // Lines resolve against `fetched_url`, where the playlist came
         // from; which of them may be written with the credentials in `h=`
-        // is a question about `url`, the origin the *caller* named, and
-        // about `carry_credentials`, what the chain that fetched the
-        // playlist had left of the caller's secrets (see
-        // [`CarriedParams`]). The two URLs part company at a redirect, and
-        // it is the caller's that decides.
-        let carried = params.carried(&url, carry_credentials);
+        // is a question for `chain`, which knows what the *caller* named
+        // and what the hops since have cost. The two URLs part company at a
+        // redirect, and only the first of them says where a line resolves.
+        let carried = params.carried(&chain);
         let rewritten = rewritten_playlist_body(chunks, fetched_url, carried);
         return finalize_response(res_builder, axum::body::Body::from_stream(rewritten));
     }
@@ -1998,7 +2071,11 @@ mod tests {
     fn the_player_token_is_carried_into_every_rewritten_line() {
         let body = "#EXT-X-KEY:METHOD=AES-128,URI=\"key/enc.key\"\nseg-0.ts\n";
         let params = ProxyParams::parse("d=whatever&p=player+one");
-        let rewritten = rewrite_playlist_carrying(body, &base(), params.carried(&base(), true));
+        let rewritten = rewrite_playlist_carrying(
+            body,
+            &base(),
+            params.carried(&CredentialChain::named_by(&base())),
+        );
         let expected = format!(
             "#EXT-X-KEY:METHOD=AES-128,URI=\"{}\"\n{}\n",
             proxied_with("http://example.com/streams/key/enc.key", "&p=player%20one"),
@@ -2141,8 +2218,11 @@ mod tests {
         let params = ProxyParams::parse(
             "d=whatever&h=Authorization%3ABearer+abc&r=Content-Type%3Avideo%2Fmp4&p=one",
         );
-        let rewritten =
-            rewrite_playlist_carrying("seg-0.ts\n", &base(), params.carried(&base(), true));
+        let rewritten = rewrite_playlist_carrying(
+            "seg-0.ts\n",
+            &base(),
+            params.carried(&CredentialChain::named_by(&base())),
+        );
         assert_eq!(
             rewritten,
             format!(
@@ -2175,7 +2255,7 @@ mod tests {
         let rewritten = rewrite_playlist_carrying(
             "https://cdn.example.org/s/1.ts\nhttp://plain.example.org/s/2.ts\n",
             &secure,
-            params.carried(&secure, true),
+            params.carried(&CredentialChain::named_by(&secure)),
         );
         assert_eq!(
             rewritten,
@@ -2209,11 +2289,14 @@ mod tests {
         let requested = Url::parse("https://secure.example.net/master.m3u8").expect("a caller URL");
         let params =
             ProxyParams::parse("d=whatever&h=Authorization%3ABearer+abc&h=User-Agent%3Aaddon%2F1");
+        // The chain: named over `https`, landed on cleartext, so nothing
+        // it names is the origin the credential was spent on.
+        let mut chain = CredentialChain::named_by(&requested);
+        chain.stepped_to(&base());
         let rewritten = rewrite_playlist_carrying(
             "https://cdn.example.org/s/1.ts\nseg-0.ts\n",
             &base(),
-            // `false`: the loop dropped them at the hop that came here.
-            params.carried(&requested, false),
+            params.carried(&chain),
         );
         assert_eq!(
             rewritten,
@@ -2231,11 +2314,19 @@ mod tests {
         );
     }
 
-    /// The cleartext exception is one origin's, not the scheme's. A caller
-    /// that names an `http://` target has spent the credential on exactly
-    /// that origin, and lines naming it are the only cleartext lines that
-    /// may carry it -- at whatever depth, since every line is a fresh
-    /// request and re-arms `h=` from what it was written with.
+    /// The exception a cleartext chain earns is one origin's, not the
+    /// scheme's, and not the scheme's in the other direction either. A
+    /// caller that names an `http://` target has spent the credential on
+    /// exactly that origin, and lines naming it are the only lines of such
+    /// a playlist that may carry it -- at whatever depth, since every line
+    /// is a fresh request and re-arms `h=` from what it was written with.
+    ///
+    /// The `https` row is the fourth round of this bug and the reason the
+    /// decision is one predicate now. It used to read `armed`, justified as
+    /// "the same trade the redirect loop makes" -- which was the opposite
+    /// of what the loop did: the loop refuses a cleartext chain's `https`
+    /// hop, and the rewriter allowed the same chain's `https` line. What
+    /// that cost is in [`CredentialChain`], measured.
     ///
     /// Two decisions are pinned here rather than only argued in
     /// [`CarriedParams`]: a subdomain is a different host, and a different
@@ -2248,7 +2339,7 @@ mod tests {
             ProxyParams::parse("d=whatever&h=Authorization%3ABearer+abc&h=User-Agent%3Aaddon%2F1");
         // `base()` is `http://example.com/streams/master.m3u8`, and here it
         // is what the caller named as well as where the playlist came from.
-        let carried = params.carried(&base(), true);
+        let carried = params.carried(&CredentialChain::named_by(&base()));
         let armed = "&h=Authorization%3ABearer%20abc&h=User-Agent%3Aaddon%2F1";
         let unarmed = "&h=User-Agent%3Aaddon%2F1";
         for (target, expected, why) in [
@@ -2279,9 +2370,10 @@ mod tests {
             ),
             (
                 "https://cdn.example.org/seg-0.ts",
-                armed,
-                "while an https line carries them wherever it points -- \
-                 the same trade the redirect loop makes",
+                unarmed,
+                "and an https line is not an exception to that: this chain \
+                 is not an https chain, and the redirect loop refuses the \
+                 same target for the same reason",
             ),
         ] {
             let target = Url::parse(target).expect("a target URL");
@@ -2302,9 +2394,11 @@ mod tests {
         let landed = Url::parse("http://b.example/edge/master.m3u8").expect("the redirect target");
         let params =
             ProxyParams::parse("d=whatever&h=Authorization%3ABearer+abc&h=User-Agent%3Aaddon%2F1");
-        // `false`: the cleartext redirect dropped the credential for the
-        // hop, which does not un-spend it on the origin the caller named.
-        let carried = params.carried(&named, false);
+        // The hop to B carried no credential, which does not un-spend it
+        // on the origin the caller named.
+        let mut chain = CredentialChain::named_by(&named);
+        chain.stepped_to(&landed);
+        let carried = params.carried(&chain);
         let armed = "&h=Authorization%3ABearer%20abc&h=User-Agent%3Aaddon%2F1";
         let unarmed = "&h=User-Agent%3Aaddon%2F1";
         for (target, expected, why) in [
@@ -2329,13 +2423,98 @@ mod tests {
         }
     }
 
+    /// The two callers of the predicate, asked the same question and made
+    /// to give the same answer: for every shape of chain and every shape of
+    /// target, what the redirect loop would put on its next hop
+    /// ([`CredentialChain::may_carry_to`], which is the call the loop makes)
+    /// is what the rewriter puts on a line naming the same target.
+    ///
+    /// This is the test for the *defect*, not for the rule -- the rule is
+    /// pinned by the tests around this one. Four rounds running, the loop
+    /// and the rewriter each implemented the policy and each round they
+    /// agreed in every direction anyone had just tested and disagreed in one
+    /// nobody had. They cannot now: `for_target` is `may_carry_to` and
+    /// nothing else. Should someone give the rewriter a condition of its
+    /// own again, this fails in whichever direction they got wrong, rather
+    /// than a fifth round finding it in the field.
+    #[test]
+    fn the_loop_and_the_rewriter_answer_alike_for_every_chain_and_target() {
+        let params =
+            ProxyParams::parse("d=whatever&h=Authorization%3ABearer+abc&h=User-Agent%3Aaddon%2F1");
+        let armed = "&h=Authorization%3ABearer%20abc&h=User-Agent%3Aaddon%2F1";
+        let unarmed = "&h=User-Agent%3Aaddon%2F1";
+        let url = |spelling: &str| Url::parse(spelling).expect("a URL");
+        // Each chain as the loop builds it: what the caller named, then the
+        // hops it has taken.
+        let chain = |named: &str, hops: &[&str]| {
+            let mut chain = CredentialChain::named_by(&url(named));
+            for hop in hops {
+                chain.stepped_to(&url(hop));
+            }
+            chain
+        };
+        for (chain, what) in [
+            (chain("http://a.example/m.m3u8", &[]), "a cleartext caller"),
+            (
+                chain("http://a.example/m.m3u8", &["http://b.example/m.m3u8"]),
+                "a cleartext caller after a cleartext redirect",
+            ),
+            (
+                chain("http://a.example/m.m3u8", &["https://c.example/m.m3u8"]),
+                "a cleartext caller after a redirect that stepped up",
+            ),
+            (chain("https://a.example/m.m3u8", &[]), "an https caller"),
+            (
+                chain("https://a.example/m.m3u8", &["https://c.example/m.m3u8"]),
+                "an https caller after an https redirect",
+            ),
+            (
+                chain("https://a.example/m.m3u8", &["http://b.example/m.m3u8"]),
+                "an https caller after a redirect that stepped down",
+            ),
+            (
+                chain(
+                    "https://a.example/m.m3u8",
+                    &["http://b.example/m.m3u8", "https://c.example/m.m3u8"],
+                ),
+                "an https caller that stepped down and back up",
+            ),
+        ] {
+            let carried = params.carried(&chain);
+            for target in [
+                "http://a.example/seg.ts",
+                "https://a.example/seg.ts",
+                "http://a.example:8080/seg.ts",
+                "http://b.example/seg.ts",
+                "https://c.example/seg.ts",
+            ] {
+                let target = url(target);
+                // What the loop asks before it builds the hop.
+                let hop = chain.may_carry_to(&target);
+                assert_eq!(
+                    carried.for_target(&target),
+                    if hop { armed } else { unarmed },
+                    "{what}, target {target}: the loop would{} carry the \
+                     credentials, so a line naming it must{} be armed",
+                    if hop { "" } else { " not" },
+                    if hop { "" } else { " not" },
+                );
+            }
+        }
+    }
+
     /// However the caller spelled the name. `h=` values are the caller's
     /// text, not a header map's, so nothing has lowercased them for us.
     #[test]
     fn a_credential_named_in_any_case_is_still_one() {
         let secure = Url::parse("https://example.com/streams/master.m3u8").expect("a base URL");
         let params = ProxyParams::parse("d=whatever&h=AUTHORIZATION%3ABearer+abc");
-        assert_eq!(params.carried(&secure, true).for_target(&base()), "");
+        assert_eq!(
+            params
+                .carried(&CredentialChain::named_by(&secure))
+                .for_target(&base()),
+            ""
+        );
     }
 
     /// Several of them, and the order is the same every time: the rewritten
@@ -2344,7 +2523,7 @@ mod tests {
     #[test]
     fn carried_parameters_come_out_in_a_stable_order() {
         let params = ProxyParams::parse("d=whatever&h=B%3A2&h=A%3A1&r=Y%3Ayes&r=X%3Ano&p=t");
-        let carried = params.carried(&base(), true);
+        let carried = params.carried(&CredentialChain::named_by(&base()));
         let https = Url::parse("https://example.com/s/1.ts").expect("an https target");
         assert_eq!(carried.for_target(&https), "&h=A%3A1&h=B%3A2&p=t");
         assert_eq!(carried.for_target(&base()), "&h=A%3A1&h=B%3A2&p=t");
