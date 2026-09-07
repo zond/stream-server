@@ -10,7 +10,6 @@ use tokio::sync::RwLock;
 pub struct AppState {
     pub engine: Arc<EngineFS>,
     pub download_engine: Arc<EngineFS>,
-    pub download_engine_disk_backed: bool,
     pub settings: Arc<RwLock<ServerSettings>>,
     /// `settings.json` on disk and the one way anything writes it (see
     /// [`SettingsFile`]). Shared with the tracker refresher's
@@ -60,15 +59,14 @@ impl AppState {
     ///
     /// In production this is the one engine there is: `run()` builds a single
     /// `EngineFS` and puts the same `Arc` in `engine` and `download_engine`
-    /// (there is no memory-only engine to prefer it over; see `run`). The
-    /// choice below only means anything for an `AppState` a test built with
-    /// two distinct engines, and then it says which one streams.
+    /// (there is no memory-only engine to prefer it over; see `run`). It used
+    /// to choose between the two on a `download_engine_disk_backed` flag that
+    /// was `true` in production and `false` in every test constructor -- and
+    /// both of those hand the same `Arc` to both fields, so the flag never
+    /// selected anything. For an `AppState` built with two distinct engines
+    /// the download engine is the one that streams.
     pub fn stream_engine(&self) -> Arc<EngineFS> {
-        if self.download_engine_disk_backed {
-            self.download_engine.clone()
-        } else {
-            self.engine.clone()
-        }
+        self.download_engine.clone()
     }
 
     #[allow(unused)]
@@ -101,7 +99,6 @@ impl AppState {
         Self::new_with_shared_settings_log_dir_and_download_engine(
             engine.clone(),
             engine,
-            false,
             settings,
             config_dir,
             log_dir,
@@ -111,7 +108,6 @@ impl AppState {
     pub fn new_with_shared_settings_log_dir_and_download_engine(
         engine: Arc<EngineFS>,
         download_engine: Arc<EngineFS>,
-        download_engine_disk_backed: bool,
         settings: Arc<RwLock<ServerSettings>>,
         config_dir: PathBuf,
         log_dir: PathBuf,
@@ -123,7 +119,6 @@ impl AppState {
         Self {
             engine,
             download_engine,
-            download_engine_disk_backed,
             settings,
             settings_file,
             config_dir,

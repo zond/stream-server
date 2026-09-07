@@ -904,13 +904,11 @@ pub async fn run(
     let download_engine = Arc::new(
         EngineFS::new_disk_backed(cache_dir.clone(), backend_config, Some(tracker_storage)).await?,
     );
-    let download_engine_disk_backed = true;
     let engine = download_engine.clone();
 
     let mut state = AppState::new_with_shared_settings_log_dir_and_download_engine(
         engine,
         download_engine,
-        download_engine_disk_backed,
         settings_arc.clone(),
         config_dir.clone(),
         log_dir.clone(),
