@@ -439,6 +439,11 @@ struct CacheRoots {
     /// a `downloadsDir` inside a cache root is no longer a walked root, and
     /// the walked root is no longer a sufficient stop condition for it.
     keep_dirs: HashSet<std::path::PathBuf>,
+    /// Every root any budget walks, so each walk can stop where another
+    /// one's root begins -- see [`evict`]. Only roots on *different* volumes
+    /// are ever both in here and nested, since [`budgets_by_volume`]
+    /// collapses the ones that share a volume into a single walk.
+    boundaries: HashSet<std::path::PathBuf>,
 }
 
 /// The walked roots on one volume, and the cap they share.
@@ -475,6 +480,18 @@ struct CacheBudget {
 /// cleaner did with every root before, so it is the conservative answer for
 /// the paths where the question has no answer, rather than a new behaviour.
 ///
+/// [`outermost`] collapses each group *after* it is grouped, never before,
+/// and that order is the whole point. The collapse throws away a root that
+/// sits inside another, `prepare_downloads_dir` deliberately permits a
+/// `downloadsDir` below a cache root, and `WalkDir` crosses mount points --
+/// so a downloads dir that is an external drive mounted under the cache root
+/// used to disappear into it and be walked, counted and capped as part of a
+/// volume its bytes are not on. A cap that is a statement about one volume
+/// cannot be built out of roots that have already stopped being separable.
+/// Grouped first, roots that really do share a volume still collapse to one
+/// walk, and roots that do not stay two budgets -- which is why every walk
+/// has to stop where another budget's root begins (see [`evict`]).
+///
 /// `volume_of` and `available` are parameters so a test can describe two
 /// volumes without needing two.
 fn budgets_by_volume(
@@ -496,7 +513,7 @@ fn budgets_by_volume(
         .map(|roots| {
             let available = roots.iter().filter_map(|root| available(root)).min();
             CacheBudget {
-                roots,
+                roots: outermost(&roots),
                 limit: CacheLimit {
                     configured,
                     available,
@@ -543,11 +560,6 @@ async fn cache_roots(state: &AppState) -> CacheRoots {
     // cache roots and the resolved `downloadsDir` -- and eviction emptying one
     // must not take the directory with it.
     let keep_dirs: HashSet<_> = download_dirs.iter().cloned().collect();
-    // A root inside another root would have its files walked, counted and
-    // aged twice -- `WalkDir` does not know the two overlap. Keeping only the
-    // outermost is what makes a downloads dir *under* a cache root (or a
-    // cache root under the downloads dir) a single walk of the outer one.
-    download_dirs = outermost(&download_dirs);
 
     // Everything a live engine writes, at the paths the backend reports (a
     // pinned engine stays live, so its data is protected for as long as
@@ -556,20 +568,31 @@ async fn cache_roots(state: &AppState) -> CacheRoots {
         state.engine.protected_paths().await.into_iter().collect();
     protected_paths.extend(state.download_engine.protected_paths().await);
 
-    // One budget per volume. The two engines normally share one directory and
-    // the downloads dir is under it, so this is normally a single budget and
-    // the whole of what follows is what it always was.
+    // One budget per volume, each collapsed to its outermost roots. The two
+    // engines normally share one directory and the downloads dir is under it,
+    // so this is normally a single budget over a single walked root and the
+    // whole of what follows is what it always was.
     let budgets = budgets_by_volume(
         &download_dirs,
         limit,
         |path| enginefs::volume_id(path).ok(),
         available_space,
     );
+    // Where it is not -- a downloads dir on a drive mounted under the cache
+    // root -- the two survive as separate roots, and neither walk may wander
+    // into the other: `WalkDir` would happily cross the mount and count the
+    // drive's bytes against the cache root's cap, which is the reading the
+    // per-volume budgets exist to stop.
+    let boundaries: HashSet<_> = budgets
+        .iter()
+        .flat_map(|budget| budget.roots.iter().cloned())
+        .collect();
 
     CacheRoots {
         budgets,
         protected_paths,
         keep_dirs,
+        boundaries,
     }
 }
 
@@ -600,6 +623,7 @@ pub(crate) async fn clean_cache(state: &AppState) -> anyhow::Result<EvictionRepo
                 &budget.roots,
                 &roots.protected_paths,
                 &roots.keep_dirs,
+                &roots.boundaries,
                 budget.limit,
             )
             .await?,
@@ -622,7 +646,14 @@ pub(crate) async fn usage(state: &AppState) -> CacheUsage {
     roots
         .budgets
         .iter()
-        .map(|budget| scan_usage(&budget.roots, &roots.protected_paths, budget.limit))
+        .map(|budget| {
+            scan_usage(
+                &budget.roots,
+                &roots.protected_paths,
+                &roots.boundaries,
+                budget.limit,
+            )
+        })
         .reduce(CacheUsage::combined_with)
         .unwrap_or_default()
 }
@@ -709,6 +740,7 @@ impl CacheUsage {
 fn scan_usage(
     download_dirs: &[std::path::PathBuf],
     protected_paths: &HashSet<std::path::PathBuf>,
+    boundaries: &HashSet<std::path::PathBuf>,
     limit: CacheLimit,
 ) -> CacheUsage {
     let mut total = 0u64;
@@ -720,7 +752,7 @@ fn scan_usage(
             continue;
         }
 
-        let mut entries = walkdir::WalkDir::new(download_dir).into_iter();
+        let mut entries = walk_within(download_dir, boundaries);
 
         loop {
             match entries.next() {
@@ -866,7 +898,10 @@ impl EvictionReport {
 /// Sizes are occupancy, not apparent length (see [`occupied_bytes`]).
 ///
 /// Every root handed in is walked to the bottom, the downloads dir included
-/// (`cache_roots` puts it in the list). Nothing is excluded by *where* it
+/// (`cache_roots` puts it in the list) -- to the bottom of *this volume*: a
+/// walk stops where another budget's root begins ([`walk_within`]), which is
+/// the only place a root can be nested inside another one by the time
+/// [`budgets_by_volume`] is done. Nothing else is excluded by *where* it
 /// lives; what a run may not touch is decided by `protected_paths` alone, and
 /// that is the only thing between the cleaner and a download somebody is
 /// watching. Callers that add a root must therefore make sure whatever must
@@ -876,6 +911,7 @@ async fn evict(
     download_dirs: &[std::path::PathBuf],
     protected_paths: &HashSet<std::path::PathBuf>,
     keep_dirs: &HashSet<std::path::PathBuf>,
+    boundaries: &HashSet<std::path::PathBuf>,
     limit: CacheLimit,
 ) -> anyhow::Result<EvictionReport> {
     // 2. Scan and Evict immediately based on age (30 days)
@@ -898,7 +934,7 @@ async fn evict(
             continue;
         }
 
-        let mut entries = walkdir::WalkDir::new(download_dir).into_iter();
+        let mut entries = walk_within(download_dir, boundaries);
 
         loop {
             match entries.next() {
@@ -1105,6 +1141,30 @@ fn is_session_artifact(path: &std::path::Path, root: &std::path::Path) -> bool {
     }
 }
 
+/// Walk `root` to the bottom, but never down into a directory that is one of
+/// `boundaries` -- the roots the other budgets walk.
+///
+/// `WalkDir` crosses mount points, and it has to: the cache root is one
+/// filesystem and everything the cleaner is responsible for in it must be
+/// reachable. But a root on another volume is another budget's, weighed
+/// against another volume's free space, and a walk that descended into it
+/// would count and evict its files against a cap that says nothing about the
+/// disk they are on -- exactly what [`budgets_by_volume`] splits the roots up
+/// to prevent. Within one volume there is nothing to stop at: those roots
+/// collapsed into this one before the walk began.
+///
+/// The root itself is at depth 0 and is therefore never its own boundary.
+fn walk_within<'a>(
+    root: &std::path::Path,
+    boundaries: &'a HashSet<std::path::PathBuf>,
+) -> walkdir::FilterEntry<walkdir::IntoIter, impl FnMut(&walkdir::DirEntry) -> bool + 'a> {
+    walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_entry(move |entry| {
+            entry.depth() == 0 || !entry.file_type().is_dir() || !boundaries.contains(entry.path())
+        })
+}
+
 /// The roots that are not inside another root, component-wise. `WalkDir` has
 /// no idea that two roots overlap, so walking a parent and its child would
 /// count, age and evict everything under the child twice; keeping only the
@@ -1158,9 +1218,9 @@ async fn remove_empty_parents(mut dir: &std::path::Path, keep: &HashSet<std::pat
 #[cfg(test)]
 mod tests {
     use super::{
-        CACHE_FREE_SPACE_FLOOR, CacheLimit, CleanSchedule, DiskFullRecovery, EvictionReport,
-        available_space, budgets_by_volume, evict, is_path_protected, is_session_artifact,
-        occupied_bytes, outermost, remove_empty_parents, scan_usage,
+        CACHE_FREE_SPACE_FLOOR, CacheLimit, CacheUsage, CleanSchedule, DiskFullRecovery,
+        EvictionReport, available_space, budgets_by_volume, evict, is_path_protected,
+        is_session_artifact, occupied_bytes, outermost, remove_empty_parents, scan_usage,
     };
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
@@ -1208,16 +1268,28 @@ mod tests {
         }
     }
 
-    /// `evict` where every walked root is also a directory to keep: the
-    /// ordinary shape, with nothing collapsed into anything. The tests about
-    /// the collapse build their own keep-set and call `evict` directly.
+    /// `evict` where every walked root is also a directory to keep and the
+    /// only boundary: the ordinary shape, one budget with nothing collapsed
+    /// into anything and no second volume to stop at. The tests about the
+    /// collapse and about two volumes build their own sets and call `evict`
+    /// directly.
     async fn evict_roots(
         download_dirs: &[PathBuf],
         protected_paths: &HashSet<PathBuf>,
         limit: CacheLimit,
     ) -> anyhow::Result<EvictionReport> {
-        let keep = download_dirs.iter().cloned().collect();
-        evict(download_dirs, protected_paths, &keep, limit).await
+        let keep: HashSet<PathBuf> = download_dirs.iter().cloned().collect();
+        evict(download_dirs, protected_paths, &keep, &keep, limit).await
+    }
+
+    /// [`scan_usage`] for one budget whose roots are the only ones walked.
+    fn scan_roots(
+        download_dirs: &[PathBuf],
+        protected_paths: &HashSet<PathBuf>,
+        limit: CacheLimit,
+    ) -> CacheUsage {
+        let boundaries = download_dirs.iter().cloned().collect();
+        scan_usage(download_dirs, protected_paths, &boundaries, limit)
     }
 
     /// The keep-set of a plain root: what `cache_roots` builds when no
@@ -1454,6 +1526,7 @@ mod tests {
             std::slice::from_ref(&root),
             &HashSet::new(),
             &keep,
+            &HashSet::from([root.clone()]),
             CacheLimit::configured(0),
         )
         .await
@@ -1535,6 +1608,116 @@ mod tests {
             report.limit,
             Some(per_volume.iter().sum()),
             "and the one report a client gets adds the volumes' caps up, {report:?}"
+        );
+    }
+
+    /// The grouping has to happen before the collapse, because the collapse
+    /// is what destroys the question.
+    ///
+    /// `outermost` throws away a root that sits inside another, and
+    /// `prepare_downloads_dir` deliberately permits a `downloadsDir` *below* a
+    /// cache root. On a desktop that dir is an external drive mounted there --
+    /// so collapsed first, the drive stopped being a root at all and was never
+    /// asked which volume it was on: its bytes were walked as part of the cache
+    /// root and capped by the cache root's free space, a cap about a volume they
+    /// are not on. That is the exact reading per-volume budgets exist to stop.
+    /// Grouped first, the mount is its own budget, while a plain subdirectory
+    /// that really does share the volume still collapses into one walk.
+    #[test]
+    fn roots_are_grouped_by_volume_before_they_are_collapsed() {
+        let cache = PathBuf::from("/c/rqbit-downloads");
+        let archive = cache.join("archive");
+        let offline = cache.join("offline");
+        let external = |path: &Path| path.starts_with(&offline);
+        let budgets = budgets_by_volume(
+            &[cache.clone(), archive.clone(), offline.clone()],
+            0,
+            |path| Some(if external(path) { 2 } else { 1 }),
+            |path| Some(if external(path) { 0 } else { 1 << 40 }),
+        );
+
+        assert_eq!(
+            budgets.len(),
+            2,
+            "the mount under the cache root is a volume of its own"
+        );
+        assert_eq!(
+            budgets[0].roots,
+            vec![cache.clone()],
+            "a subdirectory sharing the volume is still one walk, not two"
+        );
+        assert_eq!(
+            budgets[0].limit.available,
+            Some(1 << 40),
+            "and the cache root is not capped by the drive mounted inside it"
+        );
+        assert_eq!(budgets[1].roots, vec![offline.clone()]);
+        assert_eq!(budgets[1].limit.available, Some(0), "which has its own cap");
+    }
+
+    /// And the two budgets stay two walks: `WalkDir` crosses mount points, so
+    /// without a stop the cache root's walk would count and evict the download
+    /// drive's files all over again, against a cap that says nothing about the
+    /// disk they are on -- undoing the split the budgets just made.
+    #[tokio::test]
+    async fn a_walk_stops_where_another_volumes_root_begins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("rqbit-downloads");
+        let offline = cache.join("offline");
+        // Both stale, so the age rule alone decides: a cap of 0 would spare
+        // either of them as a single file bigger than the whole cap.
+        let forty_days = Duration::from_secs(40 * 24 * 60 * 60);
+        let film = cache.join(HASH).join("film.mkv");
+        write_aged(&film, &[0u8; 4096], forty_days);
+        let download = offline.join(OTHER_HASH).join("movie.mkv");
+        write_aged(&download, &[0u8; 8192], forty_days);
+
+        let external = |path: &Path| path.starts_with(&offline);
+        let budgets = budgets_by_volume(
+            &[cache.clone(), offline.clone()],
+            0,
+            |path| Some(if external(path) { 2 } else { 1 }),
+            |_| Some(1 << 40),
+        );
+        let boundaries: HashSet<PathBuf> = budgets
+            .iter()
+            .flat_map(|budget| budget.roots.iter().cloned())
+            .collect();
+
+        let totals: Vec<u64> = budgets
+            .iter()
+            .map(|budget| {
+                scan_usage(
+                    &budget.roots,
+                    &HashSet::new(),
+                    &boundaries,
+                    CacheLimit::configured(u64::MAX),
+                )
+                .total_bytes
+            })
+            .collect();
+        assert_eq!(
+            totals,
+            vec![occupancy(&film), occupancy(&download)],
+            "each volume's occupancy is its own"
+        );
+
+        // And the destructive half: the cache root ages out its own film and
+        // cannot reach across the mount for the equally stale download.
+        let keep: HashSet<PathBuf> = HashSet::from([cache.clone(), offline.clone()]);
+        evict(
+            &budgets[0].roots,
+            &HashSet::new(),
+            &keep,
+            &boundaries,
+            CacheLimit::configured(0),
+        )
+        .await
+        .unwrap();
+        assert!(!film.exists(), "the cache root evicts its own");
+        assert!(
+            download.is_file(),
+            "the download drive is another budget's to answer for"
         );
     }
 
@@ -1628,7 +1811,7 @@ mod tests {
         let roots = outermost(&roots);
         assert_eq!(roots, vec![root.clone()]);
 
-        let usage = scan_usage(&roots, &HashSet::new(), CacheLimit::configured(u64::MAX));
+        let usage = scan_roots(&roots, &HashSet::new(), CacheLimit::configured(u64::MAX));
         assert_eq!(
             usage.total_bytes,
             occupancy(&download) + occupancy(&cache),
@@ -1770,7 +1953,7 @@ mod tests {
             return;
         }
 
-        let usage = scan_usage(
+        let usage = scan_roots(
             std::slice::from_ref(&root),
             &HashSet::new(),
             CacheLimit::configured(0),
@@ -1807,7 +1990,7 @@ mod tests {
         // a distinct, explicit zero-size cap, per `ServerSettings.cache_size`
         // -- `Some(0.0)`, not `None` -- and `CacheUsage` must not blur the
         // two the way `EvictionReport::shortfall_message` does).
-        let usage = scan_usage(
+        let usage = scan_roots(
             std::slice::from_ref(&root),
             &protected,
             CacheLimit::configured(u64::MAX),
