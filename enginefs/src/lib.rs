@@ -6157,10 +6157,6 @@ mod tests {
 
     // --- pin persistence across restarts ---
 
-    /// Pins are written to `pinned-downloads.json` on every change and
-    /// re-applied at startup to the torrents the backend restored; pins of
-    /// files that do not exist are dropped and the file rewritten; an
-    /// unreadable file is ignored.
     /// What the startup sweep must and must not take. The claims come from
     /// two places, and both have to count: the torrents the backend restored,
     /// and the pins it did not -- a dormant pin has no engine, so a sweep that
@@ -6218,6 +6214,10 @@ mod tests {
         assert!(pieces.join(TEST_HASH).is_dir());
     }
 
+    /// Pins are written to `pinned-downloads.json` on every change and
+    /// re-applied at startup to the torrents the backend restored; pins of
+    /// files that do not exist are dropped and the file rewritten; an
+    /// unreadable file is ignored.
     #[tokio::test]
     async fn pinned_downloads_are_persisted_and_restored() {
         let tmp = tempfile::tempdir().unwrap();
