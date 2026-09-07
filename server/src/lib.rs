@@ -75,6 +75,7 @@ mod auth;
 mod cache_cleaner;
 mod diagnostics;
 mod lan_media;
+mod proxy_cache;
 mod proxy_streams;
 mod routes;
 mod ssdp;
@@ -909,6 +910,17 @@ pub async fn run(
         );
     }
 
+    // The proxy cache's own launch-time sweep, before the router can serve a
+    // request that writes into it. It removes the temporary files a kill left
+    // mid-write and nothing else -- everything else under that root is cache
+    // that is meant to survive a restart. See `proxy_cache::sweep`.
+    {
+        let root = state.proxy_cache.root().to_path_buf();
+        if let Err(error) = tokio::task::spawn_blocking(move || proxy_cache::sweep(&root)).await {
+            tracing::warn!(%error, "the proxy cache sweep did not finish");
+        }
+    }
+
     let mut background_tasks = Vec::new();
     // The engines' tracker refresher is a forever loop like the rest, so it
     // belongs in the list this function aborts. Detached, it is still parked
@@ -1138,6 +1150,12 @@ async fn method_not_allowed_handler(
     );
     StatusCode::METHOD_NOT_ALLOWED
 }
+
+/// The proxy cache's chunk size, exported doc-hidden so the tests that pin
+/// what it stores can speak in whole chunks instead of repeating a number
+/// that is the store's to choose (see `proxy_cache::CHUNK_BYTES`).
+#[doc(hidden)]
+pub use proxy_cache::CHUNK_BYTES as PROXY_CACHE_CHUNK_BYTES;
 
 pub fn build_router(state: AppState) -> Router {
     let control = control_router().route_layer(axum::middleware::from_fn_with_state(

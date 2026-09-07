@@ -24,6 +24,12 @@ pub struct AppState {
     /// The proxied streams players are reading right now, so a client can
     /// end its own player's (see `crate::proxy_streams`).
     pub proxy_streams: Arc<crate::proxy_streams::ProxyStreams>,
+    /// What `/proxy` has already fetched, on disk (see
+    /// `crate::proxy_cache`). Rooted inside the engine's `download_dir`,
+    /// which is where the cache cleaner already walks, so every byte of it
+    /// is ordinary cache to the cleaner: counted, aged, evicted, never
+    /// pinned.
+    pub proxy_cache: Arc<crate::proxy_cache::ProxyCache>,
     /// The optional LAN media listener shared by `run` and `ServerHandle`
     /// (see `crate::lan_media`). Constructed disabled; `run` replaces it with
     /// one carrying `ServerConfig::lan_media_addr`.
@@ -89,6 +95,7 @@ impl AppState {
         log_dir: PathBuf,
     ) -> Self {
         let settings_path = config_dir.join("settings.json");
+        let proxy_cache = Arc::new(crate::proxy_cache::ProxyCache::new(&engine.download_dir));
 
         Self {
             engine,
@@ -105,6 +112,7 @@ impl AppState {
             nzb_sessions: Arc::new(dashmap::DashMap::new()),
             devices: Arc::new(RwLock::new(Vec::new())),
             proxy_streams: Arc::new(crate::proxy_streams::ProxyStreams::new()),
+            proxy_cache,
             lan_media: Arc::new(crate::lan_media::LanMedia::new(None)),
         }
     }

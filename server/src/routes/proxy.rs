@@ -476,7 +476,32 @@ fn custom_request_headers(overrides: &BTreeMap<String, String>) -> HeaderMap {
 /// Nothing else this route sends can be one. The player's own headers are
 /// a fixed allow-list (see `build_request`) with no credential in it, so
 /// `h=` is the only way a secret reaches an origin at all.
-const CREDENTIAL_REQUEST_HEADERS: [&str; 3] = ["authorization", "cookie", "proxy-authorization"];
+pub(crate) const CREDENTIAL_REQUEST_HEADERS: [&str; 3] =
+    ["authorization", "cookie", "proxy-authorization"];
+
+/// The player's own headers that reach the origin, and the whole of them:
+/// everything else a player sends is dropped, and `h=` is the only way
+/// anything not on this list gets there.
+///
+/// `connection` and `transfer-encoding` are deliberately absent: both
+/// describe the framing of one hop, and a proxied fetch is a new hop --
+/// reqwest frames its own request, and a `transfer-encoding: chunked` copied
+/// from a bodyless player request describes a body that is not there. There
+/// is no credential on it either, which is what makes
+/// [`CREDENTIAL_REQUEST_HEADERS`] a statement about `h=` alone.
+///
+/// A module-level constant because the proxy cache keys on it: what varies
+/// the origin's answer is this list minus the two headers that say *which
+/// bytes* of one answer are wanted. Two lists that had to agree about what
+/// the player sends would be a fifth place for a rule to drift (see
+/// [`CredentialChain`] for the four).
+pub(crate) const FORWARDED_REQUEST_HEADERS: [&str; 5] = [
+    "accept",
+    "accept-language",
+    "range",
+    "if-range",
+    "user-agent",
+];
 
 /// The same header map with every name in [`CREDENTIAL_REQUEST_HEADERS`]
 /// left out -- what a hop that no longer deserves the caller's secret is
@@ -622,6 +647,172 @@ fn finalize_response(builder: Builder, body: axum::body::Body) -> Response {
             (StatusCode::BAD_GATEWAY, "Proxy response error").into_response()
         }
     }
+}
+
+/// The CORS headers every proxied response carries, on the relay and on a
+/// cache hit alike. One function because a hit is the same response the
+/// relay would have made, with the bytes coming off disk instead of a
+/// socket, and a header set that differed between the two would be a header
+/// set a player could tell them apart by.
+fn with_cors(builder: Builder) -> Builder {
+    builder
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS")
+        .header(header::ACCESS_CONTROL_ALLOW_HEADERS, "*")
+}
+
+/// Whether the origin's own `Cache-Control` forbids keeping this response.
+///
+/// `no-store` and `private` say so outright: the first is "do not write this
+/// down", the second is "this is one client's copy", and `/proxy` takes no
+/// bearer token, so a private copy in a shared store is exactly the thing
+/// [`CREDENTIAL_REQUEST_HEADERS`] is refused over. `no-cache` and a
+/// `max-age` of zero say something weaker -- revalidate before you use it --
+/// but this cache never revalidates ([`crate::proxy_cache`] says so in one
+/// sentence), so for it they say the same thing.
+///
+/// Nothing else in the header is read. There is no freshness lifetime here
+/// to compute: an entry is served until the cleaner evicts it, and a
+/// `max-age` of an hour would not make that true any earlier.
+///
+/// **This header was read nowhere in this file before the cache existed.**
+/// The rule is being introduced, not inherited.
+fn origin_forbids_caching(res_headers: &HeaderMap) -> bool {
+    let Some(value) = res_headers
+        .get(header::CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    value.split(',').any(|directive| {
+        let directive = directive.trim();
+        directive.eq_ignore_ascii_case("no-store")
+            || directive.eq_ignore_ascii_case("no-cache")
+            || directive.eq_ignore_ascii_case("private")
+            || directive.split_once('=').is_some_and(|(name, seconds)| {
+                name.trim().eq_ignore_ascii_case("max-age")
+                    && seconds.trim().trim_matches('"').parse::<u64>() == Ok(0)
+            })
+    })
+}
+
+/// The entity a response describes and the span of it the body carries --
+/// `(body first byte, body last byte, entity length, content type)` -- when
+/// this is a response [`crate::proxy_cache`] may keep, and `None` for every
+/// response it may not.
+///
+/// What it refuses, and why each:
+///
+/// * **anything but a `200` or a `206`.** An error page, a `304` and a
+///   redirect the loop declined to follow are not the resource;
+/// * **a playlist.** Live content, and the branch above replaces the body
+///   with one of ours anyway. The verdict is the one already computed for
+///   the rewrite, never a second opinion;
+/// * **a body under a content coding.** The bytes are not what the framing
+///   headers a hit would be answered with describe;
+/// * **an origin that has not proved it answers ranges.** A `206` is the
+///   proof in itself; a `200` has to say `Accept-Ranges: bytes`. Storing
+///   anything else would let a later hit answer a range the origin never
+///   said it supports, which is claiming seekability for a stream that has
+///   none the moment the cache misses;
+/// * **an entity whose length the origin will not state.** There is nothing
+///   to file the chunks under and no `Content-Range` a hit could write;
+/// * **`Cache-Control`.** See [`origin_forbids_caching`].
+fn cacheable_entity(
+    status: StatusCode,
+    res_headers: &HeaderMap,
+    is_playlist: bool,
+    encoded_body: bool,
+) -> Option<(u64, u64, u64, String)> {
+    if is_playlist || encoded_body || origin_forbids_caching(res_headers) {
+        return None;
+    }
+    let content_type = res_headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let (first, last, total) = match status {
+        StatusCode::PARTIAL_CONTENT => res_headers
+            .get(header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_content_range)?,
+        StatusCode::OK => {
+            let answers_ranges = res_headers
+                .get(header::ACCEPT_RANGES)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("bytes"));
+            if !answers_ranges {
+                return None;
+            }
+            let total: u64 = res_headers
+                .get(header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse().ok())?;
+            (0, total.checked_sub(1)?, total)
+        }
+        _ => return None,
+    };
+    Some((first, last, total, content_type))
+}
+
+/// The response a cache hit is: the same framing the relay would have
+/// written, over bytes that came off disk instead of a socket.
+///
+/// `Accept-Ranges: bytes` is not invented here. An entity only exists in the
+/// store because the origin proved it answers ranges -- a `206`, or a `200`
+/// that said so (see [`cacheable_entity`]) -- so this is the origin's own
+/// claim, remembered.
+///
+/// What a hit does *not* carry, because the store does not keep it:
+/// `ETag`, `Last-Modified` and `Server`. A player that had ranged against a
+/// tag we could not produce again would be acting on the wrong evidence, and
+/// there is no revalidation here for a validator to be worth anything to.
+fn cache_hit_response(
+    state: &AppState,
+    player_token: Option<String>,
+    response_header_overrides: &BTreeMap<String, String>,
+    ranged: bool,
+    cached: crate::proxy_cache::Cached,
+) -> Response {
+    let mut builder = Response::builder().status(if ranged {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    });
+    if !cached.content_type.is_empty() {
+        builder = builder.header(header::CONTENT_TYPE, &cached.content_type);
+    }
+    builder = builder
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CONTENT_LENGTH, cached.held_to - cached.first + 1);
+    if ranged {
+        builder = builder.header(
+            header::CONTENT_RANGE,
+            format!("bytes {}-{}/{}", cached.first, cached.held_to, cached.total),
+        );
+    }
+    builder = apply_custom_response_headers(builder, response_header_overrides);
+    builder = with_cors(builder);
+
+    // Read through the registry like any other proxied body: a client that
+    // closes its player must break this read too, and a token retired while
+    // the lookup ran is a `410` here exactly as it is after a fetch.
+    let Some(body) = state
+        .proxy_streams
+        .attach(player_token.clone(), cached.body())
+    else {
+        tracing::debug!(
+            token = player_token.as_deref().unwrap_or_default(),
+            "a player token was closed while its range was being read from the cache"
+        );
+        return (
+            StatusCode::GONE,
+            "This player's stream was closed by its client",
+        )
+            .into_response();
+    };
+    finalize_response(builder, axum::body::Body::from_stream(body))
 }
 
 /// The proxy's own parameters, in whichever URL shape carried them: the
@@ -1000,25 +1191,93 @@ async fn proxy(
             .into_response();
     }
 
+    // What the cache can do for this request, asked here and nowhere else:
+    // `url` is final by now and no origin socket has been opened, so a hit
+    // answers without one and a partial hit narrows the `Range` the loop
+    // below is about to send. `entry` is `None` for a request the cache will
+    // not touch at all -- see [`crate::proxy_cache::ProxyCache::entry`] for
+    // the whole of that list.
+    //
+    // The lookup stats one file per chunk of the range, which for a cached
+    // film is thousands, so it goes to the blocking pool rather than onto
+    // the reactor.
+    let ranged = headers.contains_key(header::RANGE);
+    let cache_entry = state.proxy_cache.entry(
+        &method,
+        &url,
+        &params.request_headers,
+        &headers,
+        state.http_addr,
+    );
+    let (cache_entry, cached) = match cache_entry {
+        Some(entry) => {
+            let range = headers
+                .get(header::RANGE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            match tokio::task::spawn_blocking(move || {
+                let cached = entry.look_up(range.as_deref());
+                (entry, cached)
+            })
+            .await
+            {
+                Ok((entry, cached)) => (Some(entry), cached),
+                Err(error) => {
+                    tracing::debug!(%error, "the proxy cache lookup did not finish");
+                    (None, None)
+                }
+            }
+        }
+        None => (None, None),
+    };
+
+    // The whole of what was asked for is here. Nothing is fetched, and the
+    // origin never learns this read happened.
+    let cached = match cached {
+        Some(cached) if cached.complete() => {
+            tracing::debug!(
+                url = %url,
+                first = cached.first,
+                last = cached.last,
+                "answering a proxied range from the cache"
+            );
+            return cache_hit_response(
+                &state,
+                player_token,
+                &params.response_headers,
+                ranged,
+                cached,
+            );
+        }
+        held => held,
+    };
+
+    // Part of it is here, so the origin is asked for the rest and for
+    // nothing else. `held_to + 1` is a chunk boundary, which is what makes
+    // what comes back fill whole chunks and not two half ones.
+    let narrowed_range = cached.as_ref().map(|cached| cached.remaining_range());
+
     let custom_request_headers = custom_request_headers(&params.request_headers);
     let uncredentialed_request_headers = without_credentials(&custom_request_headers);
     let build_request = |client: &Client, url: &Url, carry_credentials: bool| {
         let mut req_builder = client.request(method.clone(), url.clone());
 
-        // What the player asked for, forwarded as it asked for it.
-        // `connection` and `transfer-encoding` are deliberately absent: both
-        // describe the framing of one hop, and this is a new hop -- reqwest
-        // frames its own request, and a `transfer-encoding: chunked` copied
-        // from a bodyless player request describes a body that is not there.
-        let allowed_req_headers = [
-            "accept",
-            "accept-language",
-            "range",
-            "if-range",
-            "user-agent",
-        ];
-
-        for name in allowed_req_headers {
+        // What the player asked for, forwarded as it asked for it -- see
+        // [`FORWARDED_REQUEST_HEADERS`] for what is on that list and what is
+        // not.
+        for name in FORWARDED_REQUEST_HEADERS {
+            // What is left of the player's `Range` after the cache, in place
+            // of the player's own. `RequestBuilder::header` *appends*, so
+            // this has to be a substitution and not an addition beside it:
+            // sending both left the origin to choose, and it chose the first
+            // -- the whole range, which is exactly the fetch the cache was
+            // narrowing away.
+            if name == "range"
+                && let Some(range) = narrowed_range.as_deref()
+            {
+                req_builder = req_builder.header(header::RANGE, range);
+                continue;
+            }
             if let Some(value) = headers.get(name) {
                 req_builder = req_builder.header(name, value);
             }
@@ -1363,6 +1622,65 @@ async fn proxy(
         );
     }
 
+    // The entity this response describes, when it is one the cache may keep
+    // -- and `None` for every response it may not. See [`cacheable_entity`]
+    // for the list and the reason behind each entry. `is_playlist` and
+    // `encoded_body` are the verdicts already reached above rather than a
+    // second opinion about the same body.
+    let cacheable = cache_entry
+        .as_ref()
+        .and_then(|_| cacheable_entity(status, &res_headers, is_playlist, encoded_body));
+
+    // Whether the cached head may go in front of what the origin just sent.
+    // What has to hold is that the two are parts of one entity, adjacent and
+    // in the same coding: a `206` whose `Content-Range` begins exactly where
+    // the cache left off, in an entity of the same length, under no content
+    // coding, and not a playlist.
+    //
+    // An origin that ignored the narrowed range and sent the whole file
+    // (`200`) is answered honestly: the head is dropped and the origin's own
+    // response relayed, which costs a re-fetch of bytes we held and nothing
+    // else.
+    //
+    // **The one case that is not free** is an origin that honoured the range
+    // and answered about a *different* entity -- the resource changed under
+    // the URL between the lookup and the fetch. The player then gets the
+    // origin's own `206`, which is an answer to the narrowed range and not
+    // to the one it asked for; it reads the `Content-Range`, finds bytes it
+    // did not ask for and re-reads. That re-read is clean, because the fill
+    // below has by then replaced the stale entity with the one the origin
+    // just described -- but it is a broken read, it is logged as one, and it
+    // is the price of narrowing a range against a store that never
+    // revalidates.
+    let stitched = match cached {
+        Some(cached)
+            if !is_playlist
+                && !encoded_body
+                && status == StatusCode::PARTIAL_CONTENT
+                && res_headers
+                    .get(header::CONTENT_RANGE)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(parse_content_range)
+                    .is_some_and(|(first, _, total)| {
+                        first == cached.held_to + 1 && total == cached.total
+                    }) =>
+        {
+            Some(cached)
+        }
+        Some(cached) => {
+            tracing::warn!(
+                url = %fetched_url,
+                status = %status,
+                cached_total = cached.total,
+                content_range = ?res_headers.get(header::CONTENT_RANGE),
+                "the origin did not answer the narrowed range as a part of the entity the \
+                 cache holds; relaying its answer and dropping what was cached"
+            );
+            None
+        }
+        None => None,
+    };
+
     // A rewritten playlist is the whole resource however it was asked for,
     // so it is answered `200` even when the origin said `206` -- and a
     // `HEAD` for it says the same, since what it describes is that same
@@ -1441,9 +1759,33 @@ async fn proxy(
         res_builder = res_builder.header(header::ACCEPT_RANGES, "none");
     } else {
         for name in relayed_body_res_headers {
+            // A body with a cached head in front of it is longer than the
+            // one the origin just described, and starts earlier in the
+            // entity. Its own framing is written below instead; relaying the
+            // origin's here as well would be the two-content-lengths hyper
+            // panics on.
+            if stitched.is_some() && matches!(name, "content-length" | "content-range") {
+                continue;
+            }
             if let Some(value) = res_headers.get(name) {
                 res_builder = res_builder.header(name, value);
             }
+        }
+        if let Some(cached) = stitched.as_ref() {
+            // The origin's own last byte, which is what its `Content-Range`
+            // said and may be short of what was asked for.
+            let origin_last = res_headers
+                .get(header::CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(parse_content_range)
+                .map(|(_, last, _)| last)
+                .unwrap_or(cached.last);
+            res_builder = res_builder
+                .header(
+                    header::CONTENT_RANGE,
+                    format!("bytes {}-{}/{}", cached.first, origin_last, cached.total),
+                )
+                .header(header::CONTENT_LENGTH, origin_last - cached.first + 1);
         }
     }
 
@@ -1451,11 +1793,7 @@ async fn proxy(
     // r= param can never poison the response builder.
     res_builder = apply_custom_response_headers(res_builder, &params.response_headers);
 
-    // CORS headers
-    res_builder = res_builder
-        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-        .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS")
-        .header(header::ACCESS_CONTROL_ALLOW_HEADERS, "*");
+    res_builder = with_cors(res_builder);
 
     if rewriting_playlist {
         // The playlist is rewritten as it arrives, a line at a time, and
@@ -1516,7 +1854,35 @@ async fn proxy(
         )
             .into_response();
     };
-    finalize_response(res_builder, axum::body::Body::from_stream(stream))
+
+    // The body, in the order it is built: the origin's bytes, the cache
+    // writer over them, and the cached head in front.
+    //
+    // **The writer goes on after `attach`, never before.** `attach` can
+    // refuse -- the token was retired while the origin was thinking -- and
+    // that refusal serves no bytes at all; a writer started before it would
+    // have been committing chunks off a stream nobody ever read. It goes
+    // *under* the registry's stream and not over it for the other half of
+    // the same rule: what the writer sees is what the player is being
+    // served, so a close or a client that vanished ends the fill at the same
+    // byte it ends the read (see [`crate::proxy_cache::Filling`], and
+    // `proxy_streams::Registration`'s `Drop` for how a vanished client gets
+    // here at all).
+    let mut body: std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>,
+    > = Box::pin(stream);
+    if let Some((first, _, total, content_type)) = cacheable
+        && let Some(entry) = cache_entry
+    {
+        body = Box::pin(crate::proxy_cache::Filling::new(
+            body,
+            entry.fill(total, &content_type, first),
+        ));
+    }
+    if let Some(cached) = stitched {
+        body = Box::pin(cached.body().chain(body));
+    }
+    finalize_response(res_builder, axum::body::Body::from_stream(body))
 }
 
 /// `POST /proxy-streams/{token}/close`: end every proxied stream the client
