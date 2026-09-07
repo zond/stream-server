@@ -6,6 +6,8 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context;
@@ -80,6 +82,27 @@ pub struct MissingPiece {
 /// the piece files it covers. A file is therefore not a unit of storage but a
 /// range of the torrent's global bytes, and two files that share a piece share
 /// its file -- which is what [`Self::remove_file`] has to be careful about.
+///
+/// # Open handles
+///
+/// librqbit writes a piece 16 KiB at a time and a stream reads it in 8 KiB
+/// or so, and the first version of this store opened and closed the piece
+/// file for every one of those -- and, for a read, probed the staging name
+/// first, so a complete piece cost two opens per read. On ext4 that is
+/// microseconds; on the FUSE-mediated external storage and exFAT cards a
+/// large offline download lands on, an open is 50-200 µs and the read path
+/// was a third of the wall time. So the store keeps the last few handles it
+/// opened ([`OPEN_HANDLES`], keyed by piece and by which copy) and knows in
+/// memory which pieces have a staged copy, and a piece written or streamed
+/// end to end is one open.
+///
+/// The cache changes nothing about what is on disk, and it must not change
+/// what a read sees either: a handle is forgotten before the file it names
+/// is renamed into place or deleted, and a piece's cached *complete* handle
+/// goes the moment a new staged copy is begun, since a read has to prefer
+/// the staged one. A handle still in a reader's hands survives that -- it
+/// is an `Arc` -- and keeps reading the bytes it had, which is the same
+/// thing a read that had already begun would do.
 pub struct PieceStore {
     /// `<root>/<info hash>`.
     dir: PathBuf,
@@ -87,11 +110,48 @@ pub struct PieceStore {
     /// File ids [`Self::remove_file`] has been asked to drop. A piece may
     /// only go when every file that owns bytes in it is in here.
     removed_files: Mutex<BTreeSet<usize>>,
+    /// Pieces that have a staged copy, as far as this process knows: added
+    /// by the first write to one, removed when it is completed or deleted,
+    /// seeded by `init` from what a previous process left. What lets a read
+    /// go straight to the complete copy of a piece nothing is re-writing,
+    /// instead of asking the filesystem for a staged one first every time.
+    /// Advisory only -- a read that finds no staged file where this says
+    /// there is one falls through to the complete copy -- so a stale entry
+    /// costs one probe, never a wrong answer.
+    staged: Mutex<BTreeSet<u32>>,
+    /// The handles most recently opened, most recent last -- see the type
+    /// doc. Empty on a store that has just been created or taken.
+    handles: Mutex<Vec<OpenHandle>>,
     /// False once [`TorrentStorage::take`] has handed the data path to a
     /// successor. The path-based operations keep working on a taken store,
     /// exactly as the filesystem backend's do: `Session::delete` calls
     /// `remove_file` on the storage it took.
     live: AtomicBool,
+    /// Files opened, and staging names probed and found absent, for the
+    /// tests that pin the open count -- the whole reason the cache exists.
+    #[cfg(test)]
+    opens: AtomicUsize,
+    #[cfg(test)]
+    staging_probes: AtomicUsize,
+}
+
+/// How many piece files a store keeps open.
+///
+/// librqbit has a handful of pieces in flight for a torrent and a stream
+/// reads one piece at a time in order, so a few entries cover the working
+/// set; the point is the ratio (one open per piece instead of one per
+/// chunk), not a hit rate, and eight of them is eight descriptors per
+/// torrent rather than the filesystem backend's one per file.
+pub const OPEN_HANDLES: usize = 8;
+
+/// One entry of [`PieceStore::handles`]: which piece, which copy of it
+/// (the staged one is a different file from the complete one), and the
+/// handle. The `Arc` is what a read or write borrows, so forgetting an
+/// entry never closes a file mid-operation.
+struct OpenHandle {
+    piece: u32,
+    staged: bool,
+    file: Arc<File>,
 }
 
 impl PieceStore {
@@ -103,7 +163,13 @@ impl PieceStore {
             dir,
             layout,
             removed_files: Mutex::new(BTreeSet::new()),
+            staged: Mutex::new(BTreeSet::new()),
+            handles: Mutex::new(Vec::new()),
             live: AtomicBool::new(true),
+            #[cfg(test)]
+            opens: AtomicUsize::new(0),
+            #[cfg(test)]
+            staging_probes: AtomicUsize::new(0),
         }
     }
 
@@ -151,7 +217,11 @@ impl PieceStore {
     pub fn complete_piece(&self, piece: u32) -> anyhow::Result<()> {
         let staged = self.staging_path(piece);
         let path = self.piece_path(piece);
-        match std::fs::rename(&staged, &path) {
+        // Before the rename: the staged handle names a file about to become
+        // the complete one, and a cached complete handle -- the old copy a
+        // re-download is replacing -- names bytes about to be unlinked.
+        self.forget_handles(piece);
+        let completed = match std::fs::rename(&staged, &path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound && path.is_file() => Ok(()),
             Err(e) => Err(anyhow::Error::new(e).context(format!(
@@ -159,7 +229,11 @@ impl PieceStore {
                 staged.display(),
                 path.display()
             ))),
+        };
+        if completed.is_ok() {
+            self.staged.lock().remove(&piece);
         }
+        completed
     }
 
     /// Reclaim one piece. This is the entry point the policy layer drives;
@@ -173,6 +247,10 @@ impl PieceStore {
     /// Returns whether a file was actually removed, so a caller counting what
     /// it freed does not have to stat first.
     pub fn delete_piece(&self, piece: u32) -> anyhow::Result<bool> {
+        // Before the unlink, or a later read of the same piece would be
+        // served the deleted bytes through the handle that outlived them.
+        self.forget_handles(piece);
+        self.staged.lock().remove(&piece);
         let mut removed = false;
         for path in [self.staging_path(piece), self.piece_path(piece)] {
             match std::fs::remove_file(&path) {
@@ -209,11 +287,18 @@ impl PieceStore {
     ///
     /// A staged piece with no complete copy is left alone: it shadows nothing,
     /// [`Self::has_piece`] is false for it, and a pause is allowed to keep its
-    /// in-flight work.
+    /// in-flight work. Those become [`Self::staged`] -- the walk has just
+    /// seen every staged file there is -- and a handle cached on a shadow
+    /// that went is forgotten with it, so this is safe to run on a store
+    /// that has been used, not only on a fresh one.
     fn discard_shadowing_staged(&self) -> anyhow::Result<()> {
+        let mut kept = BTreeSet::new();
         let buckets = match std::fs::read_dir(&self.dir) {
             Ok(buckets) => buckets,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                *self.staged.lock() = kept;
+                return Ok(());
+            }
             Err(e) => {
                 return Err(anyhow::Error::new(e).context(format!(
                     "could not read piece directory {}",
@@ -235,21 +320,77 @@ impl PieceStore {
                 // a cosmetic failure: the stale shadow it exists to delete is
                 // exactly what gets a half-written piece served as a verified
                 // one.
-                let Some(complete) = entry
-                    .file_name()
+                let name = entry.file_name();
+                let Some(complete) = name
                     .to_str()
                     .and_then(|name| name.strip_suffix(STAGING_SUFFIX))
-                    .map(|complete| staged.with_file_name(complete))
                 else {
                     continue;
                 };
-                if complete.is_file() {
+                let piece = complete.parse::<u32>().ok();
+                if staged.with_file_name(complete).is_file() {
+                    if let Some(piece) = piece {
+                        self.forget_handles(piece);
+                    }
                     let _ = std::fs::remove_file(&staged);
+                } else if let Some(piece) = piece {
+                    kept.insert(piece);
                 }
             }
         }
+        *self.staged.lock() = kept;
         Ok(())
     }
+
+    /// The cached handle for one copy of a piece, made the most recently
+    /// used.
+    fn cached_handle(&self, piece: u32, staged: bool) -> Option<Arc<File>> {
+        let mut handles = self.handles.lock();
+        let at = handles
+            .iter()
+            .position(|h| h.piece == piece && h.staged == staged)?;
+        let handle = handles.remove(at);
+        let file = handle.file.clone();
+        handles.push(handle);
+        Some(file)
+    }
+
+    /// Keep a freshly opened handle, dropping the least recently used one
+    /// past [`OPEN_HANDLES`].
+    fn remember_handle(&self, piece: u32, staged: bool, file: &Arc<File>) {
+        let mut handles = self.handles.lock();
+        handles.retain(|h| !(h.piece == piece && h.staged == staged));
+        if handles.len() >= OPEN_HANDLES {
+            handles.remove(0);
+        }
+        handles.push(OpenHandle {
+            piece,
+            staged,
+            file: file.clone(),
+        });
+    }
+
+    /// Drop every cached handle of a piece: its files are about to be
+    /// renamed, deleted or shadowed.
+    fn forget_handles(&self, piece: u32) {
+        self.handles.lock().retain(|h| h.piece != piece);
+    }
+
+    #[cfg(test)]
+    fn count_open(&self) {
+        self.opens.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(not(test))]
+    fn count_open(&self) {}
+
+    #[cfg(test)]
+    fn count_staging_probe(&self) {
+        self.staging_probes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(not(test))]
+    fn count_staging_probe(&self) {}
 
     fn ensure_live(&self) -> anyhow::Result<()> {
         if self.live.load(Ordering::Acquire) {
@@ -259,17 +400,29 @@ impl PieceStore {
         }
     }
 
-    /// Open a piece file for writing, creating it -- and its bucket directory
-    /// -- if this is the first byte to land in it. The retry is not
+    /// The staged copy of a piece, open for writing -- the cached handle
+    /// when there is one, otherwise the file, created along with its bucket
+    /// directory if this is the first byte to land in it. The retry is not
     /// belt-and-braces: `remove_directory_if_empty` prunes bucket directories
     /// that have gone empty, so a bucket really can disappear between one
     /// write and the next.
-    fn open_for_write(&self, piece: u32) -> anyhow::Result<File> {
+    fn open_for_write(&self, piece: u32) -> anyhow::Result<Arc<File>> {
+        if let Some(file) = self.cached_handle(piece, true) {
+            return Ok(file);
+        }
+        if self.staged.lock().insert(piece) {
+            // A new staged copy over a complete one: from here a read has
+            // to see the staged bytes, so a cached complete handle -- the
+            // old copy -- must not answer for the piece any more.
+            self.forget_handles(piece);
+        }
         let path = self.staging_path(piece);
         let mut opts = OpenOptions::new();
-        opts.write(true).create(true).truncate(false);
-        match opts.open(&path) {
-            Ok(f) => Ok(f),
+        // Read as well as write: the handle is cached under the staged copy
+        // and the hash check reads that copy back through the same entry.
+        opts.read(true).write(true).create(true).truncate(false);
+        let file = match opts.open(&path) {
+            Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent).with_context(|| {
@@ -277,11 +430,17 @@ impl PieceStore {
                     })?;
                 }
                 opts.open(&path)
-                    .with_context(|| format!("could not create piece file {}", path.display()))
+                    .with_context(|| format!("could not create piece file {}", path.display()))?
             }
-            Err(e) => Err(anyhow::Error::new(e)
-                .context(format!("could not open piece file {}", path.display()))),
-        }
+            Err(e) => {
+                return Err(anyhow::Error::new(e)
+                    .context(format!("could not open piece file {}", path.display())));
+            }
+        };
+        self.count_open();
+        let file = Arc::new(file);
+        self.remember_handle(piece, true, &file);
+        Ok(file)
     }
 
     /// The newest copy of a piece: the staged one if there is one, the
@@ -295,19 +454,46 @@ impl PieceStore {
     /// so far. Reading the newer copy cannot go wrong the other way, because
     /// rqbit does not count a piece it is downloading as ours: a peer's request
     /// for it is refused before it reaches storage, and a stream waits.
-    fn open_for_read(&self, piece: u32) -> anyhow::Result<File> {
-        let staged = self.staging_path(piece);
-        match File::open(&staged) {
-            Ok(f) => return Ok(f),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(anyhow::Error::new(e)
-                    .context(format!("could not open staged piece {}", staged.display())));
+    ///
+    /// Whether there is a staged copy is answered from [`Self::staged`], not
+    /// by trying to open one: the store is told about every staged copy it
+    /// creates and finds the rest at `init`, so a piece nothing is
+    /// re-writing goes straight to its complete file. The set is advisory --
+    /// a staged copy it names may have been completed a moment ago -- so
+    /// its "yes" is still checked against the filesystem and falls through;
+    /// only its "no" is trusted, and a wrong "no" would need a staged file
+    /// this process neither wrote nor saw at `init`, which nothing makes.
+    fn open_for_read(&self, piece: u32) -> anyhow::Result<Arc<File>> {
+        if self.staged.lock().contains(&piece) {
+            if let Some(file) = self.cached_handle(piece, true) {
+                return Ok(file);
             }
+            let staged = self.staging_path(piece);
+            match File::open(&staged) {
+                Ok(f) => {
+                    self.count_open();
+                    let file = Arc::new(f);
+                    self.remember_handle(piece, true, &file);
+                    return Ok(file);
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => self.count_staging_probe(),
+                Err(e) => {
+                    return Err(anyhow::Error::new(e)
+                        .context(format!("could not open staged piece {}", staged.display())));
+                }
+            }
+        }
+        if let Some(file) = self.cached_handle(piece, false) {
+            return Ok(file);
         }
         let path = self.piece_path(piece);
         match File::open(&path) {
-            Ok(f) => Ok(f),
+            Ok(f) => {
+                self.count_open();
+                let file = Arc::new(f);
+                self.remember_handle(piece, false, &file);
+                Ok(file)
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 Err(anyhow::Error::new(MissingPiece { piece }))
             }
@@ -517,9 +703,20 @@ impl TorrentStorage for PieceStore {
             dir: self.dir.clone(),
             layout: self.layout.clone(),
             removed_files: Mutex::new(self.removed_files.lock().clone()),
+            // The successor keeps knowing which pieces are staged -- a
+            // paused torrent resumes writing them -- and opens its own
+            // handles; the dead store's are closed, so a paused torrent
+            // holds no descriptors.
+            staged: Mutex::new(self.staged.lock().clone()),
+            handles: Mutex::new(Vec::new()),
             live: AtomicBool::new(true),
+            #[cfg(test)]
+            opens: AtomicUsize::new(0),
+            #[cfg(test)]
+            staging_probes: AtomicUsize::new(0),
         };
         self.live.store(false, Ordering::Release);
+        self.handles.lock().clear();
         Ok(Box::new(successor))
     }
 }
@@ -946,7 +1143,12 @@ mod tests {
         let global = global_bytes(store.layout().total_length());
         fill(&store, &global, 8);
 
-        // Piece 2 is file 2's alone, and file 2 starts there.
+        // Piece 2 is file 2's alone, and file 2 starts there. Read first,
+        // so the complete copy's handle is the cached one when the new
+        // staged copy begins -- the cache must not let it answer.
+        let mut buf = [0u8; 8];
+        store.pread_exact(2, 0, &mut buf).unwrap();
+        assert_eq!(buf, global[16..24]);
         let again: Vec<u8> = global[16..24].iter().map(|b| !b).collect();
         store.pwrite_all(2, 0, &again).unwrap();
         assert!(
@@ -954,7 +1156,6 @@ mod tests {
             "the complete copy is still there: it is what the caller has not \
              released yet"
         );
-        let mut buf = [0u8; 8];
         store.pread_exact(2, 0, &mut buf).unwrap();
         assert_eq!(buf.to_vec(), again, "a read gets what was written last");
 
@@ -962,6 +1163,135 @@ mod tests {
         assert_eq!(std::fs::read(store.piece_path(2)).unwrap(), again);
         store.pread_exact(2, 0, &mut buf).unwrap();
         assert_eq!(buf.to_vec(), again);
+    }
+
+    /// The open count is the reason the handle cache exists: a piece is
+    /// written in 16 KiB chunks and streamed in 8 KiB reads, and each of
+    /// those used to be an open and a close -- two opens for a read, since
+    /// the staging name was probed first. Now a piece written end to end
+    /// and a piece streamed end to end are one open each, and a complete
+    /// piece's read never asks the filesystem about a staged copy.
+    #[test]
+    fn a_piece_is_opened_once_to_write_and_once_to_stream() {
+        let tmp = tempfile::tempdir().unwrap();
+        let piece_length = 256 * 1024;
+        let pieces = 4u64;
+        let specs = [FileSpec::payload(piece_length * pieces)];
+        let store = open_store(tmp.path(), piece_length, &specs);
+        let payload: Vec<u8> = (0..piece_length * pieces)
+            .map(|i| (i % 253) as u8)
+            .collect();
+
+        for (n, chunk) in payload.chunks(16 * 1024).enumerate() {
+            store.pwrite_all(0, (n * 16 * 1024) as u64, chunk).unwrap();
+        }
+        assert_eq!(
+            store.opens.load(Ordering::Relaxed),
+            pieces as usize,
+            "one open per piece written, not per chunk"
+        );
+        for piece in 0..pieces as u32 {
+            store.complete_piece(piece).unwrap();
+        }
+
+        store.opens.store(0, Ordering::Relaxed);
+        let mut buf = vec![0u8; 8 * 1024];
+        for n in 0..(payload.len() / buf.len()) {
+            let at = n * buf.len();
+            store.pread_exact(0, at as u64, &mut buf).unwrap();
+            assert_eq!(buf, payload[at..at + buf.len()]);
+        }
+        assert_eq!(
+            store.opens.load(Ordering::Relaxed),
+            pieces as usize,
+            "one open per piece streamed, not per read"
+        );
+        assert_eq!(
+            store.staging_probes.load(Ordering::Relaxed),
+            0,
+            "a complete piece nothing is re-writing is never probed for a staged copy"
+        );
+    }
+
+    /// A cached handle keeps a deleted file's bytes readable for as long as
+    /// it is held, so the cache must let go of a piece before the piece is
+    /// deleted -- or a read after the delete would answer with bytes the
+    /// store just said were gone.
+    #[test]
+    fn a_cached_handle_does_not_outlive_its_piece() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path(), PIECE_LENGTH, &SPECS);
+        let global = global_bytes(store.layout().total_length());
+        fill(&store, &global, 8);
+
+        let mut buf = [0u8; 8];
+        store.pread_exact(2, 0, &mut buf).unwrap();
+        assert!(store.delete_piece(2).unwrap());
+        let err = store.pread_exact(2, 0, &mut buf).unwrap_err();
+        assert!(
+            err.chain()
+                .any(|e| e.downcast_ref::<MissingPiece>().is_some()),
+            "the read sees the deletion, not the old handle: {err:#}"
+        );
+
+        // The same for a file's removal, which goes through delete_piece.
+        store.pread_exact(0, 0, &mut buf).unwrap();
+        store.remove_file(0, Path::new("f0")).unwrap();
+        assert!(store.pread_exact(0, 0, &mut buf).is_err());
+    }
+
+    /// What a fresh process knows about staged copies comes from `init`'s
+    /// walk, and it has to: a read of a staged piece that only a previous
+    /// process wrote must still get the staged bytes, not "missing".
+    #[test]
+    fn init_learns_which_pieces_a_previous_process_left_staged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path(), PIECE_LENGTH, &SPECS);
+        let global = global_bytes(store.layout().total_length());
+        // Piece 0 staged only; piece 2 complete with a stale shadow.
+        store.pwrite_all(0, 0, &global[0..8]).unwrap();
+        fill_piece(&store, &global, 2);
+        store.pwrite_all(2, 0, &[0u8; 3]).unwrap();
+
+        let fresh = open_store(tmp.path(), PIECE_LENGTH, &SPECS);
+        assert!(
+            fresh.staged.lock().is_empty(),
+            "a store that has not run init knows nothing yet"
+        );
+        fresh.discard_shadowing_staged().unwrap();
+        assert_eq!(
+            *fresh.staged.lock(),
+            BTreeSet::from([0]),
+            "the lone staged piece is known; the shadow was discarded, not recorded"
+        );
+        let mut buf = [0u8; 8];
+        fresh.pread_exact(0, 0, &mut buf).unwrap();
+        assert_eq!(buf, global[0..8], "read through the staged copy");
+        fresh.pread_exact(2, 0, &mut buf).unwrap();
+        assert_eq!(
+            buf,
+            global[16..24],
+            "and the verified one where the shadow was"
+        );
+    }
+
+    /// Complete exactly one piece of the store: written under its staging
+    /// name and moved into place, like a download of only that piece.
+    fn fill_piece(store: &PieceStore, global: &[u8], piece: u32) {
+        let start = piece as u64 * PIECE_LENGTH;
+        let end = (start + PIECE_LENGTH).min(global.len() as u64);
+        for (file_id, spec) in SPECS.iter().enumerate() {
+            let base = file_offset(file_id);
+            if spec.padding || base + spec.len <= start || base >= end {
+                continue;
+            }
+            let from = start.max(base);
+            let to = end.min(base + spec.len);
+            store
+                .pwrite_all(file_id, from - base, &global[from as usize..to as usize])
+                .expect("write");
+        }
+        store.complete_piece(piece).expect("complete");
     }
 
     /// The pair above is explained by bookkeeping that does not survive the
@@ -1058,15 +1388,30 @@ mod tests {
         fill(&store, &global, 8);
         store.remove_file(2, Path::new("f2")).unwrap();
 
+        // A piece being re-downloaded when the torrent pauses: the
+        // successor has to know its staged copy is the one to read.
+        let again: Vec<u8> = global[0..8].iter().map(|b| !b).collect();
+        store.pwrite_all(0, 0, &again).unwrap();
+        store.pread_exact(0, 0, &mut [0u8; 4]).unwrap();
+        assert!(!store.handles.lock().is_empty(), "handles are open");
+
         let successor = store.take().unwrap();
         assert!(
             store.pread_exact(0, 0, &mut [0u8; 4]).is_err(),
             "the taken storage is dead"
         );
         assert!(store.pwrite_all(0, 0, &[0u8; 4]).is_err());
+        assert!(
+            store.handles.lock().is_empty(),
+            "and holds no descriptors: a paused torrent keeps no files open"
+        );
         let mut buf = [0u8; 4];
         successor.pread_exact(0, 0, &mut buf).unwrap();
-        assert_eq!(buf, global[0..4], "the successor kept the directory");
+        assert_eq!(
+            buf,
+            again[0..4],
+            "the successor kept the directory, and knows which copy is newest"
+        );
 
         // `Session::delete` deletes through what `take` gave it, so the
         // successor has to remember that file 2 is already gone -- otherwise
