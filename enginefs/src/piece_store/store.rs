@@ -111,6 +111,11 @@ impl PieceStore {
     /// Whether a piece is on disk at all. Not whether it is *complete*: a
     /// piece written by half its chunks has a short file, and only a hash
     /// check can tell the difference.
+    ///
+    /// False for ever for a piece lying entirely inside a BEP-47 padding
+    /// file: nobody transfers those bytes, so nothing ever writes it. That is
+    /// the one hole in "piece presence is the have-set", and the module docs
+    /// say why it is left open rather than papered over with an empty file.
     pub fn has_piece(&self, piece: u32) -> bool {
         self.piece_path(piece).is_file()
     }

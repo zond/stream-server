@@ -14,6 +14,17 @@
 //!   holes.
 //! * **Piece presence is the have-set.** There is no record of ours for a
 //!   crash to leave disagreeing with the disk; the disk *is* the record.
+//!   With one exception, stated here because this is where the invariant is
+//!   claimed: a piece lying *entirely* inside a BEP-47 padding file has no
+//!   owner to write it, so it never gets a file and
+//!   [`store::PieceStore::has_piece`] is false for it for ever. Nothing
+//!   transfers those bytes -- librqbit skips padding on every storage path
+//!   -- so no read can reach the piece and no hash check waits on it; it is
+//!   not payload. Giving it a zero-byte file would put a have-record on disk
+//!   that no write ever justified, which is the failure mode this design
+//!   exists to remove, so the hole is named rather than filled. A conforming
+//!   torrent cannot open one anyway: padding runs to the next piece boundary
+//!   and is therefore always shorter than a piece.
 //! * **It is not an rqbit core change.** `TorrentStorage` and `StorageFactory`
 //!   are existing public seams, and enginefs reads through
 //!   `librqbit::FileStreamOptions` rather than opening files itself, so this
