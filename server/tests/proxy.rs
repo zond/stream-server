@@ -1,11 +1,13 @@
 //! What `/proxy` does with a caller-supplied remote URL.
 //!
-//! The route is a *relay*: it opens the target with reqwest and streams the
-//! bytes back. Nothing it fetches is written to the cache the cleaner walks,
-//! and nothing it fetched once is served from disk the second time. That is
-//! worth pinning here because embedders lean on it in both directions -- a
-//! client sending every remote stream through this server gets the header
-//! rewriting and the single egress point, and does *not* get caching.
+//! The route opens the target with reqwest, streams the bytes back, and
+//! **keeps the whole chunks of them it is allowed to keep**, so the next read
+//! of the same bytes is answered from disk (`server/src/proxy_cache.rs`). A
+//! client sending every remote stream through this server therefore gets the
+//! header rewriting, the single egress point *and* a cache -- but a narrow
+//! one, and the tests below pin both halves: what it serves without asking
+//! the origin, what it asks the origin for when it holds only part of a
+//! range, and every reason it refuses to keep a response at all.
 //!
 //! Both URL shapes are exercised. The Core path format
 //! (`/proxy/d=<origin>&h=.../<path>`) is the one stremio-core builds and
@@ -180,6 +182,17 @@ impl Origin {
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("the origin was asked for something")
     }
+
+    /// Whether the origin has been asked for anything it has not been asked
+    /// about yet -- how a cache hit is told from a fetch.
+    ///
+    /// Not a timing assertion: the responder records a request *before* it
+    /// writes a byte of the answer, so by the time a proxied response has
+    /// been read to its end, an origin fetch that happened has already
+    /// arrived here. Nothing has, and nothing will.
+    fn was_asked_for_nothing_more(&self) -> bool {
+        self.requests.try_recv().is_err()
+    }
 }
 
 /// Percent-encodes everything but the unreserved set, which is what a `d=`
@@ -346,12 +359,16 @@ fn a_byte_range_is_forwarded_to_the_origin_and_its_206_relayed_back() -> anyhow:
     Ok(())
 }
 
-/// The proxy relays; it does not cache. Nothing it fetched lands under the
-/// cache root, and a second request for the same bytes goes back out to the
-/// origin. Anything relying on a proxied stream being cheap to re-read has
-/// to provide that cache itself.
+/// A range shorter than a chunk leaves nothing behind, and is fetched again
+/// every time it is asked for.
+///
+/// Only *whole* chunks are stored -- there is no hash to tell a complete
+/// chunk from a truncated one, so completeness is a rename and a rename only
+/// happens when the chunk is full -- and a hundred bytes never fill one. It
+/// is the ordinary shape of a probe rather than of playback, and the cache
+/// deliberately does nothing for it.
 #[test]
-fn nothing_the_proxy_fetched_is_cached() -> anyhow::Result<()> {
+fn a_read_too_short_to_fill_a_chunk_is_not_cached() -> anyhow::Result<()> {
     let fixture = fixture()?;
     let origin = format!("http://{}", fixture.origin.addr);
     let url = format!("{}/proxy/d={}/movie.mp4", fixture.base, encode(&origin));
@@ -370,19 +387,428 @@ fn nothing_the_proxy_fetched_is_cached() -> anyhow::Result<()> {
     for _ in 0..2 {
         assert_eq!(fixture.origin.next_request().range(), Some("bytes=0-99"));
     }
+    assert_eq!(cached_chunks(&fixture).len(), 0);
 
-    // And a megabyte of proxied stream leaves nothing behind: the cache root
-    // holds only what the torrent engine put there.
-    let cached: Vec<_> = walk(&fixture.cache_root.path().join("cache"))
-        .into_iter()
-        .filter(|entry| entry.is_file())
-        .collect();
+    drop(fixture.handle);
+    Ok(())
+}
+
+/// The headline: a range the cache holds whole is answered off disk, and the
+/// origin never learns the read happened.
+#[test]
+fn a_range_the_cache_holds_is_served_without_asking_the_origin() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let origin = format!("http://{}", fixture.origin.addr);
+    let url = format!("{}/proxy/d={}/movie.mp4", fixture.base, encode(&origin));
+    let client = reqwest::blocking::Client::new();
+    let two_chunks = format!("bytes=0-{}", CHUNK * 2 - 1);
+
+    let first = client
+        .get(&url)
+        .header(reqwest::header::RANGE, &two_chunks)
+        .send()?;
+    assert_eq!(first.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(first.bytes()?.len() as u64, CHUNK * 2);
+    assert_eq!(fixture.origin.next_request().range(), Some(&*two_chunks));
+    wait_for_chunks(&fixture, 2);
+
+    let second = client
+        .get(&url)
+        .header(reqwest::header::RANGE, &two_chunks)
+        .send()?;
+    assert_eq!(second.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    let headers = second.headers().clone();
+    assert_eq!(
+        header(&headers, "content-range"),
+        Some(format!("bytes 0-{}/{ORIGIN_LENGTH}", CHUNK * 2 - 1)).as_deref(),
+        "the whole range, off disk"
+    );
+    assert_eq!(
+        header(&headers, "content-length"),
+        Some((CHUNK * 2).to_string()).as_deref()
+    );
+    assert_eq!(
+        header(&headers, "accept-ranges"),
+        Some("bytes"),
+        "the origin proved it answers ranges; this is that claim remembered"
+    );
+    assert_eq!(
+        header(&headers, "content-type"),
+        Some("video/mp4"),
+        "and the type it labelled the entity with, which a hit has to say too"
+    );
+    let body = second.bytes()?;
+    assert_eq!(body.len() as u64, CHUNK * 2);
+    assert_eq!(body[0], byte_at(0));
+    assert_eq!(body[CHUNK as usize], byte_at(CHUNK as usize));
+    assert_eq!(
+        body[(CHUNK * 2 - 1) as usize],
+        byte_at((CHUNK * 2 - 1) as usize)
+    );
+
     assert!(
-        cached.is_empty(),
-        "the proxy writes nothing to the cache the cleaner walks: {cached:?}"
+        fixture.origin.was_asked_for_nothing_more(),
+        "a range served entirely from the cache makes no origin request"
     );
 
     drop(fixture.handle);
+    Ok(())
+}
+
+/// Ranges are the whole job: holding the front of one must narrow what the
+/// origin is asked for, not merely save the write.
+#[test]
+fn a_range_partly_held_fetches_only_the_missing_part() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let origin = format!("http://{}", fixture.origin.addr);
+    let url = format!("{}/proxy/d={}/movie.mp4", fixture.base, encode(&origin));
+    let client = reqwest::blocking::Client::new();
+
+    let warm = client
+        .get(&url)
+        .header(reqwest::header::RANGE, format!("bytes=0-{}", CHUNK - 1))
+        .send()?;
+    assert_eq!(warm.bytes()?.len() as u64, CHUNK);
+    fixture.origin.next_request();
+    wait_for_chunks(&fixture, 1);
+
+    let response = client
+        .get(&url)
+        .header(reqwest::header::RANGE, format!("bytes=0-{}", CHUNK * 2 - 1))
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        header(response.headers(), "content-range"),
+        Some(format!("bytes 0-{}/{ORIGIN_LENGTH}", CHUNK * 2 - 1)).as_deref(),
+        "the player is answered about the whole range it asked for"
+    );
+    let body = response.bytes()?;
+    assert_eq!(body.len() as u64, CHUNK * 2);
+    assert_eq!(body[0], byte_at(0), "the cached head comes first");
+    assert_eq!(
+        body[CHUNK as usize],
+        byte_at(CHUNK as usize),
+        "and the origin's tail is joined to it at the right byte"
+    );
+
+    assert_eq!(
+        fixture.origin.next_request().range(),
+        Some(format!("bytes={}-{}", CHUNK, CHUNK * 2 - 1)).as_deref(),
+        "the origin is asked for the gap, from the chunk boundary the cache ended at"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
+/// Two players reading the same stream at different offsets. Neither is in
+/// the other's key -- `p=` is the client's name for its own player and is
+/// never part of what the cache is filed under -- so what one of them fetched
+/// answers the other.
+#[test]
+fn two_players_reading_one_stream_share_what_either_fetched() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let origin = format!("http://{}", fixture.origin.addr);
+    let url = |token: &str| {
+        format!(
+            "{}/proxy/d={}&p={token}/movie.mp4",
+            fixture.base,
+            encode(&origin)
+        )
+    };
+    let client = reqwest::blocking::Client::new();
+    let head = format!("bytes=0-{}", CHUNK - 1);
+    let middle = format!("bytes={}-{}", CHUNK * 2, CHUNK * 3 - 1);
+
+    let one = client
+        .get(url("one"))
+        .header(reqwest::header::RANGE, &head)
+        .send()?;
+    assert_eq!(one.bytes()?.len() as u64, CHUNK);
+    assert_eq!(fixture.origin.next_request().range(), Some(&*head));
+
+    let two = client
+        .get(url("two"))
+        .header(reqwest::header::RANGE, &middle)
+        .send()?;
+    assert_eq!(two.bytes()?.len() as u64, CHUNK);
+    assert_eq!(fixture.origin.next_request().range(), Some(&*middle));
+    wait_for_chunks(&fixture, 2);
+
+    // A third player, a third token, and neither range costs an origin
+    // request.
+    for range in [&head, &middle] {
+        let response = client
+            .get(url("three"))
+            .header(reqwest::header::RANGE, range)
+            .send()?;
+        assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.bytes()?.len() as u64, CHUNK);
+    }
+    assert!(fixture.origin.was_asked_for_nothing_more());
+
+    drop(fixture.handle);
+    Ok(())
+}
+
+/// A body that stops part way through a chunk leaves nothing on disk that a
+/// later read could take for a complete chunk.
+///
+/// The origin here promises a megabyte and writes a thousand bytes, which is
+/// what a client that vanished mid-fill looks like from the writer's side:
+/// the stream ends at a byte that is not a chunk boundary. A chunk is held in
+/// memory until it is whole, so there is nothing to half-write and nothing to
+/// sweep -- and the next read of those bytes goes back to the origin.
+#[test]
+fn a_body_that_stops_mid_chunk_leaves_no_chunk_to_serve() -> anyhow::Result<()> {
+    let fixture = fixture_with(Origin::start_with(
+        |_request: &Request, socket: &mut TcpStream| {
+            let _ = socket.write_all(
+                format!(
+                    "HTTP/1.1 206 Partial Content\r\nAccept-Ranges: bytes\r\n\
+                 Content-Type: video/mp4\r\n\
+                 Content-Range: bytes 0-{}/{ORIGIN_LENGTH}\r\n\
+                 Content-Length: {ORIGIN_LENGTH}\r\nConnection: close\r\n\r\n",
+                    ORIGIN_LENGTH - 1
+                )
+                .as_bytes(),
+            );
+            let _ = socket.write_all(&(0..1000).map(byte_at).collect::<Vec<u8>>());
+            let _ = socket.flush();
+        },
+    )?)?;
+    let origin = format!("http://{}", fixture.origin.addr);
+    let url = format!("{}/proxy/d={}/movie.mp4", fixture.base, encode(&origin));
+    let client = reqwest::blocking::Client::new();
+
+    // The body breaks where the origin stopped writing; that is the point.
+    let response = client
+        .get(&url)
+        .header(reqwest::header::RANGE, "bytes=0-")
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    let _ = response.bytes();
+    fixture.origin.next_request();
+
+    assert_eq!(
+        cached_chunks(&fixture).len(),
+        0,
+        "a chunk is written whole or not at all, so a broken fill writes nothing"
+    );
+    let again = client
+        .get(&url)
+        .header(reqwest::header::RANGE, "bytes=0-")
+        .send()?;
+    let _ = again.bytes();
+    assert_eq!(
+        fixture.origin.next_request().range(),
+        Some("bytes=0-"),
+        "and the next read of those bytes is a fetch, not a truncated hit"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
+/// Every reason the cache refuses to keep a response, one origin path each,
+/// and one that it does keep so the fixture is proving something.
+///
+/// The refusals are deliberately more than the letter of HTTP asks for. A
+/// store that never revalidates cannot honour `no-cache` or a `max-age` of
+/// zero any other way; an origin that has not said it answers ranges must not
+/// have one answered out of the cache later; and a body under a content
+/// coding is not the body the framing headers a hit writes would describe.
+#[test]
+fn nothing_the_rules_refuse_is_cached() -> anyhow::Result<()> {
+    let fixture = fixture_with(Origin::start_with(
+        |request: &Request, socket: &mut TcpStream| {
+            // Every body is a megabyte, so a response that *were* cached
+            // would leave four whole chunks behind. A refusal that only
+            // looked like one because the body was too short would prove
+            // nothing.
+            let body: Vec<u8> = (0..ORIGIN_LENGTH).map(byte_at).collect();
+            let playlist = std::iter::once("#EXTM3U".to_string())
+                .chain((0..40_000).map(|line| format!("# padding line {line}")))
+                .collect::<Vec<_>>()
+                .join("\n")
+                .into_bytes();
+            let (extra, body) = match request.target() {
+                "/no-store.mp4" => ("Cache-Control: no-store\r\n", body),
+                "/no-cache.mp4" => ("Cache-Control: no-cache\r\n", body),
+                "/private.mp4" => ("Cache-Control: private, max-age=600\r\n", body),
+                "/max-age-0.mp4" => ("Cache-Control: max-age=0\r\n", body),
+                "/coded.mp4" => ("Content-Encoding: gzip\r\n", body),
+                "/live.m3u8" => ("Content-Type: application/x-mpegurl\r\n", playlist),
+                // No `Accept-Ranges` at all: this origin has never said a
+                // range is a thing it answers.
+                "/no-ranges.mp4" => ("", body),
+                _ => ("Accept-Ranges: bytes\r\n", body),
+            };
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\n{extra}\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(head.as_bytes());
+            if request.line.starts_with("GET") {
+                let _ = socket.write_all(&body);
+            }
+            let _ = socket.flush();
+        },
+    )?)?;
+    let origin = format!("http://{}", fixture.origin.addr);
+    let client = reqwest::blocking::Client::new();
+    let proxied = |path: &str| format!("{}/proxy/d={}{path}", fixture.base, encode(&origin));
+
+    for path in [
+        "/no-store.mp4",
+        "/no-cache.mp4",
+        "/private.mp4",
+        "/max-age-0.mp4",
+        "/coded.mp4",
+        "/live.m3u8",
+        "/no-ranges.mp4",
+    ] {
+        let response = client.get(proxied(path)).send()?;
+        assert_eq!(response.status(), reqwest::StatusCode::OK, "{path}");
+        assert!(!response.bytes()?.is_empty(), "{path}");
+        fixture.origin.next_request();
+        assert_eq!(
+            cached_chunks(&fixture).len(),
+            0,
+            "{path} must not be cached"
+        );
+    }
+
+    // A `HEAD` describes a body it does not carry, and an `h=` naming a
+    // credential is refused outright rather than keyed: `/proxy` takes no
+    // bearer token of its own, so an entry one caller's secret filled is one
+    // any other caller could name.
+    let head = client.head(proxied("/plain.mp4")).send()?;
+    assert_eq!(head.status(), reqwest::StatusCode::OK);
+    fixture.origin.next_request();
+    assert_eq!(
+        cached_chunks(&fixture).len(),
+        0,
+        "a HEAD has no body to keep"
+    );
+
+    let authenticated = format!(
+        "{}/proxy/d={}&h={}/plain.mp4",
+        fixture.base,
+        encode(&origin),
+        encode("Authorization:Bearer s3cret")
+    );
+    let response = client.get(&authenticated).send()?;
+    assert_eq!(response.bytes()?.len(), ORIGIN_LENGTH);
+    assert_eq!(
+        fixture.origin.next_request().header("authorization"),
+        Some("Bearer s3cret"),
+        "the credential still travels; it is the keeping that is refused"
+    );
+    assert_eq!(cached_chunks(&fixture).len(), 0);
+
+    // And the same fixture, asked plainly, does cache -- so every assertion
+    // above is about the rule and not about the origin.
+    let response = client.get(proxied("/plain.mp4")).send()?;
+    assert_eq!(response.bytes()?.len(), ORIGIN_LENGTH);
+    fixture.origin.next_request();
+    wait_for_chunks(&fixture, 4);
+
+    // A request with no `Range` is answered from the cache only when the
+    // whole entity is there -- which it now is.
+    let response = client.get(proxied("/plain.mp4")).send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        header(response.headers(), "content-length"),
+        Some(ORIGIN_LENGTH.to_string()).as_deref()
+    );
+    assert_eq!(response.bytes()?.len(), ORIGIN_LENGTH);
+    assert!(fixture.origin.was_asked_for_nothing_more());
+
+    drop(fixture.handle);
+    Ok(())
+}
+
+/// Cached proxy bytes are ordinary cache: the cleaner walks them, counts
+/// them and evicts them, with no protection and no pin anywhere near them. A
+/// proxied stream nobody is reading is the first thing that should go.
+#[test]
+fn the_cleaner_evicts_cached_proxy_bytes() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let origin = format!("http://{}", fixture.origin.addr);
+    let url = format!("{}/proxy/d={}/movie.mp4", fixture.base, encode(&origin));
+    let client = reqwest::blocking::Client::new();
+
+    let response = client
+        .get(&url)
+        .header(reqwest::header::RANGE, "bytes=0-")
+        .send()?;
+    assert_eq!(response.bytes()?.len(), ORIGIN_LENGTH);
+    fixture.origin.next_request();
+    wait_for_chunks(&fixture, 4);
+
+    // A cap under what is cached, so the pass has something to do. Well
+    // above one chunk, so the "a single file bigger than the whole cap is
+    // kept" rule is not what is being measured.
+    fixture
+        .handle
+        .update_settings(serde_json::json!({ "cacheSize": (CHUNK as f64) * 1.5 }))?;
+    let report = fixture.handle.clean_cache_now()?;
+    assert!(report.freed > 0, "{report:?}");
+
+    let left = cached_chunks(&fixture).len();
+    assert!(left < 4, "the cleaner took cached proxy bytes: {left} left");
+
+    drop(fixture.handle);
+    Ok(())
+}
+
+/// The launch-time sweep, through a real restart.
+///
+/// It takes the temporaries a kill left mid-write and nothing else. That is
+/// the whole difference from the piece store's sweep, and it is worth a test
+/// in both directions: a torrent's pieces are claimed by the session, so
+/// anything unclaimed there is data nothing will ever reclaim, while nothing
+/// claims a cached URL -- every committed chunk is cache, and surviving a
+/// restart is the point of it.
+#[test]
+fn a_restart_sweeps_the_chunks_a_kill_was_writing_and_keeps_the_rest() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_root = tempfile::tempdir()?;
+    let start = || {
+        stream_server::start(stream_server::ServerConfig {
+            http_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            config_dir: Some(config_dir.path().join("config")),
+            cache_dir: Some(cache_root.path().join("cache")),
+            ..offline_config()
+        })
+    };
+
+    let handle = start()?;
+    drop(handle);
+
+    // What a process killed mid-write leaves: a chunk that was committed,
+    // and one that was still being written to its temporary name.
+    let bucket = cache_root
+        .path()
+        .join("cache")
+        .join("rqbit-downloads")
+        .join(".proxy")
+        .join("0".repeat(64))
+        .join(format!("{ORIGIN_LENGTH}_video%2Fmp4"))
+        .join("0");
+    std::fs::create_dir_all(&bucket)?;
+    let committed = bucket.join("0");
+    let killed = bucket.join("0.4242-0.part");
+    std::fs::write(&committed, vec![0u8; 16])?;
+    std::fs::write(&killed, vec![0u8; 16])?;
+
+    let handle = start()?;
+    assert!(!killed.exists(), "the temporary is gone");
+    assert!(committed.is_file(), "and the chunk beside it is not");
+
+    drop(handle);
     Ok(())
 }
 
@@ -3751,6 +4177,54 @@ fn closing_a_stream_needs_the_control_token() -> anyhow::Result<()> {
 
     drop(fixture.handle);
     Ok(())
+}
+
+/// The proxy cache's chunk size, which is what every range in the tests
+/// above is spelled in: a range shorter than one stores nothing, and a
+/// boundary is where a narrowed fetch begins.
+const CHUNK: u64 = stream_server::PROXY_CACHE_CHUNK_BYTES;
+
+/// One response header, as text.
+fn header<'a>(headers: &'a reqwest::header::HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+/// Every chunk file the proxy cache holds: the files under the `.proxy`
+/// root, which is inside the very directory `cache_cleaner::cache_roots`
+/// walks, and which therefore turns up in a plain walk of the cache root.
+///
+/// Temporary files are counted as chunks on purpose. A test that asserted
+/// "no chunks" while a `.part` sat there would be asserting the wrong thing.
+fn cached_chunks(fixture: &Fixture) -> Vec<std::path::PathBuf> {
+    walk(&fixture.cache_root.path().join("cache"))
+        .into_iter()
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .components()
+                    .any(|component| component.as_os_str() == ".proxy")
+        })
+        .collect()
+}
+
+/// Wait until the cache holds at least `chunks` of them.
+///
+/// A chunk is written on the blocking pool once its last byte has gone past,
+/// so it lands a moment after the response the test already read. Bounded so
+/// a regression fails instead of hanging, and the bound is generous because
+/// it is not a timing assertion.
+fn wait_for_chunks(fixture: &Fixture, chunks: usize) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if cached_chunks(fixture).len() >= chunks {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!(
+        "the cache never held {chunks} chunks; it holds {:?}",
+        cached_chunks(fixture)
+    );
 }
 
 fn walk(directory: &std::path::Path) -> Vec<std::path::PathBuf> {
