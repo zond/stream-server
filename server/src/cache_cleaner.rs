@@ -426,7 +426,7 @@ async fn recover_out_of_space_torrents(state: &AppState, recovery: &mut DiskFull
     }
 }
 
-/// The cache roots, protections and limit both [`clean_cache`] and [`usage`]
+/// The budgets, protections and keep-set both [`clean_cache`] and [`usage`]
 /// need, gathered once so the two read `AppState` the same way and can
 /// never disagree about what the cache *is*.
 struct CacheRoots {
