@@ -57,23 +57,35 @@
 //! # Not wired into the session yet, and why
 //!
 //! [`store::PieceStoreFactory`] is not passed to librqbit anywhere. Two things
-//! have to be decided in the rqbit fork before it can be, and both are about
-//! the have-set rather than about storage:
+//! had to be decided in the rqbit fork before it could be, and both were about
+//! the have-set rather than about storage. One of them is settled at the rev
+//! this crate pins; the other is not.
 //!
-//! 1. `JsonSessionPersistenceStore::update_db` refuses to persist a torrent
-//!    whose storage factory is not `FilesystemStorageFactory`, and the session
-//!    runs with persistence on, so today every add with this factory would
-//!    fail outright. Relaxing that is not mechanical: under this design the
-//!    `.bitv` fastresume bitfields stop being the have-record, because the
-//!    piece files are.
-//! 2. `initial_check` walks files in order and, on the first read error in a
-//!    file, marks the rest of that file not-have without reading it. A
-//!    sparsely populated cache -- which is the normal state here -- would
-//!    report the pieces before the first gap and nothing after it. A read of
-//!    an absent piece must keep failing ([`store::MissingPiece`]) rather than
-//!    returning zeroes, or a hash check would call a hole a verified piece; so
-//!    the have-set has to come from the store instead of from a
-//!    read-everything pass.
+//! **Settled.** `initial_check` walks files in order and, on the first read
+//! error in a file, marks the rest of that file not-have without reading it. A
+//! sparsely populated cache -- which is the normal state here -- would report
+//! the pieces before the first gap and nothing after it. The fork's answer is
+//! that the have-set no longer comes from a read-everything pass: it is the
+//! resume bitfield intersected with
+//! [`librqbit::storage::TorrentStorage::has_piece`], asked of the storage, and
+//! [`store::PieceStore`] answers it. A read of an absent piece still has to
+//! fail ([`store::MissingPiece`]) rather than return zeroes, or a hash check
+//! would call a hole a verified piece, and it does.
+//!
+//! **Not settled.** `JsonSessionPersistenceStore::update_db` refuses to
+//! persist a torrent whose storage factory is not `FilesystemStorageFactory`,
+//! and this session runs with persistence on (`LibrqbitBackend::new` hands it
+//! `SessionPersistenceConfig::Json`), so an add with this factory fails
+//! outright. What the refusal is really about is what the record omits: a
+//! `SerializedTorrent` names an output folder and a file selection and no
+//! storage at all, so a restart replays it onto the session's *default*
+//! factory. The fork's answer is a `StorageFactory::ensure_persistable`
+//! promise -- a restart finds this data again, and the have-bitfield will not
+//! outlive it -- which this store can make and the filesystem one already
+//! keeps. That commit exists on the fork's `pinned` branch but has not been
+//! pushed, so there is no rev to move to: bumping the pin to an unpushed
+//! commit would not build anywhere else, and this repo's rev is bumped
+//! deliberately. Until it is, nothing here can be handed to a torrent.
 //!
 //! Both are exercised below rather than assumed: the storage is driven through
 //! a real librqbit session's own initial check.
