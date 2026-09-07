@@ -479,6 +479,12 @@ impl SessionTuning {
     /// The settings' JSON keys whose session-start value differs between
     /// `self` (what the session opened with) and `wanted` -- what a change
     /// has to wait for the next start for.
+    ///
+    /// `peer_limit` is deliberately not among them even though it is part
+    /// of this struct: it is what the session *opened* with, and
+    /// `LibrqbitBackend::set_configured_peer_limit` changes it on the
+    /// running session, so a difference here means "already applied", not
+    /// "waiting".
     fn pending_restart(&self, wanted: &Self) -> Vec<&'static str> {
         let mut pending = Vec::new();
         if self.dht != wanted.dht {
@@ -489,9 +495,6 @@ impl SessionTuning {
         }
         if self.proxy_url != wanted.proxy_url {
             pending.extend(BT_PROXY_SETTINGS);
-        }
-        if self.peer_limit != wanted.peer_limit {
-            pending.push(BT_MAX_CONNECTIONS);
         }
         if self.bind_device != wanted.bind_device {
             pending.push(BT_OUTGOING_INTERFACES);
@@ -754,9 +757,11 @@ pub fn bt_settings_support() -> &'static [BtSettingSupport] {
         },
         BtSettingSupport {
             setting: BT_MAX_CONNECTIONS,
-            effect: NextStart,
+            effect: Live,
             note: "the per-torrent peer limit TorrentSpeedProfile::effective_connection_limits \
-                   derives from it (40 to 200 peers; 200 for the default 800)",
+                   derives from it (40 to 200 peers; 40 for the default 160), applied to \
+                   every torrent at once; while the app is in the background the lean cap \
+                   stands and this is what a return to the foreground restores",
         },
         BtSettingSupport {
             setting: "btMinPeersForStable",
@@ -803,13 +808,15 @@ pub struct LibrqbitBackend {
     piece_reclaim: bool,
     /// Which torrents the idle pause owns (see [`IdlePauses`]).
     idle_pauses: IdlePauses,
-    /// The [`Footprint`] in force (see [`TorrentBackend::set_footprint`]).
-    /// A mutex rather than an atomic because a footprint change and an add
-    /// must not interleave: the add reads the footprint and applies it to
-    /// its new torrent under this lock, and a change applies to every
-    /// torrent under it, so a torrent added during a change ends up with
-    /// the footprint that won, never with the loser's cap.
-    footprint: Mutex<Footprint>,
+    /// The two things that together decide a torrent's live-peer cap (see
+    /// [`PeerCaps`]).
+    ///
+    /// A mutex rather than atomics because a cap change and an add must not
+    /// interleave: the add reads the cap and applies it to its new torrent
+    /// under this lock, and a change applies to every torrent under it, so
+    /// a torrent added during a change ends up with the cap that won, never
+    /// with the loser's.
+    caps: Mutex<PeerCaps>,
 }
 
 /// Whether the storage the session gives a torrent that names none can
@@ -922,6 +929,10 @@ impl LibrqbitBackend {
         let stream_positions: StreamPositions = Default::default();
         let swarm_scraper = SwarmScraper::network();
         let idle_pauses: IdlePauses = Default::default();
+        let caps = PeerCaps {
+            footprint: Footprint::Full,
+            configured: session.peer_limit.unwrap_or(librqbit::DEFAULT_PEER_LIMIT),
+        };
         // Restore from session
         let mut restored_handles = session.with_torrents(|iter| {
             let mut map = HashMap::new();
@@ -1001,7 +1012,7 @@ impl LibrqbitBackend {
                 swarm_scraper,
                 idle_pauses,
                 piece_reclaim,
-                footprint: Mutex::new(Footprint::Full),
+                caps: Mutex::new(caps),
             },
             restored_handles,
         ))
@@ -1110,12 +1121,21 @@ impl LibrqbitBackend {
     }
 
     /// Apply a settings change to the running session, and say what
-    /// happened to every `bt*` setting: the download limit changes now
-    /// (librqbit's rate limiter is swappable), the session-start ones are
-    /// compared with what this session opened with and reported as waiting
-    /// for the next start when they differ, and the ones librqbit has no
-    /// knob for are listed as such every time -- see
-    /// [`bt_settings_support`] for why each is where it is.
+    /// happened to every `bt*` setting: the download limit and the peer
+    /// limit change now, the session-start ones are compared with what
+    /// this session opened with and reported as waiting for the next start
+    /// when they differ, and the ones librqbit has no knob for are listed
+    /// as such every time -- see [`bt_settings_support`] for why each is
+    /// where it is.
+    ///
+    /// `btMaxConnections` used to wait for a restart, because the cap was
+    /// `SessionOptions::peer_limit` and a session's options are fixed once
+    /// it is open. It does not have to any more: the fork's
+    /// `ManagedTorrent::set_peer_limit` is the same runtime lever
+    /// [`Footprint`] uses, so lowering the setting hangs up on the surplus
+    /// now and raising it re-queues the parked peers, with no restart and
+    /// no torrent losing its progress. The new value is stored either way,
+    /// so it is also what a return from [`Footprint::Lean`] restores.
     pub fn apply_settings(
         &self,
         profile: &TorrentSpeedProfile,
@@ -1125,8 +1145,9 @@ impl LibrqbitBackend {
         self.session
             .ratelimits
             .set_download_bps(wanted.download_bps);
+        self.set_configured_peer_limit(wanted.peer_limit.unwrap_or(librqbit::DEFAULT_PEER_LIMIT));
         BtSettingsReport {
-            applied_live: vec![BT_DOWNLOAD_SPEED_HARD_LIMIT],
+            applied_live: vec![BT_DOWNLOAD_SPEED_HARD_LIMIT, BT_MAX_CONNECTIONS],
             pending_restart: self.started_with.pending_restart(&wanted),
             not_honoured: bt_settings_support()
                 .iter()
@@ -1134,6 +1155,32 @@ impl LibrqbitBackend {
                 .map(|row| row.setting)
                 .collect(),
         }
+    }
+
+    /// Put a new per-torrent live-peer limit on every torrent the session
+    /// holds, and on every one added afterwards.
+    ///
+    /// While the app is in the background the new value is only stored:
+    /// [`Footprint::Lean`]'s cap is the one in force, and this is what a
+    /// return to [`Footprint::Full`] restores. Note what is *not* done
+    /// here -- a settings change is not a footprint change, so it never
+    /// prunes the peer table (`apply_footprint` prunes only for `Lean`,
+    /// and the footprint does not move here).
+    fn set_configured_peer_limit(&self, limit: usize) {
+        let mut caps = self.caps.lock();
+        if caps.configured == limit {
+            return;
+        }
+        caps.configured = limit;
+        let in_force = caps.limit();
+        let torrents = self.apply_caps_to_every_torrent(*caps);
+        info!(
+            peer_limit = limit,
+            in_force,
+            footprint = ?caps.footprint,
+            torrents,
+            "btMaxConnections applied to the running session"
+        );
     }
 
     /// Hermetic constructor for tests: no listen port, no DHT, no persistence,
@@ -1186,6 +1233,10 @@ impl LibrqbitBackend {
         let stream_positions: StreamPositions = Default::default();
         let swarm_scraper = SwarmScraper::disabled();
         let idle_pauses: IdlePauses = Default::default();
+        let caps = PeerCaps {
+            footprint: Footprint::Full,
+            configured: session.peer_limit.unwrap_or(librqbit::DEFAULT_PEER_LIMIT),
+        };
         let restored_handles = session.with_torrents(|iter| {
             iter.map(|(_id, handle)| {
                 let info_hash = handle.info_hash().as_string();
@@ -1219,7 +1270,7 @@ impl LibrqbitBackend {
                 swarm_scraper,
                 idle_pauses,
                 piece_reclaim,
-                footprint: Mutex::new(Footprint::Full),
+                caps: Mutex::new(caps),
             },
             restored_handles,
         ))
@@ -1584,18 +1635,44 @@ fn apply_footprint(handle: &ManagedTorrent, footprint: Footprint, peer_limit: us
     handle.set_peer_limit(peer_limit);
 }
 
-impl LibrqbitBackend {
-    /// The live-peer cap `footprint` means on this session: the configured
-    /// per-torrent limit (or librqbit's default) for `Full`,
-    /// [`LEAN_PEER_LIMIT`] for `Lean`.
-    fn peer_limit_for(&self, footprint: Footprint) -> usize {
-        match footprint {
-            Footprint::Full => self
-                .session
-                .peer_limit
-                .unwrap_or(librqbit::DEFAULT_PEER_LIMIT),
+/// What the per-torrent live-peer cap is right now: the configured limit
+/// `btMaxConnections` derives, and the [`Footprint`] that may be overriding
+/// it. They live in one lock because they are one decision -- `limit()` --
+/// and either can change under the other.
+#[derive(Debug, Clone, Copy)]
+struct PeerCaps {
+    footprint: Footprint,
+    /// What `btMaxConnections` currently asks for, per torrent
+    /// ([`TorrentSpeedProfile::effective_connection_limits`]). Starts as
+    /// whatever the session was opened with, and is changed live by
+    /// [`LibrqbitBackend::apply_settings`].
+    configured: usize,
+}
+
+impl PeerCaps {
+    /// The cap in force: the configured limit, or [`LEAN_PEER_LIMIT`] while
+    /// the app is in the background.
+    fn limit(&self) -> usize {
+        match self.footprint {
+            Footprint::Full => self.configured,
             Footprint::Lean => LEAN_PEER_LIMIT,
         }
+    }
+}
+
+impl LibrqbitBackend {
+    /// Apply `limit` to every torrent the session holds, going lean first
+    /// if `footprint` says to. Handles are collected before any work:
+    /// `with_torrents` holds the session's torrent table and the lever
+    /// takes torrent-level locks. Returns how many torrents it touched.
+    fn apply_caps_to_every_torrent(&self, caps: PeerCaps) -> usize {
+        let torrents: Vec<Arc<ManagedTorrent>> = self
+            .session
+            .with_torrents(|iter| iter.map(|(_, handle)| handle.clone()).collect());
+        for handle in &torrents {
+            apply_footprint(handle, caps.footprint, caps.limit());
+        }
+        torrents.len()
     }
 
     fn wrap(&self, handle: Arc<ManagedTorrent>) -> LibrqbitHandle {
@@ -1774,8 +1851,8 @@ impl TorrentBackend for LibrqbitBackend {
         // Under the footprint lock, so a change racing this add cannot
         // leave the new torrent with the old cap (see the field).
         {
-            let footprint = self.footprint.lock();
-            apply_footprint(&handle, *footprint, self.peer_limit_for(*footprint));
+            let caps = self.caps.lock();
+            apply_footprint(&handle, caps.footprint, caps.limit());
         }
 
         let info_hash = handle.info_hash().as_string();
@@ -1985,33 +2062,25 @@ impl TorrentBackend for LibrqbitBackend {
     /// `Disconnect` message per surplus peer; the peers hang up on their
     /// own tasks afterwards. Nothing is awaited.
     fn set_footprint(&self, footprint: Footprint) {
-        let mut current = self.footprint.lock();
-        if *current == footprint {
+        let mut caps = self.caps.lock();
+        if caps.footprint == footprint {
             // Already there. Not only a shortcut: a second `Lean` would
             // prune the peers the first one parked, and the return to
             // `Full` would then have nobody to re-dial.
             return;
         }
-        let limit = self.peer_limit_for(footprint);
-        // Handles first, then the work: `with_torrents` holds the session's
-        // torrent table, and the lever takes torrent-level locks.
-        let torrents: Vec<Arc<ManagedTorrent>> = self
-            .session
-            .with_torrents(|iter| iter.map(|(_, handle)| handle.clone()).collect());
-        for handle in &torrents {
-            apply_footprint(handle, footprint, limit);
-        }
+        caps.footprint = footprint;
+        let torrents = self.apply_caps_to_every_torrent(*caps);
         info!(
             ?footprint,
-            peer_limit = limit,
-            torrents = torrents.len(),
+            peer_limit = caps.limit(),
+            torrents,
             "torrent session footprint changed"
         );
-        *current = footprint;
     }
 
     fn footprint(&self) -> Footprint {
-        *self.footprint.lock()
+        self.caps.lock().footprint
     }
 
     /// librqbit's `DhtStats` is instantaneous (`routing_table_size`,
@@ -3481,8 +3550,10 @@ mod tests {
         assert_eq!(
             defaults,
             SessionTuning {
-                // The default 800 connections is 200 peers per torrent.
-                peer_limit: Some(200),
+                // The shipped default of 160 connections derives 40
+                // peers per torrent -- the floor, deliberately; see
+                // `DEFAULT_BT_MAX_CONNECTIONS`.
+                peer_limit: Some(40),
                 ..SessionTuning::default()
             }
         );
@@ -3534,6 +3605,10 @@ mod tests {
         // The hard limit is bytes per second; 0 is none.
         let limited = TorrentSpeedProfile {
             bt_download_speed_hard_limit: 1_500_000.0,
+            // 100 clamps up to MIN_EFFECTIVE_BT_CONNECTIONS and derives
+            // 20, which the floor lifts to 40 -- the same per-torrent cap
+            // the default derives, so `peer_limit` is not what makes this
+            // tuning differ from `defaults`.
             bt_max_connections: 100,
             ..TorrentSpeedProfile::default()
         };
@@ -3567,10 +3642,9 @@ mod tests {
                 "btProxyPort",
                 "btProxyUsername",
                 "btProxyPassword",
-                "btMaxConnections",
                 "btOutgoingInterfaces",
             ],
-            "everything but the live limit waits for the next start"
+            "everything but the two live settings waits for the next start"
         );
         assert!(defaults.pending_restart(&defaults).is_empty());
     }
@@ -3647,7 +3721,10 @@ mod tests {
             &TorrentPrivacyConfig::default(),
         );
         assert_eq!(backend.session.ratelimits.get_download_bps(), Option::None);
-        assert_eq!(report.applied_live, vec!["btDownloadSpeedHardLimit"]);
+        assert_eq!(
+            report.applied_live,
+            vec!["btDownloadSpeedHardLimit", "btMaxConnections"]
+        );
         assert_eq!(report.pending_restart, vec!["btEnableDht"]);
         assert!(report.not_honoured.contains(&"btEncryptionMode"));
         assert!(report.not_honoured.contains(&"btProxyPeerConnections"));
@@ -3659,6 +3736,50 @@ mod tests {
         assert_eq!(
             backend.session.ratelimits.get_download_bps(),
             std::num::NonZeroU32::new(2_000_000)
+        );
+
+        // And `btMaxConnections` reaches the torrents that already exist,
+        // rather than waiting for a restart the user has no way to ask for.
+        // 400 derived the 100 asserted above; 800 derives the ceiling.
+        let payload = tmp.path().join("payload.bin");
+        write_payload(&payload, 16 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+        let handle = backend
+            .add_torrent(TorrentSource::Bytes(torrent_bytes), Vec::new())
+            .await
+            .expect("add torrent");
+        assert_eq!(handle.handle.shared.peer_limit(), 100);
+        backend.apply_settings(
+            &TorrentSpeedProfile {
+                bt_max_connections: 800,
+                ..profile.clone()
+            },
+            &privacy,
+        );
+        assert_eq!(
+            handle.handle.shared.peer_limit(),
+            200,
+            "the running torrent took the new limit"
+        );
+        // The session's own option is fixed once it is open, so the report
+        // must not be read off it: the live cap is on the torrents.
+        assert_eq!(backend.session.peer_limit, Some(100));
+
+        // Under `Lean` the lean cap stands and the new value is only
+        // stored -- and it is what the return to `Full` restores.
+        backend.set_footprint(Footprint::Lean);
+        assert_eq!(handle.handle.shared.peer_limit(), LEAN_PEER_LIMIT);
+        backend.apply_settings(&profile, &privacy);
+        assert_eq!(
+            handle.handle.shared.peer_limit(),
+            LEAN_PEER_LIMIT,
+            "a settings change must not lift the background footprint"
+        );
+        backend.set_footprint(Footprint::Full);
+        assert_eq!(
+            handle.handle.shared.peer_limit(),
+            100,
+            "the foreground came back to the limit set while lean, not the one before it"
         );
     }
 
@@ -3978,9 +4099,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn the_idle_pause_stops_fetching_and_the_resume_keeps_the_pieces() {
         use crate::backend::TorrentHandle;
-        /// Long enough that the seeder below moves several pieces across
-        /// it. Not a synchronisation sleep: it is the measurement window,
-        /// and the test proves it is wide enough before relying on it.
+        /// The floor on the measurement window. Not a synchronisation
+        /// sleep: the window is the longer of this and however long the
+        /// unpaused torrent took to fetch its first bytes, so under load
+        /// it grows with what it is measuring against.
         const WINDOW: Duration = Duration::from_secs(2);
 
         let src = tempfile::tempdir().unwrap();
@@ -4020,28 +4142,21 @@ mod tests {
         };
         let handle = backend.wrap(inner);
 
-        // The precondition, and the window's own proof: across one window,
-        // while nothing is paused, bytes arrive. A failure here is the
-        // environment or a window too short to measure anything, not the
-        // pause -- and without it the frozen counter below would prove
-        // nothing at all.
-        let before = handle.handle.stats().progress_bytes;
-        tokio::time::sleep(WINDOW).await;
-        let fetching = handle.handle.stats().progress_bytes;
-        assert!(
-            fetching > before,
-            "no bytes arrived across {WINDOW:?} ({before} -> {fetching}); the seeder never fed this torrent, so there is nothing here to stop"
-        );
+        // The precondition, on its own bound rather than on a fixed
+        // window: bytes arrive. How long that takes is also how long the
+        // frozen window below has to be, so a loaded runner stretches both
+        // together instead of failing the assertion that nothing moved.
+        let window = wait_for_a_fetched_byte(&handle).await.max(WINDOW);
 
         handle.pause_torrent().await.expect("the idle pause pauses");
         wait_until_paused(&handle).await;
         let at_pause = handle.handle.stats().progress_bytes;
-        tokio::time::sleep(WINDOW).await;
+        tokio::time::sleep(window).await;
         let after = handle.handle.stats().progress_bytes;
         assert_eq!(
             after,
             at_pause,
-            "a paused torrent fetched {} more bytes across the same {WINDOW:?}",
+            "a paused torrent fetched {} more bytes across the same {window:?}",
             after.saturating_sub(at_pause)
         );
         assert!(
@@ -4074,6 +4189,31 @@ mod tests {
         }
     }
 
+    /// Wait until this torrent has received bytes from a peer, and return
+    /// how long that took.
+    ///
+    /// `fetched` is the cumulative peer-received counter and nothing else
+    /// feeds it, where `progress_bytes` is have-bytes over the *selected*
+    /// files, which a want-set reconcile moves about. The elapsed time is
+    /// the caller's measurement window: a runner too loaded to move bytes
+    /// in two seconds is also too loaded for two seconds to say anything
+    /// about a torrent that has stopped.
+    async fn wait_for_a_fetched_byte(handle: &LibrqbitHandle) -> Duration {
+        use crate::backend::TorrentHandle;
+        let start = std::time::Instant::now();
+        let deadline = start + TEST_WAIT_BOUND;
+        loop {
+            if TorrentHandle::transfer_totals(handle).fetched > 0 {
+                return start.elapsed();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the seeder never fed this torrent, so there is nothing here to stop"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// Poll until librqbit has actually parked the torrent. `Session::pause`
     /// asks a torrent still in its initial check to pause when the check
     /// ends, so the state can lag the call.
@@ -4102,15 +4242,11 @@ mod tests {
     /// a counter of trait calls.
     #[tokio::test(flavor = "multi_thread")]
     async fn seeding_off_and_a_stream_that_ended_stops_the_torrent_fetching() {
-        /// The measurement window, proved wide enough before it is relied
-        /// on -- as in `the_idle_pause_stops_fetching_and_the_resume_keeps_the_pieces`.
+        /// The floor on the measurement window, as in
+        /// `the_idle_pause_stops_fetching_and_the_resume_keeps_the_pieces`.
         const WINDOW: Duration = Duration::from_secs(2);
-        /// Stands in for `INACTIVE_TORRENT_PAUSE_GRACE`, which is minutes:
-        /// the grace is only a delay before the same code runs, so waiting
-        /// the shipped one out would add its whole length to the test and
-        /// say nothing more. Longer than `WINDOW`, because the precondition
-        /// is measured inside it.
-        const GRACE: Duration = Duration::from_secs(3);
+        /// Stands in for `INACTIVE_TORRENT_PAUSE_GRACE`.
+        const GRACE: Duration = Duration::from_millis(50);
 
         let src = tempfile::tempdir().unwrap();
         let payload = src.path().join("payload.bin");
@@ -4155,25 +4291,21 @@ mod tests {
         efs.seeding_enabled.store(false, Ordering::Relaxed);
         efs.on_stream_start(&hash, 0).await;
         efs.on_stream_end(&hash, 0).await;
-        let pause_task = efs.schedule_torrent_pause_after(hash.clone(), GRACE);
 
-        // The precondition, measured inside the grace: with the stream over
-        // and the want-set the stream left behind, this torrent is still
-        // pulling bytes off the seeder. That is the state the finding
-        // describes, and without it there would be nothing for the pause to
-        // stop. Measured with `fetched` -- the cumulative peer-received
-        // counter -- because `progress_bytes` is have-bytes over the
-        // *selected* files and the stream's own reconcile moves it about.
-        let before = TorrentHandle::transfer_totals(&handle).fetched;
-        tokio::time::sleep(WINDOW).await;
-        let fetching = TorrentHandle::transfer_totals(&handle).fetched;
-        assert!(
-            fetching > before,
-            "the torrent was not fetching during the idle grace ({before} -> {fetching}), \
-             so this test cannot show the pause stopping anything"
-        );
+        // The precondition: with the stream over and the want-set it left
+        // behind, this torrent is still pulling bytes off the seeder --
+        // the state the finding describes, and without it there would be
+        // nothing here for the pause to stop. On a bound, not a fixed
+        // window, and the time it takes is also the width of the frozen
+        // window below, so a loaded runner stretches both together.
+        let window = wait_for_a_fetched_byte(&handle).await.max(WINDOW);
 
-        pause_task.await.expect("the pause task ran");
+        // Now the grace. `INACTIVE_TORRENT_PAUSE_GRACE` is minutes and is
+        // only a delay before this same code runs, so waiting the shipped
+        // one out would add its whole length and say nothing more.
+        efs.schedule_torrent_pause_after(hash.clone(), GRACE)
+            .await
+            .expect("the pause task ran");
         let engine = efs
             .get_engine(&hash)
             .await
@@ -4196,7 +4328,7 @@ mod tests {
         assert_eq!(
             after,
             at_pause,
-            "an idle-paused torrent fetched {} more bytes across {WINDOW:?}",
+            "an idle-paused torrent fetched {} more bytes across {window:?}",
             after.saturating_sub(at_pause)
         );
         assert!(
@@ -6144,8 +6276,7 @@ mod tests {
         .await
         .expect("hermetic session");
         assert_eq!(backend.footprint(), Footprint::Full);
-        assert_eq!(backend.peer_limit_for(Footprint::Full), CONFIGURED);
-        assert_eq!(backend.peer_limit_for(Footprint::Lean), LEAN_PEER_LIMIT);
+        assert_eq!(backend.caps.lock().limit(), CONFIGURED);
 
         let first = backend
             .add_torrent(TorrentSource::Bytes(first_bytes), Vec::new())

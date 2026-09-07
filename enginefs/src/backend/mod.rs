@@ -792,12 +792,51 @@ pub struct TorrentSpeedProfile {
     pub bt_request_timeout: u64,
 }
 
-pub const DEFAULT_BT_MAX_CONNECTIONS: u64 = 800;
+/// What `btMaxConnections` is when a profile does not set it, or sets
+/// something nonsensical (0, or the legacy "unlimited" sentinel).
+///
+/// **160, for the 40 peers per torrent it derives** through
+/// [`TorrentSpeedProfile::effective_connection_limits`] (`/4`, floored at
+/// 40). It was 800, which derived the ceiling of 200.
+///
+/// 200 peers is the wrong default for the device this server is aimed at.
+/// A peer costs about 75 KiB once its protocol buffers, task, channel and
+/// table entry are counted, so 200 of them are ~15 MB per torrent -- on a
+/// 2 GB television whose low-memory killer fires at around 300 MB, which
+/// is the same measurement that produced [`LEAN_PEER_LIMIT`] and
+/// [`Footprint`]. Lean already brings the background down to 8; this is
+/// the number the *foreground* runs at, and 40 is the figure a television
+/// wants there: enough to keep a stream's window ahead of the playhead
+/// from a fast handful with room for churn, and well past the four or
+/// five peers a client unchokes at a time.
+///
+/// A user who wants the old behaviour still has it -- the setting is
+/// honoured up to [`MAX_EFFECTIVE_BT_CONNECTIONS`], and since it now
+/// applies live it costs no restart to try. Raising the *default* is what
+/// a small device cannot argue with.
+///
+/// **This reaches a fresh install, not an existing one.** The first run
+/// writes the default into `settings.json`, so an installation that has
+/// been up since the 800 default has 800 on disk and keeps it: nothing
+/// here can tell that from a user who typed it. Rewriting a persisted
+/// setting behind their back is the worse of the two, and the setting now
+/// applies live, so changing it is a request rather than a restart.
+pub const DEFAULT_BT_MAX_CONNECTIONS: u64 = 160;
 pub const LEGACY_UNLIMITED_BT_MAX_CONNECTIONS: u64 = 65535;
 pub const MAX_EFFECTIVE_BT_CONNECTIONS: u64 = 1200;
 pub const MIN_EFFECTIVE_BT_CONNECTIONS: u64 = 80;
 
 impl TorrentSpeedProfile {
+    /// `(session-wide, per-torrent, was the request normalized)`.
+    ///
+    /// Only the per-torrent figure is used -- it is librqbit's live-peer
+    /// cap, per torrent, and there is no session-wide one to set. The
+    /// derivation is `/4` clamped to 40..=200: the divisor is there
+    /// because the setting is a session-wide number in Stremio's model and
+    /// a device usually has a few torrents alive, and the floor of 40 is
+    /// what a stream needs to keep its window ahead of the playhead. With
+    /// the default of [`DEFAULT_BT_MAX_CONNECTIONS`] that lands exactly on
+    /// the floor, which is deliberate -- see that constant.
     pub fn effective_connection_limits(&self) -> (i32, i32, bool) {
         let requested = self.bt_max_connections;
         let normalized = if requested == 0 || requested >= LEGACY_UNLIMITED_BT_MAX_CONNECTIONS {
