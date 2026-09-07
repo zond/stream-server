@@ -408,14 +408,6 @@ fn device_info_and_stats_json_sys_probes_keep_their_shapes() -> anyhow::Result<(
     Ok(())
 }
 
-/// stremio-core's play_on_device (models/streaming_server.rs:716-744) POSTs
-/// to `casting/{device}/player` and treats any 2xx response as
-/// `PlayingOnDevice`. Casting isn't implemented, so the endpoint must fail
-/// visibly (non-2xx) instead of the official client silently believing
-/// playback started on the device.
-///
-/// This server runs with `ServerAuth::Disabled` (the binary's `--no-auth`):
-/// the handle has no token and control routes answer without a header.
 /// The signal a client's "working in the background" indicator reads. An
 /// idle server is dark, and asking is not itself an event: it starts no
 /// torrent, so a light can never be the reason there is something to report.
@@ -462,6 +454,14 @@ fn background_traffic_is_dark_on_an_idle_server() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// stremio-core's play_on_device (models/streaming_server.rs:716-744) POSTs
+/// to `casting/{device}/player` and treats any 2xx response as
+/// `PlayingOnDevice`. Casting isn't implemented, so the endpoint must fail
+/// visibly (non-2xx) instead of the official client silently believing
+/// playback started on the device.
+///
+/// This server runs with `ServerAuth::Disabled` (the binary's `--no-auth`):
+/// the handle has no token and control routes answer without a header.
 #[test]
 fn casting_player_reports_failure_since_casting_is_not_implemented() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
