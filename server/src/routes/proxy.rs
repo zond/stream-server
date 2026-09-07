@@ -172,6 +172,32 @@ fn relayed_location(location: &HeaderValue, from: &Url) -> HeaderValue {
         .unwrap_or_else(|| location.clone())
 }
 
+/// The three numbers a `206`'s `Content-Range` states -- first byte, last
+/// byte and the entity's whole length -- or `None` when it states anything
+/// else.
+///
+/// Anything else includes the two spellings the standard allows that say
+/// less than three numbers: a `*` complete-length, which is an origin
+/// declining to say how long the entity is, and the unsatisfied-range form
+/// `bytes */<len>`. Neither is a range of bytes, and every caller here needs
+/// one.
+///
+/// A range whose last byte is before its first, or whose last byte is past
+/// the end of the entity it claims to be part of, is not read as a range
+/// either: an origin that says that has told us nothing usable, and the
+/// arithmetic downstream would be the place we found out.
+pub(crate) fn parse_content_range(content_range: &str) -> Option<(u64, u64, u64)> {
+    let (range, total) = content_range
+        .trim()
+        .strip_prefix("bytes ")
+        .and_then(|range| range.split_once('/'))?;
+    let (first, last) = range.split_once('-')?;
+    let first: u64 = first.trim().parse().ok()?;
+    let last: u64 = last.trim().parse().ok()?;
+    let total: u64 = total.trim().parse().ok()?;
+    (first <= last && last < total).then_some((first, last, total))
+}
+
 /// Whether a `206`'s `Content-Range` says the part it carries is the whole
 /// entity -- `bytes 0-<len-1>/<len>`.
 ///
@@ -183,26 +209,10 @@ fn relayed_location(location: &HeaderValue, from: &Url) -> HeaderValue {
 /// fragment: its length is not the length the range promised, and the
 /// lines at its edges are cut.
 fn covers_the_whole_entity(content_range: &str) -> bool {
-    let Some((range, total)) = content_range
-        .trim()
-        .strip_prefix("bytes ")
-        .and_then(|range| range.split_once('/'))
-    else {
-        return false;
-    };
-    let Some((first, last)) = range.split_once('-') else {
-        return false;
-    };
-    let (Ok(first), Ok(last), Ok(total)) = (
-        first.trim().parse::<u64>(),
-        last.trim().parse::<u64>(),
-        total.trim().parse::<u64>(),
-    ) else {
-        return false;
-    };
     // `total - 1` rather than `last + 1`, so an origin claiming the last
     // byte is `u64::MAX` is a `false` and not an overflow panic.
-    first == 0 && total.checked_sub(1) == Some(last)
+    parse_content_range(content_range)
+        .is_some_and(|(first, last, total)| first == 0 && total.checked_sub(1) == Some(last))
 }
 
 /// Whether a URL's path names a playlist by its extension.
@@ -2676,6 +2686,32 @@ mod tests {
         assert!(!covers_the_whole_entity("bytes */180"));
         assert!(!covers_the_whole_entity("items 0-179/180"));
         assert!(!covers_the_whole_entity(""));
+    }
+
+    /// The parser under it, which the proxy cache reads a stored entity's
+    /// length out of. A range it cannot state all three numbers of is not a
+    /// range: everything downstream does arithmetic with them.
+    #[test]
+    fn a_content_range_is_three_numbers_or_nothing() {
+        assert_eq!(parse_content_range("bytes 10-40/180"), Some((10, 40, 180)));
+        assert_eq!(
+            parse_content_range(" bytes 0 - 179 / 180 "),
+            Some((0, 179, 180)),
+            "an origin is allowed to be generous with its spaces"
+        );
+        assert_eq!(parse_content_range("bytes 0-179/*"), None);
+        assert_eq!(parse_content_range("bytes */180"), None);
+        assert_eq!(
+            parse_content_range("bytes 40-10/180"),
+            None,
+            "a last byte before the first is not a range"
+        );
+        assert_eq!(
+            parse_content_range("bytes 0-180/180"),
+            None,
+            "nor is one that runs past the entity it claims to be part of"
+        );
+        assert_eq!(parse_content_range("items 0-179/180"), None);
     }
 
     /// The four forms a `Location` we are not following can take. Only the
