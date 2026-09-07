@@ -35,10 +35,12 @@
 //!
 //! # The parts
 //!
-//! [`layout`] is the arithmetic -- `(file_id, offset)` to `(piece,
-//! offset_in_piece)` -- with no filesystem and no librqbit types in it.
-//! [`store`] is the [`librqbit::storage::TorrentStorage`] implementation over
-//! it. [`sweep`] reconciles the store against the session at launch.
+//! [`layout`] is the arithmetic of *where* a byte lives -- `(file_id, offset)`
+//! to `(piece, offset_in_piece)` -- and [`policy`] is the arithmetic of *which*
+//! pieces we keep and which of those we share; neither has a filesystem or a
+//! librqbit type in it. [`store`] is the
+//! [`librqbit::storage::TorrentStorage`] implementation over the first.
+//! [`sweep`] reconciles the store against the session at launch.
 //!
 //! # Not wired into the session yet, and why
 //!
@@ -65,10 +67,12 @@
 //! a real librqbit session's own initial check.
 
 pub mod layout;
+pub mod policy;
 pub mod store;
 pub mod sweep;
 
 pub use layout::{FileSpec, PieceLayout, Segment};
+pub use policy::{Decision, RetentionPolicy, Shape};
 pub use store::{MissingPiece, PIECES_PER_DIRECTORY, PieceStore, PieceStoreFactory, layout_of};
 pub use sweep::{SweepReport, session_recorded_hashes, sweep_unadopted};
 
