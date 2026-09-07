@@ -9,7 +9,7 @@ edition = "2024"
 # `sha1-crypto-hash` (openssl-backed) to `sha1-ring` (aws-lc-rs-backed) and keeps
 # reqwest on rustls, so nothing here pulls in openssl-sys. `http-api-client` is
 # kept because backend/librqbit.rs uses librqbit::api::TorrentIdOrHash.
-librqbit = { git = "https://github.com/zond/rqbit", branch = "feat/configurable-stream-lookahead", default-features = false, features = [
+librqbit = { git = "https://github.com/zond/rqbit", rev = "60b1d2461fab76679254bad17f6a5c995d29137f", default-features = false, features = [
     "rust-tls",
     "http-api-client",
 ] }
