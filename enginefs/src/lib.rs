@@ -32,8 +32,8 @@ use crate::backend::librqbit::LibrqbitBackend;
 use crate::backend::priorities::EngineCacheConfig;
 
 use crate::backend::{
-    BackendMemoryDiagnostics, HotFilePriorityPlan, TorrentBackend, TorrentFilePriorityPlan,
-    TorrentHandle, TorrentListenPort, TorrentPlacement, TorrentSource,
+    BackendMemoryDiagnostics, Footprint, HotFilePriorityPlan, TorrentBackend,
+    TorrentFilePriorityPlan, TorrentHandle, TorrentListenPort, TorrentPlacement, TorrentSource,
 };
 
 const INACTIVE_TORRENT_REMOVE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
@@ -4328,6 +4328,20 @@ impl BackendEngineFS<LibrqbitBackend> {
         self.seeding_enabled.load(Ordering::Relaxed)
     }
 
+    /// Shrink to, or grow back from, a [`Footprint`] -- see the enum for
+    /// what `Lean` sheds and what it deliberately keeps (seeding). Forwarded
+    /// to the backend, which applies it to every torrent now and to every
+    /// one added later; nothing at the engine level changes, since no
+    /// engine is paused or dropped for it. Idempotent, synchronous, cheap.
+    pub fn set_footprint(&self, footprint: Footprint) {
+        self.backend.set_footprint(footprint);
+    }
+
+    /// The [`Footprint`] in force.
+    pub fn footprint(&self) -> Footprint {
+        self.backend.footprint()
+    }
+
     /// Mark the torrent as active. librqbit has no session-wide streaming mode,
     /// so this is a best-effort resume of a torrent the idle policy had paused.
     pub async fn focus_torrent(&self, target_info_hash: &str) {
@@ -5644,7 +5658,7 @@ mod tests {
         assert_eq!(value["initialWindowBytes"], 100);
         assert_eq!(
             value["peerDiscovery"],
-            serde_json::json!({ "seen": 0, "queued": 0, "connecting": 0, "live": 0 })
+            serde_json::json!({ "seen": 0, "queued": 0, "connecting": 0, "live": 0, "known": 0 })
         );
         assert_eq!(value["connectedSeeders"], 0);
         // Swarm scrape figures. The fake backend scrapes nothing, so all

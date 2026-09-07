@@ -1,10 +1,11 @@
 use crate::backend::dht_bootstrap::{self, BootstrapResolvers};
 use crate::backend::{
     BackendFileInfo, BackendMemoryDiagnostics, BtSettingEffect, BtSettingSupport, BtSettingsReport,
-    DhtStatus, DroppedFilePieces, EngineStats, FileStreamTrait, Growler, PeerDiscovery, PeerSearch,
-    PieceReadiness, Source, StartupPhase, StatsFile, StatsOptions, SwarmCap, TorrentBackend,
-    TorrentFilePriorityPlan, TorrentHandle, TorrentListenPort, TorrentPlacement,
-    TorrentPrivacyConfig, TorrentProxyType, TorrentSource, TorrentSpeedProfile, TransferTotals,
+    DhtStatus, DroppedFilePieces, EngineStats, FileStreamTrait, Footprint, Growler,
+    LEAN_PEER_LIMIT, PeerDiscovery, PeerSearch, PieceReadiness, Source, StartupPhase, StatsFile,
+    StatsOptions, SwarmCap, TorrentBackend, TorrentFilePriorityPlan, TorrentHandle,
+    TorrentListenPort, TorrentPlacement, TorrentPrivacyConfig, TorrentProxyType, TorrentSource,
+    TorrentSpeedProfile, TransferTotals,
 };
 use crate::scrape::SwarmScraper;
 use anyhow::{Context, Result};
@@ -16,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Upper bound on how long a stream request blocks waiting for librqbit to
 /// leave its `Initializing` state (opening/hash-checking files; for a magnet
@@ -777,6 +778,13 @@ pub struct LibrqbitBackend {
     /// becomes `true` the day the piece store is the session's default
     /// factory, with no other change here.
     piece_reclaim: bool,
+    /// The [`Footprint`] in force (see [`TorrentBackend::set_footprint`]).
+    /// A mutex rather than an atomic because a footprint change and an add
+    /// must not interleave: the add reads the footprint and applies it to
+    /// its new torrent under this lock, and a change applies to every
+    /// torrent under it, so a torrent added during a change ends up with
+    /// the footprint that won, never with the loser's cap.
+    footprint: Mutex<Footprint>,
 }
 
 /// Whether the storage the session gives a torrent that names none can
@@ -964,6 +972,7 @@ impl LibrqbitBackend {
                 stream_positions,
                 swarm_scraper,
                 piece_reclaim,
+                footprint: Mutex::new(Footprint::Full),
             },
             restored_handles,
         ))
@@ -1178,6 +1187,7 @@ impl LibrqbitBackend {
                 reported_errors,
                 swarm_scraper,
                 piece_reclaim,
+                footprint: Mutex::new(Footprint::Full),
             },
             restored_handles,
         ))
@@ -1521,7 +1531,38 @@ async fn copy_then_remove(src: &std::path::Path, dst: &std::path::Path) -> std::
     tokio::fs::remove_file(src).await
 }
 
+/// Put `footprint` on one torrent: prune the peer table first when going
+/// lean (see `LibrqbitBackend::set_footprint` for why the order matters),
+/// then the cap. A torrent that is not live has nothing to prune and takes
+/// the cap for when it is.
+fn apply_footprint(handle: &ManagedTorrent, footprint: Footprint, peer_limit: usize) {
+    if footprint == Footprint::Lean
+        && let Some(live) = handle.live()
+    {
+        let forgotten = live.forget_disconnected_peers();
+        debug!(
+            info_hash = %handle.info_hash().as_string(),
+            forgotten,
+            "going lean: pruned the peer table"
+        );
+    }
+    handle.set_peer_limit(peer_limit);
+}
+
 impl LibrqbitBackend {
+    /// The live-peer cap `footprint` means on this session: the configured
+    /// per-torrent limit (or librqbit's default) for `Full`,
+    /// [`LEAN_PEER_LIMIT`] for `Lean`.
+    fn peer_limit_for(&self, footprint: Footprint) -> usize {
+        match footprint {
+            Footprint::Full => self
+                .session
+                .peer_limit
+                .unwrap_or(librqbit::DEFAULT_PEER_LIMIT),
+            Footprint::Lean => LEAN_PEER_LIMIT,
+        }
+    }
+
     fn wrap(&self, handle: Arc<ManagedTorrent>) -> LibrqbitHandle {
         let info_hash = handle.info_hash().as_string();
         LibrqbitHandle {
@@ -1660,6 +1701,12 @@ impl TorrentBackend for LibrqbitBackend {
             | librqbit::AddTorrentResponse::AlreadyManaged(id, handle) => (id, handle),
             _ => return Err(anyhow::anyhow!("Unexpected response from librqbit")),
         };
+        // Under the footprint lock, so a change racing this add cannot
+        // leave the new torrent with the old cap (see the field).
+        {
+            let footprint = self.footprint.lock();
+            apply_footprint(&handle, *footprint, self.peer_limit_for(*footprint));
+        }
 
         let info_hash = handle.info_hash().as_string();
         Ok(LibrqbitHandle {
@@ -1852,6 +1899,49 @@ impl TorrentBackend for LibrqbitBackend {
         BackendMemoryDiagnostics::default()
     }
 
+    /// The per-torrent lever is librqbit's `ManagedTorrent::set_peer_limit`
+    /// (the fork's runtime-adjustable live-peer cap: it hangs up on the
+    /// surplus, least useful first, and re-queues the parked peers when the
+    /// cap goes back up) plus, going lean, its
+    /// `TorrentStateLive::forget_disconnected_peers` -- called *before* the
+    /// cap is lowered, so the addresses it drops are the dead and
+    /// not-needed ones the table had accumulated, not the peers the lower
+    /// cap is about to park, which a return to `Full` wants to re-dial. A
+    /// torrent that is not live gets the cap stored for when it is.
+    ///
+    /// Synchronous and cheap: atomics, one read lock per torrent, and a
+    /// `Disconnect` message per surplus peer; the peers hang up on their
+    /// own tasks afterwards. Nothing is awaited.
+    fn set_footprint(&self, footprint: Footprint) {
+        let mut current = self.footprint.lock();
+        if *current == footprint {
+            // Already there. Not only a shortcut: a second `Lean` would
+            // prune the peers the first one parked, and the return to
+            // `Full` would then have nobody to re-dial.
+            return;
+        }
+        let limit = self.peer_limit_for(footprint);
+        // Handles first, then the work: `with_torrents` holds the session's
+        // torrent table, and the lever takes torrent-level locks.
+        let torrents: Vec<Arc<ManagedTorrent>> = self
+            .session
+            .with_torrents(|iter| iter.map(|(_, handle)| handle.clone()).collect());
+        for handle in &torrents {
+            apply_footprint(handle, footprint, limit);
+        }
+        info!(
+            ?footprint,
+            peer_limit = limit,
+            torrents = torrents.len(),
+            "torrent session footprint changed"
+        );
+        *current = footprint;
+    }
+
+    fn footprint(&self) -> Footprint {
+        *self.footprint.lock()
+    }
+
     /// librqbit's `DhtStats` is instantaneous (`routing_table_size`,
     /// `routing_table_size_v6`) and has no "did bootstrap ever succeed"
     /// flag, so the sticky bit is latched here: any observation of a
@@ -1932,11 +2022,18 @@ impl TorrentHandle for LibrqbitHandle {
         let peer_discovery = stats
             .live
             .as_ref()
-            .map(|l| PeerDiscovery {
-                seen: l.snapshot.peer_stats.seen as u64,
-                queued: l.snapshot.peer_stats.queued as u64,
-                connecting: l.snapshot.peer_stats.connecting as u64,
-                live: l.snapshot.peer_stats.live as u64,
+            .map(|l| {
+                let p = &l.snapshot.peer_stats;
+                PeerDiscovery {
+                    seen: p.seen as u64,
+                    queued: p.queued as u64,
+                    connecting: p.connecting as u64,
+                    live: p.live as u64,
+                    // Every state a table entry can be in; librqbit keeps
+                    // a transition counter per state, so this is the
+                    // table's length without walking it.
+                    known: (p.queued + p.connecting + p.live + p.dead + p.not_needed) as u64,
+                }
             })
             .unwrap_or_default();
         let (peers, queued, unique) = (
@@ -5457,6 +5554,210 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// A seeder session for `torrent_bytes` on an ephemeral loopback port,
+    /// uploading at `upload_bps` so a download from a swarm of them outlasts
+    /// what a test asserts about its peers. No DHT, no trackers: the only way
+    /// it and a client meet is an address one of them is handed.
+    pub(super) async fn slow_seeder(
+        content_dir: &std::path::Path,
+        torrent_bytes: &[u8],
+        upload_bps: u32,
+    ) -> Arc<librqbit::Session> {
+        let seeder = librqbit::Session::new_with_opts(
+            content_dir.to_path_buf(),
+            librqbit::SessionOptions {
+                dht: None,
+                persistence: None,
+                listen: Some(librqbit::ListenerOptions {
+                    listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                    ..Default::default()
+                }),
+                disable_local_service_discovery: true,
+                ratelimits: librqbit::limits::LimitsConfig {
+                    upload_bps: std::num::NonZeroU32::new(upload_bps),
+                    download_bps: None,
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seeder session");
+        let handle = seeder
+            .add_torrent(
+                librqbit::AddTorrent::from_bytes(bytes::Bytes::copy_from_slice(torrent_bytes)),
+                Some(librqbit::AddTorrentOptions {
+                    output_folder: Some(content_dir.to_str().unwrap().to_owned()),
+                    overwrite: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("seeder add")
+            .into_handle()
+            .expect("seeder handle");
+        handle
+            .wait_until_initialized()
+            .await
+            .expect("seeder checks");
+        seeder
+    }
+
+    /// `Footprint::Lean` on a torrent with a swarm attached: the peer count
+    /// drops to `LEAN_PEER_LIMIT` (the surplus parked, not forgotten -- they
+    /// are what `Full` re-dials), the table sheds the address it was only
+    /// remembering as dead, the download -- and so the seeding -- goes on
+    /// with the peers left, a second `Lean` changes nothing, `Full` brings
+    /// the swarm back at once, and a torrent added while lean starts lean.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lean_footprint_parks_the_surplus_and_full_brings_it_back() {
+        use crate::backend::{Footprint, LEAN_PEER_LIMIT, TorrentBackend, TorrentHandle};
+        const SEEDERS: usize = LEAN_PEER_LIMIT + 4;
+
+        /// Poll the handle's stats until `pred` holds; the bound is only
+        /// there so a regression fails instead of hanging.
+        async fn wait_for(
+            handle: &LibrqbitHandle,
+            what: &str,
+            mut pred: impl FnMut(&EngineStats) -> bool,
+        ) -> EngineStats {
+            let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
+            loop {
+                let s = crate::backend::TorrentHandle::stats(handle).await;
+                if pred(&s) {
+                    return s;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{what} did not happen within {TEST_WAIT_BOUND:?}: peers={} discovery={:?}",
+                    s.peers,
+                    s.peer_discovery
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        let src = tempfile::tempdir().unwrap();
+        let payload = src.path().join("payload.bin");
+        // Big enough, at the seeders' pace, to still be downloading when the
+        // assertions are done: 12 x 32 KiB/s is ~40 s for 16 MiB.
+        write_payload(&payload, 16 * 1024 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+
+        let mut seeders = Vec::new();
+        let mut peers = Vec::new();
+        for _ in 0..SEEDERS {
+            let seeder = slow_seeder(src.path(), &torrent_bytes, 32 * 1024).await;
+            peers.push(seeder.listen_addr().expect("seeder listens"));
+            seeders.push(seeder);
+        }
+        // An address nothing listens on: it is seen, dies, and sits in the
+        // table waiting out a backoff -- what going lean prunes.
+        peers.push((std::net::Ipv4Addr::LOCALHOST, 9).into());
+
+        let dl = tempfile::tempdir().unwrap();
+        let backend = LibrqbitBackend::new_for_tests(dl.path().to_path_buf())
+            .await
+            .expect("hermetic session");
+        assert_eq!(backend.footprint(), Footprint::Full);
+        // Straight to the session, for `initial_peers` (see
+        // `stats_connected_seeders_mirrors_librqbits_live_seeder_count`).
+        let response = backend
+            .session
+            .add_torrent(
+                librqbit::AddTorrent::from_bytes(bytes::Bytes::from(torrent_bytes.clone())),
+                Some(librqbit::AddTorrentOptions {
+                    overwrite: true,
+                    initial_peers: Some(peers),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("add torrent");
+        let (librqbit::AddTorrentResponse::Added(_, inner)
+        | librqbit::AddTorrentResponse::AlreadyManaged(_, inner)) = response
+        else {
+            panic!("expected the torrent to be added");
+        };
+        let handle = backend.wrap(inner);
+
+        let full = wait_for(&handle, "every seeder connecting", |s| {
+            s.peers as usize == SEEDERS && s.peer_discovery.known as usize == SEEDERS + 1
+        })
+        .await;
+        assert_eq!(
+            handle.handle.shared.peer_limit(),
+            librqbit::DEFAULT_PEER_LIMIT
+        );
+        assert_eq!(
+            full.peer_discovery.seen as usize,
+            SEEDERS + 1,
+            "{:?}",
+            full.peer_discovery
+        );
+
+        // Lean: the surplus hangs up and is parked (still known), the dead
+        // address is forgotten, and the download goes on.
+        backend.set_footprint(Footprint::Lean);
+        assert_eq!(backend.footprint(), Footprint::Lean);
+        assert_eq!(handle.handle.shared.peer_limit(), LEAN_PEER_LIMIT);
+        let lean = wait_for(&handle, "the surplus hanging up", |s| {
+            s.peers as usize == LEAN_PEER_LIMIT && s.peer_discovery.known as usize == SEEDERS
+        })
+        .await;
+        assert_eq!(
+            lean.peer_discovery.connecting, 0,
+            "{:?}",
+            lean.peer_discovery
+        );
+        let fetched_before = handle.transfer_totals().fetched;
+        wait_for(&handle, "the download going on with the peers left", |_| {
+            handle.transfer_totals().fetched > fetched_before
+        })
+        .await;
+
+        // A second Lean is a no-op: the parked peers are not pruned.
+        backend.set_footprint(Footprint::Lean);
+        let again = TorrentHandle::stats(&handle).await;
+        assert_eq!(
+            again.peers as usize, LEAN_PEER_LIMIT,
+            "{:?}",
+            again.peer_discovery
+        );
+        assert_eq!(
+            again.peer_discovery.known as usize, SEEDERS,
+            "{:?}",
+            again.peer_discovery
+        );
+
+        // A torrent added while lean starts lean, without being live.
+        let other_src = tempfile::tempdir().unwrap();
+        write_payload(&other_src.path().join("other.bin"), 16 * 1024).await;
+        let (other_bytes, _) = make_torrent(&other_src.path().join("other.bin")).await;
+        let other = backend
+            .add_torrent(TorrentSource::Bytes(other_bytes), Vec::new())
+            .await
+            .expect("add while lean");
+        assert_eq!(other.handle.shared.peer_limit(), LEAN_PEER_LIMIT);
+
+        // Full: the parked peers are re-dialled at once; the other torrent
+        // gets the configured cap too.
+        backend.set_footprint(Footprint::Full);
+        assert_eq!(backend.footprint(), Footprint::Full);
+        assert_eq!(
+            handle.handle.shared.peer_limit(),
+            librqbit::DEFAULT_PEER_LIMIT
+        );
+        assert_eq!(
+            other.handle.shared.peer_limit(),
+            librqbit::DEFAULT_PEER_LIMIT
+        );
+        wait_for(&handle, "the parked peers coming back", |s| {
+            s.peers as usize == SEEDERS
+        })
+        .await;
+        drop(seeders);
     }
 
     /// A torrent added without `piece_reclaim` -- which is every torrent on

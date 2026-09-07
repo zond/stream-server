@@ -91,6 +91,18 @@ pub trait TorrentBackend: Send + Sync {
         DhtStatus::default()
     }
     fn set_seeding_enabled(&self, _enabled: bool) {}
+
+    /// Shrink to, or grow back from, a [`Footprint`]: applied to every
+    /// torrent the backend has and to every one it adds afterwards, until
+    /// the next call. Idempotent, cheap, and fine before any torrent
+    /// exists. What each footprint costs and keeps is documented on the
+    /// enum; the default is a no-op for a backend with nothing to shed.
+    fn set_footprint(&self, _footprint: Footprint) {}
+
+    /// The footprint in force (see [`Self::set_footprint`]).
+    fn footprint(&self) -> Footprint {
+        Footprint::Full
+    }
     /// Whether adds here set piece reclaim, which the backend can only do on
     /// a storage that can release a single piece. When it does, a torrent
     /// the backend *restores* at startup comes back paused whatever it was
@@ -613,6 +625,45 @@ pub enum StartupPhase {
     Error,
 }
 
+/// How much of the host a torrent session may hold, chosen by the
+/// embedder from what the host is doing with the app.
+///
+/// [`Footprint::Lean`] is for the background: a media app the OS has put
+/// behind something else, on a device whose low-memory killer takes the
+/// fattest background process first. The session keeps every torrent
+/// running -- **seeding goes on**, downloads in progress go on -- but with
+/// [`LEAN_PEER_LIMIT`] peers per torrent instead of the configured limit,
+/// and with its peer table pruned of the addresses it was keeping only to
+/// remember not to dial them again. Nothing is paused, nothing on disk is
+/// touched, and a stream request that arrives while lean is served like
+/// any other, just from fewer peers.
+///
+/// [`Footprint::Full`] restores the configured limit; the peers the lean
+/// cap parked are the first re-dialled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Footprint {
+    /// Everything the settings allow.
+    #[default]
+    Full,
+    /// Background: few peers, pruned peer tables, still seeding.
+    Lean,
+}
+
+/// Peers per torrent under [`Footprint::Lean`].
+///
+/// Why eight: a peer costs about 48 KiB of protocol buffers plus its task
+/// and channel, so two hundred of them are the biggest single line of a
+/// backgrounded server's heap, and the number that keeps growing as the
+/// swarm churns. Seeding does not need them -- a BitTorrent client uploads
+/// to four or five unchoked peers at a time and a home uplink saturates
+/// before that -- while a handful keeps the torrent visible (PEX still
+/// flows, trackers still see a seeder, incoming leechers still get a slot)
+/// and keeps a pinned download moving from its best few sources. Eight is
+/// the unchoke set with headroom for churn: a peer that hangs up is
+/// replaced from the queue, not from a re-dial storm.
+pub const LEAN_PEER_LIMIT: usize = 8;
+
 /// Peer-discovery breakdown straight from the backend's per-torrent peer
 /// counters, so a client can tell "nobody found yet" from "found but not
 /// connected" while `Buffering`.
@@ -627,6 +678,11 @@ pub struct PeerDiscovery {
     pub connecting: u64,
     /// Peers with a completed handshake we exchange data with.
     pub live: u64,
+    /// Every address the peer table holds right now, in whatever state --
+    /// what `seen` counts cumulatively, minus what has been forgotten. This
+    /// is the table [`Footprint::Lean`] prunes, so it is the figure that
+    /// shows the pruning; `seen` never goes down.
+    pub known: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
