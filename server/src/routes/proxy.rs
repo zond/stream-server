@@ -727,11 +727,18 @@ fn cacheable_entity(
     if is_playlist || encoded_body || origin_forbids_caching(res_headers) {
         return None;
     }
+    // The type goes into the entity's directory name, and a directory name
+    // is 255 bytes on every filesystem this runs on. An origin is free to
+    // send a longer one; what it is not free to do is make every chunk write
+    // fail its `mkdir` and say so in the log.
     let content_type = res_headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
+        .unwrap_or_default();
+    if content_type.len() > MAX_CACHED_CONTENT_TYPE {
+        return None;
+    }
+    let content_type = content_type.to_string();
     let (first, last, total) = match status {
         StatusCode::PARTIAL_CONTENT => res_headers
             .get(header::CONTENT_RANGE)
@@ -755,6 +762,12 @@ fn cacheable_entity(
     };
     Some((first, last, total, content_type))
 }
+
+/// How long a content type may be and still be stored. Sixty-four bytes is
+/// past every type anything plays -- `application/vnd.apple.mpegurl` is
+/// twenty-nine -- and short enough that percent-encoding it can never grow a
+/// directory name past what a filesystem takes.
+const MAX_CACHED_CONTENT_TYPE: usize = 64;
 
 /// The response a cache hit is: the same framing the relay would have
 /// written, over bytes that came off disk instead of a socket.
