@@ -40,15 +40,27 @@
 //! # Two choices worth stating, because they look arbitrary
 //!
 //! **A piece is committed at the moment it leaves the window**, not while it
-//! is still inside one. That is the only moment where committing is provably
-//! free: the piece is already on disk, and the alternative for it is deletion.
+//! is still inside one, and not merely by being outside the one the window is
+//! in now. That is the only moment where committing is provably free: the
+//! piece is already on disk, and the alternative for it is deletion.
 //! Committing a window piece early would be free too, but it would fill the
 //! shared half with the read-ahead of the first minute of the file and settle
-//! the whole session's sharing before playback had passed anything. Waiting
-//! until the window releases a piece is also what makes "a piece we might
-//! reclaim is never announced" decidable in one place: the decision to
-//! advertise and the decision never to reclaim are the same decision, taken
-//! once.
+//! the whole session's sharing before playback had passed anything. So would
+//! committing a piece *ahead* of the window -- read-ahead the playhead has not
+//! reached, or a leftover cache from a previous session -- which is the same
+//! mistake wearing the opposite sign: on the first pass of a stream that
+//! resumes onto a warm cache it settles the permanent, never-reclaimed,
+//! always-advertised set out of pieces playback has passed over none of.
+//!
+//! "Leaves the window" is therefore a transition and not a position, and
+//! deciding it needs one pass of memory: the window the previous
+//! [`RetentionPolicy::advance`] chose. A held piece is a commit candidate
+//! exactly when that window covered it and this one does not. A held piece the
+//! window has never covered is a reclaim candidate and nothing else, whichever
+//! side of the playhead it is on. Waiting until the window releases a piece is
+//! also what makes "a piece we might reclaim is never announced" decidable in
+//! one place: the decision to advertise and the decision never to reclaim are
+//! the same decision, taken once.
 //!
 //! **The first pieces offered win, and the set then never changes.** The
 //! design says to choose by whatever is cheapest and explicitly not by rarity:
@@ -147,6 +159,24 @@ pub struct RetentionPolicy {
     pieces: Range<u32>,
     shape: Shape,
     committed: BTreeSet<u32>,
+    /// The window the previous [`Self::advance`] chose, and the whole of what
+    /// this policy remembers about where the playhead has been.
+    ///
+    /// A piece is committable when the window *releases* it, which is a
+    /// transition between two passes and cannot be read off one of them: a
+    /// piece outside the current window is as likely to be read-ahead or a
+    /// leftover cache the playhead has never reached as it is to be something
+    /// playback has passed over. Empty until the first pass, so a stream that
+    /// starts on a warm cache commits none of it -- those pieces are reclaim
+    /// candidates like any other piece no window has covered.
+    ///
+    /// One pass is all the memory the rule needs, and the cost of it being
+    /// only one is stated rather than hidden: a piece we did not hold at the
+    /// moment the window let go of it is never committed later. That is the
+    /// honest reading of "committed from pieces we already hold" -- we did not
+    /// have it while it was covered -- and the piece is reclaimed like the
+    /// rest of what the window has left behind.
+    covered: Range<u32>,
 }
 
 impl RetentionPolicy {
@@ -183,10 +213,12 @@ impl RetentionPolicy {
                 most - piece_length + 1
             );
         }
+        let covered = pieces.start..pieces.start;
         Ok(Self {
             pieces,
             shape: Self::shape_for(budget_bytes, piece_length, bytes),
             committed: BTreeSet::new(),
+            covered,
         })
     }
 
@@ -268,10 +300,19 @@ impl RetentionPolicy {
     /// the piece files themselves. Pieces outside this file's range are not
     /// this policy's to touch and are skipped, not reclaimed.
     ///
+    /// A held piece outside the window is reclaimed whatever else is true of
+    /// it; it is *committed* instead only if the previous pass's window
+    /// covered it, because that is what makes it a piece the window released
+    /// rather than one it has never reached (see [`Self::covered`]). So the
+    /// first pass of a stream commits nothing: no window has covered anything
+    /// yet.
+    ///
     /// Idempotent for a fixed playhead and a fixed `held`: the second call
     /// commits nothing new and reclaims the same pieces, because a reclaim is
     /// a request rather than a record. The caller is what makes it true, by
-    /// deleting them and no longer holding them.
+    /// deleting them and no longer holding them. The second call has a second
+    /// reason to commit nothing new -- the window it is compared against is
+    /// the one it is.
     pub fn advance(&mut self, playhead: u32, held: &BTreeSet<u32>) -> Decision {
         let window = self.window_at(playhead);
         let mut decision = Decision {
@@ -302,16 +343,21 @@ impl RetentionPolicy {
             if !self.pieces.contains(&piece) || self.committed.contains(&piece) {
                 continue;
             }
-            let released = !window.contains(&piece);
+            // Outside the window is what makes a piece reclaimable. Having
+            // been inside the *previous* one is what makes it committable:
+            // together they are the window letting go of it.
+            let outside = !window.contains(&piece);
+            let released = outside && self.covered.contains(&piece);
             // Under `Whole` there is no window to be released from: the file
             // fits, so every piece of it is shared as soon as it arrives.
             if (released || self.shape == Shape::Whole) && self.committed.len() < capacity {
                 self.committed.insert(piece);
                 decision.committed.push(piece);
-            } else if released {
+            } else if outside {
                 decision.reclaim.push(piece);
             }
         }
+        self.covered = window;
         decision
     }
 }
@@ -536,29 +582,69 @@ mod tests {
         // window 10 (one behind, nine ahead), committed 10.
         let mut disk: BTreeSet<u32> = (0..40).collect();
 
+        // Arriving on a warm cache. No window has covered any of it, so the
+        // shared half stays empty and everything outside the window goes back
+        // -- 39 too: it is ahead of the window, and a piece we hold outside
+        // the window is a piece we are not keeping.
         let d = p.advance(30, &disk);
         assert_eq!(d.window, 29..39);
-        assert_eq!(
-            d.committed,
-            (0..10).collect::<Vec<_>>(),
-            "the first ten the window let go of fill the shared half"
+        assert!(
+            d.committed.is_empty(),
+            "nothing has been passed over yet, whatever is on disk"
         );
-        assert_eq!(
-            d.reclaim,
-            (10..29).chain([39]).collect::<Vec<_>>(),
-            "the rest goes back -- 39 too: it is ahead of the window, and a \
-             piece we hold outside the window is a piece we are not keeping"
-        );
+        assert_eq!(d.reclaim, (0..29).chain([39]).collect::<Vec<_>>());
         for piece in &d.reclaim {
             disk.remove(piece);
         }
-        assert_eq!(disk, held((0..10).chain(29..39)));
+        assert_eq!(disk, held(29..39));
 
-        // A scan back of a few seconds is served from the window itself.
-        let d = p.advance(29, &disk);
-        assert_eq!(d.window, 28..38);
-        assert!(d.reclaim.contains(&38), "and 38 has just left it");
-        assert!(!d.reclaim.contains(&29));
+        // Playing on. The window slides off what it covered, and those ten --
+        // which we hold, because covering them is what fetched them -- fill
+        // the shared half.
+        disk.extend(39..49);
+        let d = p.advance(40, &disk);
+        assert_eq!(d.window, 39..49);
+        assert_eq!(
+            d.committed,
+            (29..39).collect::<Vec<_>>(),
+            "the first ten the window let go of fill the shared half"
+        );
+        assert!(d.reclaim.is_empty(), "and nothing else is held");
+        assert_eq!(*p.advertised(), held(29..39));
+
+        // A scan back of a few seconds is served from the window itself, and
+        // what the window leaves behind now has nowhere to go: the shared half
+        // is full.
+        let d = p.advance(39, &disk);
+        assert_eq!(d.window, 38..48);
+        assert!(d.committed.is_empty(), "the shared half is full");
+        assert_eq!(d.reclaim, vec![48], "and 48 has just left the window");
+        assert!(!d.reclaim.contains(&39));
+    }
+
+    /// A held piece the window has never covered is a reclaim candidate and
+    /// never a commit candidate, whichever side of the playhead it is on.
+    ///
+    /// Reading "released" off the current window alone made this true of every
+    /// piece outside it, so the first pass of a stream that resumed onto a warm
+    /// cache settled the permanent, never-reclaimed, always-advertised set out
+    /// of leftovers -- with the playhead on piece 0, having passed over
+    /// nothing, which is verbatim the outcome the rule exists to avoid.
+    #[test]
+    fn a_piece_no_window_has_covered_is_never_committed() {
+        let mut p = policy(20, 200);
+        let d = p.advance(0, &held(0..40));
+        assert_eq!(d.window, 0..10);
+        assert!(
+            d.committed.is_empty() && p.advertised().is_empty(),
+            "committed {:?} with the playhead on piece 0",
+            d.committed
+        );
+        assert_eq!(
+            d.reclaim,
+            (10..40).collect::<Vec<_>>(),
+            "a cache the playhead has not reached is cache to give back"
+        );
     }
 
     /// Once the committed half is full it does not move again, however the
@@ -637,26 +723,37 @@ mod tests {
     #[test]
     fn a_committed_piece_we_have_lost_stops_being_advertised() {
         let mut p = policy(20, 200);
-        let mut disk: BTreeSet<u32> = (0..40).collect();
-        let d = p.advance(30, &disk);
-        for piece in &d.reclaim {
-            disk.remove(piece);
-        }
+        // Fill the shared half the only way it can be filled: hold a window's
+        // worth, then move the playhead past it.
+        let mut disk: BTreeSet<u32> = (0..10).collect();
+        p.advance(0, &disk);
+        disk.extend(10..20);
+        p.advance(11, &disk);
         assert_eq!(*p.advertised(), held(0..10));
 
         disk.remove(&4);
-        let d = p.advance(30, &disk);
+        let d = p.advance(11, &disk);
         assert_eq!(d.withdrawn, vec![4]);
         assert!(!p.is_advertised(4));
         assert_eq!(*p.advertised(), held((0..10).filter(|&x| x != 4)));
 
-        // And it can be committed again when it comes back, because there is
-        // now room for it. Nothing else moved.
+        // It coming back does not put it back. Being on disk is not what
+        // commits a piece -- the window releasing it is -- and this window has
+        // released nothing since. So it is an ordinary held piece outside the
+        // window, which is a piece to give back.
         disk.insert(4);
-        let d = p.advance(30, &disk);
-        assert_eq!(d.committed, vec![4]);
-        assert!(d.withdrawn.is_empty());
-        assert_eq!(*p.advertised(), held(0..10));
+        let d = p.advance(11, &disk);
+        assert!(d.committed.is_empty() && d.withdrawn.is_empty());
+        assert_eq!(d.reclaim, vec![4]);
+        assert_eq!(*p.advertised(), held((0..10).filter(|&x| x != 4)));
+
+        // The slot it freed goes to the next piece the window lets go of.
+        disk.remove(&4);
+        disk.extend(20..30);
+        let d = p.advance(21, &disk);
+        assert_eq!(d.window, 20..30);
+        assert_eq!(d.committed, vec![10], "one slot, one release");
+        assert_eq!(p.advertised().len(), 10);
     }
 
     /// The policy governs one file. A torrent's other files are held by
@@ -675,14 +772,21 @@ mod tests {
         let d = p.advance(150, &held([0, 5, 99, 100, 150, 199, 200, 4000]));
         assert_eq!(d.window, 150..155);
         assert!(
-            d.reclaim.is_empty(),
-            "the shared half has room, so what is outside the window joins it"
+            d.committed.is_empty(),
+            "no window has released anything yet"
         );
         assert_eq!(
-            d.committed,
+            d.reclaim,
             vec![100, 199],
-            "and only pieces this file owns are considered at all"
+            "only pieces this file owns are considered at all"
         );
+
+        // And the same once there is something to commit: the window has let
+        // go of 150, and the other files' pieces are still not ours to touch.
+        let d = p.advance(160, &held([0, 5, 99, 150, 160, 200, 4000]));
+        assert_eq!(d.window, 160..165);
+        assert_eq!(d.committed, vec![150]);
+        assert!(d.reclaim.is_empty());
         assert!(!p.is_advertised(99) && !p.is_advertised(200));
     }
 
@@ -692,12 +796,20 @@ mod tests {
     #[test]
     fn a_second_pass_over_the_same_disk_decides_the_same_thing() {
         let mut p = policy(20, 200);
-        let disk: BTreeSet<u32> = (0..40).collect();
+        // With a release in the first of the two passes, so that "the same
+        // thing" is not trivially "nothing".
+        let mut disk: BTreeSet<u32> = (0..10).collect();
+        p.advance(0, &disk);
+        disk.extend(10..40);
         let first = p.advance(30, &disk);
         let second = p.advance(30, &disk);
         assert_eq!(first.window, second.window);
         assert_eq!(first.reclaim, second.reclaim);
-        assert!(second.committed.is_empty(), "already committed");
+        assert_eq!(first.committed, (0..10).collect::<Vec<_>>());
+        assert!(
+            second.committed.is_empty(),
+            "already committed, and this window has let go of nothing since"
+        );
         assert!(second.withdrawn.is_empty());
     }
 
