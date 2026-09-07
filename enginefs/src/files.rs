@@ -76,6 +76,12 @@ pub struct FileHandle<H: TorrentHandle> {
     /// Which file of the torrent, for the blocked-read log.
     file_idx: usize,
     cursor: ReadCursor,
+    /// This reader's key in the engine's waker registry, so a torrent that
+    /// is stopped for space can wake a read parked on a piece it will not
+    /// download -- see [`Engine::refuse_reads_for_space`].
+    ///
+    /// [`Engine::refuse_reads_for_space`]: crate::engine::Engine::refuse_reads_for_space
+    reader_id: u64,
 }
 
 impl<H: TorrentHandle> FileHandle<H> {
@@ -87,6 +93,7 @@ impl<H: TorrentHandle> FileHandle<H> {
         file_idx: usize,
         start_offset: u64,
     ) -> Self {
+        let reader_id = engine.next_reader_id();
         Self {
             size,
             name,
@@ -94,7 +101,18 @@ impl<H: TorrentHandle> FileHandle<H> {
             engine,
             file_idx,
             cursor: ReadCursor::new(start_offset),
+            reader_id,
         }
+    }
+
+    /// The error a read on a torrent stopped for want of disk space fails
+    /// with -- `StorageFull`, so a caller that looks at the kind sees the
+    /// device's problem and not the torrent's.
+    pub fn stopped_for_space_error() -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            "the torrent was stopped for want of disk space",
+        )
     }
 
     /// Log a read that had to wait, once it finally returns.
@@ -125,10 +143,23 @@ impl<H: TorrentHandle> AsyncRead for FileHandle<H> {
         cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
+        // A torrent stopped for space is not downloading the piece this
+        // read may be about to park on, and the backend wakes a parked read
+        // only when its piece arrives. So the engine says whether reads are
+        // to fail instead, and a read that does park leaves its waker where
+        // the engine can reach it.
+        if self.engine.reads_refused() {
+            self.cursor.resume(Instant::now(), 0);
+            return Poll::Ready(Err(Self::stopped_for_space_error()));
+        }
         let before = buf.filled().len();
         let polled = Pin::new(&mut self.stream).poll_read(cx, buf);
         match polled {
-            Poll::Pending => self.cursor.park(Instant::now()),
+            Poll::Pending => {
+                self.engine
+                    .register_read_waker(self.reader_id, cx.waker().clone());
+                self.cursor.park(Instant::now());
+            }
             Poll::Ready(ref result) => {
                 let delivered = if result.is_ok() {
                     buf.filled().len().saturating_sub(before) as u64
@@ -148,6 +179,7 @@ impl<H: TorrentHandle> AsyncRead for FileHandle<H> {
 
 impl<H: TorrentHandle> Drop for FileHandle<H> {
     fn drop(&mut self) {
+        self.engine.forget_read_waker(self.reader_id);
         self.engine.active_streams.fetch_sub(1, Ordering::SeqCst);
     }
 }

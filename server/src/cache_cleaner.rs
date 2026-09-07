@@ -59,36 +59,33 @@ impl CleanSchedule {
 }
 
 /// Free space on the cache's volume that the cleaner keeps the torrent
-/// cache out of.
+/// cache out of -- `enginefs`'s constant, re-exported, because it is one
+/// line read three ways and the three may not drift apart.
 ///
-/// Not a fresh guess: `routes::stream::ensure_download_disk_ready` already
-/// refuses to stream to disk unless this much is free on top of what the
-/// request needs -- a failed check runs one pass of this cleaner and, if the
-/// disk is still short, answers the stream `507 Insufficient Storage`. (It
-/// used to say it "degraded the request to memory-only"; there is no
-/// memory-only engine, and the fallback re-selected the same disk-backed
-/// one.) Below this line the server has therefore already decided the disk
-/// is unusable, so it is exactly the line the cleaner must keep the cache out
-/// of -- one constant, so the check that gives up on the disk and the
-/// cleaner whose job is to stop it coming to that cannot drift apart. (One
-/// constant, two readings: the cleaner asks `fs4::available_space`, which
-/// is `statvfs` on the path, while `ensure_download_disk_ready` matches the
-/// path against `sysinfo`'s mount list behind a 3-second cache. Same
-/// question, different syscall.)
+/// `routes::stream::ensure_download_disk_ready` refuses to stream to disk
+/// unless this much is free on top of what the request needs -- a failed
+/// check runs one pass of this cleaner and, if the disk is still short,
+/// answers the stream `507 Insufficient Storage`. Below this line the server
+/// has therefore already decided the disk is unusable, so it is exactly the
+/// line the cleaner must keep the cache out of. (One constant, two readings:
+/// the cleaner asks `fs4::available_space`, which is `statvfs` on the path,
+/// while `ensure_download_disk_ready` matches the path against `sysinfo`'s
+/// mount list behind a 3-second cache. Same question, different syscall.)
 ///
-/// **It is a target, not a guarantee, and nothing here can make it one.**
-/// The cleaner only deletes; it cannot throttle a writer. librqbit writes
-/// the file it wants straight through this line to ENOSPC between passes,
-/// which is the whole reason [`recover_out_of_space_torrents`] exists, and
-/// on the device that prompted all this Available went to nothing rather
-/// than stopping at 512 MiB. Offline downloads are a third writer with a
-/// margin of its own -- `enginefs::PIN_FREE_SPACE_MARGIN`, 500 MiB,
-/// checked once when a pin is accepted and against a directory this
-/// cleaner never walks -- so a pin can settle the volume below this line
-/// by design, and several accepted together can take it to zero. What this
-/// number does hold is where the *cache* is evicted back to once a pass
-/// runs.
-pub(crate) const CACHE_FREE_SPACE_FLOOR: u64 = 512 * 1024 * 1024;
+/// The third reader is the engine's free-space watch
+/// (`EngineFS::free_space_watch_tick`), and it is what turns the target into
+/// something close to a guarantee. The cleaner only deletes; it cannot
+/// throttle a writer, and librqbit writes the file it wants straight through
+/// this line to ENOSPC between passes -- on the device that prompted all
+/// this, Available went to nothing in 40 s rather than stopping at 512 MiB.
+/// The watch stops a writing torrent when the volume falls under the floor
+/// and rings [`recover_out_of_space_torrents`], so what this cleaner is
+/// handed is a torrent paused a few MB under the line, not one dead at
+/// zero. Offline downloads keep a margin of their own
+/// (`enginefs::PIN_FREE_SPACE_MARGIN`, 500 MiB, checked once when a pin is
+/// accepted), so a pin can settle the volume below this line by design; the
+/// watch stops it there like any other writer.
+pub(crate) use enginefs::CACHE_FREE_SPACE_FLOOR;
 
 /// What caps the cache on one run: what the operator configured and what the
 /// filesystem can still give.

@@ -37,6 +37,46 @@ use crate::backend::{
 };
 
 const INACTIVE_TORRENT_REMOVE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
+/// Free space the cache is kept out of on the volume the torrents write to.
+///
+/// One number, three readers, and it is one number so they cannot drift:
+/// the server's stream route refuses to start a stream to disk with less
+/// than this free; its cache cleaner evicts the cache back to it; and the
+/// engine's free-space watch ([`BackendEngineFS::free_space_watch_tick`])
+/// stops a torrent that is writing when the volume falls under it. The
+/// third is what makes the other two hold. librqbit's storage writes the
+/// whole file it wants and stops only at ENOSPC, which it treats as a fatal
+/// torrent error -- so without the watch a torrent larger than the free
+/// space ran the volume to zero between two cleaner passes (40 s at full
+/// speed on the television that prompted this), and with the volume at
+/// zero every other stream and the OS around them failed too. The watch
+/// checks every [`FREE_SPACE_WATCH_INTERVAL`], so a torrent can overshoot
+/// the floor by that long of writing; the floor is sized to absorb it.
+///
+/// Offline downloads are the fourth writer and keep their own margin,
+/// [`PIN_FREE_SPACE_MARGIN`], checked once when a pin is accepted; a pin
+/// can therefore settle the volume under this line by design, and the
+/// watch stops it there like anything else.
+pub const CACHE_FREE_SPACE_FLOOR: u64 = 512 * 1024 * 1024;
+/// How often the free-space watch reads the volume. One `statvfs` per
+/// distinct output folder per tick -- microseconds -- so it can afford to
+/// be short, and it has to be: a torrent at 20 MB/s writes 40 MB per tick
+/// past the floor before the watch sees it.
+pub const FREE_SPACE_WATCH_INTERVAL: Duration = Duration::from_secs(2);
+/// A torrent the watch stopped is started again by the watch only once the
+/// volume has this much *over* the floor -- or by the cache cleaner the
+/// moment it has made room, whatever the margin. Without the hysteresis a
+/// torrent resumed at the floor writes a few MB, is stopped again, and
+/// flaps: each stop drops its peers and each start re-announces.
+pub const FREE_SPACE_RESUME_MARGIN: u64 = 64 * 1024 * 1024;
+/// How long a torrent may stay stopped for space with its readers parked
+/// before the watch fails them (`Engine::refuse_reads_for_space`). The
+/// cache cleaner normally settles it well inside this -- the stop notifies
+/// it, and its pass either makes room and restarts the torrent or evicts
+/// it -- so a reader sees a buffering blip, not a failure. This is the
+/// bound for a server whose cleaner is off or stuck: a parked read that
+/// nothing will complete is a player spinning for ever.
+pub const STOPPED_READ_STALL_BOUND: Duration = Duration::from_secs(20);
 /// Free space that must remain on the download volume after a pinned file's
 /// missing bytes are written; `pin_download` refuses below it
 /// ([`PinDownloadError::InsufficientSpace`]). Re-pinning a complete file
@@ -578,6 +618,10 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     /// The housekeeping sweep started by the constructor, kept so its owner
     /// can cancel it. See [`Self::take_sweep_task`].
     sweep_task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Rung once per free-space watch tick that stopped a torrent, for the
+    /// cache cleaner to run a pass at once rather than on its next poll --
+    /// see [`Self::out_of_space_signal`].
+    out_of_space_notify: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Debug, Clone)]
@@ -753,6 +797,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             volume_id_probe: Arc::new(volume_id),
             clock,
             sweep_task: parking_lot::Mutex::new(None),
+            out_of_space_notify: Arc::new(tokio::sync::Notify::new()),
         };
 
         let engines_clone = engines.clone();
@@ -1153,6 +1198,161 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// See [`crate::trackers::TrackerManager::take_refresh_task`].
     pub fn take_tracker_refresh_task(&self) -> Option<tokio::task::JoinHandle<()>> {
         self.tracker_manager.take_refresh_task()
+    }
+
+    /// Start the free-space watch: [`Self::free_space_watch_tick`] every
+    /// [`FREE_SPACE_WATCH_INTERVAL`] for as long as this engine exists. The
+    /// caller owns the task -- `server::run` puts it with the other forever
+    /// loops it aborts on shutdown -- and the task holds the engine weakly,
+    /// so an embedder that drops the engine without aborting it ends it
+    /// too. Not started by the constructor, unlike the housekeeping sweep:
+    /// the tests drive the tick by hand against a probe of their own, and a
+    /// watch running behind them against the real volume would stop their
+    /// fake torrents whenever the machine happened to be short of disk.
+    pub fn start_free_space_watch(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(FREE_SPACE_WATCH_INTERVAL);
+            loop {
+                interval.tick().await;
+                let Some(engine_fs) = weak.upgrade() else {
+                    return;
+                };
+                engine_fs.free_space_watch_tick().await;
+            }
+        })
+    }
+
+    /// One pass of the free-space watch.
+    ///
+    /// For every engine, read the free space of the volume its output folder
+    /// is on (one probe per distinct folder) and:
+    ///
+    /// * under [`CACHE_FREE_SPACE_FLOOR`], stop a torrent that is still
+    ///   writing -- live, unfinished, not idle-paused, not already in the
+    ///   error state -- with [`TorrentHandle::stop_for_space`], mark it, and
+    ///   ring [`Self::out_of_space_signal`] so the cache cleaner runs a pass
+    ///   now. The torrent keeps its files and its piece map; its readers
+    ///   stay parked on whatever piece they were waiting for, which is a
+    ///   buffering pause for the player while the cleaner decides.
+    /// * at [`CACHE_FREE_SPACE_FLOOR`] + [`FREE_SPACE_RESUME_MARGIN`] or
+    ///   more, start a torrent this watch stopped again -- the space came
+    ///   back by some other route than the cleaner, which restarts what it
+    ///   makes room for itself.
+    /// * a torrent still stopped after [`STOPPED_READ_STALL_BOUND`] has its
+    ///   readers failed ([`Engine::refuse_reads_for_space`]): nothing is
+    ///   coming for them, and a player must be told rather than left
+    ///   spinning.
+    ///
+    /// Pinned torrents are stopped like any other -- a pin is a reason to
+    /// keep the bytes, not a licence to run the disk to zero -- and the
+    /// cleaner's recovery restarts them once it has room. A volume that
+    /// cannot be probed is left alone, as everywhere else: an unreadable
+    /// reading is not "full".
+    pub async fn free_space_watch_tick(&self) {
+        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
+        if engines.is_empty() {
+            return;
+        }
+        let now = self.clock.now_secs();
+        let mut readings: HashMap<std::path::PathBuf, Option<u64>> = HashMap::new();
+        let mut stopped_any = false;
+        for engine in engines {
+            if engine.handle.manages_playback_lifecycle() {
+                continue;
+            }
+            let folder = engine
+                .handle
+                .output_folder()
+                .unwrap_or_else(|| self.download_dir.clone());
+            let available = *readings.entry(folder.clone()).or_insert_with(|| {
+                match probe_at_existing_ancestor(&*self.free_space_probe, &folder) {
+                    Ok(available) => Some(available),
+                    Err(error) => {
+                        debug!(
+                            folder = %folder.display(),
+                            %error,
+                            "could not read the output volume's free space; the watch leaves its torrents alone"
+                        );
+                        None
+                    }
+                }
+            });
+            let Some(available) = available else {
+                continue;
+            };
+
+            if let Some(stopped_for) = engine.stopped_for_space_for(now) {
+                if available >= CACHE_FREE_SPACE_FLOOR.saturating_add(FREE_SPACE_RESUME_MARGIN) {
+                    match engine.handle.restart_after_error().await {
+                        Ok(()) => {
+                            engine.clear_space_stop();
+                            tracing::info!(
+                                info_hash = %engine.info_hash,
+                                available,
+                                "torrent_resumed_after_space_recovered"
+                            );
+                        }
+                        Err(error) => tracing::warn!(
+                            info_hash = %engine.info_hash,
+                            error = %format!("{error:#}"),
+                            "could not resume a torrent the free-space watch had stopped"
+                        ),
+                    }
+                } else if !engine.reads_refused() && stopped_for >= STOPPED_READ_STALL_BOUND {
+                    tracing::warn!(
+                        info_hash = %engine.info_hash,
+                        stopped_secs = stopped_for.as_secs(),
+                        available,
+                        "a torrent stopped for want of disk space is still stopped; failing its readers rather than leaving them parked"
+                    );
+                    engine.refuse_reads_for_space();
+                }
+                continue;
+            }
+
+            if available >= CACHE_FREE_SPACE_FLOOR {
+                continue;
+            }
+            // Nothing to stop: not writing anyway, or the backend has already
+            // stopped it (out of space, or dead).
+            if engine.idle_paused.load(Ordering::Relaxed)
+                || engine.handle.is_in_error_state().await
+                || engine.handle.is_finished().await
+            {
+                continue;
+            }
+            match engine.handle.stop_for_space().await {
+                Ok(()) => {
+                    engine.mark_stopped_for_space(now);
+                    stopped_any = true;
+                    tracing::warn!(
+                        info_hash = %engine.info_hash,
+                        available,
+                        floor = CACHE_FREE_SPACE_FLOOR,
+                        pinned = engine.is_pinned(),
+                        "torrent_stopped_for_space"
+                    );
+                }
+                Err(error) => debug!(
+                    info_hash = %engine.info_hash,
+                    error = %format!("{error:#}"),
+                    "the backend would not stop the torrent for space"
+                ),
+            }
+        }
+        if stopped_any {
+            self.out_of_space_notify.notify_one();
+        }
+    }
+
+    /// Completes once the free-space watch has stopped a torrent since the
+    /// last time this completed (or since the engine was made, if a stop
+    /// came first). One permit, not a counter: the cache cleaner that awaits
+    /// this runs one pass per wake-up, and a pass covers every stopped
+    /// torrent there is.
+    pub async fn out_of_space_signal(&self) {
+        self.out_of_space_notify.notified().await
     }
 
     /// The tracker list a torrent is added with: the built-in defaults, the
@@ -1668,7 +1868,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     }
 
     /// Info hashes of torrents the backend stopped because the volume they
-    /// write to ran out of space.
+    /// write to ran out of space, and of torrents the free-space watch
+    /// stopped before it could ([`Self::free_space_watch_tick`]).
     ///
     /// A full disk is the one torrent error worth acting on rather than
     /// reporting: the swarm is fine, the torrent is fine, the device is out
@@ -1681,7 +1882,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
         let mut hashes = Vec::new();
         for engine in engines {
-            if engine.handle.is_out_of_space().await {
+            if engine.is_stopped_for_space() || engine.handle.is_out_of_space().await {
                 hashes.push(engine.handle.info_hash());
             }
         }
@@ -1689,14 +1890,16 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     }
 
     /// Put the torrent `info_hash` back to work after the backend stopped it
-    /// with an error. `false` when no engine holds that hash any more (it was
-    /// swept while space was being reclaimed), which is not a failure.
+    /// with an error, or after the free-space watch stopped it. `false` when
+    /// no engine holds that hash any more (it was swept while space was
+    /// being reclaimed), which is not a failure.
     pub async fn restart_after_error(&self, info_hash: &str) -> Result<bool> {
         let engine = self.engines.read().await.get(info_hash).cloned();
         let Some(engine) = engine else {
             return Ok(false);
         };
         engine.handle.restart_after_error().await?;
+        engine.clear_space_stop();
         Ok(true)
     }
 
@@ -4057,6 +4260,8 @@ mod tests {
         uploaded: AtomicU64,
         /// How many times the torrent was put back to work after that.
         restart_after_error: AtomicUsize,
+        /// How many times the free-space watch stopped the torrent.
+        stop_for_space: AtomicUsize,
     }
 
     /// Simulates librqbit's `Initializing` state for the fake torrent: the
@@ -4448,6 +4653,15 @@ mod tests {
 
         async fn is_out_of_space(&self) -> bool {
             self.counters.out_of_space.load(Ordering::SeqCst)
+        }
+
+        async fn is_finished(&self) -> bool {
+            self.counters.seeded.load(Ordering::SeqCst)
+        }
+
+        async fn stop_for_space(&self) -> Result<()> {
+            self.counters.stop_for_space.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
 
         async fn is_in_error_state(&self) -> bool {
@@ -6571,6 +6785,239 @@ mod tests {
                 placed.join("video-1.mkv")
             ]
         );
+    }
+
+    // --- the free-space watch ---
+
+    /// A reader whose every read parks, like a `FileStream` on a piece the
+    /// torrent is not downloading.
+    struct ParkedStream;
+
+    impl tokio::io::AsyncRead for ParkedStream {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl tokio::io::AsyncSeek for ParkedStream {
+        fn start_seek(
+            self: std::pin::Pin<&mut Self>,
+            _position: std::io::SeekFrom,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn poll_complete(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<u64>> {
+            std::task::Poll::Ready(Ok(0))
+        }
+    }
+
+    /// The whole point: a torrent that is writing is stopped when the volume
+    /// falls under the floor, before the filesystem stops it with ENOSPC and
+    /// librqbit declares it dead -- and it is listed for the cleaner, which
+    /// is what makes room for it. Stopped once, not once per tick; started
+    /// again by the watch only once the volume is a margin over the floor,
+    /// so it does not flap at the line.
+    #[tokio::test]
+    async fn the_watch_stops_a_writing_torrent_under_the_floor_and_resumes_it_over_the_margin() {
+        let (mut enginefs, counters) = test_enginefs_with_file_count(1);
+        let available = Arc::new(AtomicU64::new(CACHE_FREE_SPACE_FLOOR));
+        let probe_available = available.clone();
+        enginefs.set_free_space_probe(move |_| Ok(probe_available.load(Ordering::SeqCst)));
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+
+        // At the floor: fine.
+        enginefs.free_space_watch_tick().await;
+        assert_eq!(counters.stop_for_space.load(Ordering::SeqCst), 0);
+        assert!(!engine.is_stopped_for_space());
+
+        // A byte under it: stopped, once, and the cleaner's business now.
+        available.store(CACHE_FREE_SPACE_FLOOR - 1, Ordering::SeqCst);
+        enginefs.free_space_watch_tick().await;
+        enginefs.free_space_watch_tick().await;
+        assert_eq!(counters.stop_for_space.load(Ordering::SeqCst), 1);
+        assert!(engine.is_stopped_for_space());
+        assert_eq!(
+            enginefs.out_of_space_torrents().await,
+            vec![TEST_HASH.to_string()]
+        );
+        assert!(!engine.reads_refused(), "its readers wait for the cleaner");
+
+        // Back over the floor but inside the margin: still stopped.
+        available.store(
+            CACHE_FREE_SPACE_FLOOR + FREE_SPACE_RESUME_MARGIN - 1,
+            Ordering::SeqCst,
+        );
+        enginefs.free_space_watch_tick().await;
+        assert!(engine.is_stopped_for_space());
+        assert_eq!(counters.restart_after_error.load(Ordering::SeqCst), 0);
+
+        // The margin over: started again, and off the cleaner's list.
+        available.store(
+            CACHE_FREE_SPACE_FLOOR + FREE_SPACE_RESUME_MARGIN,
+            Ordering::SeqCst,
+        );
+        enginefs.free_space_watch_tick().await;
+        assert_eq!(counters.restart_after_error.load(Ordering::SeqCst), 1);
+        assert!(!engine.is_stopped_for_space());
+        assert!(enginefs.out_of_space_torrents().await.is_empty());
+    }
+
+    /// The watch stops writers. A torrent the idle policy paused, one that
+    /// has everything it wants, one the backend already stopped with an
+    /// error: none of them is writing, and stopping them would only cost
+    /// peers (and, for the finished one, its seeding) for nothing.
+    #[tokio::test]
+    async fn the_watch_leaves_alone_what_writes_nothing() {
+        let (mut enginefs, counters) = test_enginefs_with_file_count(1);
+        enginefs.set_free_space_probe(|_| Ok(0));
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+
+        engine.idle_paused.store(true, Ordering::SeqCst);
+        enginefs.free_space_watch_tick().await;
+        engine.idle_paused.store(false, Ordering::SeqCst);
+
+        counters.seeded.store(true, Ordering::SeqCst);
+        enginefs.free_space_watch_tick().await;
+        counters.seeded.store(false, Ordering::SeqCst);
+
+        counters.in_error_state.store(true, Ordering::SeqCst);
+        enginefs.free_space_watch_tick().await;
+        counters.in_error_state.store(false, Ordering::SeqCst);
+
+        assert_eq!(counters.stop_for_space.load(Ordering::SeqCst), 0);
+        assert!(!engine.is_stopped_for_space());
+
+        // And a volume it cannot read is not a full one.
+        enginefs.set_free_space_probe(|_| Err(std::io::Error::other("no statvfs here")));
+        enginefs.free_space_watch_tick().await;
+        assert_eq!(counters.stop_for_space.load(Ordering::SeqCst), 0);
+
+        // Whereas the same torrent, writing, is stopped -- pinned or not
+        // (the pin is accepted while there is room, as a pin is, and the
+        // volume fills under it).
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
+        enginefs.set_free_space_probe(|_| Ok(0));
+        enginefs.free_space_watch_tick().await;
+        assert_eq!(counters.stop_for_space.load(Ordering::SeqCst), 1);
+        assert!(engine.is_stopped_for_space());
+    }
+
+    /// A stop rings the cleaner, and the cleaner's own restart is the other
+    /// way a stopped torrent comes back: `restart_after_error` clears the
+    /// stop whatever the volume reads, since the cleaner has just made the
+    /// room it is restarting into.
+    #[tokio::test]
+    async fn a_stop_for_space_rings_the_cleaner_and_its_restart_clears_the_stop() {
+        let (mut enginefs, counters) = test_enginefs_with_file_count(1);
+        enginefs.set_free_space_probe(|_| Ok(0));
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+
+        let rung = tokio::time::timeout(Duration::from_millis(10), enginefs.out_of_space_signal());
+        assert!(rung.await.is_err(), "nothing has been stopped yet");
+
+        enginefs.free_space_watch_tick().await;
+        tokio::time::timeout(TEST_WAIT_BOUND, enginefs.out_of_space_signal())
+            .await
+            .expect("the stop rang the cleaner");
+        assert!(engine.is_stopped_for_space());
+
+        assert!(enginefs.restart_after_error(TEST_HASH).await.unwrap());
+        assert_eq!(counters.restart_after_error.load(Ordering::SeqCst), 1);
+        assert!(!engine.is_stopped_for_space());
+        assert!(enginefs.out_of_space_torrents().await.is_empty());
+    }
+
+    /// A read parked on a piece a stopped torrent will not download is a
+    /// player spinning for ever. Refusing reads wakes the parked one to
+    /// fail with `StorageFull`, fails a new one at its first poll, and the
+    /// watch does the refusing itself once a torrent has been stopped for
+    /// [`STOPPED_READ_STALL_BOUND`] -- the bound for a cleaner that is not
+    /// there to settle it sooner.
+    #[tokio::test(start_paused = true)]
+    async fn readers_of_a_torrent_stopped_for_space_are_failed_rather_than_parked() {
+        use tokio::io::{AsyncRead, AsyncReadExt};
+        let (mut enginefs, _counters) = test_enginefs_with_file_count(1);
+        enginefs.set_free_space_probe(|_| Ok(0));
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        let mut reader = crate::files::FileHandle::new(
+            100,
+            "video-0.mkv".to_string(),
+            Box::new(ParkedStream),
+            engine.clone(),
+            0,
+            0,
+        );
+        engine.active_streams.fetch_add(1, Ordering::SeqCst);
+
+        // Parked, and registered with the engine.
+        let mut buf = [0u8; 16];
+        let parked = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(
+                std::pin::Pin::new(&mut reader)
+                    .poll_read(cx, &mut tokio::io::ReadBuf::new(&mut buf))
+                    .is_pending(),
+            )
+        })
+        .await;
+        assert!(parked, "a read on a missing piece parks");
+
+        // Stopped, inside the stall bound: the read stays parked (the
+        // cleaner is expected to settle it), so a task on it does not end.
+        enginefs.free_space_watch_tick().await;
+        assert!(engine.is_stopped_for_space());
+        let waiting = tokio::spawn(async move {
+            let mut buf = [0u8; 16];
+            let result = reader.read(&mut buf).await;
+            (reader, result)
+        });
+        tokio::time::advance(STOPPED_READ_STALL_BOUND - Duration::from_secs(1)).await;
+        enginefs.free_space_watch_tick().await;
+        assert!(!engine.reads_refused());
+        assert!(!waiting.is_finished(), "still parked inside the bound");
+
+        // The bound passed: the watch fails the readers, and the parked
+        // read is woken to see it.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        enginefs.free_space_watch_tick().await;
+        assert!(engine.reads_refused());
+        let (mut reader, result) = tokio::time::timeout(TEST_WAIT_BOUND, waiting)
+            .await
+            .expect("the parked read was woken")
+            .unwrap();
+        assert_eq!(
+            result.expect_err("and failed").kind(),
+            std::io::ErrorKind::StorageFull
+        );
+
+        // A fresh read fails at once, without touching the stream.
+        let mut buf = [0u8; 16];
+        assert_eq!(
+            reader.read(&mut buf).await.expect_err("refused").kind(),
+            std::io::ErrorKind::StorageFull
+        );
+
+        // Back to work: reads park again as before.
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        enginefs.free_space_watch_tick().await;
+        assert!(!engine.is_stopped_for_space() && !engine.reads_refused());
+        let parked = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(
+                std::pin::Pin::new(&mut reader)
+                    .poll_read(cx, &mut tokio::io::ReadBuf::new(&mut buf))
+                    .is_pending(),
+            )
+        })
+        .await;
+        assert!(parked);
+        drop(reader);
     }
 
     // --- free-space check before pinning ---

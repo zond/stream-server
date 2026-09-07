@@ -261,8 +261,21 @@ pub trait TorrentHandle: Send + Sync + Clone {
     /// Put a torrent the backend stopped with an error back to work, after
     /// whatever caused the error has been dealt with. Errs for a backend that
     /// cannot restart one, so a caller never mistakes silence for recovery.
+    /// Also what puts a torrent stopped by [`Self::stop_for_space`] back to
+    /// work.
     async fn restart_after_error(&self) -> Result<()> {
         anyhow::bail!("this backend cannot restart a stopped torrent")
+    }
+    /// Stop the torrent -- no more reads from peers, no more writes to disk
+    /// -- because the volume it writes to is about to run out. Not the idle
+    /// pause ([`Self::pause_torrent`], a no-op for a backend that would
+    /// rather throttle than lose its peers): this one must actually stop
+    /// the writes, since the alternative is the filesystem stopping them
+    /// with ENOSPC and the backend declaring the torrent dead. Undone by
+    /// [`Self::restart_after_error`]. Errs for a backend that cannot, and
+    /// for a torrent already stopped.
+    async fn stop_for_space(&self) -> Result<()> {
+        anyhow::bail!("this backend cannot stop a torrent for space")
     }
     /// Pause torrent activity when no stream is currently using it.
     async fn pause_torrent(&self) -> Result<()> {

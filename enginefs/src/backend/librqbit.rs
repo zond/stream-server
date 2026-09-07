@@ -2244,6 +2244,17 @@ impl TorrentHandle for LibrqbitHandle {
         self.session.unpause(&self.handle).await
     }
 
+    /// `Session::pause` -> `ManagedTorrent::pause`: a live torrent's state
+    /// becomes `Paused`, which drops its peers and its pending writes and
+    /// keeps its files and piece map -- and which `Session::unpause` (our
+    /// `restart_after_error`) takes straight back to live, no re-check, so
+    /// nothing may touch those files while it is paused. A torrent still
+    /// in its initial check is asked to pause once the check ends. Errs on
+    /// a torrent already paused or in the error state, in librqbit's words.
+    async fn stop_for_space(&self) -> Result<()> {
+        self.session.pause(&self.handle).await
+    }
+
     /// `Session::unpause`, for a torrent librqbit restored paused because it
     /// was added with `piece_reclaim` (the fork forces a restored reclaim
     /// torrent paused; see [`AddTorrentOptions::piece_reclaim`] in the fork
@@ -3619,6 +3630,53 @@ mod tests {
         let (_backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
         assert!(!handle.is_out_of_space().await);
         assert!(!handle.is_in_error_state().await);
+    }
+
+    /// Against the shipped librqbit: `stop_for_space` is `Session::pause`,
+    /// which takes a live torrent to `Paused` (no peers, no writes, files and
+    /// piece map kept) and refuses a torrent already paused, and
+    /// `restart_after_error` is `Session::unpause`, which takes it straight
+    /// back to live.
+    #[tokio::test]
+    async fn stop_for_space_pauses_a_live_torrent_and_restart_takes_it_back() {
+        use crate::backend::TorrentHandle;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let payload = dir.join("payload.bin");
+        write_payload(&payload, 16 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+        let (_backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
+        handle.await_initialized().await.expect("the check ends");
+
+        handle
+            .stop_for_space()
+            .await
+            .expect("a live torrent pauses");
+        let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
+        while !handle.handle.is_paused() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(handle.handle.is_paused());
+        assert!(
+            handle.stop_for_space().await.is_err(),
+            "a paused torrent is not paused twice"
+        );
+        assert!(
+            !handle.is_out_of_space().await && !handle.is_in_error_state().await,
+            "paused is not the error state"
+        );
+
+        handle
+            .restart_after_error()
+            .await
+            .expect("unpause takes it back to live");
+        assert!(!handle.handle.is_paused());
+        assert!(
+            handle
+                .handle
+                .with_state(|s| matches!(s, ManagedTorrentState::Live(_))),
+            "live again"
+        );
     }
 
     /// `stats().sources` must list the trackers the torrent was added with:

@@ -4,10 +4,10 @@ use crate::backend::{
 };
 use crate::cache::DataCache;
 use anyhow::Context;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::files::FileHandle;
 use regex::Regex;
@@ -261,6 +261,24 @@ pub struct Engine<H: TorrentHandle> {
     /// seeding-disabled pause; the handle keeps its own copy for the
     /// want-set planner (`TorrentHandle::pin_file`).
     pub pinned_files: parking_lot::RwLock<BTreeSet<usize>>,
+    /// The free-space watch stopped this torrent because the volume it
+    /// writes to fell under the floor (`BackendEngineFS::free_space_watch_tick`).
+    /// Cleared by whatever puts it back to work -- the watch when space
+    /// recovers, or the cache cleaner's `restart_after_error` once it has
+    /// made room. Read on the stream route, which answers `507` for it.
+    stopped_for_space: AtomicBool,
+    /// `Clock::now_secs()` of the stop, for the stall bound on its readers.
+    stopped_for_space_at_secs: AtomicU64,
+    /// Reads through this engine fail with `StorageFull` instead of parking:
+    /// see [`Self::refuse_reads_for_space`].
+    reads_refused: AtomicBool,
+    /// The waker of every read currently parked on a missing piece, by
+    /// reader ([`crate::files::FileHandle`] registers on `Pending` and
+    /// forgets itself on drop). The backend wakes a parked read when its
+    /// piece arrives and never otherwise, so a torrent that is stopped
+    /// leaves its readers parked for good unless something here wakes them.
+    read_wakers: parking_lot::Mutex<HashMap<u64, std::task::Waker>>,
+    next_reader_id: AtomicU64,
 }
 
 impl<H: TorrentHandle> Engine<H> {
@@ -277,7 +295,84 @@ impl<H: TorrentHandle> Engine<H> {
                 .build(),
             idle_paused: AtomicBool::new(false),
             pinned_files: parking_lot::RwLock::new(BTreeSet::new()),
+            stopped_for_space: AtomicBool::new(false),
+            stopped_for_space_at_secs: AtomicU64::new(0),
+            reads_refused: AtomicBool::new(false),
+            read_wakers: parking_lot::Mutex::new(HashMap::new()),
+            next_reader_id: AtomicU64::new(1),
         }
+    }
+
+    /// Whether the free-space watch has this torrent stopped.
+    pub fn is_stopped_for_space(&self) -> bool {
+        self.stopped_for_space.load(Ordering::SeqCst)
+    }
+
+    /// The watch stopped the torrent at `now_secs` (the engine's clock).
+    pub(crate) fn mark_stopped_for_space(&self, now_secs: u64) {
+        self.stopped_for_space_at_secs
+            .store(now_secs, Ordering::SeqCst);
+        self.stopped_for_space.store(true, Ordering::SeqCst);
+    }
+
+    /// How long the torrent has been stopped for space at `now_secs`;
+    /// `None` when it is not.
+    pub(crate) fn stopped_for_space_for(&self, now_secs: u64) -> Option<Duration> {
+        self.is_stopped_for_space().then(|| {
+            Duration::from_secs(
+                now_secs.saturating_sub(self.stopped_for_space_at_secs.load(Ordering::SeqCst)),
+            )
+        })
+    }
+
+    /// The torrent is back to work: neither stopped nor refusing reads.
+    /// Readers that were failed meanwhile are gone; new ones read normally.
+    pub(crate) fn clear_space_stop(&self) {
+        self.stopped_for_space.store(false, Ordering::SeqCst);
+        self.reads_refused.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether reads through this engine fail rather than wait.
+    pub fn reads_refused(&self) -> bool {
+        self.reads_refused.load(Ordering::SeqCst)
+    }
+
+    /// Fail every read on this engine, now and until [`Self::clear_space_stop`]:
+    /// the parked ones are woken to find `reads_refused` set and return
+    /// `StorageFull`, and a new one returns it on its first poll.
+    ///
+    /// A player reading a torrent that has been stopped for space would
+    /// otherwise sit on a read that nothing will ever complete -- the piece
+    /// it waits for is not being downloaded -- which the player shows as an
+    /// endless buffering wheel. A failed read ends the response, and the
+    /// player's next request meets the `507` the stream route answers for a
+    /// stopped torrent.
+    pub fn refuse_reads_for_space(&self) {
+        self.reads_refused.store(true, Ordering::SeqCst);
+        self.wake_readers();
+    }
+
+    /// Wake every parked read so it polls again.
+    pub(crate) fn wake_readers(&self) {
+        let wakers: Vec<_> = self.read_wakers.lock().drain().map(|(_, w)| w).collect();
+        for waker in wakers {
+            waker.wake();
+        }
+    }
+
+    /// A fresh id for a reader that will register wakers.
+    pub(crate) fn next_reader_id(&self) -> u64 {
+        self.next_reader_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Reader `id` is parked; wake it with `waker` when reads are refused.
+    pub(crate) fn register_read_waker(&self, id: u64, waker: std::task::Waker) {
+        self.read_wakers.lock().insert(id, waker);
+    }
+
+    /// Reader `id` is gone (or served); nothing to wake.
+    pub(crate) fn forget_read_waker(&self, id: u64) {
+        self.read_wakers.lock().remove(&id);
     }
 
     /// Whether any file of this torrent is pinned as an offline download.
