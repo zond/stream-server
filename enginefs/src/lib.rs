@@ -526,6 +526,12 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     volume_id_probe: VolumeProbe,
     /// Epoch of every `*_secs` timestamp this instance and its engines keep.
     clock: Clock,
+    /// The backend's byte counters, taken once at construction (see
+    /// [`TorrentBackend::storage_traffic`]).
+    storage_traffic: Arc<crate::traffic::StorageTraffic>,
+    /// The last reading of those counters and the verdict it produced --
+    /// what [`Self::background_traffic`] answers from.
+    traffic_window: crate::traffic::TrafficWindow,
     /// The housekeeping sweep started by the constructor, kept so its owner
     /// can cancel it. See [`Self::take_sweep_task`].
     sweep_task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -589,6 +595,33 @@ pub struct StreamActivitySnapshot {
     pub idle_paused_torrents: Vec<String>,
 }
 
+impl StreamActivitySnapshot {
+    /// Whether a player is reading from this server right now.
+    ///
+    /// Three of the fields here are live and the rest are sticky, and telling
+    /// them apart is the whole of the answer:
+    ///
+    /// * `engine_active_streams` counts open file readers -- up when one is
+    ///   handed out, down when the [`crate::files::FileHandle`] is dropped.
+    /// * `active_streams` counts the stream responses on top of them
+    ///   (`on_stream_start`/`on_stream_end`), which is also what an HLS
+    ///   client's segment requests move.
+    /// * `active_playback_leases` is already filtered to unexpired leases:
+    ///   how a client that reads in short bursts says it is still there
+    ///   between them.
+    ///
+    /// `active_file` and `active_multifile_selections` are the ones to leave
+    /// out. They name the file most recently chosen, and they deliberately
+    /// outlive the stream, because the want-set is planned from them -- a
+    /// light driven by either would come on with the first playback of the
+    /// session and never go out again.
+    pub fn playback_is_live(&self) -> bool {
+        self.engine_active_streams > 0
+            || self.active_streams.values().any(|count| *count > 0)
+            || !self.active_playback_leases.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EngineDiagnosticsSnapshot {
     pub uptime_secs: u64,
@@ -616,6 +649,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         tracker_storage: Option<Arc<dyn crate::trackers::TrackerStorage>>,
     ) -> Self {
         let clock = Clock::start();
+        let storage_traffic = backend.storage_traffic();
         let mut engines_map = HashMap::new();
         for (hash, handle) in restored_handles {
             engines_map.insert(
@@ -654,6 +688,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             free_space_probe: Arc::new(|path| fs4::available_space(path)),
             volume_id_probe: Arc::new(volume_id),
             clock,
+            storage_traffic,
+            traffic_window: Default::default(),
             sweep_task: parking_lot::Mutex::new(None),
         };
 
@@ -1638,6 +1674,33 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             active_multifile_selections,
             idle_paused_torrents,
         }
+    }
+
+    /// Whether this server is using the connection while nobody is watching
+    /// -- one fact, decided here.
+    ///
+    /// It is a conjunction of two things that are measured differently, and
+    /// that is exactly why it is answered in one place rather than left to
+    /// the client: two signals crossing an FFI boundary would be sampled a
+    /// moment apart, and a light driven by the pair would flicker on every
+    /// disagreement between them. Here they cannot disagree.
+    ///
+    /// *Traffic* is bytes through the torrent storage over the last window
+    /// (see [`crate::traffic::TRAFFIC_WINDOW`]): a peer we are serving, a
+    /// download running with nothing on screen, the hash check that download
+    /// needs. *Nobody watching* is
+    /// [`StreamActivitySnapshot::playback_is_live`] -- and it has to be false
+    /// over the window as well as now, or the light would blame every viewer
+    /// for their own playback the moment they stopped it.
+    ///
+    /// Cheap and free of side effects on purpose: it reads the engines that
+    /// exist and two atomics. It creates nothing -- a light that started a
+    /// torrent in order to report on it would be reporting on itself -- so
+    /// it never goes near `get_or_begin_add_magnet`.
+    pub async fn background_traffic(&self) -> crate::traffic::BackgroundTraffic {
+        let playing = self.stream_activity_snapshot().await.playback_is_live();
+        self.traffic_window
+            .sample(self.clock.now_secs(), &self.storage_traffic, playing)
     }
 
     pub async fn diagnostics_snapshot(&self) -> EngineDiagnosticsSnapshot {
@@ -3811,6 +3874,9 @@ mod tests {
         /// `add_hold`, standing in for metadata still resolving.
         hold_add: Arc<AtomicBool>,
         add_hold: Arc<tokio::sync::Semaphore>,
+        /// What this fake session's storage has moved -- a test adds to it
+        /// directly, where the real backend's wrapper would.
+        traffic: Arc<crate::traffic::StorageTraffic>,
     }
 
     impl FakeBackend {
@@ -3827,6 +3893,7 @@ mod tests {
                 hide_torrents: Arc::new(AtomicBool::new(false)),
                 hold_add: Arc::new(AtomicBool::new(false)),
                 add_hold: Arc::new(tokio::sync::Semaphore::new(0)),
+                traffic: crate::traffic::StorageTraffic::new(),
             }
         }
     }
@@ -3917,6 +3984,10 @@ mod tests {
 
         async fn memory_diagnostics(&self) -> BackendMemoryDiagnostics {
             BackendMemoryDiagnostics::default()
+        }
+
+        fn storage_traffic(&self) -> Arc<crate::traffic::StorageTraffic> {
+            self.traffic.clone()
         }
     }
 
@@ -5052,6 +5123,106 @@ mod tests {
         assert_eq!(snapshot.active_multifile_selections[0].file_idx, 2);
         assert_eq!(*counters.last_active_file.lock().unwrap(), Some(2));
         assert_eq!(counters.clear_file_streaming.load(Ordering::SeqCst), 0);
+    }
+
+    /// Which of the snapshot's fields mean "somebody is watching". The
+    /// sticky ones are the trap: they are what the want-set is planned from,
+    /// so they outlive the stream on purpose, and a light driven by them
+    /// would come on with the first playback of the session and stay on.
+    #[tokio::test]
+    async fn only_the_live_fields_count_as_playback() {
+        let (enginefs, _counters) = test_enginefs_with_file_count(2);
+
+        enginefs.on_stream_start(TEST_HASH, 1).await;
+        assert!(
+            enginefs.stream_activity_snapshot().await.playback_is_live(),
+            "an open stream is somebody watching"
+        );
+
+        enginefs.on_stream_end(TEST_HASH, 1).await;
+        let after = enginefs.stream_activity_snapshot().await;
+        assert!(
+            after.active_file.is_some() || !after.active_multifile_selections.is_empty(),
+            "the sticky bookkeeping is still there -- otherwise this asserts nothing"
+        );
+        assert!(
+            !after.playback_is_live(),
+            "the stream is over: what is left names the last file chosen, not a reader"
+        );
+
+        insert_active_lease(&enginefs, 1).await;
+        assert!(
+            enginefs.stream_activity_snapshot().await.playback_is_live(),
+            "a live playback lease is a client that is still there between reads"
+        );
+    }
+
+    /// The conjunction the client's activity light is, end to end: bytes
+    /// through the storage, over a window, with nothing playing over it.
+    ///
+    /// Paused time so the windows are exact. The housekeeping sweep is
+    /// aborted first: its 15 s loop is a timer the virtual clock would
+    /// advance to on its own the moment the runtime idles, and every window
+    /// here is five seconds long.
+    #[tokio::test(start_paused = true)]
+    async fn the_light_is_traffic_nobody_was_watching() {
+        use crate::traffic::TRAFFIC_WINDOW;
+        let (enginefs, _counters) = test_enginefs_with_file_count(2);
+        if let Some(sweep) = enginefs.take_sweep_task() {
+            sweep.abort();
+        }
+        if let Some(refresher) = enginefs.take_tracker_refresh_task() {
+            refresher.abort();
+        }
+        let traffic = enginefs.backend.storage_traffic();
+
+        traffic.add_written(64 * 1024);
+        let first = enginefs.background_traffic().await;
+        assert!(
+            !first.moving && !first.active,
+            "the first reading is a baseline, whatever the totals already say"
+        );
+
+        traffic.add_written(64 * 1024);
+        tokio::time::advance(TRAFFIC_WINDOW).await;
+        let downloading = enginefs.background_traffic().await;
+        assert!(downloading.moving && downloading.active && !downloading.playing);
+        assert_eq!(downloading.bytes_written, 128 * 1024);
+        assert_eq!(downloading.window_secs, TRAFFIC_WINDOW.as_secs());
+
+        // A player starts. The same bytes are moving; the fact is different,
+        // and it changes with the player rather than at the next window.
+        enginefs.on_stream_start(TEST_HASH, 1).await;
+        let watched = enginefs.background_traffic().await;
+        assert!(watched.playing && watched.moving && !watched.active);
+
+        traffic.add_written(64 * 1024);
+        tokio::time::advance(TRAFFIC_WINDOW).await;
+        assert!(!enginefs.background_traffic().await.active);
+
+        // Playback ends, and the bytes it moved are still in the totals. The
+        // window they moved in had somebody watching, so it is not ours to
+        // claim -- the light waits for a window nobody was in.
+        enginefs.on_stream_end(TEST_HASH, 1).await;
+        traffic.add_written(64 * 1024);
+        tokio::time::advance(TRAFFIC_WINDOW).await;
+        let just_after = enginefs.background_traffic().await;
+        assert!(
+            just_after.moving && !just_after.playing && !just_after.active,
+            "the window that playback was in must not light the light once it ends"
+        );
+
+        traffic.add_written(64 * 1024);
+        tokio::time::advance(TRAFFIC_WINDOW).await;
+        assert!(
+            enginefs.background_traffic().await.active,
+            "a whole window with traffic and no player is exactly what the light is"
+        );
+
+        // And the light goes out when the traffic does.
+        tokio::time::advance(TRAFFIC_WINDOW).await;
+        let idle = enginefs.background_traffic().await;
+        assert!(!idle.moving && !idle.active);
     }
 
     #[tokio::test]

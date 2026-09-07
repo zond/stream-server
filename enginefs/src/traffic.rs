@@ -97,11 +97,11 @@ impl StorageTraffic {
         self.bytes_written.load(Ordering::Relaxed)
     }
 
-    fn add_read(&self, bytes: usize) {
+    pub(crate) fn add_read(&self, bytes: usize) {
         self.bytes_read.fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
-    fn add_written(&self, bytes: usize) {
+    pub(crate) fn add_written(&self, bytes: usize) {
         self.bytes_written
             .fetch_add(bytes as u64, Ordering::Relaxed);
     }
