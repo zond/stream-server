@@ -474,6 +474,12 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     /// torrent (a relocation must not be raced by a second pin); entries
     /// live only while a call holds or waits for them.
     pin_locks: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Relocations in flight, keyed by info hash: every path the move reads
+    /// from or writes to, held only for the length of the move. See
+    /// [`Self::begin_relocation`] -- the engine leaves the registry before
+    /// the backend touches a file, so this is the only thing naming either
+    /// end of the copy while it runs.
+    relocations: parking_lot::Mutex<HashMap<String, Vec<std::path::PathBuf>>>,
     /// Persisted pins of torrents the backend did not have at startup
     /// (see [`Self::restore_pinned_downloads`]): kept in the persisted file
     /// and applied by the next `pin_download` of the torrent, or dropped by
@@ -611,6 +617,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             magnet_adds: Arc::new(RwLock::new(HashMap::new())),
             downloads_dir: parking_lot::RwLock::new(None),
             pin_locks: parking_lot::Mutex::new(HashMap::new()),
+            relocations: parking_lot::Mutex::new(HashMap::new()),
             dormant_pins: parking_lot::Mutex::new(BTreeMap::new()),
             free_space_probe: Arc::new(|path| fs4::available_space(path)),
             volume_id_probe: Arc::new(volume_id),
@@ -1396,37 +1403,61 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// every piece in it is walked, and a wiring commit that forgot this
     /// would make live piece data evictable mid-playback with nothing to
     /// notice it.
+    ///
+    /// Plus both ends of every relocation in flight
+    /// ([`Self::begin_relocation`]). A relocation is the one window where a
+    /// torrent's data has no engine at all speaking for it -- the engine
+    /// leaves the registry before the backend is asked to move a byte, and a
+    /// cross-device copy takes minutes -- so without those entries the
+    /// cleaner would walk the tree being written into and the tree being read
+    /// out of, with nothing protecting either.
     pub async fn protected_paths(&self) -> Vec<std::path::PathBuf> {
         let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
         let pieces = crate::piece_store::root_in(&self.download_dir);
         let mut paths = Vec::new();
         for engine in engines {
-            paths.push(pieces.join(&engine.info_hash));
-            let stats = engine.get_statistics().await;
-            let folder = engine
-                .handle
-                .output_folder()
-                .filter(|folder| *folder != self.download_dir);
-            if stats.files.is_empty() {
-                paths.push(folder.unwrap_or_else(|| self.download_dir.join(&stats.name)));
-                continue;
-            }
-            for (idx, file) in stats.files.iter().enumerate() {
-                let path = match engine.handle.file_path(idx).await {
-                    Some(path) => path,
-                    None => folder
-                        .as_deref()
-                        .unwrap_or(&self.download_dir)
-                        .join(&file.path),
-                };
-                paths.push(path);
-            }
+            paths.extend(self.engine_paths(&engine).await);
         }
         for pin in self.dormant_pinned_downloads() {
             paths.push(pieces.join(&pin.info_hash));
             if let Some(folder) = self.download_folder(&pin.info_hash) {
                 paths.push(folder);
             }
+        }
+        paths.extend(self.relocations.lock().values().flatten().cloned());
+        paths
+    }
+
+    /// Every path `engine`'s data can be at: its directory in the piece store
+    /// first (that placement is this layer's own, whatever the backend
+    /// reports), then each file at the path the backend gives, or the best
+    /// guess from the output folder when it gives none.
+    ///
+    /// Factored out of [`Self::protected_paths`] because a relocation has to
+    /// name exactly this set for an engine that has just left the registry:
+    /// the source of the copy is as evictable as the destination while the
+    /// move runs, and half of a download arriving is the same loss as none.
+    async fn engine_paths(&self, engine: &Arc<Engine<B::Handle>>) -> Vec<std::path::PathBuf> {
+        let mut paths =
+            vec![crate::piece_store::root_in(&self.download_dir).join(&engine.info_hash)];
+        let stats = engine.get_statistics().await;
+        let folder = engine
+            .handle
+            .output_folder()
+            .filter(|folder| *folder != self.download_dir);
+        if stats.files.is_empty() {
+            paths.push(folder.unwrap_or_else(|| self.download_dir.join(&stats.name)));
+            return paths;
+        }
+        for (idx, file) in stats.files.iter().enumerate() {
+            let path = match engine.handle.file_path(idx).await {
+                Some(path) => path,
+                None => folder
+                    .as_deref()
+                    .unwrap_or(&self.download_dir)
+                    .join(&file.path),
+            };
+            paths.push(path);
         }
         paths
     }
@@ -2732,7 +2763,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         );
         let (settle, pending) =
             PendingMagnetAdd::settled_later(engine.info_hash.clone(), trackers.clone().into());
-        self.begin_relocation(&engine, pending.clone()).await;
+        self.begin_relocation(&engine, &folder, pending.clone())
+            .await;
         let relocated = self
             .backend
             .relocate_torrent(&engine.info_hash, placement, trackers)
@@ -2779,11 +2811,26 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// registry's engine) and put `pending` in its place in the magnet-add
     /// registry, atomically for lookups: `lookup_or_begin_add_magnet` takes
     /// the add registry before the engines, as this does.
+    ///
+    /// Records both ends of the move in `relocations` *first*, so there is no
+    /// instant in which the data is walkable and evictable: taking the engine
+    /// out of the registry takes it out of [`Self::protected_paths`] too, and
+    /// the new engine that would put it back does not exist until the backend
+    /// has finished copying. `destination` is the folder being written into;
+    /// the source paths come from the engine that is about to leave. The
+    /// entry goes with [`Self::end_relocation`], after the successor is
+    /// published.
     async fn begin_relocation(
         &self,
         engine: &Arc<Engine<B::Handle>>,
+        destination: &std::path::Path,
         pending: PendingMagnetAdd<B::Handle>,
     ) {
+        let mut protected = self.engine_paths(engine).await;
+        protected.push(destination.to_path_buf());
+        self.relocations
+            .lock()
+            .insert(engine.info_hash.clone(), protected);
         let now = self.clock.now_secs();
         let mut adds = self.magnet_adds.write().await;
         let mut engines = self.engines.write().await;
@@ -2802,10 +2849,12 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         );
     }
 
-    /// Drop the relocation's registry entry, if it still is `pending`. The
-    /// engine (if any) is published before this, so a lookup between the
-    /// two always finds one or the other.
+    /// Drop the relocation's registry entry, if it still is `pending`, and the
+    /// paths it was protecting. The engine (if any) is published before this,
+    /// so a lookup between the two always finds one or the other, and
+    /// [`Self::protected_paths`] never stops naming the data it is holding.
     async fn end_relocation(&self, info_hash: &str, pending: &PendingMagnetAdd<B::Handle>) {
+        self.relocations.lock().remove(info_hash);
         let mut adds = self.magnet_adds.write().await;
         if matches!(
             adds.get(info_hash).map(|entry| &entry.state),
@@ -5200,6 +5249,61 @@ mod tests {
         assert_eq!(current.handle.output_folder(), Some(dir.join(TEST_HASH)));
         assert_eq!(current.get_statistics().await.pinned_files, vec![0, 1]);
         assert!(enginefs.pin_locks.lock().is_empty(), "locks are per call");
+    }
+
+    /// A relocation is the one window in which a torrent's data has nothing
+    /// speaking for it, and both ends of the move are exposed.
+    ///
+    /// `begin_relocation` takes the engine out of the registry before the
+    /// backend is asked to move anything, and `protected_paths` names only the
+    /// engines it can see. So for the whole of a copy that can take minutes
+    /// the cleaner walks the destination tree -- files whose mtime is *now*,
+    /// but which the size rule will happily take -- and the source it is being
+    /// copied from, with neither in the protected set. What arrives is then
+    /// half a download.
+    #[tokio::test]
+    async fn a_relocation_protects_both_ends_of_the_move_while_it_runs() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        let show = enginefs.download_dir.join("show");
+        *counters.output_folder.lock().unwrap() = Some(show.clone());
+        let downloads = enginefs.download_dir.join("offline");
+        enginefs.set_downloads_dir(Some(downloads.clone()));
+        enginefs.backend.hold_relocate.store(true, Ordering::SeqCst);
+        let pieces = crate::piece_store::root_in(&enginefs.download_dir);
+
+        let inspect = async {
+            until(|| relocation_started(&enginefs)).await;
+            assert!(
+                enginefs.get_engine(TEST_HASH).await.is_none(),
+                "the engine is out of the registry for the length of the move"
+            );
+            let protected = enginefs.protected_paths().await;
+            assert!(
+                protected.contains(&downloads.join(TEST_HASH)),
+                "the destination being written into: {protected:?}"
+            );
+            assert!(
+                protected.contains(&show.join("video-0.mkv")),
+                "the source being copied out of: {protected:?}"
+            );
+            assert!(
+                protected.contains(&pieces.join(TEST_HASH)),
+                "and the pieces, at either end: {protected:?}"
+            );
+            enginefs.backend.relocate_hold.add_permits(1);
+        };
+        let (pinned, ()) = tokio::join!(enginefs.pin_download(TEST_HASH, 0, None), inspect);
+        pinned.expect("the pin relocates the torrent");
+
+        // And once the new engine is published it is the engine that speaks
+        // for the data again -- the relocation's own entry is not left behind
+        // to protect a folder nothing is using.
+        let after = enginefs.protected_paths().await;
+        assert!(after.contains(&downloads.join(TEST_HASH).join("video-0.mkv")));
+        assert!(
+            !after.contains(&show.join("video-0.mkv")),
+            "the source it moved off is cache again: {after:?}"
+        );
     }
 
     /// When a relocation fails and the torrent is gone from the backend,
