@@ -5604,14 +5604,184 @@ mod tests {
         seeder
     }
 
-    /// `Footprint::Lean` on a torrent with a swarm attached: the peer count
-    /// drops to `LEAN_PEER_LIMIT` (the surplus parked, not forgotten -- they
-    /// are what `Full` re-dials), the table sheds the address it was only
-    /// remembering as dead, the download -- and so the seeding -- goes on
-    /// with the peers left, a second `Lean` changes nothing, `Full` brings
-    /// the swarm back at once, and a torrent added while lean starts lean.
+    /// The footprint's arithmetic, with no swarm to wait for: `Lean` puts
+    /// `LEAN_PEER_LIMIT` on every torrent the session holds, `Full` puts the
+    /// *configured* limit back (a session opened from settings has one of
+    /// its own, so this would catch a `Full` that restored librqbit's
+    /// default instead), a torrent added while lean takes the lean cap
+    /// before it is ever live, and one added while full takes the
+    /// configured one.
+    ///
+    /// The cap is the whole lever -- parking the surplus and re-dialling it
+    /// is what librqbit does with it -- so this is the half of
+    /// `set_footprint` that can be pinned without a network:
+    /// `lean_parks_the_surplus_and_full_re_dials_it` below is the one test
+    /// that shows the cap actually moving peers.
     #[tokio::test(flavor = "multi_thread")]
-    async fn lean_footprint_parks_the_surplus_and_full_brings_it_back() {
+    async fn footprint_caps_every_torrent_and_the_next_one_added() {
+        use crate::backend::{Footprint, LEAN_PEER_LIMIT, TorrentBackend};
+        /// Above `LEAN_PEER_LIMIT`, as every real profile's is (the
+        /// shipped default derives 100), so lean is a shrink.
+        const CONFIGURED: usize = 100;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        tokio::fs::create_dir_all(&src).await.unwrap();
+        write_payload(&src.join("a.bin"), 32 * 1024).await;
+        write_payload(&src.join("b.bin"), 32 * 1024).await;
+        let (first_bytes, _) = make_torrent(&src.join("a.bin")).await;
+        let (second_bytes, _) = make_torrent(&src.join("b.bin")).await;
+
+        // Opened the way the settings open one, so the configured peer
+        // limit is a real value rather than `None`. No DHT, no LSD, no
+        // peers: nothing here waits for the network.
+        let (backend, _) = LibrqbitBackend::new_with_settings(
+            tmp.path().join("dl"),
+            TorrentListenPort::Ephemeral,
+            Vec::new(),
+            BootstrapResolvers::offline(),
+            SessionTuning {
+                dht: false,
+                lsd: false,
+                peer_limit: Some(CONFIGURED),
+                ..SessionTuning::default()
+            },
+        )
+        .await
+        .expect("hermetic session");
+        assert_eq!(backend.footprint(), Footprint::Full);
+        assert_eq!(backend.peer_limit_for(Footprint::Full), CONFIGURED);
+        assert_eq!(backend.peer_limit_for(Footprint::Lean), LEAN_PEER_LIMIT);
+
+        let first = backend
+            .add_torrent(TorrentSource::Bytes(first_bytes), Vec::new())
+            .await
+            .expect("add while full");
+        assert_eq!(first.handle.shared.peer_limit(), CONFIGURED);
+
+        // Lean reaches the torrent already there.
+        backend.set_footprint(Footprint::Lean);
+        assert_eq!(backend.footprint(), Footprint::Lean);
+        assert_eq!(first.handle.shared.peer_limit(), LEAN_PEER_LIMIT);
+
+        // And the one added afterwards, whatever state it is in: the cap
+        // lives on `ManagedTorrentShared`, so a torrent still hash-checking
+        // carries it into its live state.
+        let second = backend
+            .add_torrent(TorrentSource::Bytes(second_bytes), Vec::new())
+            .await
+            .expect("add while lean");
+        assert_eq!(second.handle.shared.peer_limit(), LEAN_PEER_LIMIT);
+
+        // A repeated `Lean` changes nothing (and, in the swarm, prunes
+        // nothing -- see the test below).
+        backend.set_footprint(Footprint::Lean);
+        assert_eq!(backend.footprint(), Footprint::Lean);
+        assert_eq!(first.handle.shared.peer_limit(), LEAN_PEER_LIMIT);
+        assert_eq!(second.handle.shared.peer_limit(), LEAN_PEER_LIMIT);
+
+        // Full puts the configured limit back on both.
+        backend.set_footprint(Footprint::Full);
+        assert_eq!(backend.footprint(), Footprint::Full);
+        assert_eq!(first.handle.shared.peer_limit(), CONFIGURED);
+        assert_eq!(second.handle.shared.peer_limit(), CONFIGURED);
+    }
+
+    /// Going lean prunes the peer table of the addresses it was only
+    /// remembering: three peers that never answered are `Dead`, and `Lean`
+    /// forgets all three (`known` 3 -> 0) while `seen`, which only ever
+    /// grows, still says they were met.
+    ///
+    /// No swarm and no timing luck: the dials are to closed loopback ports,
+    /// which are refused rather than left to a timeout, and librqbit's
+    /// reconnect backoff starts at ten seconds -- so once every address is
+    /// `Dead` there is a wide window in which nothing moves it back. This
+    /// is where the pruning is pinned; the swarm test only has to show that
+    /// the peers the *cap* parks are not pruned with them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn going_lean_forgets_the_peers_it_was_only_remembering() {
+        use crate::backend::{Footprint, TorrentBackend, TorrentHandle};
+        const DEAD: usize = 3;
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_payload(&tmp.path().join("payload.bin"), 64 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&tmp.path().join("payload.bin")).await;
+
+        // Ports nothing listens on: seen, dialled, refused, and left in the
+        // table waiting out a backoff. Discard ports (9) are never bound.
+        let dead: Vec<std::net::SocketAddr> = (0..DEAD)
+            .map(|i| (std::net::Ipv4Addr::LOCALHOST, 9 + i as u16).into())
+            .collect();
+
+        let dl = tmp.path().join("dl");
+        let backend = LibrqbitBackend::new_for_tests(dl.clone())
+            .await
+            .expect("hermetic session");
+        // Straight to the session, for `initial_peers` (see
+        // `stats_connected_seeders_mirrors_librqbits_live_seeder_count`).
+        let response = backend
+            .session
+            .add_torrent(
+                librqbit::AddTorrent::from_bytes(bytes::Bytes::from(torrent_bytes)),
+                Some(librqbit::AddTorrentOptions {
+                    overwrite: true,
+                    initial_peers: Some(dead),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("add torrent");
+        let (librqbit::AddTorrentResponse::Added(_, inner)
+        | librqbit::AddTorrentResponse::AlreadyManaged(_, inner)) = response
+        else {
+            panic!("expected the torrent to be added");
+        };
+        let handle = backend.wrap(inner);
+
+        // Every address dialled and refused: nothing queued, connecting or
+        // live, so the whole table is `Dead`.
+        let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
+        let dead_table = loop {
+            let s = TorrentHandle::stats(&handle).await;
+            let d = s.peer_discovery;
+            if d.known as usize == DEAD && d.queued + d.connecting + d.live == 0 {
+                break d;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the dials to closed ports never all came back dead \
+                 within {TEST_WAIT_BOUND:?}: {d:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(dead_table.seen as usize, DEAD, "{dead_table:?}");
+
+        backend.set_footprint(Footprint::Lean);
+        let pruned = TorrentHandle::stats(&handle).await.peer_discovery;
+        assert_eq!(pruned.known, 0, "the dead addresses are gone: {pruned:?}");
+        assert_eq!(
+            pruned.seen as usize, DEAD,
+            "`seen` is cumulative and does not un-count them: {pruned:?}"
+        );
+    }
+
+    /// The wiring, against a real swarm and the one test here that needs
+    /// one: `Lean` lowers the cap, the surplus peers hang up but stay in
+    /// the table -- parked, not forgotten, which is what `Full` re-dials --
+    /// the download (and so the seeding) goes on from the peers left, a
+    /// repeated `Lean` prunes nothing, and `Full` brings the swarm back
+    /// past the lean cap.
+    ///
+    /// Only the cap is asserted exactly: it is ours to set, and it is read
+    /// from the torrent rather than inferred from a peer count. Everything
+    /// about the peers is asserted as a *side of the cap*, never as an
+    /// exact number, because how many of a dozen loopback sessions are
+    /// connected at any instant is the network's business and a loaded
+    /// runner's. The precondition -- more live peers than the lean cap, so
+    /// there is a surplus to park at all -- is waited for on its own and
+    /// says, when it fails, that the environment never produced it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lean_parks_the_surplus_and_full_re_dials_it() {
         use crate::backend::{Footprint, LEAN_PEER_LIMIT, TorrentBackend, TorrentHandle};
         const SEEDERS: usize = LEAN_PEER_LIMIT + 4;
 
@@ -5640,21 +5810,21 @@ mod tests {
 
         let src = tempfile::tempdir().unwrap();
         let payload = src.path().join("payload.bin");
-        // Big enough, at the seeders' pace, to still be downloading when the
-        // assertions are done: 12 x 32 KiB/s is ~40 s for 16 MiB.
+        // Big enough, at the seeders' pace, that the torrent is still
+        // downloading when the assertions are done -- a torrent that
+        // finished would hang up on the seeders itself, which is not what
+        // this test is about. 12 x 16 KiB/s is ~85 s for 16 MiB, and lean
+        // only slows that down.
         write_payload(&payload, 16 * 1024 * 1024).await;
         let (torrent_bytes, _hash) = make_torrent(&payload).await;
 
         let mut seeders = Vec::new();
         let mut peers = Vec::new();
         for _ in 0..SEEDERS {
-            let seeder = slow_seeder(src.path(), &torrent_bytes, 32 * 1024).await;
+            let seeder = slow_seeder(src.path(), &torrent_bytes, 16 * 1024).await;
             peers.push(seeder.listen_addr().expect("seeder listens"));
             seeders.push(seeder);
         }
-        // An address nothing listens on: it is seen, dies, and sits in the
-        // table waiting out a backoff -- what going lean prunes.
-        peers.push((std::net::Ipv4Addr::LOCALHOST, 9).into());
 
         let dl = tempfile::tempdir().unwrap();
         let backend = LibrqbitBackend::new_for_tests(dl.path().to_path_buf())
@@ -5663,6 +5833,9 @@ mod tests {
         assert_eq!(backend.footprint(), Footprint::Full);
         // Straight to the session, for `initial_peers` (see
         // `stats_connected_seeders_mirrors_librqbits_live_seeder_count`).
+        // These addresses are the only ones this session will ever know:
+        // no DHT, no trackers, no LSD -- so a peer that comes back after
+        // `Full` can only be one the cap parked.
         let response = backend
             .session
             .add_torrent(
@@ -5681,80 +5854,72 @@ mod tests {
             panic!("expected the torrent to be added");
         };
         let handle = backend.wrap(inner);
-
-        let full = wait_for(&handle, "every seeder connecting", |s| {
-            s.peers as usize == SEEDERS && s.peer_discovery.known as usize == SEEDERS + 1
-        })
-        .await;
         assert_eq!(
             handle.handle.shared.peer_limit(),
             librqbit::DEFAULT_PEER_LIMIT
         );
-        assert_eq!(
-            full.peer_discovery.seen as usize,
-            SEEDERS + 1,
-            "{:?}",
-            full.peer_discovery
-        );
 
-        // Lean: the surplus hangs up and is parked (still known), the dead
-        // address is forgotten, and the download goes on.
+        // The precondition, on its own bound: without more live peers than
+        // the lean cap there is no surplus to park and the test has nothing
+        // to say. A failure here is the environment, not the footprint.
+        wait_for(
+            &handle,
+            "the swarm outgrowing the lean cap (the environment never \
+             connected more than LEAN_PEER_LIMIT of the seeders)",
+            |s| s.peers as usize > LEAN_PEER_LIMIT,
+        )
+        .await;
+
+        // Lean: the cap moves at once (no network in that), and the peers
+        // over it are asked to hang up.
         backend.set_footprint(Footprint::Lean);
         assert_eq!(backend.footprint(), Footprint::Lean);
         assert_eq!(handle.handle.shared.peer_limit(), LEAN_PEER_LIMIT);
+
         let lean = wait_for(&handle, "the surplus hanging up", |s| {
-            s.peers as usize == LEAN_PEER_LIMIT && s.peer_discovery.known as usize == SEEDERS
+            (s.peers as usize) <= LEAN_PEER_LIMIT
         })
         .await;
-        assert_eq!(
-            lean.peer_discovery.connecting, 0,
-            "{:?}",
+        // Parked, not forgotten: the pruning a lean does runs *before* the
+        // cap drops, so the peers that were live a moment ago survive it,
+        // and the table still holds more addresses than the cap now lets be
+        // live. Those are what `Full` re-dials below.
+        assert!(
+            lean.peer_discovery.known as usize > LEAN_PEER_LIMIT,
+            "the surplus was parked, not forgotten: {:?}",
             lean.peer_discovery
         );
+
+        // Seeding and downloading go on from the peers left.
         let fetched_before = handle.transfer_totals().fetched;
         wait_for(&handle, "the download going on with the peers left", |_| {
             handle.transfer_totals().fetched > fetched_before
         })
         .await;
 
-        // A second Lean is a no-op: the parked peers are not pruned.
+        // A second `Lean` is a no-op: it must not prune the peers the first
+        // one parked, or `Full` would have nobody to re-dial. Nothing but a
+        // prune shrinks the table, so "no smaller" is the assertion.
+        let before_repeat = TorrentHandle::stats(&handle).await.peer_discovery;
         backend.set_footprint(Footprint::Lean);
-        let again = TorrentHandle::stats(&handle).await;
-        assert_eq!(
-            again.peers as usize, LEAN_PEER_LIMIT,
-            "{:?}",
-            again.peer_discovery
-        );
-        assert_eq!(
-            again.peer_discovery.known as usize, SEEDERS,
-            "{:?}",
-            again.peer_discovery
+        let after_repeat = TorrentHandle::stats(&handle).await.peer_discovery;
+        assert_eq!(handle.handle.shared.peer_limit(), LEAN_PEER_LIMIT);
+        assert!(
+            after_repeat.known >= before_repeat.known,
+            "a repeated Lean pruned the parked peers: {before_repeat:?} -> {after_repeat:?}"
         );
 
-        // A torrent added while lean starts lean, without being live.
-        let other_src = tempfile::tempdir().unwrap();
-        write_payload(&other_src.path().join("other.bin"), 16 * 1024).await;
-        let (other_bytes, _) = make_torrent(&other_src.path().join("other.bin")).await;
-        let other = backend
-            .add_torrent(TorrentSource::Bytes(other_bytes), Vec::new())
-            .await
-            .expect("add while lean");
-        assert_eq!(other.handle.shared.peer_limit(), LEAN_PEER_LIMIT);
-
-        // Full: the parked peers are re-dialled at once; the other torrent
-        // gets the configured cap too.
+        // Full: the cap goes back at once, and the parked peers -- the only
+        // addresses this session has ever known -- are re-dialled, so the
+        // swarm grows back past the lean cap.
         backend.set_footprint(Footprint::Full);
         assert_eq!(backend.footprint(), Footprint::Full);
         assert_eq!(
             handle.handle.shared.peer_limit(),
             librqbit::DEFAULT_PEER_LIMIT
         );
-        assert_eq!(
-            other.handle.shared.peer_limit(),
-            librqbit::DEFAULT_PEER_LIMIT
-        );
         wait_for(&handle, "the parked peers coming back", |s| {
-            s.peers as usize == SEEDERS
+            s.peers as usize > LEAN_PEER_LIMIT
         })
         .await;
         drop(seeders);
