@@ -1496,7 +1496,7 @@ mod tests {
 
         WALKED_ON_THIS_THREAD.set(false);
         let report = evict_roots(
-            &[root.clone()],
+            std::slice::from_ref(&root),
             &HashSet::new(),
             CacheLimit::configured(u64::MAX),
         )
