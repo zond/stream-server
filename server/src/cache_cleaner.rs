@@ -1,4 +1,5 @@
 use crate::state::AppState;
+use futures_util::future::BoxFuture;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,6 +30,17 @@ const DISK_FULL_POLL_INTERVAL: Duration = Duration::from_secs(15);
 /// within [`CLEAN_DEBOUNCE`], so this only has to catch a server that has
 /// been idle since startup and one whose watch could not be established.
 const CLEAN_FALLBACK_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// How far under the cap a pass run on behalf of a stopped torrent evicts
+/// ([`recover_out_of_space_torrents`]), so the torrent it restarts has room
+/// to run before it is stopped again. The watch stops a torrent a few MB
+/// under the floor and the cap is the floor, so a pass to the cap alone
+/// would free those few MB, restart the torrent, and be rung again within
+/// the second -- a full cache walk per second for as long as there is old
+/// cache to drain a proxy chunk at a time. At least the engine's resume
+/// margin, so the watch agrees the volume has recovered; more, so the walks
+/// are seconds apart at the least.
+const RECOVERY_HEADROOM: u64 = 4 * enginefs::FREE_SPACE_RESUME_MARGIN;
 
 /// Whether a debounced clean is already due.
 ///
@@ -256,6 +268,7 @@ pub fn start(state: Arc<AppState>) -> JoinHandle<()> {
         let mut schedule = CleanSchedule::default();
         let mut disk_full_recovery = DiskFullRecovery::default();
         let mut active_cleaning_timer = Box::pin(tokio::time::sleep(Duration::MAX)); // Inactive initially
+        let engines = engines_of(&state);
 
         loop {
             tokio::select! {
@@ -282,8 +295,15 @@ pub fn start(state: Arc<AppState>) -> JoinHandle<()> {
                     }
                 }
 
-                // 3. A torrent the backend stopped for want of disk space
+                // 3. A torrent the backend stopped for want of disk space,
+                //    found by the poll -- or, 3a, one the free-space watch
+                //    just stopped, which rings this the moment it does: the
+                //    torrent's readers are parked until the pass restarts it,
+                //    and a poll interval of parking is a player buffering.
                 _ = disk_full_poll.tick() => {
+                    recover_out_of_space_torrents(&state, &mut disk_full_recovery).await;
+                }
+                _ = out_of_space_signal(&engines) => {
                     recover_out_of_space_torrents(&state, &mut disk_full_recovery).await;
                 }
 
@@ -362,16 +382,32 @@ impl DiskFullRecovery {
     }
 }
 
+/// The distinct engines of `state`. The stream and download engines are
+/// often the same `Arc`; asking one twice would restart a torrent that is
+/// already live again and log the backend's complaint about it.
+fn engines_of(state: &AppState) -> Vec<Arc<enginefs::EngineFS>> {
+    if Arc::ptr_eq(&state.engine, &state.download_engine) {
+        vec![state.engine.clone()]
+    } else {
+        vec![state.engine.clone(), state.download_engine.clone()]
+    }
+}
+
+/// Completes when any of `engines` has had a torrent stopped for space
+/// since the last time this completed (`EngineFS::out_of_space_signal`).
+async fn out_of_space_signal(engines: &[Arc<enginefs::EngineFS>]) {
+    let signals: Vec<BoxFuture<'_, ()>> = engines
+        .iter()
+        .map(|engine| Box::pin(engine.out_of_space_signal()) as BoxFuture<'_, ()>)
+        .collect();
+    if signals.is_empty() {
+        std::future::pending::<()>().await;
+    }
+    futures_util::future::select_all(signals).await;
+}
+
 async fn recover_out_of_space_torrents(state: &AppState, recovery: &mut DiskFullRecovery) {
-    // The stream and download engines are often the same `Arc`; asking one
-    // twice would restart a torrent that is already live again and log the
-    // backend's complaint about it.
-    let engines: Vec<Arc<enginefs::EngineFS>> =
-        if Arc::ptr_eq(&state.engine, &state.download_engine) {
-            vec![state.engine.clone()]
-        } else {
-            vec![state.engine.clone(), state.download_engine.clone()]
-        };
+    let engines = engines_of(state);
 
     let mut stopped = Vec::new();
     for engine in &engines {
@@ -394,7 +430,7 @@ async fn recover_out_of_space_torrents(state: &AppState, recovery: &mut DiskFull
         torrents = stopped.len(),
         "a torrent stopped for want of disk space; cleaning the cache to make room"
     );
-    let report = match clean_cache(state).await {
+    let report = match clean_cache_with_headroom(state, RECOVERY_HEADROOM).await {
         Ok(report) => report,
         Err(e) => {
             error!("Cache cleaner error: {}", e);
@@ -421,7 +457,7 @@ async fn recover_out_of_space_torrents(state: &AppState, recovery: &mut DiskFull
             ),
             Ok(false) => debug!(
                 info_hash = %info_hash,
-                "the torrent was gone by the time space had been reclaimed"
+                "the torrent was gone by the time space had been reclaimed (evicted whole, or swept)"
             ),
             Err(e) => warn!(
                 info_hash = %info_hash,
@@ -443,6 +479,9 @@ struct CacheRoots {
     /// (`EvictionClasses::dead`). Ordinary cache in every other respect:
     /// walked, counted, aged; they only sort to the front of the size rule.
     evict_first: HashSet<std::path::PathBuf>,
+    /// Torrents stopped for want of disk space, to be evicted whole through
+    /// their engine when nothing else can go -- see [`evict`].
+    stopped: Vec<StoppedTorrent>,
     /// Directories the cleaner was handed and may therefore never delete,
     /// however empty eviction leaves them -- see [`remove_empty_parents`].
     /// Every root *before* [`outermost`] collapsed them, which is the point:
@@ -575,14 +614,24 @@ async fn cache_roots(state: &AppState) -> CacheRoots {
     // pinned engine stays live, so its data is protected for as long as
     // the pin holds) -- and, from the same walk of the engines, what a dead
     // one left behind, which goes first.
-    let mut classes = state.engine.eviction_classes().await;
-    if !Arc::ptr_eq(&state.engine, &state.download_engine) {
-        let more = state.download_engine.eviction_classes().await;
-        classes.protected.extend(more.protected);
-        classes.dead.extend(more.dead);
+    let mut protected_paths = HashSet::new();
+    let mut evict_first = HashSet::new();
+    let mut stopped = Vec::new();
+    for engine in engines_of(state) {
+        let classes = engine.eviction_classes().await;
+        protected_paths.extend(classes.protected);
+        evict_first.extend(classes.dead);
+        stopped.extend(
+            classes
+                .stopped_for_space
+                .into_iter()
+                .map(|torrent| StoppedTorrent {
+                    engine: engine.clone(),
+                    info_hash: torrent.info_hash,
+                    paths: torrent.paths.into_iter().collect(),
+                }),
+        );
     }
-    let protected_paths: HashSet<_> = classes.protected.into_iter().collect();
-    let evict_first: HashSet<_> = classes.dead.into_iter().collect();
 
     // One budget per volume, each collapsed to its outermost roots. The two
     // engines normally share one directory and the downloads dir is under it,
@@ -608,8 +657,31 @@ async fn cache_roots(state: &AppState) -> CacheRoots {
         budgets,
         protected_paths,
         evict_first,
+        stopped,
         keep_dirs,
         boundaries,
+    }
+}
+
+/// A torrent stopped for want of disk space, with the engine that can evict
+/// it whole (`EngineFS::evict_stopped_torrent`) and every path its data can
+/// be at. The walk buckets what it finds under those paths per torrent, so
+/// [`evict`] knows what evicting one would reclaim without walking again.
+struct StoppedTorrent {
+    engine: Arc<enginefs::EngineFS>,
+    info_hash: String,
+    paths: HashSet<std::path::PathBuf>,
+}
+
+impl StoppedTorrent {
+    /// `evict_stopped_torrent` on this torrent's engine, in the shape
+    /// [`evict`] takes so a test can hand it something else.
+    fn evictor(&self) -> impl for<'a> Fn(&'a str) -> BoxFuture<'a, anyhow::Result<bool>> + '_ {
+        move |info_hash: &str| {
+            let engine = self.engine.clone();
+            let info_hash = info_hash.to_string();
+            Box::pin(async move { engine.evict_stopped_torrent(&info_hash).await })
+        }
     }
 }
 
@@ -619,6 +691,16 @@ async fn cache_roots(state: &AppState) -> CacheRoots {
 /// `POST /cache/clean` -- the on-demand path takes exactly this function,
 /// so it can never diverge from the scheduled sweep's protections.
 pub(crate) async fn clean_cache(state: &AppState) -> anyhow::Result<EvictionReport> {
+    clean_cache_with_headroom(state, 0).await
+}
+
+/// [`clean_cache`], evicting to `headroom` bytes under each volume's cap
+/// rather than to the cap -- for the pass run on behalf of a stopped torrent
+/// (see [`RECOVERY_HEADROOM`]).
+async fn clean_cache_with_headroom(
+    state: &AppState,
+    headroom: u64,
+) -> anyhow::Result<EvictionReport> {
     let roots = cache_roots(state).await;
     let mut reports = Vec::with_capacity(roots.budgets.len());
     for budget in &roots.budgets {
@@ -635,14 +717,23 @@ pub(crate) async fn clean_cache(state: &AppState) -> anyhow::Result<EvictionRepo
             });
             continue;
         }
+        let stopped: Vec<(String, HashSet<std::path::PathBuf>)> = roots
+            .stopped
+            .iter()
+            .map(|torrent| (torrent.info_hash.clone(), torrent.paths.clone()))
+            .collect();
+        let evictors: Vec<_> = roots.stopped.iter().map(StoppedTorrent::evictor).collect();
         reports.push(
             evict(
                 &budget.roots,
                 &roots.protected_paths,
                 &roots.evict_first,
+                &stopped,
+                &evictors,
                 &roots.keep_dirs,
                 &roots.boundaries,
                 budget.limit,
+                headroom,
             )
             .await?,
         );
@@ -998,6 +1089,23 @@ impl EvictionReport {
 /// (`EvictionClasses::dead`): bytes nothing will read or resume into, which
 /// on a full device are what stands between the user and the next stream,
 /// so they go before a film somebody might watch again.
+///
+/// Last of all, and only when the pass could free nothing else, a torrent
+/// stopped for want of disk space is evicted *whole* -- torrent and files,
+/// by the `i`th of `evictors` for the `i`th of `stopped`, which is its
+/// engine's `evict_stopped_torrent`. Last, not first, on purpose. While the
+/// pass can evict anything else, doing that makes the room the stopped
+/// torrent needs to resume with its progress, which `recover_out_of_space_torrents`
+/// then does -- the film somebody is watching plays on, at the cost of a film
+/// nobody is. Only once nothing else can go are its bytes worthless: they
+/// are progress into a file this volume cannot finish, and they are what
+/// stands between the user and their next stream (their retry of the same
+/// title included). "Nothing else could go" is read from this pass -- the
+/// age rule and the size rule freed nothing -- rather than from the cap
+/// alone, so a pass that freed *something* restarts the torrent into that
+/// room and the next pass, if there is one, gets to judge again.
+///
+/// `headroom` lowers the cap this run evicts to (see [`RECOVERY_HEADROOM`]).
 /// Sizes are occupancy, not apparent length (see [`occupied_bytes`]).
 ///
 /// Every root handed in is walked to the bottom, the downloads dir included
@@ -1010,14 +1118,22 @@ impl EvictionReport {
 /// watching. Callers that add a root must therefore make sure whatever must
 /// survive is named there -- see `EngineFS::protected_paths`, which covers
 /// live engines and the dormant pins that have no engine to speak for them.
-async fn evict(
+#[allow(clippy::too_many_arguments)]
+async fn evict<E>(
     download_dirs: &[std::path::PathBuf],
     protected_paths: &HashSet<std::path::PathBuf>,
     evict_first: &HashSet<std::path::PathBuf>,
+    stopped: &[(String, HashSet<std::path::PathBuf>)],
+    evictors: &[E],
     keep_dirs: &HashSet<std::path::PathBuf>,
     boundaries: &HashSet<std::path::PathBuf>,
     limit: CacheLimit,
-) -> anyhow::Result<EvictionReport> {
+    headroom: u64,
+) -> anyhow::Result<EvictionReport>
+where
+    E: for<'a> Fn(&'a str) -> BoxFuture<'a, anyhow::Result<bool>>,
+{
+    debug_assert_eq!(stopped.len(), evictors.len());
     // 1. Walk. On the blocking pool, not on the worker this future is
     // running on: `walkdir` plus a `statx` per file is synchronous I/O over
     // the whole tree -- sixteen thousand files for 4 GB of proxy cache, on
@@ -1032,6 +1148,7 @@ async fn evict(
         download_dirs: download_dirs.to_vec(),
         protected_paths: protected_paths.clone(),
         evict_first: evict_first.clone(),
+        stopped: stopped.iter().map(|(_, paths)| paths.clone()).collect(),
         boundaries: boundaries.clone(),
         max_age: Duration::from_secs(30 * 24 * 60 * 60),
         now: std::time::SystemTime::now(),
@@ -1042,6 +1159,7 @@ async fn evict(
         mut total_size,
         protected_size,
         protected_files,
+        stopped: stopped_found,
     } = tokio::task::spawn_blocking(move || walk.run())
         .await
         .map_err(|error| anyhow::anyhow!("the cache walk did not finish: {error}"))?;
@@ -1086,7 +1204,9 @@ async fn evict(
             "the cache volume's free space, not cacheSize, is what caps the cache"
         );
     }
-    let limit = limit.effective(total_size);
+    let limit = limit
+        .effective(total_size)
+        .map(|limit| limit.saturating_sub(headroom));
     let mut deleted_count = 0usize;
     let mut freed_space = 0u64;
     if let Some(limit) = limit
@@ -1146,6 +1266,45 @@ async fn evict(
             "Cleaned up {} files, freed {} bytes. New size: {}",
             deleted_count, freed_space, total_size
         );
+
+        // 4. Nothing else could go, and the run is still over: a torrent
+        // stopped for want of space goes whole, largest first, until the
+        // run is under. See the doc above for why this is last.
+        if total_size > limit && deleted_count == 0 && aged_out_files == 0 {
+            let mut candidates: Vec<usize> = (0..stopped.len())
+                .filter(|&i| stopped_found[i].bytes > 0)
+                .collect();
+            candidates.sort_by_key(|&i| std::cmp::Reverse(stopped_found[i].bytes));
+            for i in candidates {
+                if total_size <= limit {
+                    break;
+                }
+                let (info_hash, _) = &stopped[i];
+                let found = &stopped_found[i];
+                match evictors[i](info_hash).await {
+                    Ok(true) => {
+                        info!(
+                            info_hash = %info_hash,
+                            bytes = found.bytes,
+                            files = found.files,
+                            "nothing else could be evicted; a torrent stopped for want of disk space went whole, with its partial download"
+                        );
+                        total_size = total_size.saturating_sub(found.bytes);
+                        freed_space += found.bytes;
+                        deleted_count += found.files;
+                    }
+                    Ok(false) => debug!(
+                        info_hash = %info_hash,
+                        "the stopped torrent was gone, restarted or pinned by the time the pass reached it"
+                    ),
+                    Err(e) => warn!(
+                        info_hash = %info_hash,
+                        error = %format!("{e:#}"),
+                        "could not evict a torrent stopped for want of disk space"
+                    ),
+                }
+            }
+        }
     }
 
     let report = EvictionReport {
@@ -1172,6 +1331,10 @@ struct WalkInputs {
     /// Sorted to the front of the size rule, whatever their age -- see
     /// [`evict`].
     evict_first: HashSet<std::path::PathBuf>,
+    /// The paths of each torrent stopped for want of space, in the caller's
+    /// order. Counted into their own buckets ([`Walked::stopped`]), never
+    /// into the evictable files -- the engine, not the walk, deletes those.
+    stopped: Vec<HashSet<std::path::PathBuf>>,
     boundaries: HashSet<std::path::PathBuf>,
     /// The age rule: a file last modified longer ago than this goes.
     max_age: Duration,
@@ -1195,6 +1358,16 @@ struct Walked {
     total_size: u64,
     protected_size: u64,
     protected_files: usize,
+    /// What lies under each stopped torrent's paths, in [`WalkInputs::stopped`]'s
+    /// order: in `total_size`, in no other class.
+    stopped: Vec<StoppedFound>,
+}
+
+/// Occupancy the walk found under one stopped torrent's paths.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct StoppedFound {
+    bytes: u64,
+    files: usize,
 }
 
 impl WalkInputs {
@@ -1211,6 +1384,7 @@ impl WalkInputs {
             total_size: 0,
             protected_size: 0,
             protected_files: 0,
+            stopped: vec![StoppedFound::default(); self.stopped.len()],
         };
         for download_dir in &self.download_dirs {
             if !download_dir.exists() {
@@ -1241,6 +1415,16 @@ impl WalkInputs {
                     walked.total_size += size;
                     walked.protected_size += size;
                     walked.protected_files += 1;
+                    continue;
+                }
+                if let Some(i) = self
+                    .stopped
+                    .iter()
+                    .position(|paths| is_path_protected(&path, paths))
+                {
+                    walked.total_size += size;
+                    walked.stopped[i].bytes += size;
+                    walked.stopped[i].files += 1;
                     continue;
                 }
                 let modified = metadata.modified().ok();
@@ -1405,6 +1589,7 @@ mod tests {
         evict, is_path_protected, is_session_artifact, occupied_bytes, outermost,
         remove_empty_parents, scan_usage,
     };
+    use futures_util::future::BoxFuture;
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};
@@ -1466,11 +1651,22 @@ mod tests {
             download_dirs,
             protected_paths,
             &HashSet::new(),
+            &[],
+            &no_evictors(),
             &keep,
             &keep,
             limit,
+            0,
         )
         .await
+    }
+
+    /// The shape `evict` takes an evictor in, for a run with none.
+    type Evictor = fn(&str) -> BoxFuture<'_, anyhow::Result<bool>>;
+
+    /// The evictor list for a run with no stopped torrents.
+    fn no_evictors() -> Vec<Evictor> {
+        Vec::new()
     }
 
     /// [`scan_usage`] for one budget whose roots are the only ones walked.
@@ -1748,9 +1944,12 @@ mod tests {
             std::slice::from_ref(&root),
             &HashSet::new(),
             &HashSet::new(),
+            &[],
+            &no_evictors(),
             &keep,
             &HashSet::from([root.clone()]),
             CacheLimit::configured(0),
+            0,
         )
         .await
         .unwrap();
@@ -1932,9 +2131,12 @@ mod tests {
             &budgets[0].roots,
             &HashSet::new(),
             &HashSet::new(),
+            &[],
+            &no_evictors(),
             &keep,
             &boundaries,
             CacheLimit::configured(0),
+            0,
         )
         .await
         .unwrap();
@@ -2106,9 +2308,12 @@ mod tests {
             std::slice::from_ref(&root),
             &HashSet::new(),
             &HashSet::from([dead.clone()]),
+            &[],
+            &no_evictors(),
             &keep,
             &keep,
             CacheLimit::configured(occupied - dead_occupancy / 2),
+            0,
         )
         .await
         .unwrap();
@@ -2128,9 +2333,12 @@ mod tests {
             std::slice::from_ref(&root),
             &HashSet::new(),
             &HashSet::from([dead_dir.clone()]),
+            &[],
+            &no_evictors(),
             &keep,
             &keep,
             CacheLimit::configured(occupancy(&old_film) + occupancy(&e1)),
+            0,
         )
         .await
         .unwrap();
@@ -2140,6 +2348,174 @@ mod tests {
             !(e1.exists() && e2.exists()),
             "and it came from the dead torrent's folder"
         );
+    }
+
+    /// An evictor standing in for the engine: records the hash and deletes
+    /// the torrent's directory, as `evict_stopped_torrent` would through the
+    /// session, answering `verdict`.
+    fn fake_evictor(
+        calls: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        dir: &Path,
+        verdict: bool,
+    ) -> impl for<'a> Fn(&'a str) -> BoxFuture<'a, anyhow::Result<bool>> {
+        let calls = calls.clone();
+        let dir = dir.to_path_buf();
+        move |hash: &str| {
+            calls.lock().unwrap().push(hash.to_string());
+            let dir = dir.clone();
+            Box::pin(async move {
+                if verdict {
+                    tokio::fs::remove_dir_all(&dir).await?;
+                }
+                Ok(verdict)
+            })
+        }
+    }
+
+    /// A torrent stopped for want of disk space goes whole -- through its
+    /// engine, not by unlinking -- and only when the pass could free nothing
+    /// else: while it can, that is the room the stopped torrent resumes
+    /// into, and the film being watched is worth more than one nobody is.
+    /// Its bytes are never reported as protected, since a pass can take
+    /// them.
+    #[tokio::test]
+    async fn a_torrent_stopped_for_space_goes_whole_only_when_nothing_else_can() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("rqbit-downloads");
+        let old_film = root.join("Old").join("film.mkv");
+        write_aged(
+            &old_film,
+            &[0u8; 8192],
+            Duration::from_secs(7 * 24 * 60 * 60),
+        );
+        let stopped_dir = root.join("Stopped");
+        let partial = stopped_dir.join("film.mkv");
+        write_aged(&partial, &[0u8; 8192], Duration::from_secs(10));
+        let old_occupancy = occupancy(&old_film);
+        let partial_occupancy = occupancy(&partial);
+        let keep: HashSet<PathBuf> = HashSet::from([root.clone()]);
+        let stopped = vec![(HASH.to_string(), HashSet::from([stopped_dir.clone()]))];
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // Over by half the old film: the old film goes, the stopped torrent
+        // stays -- with room to resume into.
+        let report = evict(
+            std::slice::from_ref(&root),
+            &HashSet::new(),
+            &HashSet::new(),
+            &stopped,
+            &[fake_evictor(&calls, &stopped_dir, true)],
+            &keep,
+            &keep,
+            CacheLimit::configured(old_occupancy + partial_occupancy - old_occupancy / 2),
+            0,
+        )
+        .await
+        .unwrap();
+        assert!(!old_film.exists());
+        assert!(
+            partial.is_file(),
+            "the stopped torrent resumes into that room"
+        );
+        assert!(calls.lock().unwrap().is_empty(), "the engine was not asked");
+        assert_eq!(report.freed, old_occupancy);
+        assert_eq!(
+            report.protected, 0,
+            "a stopped torrent's bytes are not protected"
+        );
+        assert_eq!(report.total, partial_occupancy);
+
+        // Nothing else left and still over: the stopped torrent goes whole,
+        // through the engine, and the run ends under.
+        let report = evict(
+            std::slice::from_ref(&root),
+            &HashSet::new(),
+            &HashSet::new(),
+            &stopped,
+            &[fake_evictor(&calls, &stopped_dir, true)],
+            &keep,
+            &keep,
+            CacheLimit::configured(partial_occupancy / 2),
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(*calls.lock().unwrap(), vec![HASH.to_string()]);
+        assert!(!stopped_dir.exists());
+        assert_eq!(report.freed, partial_occupancy);
+        assert_eq!(report.deleted, 1);
+        assert_eq!(report.total, 0);
+        assert_eq!(report.over_limit, 0);
+        assert!(report.made_room());
+
+        // An engine that declines (the torrent restarted or was pinned
+        // meanwhile) leaves the run over, and honest about it.
+        write_aged(&partial, &[0u8; 8192], Duration::from_secs(10));
+        calls.lock().unwrap().clear();
+        let report = evict(
+            std::slice::from_ref(&root),
+            &HashSet::new(),
+            &HashSet::new(),
+            &stopped,
+            &[fake_evictor(&calls, &stopped_dir, false)],
+            &keep,
+            &keep,
+            CacheLimit::configured(partial_occupancy / 2),
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(*calls.lock().unwrap(), vec![HASH.to_string()]);
+        assert!(partial.is_file());
+        assert_eq!(report.freed, 0);
+        assert_eq!(report.over_limit, partial_occupancy - partial_occupancy / 2);
+        assert!(report.shortfall_message().is_some());
+    }
+
+    /// The pass run for a stopped torrent evicts to `headroom` under the
+    /// cap, so the torrent it restarts has room to run before the watch
+    /// stops it again -- a pass to the cap alone frees the few MB the
+    /// torrent overshot by, and is rung again within the second.
+    #[tokio::test]
+    async fn headroom_lowers_the_cap_a_recovery_pass_evicts_to() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("rqbit-downloads");
+        let older = root.join("older.mkv");
+        write_aged(&older, &[0u8; 8192], Duration::from_secs(7200));
+        let newer = root.join("newer.mkv");
+        write_aged(&newer, &[0u8; 8192], Duration::from_secs(60));
+        let occupied = occupancy(&older) + occupancy(&newer);
+
+        // Exactly at the cap: an ordinary pass evicts nothing.
+        let report = evict_roots(
+            std::slice::from_ref(&root),
+            &HashSet::new(),
+            CacheLimit::configured(occupied),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.deleted, 0);
+
+        // The same cap with headroom: the pass makes that much room, oldest
+        // first, and reports the cap it actually evicted to.
+        let keep: HashSet<PathBuf> = HashSet::from([root.clone()]);
+        let report = evict(
+            std::slice::from_ref(&root),
+            &HashSet::new(),
+            &HashSet::new(),
+            &[],
+            &no_evictors(),
+            &keep,
+            &keep,
+            CacheLimit::configured(occupied),
+            occupancy(&older) / 2,
+        )
+        .await
+        .unwrap();
+        assert!(!older.exists());
+        assert!(newer.is_file());
+        assert_eq!(report.limit, Some(occupied - occupancy(&newer) / 2));
+        assert!(report.made_room());
     }
 
     /// librqbit pre-allocates each file it wants at its full length, so the

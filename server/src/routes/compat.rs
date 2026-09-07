@@ -108,6 +108,9 @@ pub fn engine_creation_failure(error: &MagnetAddError) -> (StatusCode, String) {
         MagnetAddError::Cancelled { .. } | MagnetAddError::TaskFailed { .. } => {
             StatusCode::INTERNAL_SERVER_ERROR
         }
+        // The disk's problem, and the status the stream route and the pin
+        // route already give a full disk.
+        MagnetAddError::EvictedForSpace { .. } => StatusCode::INSUFFICIENT_STORAGE,
     };
     (status, error.client_message())
 }
@@ -324,6 +327,15 @@ mod tests {
         });
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(!body.contains("/home/user"), "{body}");
+
+        // A torrent the cleaner evicted for want of disk space is the
+        // disk's fault, and the status a full disk gets everywhere else.
+        let (status, body) = engine_creation_failure(&MagnetAddError::EvictedForSpace {
+            info_hash: "abc".into(),
+            retry_after_secs: 30,
+        });
+        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+        assert!(body.contains("disk space"), "{body}");
     }
 
     /// `query_values` already percent-decodes `tr=`; decoding a second time

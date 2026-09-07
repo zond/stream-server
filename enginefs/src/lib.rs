@@ -1,5 +1,5 @@
 use crate::engine::Engine;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
 use std::collections::{BTreeMap, HashMap};
@@ -77,6 +77,14 @@ pub const FREE_SPACE_RESUME_MARGIN: u64 = 64 * 1024 * 1024;
 /// bound for a server whose cleaner is off or stuck: a parked read that
 /// nothing will complete is a player spinning for ever.
 pub const STOPPED_READ_STALL_BOUND: Duration = Duration::from_secs(20);
+/// How long after the cache cleaner has evicted a torrent stopped for space
+/// ([`BackendEngineFS::evict_stopped_torrent`]) a request for the same hash
+/// is refused rather than re-added. A player whose body was just failed
+/// reconnects within a second and stremio-core's stats poll asks about the
+/// hash every second; either would re-add the torrent and refill the disk
+/// the cleaner has just emptied, in a loop nobody asked for. A user who
+/// sees the error and presses play again arrives later than this.
+pub const EVICTED_FOR_SPACE_RETRY_AFTER: Duration = Duration::from_secs(30);
 /// Free space that must remain on the download volume after a pinned file's
 /// missing bytes are written; `pin_download` refuses below it
 /// ([`PinDownloadError::InsufficientSpace`]). Re-pinning a complete file
@@ -207,6 +215,19 @@ pub enum MagnetAddError {
         info_hash: String,
         error: Arc<anyhow::Error>,
     },
+    /// The torrent was stopped for want of disk space and the cache cleaner
+    /// evicted it whole -- torrent and partial download -- because nothing
+    /// else on the volume could go ([`BackendEngineFS::evict_stopped_torrent`]).
+    /// Until `retry_after_secs` on the engine's clock, a request for the
+    /// hash gets this instead of a fresh add; see
+    /// [`EVICTED_FOR_SPACE_RETRY_AFTER`]. Routes map it to 507.
+    #[error(
+        "torrent {info_hash} was stopped for want of disk space and its partial download evicted"
+    )]
+    EvictedForSpace {
+        info_hash: String,
+        retry_after_secs: u64,
+    },
 }
 
 impl MagnetAddError {
@@ -222,6 +243,23 @@ impl MagnetAddError {
             Self::Backend { .. } | Self::TaskFailed { .. } | Self::Cancelled { .. } => {
                 "backend refused the torrent; see server logs".to_string()
             }
+            Self::EvictedForSpace { .. } => {
+                "the torrent was stopped for want of disk space and its partial download evicted; \
+                 free some space and retry"
+                    .to_string()
+            }
+        }
+    }
+
+    /// Whether a blocking lookup at `now_secs` may retry the add this error
+    /// ended: always, except inside the cooling-off period of an eviction
+    /// for space.
+    fn may_retry_at(&self, now_secs: u64) -> bool {
+        match self {
+            Self::EvictedForSpace {
+                retry_after_secs, ..
+            } => now_secs >= *retry_after_secs,
+            _ => true,
         }
     }
 }
@@ -736,6 +774,26 @@ pub struct EvictionClasses {
     /// other file -- the backend's error state holds no open handle on them
     /// -- only sorted to the front of the eviction order.
     pub dead: Vec<std::path::PathBuf>,
+    /// Unpinned torrents stopped for want of disk space -- by the free-space
+    /// watch, or by librqbit's ENOSPC -- with every path of theirs. Not
+    /// protected, but not for the cleaner to unlink either: a paused
+    /// torrent holds its files open and its piece map says it has them, so
+    /// deleting the bytes alone would leave it resuming over nothing. The
+    /// cleaner takes one of these whole, through
+    /// `BackendEngineFS::evict_stopped_torrent`, and only when nothing else
+    /// can go: while anything else can, evicting *that* lets the stopped
+    /// torrent resume with its progress, which is the better outcome for
+    /// the person watching it.
+    pub stopped_for_space: Vec<StoppedTorrent>,
+}
+
+/// A torrent stopped for want of disk space, as [`EvictionClasses`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoppedTorrent {
+    pub info_hash: String,
+    /// Every path its data can be at -- the same set a live torrent would
+    /// have protected.
+    pub paths: Vec<std::path::PathBuf>,
 }
 
 pub type EngineFS = BackendEngineFS<LibrqbitBackend>;
@@ -1518,7 +1576,9 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     pending.joined();
                     return Lookup::found(EngineLookup::Adding(pending.clone()));
                 }
-                MagnetAddState::Failed(failed) if !retry_failed => {
+                MagnetAddState::Failed(failed)
+                    if !retry_failed || !failed.error.may_retry_at(now) =>
+                {
                     return Lookup::found(EngineLookup::Failed(failed.clone()));
                 }
                 MagnetAddState::Failed(failed) => {
@@ -1804,18 +1864,30 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// engine in the registry". On the television that prompted this two
     /// torrents that had died of a storage bug held 700 MB between them,
     /// the cleaner reported them protected, and every later stream failed
-    /// for the space they held. A *pinned* dead torrent stays protected: the
-    /// user asked for those bytes, and an unpin is how they say otherwise.
+    /// for the space they held. The third torrent there had died of ENOSPC,
+    /// and was protected too: a torrent stopped for space is listed
+    /// separately ([`EvictionClasses::stopped_for_space`]), for the cleaner
+    /// to evict whole when nothing else can go. A *pinned* torrent stays
+    /// protected however it stopped: the user asked for those bytes, and an
+    /// unpin is how they say otherwise.
     pub async fn eviction_classes(&self) -> EvictionClasses {
         let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
         let pieces = crate::piece_store::root_in(&self.download_dir);
         let mut classes = EvictionClasses::default();
         for engine in engines {
-            let dead = !engine.is_pinned()
-                && engine.handle.is_in_error_state().await
-                && !engine.handle.is_out_of_space().await;
             let paths = self.engine_paths(&engine).await;
-            if dead {
+            if engine.is_pinned() {
+                classes.protected.extend(paths);
+                continue;
+            }
+            let out_of_space =
+                engine.is_stopped_for_space() || engine.handle.is_out_of_space().await;
+            if out_of_space {
+                classes.stopped_for_space.push(StoppedTorrent {
+                    info_hash: engine.info_hash.clone(),
+                    paths,
+                });
+            } else if engine.handle.is_in_error_state().await {
                 classes.dead.extend(paths);
             } else {
                 classes.protected.extend(paths);
@@ -1900,6 +1972,78 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         };
         engine.handle.restart_after_error().await?;
         engine.clear_space_stop();
+        Ok(true)
+    }
+
+    /// Evict a torrent stopped for want of disk space, whole: the torrent
+    /// leaves the registry and the session, its files go with it
+    /// ([`TorrentBackend::remove_torrent_and_files`]), its readers are
+    /// failed, and a request for the hash inside
+    /// [`EVICTED_FOR_SPACE_RETRY_AFTER`] is answered
+    /// [`MagnetAddError::EvictedForSpace`] rather than re-adding it.
+    /// `false` -- and nothing done -- for a hash no engine holds, for one
+    /// that is not stopped for space, and for a pinned one.
+    ///
+    /// The cache cleaner calls this when a pass could get under the cap by
+    /// no other means (`cache_cleaner::evict`); it decides *when*, this
+    /// layer does the removing, because the two records of the data have to
+    /// go together. A torrent librqbit paused still holds its files open
+    /// (an unlink frees no block) and its piece map still says it has them
+    /// (a resume reads pieces from a file that is empty), so the files may
+    /// not simply be deleted under it; `Session::delete` takes the state,
+    /// closes the files, deletes them, and leaves any open `FileStream`
+    /// erroring on its next poll rather than reading a file that is gone.
+    ///
+    /// What the user sees is the point of it. They started a film larger
+    /// than the free space; it stopped; they press play again. Before this
+    /// the previous attempt's corpse held the space, protected as a live
+    /// engine's files, and the retry failed for want of the room the corpse
+    /// took. Now the retry finds the space (and, within the cooling-off
+    /// period, a `507` that says why rather than a fresh add that would
+    /// refill the disk to fail the same way). The earlier attempt's
+    /// progress is lost -- but it was progress into a file that could not
+    /// have been finished on this volume anyway.
+    pub async fn evict_stopped_torrent(&self, info_hash: &str) -> Result<bool> {
+        let info_hash = info_hash.to_lowercase();
+        let engine = self.engines.read().await.get(&info_hash).cloned();
+        let Some(engine) = engine else {
+            return Ok(false);
+        };
+        if engine.is_pinned()
+            || !(engine.is_stopped_for_space() || engine.handle.is_out_of_space().await)
+        {
+            return Ok(false);
+        }
+        // Readers first, so a read that races the delete fails with the
+        // device's error rather than the backend's.
+        engine.refuse_reads_for_space();
+        if !self.remove_engine_if_current(&engine).await {
+            return Ok(false);
+        }
+        let now = self.clock.now_secs();
+        self.magnet_adds.write().await.insert(
+            info_hash.clone(),
+            MagnetAddEntry {
+                state: MagnetAddState::Failed(FailedMagnetAdd {
+                    error: MagnetAddError::EvictedForSpace {
+                        info_hash: info_hash.clone(),
+                        retry_after_secs: now
+                            .saturating_add(EVICTED_FOR_SPACE_RETRY_AFTER.as_secs()),
+                    },
+                    trackers: Arc::from(Vec::new()),
+                }),
+                last_polled_secs: AtomicU64::new(now),
+            },
+        );
+        self.backend
+            .remove_torrent_and_files(&info_hash)
+            .await
+            .with_context(|| format!("evicting {info_hash}, stopped for want of disk space"))?;
+        tracing::info!(
+            info_hash = %info_hash,
+            retry_after_secs = EVICTED_FOR_SPACE_RETRY_AFTER.as_secs(),
+            "evicted a torrent stopped for want of disk space, with its partial download"
+        );
         Ok(true)
     }
 
@@ -6677,11 +6821,13 @@ mod tests {
             "protected_paths is the same walk"
         );
 
-        // Out of space is not dead: the recovery restarts that one.
+        // Out of space is not dead: that one is listed whole, for the
+        // recovery to restart or the cleaner to take as a last resort.
         counters.out_of_space.store(true, Ordering::SeqCst);
         let stopped = enginefs.eviction_classes().await;
-        assert_eq!(stopped.protected, files);
+        assert!(stopped.protected.is_empty());
         assert!(stopped.dead.is_empty());
+        assert_eq!(stopped.stopped_for_space.len(), 1);
         counters.out_of_space.store(false, Ordering::SeqCst);
 
         // Pinned and dead: the pin outranks the death.
@@ -6933,6 +7079,160 @@ mod tests {
         assert_eq!(counters.restart_after_error.load(Ordering::SeqCst), 1);
         assert!(!engine.is_stopped_for_space());
         assert!(enginefs.out_of_space_torrents().await.is_empty());
+    }
+
+    /// To the backend a torrent the watch stopped is merely paused, which
+    /// the client would show as buffering for ever; the statistics say what
+    /// is actually wrong, in the field a torrent error has always used, and
+    /// stop saying it when the torrent is back.
+    #[tokio::test]
+    async fn a_torrent_stopped_for_space_reports_it_in_its_statistics() {
+        let (mut enginefs, _counters) = test_enginefs_with_file_count(1);
+        enginefs.set_free_space_probe(|_| Ok(0));
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        assert_eq!(engine.get_statistics().await.error, None);
+
+        enginefs.free_space_watch_tick().await;
+        let stats = engine.get_statistics().await;
+        assert_eq!(stats.phase, StartupPhase::Error);
+        assert_eq!(
+            stats.error.as_deref(),
+            Some(crate::engine::STOPPED_FOR_SPACE_MESSAGE)
+        );
+
+        enginefs.restart_after_error(TEST_HASH).await.unwrap();
+        let stats = engine.get_statistics().await;
+        assert_ne!(stats.phase, StartupPhase::Error);
+        assert_eq!(stats.error, None);
+    }
+
+    /// A torrent stopped for space is neither protected nor the cleaner's to
+    /// unlink: it is listed whole, so the cleaner can take it through the
+    /// engine when nothing else can go. Stopped by the watch or by librqbit's
+    /// ENOSPC alike; a pinned one stays protected however it stopped.
+    #[tokio::test]
+    async fn a_torrent_stopped_for_space_is_listed_whole_for_the_cleaner() {
+        let (mut enginefs, counters) = test_enginefs_with_file_count(2);
+        let root = enginefs.download_dir.clone();
+        let files = vec![
+            crate::piece_store::root_in(&root).join(TEST_HASH),
+            root.join("video-0.mkv"),
+            root.join("video-1.mkv"),
+        ];
+        let whole = StoppedTorrent {
+            info_hash: TEST_HASH.to_string(),
+            paths: files.clone(),
+        };
+
+        enginefs.set_free_space_probe(|_| Ok(0));
+        enginefs.free_space_watch_tick().await;
+        let classes = enginefs.eviction_classes().await;
+        assert!(classes.protected.is_empty() && classes.dead.is_empty());
+        assert_eq!(classes.stopped_for_space, vec![whole.clone()]);
+        assert!(enginefs.protected_paths().await.is_empty());
+
+        // librqbit's own ENOSPC stop reads the same.
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        enginefs.free_space_watch_tick().await;
+        assert!(
+            enginefs
+                .eviction_classes()
+                .await
+                .stopped_for_space
+                .is_empty()
+        );
+        counters.out_of_space.store(true, Ordering::SeqCst);
+        assert_eq!(
+            enginefs.eviction_classes().await.stopped_for_space,
+            vec![whole]
+        );
+
+        // The pin outranks the stop.
+        enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
+        let classes = enginefs.eviction_classes().await;
+        assert_eq!(classes.protected, files);
+        assert!(classes.stopped_for_space.is_empty());
+    }
+
+    /// Evicting a stopped torrent takes the torrent and its files together
+    /// (the two records of the data), fails its readers, and refuses the
+    /// hash for a cooling-off period -- a player's reconnect and a stats
+    /// poll would otherwise re-add it within the second and refill the disk
+    /// the cleaner had just emptied. A user's retry, later, is a fresh add.
+    /// Nothing is evicted that is not stopped for space, or that is pinned.
+    #[tokio::test(start_paused = true)]
+    async fn evicting_a_stopped_torrent_takes_it_whole_and_refuses_the_hash_a_while() {
+        let (mut enginefs, _counters) = test_enginefs_with_file_count(1);
+        let removed_with_files = enginefs.backend.removed_with_files.clone();
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+
+        // Live: not the cleaner's to evict.
+        assert!(!enginefs.evict_stopped_torrent(TEST_HASH).await.unwrap());
+        assert!(removed_with_files.lock().unwrap().is_empty());
+
+        // Pinned while there was room, then stopped as the volume fills:
+        // the pin keeps it.
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
+        enginefs.set_free_space_probe(|_| Ok(0));
+        enginefs.free_space_watch_tick().await;
+        assert!(engine.is_stopped_for_space());
+        assert!(!enginefs.evict_stopped_torrent(TEST_HASH).await.unwrap());
+        enginefs.unpin_download(TEST_HASH, 0, false).await.unwrap();
+        assert!(
+            engine.is_stopped_for_space(),
+            "the unpin does not restart it"
+        );
+
+        // Stopped and unpinned: gone whole.
+        assert!(enginefs.evict_stopped_torrent(TEST_HASH).await.unwrap());
+        assert_eq!(
+            *removed_with_files.lock().unwrap(),
+            vec![TEST_HASH.to_string()]
+        );
+        assert!(enginefs.peek_engine(TEST_HASH).await.is_none());
+        assert!(engine.reads_refused(), "its readers are failed");
+        assert!(enginefs.out_of_space_torrents().await.is_empty());
+        assert!(
+            !enginefs.restart_after_error(TEST_HASH).await.unwrap(),
+            "and there is nothing left to restart"
+        );
+        assert!(
+            !enginefs.evict_stopped_torrent(TEST_HASH).await.unwrap(),
+            "evicting it again does nothing"
+        );
+
+        // Inside the cooling-off period every lookup meets the eviction:
+        // the poller as a failure record, the blocking add as an error,
+        // and neither re-adds the torrent.
+        match enginefs.get_or_begin_add_magnet(TEST_HASH, None).await {
+            EngineLookup::Failed(failed) => assert!(
+                matches!(failed.error, MagnetAddError::EvictedForSpace { .. }),
+                "{:?}",
+                failed.error
+            ),
+            _ => panic!("the eviction is what a poller sees"),
+        }
+        match enginefs.get_or_add_magnet(TEST_HASH, None).await {
+            Err(MagnetAddError::EvictedForSpace { info_hash, .. }) => {
+                assert_eq!(info_hash, TEST_HASH);
+            }
+            Ok(_) => panic!("a stream request is refused, not served a fresh add"),
+            Err(other) => panic!("refused for the wrong reason: {other:?}"),
+        }
+        assert!(enginefs.peek_engine(TEST_HASH).await.is_none());
+
+        // After it, a request is a fresh add.
+        tokio::time::advance(EVICTED_FOR_SPACE_RETRY_AFTER).await;
+        let readded = enginefs
+            .get_or_add_magnet(TEST_HASH, None)
+            .await
+            .expect("the cooling-off period is over");
+        assert!(
+            !Arc::ptr_eq(&readded, &engine),
+            "a new engine, not the corpse"
+        );
+        assert!(!readded.is_stopped_for_space() && !readded.reads_refused());
     }
 
     /// A read parked on a piece a stopped torrent will not download is a

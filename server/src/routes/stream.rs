@@ -424,6 +424,13 @@ type DiskSpaceCache =
 static DISK_SPACE_CACHE: std::sync::OnceLock<DiskSpaceCache> = std::sync::OnceLock::new();
 const DISK_SPACE_CACHE_TTL: Duration = Duration::from_secs(3);
 
+/// The body of every `507` the stream route answers: a fixed sentence,
+/// because the conditions behind it (`ensure_download_disk_ready`'s own
+/// message, the engine's reason for a stop) name the cache root, and no
+/// response may carry a path.
+const INSUFFICIENT_DISK_SPACE_BODY: &str =
+    "Insufficient disk space for this stream; free some space and retry";
+
 /// Free space a test has declared for a root and everything under it,
 /// standing in for the volume probe -- see [`pretend_available_space`].
 type DiskSpaceOverrides = std::sync::Mutex<Vec<(std::path::PathBuf, u64)>>;
@@ -666,7 +673,7 @@ async fn ensure_disk_ready_or_refuse(
             );
             Err((
                 StatusCode::INSUFFICIENT_STORAGE,
-                "Insufficient disk space for this stream; free some space and retry",
+                INSUFFICIENT_DISK_SPACE_BODY,
             ))
         }
     }
@@ -943,6 +950,27 @@ async fn stream_video_with(
         }
         Err(refusal) => return refusal.into_response(),
     };
+
+    // A torrent the free-space watch has stopped is not downloading, so a
+    // reader opened on it would park on its first missing piece for as long
+    // as it stays stopped -- a player buffering with no end. The engine has
+    // already said what is wrong with the disk; say it to the client, with
+    // the body the free-space check uses for the same condition. The cache
+    // cleaner either restarts the torrent (and the next request streams) or
+    // evicts it (and the next request meets `MagnetAddError::EvictedForSpace`,
+    // the same `507`, until the cooling-off period ends).
+    if engine.is_stopped_for_space() {
+        tracing::warn!(
+            stream_id,
+            info_hash = %info_hash,
+            "stream_video: the torrent is stopped for want of disk space; refusing the stream"
+        );
+        return (
+            StatusCode::INSUFFICIENT_STORAGE,
+            INSUFFICIENT_DISK_SPACE_BODY,
+        )
+            .into_response();
+    }
 
     let _metadata_resolution = MetadataResolutionGuard::acquire(&engine).await;
     let files = engine.handle.get_files().await;

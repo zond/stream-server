@@ -245,6 +245,12 @@ impl GetFileError {
     }
 }
 
+/// What `stats.error` says for a torrent the free-space watch stopped
+/// (`BackendEngineFS::free_space_watch_tick`): a fixed, path-free sentence,
+/// like `librqbit::TORRENT_ERROR_MESSAGE` for the backend's own error state.
+pub const STOPPED_FOR_SPACE_MESSAGE: &str =
+    "the torrent is stopped for want of disk space; free some space and it will resume";
+
 pub struct Engine<H: TorrentHandle> {
     pub info_hash: String,
     pub handle: H,
@@ -443,6 +449,17 @@ impl<H: TorrentHandle> Engine<H> {
                 guessed_file_idx,
                 stats.files.len()
             );
+        }
+
+        // A torrent the free-space watch stopped is `Paused` to the backend,
+        // which is `buffering` to a client -- a wheel that never ends. It
+        // is an error in the sense the `error` field has always had: a
+        // full disk, and the client can act on it.
+        if self.is_stopped_for_space() {
+            stats.phase = crate::backend::StartupPhase::Error;
+            stats
+                .error
+                .get_or_insert_with(|| STOPPED_FOR_SPACE_MESSAGE.to_string());
         }
 
         stats
