@@ -42,6 +42,20 @@ pub trait TorrentBackend: Send + Sync {
         trackers: Vec<String>,
     ) -> Result<Self::Handle>;
 
+    /// The info hash `source` names, read without adding anything.
+    ///
+    /// The point is a refusal that has to happen *before* the add: a hash
+    /// the cache cleaner evicted for want of space is refused for
+    /// [`crate::EVICTED_FOR_SPACE_RETRY_AFTER`], and a backend add is
+    /// already writing files by the time it can be asked what it added.
+    /// `None` for a source whose hash cannot be known without fetching it
+    /// (a `.torrent` behind a URL) or for a backend that cannot parse one;
+    /// the caller then proceeds, which is what happened for every source
+    /// before this existed.
+    fn source_info_hash(&self, _source: &TorrentSource) -> Option<String> {
+        None
+    }
+
     /// [`Self::add_torrent`] with an explicit [`TorrentPlacement`]. The
     /// default ignores the placement -- the only possible answer for a
     /// backend with one root and no per-file selection -- so callers that

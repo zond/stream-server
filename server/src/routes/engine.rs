@@ -166,7 +166,18 @@ pub async fn create_engine(
                 // every other torrent-creation failure's: the error is
                 // logged here in full and never echoed, since a backend
                 // error can carry the cache root's path.
+                // The one typed failure this path can produce: the hash was
+                // evicted for want of disk space and is inside its
+                // cooling-off period. It gets the same 507 and the same
+                // words as the magnet path's, or a client that re-creates
+                // the torrent from its `.torrent` file would read "Failed
+                // to add torrent" for a full disk.
                 Err(e) => {
+                    if let Some(typed) = e.downcast_ref::<enginefs::MagnetAddError>() {
+                        let (status, message) = compat::engine_creation_failure(typed);
+                        tracing::warn!(%typed, "create_engine refused the torrent");
+                        return (status, Json(json!({ "error": message })));
+                    }
                     tracing::error!(error = %format!("{e:#}"), "create_engine failed to add torrent");
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,

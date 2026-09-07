@@ -1456,15 +1456,62 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         engine
     }
 
+    /// Add a torrent from a `.torrent` blob or URL and publish its engine.
+    ///
+    /// Honours the [`MagnetAddError::EvictedForSpace`] cooling-off period,
+    /// which the magnet path enforces in `lookup_or_begin_add_magnet`. It
+    /// has to be enforced here too and for the same reason: the cleaner
+    /// evicts a stopped torrent only when a pass could free nothing else,
+    /// and a re-add inside the window refills the volume it just emptied.
+    /// The magnet path is the one a player's reconnect and stremio-core's
+    /// stats poll take, so this one needs a user action to reach -- but
+    /// "the client re-creates the torrent it has the file for" is exactly
+    /// what a Stremio client does with a `.torrent` addon result, and the
+    /// refusal is a `507` that says why rather than a disk that fills
+    /// again.
+    ///
+    /// The check is before the add because a backend add is already writing
+    /// files by the time it could be asked what it added; the hash comes
+    /// from [`TorrentBackend::source_info_hash`], and a source whose hash
+    /// cannot be known without fetching it is added as before. The error is
+    /// the typed [`MagnetAddError`] inside the `anyhow`, so a route can
+    /// `downcast_ref` it to the same status the magnet path gives.
     pub async fn add_torrent(
         &self,
         source: TorrentSource,
         extra_trackers: Option<Vec<String>>,
     ) -> Result<Arc<Engine<B::Handle>>> {
+        if let Some(info_hash) = self.backend.source_info_hash(&source)
+            && let Some(refusal) = self.evicted_for_space_refusal(&info_hash).await
+        {
+            tracing::warn!(
+                info_hash,
+                "refusing a torrent-file add of a hash evicted for want of disk space"
+            );
+            return Err(anyhow::Error::new(refusal));
+        }
         let trackers = self.merged_trackers(extra_trackers).await;
         debug!(count = trackers.len(), "Adding torrent with trackers");
         let handle = self.backend.add_torrent(source, trackers).await?;
         Ok(Self::register_engine(&self.engines, handle, self.clock).await)
+    }
+
+    /// The standing [`MagnetAddError::EvictedForSpace`] for `info_hash`, if
+    /// the cooling-off period from [`Self::evict_stopped_torrent`] has not
+    /// run out. `None` for every other recorded failure: only this one
+    /// refuses a retry, and only for its window.
+    async fn evicted_for_space_refusal(&self, info_hash: &str) -> Option<MagnetAddError> {
+        let now = self.clock.now_secs();
+        let adds = self.magnet_adds.read().await;
+        let MagnetAddState::Failed(failed) = &adds.get(info_hash)?.state else {
+            return None;
+        };
+        match &failed.error {
+            error @ MagnetAddError::EvictedForSpace { .. } if !error.may_retry_at(now) => {
+                Some(error.clone())
+            }
+            _ => None,
+        }
     }
 
     /// Existing engine for `info_hash`, or the in-flight magnet add for it --
@@ -4588,6 +4635,14 @@ mod tests {
             Ok(self.handles[0].clone())
         }
 
+        /// This backend's one torrent is `TEST_HASH`, whatever the source
+        /// says -- as `add_torrent` above already assumes. Implemented so
+        /// the checks `EngineFS::add_torrent` makes *before* handing a
+        /// source to a backend can be tested at all.
+        fn source_info_hash(&self, _source: &TorrentSource) -> Option<String> {
+            Some(TEST_HASH.to_string())
+        }
+
         async fn add_torrent_placed(
             &self,
             _source: TorrentSource,
@@ -7268,6 +7323,52 @@ mod tests {
             "a new engine, not the corpse"
         );
         assert!(!readded.is_stopped_for_space() && !readded.reads_refused());
+    }
+
+    /// The cooling-off period covers the `.torrent`-file path too.
+    ///
+    /// It was enforced only in `lookup_or_begin_add_magnet`, so a client
+    /// that re-created the torrent from the file rather than from the hash
+    /// walked straight past it and started refilling the volume the cleaner
+    /// had just emptied -- and the eviction is the pass's last resort,
+    /// taken only when nothing else could go. The check is before the add,
+    /// because a backend add has already created files by the time it could
+    /// be asked what it added.
+    #[tokio::test(start_paused = true)]
+    async fn a_torrent_file_re_add_is_refused_inside_the_eviction_cooldown() {
+        let (mut enginefs, _counters) = test_enginefs_with_file_count(1);
+        enginefs.set_free_space_probe(|_| Ok(0));
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        engine.mark_stopped_for_space(enginefs.clock.now_secs());
+        assert!(enginefs.evict_stopped_torrent(TEST_HASH).await.unwrap());
+
+        let Err(refused) = enginefs
+            .add_torrent(TorrentSource::Bytes(b"a .torrent blob".to_vec()), None)
+            .await
+        else {
+            panic!("the hash is inside its cooling-off period and must be refused");
+        };
+        match refused.downcast_ref::<MagnetAddError>() {
+            Some(MagnetAddError::EvictedForSpace { info_hash, .. }) => {
+                assert_eq!(info_hash, TEST_HASH, "and it names the hash it refused");
+            }
+            _ => panic!("the route needs the typed error to answer 507: {refused:#}"),
+        }
+        assert!(
+            enginefs.peek_engine(TEST_HASH).await.is_none(),
+            "the refusal must not have added the torrent on the way to erroring"
+        );
+
+        // After the window it is an ordinary add again.
+        tokio::time::advance(EVICTED_FOR_SPACE_RETRY_AFTER).await;
+        assert!(
+            enginefs
+                .add_torrent(TorrentSource::Bytes(b"a .torrent blob".to_vec()), None)
+                .await
+                .is_ok(),
+            "the cooling-off period is over"
+        );
+        assert!(enginefs.peek_engine(TEST_HASH).await.is_some());
     }
 
     /// A read parked on a piece a stopped torrent will not download is a
