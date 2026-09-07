@@ -1,9 +1,9 @@
 use crate::backend::dht_bootstrap::{self, BootstrapResolvers};
 use crate::backend::{
-    BackendFileInfo, BackendMemoryDiagnostics, DhtStatus, EngineStats, FileStreamTrait, Growler,
-    PeerDiscovery, PeerSearch, PieceReadiness, Source, StartupPhase, StatsFile, StatsOptions,
-    SwarmCap, TorrentBackend, TorrentFilePriorityPlan, TorrentHandle, TorrentListenPort,
-    TorrentPlacement, TorrentSource, TransferTotals,
+    BackendFileInfo, BackendMemoryDiagnostics, DhtStatus, DroppedFilePieces, EngineStats,
+    FileStreamTrait, Growler, PeerDiscovery, PeerSearch, PieceReadiness, Source, StartupPhase,
+    StatsFile, StatsOptions, SwarmCap, TorrentBackend, TorrentFilePriorityPlan, TorrentHandle,
+    TorrentListenPort, TorrentPlacement, TorrentSource, TransferTotals,
 };
 use crate::scrape::SwarmScraper;
 use anyhow::{Context, Result};
@@ -733,6 +733,50 @@ fn plan_only_files(
     }
 }
 
+/// The claim [`LibrqbitHandle::drop_file_pieces`] hands out: librqbit's own
+/// [`librqbit::DroppedPieces`], plus the re-selection its release does not
+/// do by itself.
+///
+/// A dropped piece stays dropped until something re-selects it -- a seek
+/// into it, or its file going from unselected to selected -- and releasing
+/// the claim does not: `finish_release` only lets a piece that was
+/// re-selected *meanwhile* be downloaded. So the boundary piece the deleted
+/// file shared with a still-selected neighbour would stay out of the
+/// neighbour's want-set for the rest of the session, and an offline device
+/// would find the neighbour's first or last piece missing with no way to
+/// fetch it. Dropping this re-selects the range after the release: librqbit
+/// queues the pieces of files that are still selected (the shared one) and
+/// leaves the deleted file's own pieces as plain missing pieces, which is
+/// what a later re-pin expects to find.
+struct ReleaseThenReselect {
+    dropped: Option<librqbit::DroppedPieces>,
+    torrent: Arc<ManagedTorrent>,
+    range: std::ops::Range<u32>,
+}
+
+impl Drop for ReleaseThenReselect {
+    fn drop(&mut self) {
+        // Release first, then re-select: a piece re-selected while still
+        // under release would be one the deletion could race.
+        drop(self.dropped.take());
+        match self.torrent.reselect_pieces(self.range.clone()) {
+            Ok(reselected) => debug!(
+                info_hash = %self.torrent.info_hash().as_string(),
+                reselected,
+                "re-selected what a still-selected file shares with the deleted one"
+            ),
+            // Not live any more (paused or gone): the have-set will be
+            // rebuilt from disk when it next comes up, so there is nothing
+            // to correct here.
+            Err(error) => debug!(
+                info_hash = %self.torrent.info_hash().as_string(),
+                error = %format!("{error:#}"),
+                "could not re-select around the deleted file's pieces"
+            ),
+        }
+    }
+}
+
 pub struct LibrqbitHandle {
     pub handle: Arc<ManagedTorrent>,
     pub info_hash: String,
@@ -946,6 +990,18 @@ impl TorrentBackend for LibrqbitBackend {
                         .output_folder
                         .map(|folder| folder.to_string_lossy().into_owned()),
                     only_files: placement.only_files,
+                    // What makes `ManagedTorrent::drop_pieces` -- and so
+                    // `LibrqbitHandle::drop_file_pieces` -- available on
+                    // this torrent. Off, librqbit refuses to forget a piece
+                    // it has, and a per-file delete of a pinned download
+                    // leaves it advertising pieces whose bytes are gone.
+                    // Nothing drops anything on its own with it on; it only
+                    // opens the API, at the price of a read lock per Have
+                    // the torrent announces. Not persisted: a torrent the
+                    // session restores at startup comes back without it
+                    // (`SerializedTorrent::into_add_torrent` builds default
+                    // options), which `drop_file_pieces` reports.
+                    piece_reclaim: true,
                     ..Default::default()
                 }),
             )
@@ -1721,6 +1777,69 @@ impl TorrentHandle for LibrqbitHandle {
             }
         }
         Ok(())
+    }
+
+    /// `ManagedTorrent::drop_pieces` over the file's piece range (see the
+    /// trait doc). librqbit clears the have-bits, stops advertising the
+    /// pieces and stops wanting them, and hands back the claim that keeps
+    /// them unwanted until the caller has deleted the bytes.
+    ///
+    /// librqbit skips two kinds of piece on its own: ones it does not have
+    /// (nothing to forget) and ones a live stream's lookahead is about to
+    /// read (dropping those would only re-request them at once; a reader
+    /// still on the file being deleted gets the read error it was going to
+    /// get anyway). A boundary piece the neighbouring file shares is
+    /// dropped too -- half of its bytes are about to go, so its have-bit
+    /// would be a lie -- and comes back through the neighbour's selection
+    /// once the claim is released.
+    ///
+    /// Two states refuse. A torrent that is not live (still hash-checking,
+    /// or paused) has no live have-set to edit. And a torrent restored from
+    /// the session's records at startup was re-added without
+    /// `piece_reclaim` (`add_torrent_placed` sets it; the restore path
+    /// builds default options), so librqbit answers `PieceReclaimDisabled`
+    /// for it however long it has been running. Both are reported, not
+    /// hidden: the caller deletes the bytes regardless, and until the next
+    /// restart librqbit believes it has them. The restart heals it -- the
+    /// fastresume validation hash-checks at least one claimed piece of every
+    /// file, the deleted file reads back empty, and the whole torrent is
+    /// re-checked from disk -- and the pieces stay out of the want-set
+    /// because `only_files` is persisted without the file.
+    async fn drop_file_pieces(&self, file_idx: usize) -> Result<Option<DroppedFilePieces>> {
+        let range = self
+            .handle
+            .with_metadata(|m| m.file_infos.get(file_idx).map(|f| f.piece_range.clone()))
+            .context("torrent has no metadata to name the file's pieces")?
+            .with_context(|| format!("file index {file_idx} out of range"))?;
+        let dropped = match self.handle.drop_pieces(range.clone()) {
+            Ok(dropped) => dropped,
+            Err(e)
+                if e.downcast_ref::<librqbit::Error>()
+                    .is_some_and(|e| matches!(e, librqbit::Error::PieceReclaimDisabled)) =>
+            {
+                return Err(e.context(
+                    "the torrent was restored from the session's records, which come back \
+                     without piece reclaim (AddTorrentOptions::piece_reclaim is not \
+                     persisted), so librqbit cannot forget the pieces before the next restart",
+                ));
+            }
+            Err(e) => return Err(e.context("librqbit could not forget the file's pieces")),
+        };
+        let pieces = dropped.pieces().to_vec();
+        debug!(
+            info_hash = %self.info_hash,
+            file_idx,
+            pieces = pieces.len(),
+            "dropped the file's pieces from the have-set"
+        );
+        Ok(Some(DroppedFilePieces::new(
+            pieces,
+            ReleaseThenReselect {
+                dropped: Some(dropped),
+                torrent: self.handle.clone(),
+                range,
+            },
+        )))
     }
 
     /// The engine's primary multi-file switching hook
@@ -4045,6 +4164,156 @@ mod tests {
         // Out-of-range pin is a structural error and records nothing.
         assert!(handle.pin_file(3).await.is_err());
         assert!(TorrentHandle::stats(&handle).await.pinned_files.is_empty());
+    }
+
+    /// Forgetting a file's pieces against the real backend: the have-set
+    /// loses exactly that file's pieces, the boundary piece its neighbour
+    /// shares included, and while the claim stands nothing is queued. Once
+    /// it is released the neighbour's half of the boundary piece is wanted
+    /// again, and a re-selection of the file has something to download --
+    /// which is what a re-pin after a delete needs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_a_files_pieces_forgets_them_until_they_are_wanted_again() {
+        use crate::backend::{TorrentFilePriorityPlan, TorrentHandle};
+        const PIECE: u64 = 16 * 1024;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let content_dir = dir.join("multi");
+        tokio::fs::create_dir_all(&content_dir).await.unwrap();
+        // Neither a whole number of pieces, so whichever order the
+        // filesystem lists them in, the two share a boundary piece.
+        write_payload(&content_dir.join("a.bin"), 40 * 1024).await;
+        write_payload(&content_dir.join("b.bin"), 56 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&content_dir).await;
+        let (_backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
+        handle.handle.wait_until_initialized().await.unwrap();
+        let lengths: Vec<u64> = handle
+            .handle
+            .with_metadata(|m| m.file_infos.iter().map(|f| f.len).collect())
+            .unwrap();
+        let total: u64 = lengths.iter().sum();
+        let stats = handle.handle.stats();
+        assert!(stats.finished, "seeded: {stats}");
+        assert_eq!(stats.file_progress, lengths);
+
+        // The first file goes, the second is pinned and stays wanted.
+        handle.pin_file(0).await.unwrap();
+        handle.pin_file(1).await.unwrap();
+        handle.unpin_file(0).await.unwrap();
+        handle
+            .reconcile_file_priorities(TorrentFilePriorityPlan {
+                active_file: None,
+                hot_file: None,
+                generation: 1,
+                reason: "test",
+            })
+            .await
+            .unwrap();
+        assert_eq!(handle.handle.only_files(), Some(vec![1]));
+
+        let dropped = handle
+            .drop_file_pieces(0)
+            .await
+            .expect("a live torrent added here can drop")
+            .expect("librqbit keeps a have-set");
+        let file_pieces = lengths[0].div_ceil(PIECE) as usize;
+        assert_eq!(dropped.pieces().len(), file_pieces, "{dropped:?}");
+        let stats = handle.handle.stats();
+        assert_eq!(stats.file_progress[0], 0, "the file is not had: {stats}");
+        assert!(!handle.is_file_complete(0).await);
+        assert!(!TorrentHandle::stats(&handle).await.files[0].complete);
+        // The boundary piece went with it: the neighbour lost its share.
+        let boundary_share = PIECE - lengths[0] % PIECE;
+        assert_eq!(
+            stats.file_progress[1],
+            lengths[1] - boundary_share,
+            "{stats}"
+        );
+        assert_eq!(
+            stats.progress_bytes,
+            total - file_pieces as u64 * PIECE,
+            "{stats}"
+        );
+        assert!(
+            stats.finished,
+            "while the claim stands nothing is wanted back, not even the \
+             boundary piece: {stats}"
+        );
+
+        // Releasing the claim re-queues what is still selected -- the
+        // neighbour's boundary piece -- and nothing of the dropped file.
+        drop(dropped);
+        let stats = handle.handle.stats();
+        assert!(
+            !stats.finished,
+            "the neighbour wants its boundary piece: {stats}"
+        );
+        assert_eq!(stats.file_progress[0], 0, "{stats}");
+
+        // Selecting the file again wants all of it.
+        handle.pin_file(0).await.unwrap();
+        let stats = handle.handle.stats();
+        assert!(!stats.finished, "{stats}");
+        assert_eq!(stats.file_progress[0], 0, "{stats}");
+        assert_eq!(
+            stats.progress_bytes,
+            total - file_pieces as u64 * PIECE,
+            "nothing was downloaded in a session with no peers: {stats}"
+        );
+    }
+
+    /// A torrent added without `piece_reclaim` -- which is what the session
+    /// restores at startup, since `SerializedTorrent::into_add_torrent`
+    /// builds default options -- cannot forget a piece, and the refusal
+    /// says why rather than reading as a generic backend error. The delete
+    /// path logs it and goes on deleting; the next restart re-checks the
+    /// torrent from disk.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_pieces_of_a_restored_torrent_is_refused_by_name() {
+        use crate::backend::TorrentHandle;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        write_payload(&dir.join("payload.bin"), 32 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&dir.join("payload.bin")).await;
+        let backend = LibrqbitBackend::new_for_tests(dir.clone())
+            .await
+            .expect("hermetic session");
+        // Straight to the session with the options a restore builds.
+        let response = backend
+            .session
+            .add_torrent(
+                librqbit::AddTorrent::from_bytes(bytes::Bytes::from(torrent_bytes)),
+                Some(librqbit::AddTorrentOptions {
+                    overwrite: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("add torrent");
+        let (librqbit::AddTorrentResponse::Added(_, inner)
+        | librqbit::AddTorrentResponse::AlreadyManaged(_, inner)) = response
+        else {
+            panic!("expected the torrent to be added");
+        };
+        inner.wait_until_initialized().await.unwrap();
+        let handle = backend
+            .get_torrent(&inner.info_hash().as_string())
+            .await
+            .unwrap();
+        assert!(handle.is_file_complete(0).await, "seeded");
+
+        let error = handle
+            .drop_file_pieces(0)
+            .await
+            .expect_err("no reclaim on this torrent");
+        let text = format!("{error:#}");
+        assert!(text.contains("restored from the session"), "{text}");
+        assert!(text.contains("piece_reclaim"), "{text}");
+        assert_eq!(
+            handle.handle.stats().file_progress,
+            vec![32 * 1024],
+            "and nothing was dropped"
+        );
     }
 
     /// `complete` follows the per-file progress: nothing on disk means no

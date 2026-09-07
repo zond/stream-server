@@ -2404,6 +2404,23 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// without the file first, so the backend does not write it again.
     /// Best effort: a failure is logged, the unpin stands, and the returned
     /// flag says whether the data is actually gone.
+    ///
+    /// The bytes are one record of the file and the backend's have-set is
+    /// the other, and deleting the first does nothing to the second: left
+    /// alone, librqbit went on reporting the deleted file complete,
+    /// advertising its pieces and answering a peer's request with a read
+    /// past the end of nothing, and a re-pin of the file found nothing to
+    /// download and declared it finished -- an "offline" episode that is an
+    /// immediate read error. So the have-set is edited first
+    /// ([`TorrentHandle::drop_file_pieces`]) and the claim it returns is
+    /// held until the unlink is done: while it stands nothing can download
+    /// a piece back into the file being deleted, and dropping it is what
+    /// re-queues the boundary piece the still-pinned neighbour shares. A
+    /// backend that cannot drop (a torrent restored at startup -- see the
+    /// librqbit handle's doc for why, and for what the next restart does
+    /// about it) is a warning and the delete goes ahead: the caller asked
+    /// for the disk back, and the stale have-set is the lesser of the two
+    /// lies.
     async fn delete_download_data(&self, engine: &Arc<Engine<B::Handle>>, file_idx: usize) -> bool {
         if engine.is_pinned() {
             let Some(path) = engine.handle.file_path(file_idx).await else {
@@ -2413,6 +2430,20 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     "backend knows no path for the file; its data stays on disk"
                 );
                 return false;
+            };
+            let dropped = match engine.handle.drop_file_pieces(file_idx).await {
+                Ok(dropped) => dropped,
+                Err(error) => {
+                    tracing::warn!(
+                        info_hash = %engine.info_hash,
+                        file_idx,
+                        error = %format!("{error:#}"),
+                        "the backend keeps the deleted file's pieces in its have-set: until the \
+                         next restart it will report the file complete, advertise its pieces, \
+                         and a re-pin will download nothing"
+                    );
+                    None
+                }
             };
             // Truncated before it is unlinked: librqbit opens every file of
             // a torrent at storage init and keeps the `File` for the
@@ -2440,12 +2471,13 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     "could not open the download's file to release its blocks"
                 ),
             }
-            return match tokio::fs::remove_file(&path).await {
+            let deleted = match tokio::fs::remove_file(&path).await {
                 Ok(()) => {
                     tracing::info!(
                         info_hash = %engine.info_hash,
                         file_idx,
                         path = %path.display(),
+                        pieces_dropped = dropped.as_ref().map(|d| d.pieces().len()),
                         "download_file_deleted"
                     );
                     true
@@ -2462,6 +2494,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     false
                 }
             };
+            // Released only now that the bytes are gone -- see the doc above
+            // for what the claim holds off while they go.
+            drop(dropped);
+            return deleted;
         }
         self.remove_engine_if_current(engine).await;
         match self
@@ -3772,6 +3808,9 @@ mod tests {
         seeded: AtomicBool,
         pin_file: AtomicUsize,
         unpin_file: AtomicUsize,
+        /// Files whose pieces `drop_file_pieces` was asked to forget, in
+        /// order -- the delete path must ask before it removes a byte.
+        dropped_file_pieces: Mutex<Vec<usize>>,
         /// The fake handle's own pin set (what the real backend keeps in its
         /// `PinnedFiles` map), reported through `stats()`.
         pinned: Mutex<std::collections::BTreeSet<usize>>,
@@ -4147,6 +4186,18 @@ mod tests {
             self.counters.unpin_file.fetch_add(1, Ordering::SeqCst);
             self.counters.pinned.lock().unwrap().remove(&file_idx);
             Ok(())
+        }
+
+        async fn drop_file_pieces(
+            &self,
+            file_idx: usize,
+        ) -> Result<Option<crate::backend::DroppedFilePieces>> {
+            self.counters
+                .dropped_file_pieces
+                .lock()
+                .unwrap()
+                .push(file_idx);
+            Ok(Some(crate::backend::DroppedFilePieces::new(vec![], ())))
         }
 
         fn output_folder(&self) -> Option<std::path::PathBuf> {
@@ -6906,6 +6957,86 @@ mod tests {
         );
     }
 
+    /// Deleting one pinned file of two, against the real backend. The bytes
+    /// going is half of it; librqbit forgetting it had them is the other
+    /// half, and the one that was missing: the deleted file kept reporting
+    /// complete, and a re-pin found nothing to download.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn per_file_delete_forgets_the_pieces_with_the_real_backend() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("show");
+        std::fs::create_dir_all(&src).unwrap();
+        // Whole pieces each, so neither file's index depends on which
+        // shares a boundary piece with which.
+        let payload = |seed: u8| -> Vec<u8> { (0..64 * 1024).map(|i| (i as u8) ^ seed).collect() };
+        std::fs::write(src.join("e1.bin"), payload(1)).unwrap();
+        std::fs::write(src.join("e2.bin"), payload(2)).unwrap();
+        let (bytes, hash) = real_torrent(&src).await;
+        let e1 = crate::backend::librqbit::torrent_file_index(&bytes, "e1.bin");
+        let e2 = crate::backend::librqbit::torrent_file_index(&bytes, "e2.bin");
+        let offline = tmp.path().join("offline");
+        let folder = offline.join(&hash);
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("e1.bin"), payload(1)).unwrap();
+        std::fs::write(folder.join("e2.bin"), payload(2)).unwrap();
+
+        let inner = LibrqbitBackend::new_for_tests(tmp.path().join("dl"))
+            .await
+            .expect("hermetic session");
+        let mut enginefs = BackendEngineFS::new_with_backend(
+            BytesForMagnet {
+                inner,
+                torrents: HashMap::from([(hash.clone(), bytes.clone())]),
+            },
+            HashMap::new(),
+            tmp.path().join("cache"),
+            tmp.path().join("dl"),
+        );
+        enginefs.set_downloads_dir(Some(offline.clone()));
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+
+        let engine = enginefs.pin_download(&hash, e1, None).await.unwrap();
+        enginefs.pin_download(&hash, e2, None).await.unwrap();
+        engine.handle.handle.wait_until_initialized().await.unwrap();
+        let stats = engine.get_statistics().await;
+        assert!(
+            stats.files[e1].complete && stats.files[e2].complete,
+            "seeded in place: {stats:?}"
+        );
+
+        let outcome = enginefs.unpin_download(&hash, e1, true).await.unwrap();
+        assert!(outcome.unpinned && outcome.deleted_files);
+        assert!(!folder.join("e1.bin").exists(), "the bytes are gone");
+        assert!(folder.join("e2.bin").is_file(), "the other pin's are not");
+        let engine = enginefs
+            .get_engine(&hash)
+            .await
+            .expect("the torrent keeps running");
+        let stats = engine.get_statistics().await;
+        assert!(
+            !stats.files[e1].complete,
+            "librqbit no longer claims the deleted file: {:?}",
+            stats.files
+        );
+        assert_eq!(stats.files[e1].downloaded, 0, "{:?}", stats.files);
+        assert!(stats.files[e2].complete, "{:?}", stats.files);
+        assert_eq!(
+            engine.handle.handle.stats().file_progress[e1],
+            0,
+            "and it says so in its own terms"
+        );
+
+        // A re-pin has something to download again, instead of reporting a
+        // finished file that reads as an error.
+        enginefs.pin_download(&hash, e1, None).await.unwrap();
+        let stats = engine.handle.handle.stats();
+        assert!(
+            !stats.finished,
+            "the re-pinned file is wanted and missing: {stats}"
+        );
+        assert_eq!(stats.progress_bytes, 64 * 1024, "{stats}");
+    }
+
     // --- pin persistence across restarts ---
 
     /// What the startup sweep must and must not take. The claims come from
@@ -7506,6 +7637,11 @@ mod tests {
             counters.reconcile_file_priorities.load(Ordering::SeqCst),
             before + 1,
             "the want-set is recomputed without the deleted file"
+        );
+        assert_eq!(
+            *counters.dropped_file_pieces.lock().unwrap(),
+            vec![0],
+            "and the backend is told to forget the file's pieces"
         );
     }
 

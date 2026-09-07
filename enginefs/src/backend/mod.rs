@@ -128,6 +128,49 @@ impl TransferTotals {
     }
 }
 
+/// Pieces a backend has agreed to forget it has, handed out by
+/// [`TorrentHandle::drop_file_pieces`] to whoever is about to delete the
+/// bytes behind them.
+///
+/// Hold it for the length of the deletion and drop it when the bytes are
+/// gone. Dropping is not tidiness: it is what tells the backend the release
+/// is over. Until then the pieces are neither had nor wanted, so a stream's
+/// lookahead cannot download one of them back into the file that is being
+/// deleted under it; afterwards a piece that is still selected (a boundary
+/// piece the neighbouring file shares) is queued for download again.
+#[must_use = "the pieces stay claimed until this is dropped: delete their bytes first"]
+pub struct DroppedFilePieces {
+    pieces: Vec<u32>,
+    /// The backend's own claim, released on drop. Erased to `Any` because
+    /// this trait cannot name librqbit's `DroppedPieces` without making
+    /// every backend depend on librqbit.
+    _claim: Box<dyn std::any::Any + Send>,
+}
+
+impl DroppedFilePieces {
+    /// `pieces` are the indices actually dropped; `claim` is whatever the
+    /// backend needs dropped at the end of the release.
+    pub fn new(pieces: Vec<u32>, claim: impl std::any::Any + Send) -> Self {
+        Self {
+            pieces,
+            _claim: Box::new(claim),
+        }
+    }
+
+    /// The pieces the backend forgot, in the order it dropped them.
+    pub fn pieces(&self) -> &[u32] {
+        &self.pieces
+    }
+}
+
+impl std::fmt::Debug for DroppedFilePieces {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("DroppedFilePieces")
+            .field(&self.pieces)
+            .finish()
+    }
+}
+
 #[async_trait::async_trait]
 pub trait TorrentHandle: Send + Sync + Clone {
     fn info_hash(&self) -> String;
@@ -227,6 +270,24 @@ pub trait TorrentHandle: Send + Sync + Clone {
     /// the caller drives (`BackendEngineFS::unpin_download` reconciles).
     async fn unpin_file(&self, _file_idx: usize) -> Result<()> {
         Ok(())
+    }
+    /// Forget that the torrent has the pieces `file_idx` lies in, because
+    /// the caller is about to delete the file's bytes and the backend's
+    /// have-set is the other record of them. Deleting the bytes alone leaves
+    /// that record standing: the backend goes on reporting the file
+    /// complete, advertising its pieces to peers and serving them a read
+    /// past the end of an empty file, and a later re-pin of the file finds
+    /// nothing to download. The file must already be out of the want-set
+    /// (`reconcile_file_priorities` without it), or the drop would only
+    /// queue the pieces again.
+    ///
+    /// Returns the claim to hold while the bytes go -- see
+    /// [`DroppedFilePieces`]. `Ok(None)` is a backend with no have-set of
+    /// its own for a deletion to disagree with. `Err` is a backend that has
+    /// one and could not drop it: the caller deletes the bytes regardless
+    /// (it was asked to) and says what stands until the next restart.
+    async fn drop_file_pieces(&self, _file_idx: usize) -> Result<Option<DroppedFilePieces>> {
+        Ok(None)
     }
     /// The file's on-disk path (the torrent's output folder joined with the
     /// file's relative name), for handing a completed download to a local
