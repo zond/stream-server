@@ -237,6 +237,11 @@ fn fixture() -> anyhow::Result<Fixture> {
 }
 
 fn fixture_with(origin: Origin) -> anyhow::Result<Fixture> {
+    // Before the first request, which is when the proxy's client is built and
+    // the trust set is read. Every proxy request in this binary follows a
+    // fixture, so this is the ordering point; the call after the first is a
+    // no-op.
+    enginefs::http_client::trust_roots_for_tests(vec![TEST_CA.pem.clone()]);
     let config_dir = tempfile::tempdir()?;
     let cache_root = tempfile::tempdir()?;
     let handle = stream_server::start(stream_server::ServerConfig {
@@ -2602,29 +2607,64 @@ fn a_custom_response_header_cannot_reframe_the_response() -> anyhow::Result<()> 
     Ok(())
 }
 
-/// A TLS origin with a certificate nothing will verify: self-signed, and a
-/// CA certificate used as an end entity at that, so rustls rejects it
-/// whatever the hostname. The PEMs beside this file are throwaways for
-/// exactly this listener, which binds loopback and serves one string.
+/// The certificate authority this test binary issues fixture certificates
+/// from, generated once and registered with `enginefs`'s trust set by
+/// [`fixture_with`].
+///
+/// The fixture used to ship a self-signed CA certificate and serve it as the
+/// end entity, which rustls refuses whatever it is trusted as -- so the only
+/// HTTPS origin these tests could build was an unverifiable one, and the
+/// tests that needed a *working* chain got one only because `/proxy` silently
+/// downgraded to accepting anything. That downgrade is gone, so the fixture
+/// issues a real chain instead.
+struct TestCa {
+    certificate: rcgen::Certificate,
+    key: rcgen::KeyPair,
+    pem: Vec<u8>,
+}
+
+static TEST_CA: std::sync::LazyLock<TestCa> = std::sync::LazyLock::new(|| {
+    let mut params =
+        rcgen::CertificateParams::new(Vec::new()).expect("no subject names on a CA to reject");
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params.distinguished_name = {
+        let mut name = rcgen::DistinguishedName::new();
+        name.push(rcgen::DnType::CommonName, "stream-server test CA");
+        name
+    };
+    let key = rcgen::KeyPair::generate().expect("a key for the test CA");
+    let certificate = params.self_signed(&key).expect("a self-signed test CA");
+    let pem = certificate.pem().into_bytes();
+    TestCa {
+        certificate,
+        key,
+        pem,
+    }
+});
+
+/// A TLS origin whose chain verifies, issued by [`TEST_CA`] for the two names
+/// a loopback listener is reached by. The PEMs live in a temporary directory
+/// for exactly this listener, which binds loopback and serves one string.
 struct TlsOrigin {
     addr: SocketAddr,
     _certificates: tempfile::TempDir,
 }
 
 impl TlsOrigin {
-    /// The default: one string under every path.
-    fn start() -> anyhow::Result<Self> {
-        Self::start_with(
-            axum::Router::new().fallback(axum::routing::get(|| async { "secret bytes" })),
-        )
-    }
-
     fn start_with(app: axum::Router) -> anyhow::Result<Self> {
         let certificates = tempfile::tempdir()?;
         let cert = certificates.path().join("cert.pem");
         let key = certificates.path().join("key.pem");
-        std::fs::write(&cert, include_str!("selfsigned-cert.pem"))?;
-        std::fs::write(&key, include_str!("selfsigned-key.pem"))?;
+
+        // Both spellings: the tests reach this listener as `localhost` and as
+        // `127.0.0.1`, and a certificate valid for one is refused for the
+        // other -- which is the whole point of checking the name.
+        let leaf_params =
+            rcgen::CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()])?;
+        let leaf_key = rcgen::KeyPair::generate()?;
+        let leaf = leaf_params.signed_by(&leaf_key, &TEST_CA.certificate, &TEST_CA.key)?;
+        std::fs::write(&cert, leaf.pem())?;
+        std::fs::write(&key, leaf_key.serialize_pem())?;
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         // axum-server registers the listener with tokio, which refuses a
@@ -2651,20 +2691,77 @@ impl TlsOrigin {
             _certificates: certificates,
         })
     }
+
+    /// An origin serving a certificate no trust set here will accept: signed
+    /// by a second, unregistered CA, so it fails on the issuer rather than on
+    /// the name or on a date that will one day pass.
+    fn start_untrusted() -> anyhow::Result<Self> {
+        let certificates = tempfile::tempdir()?;
+        let cert = certificates.path().join("cert.pem");
+        let key = certificates.path().join("key.pem");
+
+        let mut ca_params = rcgen::CertificateParams::new(Vec::new())?;
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate()?;
+        let ca = ca_params.self_signed(&ca_key)?;
+
+        let leaf_params =
+            rcgen::CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()])?;
+        let leaf_key = rcgen::KeyPair::generate()?;
+        let leaf = leaf_params.signed_by(&leaf_key, &ca, &ca_key)?;
+        std::fs::write(&cert, leaf.pem())?;
+        std::fs::write(&key, leaf_key.serialize_pem())?;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let addr = listener.local_addr()?;
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime for the TLS origin");
+            runtime.block_on(async move {
+                let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
+                    .await
+                    .expect("the fixture certificate is readable");
+                let _ = axum_server::from_tcp_rustls(listener, config)
+                    .expect("the listener is ours")
+                    .serve(
+                        axum::Router::new()
+                            .fallback(axum::routing::get(|| async { "secret bytes" }))
+                            .into_make_service(),
+                    )
+                    .await;
+            });
+        });
+        Ok(Self {
+            addr,
+            _certificates: certificates,
+        })
+    }
 }
 
-/// The downgrade, working as advertised: an endpoint whose certificate will
-/// not verify is fetched once with verification, once without, and written
-/// down so the next request pays only one handshake.
+/// A certificate that will not verify is a refusal, not a downgrade.
 ///
-/// What is written down is the whole origin -- scheme, host *and* port. A
-/// certificate is served by a TLS endpoint, not by a name: keyed by host
-/// alone, this failure would also have turned verification off for the same
-/// host's `:443`, and for `http://localhost`, which has no certificate to
-/// verify in the first place.
+/// This route was built with `danger_accept_invalid_certs(true)` from its
+/// first commit -- inherited from the closed-source `server.js` proxy it was
+/// ported from, commented "Parity with rejectUnauthorized: false", and never
+/// a response to any host that was measured. It was later narrowed to a retry
+/// that fired only on a certificate error and remembered the origin, which
+/// was an improvement and still left every promise the trust policy makes
+/// advisory: an on-path attacker can produce a certificate error as easily as
+/// a misconfigured CDN can, so the retry handed the attacker exactly what
+/// verification was there to deny -- with the stream URL's credential still
+/// attached.
+///
+/// What made it defensible was that the alternative was breaking streams that
+/// played. That alternative is gone: `enginefs::http_client_builder` now
+/// trusts the platform's own store alongside the compiled-in roots, so a
+/// device or organisation that installed a CA verifies again, and what is
+/// left failing here is a chain nothing on the device trusts either.
 #[test]
-fn an_endpoint_whose_certificate_fails_is_fetched_unverified_and_named() -> anyhow::Result<()> {
-    let tls = TlsOrigin::start()?;
+fn an_endpoint_whose_certificate_fails_is_refused() -> anyhow::Result<()> {
+    let tls = TlsOrigin::start_untrusted()?;
     let fixture = fixture()?;
     let target = format!("https://localhost:{}/film.mkv", tls.addr.port());
     let response = reqwest::blocking::Client::new()
@@ -2673,40 +2770,32 @@ fn an_endpoint_whose_certificate_fails_is_fetched_unverified_and_named() -> anyh
 
     assert_eq!(
         response.status(),
-        reqwest::StatusCode::OK,
-        "the stream plays, which is why the downgrade exists at all"
+        reqwest::StatusCode::BAD_GATEWAY,
+        "the fetch fails rather than being retried without verification"
     );
-    assert_eq!(response.text()?, "secret bytes");
-    let downgraded = stream_server::unverified_origins();
-    assert!(
-        downgraded.contains(&format!("https://localhost:{}", tls.addr.port())),
-        "the endpoint is written down with its scheme and port: {downgraded:?}"
-    );
-    assert!(
-        !downgraded.contains(&"localhost".to_string()),
-        "and not as a bare host, which would take every port with it: {downgraded:?}"
+    assert_ne!(
+        response.text()?,
+        "secret bytes",
+        "and the body the origin was holding never reaches the player"
     );
 
     drop(fixture.handle);
     Ok(())
 }
 
-/// The same failure one redirect away, which is where the host recorded
-/// used to be the wrong one entirely. reqwest attributes a connect failure
-/// to the URL the request *started* at, so the redirecting host was marked
-/// unverified for a certificate it never presented, and the endpoint whose
-/// handshake actually failed was not marked at all -- the same mistake an
-/// `https` -> `https` chain makes, where the host downgraded is the *good*
-/// one. Its redirect policy is asked before every hop, so the failing one
-/// has a name after all.
+/// The same failure one redirect away, because a chain is where this route
+/// used to get the endpoint wrong: reqwest attributes a connect failure to
+/// the URL the request *started* at, so the redirecting host was the one
+/// marked unverified for a certificate it never presented. Walking the chain
+/// here is what gave the failing hop a name; now that nothing is downgraded,
+/// what has to hold is that the failure still stops the fetch rather than
+/// being lost behind the hop that succeeded.
 ///
-/// The redirector is plain HTTP because a verifiable first hop needs a
-/// certificate authority; the hop that fails is the second either way, and
-/// it is the second that must be the one written down.
+/// The redirector is plain HTTP because a verifiable first hop would need a
+/// certificate authority; the hop that fails is the second either way.
 #[test]
-fn a_certificate_failure_behind_a_redirect_downgrades_the_endpoint_that_failed()
--> anyhow::Result<()> {
-    let tls = TlsOrigin::start()?;
+fn a_certificate_failure_behind_a_redirect_still_refuses() -> anyhow::Result<()> {
+    let tls = TlsOrigin::start_untrusted()?;
     let tls_addr = tls.addr;
     let redirector = Origin::start_with(move |_request: &Request, socket: &mut TcpStream| {
         let _ = socket.write_all(
@@ -2729,46 +2818,10 @@ fn a_certificate_failure_behind_a_redirect_downgrades_the_endpoint_that_failed()
 
     assert_eq!(
         response.status(),
-        reqwest::StatusCode::OK,
-        "the retry follows the same redirect, and the stream plays"
+        reqwest::StatusCode::BAD_GATEWAY,
+        "the second hop's certificate stops the chain"
     );
-    assert_eq!(response.text()?, "secret bytes");
-
-    let downgraded = stream_server::unverified_origins();
-    assert!(
-        downgraded.contains(&format!("https://127.0.0.1:{}", tls_addr.port())),
-        "the endpoint whose handshake failed is the one written down: {downgraded:?}"
-    );
-    assert!(
-        !downgraded.contains(&format!("http://{redirector_addr}")),
-        "and the host that only redirected us is not: {downgraded:?}"
-    );
-
-    drop(fixture.handle);
-    Ok(())
-}
-
-/// The measured reproduction of reading the error's prose instead of its
-/// type: no TLS anywhere, a refused connection, and a filename with the
-/// word "certificate" in it. It marked the host unverified for the life of
-/// the process.
-#[test]
-fn a_filename_cannot_turn_certificate_verification_off() -> anyhow::Result<()> {
-    let fixture = fixture()?;
-    let response = reqwest::blocking::Client::new()
-        .get(format!(
-            "{}/proxy/?d={}",
-            fixture.base,
-            encode("http://127.0.0.1:1/certificate-of-authenticity.mkv")
-        ))
-        .send()?;
-
-    assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
-    let downgraded = stream_server::unverified_origins();
-    assert!(
-        !downgraded.contains(&"http://127.0.0.1:1".to_string()),
-        "a connection refused is not a certificate failure: {downgraded:?}"
-    );
+    assert_ne!(response.text()?, "secret bytes");
 
     drop(fixture.handle);
     Ok(())

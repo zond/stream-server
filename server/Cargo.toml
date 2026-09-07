@@ -99,6 +99,15 @@ chrono = "0.4.42"
 sysinfo = "0.39.5"
 
 [dev-dependencies]
+# Turns on the test-root registry in the same enginefs the tests link, so the
+# proxy's TLS fixture can present a chain that verifies. Feature unification
+# keeps this to test builds -- `cargo build --release` never sees it.
+enginefs = { path = "../enginefs", features = ["test-roots"] }
+# Generates that fixture's CA and leaf at run time. The old fixture shipped a
+# self-signed CA certificate used as an end entity, which rustls refuses
+# whatever it is trusted as, so it could only ever be the unverifiable case.
+rcgen = "0.13"
+
 # Paused-clock machinery for `#[tokio::test(start_paused = true)]`, as in
 # enginefs; nothing in the shipped crate uses it.
 tokio = { version = "1.42", features = ["test-util"] }
