@@ -430,7 +430,8 @@ async fn recover_out_of_space_torrents(state: &AppState, recovery: &mut DiskFull
 /// need, gathered once so the two read `AppState` the same way and can
 /// never disagree about what the cache *is*.
 struct CacheRoots {
-    download_dirs: Vec<std::path::PathBuf>,
+    /// One entry per volume the walked roots live on. Usually one.
+    budgets: Vec<CacheBudget>,
     protected_paths: HashSet<std::path::PathBuf>,
     /// Directories the cleaner was handed and may therefore never delete,
     /// however empty eviction leaves them -- see [`remove_empty_parents`].
@@ -438,7 +439,71 @@ struct CacheRoots {
     /// a `downloadsDir` inside a cache root is no longer a walked root, and
     /// the walked root is no longer a sufficient stop condition for it.
     keep_dirs: HashSet<std::path::PathBuf>,
+}
+
+/// The walked roots on one volume, and the cap they share.
+///
+/// A cap is a statement about a *volume*: [`CacheLimit::effective`] reads that
+/// volume's free space and holds [`CACHE_FREE_SPACE_FLOOR`] of it back. So the
+/// roots on one volume can be weighed against one number and the roots on
+/// another cannot. What this replaced summed every root's occupancy into a
+/// single total and weighed it against the *tightest* free-space figure of all
+/// of them -- correct while there is one volume, which is the phone this was
+/// written for, and wrong on a desktop with `downloadsDir` on an external
+/// drive. There the min is the external drive's, the sum carries the system
+/// disk's cache, and every pass evicts a film nobody is short of space for to
+/// answer a shortage on a drive it can reclaim nothing from: what fills a
+/// download drive is pinned, and protection keeps it.
+///
+/// `settings.cacheSize` becomes a per-volume allowance by the same argument.
+/// It was never defined across volumes -- there has only ever been one budget
+/// -- and of the two readings available, this is the one that cannot have a
+/// full downloads volume evict a healthy cache root to nothing.
+struct CacheBudget {
+    roots: Vec<std::path::PathBuf>,
     limit: CacheLimit,
+}
+
+/// Group `roots` by the volume they are on, and give each group a cap of its
+/// own: `configured` (the operator's `cacheSize`, per volume) against the
+/// tightest free-space reading among that group's roots -- which is a real
+/// minimum now, since roots that share a volume share its free space and only
+/// differ by which of them could be probed at all.
+///
+/// Roots whose volume cannot be identified -- one that does not exist yet, a
+/// filesystem that will not answer -- share a single group. That is what the
+/// cleaner did with every root before, so it is the conservative answer for
+/// the paths where the question has no answer, rather than a new behaviour.
+///
+/// `volume_of` and `available` are parameters so a test can describe two
+/// volumes without needing two.
+fn budgets_by_volume(
+    roots: &[std::path::PathBuf],
+    configured: u64,
+    volume_of: impl Fn(&std::path::Path) -> Option<u64>,
+    available: impl Fn(&std::path::Path) -> Option<u64>,
+) -> Vec<CacheBudget> {
+    let mut by_volume: std::collections::BTreeMap<Option<u64>, Vec<std::path::PathBuf>> =
+        std::collections::BTreeMap::new();
+    for root in roots {
+        by_volume
+            .entry(volume_of(root))
+            .or_default()
+            .push(root.clone());
+    }
+    by_volume
+        .into_values()
+        .map(|roots| {
+            let available = roots.iter().filter_map(|root| available(root)).min();
+            CacheBudget {
+                roots,
+                limit: CacheLimit {
+                    configured,
+                    available,
+                },
+            }
+        })
+        .collect()
 }
 
 async fn cache_roots(state: &AppState) -> CacheRoots {
@@ -491,24 +556,20 @@ async fn cache_roots(state: &AppState) -> CacheRoots {
         state.engine.protected_paths().await.into_iter().collect();
     protected_paths.extend(state.download_engine.protected_paths().await);
 
-    // The volume's free space, read per walked root and taken at its
-    // tightest. The two engines normally share one directory; when they do
-    // not and the volumes differ, the cache has to fit inside the smaller.
-    // Roots that do not exist yet cannot be probed and are skipped rather
-    // than counted as full.
-    let available = download_dirs
-        .iter()
-        .filter_map(|download_dir| available_space(download_dir))
-        .min();
+    // One budget per volume. The two engines normally share one directory and
+    // the downloads dir is under it, so this is normally a single budget and
+    // the whole of what follows is what it always was.
+    let budgets = budgets_by_volume(
+        &download_dirs,
+        limit,
+        |path| enginefs::volume_id(path).ok(),
+        available_space,
+    );
 
     CacheRoots {
-        download_dirs,
+        budgets,
         protected_paths,
         keep_dirs,
-        limit: CacheLimit {
-            configured: limit,
-            available,
-        },
     }
 }
 
@@ -519,24 +580,35 @@ async fn cache_roots(state: &AppState) -> CacheRoots {
 /// so it can never diverge from the scheduled sweep's protections.
 pub(crate) async fn clean_cache(state: &AppState) -> anyhow::Result<EvictionReport> {
     let roots = cache_roots(state).await;
-    if roots
-        .download_dirs
-        .iter()
-        .all(|download_dir| !download_dir.exists())
-    {
-        return Ok(EvictionReport {
-            limit: roots.limit.effective(0),
-            ..EvictionReport::default()
-        });
+    let mut reports = Vec::with_capacity(roots.budgets.len());
+    for budget in &roots.budgets {
+        // A volume whose roots do not exist yet has nothing to walk, but its
+        // cap is still part of what this run enforced.
+        if budget
+            .roots
+            .iter()
+            .all(|download_dir| !download_dir.exists())
+        {
+            reports.push(EvictionReport {
+                limit: budget.limit.effective(0),
+                ..EvictionReport::default()
+            });
+            continue;
+        }
+        reports.push(
+            evict(
+                &budget.roots,
+                &roots.protected_paths,
+                &roots.keep_dirs,
+                budget.limit,
+            )
+            .await?,
+        );
     }
-
-    evict(
-        &roots.download_dirs,
-        &roots.protected_paths,
-        &roots.keep_dirs,
-        roots.limit,
-    )
-    .await
+    Ok(reports
+        .into_iter()
+        .reduce(EvictionReport::combined_with)
+        .unwrap_or_default())
 }
 
 /// What the cache currently occupies against its configured limit
@@ -547,7 +619,12 @@ pub(crate) async fn clean_cache(state: &AppState) -> anyhow::Result<EvictionRepo
 /// (`ServerHandle::cache_usage` and `GET /cache.json`).
 pub(crate) async fn usage(state: &AppState) -> CacheUsage {
     let roots = cache_roots(state).await;
-    scan_usage(&roots.download_dirs, &roots.protected_paths, roots.limit)
+    roots
+        .budgets
+        .iter()
+        .map(|budget| scan_usage(&budget.roots, &roots.protected_paths, budget.limit))
+        .reduce(CacheUsage::combined_with)
+        .unwrap_or_default()
 }
 
 /// What a cache root costs on disk, as the cleaner must count it.
@@ -603,6 +680,25 @@ pub struct CacheUsage {
     pub protected_bytes: u64,
     /// How many files that is.
     pub protected_files: usize,
+}
+
+impl CacheUsage {
+    /// Fold another volume's scan into this one, for the single answer
+    /// `GET /cache.json` gives. See [`EvictionReport::combined_with`], which
+    /// folds the same way and for the same reasons -- `limit_bytes`
+    /// especially: an uncapped volume leaves the run as a whole uncapped,
+    /// because its occupancy is in `total_bytes` and nothing bounds it.
+    fn combined_with(self, other: Self) -> Self {
+        Self {
+            total_bytes: self.total_bytes.saturating_add(other.total_bytes),
+            limit_bytes: self
+                .limit_bytes
+                .zip(other.limit_bytes)
+                .map(|(a, b)| a.saturating_add(b)),
+            protected_bytes: self.protected_bytes.saturating_add(other.protected_bytes),
+            protected_files: self.protected_files + other.protected_files,
+        }
+    }
 }
 
 /// The read-only half of [`evict`]'s walk: every payload file's occupancy
@@ -702,11 +798,42 @@ pub struct EvictionReport {
 }
 
 impl EvictionReport {
+    /// Fold another volume's run into this one, so a caller of
+    /// `POST /cache/clean` gets one report for the pass.
+    ///
+    /// Sizes add. The limits add only while every volume has one: an uncapped
+    /// volume's occupancy is in `total` with nothing bounding it, so an
+    /// aggregate cap would be a number the run never enforced, and
+    /// [`Self::shortfall_message`] would warn about a shortfall no volume has.
+    /// The shortfall a volume really has is warned about by the run that found
+    /// it, where the numbers are still one volume's own.
+    fn combined_with(self, other: Self) -> Self {
+        Self {
+            total: self.total.saturating_add(other.total),
+            protected: self.protected.saturating_add(other.protected),
+            protected_files: self.protected_files + other.protected_files,
+            freed: self.freed.saturating_add(other.freed),
+            deleted: self.deleted + other.deleted,
+            limit: self
+                .limit
+                .zip(other.limit)
+                .map(|(a, b)| a.saturating_add(b)),
+        }
+    }
+
     /// Whether this run reclaimed anything -- the condition
     /// [`recover_out_of_space_torrents`] restarts a stopped torrent on. A
     /// clean that freed nothing has not changed the device's mind, so
     /// restarting into it would only reproduce the error the torrent already
     /// has.
+    ///
+    /// Across volumes this is "some volume gained room", not "the volume the
+    /// stopped torrent writes to did": a pass is one report, and which volume
+    /// a stopped torrent's output folder is on is not something this layer is
+    /// told. A restart onto a volume that is still full reproduces the ENOSPC,
+    /// the torrent stops again, and `recover_out_of_space_torrents` reports it
+    /// once and leaves it -- the same net that already catches a restart that
+    /// was simply too early.
     pub fn made_room(&self) -> bool {
         self.freed > 0
     }
@@ -1032,8 +1159,8 @@ async fn remove_empty_parents(mut dir: &std::path::Path, keep: &HashSet<std::pat
 mod tests {
     use super::{
         CACHE_FREE_SPACE_FLOOR, CacheLimit, CleanSchedule, DiskFullRecovery, EvictionReport,
-        available_space, evict, is_path_protected, is_session_artifact, occupied_bytes, outermost,
-        remove_empty_parents, scan_usage,
+        available_space, budgets_by_volume, evict, is_path_protected, is_session_artifact,
+        occupied_bytes, outermost, remove_empty_parents, scan_usage,
     };
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
@@ -1339,6 +1466,109 @@ mod tests {
         );
         assert!(offline.is_dir(), "but the downloads dir itself stays");
         assert!(root.is_dir());
+    }
+
+    /// Roots on two volumes are two budgets, never one.
+    ///
+    /// The occupancy of every walked root used to be summed into one number
+    /// and weighed against a single free-space figure -- the *tightest* of the
+    /// roots, since one volume running out is enough to stop a write. That is
+    /// right while every root is on one volume, which is the phone this was
+    /// written for and is not the desktop with `downloadsDir` on an external
+    /// drive. There the min is the external drive's, the sum includes the
+    /// system disk's cache, and the cleaner evicts a healthy volume's film to
+    /// answer a shortage on a volume it never touches -- and cannot fix, since
+    /// what fills the download drive is pinned and protected.
+    #[tokio::test]
+    async fn each_volume_gets_a_budget_of_its_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        let offline = tmp.path().join("offline");
+        let film = cache.join(HASH).join("film.mkv");
+        write_aged(&film, &[0u8; 8192], Duration::from_secs(60));
+        let stale = offline.join(OTHER_HASH).join("leftovers.bin");
+        write_aged(&stale, &[0u8; 8192], Duration::from_secs(60));
+        let stale_occupancy = occupancy(&stale);
+
+        // Two volumes: the cache root's has a terabyte, the downloads
+        // drive is right up against the floor.
+        let on_the_download_drive = |path: &Path| path.starts_with(&offline);
+        let budgets = budgets_by_volume(
+            &[cache.clone(), offline.clone()],
+            // No `cacheSize` set, so the disk is the only thing capping
+            // anything -- the case the tightest-of-all minimum made worst.
+            0,
+            |path| Some(if on_the_download_drive(path) { 2 } else { 1 }),
+            |path| {
+                Some(if on_the_download_drive(path) {
+                    0
+                } else {
+                    1 << 40
+                })
+            },
+        );
+        assert_eq!(budgets.len(), 2, "one budget per volume");
+
+        let mut reports = Vec::new();
+        for budget in &budgets {
+            reports.push(
+                evict_roots(&budget.roots, &HashSet::new(), budget.limit)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let per_volume: Vec<u64> = reports
+            .iter()
+            .map(|report| report.limit.expect("every volume is capped here"))
+            .collect();
+        let report = reports
+            .into_iter()
+            .reduce(EvictionReport::combined_with)
+            .unwrap();
+        assert!(
+            film.is_file(),
+            "the roomy volume's cache is not what a full download drive costs"
+        );
+        assert!(!stale.exists(), "the full volume evicts its own");
+        assert_eq!(report.freed, stale_occupancy, "{report:?}");
+        assert_eq!(
+            report.limit,
+            Some(per_volume.iter().sum()),
+            "and the one report a client gets adds the volumes' caps up, {report:?}"
+        );
+    }
+
+    /// The shape every device this actually ships on has, and the guarantee
+    /// that grouping changed nothing for it: all the roots on one volume are
+    /// one budget with one cap, as they were when there was only ever one.
+    /// Roots whose volume cannot be identified at all -- one that does not
+    /// exist yet, a filesystem that will not answer -- also share a budget,
+    /// which is the same conservative answer the cleaner gave every root
+    /// before it asked the question.
+    #[test]
+    fn roots_that_cannot_be_told_apart_share_one_budget() {
+        let roots = [
+            PathBuf::from("/c/rqbit-downloads"),
+            PathBuf::from("/c/offline"),
+        ];
+        let tightest = |path: &Path| Some(if path.ends_with("offline") { 100 } else { 900 });
+
+        for volume_of in [
+            // One volume, identified.
+            (|_: &Path| Some(1)) as fn(&Path) -> Option<u64>,
+            // No volume identifiable for either.
+            |_: &Path| None,
+        ] {
+            let budgets = budgets_by_volume(&roots, 42, volume_of, tightest);
+            assert_eq!(budgets.len(), 1);
+            assert_eq!(budgets[0].roots, roots);
+            assert_eq!(budgets[0].limit.configured, 42);
+            assert_eq!(
+                budgets[0].limit.available,
+                Some(100),
+                "the tightest reading among roots that share a budget"
+            );
+        }
     }
 
     /// A downloads dir inside a cache root (or a cache root inside the

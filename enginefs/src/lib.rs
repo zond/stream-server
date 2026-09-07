@@ -257,14 +257,19 @@ type VolumeProbe = Arc<dyn Fn(&std::path::Path) -> std::io::Result<u64> + Send +
 /// An identity of the volume holding `path`, equal for two paths on the
 /// same volume: the device id on Unix; the path prefix (drive letter or
 /// UNC share) on Windows, where std exposes no stable volume serial.
+///
+/// Public because the server's cache cleaner asks the same question of its
+/// walk roots -- a free-space cap is a statement about a volume, so roots on
+/// two volumes cannot share one budget -- and two answers to "are these the
+/// same volume" that disagree would be worse than either.
 #[cfg(unix)]
-fn volume_id(path: &std::path::Path) -> std::io::Result<u64> {
+pub fn volume_id(path: &std::path::Path) -> std::io::Result<u64> {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata(path).map(|metadata| metadata.dev())
 }
 
 #[cfg(windows)]
-fn volume_id(path: &std::path::Path) -> std::io::Result<u64> {
+pub fn volume_id(path: &std::path::Path) -> std::io::Result<u64> {
     use std::hash::{Hash, Hasher};
     match path.components().next() {
         Some(std::path::Component::Prefix(prefix)) => {
@@ -277,7 +282,7 @@ fn volume_id(path: &std::path::Path) -> std::io::Result<u64> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn volume_id(_path: &std::path::Path) -> std::io::Result<u64> {
+pub fn volume_id(_path: &std::path::Path) -> std::io::Result<u64> {
     Err(std::io::Error::other("volume identity unavailable"))
 }
 
