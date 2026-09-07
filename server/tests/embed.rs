@@ -2058,6 +2058,17 @@ fn lan_media_server(
     Ok((handle, base, info_hash, idx, payload))
 }
 
+/// Permit and start the LAN media listener the way a cast session does: the
+/// setting first, because the veto is the default, then the start. Nothing
+/// binds the listener at startup, however it is configured, so every test
+/// that wants one up asks for it here.
+fn start_lan_media(handle: &ServerHandle) -> anyhow::Result<std::net::SocketAddr> {
+    handle.update_settings(serde_json::json!({ "lanMediaEnabled": true }))?;
+    handle
+        .set_lan_media(true)?
+        .ok_or_else(|| anyhow::anyhow!("set_lan_media(true) answered with no address"))
+}
+
 /// `stats.json` reports the piece the open reader is waiting on, in bytes.
 ///
 /// Whole verified pieces are all the have-bitfield can show, and a piece on
@@ -2157,7 +2168,7 @@ fn lan_media_listener_serves_media_but_no_control_route() -> anyhow::Result<()> 
         Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
     )?;
 
-    let lan_addr = handle.lan_media_addr().expect("LAN listener bound");
+    let lan_addr = start_lan_media(&handle)?;
     assert!(handle.lan_media_running());
     assert_ne!(
         lan_addr,
@@ -2425,12 +2436,38 @@ fn set_lan_media_toggles_the_listener_and_the_setting_can_forbid_it() -> anyhow:
         })
     };
 
-    let started = handle.lan_media_addr().expect("bound at startup");
+    // Nothing is bound at startup, however the address is configured: the
+    // listener is a cast session's, and there is none yet.
     let peer = std::net::IpAddr::from([127, 0, 0, 1]);
+    assert!(!handle.lan_media_running());
+    assert_eq!(handle.lan_media_addr(), None);
+    assert_eq!(handle.lan_media_base_url(peer), None);
+
+    // Starting is refused while the setting forbids it (the default).
+    assert!(!handle.settings()?.lan_media_enabled);
+    let error = handle.set_lan_media(true).unwrap_err().to_string();
+    assert_eq!(
+        error,
+        "the lanMediaEnabled setting forbids the LAN media listener; \
+         set it through POST /settings (or update_settings) first",
+        "the whole sentence, so a lost line continuation cannot leave a gap in it"
+    );
+    assert!(!handle.lan_media_running());
+
+    // Permitted, it starts and advertises the address it bound.
+    handle.update_settings(serde_json::json!({ "lanMediaEnabled": true }))?;
+    let started = handle.set_lan_media(true)?.expect("bound");
+    assert!(handle.lan_media_running());
+    assert_eq!(handle.lan_media_addr(), Some(started));
     assert_eq!(
         handle.lan_media_base_url(peer).map(|url| url.to_string()),
         Some(format!("http://{started}/")),
         "a listener bound to one address advertises that address"
+    );
+    assert_eq!(
+        handle.set_lan_media(true)?,
+        Some(started),
+        "starting an already-running listener is a no-op"
     );
 
     // Stop: the socket is gone when the call returns, and so is the URL.
@@ -2448,28 +2485,11 @@ fn set_lan_media_toggles_the_listener_and_the_setting_can_forbid_it() -> anyhow:
         "the stopped LAN listener still answered: {refused:?}"
     );
 
-    // Starting again is refused while the setting forbids it (the default).
-    assert!(!handle.settings()?.lan_media_enabled);
-    let error = handle.set_lan_media(true).unwrap_err().to_string();
-    assert_eq!(
-        error,
-        "the lanMediaEnabled setting forbids the LAN media listener; \
-         set it through POST /settings (or update_settings) first",
-        "the whole sentence, so a lost line continuation cannot leave a gap in it"
-    );
-    assert!(!handle.lan_media_running());
-
-    // Permitted, it comes back -- on a fresh OS-assigned port -- and serves
-    // media again.
-    handle.update_settings(serde_json::json!({ "lanMediaEnabled": true }))?;
+    // Still permitted, it comes back -- on a fresh OS-assigned port -- and
+    // serves media again.
     let restarted = handle.set_lan_media(true)?.expect("bound");
     assert!(handle.lan_media_running());
     assert_eq!(handle.lan_media_addr(), Some(restarted));
-    assert_eq!(
-        handle.set_lan_media(true)?,
-        Some(restarted),
-        "starting an already-running listener is a no-op"
-    );
     let response = reqwest::blocking::Client::new()
         .get(format!("http://{restarted}/{info_hash}/{idx}"))
         .send()?
@@ -2504,6 +2524,74 @@ fn set_lan_media_toggles_the_listener_and_the_setting_can_forbid_it() -> anyhow:
     Ok(())
 }
 
+/// A configured LAN media address is a place, not a running listener: the
+/// server comes up with nothing bound there, so the persisted veto is never
+/// bypassed by the boot, and a port already in use is the cast caller's
+/// error rather than the server's.
+///
+/// The address is pre-bound by this test, which is what the fixed port an
+/// embedder might configure runs into when a previous instance -- or any
+/// other program -- still holds it. Once the port is free the same handle
+/// starts the listener without a restart.
+#[test]
+fn a_configured_lan_media_address_binds_nothing_until_a_cast_asks() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    let taken = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let contested = taken.local_addr()?;
+    let (handle, base, info_hash, idx, payload) = lan_media_server(
+        config_dir.path(),
+        cache_dir.path(),
+        src.path(),
+        Some(contested),
+    )?;
+
+    // The server is up and serving, on loopback, with the LAN address held
+    // by somebody else the whole time.
+    assert!(!handle.lan_media_running());
+    assert_eq!(handle.lan_media_addr(), None);
+    let heartbeat: serde_json::Value = bearer_client(&handle)?
+        .get(format!("{base}/heartbeat"))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    assert_eq!(heartbeat["success"], true);
+
+    // Asking for the listener while the port is taken fails the ask, and
+    // only the ask.
+    let error = start_lan_media(&handle).unwrap_err().to_string();
+    assert!(
+        error.contains(&format!(
+            "failed to bind the LAN media listener on {contested}"
+        )),
+        "{error}"
+    );
+    assert!(!handle.lan_media_running());
+    let heartbeat: serde_json::Value = bearer_client(&handle)?
+        .get(format!("{base}/heartbeat"))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    assert_eq!(heartbeat["success"], true);
+
+    // Port released: the same server binds it on the next ask.
+    drop(taken);
+    let bound = handle
+        .set_lan_media(true)?
+        .expect("bound once the port is free");
+    assert_eq!(bound, contested);
+    let response = reqwest::blocking::Client::new()
+        .get(format!("http://{bound}/{info_hash}/{idx}"))
+        .send()?
+        .error_for_status()?;
+    assert_eq!(response.bytes()?.as_ref(), payload.as_slice());
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
 /// The LAN listener counts what has reached it, per cast session.
 ///
 /// This is the only way to tell a receiver that never fetched the stream
@@ -2529,7 +2617,7 @@ fn the_lan_listener_counts_the_requests_that_reach_it() -> anyhow::Result<()> {
         src.path(),
         Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
     )?;
-    let lan_addr = handle.lan_media_addr().expect("LAN bound");
+    let lan_addr = start_lan_media(&handle)?;
     let lan = format!("http://{lan_addr}");
     let anonymous = reqwest::blocking::Client::new();
 
@@ -2580,9 +2668,6 @@ fn the_lan_listener_counts_the_requests_that_reach_it() -> anyhow::Result<()> {
     // Tapping a second receiver starts a cast on a listener that is already
     // bound, and the question that cast asks is about itself: the first
     // receiver's requests must not answer for it.
-    // A configured address is bound at startup whatever the setting says;
-    // starting one by hand needs the operator's permission first.
-    handle.update_settings(serde_json::json!({ "lanMediaEnabled": true }))?;
     assert_eq!(
         handle.set_lan_media(true)?,
         Some(lan_addr),

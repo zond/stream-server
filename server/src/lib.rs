@@ -123,9 +123,11 @@ pub struct ServerConfig {
     /// `None` -- the default for both [`Self::embedded`] and
     /// [`Self::binary_default`] -- means there is no LAN listener at all and
     /// [`ServerHandle::set_lan_media`] has nothing to start. `Some(addr)`
-    /// (typically `0.0.0.0:0`, letting the OS pick the port) binds it at
-    /// startup; from then on [`ServerHandle::set_lan_media`] stops and starts
-    /// it per cast session, subject to the `lanMediaEnabled` setting.
+    /// (typically `0.0.0.0:0`, letting the OS pick the port) is where
+    /// [`ServerHandle::set_lan_media`] binds it per cast session, subject to
+    /// the `lanMediaEnabled` setting. Nothing is bound at startup: the
+    /// address says where a cast may put the listener, not that one is up,
+    /// so a port in use fails the cast that asked for it, not the server.
     pub lan_media_addr: Option<SocketAddr>,
     /// Whether DHT bootstrap *names* are resolved to address literals before
     /// librqbit sees them (system resolver, then DNS over HTTPS, then a
@@ -996,15 +998,16 @@ pub async fn run(
 
     let app = build_router(state.clone());
 
-    // Bind the LAN media listener before reporting ready, so a configured
-    // address is either serving or has failed the start -- never "maybe" --
-    // by the time `start` hands back a `ServerHandle`. A configured address
-    // that cannot be bound is as fatal as the loopback one: the embedder
-    // asked for it explicitly.
+    // The LAN media listener is deliberately not started here. It exists for
+    // the length of a cast session (see `lan_media`), and
+    // `ServerHandle::set_lan_media` is the one path that binds it -- which is
+    // also the only path that consults the `lanMediaEnabled` veto. Binding a
+    // configured address at boot put the LAN surface up before any cast had
+    // asked, with the persisted veto loaded a few lines above and ignored,
+    // and made a port already in use fatal to the loopback server the
+    // embedder actually needed. A bind failure is now the cast caller's
+    // error and nobody else's; the handle below is for the stop at shutdown.
     let lan_media = state.lan_media.clone();
-    if lan_media.configured_addr().is_some() {
-        lan_media.start(&state).await?;
-    }
 
     tracing::info!("listening on {}", bound_http_addr);
     if cfg.print_startup {

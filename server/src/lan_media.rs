@@ -17,8 +17,10 @@
 //!
 //! It is off unless an embedder configures [`ServerConfig::lan_media_addr`],
 //! and [`ServerHandle::set_lan_media`] starts and stops it at runtime so it
-//! exists only for as long as a cast session does. The `lanMediaEnabled`
-//! setting is the operator's veto over both.
+//! exists only for as long as a cast session does -- nothing binds it at
+//! startup, so a configured address is a place, not a running listener. The
+//! `lanMediaEnabled` setting is the operator's veto, and since every start
+//! goes through `set_lan_media`, every start is subject to it.
 //!
 //! [`ServerConfig::embedded`]: crate::ServerConfig::embedded
 //! [`ServerConfig::lan_media_addr`]: crate::ServerConfig::lan_media_addr
@@ -31,10 +33,10 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use url::Url;
 
-/// The LAN media listener's control block, held by [`AppState`] so both
-/// [`crate::run`] (which starts it at boot when an address is configured) and
-/// [`crate::ServerHandle`] (which toggles it per cast session) reach the same
-/// one.
+/// The LAN media listener's control block, held by [`AppState`] so
+/// [`crate::ServerHandle`] (which starts and stops it per cast session),
+/// the settings update (which stops it when the veto is revoked) and
+/// [`crate::run`] (which stops it at shutdown) all reach the same one.
 pub struct LanMedia {
     /// Where a listener binds when it is started, from
     /// [`crate::ServerConfig::lan_media_addr`]. `None` means the embedder
