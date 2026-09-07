@@ -696,8 +696,75 @@ fn origin_forbids_caching(res_headers: &HeaderMap) -> bool {
     })
 }
 
-/// The entity a response describes and the span of it the body carries --
-/// `(body first byte, body last byte, entity length, content type)` -- when
+/// How a response identifies **which** entity it is a part of: its `ETag`,
+/// or its `Last-Modified` when it offers no usable one.
+///
+/// Length and content type say what an entity is like; only this says which
+/// it is. A URL whose content is replaced by content of the same size and
+/// type is invisible to the other two, and it is the case that turns a
+/// narrowed range into a body spliced from two generations -- so the store
+/// files an entity under this as well, and a cached head and a fresh `206`
+/// are joined only when both name it.
+///
+/// The header is part of the value, not just its text: a date and a tag are
+/// different claims however they happen to be spelled, and comparing them
+/// across is comparing nothing. So one response yields one validator, chosen
+/// the same way every time, and two are equal only when they were chosen
+/// from the same header.
+///
+/// A **weak** `ETag` (`W/"..."`) is not one. It promises the two
+/// representations are semantically equivalent, not that they are the same
+/// bytes, and bytes are the whole of what is being joined here -- so it is
+/// passed over for the `Last-Modified` beside it, and a response offering
+/// only a weak tag offers nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EntityValidator {
+    /// `etag` or `last-modified` -- the header it was read from.
+    header: HeaderName,
+    /// Its value, exactly as the origin wrote it, which is what goes back
+    /// out as `If-Range`.
+    value: String,
+}
+
+impl EntityValidator {
+    /// The one a response offers, or `None` when it offers none.
+    fn of(res_headers: &HeaderMap) -> Option<Self> {
+        let read = |name: HeaderName| {
+            res_headers
+                .get(&name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| Self {
+                    header: name,
+                    value: value.to_string(),
+                })
+        };
+        read(header::ETAG)
+            .filter(|etag| !etag.value.starts_with("W/"))
+            .or_else(|| read(header::LAST_MODIFIED))
+    }
+
+    /// How the store files it and how two are compared -- the header's name
+    /// and the value, so a date can never be read as a tag.
+    fn filed(&self) -> String {
+        format!("{}:{}", self.header.as_str(), self.value)
+    }
+
+    /// The other direction, for the one caller that has a filed validator
+    /// and no response to read: a full cache hit, labelling the bytes it is
+    /// about to serve. `None` for anything this did not write.
+    fn from_filed(filed: &str) -> Option<Self> {
+        let (name, value) = filed.split_once(':')?;
+        let header = HeaderName::from_bytes(name.as_bytes()).ok()?;
+        (header == header::ETAG || header == header::LAST_MODIFIED).then(|| Self {
+            header,
+            value: value.to_string(),
+        })
+    }
+}
+
+/// The entity a response describes and the offset its body starts at, when
 /// this is a response [`crate::proxy_cache`] may keep, and `None` for every
 /// response it may not.
 ///
@@ -717,33 +784,31 @@ fn origin_forbids_caching(res_headers: &HeaderMap) -> bool {
 ///   none the moment the cache misses;
 /// * **an entity whose length the origin will not state.** There is nothing
 ///   to file the chunks under and no `Content-Range` a hit could write;
+/// * **an entity the origin will not identify.** No `ETag` and no
+///   `Last-Modified` (see [`EntityValidator`]) and there is nothing that
+///   could ever tell a second generation of this resource from the one being
+///   stored -- not on the way in, where chunks of both would land in one
+///   directory, and not on the way out, where a cached head would be joined
+///   to a stranger's tail. Neither mistake is one the player, this route or
+///   the store could find out about afterwards, so the response is not kept;
+/// * **an entity whose length, type and validator will not make a directory
+///   name.** See [`crate::proxy_cache::can_be_filed`];
 /// * **`Cache-Control`.** See [`origin_forbids_caching`].
 fn cacheable_entity(
     status: StatusCode,
     res_headers: &HeaderMap,
     is_playlist: bool,
     encoded_body: bool,
-) -> Option<(u64, u64, u64, String)> {
+) -> Option<CacheableEntity> {
     if is_playlist || encoded_body || origin_forbids_caching(res_headers) {
         return None;
     }
-    // The type goes into the entity's directory name, and a directory name
-    // is 255 bytes on every filesystem this runs on. An origin is free to
-    // send a longer one; what it is not free to do is make every chunk write
-    // fail its `mkdir` and say so in the log.
-    let content_type = res_headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-    if content_type.len() > MAX_CACHED_CONTENT_TYPE {
-        return None;
-    }
-    let content_type = content_type.to_string();
-    let (first, last, total) = match status {
+    let (first, total) = match status {
         StatusCode::PARTIAL_CONTENT => res_headers
             .get(header::CONTENT_RANGE)
             .and_then(|value| value.to_str().ok())
-            .and_then(parse_content_range)?,
+            .and_then(parse_content_range)
+            .map(|(first, _, total)| (first, total))?,
         StatusCode::OK => {
             let answers_ranges = res_headers
                 .get(header::ACCEPT_RANGES)
@@ -756,31 +821,62 @@ fn cacheable_entity(
                 .get(header::CONTENT_LENGTH)
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.trim().parse().ok())?;
-            (0, total.checked_sub(1)?, total)
+            // An entity of no bytes has no chunk to keep and no last byte to
+            // state.
+            if total == 0 {
+                return None;
+            }
+            (0, total)
         }
         _ => return None,
     };
-    Some((first, last, total, content_type))
+    let content_type = res_headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let validator = EntityValidator::of(res_headers)?;
+    crate::proxy_cache::can_be_filed(total, &content_type, &validator.filed()).then_some(
+        CacheableEntity {
+            first,
+            total,
+            content_type,
+            validator,
+        },
+    )
 }
 
-/// How long a content type may be and still be stored. Sixty-four bytes is
-/// past every type anything plays -- `application/vnd.apple.mpegurl` is
-/// twenty-nine -- and short enough that percent-encoding it can never grow a
-/// directory name past what a filesystem takes.
-const MAX_CACHED_CONTENT_TYPE: usize = 64;
+/// What [`cacheable_entity`] found: the entity, and where in it this body
+/// begins.
+struct CacheableEntity {
+    /// The absolute offset of the body's first byte -- zero for a `200`, the
+    /// `Content-Range`'s first byte for a `206`.
+    first: u64,
+    total: u64,
+    content_type: String,
+    validator: EntityValidator,
+}
 
-/// The response a cache hit is: the same framing the relay would have
-/// written, over bytes that came off disk instead of a socket.
+/// The response a cache hit is: framing written from what the store holds,
+/// over bytes that came off disk instead of a socket.
 ///
-/// `Accept-Ranges: bytes` is not invented here. An entity only exists in the
-/// store because the origin proved it answers ranges -- a `206`, or a `200`
-/// that said so (see [`cacheable_entity`]) -- so this is the origin's own
-/// claim, remembered.
+/// Every field in it describes the entity rather than the fetch that is not
+/// happening, and each is the origin's own claim remembered rather than one
+/// invented here:
 ///
-/// What a hit does *not* carry, because the store does not keep it:
-/// `ETag`, `Last-Modified` and `Server`. A player that had ranged against a
-/// tag we could not produce again would be acting on the wrong evidence, and
-/// there is no revalidation here for a validator to be worth anything to.
+/// * `Accept-Ranges: bytes`, because an entity only exists in the store at
+///   all if the origin proved it answers ranges -- a `206`, or a `200` that
+///   said so (see [`cacheable_entity`]);
+/// * the content type it labelled the entity with;
+/// * the validator it identified the entity by (see [`EntityValidator`]),
+///   which is the same one a stitched response carries and which is over the
+///   same entity's bytes either way. A hit that withheld it while a stitch of
+///   the very same entity stated it would have two cache answers disagreeing
+///   about what they had served.
+///
+/// What a hit does not carry is `Server` and `Date`: both describe a hop to
+/// an origin that is not being made, and there is nothing truthful to put in
+/// them.
 fn cache_hit_response(
     state: &AppState,
     player_token: Option<String>,
@@ -799,6 +895,9 @@ fn cache_hit_response(
     builder = builder
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::CONTENT_LENGTH, cached.held_to - cached.first + 1);
+    if let Some(validator) = EntityValidator::from_filed(&cached.validator) {
+        builder = builder.header(validator.header, validator.value);
+    }
     if ranged {
         builder = builder.header(
             header::CONTENT_RANGE,
@@ -1268,7 +1367,21 @@ async fn proxy(
     // Part of it is here, so the origin is asked for the rest and for
     // nothing else. `held_to + 1` is a chunk boundary, which is what makes
     // what comes back fill whole chunks and not two half ones.
-    let narrowed_range = cached.as_ref().map(|cached| cached.remaining_range());
+    //
+    // And it is asked *conditionally*, under the validator the head is filed
+    // by. A narrowed range is only worth asking for while the head it was
+    // narrowed against is still part of the entity; `If-Range` is the one
+    // question that says so, and an origin that honours it answers the whole
+    // of the new entity when the head has gone stale -- which is a correct
+    // answer to the player rather than a tail it did not ask for. It is not
+    // the guard (an origin may ignore it, and many do); the guard is the
+    // comparison below, on what actually came back.
+    let narrowed = cached.as_ref().map(|cached| {
+        (
+            cached.remaining_range(),
+            EntityValidator::from_filed(&cached.validator).map(|validator| validator.value),
+        )
+    });
 
     let custom_request_headers = custom_request_headers(&params.request_headers);
     let uncredentialed_request_headers = without_credentials(&custom_request_headers);
@@ -1286,9 +1399,19 @@ async fn proxy(
             // -- the whole range, which is exactly the fetch the cache was
             // narrowing away.
             if name == "range"
-                && let Some(range) = narrowed_range.as_deref()
+                && let Some((range, _)) = narrowed.as_ref()
             {
                 req_builder = req_builder.header(header::RANGE, range);
+                continue;
+            }
+            // The player's own `if-range` never reaches here with a narrowed
+            // range beside it: a request carrying one is not a request the
+            // cache touches at all ([`crate::proxy_cache::ProxyCache::entry`]
+            // refuses it), so there is nothing of the player's to displace.
+            if name == "if-range"
+                && let Some((_, Some(validator))) = narrowed.as_ref()
+            {
+                req_builder = req_builder.header(header::IF_RANGE, validator);
                 continue;
             }
             if let Some(value) = headers.get(name) {
@@ -1645,31 +1768,48 @@ async fn proxy(
         .and_then(|_| cacheable_entity(status, &res_headers, is_playlist, encoded_body));
 
     // Whether the cached head may go in front of what the origin just sent.
-    // What has to hold is that the two are parts of one entity, adjacent and
-    // in the same coding: a `206` whose `Content-Range` begins exactly where
-    // the cache left off, in an entity of the same length, under no content
-    // coding, and not a playlist.
+    // What has to hold is that the two are parts of **one entity**, adjacent
+    // and in the same coding, and "one entity" is the whole of the question:
+    //
+    // * the origin **names the same validator** the head is filed under
+    //   ([`EntityValidator`]). Length and type cannot say this. A resource
+    //   replaced by one of the same size and type is invisible to both, and
+    //   splicing across that change produces a body half of one generation
+    //   and half of another with nothing anywhere able to notice -- not the
+    //   player, which was told a coherent `Content-Range`, and not this
+    //   store, which has no hash to check its own bytes against. It is the
+    //   only failure here that is silent, so it is the one the guard is
+    //   built around;
+    // * its `Content-Range` begins exactly where the cache left off, in an
+    //   entity of the same length;
+    // * it is a `206`, under no content coding, and not a playlist.
     //
     // An origin that ignored the narrowed range and sent the whole file
     // (`200`) is answered honestly: the head is dropped and the origin's own
     // response relayed, which costs a re-fetch of bytes we held and nothing
-    // else.
+    // else. That is also what an origin that honours the `If-Range` above
+    // answers when the head has gone stale, and it is why the condition is
+    // worth sending -- the player gets the whole of the entity that exists
+    // now, which is a correct answer to a range request.
     //
-    // **The one case that is not free** is an origin that honoured the range
-    // and answered about a *different* entity -- the resource changed under
-    // the URL between the lookup and the fetch. The player then gets the
-    // origin's own `206`, which is an answer to the narrowed range and not
-    // to the one it asked for; it reads the `Content-Range`, finds bytes it
-    // did not ask for and re-reads. That re-read is clean, because the fill
-    // below has by then replaced the stale entity with the one the origin
-    // just described -- but it is a broken read, it is logged as one, and it
-    // is the price of narrowing a range against a store that never
-    // revalidates.
+    // **The one case that is not free** is an origin that ignored the
+    // condition and answered the narrowed range out of a *different* entity.
+    // The head is dropped and its `206` is relayed as it stands, which is an
+    // answer to the narrowed range and not to the one the player asked for;
+    // the player reads the `Content-Range`, finds bytes it did not ask for
+    // and re-reads. That re-read is clean, because the fill below has by then
+    // filed the entity the origin just described and dropped the one it
+    // replaced -- but it is a broken read, it is logged as one, and it is the
+    // price of narrowing a range against a store that never revalidates. A
+    // broken read is a price worth paying; a silent splice is not, because
+    // nothing downstream could ever find out it had been paid.
     let stitched = match cached {
         Some(cached)
             if !is_playlist
                 && !encoded_body
                 && status == StatusCode::PARTIAL_CONTENT
+                && EntityValidator::of(&res_headers)
+                    .is_some_and(|validator| validator.filed() == cached.validator)
                 && res_headers
                     .get(header::CONTENT_RANGE)
                     .and_then(|value| value.to_str().ok())
@@ -1686,6 +1826,8 @@ async fn proxy(
                 status = %status,
                 cached_total = cached.total,
                 content_range = ?res_headers.get(header::CONTENT_RANGE),
+                same_entity = EntityValidator::of(&res_headers)
+                    .is_some_and(|validator| validator.filed() == cached.validator),
                 "the origin did not answer the narrowed range as a part of the entity the \
                  cache holds; relaying its answer and dropping what was cached"
             );
@@ -1777,7 +1919,22 @@ async fn proxy(
             // entity. Its own framing is written below instead; relaying the
             // origin's here as well would be the two-content-lengths hyper
             // panics on.
-            if stitched.is_some() && matches!(name, "content-length" | "content-range") {
+            //
+            // Its validators are written below too, and for a reason that is
+            // not framing: relayed from here they are the *fetched*
+            // response's, and half the body they would be labelling came off
+            // disk. That is the same defect as the splice above, one step
+            // later -- the guard is what makes it a lie rather than what
+            // makes it true, since a stitch that happens has proved the two
+            // halves share a validator. What it has not proved is anything
+            // about the origin's *other* validator, so only the one that was
+            // compared goes back out.
+            if stitched.is_some()
+                && matches!(
+                    name,
+                    "content-length" | "content-range" | "etag" | "last-modified"
+                )
+            {
                 continue;
             }
             if let Some(value) = res_headers.get(name) {
@@ -1785,6 +1942,9 @@ async fn proxy(
             }
         }
         if let Some(cached) = stitched.as_ref() {
+            if let Some(validator) = EntityValidator::from_filed(&cached.validator) {
+                res_builder = res_builder.header(validator.header, validator.value);
+            }
             // The origin's own last byte, which is what its `Content-Range`
             // said and may be short of what was asked for.
             let origin_last = res_headers
@@ -1884,12 +2044,17 @@ async fn proxy(
     let mut body: std::pin::Pin<
         Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>,
     > = Box::pin(stream);
-    if let Some((first, _, total, content_type)) = cacheable
+    if let Some(entity) = cacheable
         && let Some(entry) = cache_entry
     {
         body = Box::pin(crate::proxy_cache::Filling::new(
             body,
-            entry.fill(total, &content_type, first),
+            entry.fill(
+                entity.total,
+                &entity.content_type,
+                &entity.validator.filed(),
+                entity.first,
+            ),
         ));
     }
     if let Some(cached) = stitched {
@@ -2238,6 +2403,85 @@ fn rewrite_playlist_carrying(body: &str, base: &Url, carried: CarriedParams) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn validated(headers: &[(&str, &str)]) -> Option<String> {
+        let mut map = HeaderMap::new();
+        for (name, value) in headers {
+            map.insert(
+                HeaderName::from_bytes(name.as_bytes()).expect("a literal header name"),
+                HeaderValue::from_str(value).expect("a literal header value"),
+            );
+        }
+        EntityValidator::of(&map).map(|validator| validator.filed())
+    }
+
+    /// Which of the two an entity is filed and compared under, and what
+    /// makes a response offer neither.
+    #[test]
+    fn an_entity_is_identified_by_its_tag_or_by_its_date() {
+        let date = "Wed, 21 Oct 2015 07:28:00 GMT";
+        assert_eq!(
+            validated(&[("etag", "\"v1\""), ("last-modified", date)]),
+            Some("etag:\"v1\"".to_string()),
+            "a tag says more than a date, so a tag is what is filed"
+        );
+        assert_eq!(
+            validated(&[("last-modified", date)]),
+            Some(format!("last-modified:{date}"))
+        );
+        // A weak tag promises the two representations mean the same, not
+        // that they are the same bytes -- and bytes are the whole of what a
+        // stitch joins. So it is passed over for the date beside it, and on
+        // its own it is nothing.
+        assert_eq!(
+            validated(&[("etag", "W/\"v1\""), ("last-modified", date)]),
+            Some(format!("last-modified:{date}"))
+        );
+        assert_eq!(validated(&[("etag", "W/\"v1\"")]), None);
+        assert_eq!(validated(&[("etag", "")]), None, "and nor is an empty one");
+        assert_eq!(validated(&[("content-type", "video/mp4")]), None);
+
+        // The header is part of the value: a date and a tag are different
+        // claims, and two validators are equal only when they were read from
+        // the same header.
+        assert_ne!(
+            validated(&[("etag", date)]),
+            validated(&[("last-modified", date)])
+        );
+    }
+
+    /// What is filed can be read back, so a cache hit can label the bytes it
+    /// serves with the validator they are filed under.
+    #[test]
+    fn a_filed_validator_reads_back_as_the_header_it_came_from() {
+        for headers in [
+            vec![("etag", "\"v1:2\"")],
+            vec![("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT")],
+        ] {
+            let validator = EntityValidator::of(&{
+                let mut map = HeaderMap::new();
+                for (name, value) in &headers {
+                    map.insert(
+                        HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                        HeaderValue::from_str(value).unwrap(),
+                    );
+                }
+                map
+            })
+            .expect("a validator");
+            assert_eq!(
+                EntityValidator::from_filed(&validator.filed()),
+                Some(validator.clone()),
+                "an ETag may hold a colon of its own; the first one is the separator"
+            );
+        }
+        assert_eq!(EntityValidator::from_filed("nonsense"), None);
+        assert_eq!(
+            EntityValidator::from_filed("server:nginx"),
+            None,
+            "and only the two headers an entity is ever identified by"
+        );
+    }
 
     fn base() -> Url {
         Url::parse("http://example.com/streams/master.m3u8").unwrap()

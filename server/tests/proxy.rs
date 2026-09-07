@@ -81,6 +81,13 @@ struct Origin {
 
 const ORIGIN_LENGTH: usize = 1024 * 1024;
 
+/// How the default origin identifies its entity. A response the origin will
+/// identify by neither `ETag` nor `Last-Modified` is not one the cache keeps
+/// -- nothing could ever tell a second generation of it from the first -- so
+/// an origin whose bytes these tests expect to find in the store has to say
+/// which entity they are of, the way a real one does.
+const ORIGIN_ETAG: &str = "\"the-movie\"";
+
 impl Origin {
     /// The default origin: [`ORIGIN_LENGTH`] bytes of [`byte_at`] with
     /// `Range` support, which is how a test tells "the proxy relayed the
@@ -103,7 +110,7 @@ impl Origin {
                     (
                         format!(
                             "HTTP/1.1 206 Partial Content\r\nAccept-Ranges: bytes\r\n\
-                             Content-Type: video/mp4\r\n\
+                             Content-Type: video/mp4\r\nETag: {ORIGIN_ETAG}\r\n\
                              Content-Range: bytes {first}-{last}/{ORIGIN_LENGTH}\r\n\
                              Content-Length: {}\r\nConnection: close\r\n\r\n",
                             body.len()
@@ -116,7 +123,7 @@ impl Origin {
                     (
                         format!(
                             "HTTP/1.1 200 OK\r\nAccept-Ranges: bytes\r\n\
-                             Content-Type: video/mp4\r\n\
+                             Content-Type: video/mp4\r\nETag: {ORIGIN_ETAG}\r\n\
                              Content-Length: {ORIGIN_LENGTH}\r\nConnection: close\r\n\r\n"
                         ),
                         body,
@@ -500,6 +507,251 @@ fn a_range_partly_held_fetches_only_the_missing_part() -> anyhow::Result<()> {
     drop(fixture.handle);
     Ok(())
 }
+/// An origin whose entity can change under the caller's feet **without
+/// changing its length or its content type** -- the one shape a store filed
+/// by length and type alone cannot tell apart, and the reason a validator is
+/// filed with them.
+///
+/// Flipping the returned flag serves a second generation of the same
+/// resource: same length, same `Content-Type`, every byte different, and a
+/// new `ETag`. `honours_if_range` is the difference between an origin that
+/// implements the conditional and one that ignores it -- both must leave the
+/// player holding bytes from one generation and never a body spliced from
+/// two.
+fn generational_origin(
+    honours_if_range: bool,
+) -> anyhow::Result<(std::sync::Arc<std::sync::atomic::AtomicBool>, Origin)> {
+    let second = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = second.clone();
+    let origin = Origin::start_with(move |request: &Request, socket: &mut TcpStream| {
+        let second = flag.load(std::sync::atomic::Ordering::SeqCst);
+        let etag = if second { "\"v2\"" } else { "\"v1\"" };
+        let byte = |offset: usize| generation_byte(second, offset);
+        let asked = request.range().and_then(|value| {
+            let (first, last) = value.trim_start_matches("bytes=").split_once('-')?;
+            let first: usize = first.parse().ok()?;
+            let last: usize = if last.is_empty() {
+                ORIGIN_LENGTH - 1
+            } else {
+                last.parse().ok()?
+            };
+            Some((first, last))
+        });
+        // The whole point of `If-Range`: a head the caller still holds is
+        // worth a `206` for the tail, and a head that is no longer part of
+        // this entity is worth the whole entity instead.
+        let stale = request
+            .header("if-range")
+            .is_some_and(|value| value.trim() != etag);
+        let served = if honours_if_range && stale {
+            None
+        } else {
+            asked
+        };
+        let (head, body) = match served {
+            Some((first, last)) => {
+                let body: Vec<u8> = (first..=last).map(byte).collect();
+                (
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\nAccept-Ranges: bytes\r\n\
+                         Content-Type: video/mp4\r\nETag: {etag}\r\n\
+                         Content-Range: bytes {first}-{last}/{ORIGIN_LENGTH}\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    ),
+                    body,
+                )
+            }
+            None => {
+                let body: Vec<u8> = (0..ORIGIN_LENGTH).map(byte).collect();
+                (
+                    format!(
+                        "HTTP/1.1 200 OK\r\nAccept-Ranges: bytes\r\n\
+                         Content-Type: video/mp4\r\nETag: {etag}\r\n\
+                         Content-Length: {ORIGIN_LENGTH}\r\nConnection: close\r\n\r\n"
+                    ),
+                    body,
+                )
+            }
+        };
+        let _ = socket.write_all(head.as_bytes());
+        let _ = socket.write_all(&body);
+        let _ = socket.flush();
+    })?;
+    Ok((second, origin))
+}
+
+/// The byte at `offset` in one generation or the other. Complementary, so a
+/// body spliced from both is caught wherever the seam falls.
+fn generation_byte(second: bool, offset: usize) -> u8 {
+    if second {
+        !byte_at(offset)
+    } else {
+        byte_at(offset)
+    }
+}
+
+/// Every byte of `body` belongs to one generation, and the assertion names
+/// which -- a splice fails it at the seam rather than at the length.
+fn assert_generation(body: &[u8], second: bool, from: usize, what: &str) {
+    for (index, byte) in body.iter().enumerate() {
+        assert_eq!(
+            *byte,
+            generation_byte(second, from + index),
+            "{what}: byte {} of the entity is from the other generation",
+            from + index
+        );
+    }
+}
+
+/// Warm chunk 0 of the generational origin's entity into the cache, and
+/// answer with the URL the rest of the test reads.
+fn warm_the_head(fixture: &Fixture) -> anyhow::Result<String> {
+    let origin = format!("http://{}", fixture.origin.addr);
+    let url = format!("{}/proxy/d={}/movie.mp4", fixture.base, encode(&origin));
+    let response = reqwest::blocking::Client::new()
+        .get(&url)
+        .header(reqwest::header::RANGE, format!("bytes=0-{}", CHUNK - 1))
+        .send()?;
+    assert_eq!(response.bytes()?.len() as u64, CHUNK);
+    fixture.origin.next_request();
+    wait_for_chunks(fixture, 1);
+    Ok(url)
+}
+
+/// A cached head is joined to a fresh `206` only when the origin says the
+/// two are parts of one entity, and the joined response is labelled with the
+/// validator that said so.
+///
+/// Length and content type cannot say it: a resource that changes without
+/// changing either is exactly the case the store has no other way to see.
+/// So the entity is filed under the origin's own validator as well, the
+/// narrowed fetch carries it as `If-Range`, and the `206` that comes back
+/// has to name it again before a byte of the cached head goes in front.
+#[test]
+fn a_stitch_is_licensed_by_the_validator_the_head_was_filed_under() -> anyhow::Result<()> {
+    let (_generation, origin) = generational_origin(true)?;
+    let fixture = fixture_with(origin)?;
+    let url = warm_the_head(&fixture)?;
+
+    let response = reqwest::blocking::Client::new()
+        .get(&url)
+        .header(reqwest::header::RANGE, format!("bytes=0-{}", CHUNK * 2 - 1))
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    let headers = response.headers().clone();
+    assert_eq!(
+        header(&headers, "content-range"),
+        Some(format!("bytes 0-{}/{ORIGIN_LENGTH}", CHUNK * 2 - 1)).as_deref(),
+        "the player is answered about the whole range it asked for"
+    );
+    assert_eq!(
+        header(&headers, "etag"),
+        Some("\"v1\""),
+        "and the body is labelled with the validator both halves of it are filed under"
+    );
+    let body = response.bytes()?;
+    assert_eq!(body.len() as u64, CHUNK * 2);
+    assert_generation(&body, false, 0, "an unchanged entity");
+
+    let asked = fixture.origin.next_request();
+    assert_eq!(
+        asked.range(),
+        Some(format!("bytes={}-{}", CHUNK, CHUNK * 2 - 1)).as_deref(),
+        "the origin is asked for the gap, from the chunk boundary the cache ended at"
+    );
+    assert_eq!(
+        asked.header("if-range"),
+        Some("\"v1\""),
+        "and asked to answer it as a tail only while the head is still part of the entity"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
+/// The same narrowing against an entity that changed between the two reads.
+/// Same length, same type, different bytes -- so nothing but the validator
+/// can tell, and the `If-Range` the narrowed fetch carries makes the origin
+/// answer with the whole of the new entity instead of a tail that would be
+/// spliced onto the old one's head.
+#[test]
+fn an_entity_that_changed_is_not_spliced_onto_the_cached_head() -> anyhow::Result<()> {
+    let (generation, origin) = generational_origin(true)?;
+    let fixture = fixture_with(origin)?;
+    let url = warm_the_head(&fixture)?;
+    generation.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let response = reqwest::blocking::Client::new()
+        .get(&url)
+        .header(reqwest::header::RANGE, format!("bytes=0-{}", CHUNK * 2 - 1))
+        .send()?;
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::OK,
+        "the head this range was narrowed against is not part of this entity any more, \
+         so the origin answers with the whole of the one that is"
+    );
+    assert_eq!(
+        header(response.headers(), "etag"),
+        Some("\"v2\""),
+        "labelled with the validator of the bytes actually served"
+    );
+    let body = response.bytes()?;
+    assert_eq!(body.len(), ORIGIN_LENGTH);
+    assert_generation(&body, true, 0, "a changed entity");
+
+    assert_eq!(
+        fixture.origin.next_request().header("if-range"),
+        Some("\"v1\""),
+        "the condition named the head, which is what made the answer whole"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
+/// And an origin that ignores `If-Range` altogether -- which is allowed, and
+/// is why the condition is not the guard. It answers the narrowed range as a
+/// `206` of the *new* entity; the `ETag` on it is not the one the cached head
+/// is filed under, so the head is dropped and the origin's own answer is
+/// relayed as it stands.
+///
+/// That answer is a range the player did not ask for, and it says so: the
+/// `Content-Range` is the origin's, the body is one generation's, and the
+/// player re-reads. A broken read is the price of narrowing against a store
+/// that never revalidates; a body spliced out of two generations is not,
+/// because nothing downstream could ever find out.
+#[test]
+fn an_origin_that_ignores_if_range_is_still_not_spliced() -> anyhow::Result<()> {
+    let (generation, origin) = generational_origin(false)?;
+    let fixture = fixture_with(origin)?;
+    let url = warm_the_head(&fixture)?;
+    generation.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let response = reqwest::blocking::Client::new()
+        .get(&url)
+        .header(reqwest::header::RANGE, format!("bytes=0-{}", CHUNK * 2 - 1))
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    let headers = response.headers().clone();
+    assert_eq!(
+        header(&headers, "content-range"),
+        Some(format!("bytes {}-{}/{ORIGIN_LENGTH}", CHUNK, CHUNK * 2 - 1)).as_deref(),
+        "the origin's own answer, not one that claims the cached head is in front of it"
+    );
+    assert_eq!(
+        header(&headers, "etag"),
+        Some("\"v2\""),
+        "and the validator of the entity it came from"
+    );
+    let body = response.bytes()?;
+    assert_eq!(body.len() as u64, CHUNK);
+    assert_generation(&body, true, CHUNK as usize, "an ignored If-Range");
+
+    drop(fixture.handle);
+    Ok(())
+}
 
 /// Two players reading the same stream at different offsets. Neither is in
 /// the other's key -- `p=` is the client's name for its own player and is
@@ -645,7 +897,7 @@ fn nothing_the_rules_refuse_is_cached() -> anyhow::Result<()> {
                 _ => ("Accept-Ranges: bytes\r\n", body),
             };
             let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\n{extra}\
+                "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nETag: {ORIGIN_ETAG}\r\n{extra}\
                  Content-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             );

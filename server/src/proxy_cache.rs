@@ -37,22 +37,30 @@
 //! # On disk
 //!
 //! ```text
-//! <download dir>/.proxy/<key>/<length>_<content type>/<bucket>/<chunk>
+//! <download dir>/.proxy/<key>/<length>_<content type>_<validator>/<bucket>/<chunk>
 //! ```
 //!
 //! * `<key>` is [`ProxyCache::entry`]'s hash of everything that varies what
 //!   the origin sends back -- see there.
-//! * `<length>_<content type>` is the **entity**: its byte length, and the
-//!   type the origin labelled it with, percent-encoded. Both are in the
-//!   directory name rather than in a metadata file beside the chunks, and
+//! * `<length>_<content type>_<validator>` is the **entity**: its byte
+//!   length, the type the origin labelled it with, and the validator the
+//!   origin identified it by, the last two percent-encoded. All three are in
+//!   the directory name rather than in a metadata file beside the chunks, and
 //!   that is deliberate. The cache cleaner evicts file by file, oldest mtime
 //!   first; a metadata file is written once at the start of a fill and never
 //!   touched again, so it is the *first* thing in an entry the cleaner would
-//!   take -- and losing it would leave a directory of chunks whose length and
-//!   type nothing could state. A directory name cannot be evicted out from
-//!   under the files it describes. An entity whose length or type changed
-//!   gets a new directory, and the fill that discovers it removes the old
-//!   one.
+//!   take -- and losing it would leave a directory of chunks nothing could
+//!   state the length, type or identity of. A directory name cannot be
+//!   evicted out from under the files it describes. An entity that differs
+//!   from the one before it in any of the three gets a new directory, and the
+//!   fill that discovers it removes the old one.
+//! * **The validator is the only one of the three that can tell two
+//!   generations of one resource apart**, and it is why chunks from two of
+//!   them can never end up in one directory or one body. Length and type say
+//!   nothing about a URL whose content was replaced by content of the same
+//!   size -- which is why a response the origin will identify by neither
+//!   `ETag` nor `Last-Modified` is not kept at all
+//!   (`routes::proxy::cacheable_entity`).
 //! * `<bucket>` is `<chunk> / 1000`, for the same reason the piece store
 //!   buckets: exFAT and FAT32 scan a directory linearly, and that is exactly
 //!   where a phone's cache lives.
@@ -304,7 +312,7 @@ impl Entry {
     /// origin's `206` tail. The shape a player actually sends is
     /// `Range: bytes=0-`, which is the ranged path.
     pub fn look_up(&self, range: Option<&str>) -> Option<Cached> {
-        let (dir, total, content_type) = self.sole_entity()?;
+        let (dir, total, content_type, validator) = self.sole_entity()?;
         let (first, last) = match range {
             Some(header) => crate::routes::util::parse_range(header, total)?,
             None => (0, total.checked_sub(1)?),
@@ -338,6 +346,7 @@ impl Entry {
             dir,
             total,
             content_type,
+            validator,
             first,
             last,
             held_to,
@@ -348,8 +357,10 @@ impl Entry {
     ///
     /// `body_start` is the absolute offset of the response body's first byte:
     /// zero for a `200`, the `Content-Range`'s first byte for a `206`.
-    pub fn fill(&self, total: u64, content_type: &str, body_start: u64) -> Filler {
-        let dir = self.dir.join(entity_dir_name(total, content_type));
+    pub fn fill(&self, total: u64, content_type: &str, validator: &str, body_start: u64) -> Filler {
+        let dir = self
+            .dir
+            .join(entity_dir_name(total, content_type, validator));
         // The entity directory and the removal of any *other* entity under
         // this key happen once, off the reactor, and neither has to finish
         // before the first chunk is written: a chunk write creates its own
@@ -379,39 +390,80 @@ impl Entry {
     /// one leaves, and there is nothing here that can say which of them the
     /// origin would send now -- so the request goes to the origin, and the
     /// fill it comes back with removes the loser.
-    fn sole_entity(&self) -> Option<(PathBuf, u64, String)> {
-        let mut only: Option<(PathBuf, u64, String)> = None;
+    fn sole_entity(&self) -> Option<(PathBuf, u64, String, String)> {
+        let mut only: Option<(PathBuf, u64, String, String)> = None;
         for entry in std::fs::read_dir(&self.dir).ok()?.flatten() {
             let name = entry.file_name();
-            let Some((total, content_type)) = name.to_str().and_then(parse_entity_dir_name) else {
+            let Some((total, content_type, validator)) =
+                name.to_str().and_then(parse_entity_dir_name)
+            else {
                 continue;
             };
             if only.is_some() {
                 return None;
             }
-            only = Some((entry.path(), total, content_type));
+            only = Some((entry.path(), total, content_type, validator));
         }
         only
     }
 }
 
-/// `<length>_<percent-encoded content type>`. The length is decimal digits,
-/// so the first `_` is the separator however the type is spelled.
-fn entity_dir_name(total: u64, content_type: &str) -> String {
-    format!("{total}_{}", urlencoding::encode(content_type))
+/// `<length>_<content type>_<validator>`, the last two percent-encoded.
+///
+/// `_` is escaped along with everything else a percent-encoding escapes, so
+/// the name splits into exactly three fields however an origin spells a type
+/// or a tag. It is in the unreserved set that `urlencoding::encode` leaves
+/// alone, and a content type may hold one (`application/x-foo_bar`), so
+/// leaving it would make the separator ambiguous the first time an origin
+/// used it.
+fn entity_dir_name(total: u64, content_type: &str, validator: &str) -> String {
+    format!(
+        "{total}_{}_{}",
+        encode_field(content_type),
+        encode_field(validator)
+    )
 }
 
-fn parse_entity_dir_name(name: &str) -> Option<(u64, String)> {
-    let (total, content_type) = name.split_once('_')?;
-    Some((
-        total.parse().ok()?,
-        urlencoding::decode(content_type).ok()?.into_owned(),
-    ))
+fn encode_field(value: &str) -> String {
+    urlencoding::encode(value).replace('_', "%5F")
+}
+
+/// The three fields back, and `None` for a name that is not three fields or
+/// whose validator is empty. An entity with no validator is one nothing could
+/// tell a later generation of the resource from, and nothing writes one -- so
+/// a directory claiming to be one is not read as an entity at all.
+fn parse_entity_dir_name(name: &str) -> Option<(u64, String, String)> {
+    let mut fields = name.split('_');
+    let total: u64 = fields.next()?.parse().ok()?;
+    let content_type = urlencoding::decode(fields.next()?).ok()?.into_owned();
+    let validator = urlencoding::decode(fields.next()?).ok()?.into_owned();
+    if fields.next().is_some() || validator.is_empty() {
+        return None;
+    }
+    Some((total, content_type, validator))
+}
+
+/// How long an entity's directory name may be: 255 bytes, which is what one
+/// name may hold on every filesystem this runs on, and the name is ASCII once
+/// its two text fields are percent-encoded so bytes and characters are the
+/// same count.
+///
+/// An origin is free to send a content type or an `ETag` longer than the
+/// remainder; what it is not free to do is make every chunk write of that
+/// response fail its `mkdir` and say so in the log. Beyond this the response
+/// is simply not one the cache keeps, like every other thing it declines.
+const MAX_ENTITY_DIR_NAME: usize = 255;
+
+/// Whether an entity of this length, type and validator can be filed at all.
+/// Asked by `routes::proxy::cacheable_entity` before a response is kept,
+/// because the answer is a refusal and every refusal lives there.
+pub fn can_be_filed(total: u64, content_type: &str, validator: &str) -> bool {
+    entity_dir_name(total, content_type, validator).len() <= MAX_ENTITY_DIR_NAME
 }
 
 /// Remove every entity under `key_dir` but `keep`: the origin has just said
-/// what this resource is, and an entity of a different length or a different
-/// type is not it any more.
+/// what this resource is, and an entity of a different length, a different
+/// type or a different validator is not it any more.
 fn remove_other_entities(key_dir: &Path, keep: &Path) {
     let Ok(entries) = std::fs::read_dir(key_dir) else {
         return;
@@ -454,6 +506,14 @@ pub struct Cached {
     pub total: u64,
     /// What the origin labelled the entity, empty when it said nothing.
     pub content_type: String,
+    /// How the origin identified the entity, as
+    /// `routes::proxy::EntityValidator` files it -- the header it came in and
+    /// its value. Never empty: a response the origin would identify by
+    /// neither `ETag` nor `Last-Modified` is not kept.
+    ///
+    /// It is what says that this and a fresh `206` are parts of one entity,
+    /// and it is the `If-Range` the narrowed fetch asks under.
+    pub validator: String,
     /// The first byte the request asked for, clamped into the entity.
     pub first: u64,
     /// The last byte it asked for, likewise.
@@ -737,6 +797,12 @@ mod tests {
         11470,
     );
 
+    /// How an origin identified the entity these tests store, as
+    /// `routes::proxy::EntityValidator` files it. Every entity has one --
+    /// a response the origin will identify by neither `ETag` nor
+    /// `Last-Modified` is not kept at all.
+    const VALIDATOR: &str = "etag:\"v1\"";
+
     fn entry_of(cache: &ProxyCache, target: &str) -> Entry {
         cache
             .entry(
@@ -932,7 +998,9 @@ mod tests {
         let (_root, cache) = cache();
         let entry = entry_of(&cache, "https://host/film.mkv");
         let total = CHUNK_BYTES + 10;
-        let dir = entry.dir.join(entity_dir_name(total, "video/mp4"));
+        let dir = entry
+            .dir
+            .join(entity_dir_name(total, "video/mp4", VALIDATOR));
         std::fs::create_dir_all(chunk_path(&dir, 0).parent().unwrap()).unwrap();
 
         write_chunk(&dir, 0, &vec![7u8; CHUNK_BYTES as usize]);
@@ -970,7 +1038,9 @@ mod tests {
         let (_root, cache) = cache();
         let entry = entry_of(&cache, "https://host/film.mkv");
         let total = CHUNK_BYTES * 4;
-        let dir = entry.dir.join(entity_dir_name(total, "video/mp4"));
+        let dir = entry
+            .dir
+            .join(entity_dir_name(total, "video/mp4", VALIDATOR));
         for index in [0u64, 1, 3] {
             write_chunk(&dir, index, &vec![index as u8; CHUNK_BYTES as usize]);
         }
@@ -1018,11 +1088,11 @@ mod tests {
         let entry = entry_of(&cache, "https://host/film.mkv");
         let old = entry
             .dir
-            .join(entity_dir_name(CHUNK_BYTES * 2, "video/mp4"));
+            .join(entity_dir_name(CHUNK_BYTES * 2, "video/mp4", VALIDATOR));
         write_chunk(&old, 0, &vec![1u8; CHUNK_BYTES as usize]);
         assert!(entry.look_up(Some("bytes=0-0")).is_some());
 
-        let filler = entry.fill(CHUNK_BYTES * 3, "video/mp4", 0);
+        let filler = entry.fill(CHUNK_BYTES * 3, "video/mp4", VALIDATOR, 0);
         // The sibling removal is a blocking task; wait for it the way a test
         // waits for anything it did not await.
         for _ in 0..200 {
@@ -1045,11 +1115,13 @@ mod tests {
         let (_root, cache) = cache();
         let entry = entry_of(&cache, "https://host/film.mkv");
         let total = CHUNK_BYTES * 2 + 7;
-        let mut filler = entry.fill(total, "video/mp4", 0);
+        let mut filler = entry.fill(total, "video/mp4", VALIDATOR, 0);
         filler.take(&vec![9u8; CHUNK_BYTES as usize + 12]);
         drop(filler);
 
-        let dir = entry.dir.join(entity_dir_name(total, "video/mp4"));
+        let dir = entry
+            .dir
+            .join(entity_dir_name(total, "video/mp4", VALIDATOR));
         for _ in 0..200 {
             if chunk_path(&dir, 0).is_file() {
                 break;
@@ -1072,11 +1144,13 @@ mod tests {
         let (_root, cache) = cache();
         let entry = entry_of(&cache, "https://host/film.mkv");
         let total = CHUNK_BYTES * 3;
-        let mut filler = entry.fill(total, "video/mp4", 100);
+        let mut filler = entry.fill(total, "video/mp4", VALIDATOR, 100);
         filler.take(&vec![9u8; (CHUNK_BYTES * 2) as usize]);
         drop(filler);
 
-        let dir = entry.dir.join(entity_dir_name(total, "video/mp4"));
+        let dir = entry
+            .dir
+            .join(entity_dir_name(total, "video/mp4", VALIDATOR));
         for _ in 0..200 {
             if chunk_path(&dir, 1).is_file() {
                 break;
@@ -1095,7 +1169,9 @@ mod tests {
     fn the_sweep_takes_the_temporaries_and_nothing_else() {
         let (_root, cache) = cache();
         let entry = entry_of(&cache, "https://host/film.mkv");
-        let dir = entry.dir.join(entity_dir_name(CHUNK_BYTES, "video/mp4"));
+        let dir = entry
+            .dir
+            .join(entity_dir_name(CHUNK_BYTES, "video/mp4", VALIDATOR));
         write_chunk(&dir, 0, &vec![3u8; CHUNK_BYTES as usize]);
         let killed = chunk_path(&dir, 0).parent().unwrap().join("0.999-0.part");
         std::fs::write(&killed, [3u8; 64]).unwrap();
@@ -1135,6 +1211,70 @@ mod tests {
                 "{name} would reach the origin without an addon ever naming it"
             );
         }
+    }
+
+    /// The three fields go into one directory name, and the rule about that
+    /// name is the only reason a response the origin describes perfectly well
+    /// might still not be kept.
+    ///
+    /// This is where it is pinned rather than in the route's tests, because
+    /// from outside the two answers are the same: a name past what a
+    /// filesystem takes fails its `mkdir` for every chunk of the response, so
+    /// nothing is cached either way. What the rule buys is that the refusal
+    /// is a decision made once instead of a line in the log per chunk -- and
+    /// the boundary is asserted against the filesystem itself, since a
+    /// constant that were one byte out would refuse names that fit or accept
+    /// names that do not.
+    #[test]
+    fn an_entity_is_kept_only_under_a_name_a_directory_can_hold() {
+        let (root, cache) = cache();
+        let validator = "etag:\"v1\"";
+        let fits = "video/".to_string()
+            + &"x"
+                .repeat(MAX_ENTITY_DIR_NAME - entity_dir_name(u64::MAX, "video/", validator).len());
+        assert!(can_be_filed(u64::MAX, &fits, validator));
+        assert!(!can_be_filed(u64::MAX, &(fits.clone() + "x"), validator));
+
+        // And the longest name it accepts is one the filesystem takes.
+        let name = entity_dir_name(u64::MAX, &fits, validator);
+        assert_eq!(name.len(), MAX_ENTITY_DIR_NAME);
+        std::fs::create_dir_all(root.path().join(&name)).expect("a name a directory can hold");
+
+        // A validator is as able to be the long field as a type is: the rule
+        // is about the name, not about which of them grew.
+        assert!(!can_be_filed(1, "video/mp4", &"etag:x".repeat(64)));
+        let _ = cache;
+    }
+
+    /// The name splits into exactly the three fields it was written from,
+    /// whatever an origin spells them with -- `_` included, which is in the
+    /// set a percent-encoding would otherwise leave alone.
+    #[test]
+    fn an_entity_name_round_trips_through_the_characters_that_could_break_it() {
+        for (content_type, validator) in [
+            ("video/mp4", "etag:\"v1\""),
+            ("application/x-foo_bar", "etag:\"a_b\""),
+            (
+                "video/mp4; codecs=\"avc1\"",
+                "last-modified:Wed, 21 Oct 2015 07:28:00 GMT",
+            ),
+            ("", "etag:%5F"),
+        ] {
+            let name = entity_dir_name(4096, content_type, validator);
+            assert_eq!(
+                parse_entity_dir_name(&name),
+                Some((4096, content_type.to_string(), validator.to_string())),
+                "{name}"
+            );
+        }
+        // An entity with no validator is one nothing could tell a later
+        // generation of the resource from, and nothing writes one -- so a
+        // directory claiming to be one is not read as an entity at all.
+        assert_eq!(
+            parse_entity_dir_name(&entity_dir_name(4096, "video/mp4", "")),
+            None
+        );
+        assert_eq!(parse_entity_dir_name("4096_video%2Fmp4"), None);
     }
 
     #[test]
