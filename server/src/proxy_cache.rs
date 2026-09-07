@@ -104,11 +104,14 @@ pub const PROXY_CACHE_DIR: &str = ".proxy";
 
 /// How many bytes one chunk file holds, except the last of an entity.
 ///
-/// 256 KiB. Small enough that the cleaner's single-file rule can never see
-/// one as bigger than the whole cap (`cacheSize` is megabytes at the very
-/// least), that eviction is fine-grained, and that a partial hit wastes at
-/// most this much of a re-fetch; large enough that a 2 GB film is eight
-/// thousand files rather than a hundred thousand.
+/// 256 KiB. Small enough that the cleaner's single-file rule -- a file
+/// bigger than the whole cap is kept rather than evicted -- can never see one
+/// (`cacheSize` is megabytes at the very least), that eviction is
+/// fine-grained, and that the two places a chunk boundary costs something
+/// bound it to this much: a fetch that starts mid-chunk drops what it carries
+/// of that chunk, and a chunk buffered but never completed is this much
+/// memory per stream. Large enough that a 2 GB film is eight thousand files
+/// rather than a hundred thousand.
 pub const CHUNK_BYTES: u64 = 256 * 1024;
 
 /// How many chunk files share one directory. A thousand, decimal, for the
