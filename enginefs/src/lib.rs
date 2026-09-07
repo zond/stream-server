@@ -1579,6 +1579,26 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         self.backend.dht_status()
     }
 
+    /// Every existing engine's [`crate::backend::TransferTotals`], keyed by
+    /// info hash -- the activity light's reading of the connection.
+    ///
+    /// A peek, not a poll, like [`Self::peek_engine`]: `last_accessed` is
+    /// left alone, where [`Engine::get_statistics`] touches it. That is not
+    /// a nicety. The light asks every second or two for the life of the
+    /// process, and a reading that counted as a poll would hold every
+    /// torrent out of the idle sweep for ever -- seeding on, and the light
+    /// then lit by the traffic it caused. It also creates nothing: the
+    /// engines that exist are iterated and no hash is looked up, so it never
+    /// goes near `get_or_begin_add_magnet`. A hash removed since the last
+    /// reading is simply absent, and its bytes leave the sum with it.
+    pub async fn transfer_totals(&self) -> HashMap<String, crate::backend::TransferTotals> {
+        let engines = self.engines.read().await;
+        engines
+            .iter()
+            .map(|(hash, engine)| (hash.clone(), engine.handle.transfer_totals()))
+            .collect()
+    }
+
     pub async fn get_all_statistics(&self) -> HashMap<String, crate::backend::EngineStats> {
         let engines = self.engines.read().await;
         let mut stats = HashMap::new();
@@ -3799,6 +3819,11 @@ mod tests {
         /// Test knob: the backend stopped this torrent because the volume is
         /// full, as librqbit does on an ENOSPC write.
         out_of_space: AtomicBool,
+        /// What the fake torrent has moved over the connection, reported
+        /// through `transfer_totals()`; a test adds to these where peers
+        /// would.
+        fetched: AtomicU64,
+        uploaded: AtomicU64,
         /// How many times the torrent was put back to work after that.
         restart_after_error: AtomicUsize,
     }
@@ -4037,6 +4062,13 @@ mod tests {
     impl TorrentHandle for FakeHandle {
         fn info_hash(&self) -> String {
             self.info_hash.clone()
+        }
+
+        fn transfer_totals(&self) -> crate::backend::TransferTotals {
+            crate::backend::TransferTotals {
+                fetched: self.counters.fetched.load(Ordering::SeqCst),
+                uploaded: self.counters.uploaded.load(Ordering::SeqCst),
+            }
         }
 
         fn name(&self) -> Option<String> {
@@ -5244,6 +5276,49 @@ mod tests {
             .values_mut()
             .for_each(|lease| lease.expires_at_secs = 0);
         both_agree(&enginefs, false, "an expired lease is a client that left").await;
+    }
+
+    /// The light's reading of the connection is a peek over the engines that
+    /// exist: it touches no idle clock, looks nothing up, adds nothing, and
+    /// an engine that has gone is gone from the sum.
+    #[tokio::test]
+    async fn transfer_totals_is_a_peek_over_the_engines_that_exist() {
+        use crate::backend::TransferTotals;
+        let (enginefs, counters) = test_enginefs();
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        let stale = u64::MAX;
+        engine.last_accessed.store(stale, Ordering::SeqCst);
+
+        let totals = enginefs.transfer_totals().await;
+        assert_eq!(totals.len(), 1);
+        assert_eq!(totals[TEST_HASH], TransferTotals::default());
+
+        counters.fetched.store(4_096, Ordering::SeqCst);
+        counters.uploaded.store(512, Ordering::SeqCst);
+        assert_eq!(
+            enginefs.transfer_totals().await[TEST_HASH],
+            TransferTotals {
+                fetched: 4_096,
+                uploaded: 512,
+            }
+        );
+        assert_eq!(
+            engine.last_accessed.load(Ordering::SeqCst),
+            stale,
+            "reading the counters counted as a poll: a light asking every second would \
+             keep this torrent out of the idle sweep for ever"
+        );
+
+        enginefs.remove_engine(TEST_HASH).await;
+        assert!(
+            enginefs.transfer_totals().await.is_empty(),
+            "a removed engine is absent, not re-added"
+        );
+        assert!(enginefs.list_engines().await.is_empty());
+        assert!(
+            enginefs.magnet_adds.read().await.is_empty(),
+            "asking for the totals began no add"
+        );
     }
 
     /// The conjunction the client's activity light is, end to end: bytes

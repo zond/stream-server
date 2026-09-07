@@ -106,12 +106,53 @@ pub trait TorrentBackend: Send + Sync {
     fn set_seeding_enabled(&self, _enabled: bool) {}
 }
 
+/// What one torrent has moved over the connection: bytes received from peers
+/// and bytes sent to them, as the backend itself counts them.
+///
+/// `fetched`, not "downloaded", on purpose. [`EngineStats::downloaded`] is
+/// have-bytes -- what the torrent holds verified, which librqbit mirrors
+/// from the hash check's progress while a torrent initializes -- so it grows
+/// through the initial check of every restored torrent at every startup,
+/// with no network in sight. That is exactly the reading the activity light
+/// must not take, and giving the two counters two names keeps one from
+/// standing in for the other. `fetched` is the peer-received counter and
+/// nothing else feeds it.
+///
+/// Both are the live state's counters: they start at zero when a torrent
+/// goes live and are gone when it leaves that state (paused, errored,
+/// removed). A sum over torrents can therefore drop, which reads as "not
+/// grown" to anyone comparing readings -- the right answer, since a torrent
+/// that stopped is not using the connection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TransferTotals {
+    /// Bytes received from peers.
+    pub fetched: u64,
+    /// Bytes sent to peers.
+    pub uploaded: u64,
+}
+
+impl TransferTotals {
+    /// Both directions added, so a set of torrents folds to one reading.
+    pub fn plus(self, other: TransferTotals) -> TransferTotals {
+        TransferTotals {
+            fetched: self.fetched.saturating_add(other.fetched),
+            uploaded: self.uploaded.saturating_add(other.uploaded),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 pub trait TorrentHandle: Send + Sync + Clone {
     fn info_hash(&self) -> String;
     fn name(&self) -> Option<String>;
 
     async fn stats(&self) -> EngineStats;
+    /// The torrent's [`TransferTotals`], and nothing else: no file list, no
+    /// tracker snapshot, no scrape scheduled, no lifecycle bookkeeping.
+    /// Unlike `stats()` this is polled every second or two by the activity
+    /// light for every torrent that exists, so it has to be a handful of
+    /// atomic loads under the state lock and must never reach the network.
+    fn transfer_totals(&self) -> TransferTotals;
     async fn add_trackers(&self, trackers: Vec<String>) -> Result<()>;
     /// Cheap check for whether the torrent has finished downloading its wanted
     /// data. Unlike `stats()`, this must not rebuild the full statistics or walk

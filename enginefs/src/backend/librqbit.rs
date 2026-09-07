@@ -3,7 +3,7 @@ use crate::backend::{
     BackendFileInfo, BackendMemoryDiagnostics, DhtStatus, EngineStats, FileStreamTrait, Growler,
     PeerDiscovery, PeerSearch, PieceReadiness, Source, StartupPhase, StatsFile, StatsOptions,
     SwarmCap, TorrentBackend, TorrentFilePriorityPlan, TorrentHandle, TorrentListenPort,
-    TorrentPlacement, TorrentSource,
+    TorrentPlacement, TorrentSource, TransferTotals,
 };
 use crate::scrape::SwarmScraper;
 use anyhow::{Context, Result};
@@ -1224,6 +1224,23 @@ impl TorrentHandle for LibrqbitHandle {
             .metadata
             .load_full()
             .and_then(|m| m.info.name().map(|n| n.to_string()))
+    }
+
+    /// Two atomics off the live state; zero in every other state, because
+    /// that is where librqbit keeps them (`TorrentStateLive::stats`). Not
+    /// `progress_bytes`: while a torrent initializes that mirrors the hash
+    /// check's `checked_bytes`, which is disk read back, not a peer.
+    fn transfer_totals(&self) -> TransferTotals {
+        self.handle.with_state(|state| match state {
+            ManagedTorrentState::Live(live) => {
+                let snapshot = live.stats_snapshot();
+                TransferTotals {
+                    fetched: snapshot.fetched_bytes,
+                    uploaded: snapshot.uploaded_bytes,
+                }
+            }
+            _ => TransferTotals::default(),
+        })
     }
 
     async fn stats(&self) -> EngineStats {
@@ -3028,6 +3045,51 @@ mod tests {
         assert_eq!(stats.phase, StartupPhase::Ready);
         assert_eq!(stats.initial_window_ready_bytes, Some(payload_len));
         assert_eq!(stats.initial_window_bytes, Some(payload_len));
+    }
+
+    /// The offline restart, as the activity light sees it. A torrent whose
+    /// data is already on disk is added to a session with no network -- the
+    /// shape of every restored torrent at startup -- and librqbit's initial
+    /// check reads all of it back to hash it. That read is what lit the
+    /// light when the storage was the counter; through the connection's own
+    /// counters nothing moves, and the light has to stay dark on both sides
+    /// while the check runs and once it is over. The counter that *would*
+    /// have lit it is asserted alongside, so the trap stays named: the
+    /// stats' `downloaded` ends at the payload's length without a peer ever
+    /// having been asked for a byte.
+    #[tokio::test]
+    async fn the_initial_check_moves_nothing_over_the_connection() {
+        use crate::backend::TorrentHandle;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let payload = dir.join("payload.bin");
+        let payload_len = 96 * 1024u64;
+        write_payload(&payload, payload_len as usize).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+
+        let (_backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
+        // Sampled while the check may still be running: the first reading
+        // the light takes after a restart is exactly this one.
+        assert_eq!(handle.transfer_totals(), TransferTotals::default());
+        handle.handle.wait_until_initialized().await.unwrap();
+        assert_eq!(
+            handle.transfer_totals(),
+            TransferTotals::default(),
+            "the initial check read the whole payload back from disk; none of it crossed \
+             the connection"
+        );
+
+        let stats = TorrentHandle::stats(&handle).await;
+        assert_eq!(
+            stats.phase,
+            StartupPhase::Ready,
+            "the check did run to the end"
+        );
+        assert_eq!(
+            stats.downloaded, payload_len,
+            "have-bytes grew to the whole payload with no peer involved -- which is why \
+             `downloaded` could not be the light's counter"
+        );
     }
 
     /// The startup window follows the reader, and the piece length is
