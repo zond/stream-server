@@ -416,6 +416,52 @@ fn device_info_and_stats_json_sys_probes_keep_their_shapes() -> anyhow::Result<(
 ///
 /// This server runs with `ServerAuth::Disabled` (the binary's `--no-auth`):
 /// the handle has no token and control routes answer without a header.
+/// The signal a client's "working in the background" indicator reads. An
+/// idle server is dark, and asking is not itself an event: it starts no
+/// torrent, so a light can never be the reason there is something to report.
+#[test]
+fn background_traffic_is_dark_on_an_idle_server() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_dir.path().join("cache")),
+        ..offline_config()
+    })?;
+
+    let traffic = handle.background_traffic()?;
+    assert!(!traffic.active, "nothing has been asked of this server yet");
+    assert!(!traffic.moving && !traffic.playing);
+    assert_eq!(traffic.bytes_read, 0);
+    assert_eq!(traffic.bytes_written, 0);
+    assert!(traffic.window_secs > 0, "the window has to be a duration");
+
+    // It crosses FFI as JSON like every other type on this boundary.
+    let json = serde_json::to_value(&traffic)?;
+    assert_eq!(json["active"], serde_json::json!(false));
+
+    // And it created nothing on the way: `/stats.json` still knows no torrent
+    // (its non-torrent keys are `dht`, and `sys` only when asked for).
+    let response = bearer_client(&handle)?
+        .get(format!("http://{}/stats.json", handle.http_addr()))
+        .send()?
+        .error_for_status()?;
+    let body: serde_json::Value = response.json()?;
+    let torrents: Vec<&String> = body
+        .as_object()
+        .expect("object")
+        .keys()
+        .filter(|key| key.len() == 40)
+        .collect();
+    assert!(torrents.is_empty(), "asking lit an engine: {torrents:?}");
+
+    handle.shutdown()?;
+    handle.join()?;
+
+    Ok(())
+}
+
 #[test]
 fn casting_player_reports_failure_since_casting_is_not_implemented() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;

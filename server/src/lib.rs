@@ -271,6 +271,31 @@ impl ServerHandle {
         routes::system::dht_status(&self.state)
     }
 
+    /// Whether this server is using the connection while nothing is playing
+    /// -- what a client's "working in the background" indicator shows.
+    ///
+    /// One fact, not two: bytes through the torrent storage over the last
+    /// window (a peer we are serving, an offline download running with
+    /// nothing on screen, the hash check that download needs) *and* no
+    /// playback over that window. The conjunction is taken in enginefs
+    /// (`BackendEngineFS::background_traffic`) on purpose -- an embedder
+    /// reading the two halves separately would sample them a moment apart
+    /// and get a light that flickers whenever they disagree.
+    ///
+    /// Library-only: there is no control route for it, because the consumer
+    /// is the embedding client rather than anything speaking HTTP, and
+    /// `enginefs::traffic::BackgroundTraffic` is `serde`-serializable like
+    /// every other type crossing this boundary. Cheap enough to poll every
+    /// second or two -- it reads the engines that already exist and two
+    /// atomics -- and it creates nothing: no engine, no magnet add. The
+    /// verdict only changes when a window closes
+    /// (`enginefs::traffic::TRAFFIC_WINDOW`), so asking faster than that is
+    /// answered from the standing reading.
+    pub fn background_traffic(&self) -> anyhow::Result<enginefs::traffic::BackgroundTraffic> {
+        let state = self.state.clone();
+        self.block_on_server(async move { state.stream_engine().background_traffic().await })
+    }
+
     /// Torrent-level stats, exactly what `GET /{infoHash}/stats.json?tr=...`
     /// answers (see `routes::system::engine_stats`): `trackers` are the
     /// `tr=` values -- normalised exactly as the route normalises them
