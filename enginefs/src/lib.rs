@@ -23,6 +23,7 @@ pub mod piece_waiter;
 pub mod scrape;
 pub mod tracker_prober;
 pub mod trackers;
+pub mod traffic;
 
 // Re-export TrackerStorage for use by server crate
 pub use trackers::TrackerStorage;
