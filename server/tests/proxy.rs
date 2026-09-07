@@ -955,14 +955,30 @@ fn a_body_that_stops_mid_chunk_leaves_no_chunk_to_serve() -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Every reason the cache refuses to keep a response, one origin path each,
-/// and one that it does keep so the fixture is proving something.
+/// Every reason the cache refuses to keep a response, **each proved by the
+/// one thing that makes it fail**.
+///
+/// The origin serves the same cacheable megabyte at every path, and reads
+/// the first path segment as the name of the one defect to introduce into
+/// it: a `Cache-Control` directive, a content coding, a missing
+/// `Accept-Ranges`, and so on. So every case here is paired with the same
+/// response minus its defect, on a URL of its own, and the pair is the whole
+/// assertion -- the defective one stores nothing, the control stores its four
+/// chunks. A case that failed for some *other* reason would take its control
+/// down with it.
+///
+/// That pairing is the point. The origin this test used to run against
+/// emitted `Accept-Ranges: bytes` from one arm only, so six of its seven
+/// paths were refused for a rule none of them was written to exercise and the
+/// test passed with every one of those rules deleted.
 ///
 /// The refusals are deliberately more than the letter of HTTP asks for. A
 /// store that never revalidates cannot honour `no-cache` or a `max-age` of
 /// zero any other way; an origin that has not said it answers ranges must not
-/// have one answered out of the cache later; and a body under a content
-/// coding is not the body the framing headers a hit writes would describe.
+/// have one answered out of the cache later; a body under a content coding is
+/// not the body the framing headers a hit writes would describe; and an
+/// entity the origin will not identify is one no later read could tell a
+/// second generation of from the first.
 #[test]
 fn nothing_the_rules_refuse_is_cached() -> anyhow::Result<()> {
     let fixture = fixture_with(Origin::start_with(
@@ -977,22 +993,70 @@ fn nothing_the_rules_refuse_is_cached() -> anyhow::Result<()> {
                 .collect::<Vec<_>>()
                 .join("\n")
                 .into_bytes();
-            let (extra, body) = match request.target() {
-                "/no-store.mp4" => ("Cache-Control: no-store\r\n", body),
-                "/no-cache.mp4" => ("Cache-Control: no-cache\r\n", body),
-                "/private.mp4" => ("Cache-Control: private, max-age=600\r\n", body),
-                "/max-age-0.mp4" => ("Cache-Control: max-age=0\r\n", body),
-                "/coded.mp4" => ("Content-Encoding: gzip\r\n", body),
-                "/live.m3u8" => ("Content-Type: application/x-mpegurl\r\n", playlist),
-                // No `Accept-Ranges` at all: this origin has never said a
-                // range is a thing it answers.
-                "/no-ranges.mp4" => ("", body),
-                _ => ("Accept-Ranges: bytes\r\n", body),
-            };
+            // `/<shape>/<defect>/<name>`: the shape of the response, the one
+            // thing wrong with it, and a name to keep one case's cache entry
+            // out of another's. Nothing else about the response varies.
+            let mut segments = request.target().trim_start_matches('/').split('/');
+            let shape = segments.next().unwrap_or_default().to_string();
+            let defect = segments.next().unwrap_or_default().to_string();
+            let mut content_type = "video/mp4".to_string();
+            let mut body = body;
+            let mut extra = String::new();
+            let mut accept_ranges = true;
+            let mut content_length = true;
+            let mut etag = true;
+            match defect.as_str() {
+                "none" => {}
+                "no-store" => extra.push_str("Cache-Control: no-store\r\n"),
+                "no-cache" => extra.push_str("Cache-Control: no-cache\r\n"),
+                "private" => extra.push_str("Cache-Control: private, max-age=600\r\n"),
+                "max-age-0" => extra.push_str("Cache-Control: max-age=0\r\n"),
+                "coded" => extra.push_str("Content-Encoding: gzip\r\n"),
+                "playlist" => {
+                    content_type = "application/x-mpegurl".to_string();
+                    body = playlist;
+                }
+                "no-ranges" => accept_ranges = false,
+                "no-length" => content_length = false,
+                "no-validator" => etag = false,
+                other => panic!("the test asked for a defect the origin does not serve: {other}"),
+            }
+            // A `206` a byte short of the whole entity. It is what the
+            // playlist rule needs to be *reachable*: a playlist that is the
+            // whole body is replaced by the rewrite, which never reaches the
+            // cache at all, so the only response the rule itself decides is
+            // the fragment the rewrite declines to touch.
+            if shape == "fragment" {
+                body.truncate(ORIGIN_LENGTH - 1);
+            }
             let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nETag: {ORIGIN_ETAG}\r\n{extra}\
-                 Content-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
+                "HTTP/1.1 {}\r\nContent-Type: {content_type}\r\n{extra}{}{}{}\
+                 Connection: close\r\n\r\n",
+                if shape == "fragment" {
+                    format!(
+                        "206 Partial Content\r\nContent-Range: bytes 0-{}/{ORIGIN_LENGTH}",
+                        ORIGIN_LENGTH - 2
+                    )
+                } else {
+                    "200 OK".to_string()
+                },
+                if accept_ranges {
+                    "Accept-Ranges: bytes\r\n"
+                } else {
+                    ""
+                },
+                if etag {
+                    format!("ETag: {ORIGIN_ETAG}\r\n")
+                } else {
+                    String::new()
+                },
+                if content_length {
+                    format!("Content-Length: {}\r\n", body.len())
+                } else {
+                    // Close-delimited instead, which is a body whose length
+                    // the origin never states.
+                    String::new()
+                },
             );
             let _ = socket.write_all(head.as_bytes());
             if request.line.starts_with("GET") {
@@ -1005,41 +1069,114 @@ fn nothing_the_rules_refuse_is_cached() -> anyhow::Result<()> {
     let client = reqwest::blocking::Client::new();
     let proxied = |path: &str| format!("{}/proxy/d={}{path}", fixture.base, encode(&origin));
 
-    for path in [
-        "/no-store.mp4",
-        "/no-cache.mp4",
-        "/private.mp4",
-        "/max-age-0.mp4",
-        "/coded.mp4",
-        "/live.m3u8",
-        "/no-ranges.mp4",
+    // Each defect against the same response without it, in the same shape.
+    // `held` is what the store held before the pair, so both halves are
+    // counted against the same starting point.
+    let mut held = 0;
+    for (shape, defect) in [
+        ("whole", "no-store"),
+        ("whole", "no-cache"),
+        ("whole", "private"),
+        ("whole", "max-age-0"),
+        ("whole", "coded"),
+        ("fragment", "playlist"),
+        ("whole", "no-ranges"),
+        ("whole", "no-length"),
+        ("whole", "no-validator"),
     ] {
-        let response = client.get(proxied(path)).send()?;
-        assert_eq!(response.status(), reqwest::StatusCode::OK, "{path}");
-        assert!(!response.bytes()?.is_empty(), "{path}");
+        // Three chunks in a fragment a byte short of the entity, four in a
+        // whole one.
+        let kept = if shape == "fragment" { 3 } else { 4 };
+        let response = client
+            .get(proxied(&format!("/{shape}/{defect}/film.mp4")))
+            .send()?;
+        assert!(response.status().is_success(), "{defect}");
+        assert!(!response.bytes()?.is_empty(), "{defect}");
         fixture.origin.next_request();
         assert_eq!(
             cached_chunks(&fixture).len(),
-            0,
-            "{path} must not be cached"
+            held,
+            "{defect} must not be cached"
+        );
+
+        // The same response, the same shape, the same length, the same
+        // everything but the defect -- and it is kept. So the assertion
+        // above is about the rule and not about the origin, the body or the
+        // fixture.
+        let control = client
+            .get(proxied(&format!("/{shape}/none/{defect}.mp4")))
+            .send()?;
+        assert!(!control.bytes()?.is_empty(), "{defect} control");
+        fixture.origin.next_request();
+        held += kept;
+        wait_for_chunks(&fixture, held);
+        assert_eq!(
+            cached_chunks(&fixture).len(),
+            held,
+            "{defect} control caches its chunks and nothing else does"
         );
     }
 
-    // A `HEAD` describes a body it does not carry, and an `h=` naming a
-    // credential is refused outright rather than keyed: `/proxy` takes no
-    // bearer token of its own, so an entry one caller's secret filled is one
-    // any other caller could name.
-    let head = client.head(proxied("/plain.mp4")).send()?;
+    // The `long-type` rule has no case here and cannot have one. A content
+    // type past what one directory name holds is refused
+    // (`proxy_cache::can_be_filed`), and if it were not, every chunk write of
+    // that response would fail its own `mkdir` -- so nothing is cached either
+    // way and no origin can tell the two apart. What the rule buys is that
+    // the failure is a decision rather than a line in the log per chunk, and
+    // it is pinned where that is visible: beside the function, in
+    // `proxy_cache`'s own tests.
+    //
+    // And the refusals that are about the *request* rather than the
+    // response. What each of them refuses is an **entry**, not a response, so
+    // "nothing new was cached" does not isolate any of them -- a `HEAD` has
+    // no body to store whatever the rule says. What does isolate them is the
+    // other half of an entry: the read. Each entity below is filled by an
+    // ordinary `GET` first, and the refused request is then made against a
+    // store that holds the whole of it. A rule that stopped working would
+    // answer that request off disk, and the origin would never hear it.
+    //
+    // A `HEAD` describes a body it does not carry; an `If-Range` is a
+    // conditional, and answering one out of a store that never revalidates
+    // would be inventing the condition's answer; an `h=` naming a credential
+    // is refused outright rather than keyed, since `/proxy` takes no bearer
+    // token of its own and an entry one caller's secret filled is one any
+    // other caller could name.
+    for path in [
+        "/whole/none/head.mp4",
+        "/whole/none/conditional.mp4",
+        "/whole/none/authenticated.mp4",
+    ] {
+        let response = client.get(proxied(path)).send()?;
+        assert_eq!(response.bytes()?.len(), ORIGIN_LENGTH);
+        fixture.origin.next_request();
+        held += 4;
+        wait_for_chunks(&fixture, held);
+    }
+
+    let head = client.head(proxied("/whole/none/head.mp4")).send()?;
     assert_eq!(head.status(), reqwest::StatusCode::OK);
-    fixture.origin.next_request();
-    assert_eq!(
-        cached_chunks(&fixture).len(),
-        0,
-        "a HEAD has no body to keep"
+    assert!(
+        head.bytes()?.is_empty(),
+        "a HEAD carries no body, from the cache or from anywhere else"
+    );
+    assert!(
+        fixture.origin.next_request().line.starts_with("HEAD"),
+        "a HEAD has no body to keep, so it has no entry to read from either"
+    );
+
+    let conditional = client
+        .get(proxied("/whole/none/conditional.mp4"))
+        .header(reqwest::header::RANGE, "bytes=0-")
+        .header(reqwest::header::IF_RANGE, ORIGIN_ETAG)
+        .send()?;
+    assert_eq!(conditional.bytes()?.len(), ORIGIN_LENGTH);
+    assert!(
+        fixture.origin.next_request().header("if-range").is_some(),
+        "a conditional cannot be answered by a store that never revalidates"
     );
 
     let authenticated = format!(
-        "{}/proxy/d={}&h={}/plain.mp4",
+        "{}/proxy/d={}&h={}/whole/none/authenticated.mp4",
         fixture.base,
         encode(&origin),
         encode("Authorization:Bearer s3cret")
@@ -1049,24 +1186,28 @@ fn nothing_the_rules_refuse_is_cached() -> anyhow::Result<()> {
     assert_eq!(
         fixture.origin.next_request().header("authorization"),
         Some("Bearer s3cret"),
-        "the credential still travels; it is the keeping that is refused"
+        "the credential still travels; it is the entry that is refused, both \
+         the writing of one and the reading of one"
     );
-    assert_eq!(cached_chunks(&fixture).len(), 0);
 
-    // And the same fixture, asked plainly, does cache -- so every assertion
-    // above is about the rule and not about the origin.
-    let response = client.get(proxied("/plain.mp4")).send()?;
-    assert_eq!(response.bytes()?.len(), ORIGIN_LENGTH);
-    fixture.origin.next_request();
-    wait_for_chunks(&fixture, 4);
+    assert_eq!(
+        cached_chunks(&fixture).len(),
+        held,
+        "and none of the three left anything behind either"
+    );
 
     // A request with no `Range` is answered from the cache only when the
-    // whole entity is there -- which it now is.
-    let response = client.get(proxied("/plain.mp4")).send()?;
+    // whole entity is there -- which for this one it now is.
+    let response = client.get(proxied("/whole/none/head.mp4")).send()?;
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     assert_eq!(
         header(response.headers(), "content-length"),
         Some(ORIGIN_LENGTH.to_string()).as_deref()
+    );
+    assert_eq!(
+        header(response.headers(), "etag"),
+        Some(ORIGIN_ETAG),
+        "and labelled with the validator the entity is filed under"
     );
     assert_eq!(response.bytes()?.len(), ORIGIN_LENGTH);
     assert!(fixture.origin.was_asked_for_nothing_more());
@@ -4548,6 +4689,10 @@ fn cached_chunks(fixture: &Fixture) -> Vec<std::path::PathBuf> {
                 && path
                     .components()
                     .any(|component| component.as_os_str() == ".proxy")
+                // A chunk still being written is not one the cache holds --
+                // it has no name a read would look at. Counting them made a
+                // waiting test return on a chunk that had not landed yet.
+                && !path.to_string_lossy().ends_with(".part")
         })
         .collect()
 }
