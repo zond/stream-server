@@ -13,6 +13,14 @@ librqbit = { git = "https://github.com/zond/rqbit", rev = "60b1d2461fab76679254b
     "rust-tls",
     "http-api-client",
 ] }
+# `librqbit` does not re-export `librqbit_core::lengths::ValidPieceIndex`, which
+# `TorrentStorage::has_piece` and `on_piece_completed` take, so a storage
+# implemented outside the crate has to name the type itself. Same git rev as
+# `librqbit` -- a second copy of these types would be a different `ValidPieceIndex`
+# and would not satisfy the trait. `default-features=false` keeps its
+# `sha1-crypto-hash` default out of the feature union, which is what the note
+# above is protecting.
+librqbit-core = { git = "https://github.com/zond/rqbit", rev = "60b1d2461fab76679254bad17f6a5c995d29137f", default-features = false }
 tokio = { version = "1.42.0", features = [
     "rt-multi-thread",
     "macros",

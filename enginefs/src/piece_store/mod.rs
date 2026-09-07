@@ -13,7 +13,16 @@
 //!   bitfield flush left a crash window in which the recorded haves were
 //!   holes.
 //! * **Piece presence is the have-set.** There is no record of ours for a
-//!   crash to leave disagreeing with the disk; the disk *is* the record.
+//!   crash to leave disagreeing with the disk; the disk *is* the record. That
+//!   is why a piece's bytes are written under a staging name and renamed into
+//!   place only once librqbit's hash check has passed
+//!   ([`store::STAGING_SUFFIX`]): presence has to mean *complete*, and a
+//!   file created by a piece's first 16 KiB chunk is there for the whole of
+//!   the download. The errors are not symmetric -- a wrong "no" costs a
+//!   re-download, a wrong "yes" leaves a have-bit standing over bytes nothing
+//!   verified, and the fastresume check that might have caught it samples
+//!   ~65 pieces of a torrent however large.
+//!
 //!   With one exception, stated here because this is where the invariant is
 //!   claimed: a piece lying *entirely* inside a BEP-47 padding file has no
 //!   owner to write it, so it never gets a file and
@@ -24,7 +33,10 @@
 //!   that no write ever justified, which is the failure mode this design
 //!   exists to remove, so the hole is named rather than filled. A conforming
 //!   torrent cannot open one anyway: padding runs to the next piece boundary
-//!   and is therefore always shorter than a piece.
+//!   and is therefore always shorter than a piece. The question
+//!   [`librqbit::storage::TorrentStorage::has_piece`] asks is a different one
+//!   -- "can this storage have lost the piece?" -- and for such a piece the
+//!   answer is no, so it does not have the hole.
 //! * **It is not an rqbit core change.** `TorrentStorage` and `StorageFactory`
 //!   are existing public seams, and enginefs reads through
 //!   `librqbit::FileStreamOptions` rather than opening files itself, so this

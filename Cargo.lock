@@ -1128,6 +1128,7 @@ dependencies = [
  "futures",
  "hex",
  "librqbit",
+ "librqbit-core",
  "memmap2",
  "moka",
  "parking_lot",

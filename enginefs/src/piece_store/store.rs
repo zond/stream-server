@@ -28,6 +28,19 @@ use super::layout::{FileSpec, PieceLayout};
 /// directory listing by hand than the shift it saves.
 pub const PIECES_PER_DIRECTORY: u32 = 1000;
 
+/// What a piece file is called while it is still being written.
+///
+/// A piece arrives 16 KiB at a time, so a file created by its first chunk is
+/// there for the whole of the download -- and the storage contract is that
+/// presence means **complete**, because a wrong "yes" is not a re-download but
+/// silent corruption: the have-set a restart starts from is the resume data
+/// intersected with what the storage says it still holds, the intersection can
+/// only clear bits, and the fastresume hash check samples ~65 pieces of a
+/// torrent however large. So the bytes go to this name and are renamed into
+/// place in [`TorrentStorage::on_piece_completed`], which runs after the hash
+/// check. A rename within one directory is atomic on every filesystem here.
+pub const STAGING_SUFFIX: &str = ".part";
+
 /// A read asked for a piece that is not on disk.
 ///
 /// Distinct from an I/O failure on purpose. Under this design the presence of
@@ -103,37 +116,126 @@ impl PieceStore {
         &self.layout
     }
 
-    /// Where one piece is stored.
+    /// Where one piece is stored once it is whole.
     pub fn piece_path(&self, piece: u32) -> PathBuf {
         piece_path(&self.dir, piece)
     }
 
-    /// Whether a piece is on disk at all. Not whether it is *complete*: a
-    /// piece written by half its chunks has a short file, and only a hash
-    /// check can tell the difference.
+    /// Where its bytes go while it is being written -- see
+    /// [`STAGING_SUFFIX`].
+    pub fn staging_path(&self, piece: u32) -> PathBuf {
+        staging_path(&self.dir, piece)
+    }
+
+    /// Whether this piece is on disk, **complete**. A piece halfway through
+    /// being downloaded is not: its bytes are under [`Self::staging_path`]
+    /// until the hash check passes.
     ///
     /// False for ever for a piece lying entirely inside a BEP-47 padding
     /// file: nobody transfers those bytes, so nothing ever writes it. That is
     /// the one hole in "piece presence is the have-set", and the module docs
     /// say why it is left open rather than papered over with an empty file.
+    /// [`TorrentStorage::has_piece`] answers a different question and does not
+    /// have that hole -- see there.
     pub fn has_piece(&self, piece: u32) -> bool {
         self.piece_path(piece).is_file()
+    }
+
+    /// Promote a written piece to a complete one. Nothing may read it as ours
+    /// before this returns and everything may afterwards, so this is the
+    /// single instant at which the have-record for a piece comes into being.
+    ///
+    /// Idempotent in the direction that matters: called for a piece already in
+    /// place with nothing staged, it says so rather than failing, because
+    /// librqbit logs a failure here at debug and marks the piece have anyway.
+    pub fn complete_piece(&self, piece: u32) -> anyhow::Result<()> {
+        let staged = self.staging_path(piece);
+        let path = self.piece_path(piece);
+        match std::fs::rename(&staged, &path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound && path.is_file() => Ok(()),
+            Err(e) => Err(anyhow::Error::new(e).context(format!(
+                "could not move the completed piece {} into place at {}",
+                staged.display(),
+                path.display()
+            ))),
+        }
     }
 
     /// Reclaim one piece. This is the entry point the policy layer drives;
     /// it is deliberately not on the storage trait, because librqbit has no
     /// concept of giving a verified piece back.
     ///
+    /// Takes the staged copy with it. A piece being downloaded again over one
+    /// the caller is releasing has both, and half of a piece nobody wants is
+    /// worth exactly as little as the whole of it.
+    ///
     /// Returns whether a file was actually removed, so a caller counting what
     /// it freed does not have to stat first.
     pub fn delete_piece(&self, piece: u32) -> anyhow::Result<bool> {
-        let path = self.piece_path(piece);
-        match std::fs::remove_file(&path) {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(anyhow::Error::new(e)
-                .context(format!("could not delete piece file {}", path.display()))),
+        let mut removed = false;
+        for path in [self.staging_path(piece), self.piece_path(piece)] {
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed = true,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(anyhow::Error::new(e)
+                        .context(format!("could not delete piece file {}", path.display())));
+                }
+            }
         }
+        Ok(removed)
+    }
+
+    /// Whether any file of the torrent owns payload bytes in this piece.
+    ///
+    /// False only for a piece lying entirely inside padding or zero-length
+    /// files, which nothing transfers and nothing ever writes.
+    fn piece_has_an_owner(&self, piece: u32) -> bool {
+        self.layout
+            .files_overlapping_piece(piece)
+            .any(|file| self.layout.owns_bytes(file))
+    }
+
+    /// Throw away staged bytes that shadow a piece we already have whole.
+    ///
+    /// A read prefers the staged copy, because the one time both exist within
+    /// a session is a piece being downloaded again over one the policy layer
+    /// dropped but has not deleted yet, and it is the new bytes the hash check
+    /// has to see. A process that dies mid-re-download leaves that pair behind
+    /// with the chunk bookkeeping that explained it gone, and the stale half
+    /// would then shadow a verified piece for reads *and* for peers, since the
+    /// complete file still standing is what makes it ours.
+    ///
+    /// A staged piece with no complete copy is left alone: it shadows nothing,
+    /// [`Self::has_piece`] is false for it, and a pause is allowed to keep its
+    /// in-flight work.
+    fn discard_shadowing_staged(&self) -> anyhow::Result<()> {
+        let buckets = match std::fs::read_dir(&self.dir) {
+            Ok(buckets) => buckets,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "could not read piece directory {}",
+                    self.dir.display()
+                )));
+            }
+        };
+        for bucket in buckets.flatten() {
+            let Ok(entries) = std::fs::read_dir(bucket.path()) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let staged = entry.path();
+                if staged.extension().is_none_or(|ext| ext != "part") {
+                    continue;
+                }
+                if staged.with_extension("").is_file() {
+                    let _ = std::fs::remove_file(&staged);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn ensure_live(&self) -> anyhow::Result<()> {
@@ -150,7 +252,7 @@ impl PieceStore {
     /// that have gone empty, so a bucket really can disappear between one
     /// write and the next.
     fn open_for_write(&self, piece: u32) -> anyhow::Result<File> {
-        let path = self.piece_path(piece);
+        let path = self.staging_path(piece);
         let mut opts = OpenOptions::new();
         opts.write(true).create(true).truncate(false);
         match opts.open(&path) {
@@ -169,7 +271,27 @@ impl PieceStore {
         }
     }
 
+    /// The newest copy of a piece: the staged one if there is one, the
+    /// complete one otherwise.
+    ///
+    /// That order and not the other. The two exist together only while a piece
+    /// the policy layer dropped is being downloaded again before its old copy
+    /// has been deleted, and the read that decides whether to keep the new
+    /// bytes is the hash check itself -- served the old copy it would pass over
+    /// bytes nothing wrote and promote whatever the new download had managed
+    /// so far. Reading the newer copy cannot go wrong the other way, because
+    /// rqbit does not count a piece it is downloading as ours: a peer's request
+    /// for it is refused before it reaches storage, and a stream waits.
     fn open_for_read(&self, piece: u32) -> anyhow::Result<File> {
+        let staged = self.staging_path(piece);
+        match File::open(&staged) {
+            Ok(f) => return Ok(f),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(anyhow::Error::new(e)
+                    .context(format!("could not open staged piece {}", staged.display())));
+            }
+        }
         let path = self.piece_path(piece);
         match File::open(&path) {
             Ok(f) => Ok(f),
@@ -189,10 +311,20 @@ pub(super) fn piece_path(dir: &Path, piece: u32) -> PathBuf {
     path
 }
 
+/// The same path with [`STAGING_SUFFIX`] on it: in the same bucket directory,
+/// so promoting it is a rename and not a move across directories.
+pub(super) fn staging_path(dir: &Path, piece: u32) -> PathBuf {
+    let mut path = piece_path(dir, piece).into_os_string();
+    path.push(STAGING_SUFFIX);
+    path.into()
+}
+
 impl TorrentStorage for PieceStore {
     /// Nothing to open and nothing to pre-allocate -- just the torrent's own
-    /// directory, so the first write does not have to race to create it. The
-    /// bucket directories are made on demand.
+    /// directory, so the first write does not have to race to create it, and
+    /// the one piece of reconciliation the store owes a fresh process
+    /// ([`Self::discard_shadowing_staged`]). The bucket directories are made on
+    /// demand.
     fn init(
         &mut self,
         _shared: &librqbit::ManagedTorrentShared,
@@ -200,7 +332,7 @@ impl TorrentStorage for PieceStore {
     ) -> anyhow::Result<()> {
         std::fs::create_dir_all(&self.dir)
             .with_context(|| format!("could not create piece directory {}", self.dir.display()))?;
-        Ok(())
+        self.discard_shadowing_staged()
     }
 
     fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
@@ -324,6 +456,40 @@ impl TorrentStorage for PieceStore {
     /// carries on when this fails, so the honest answer is to succeed.
     fn ensure_file_length(&self, _file_id: usize, _length: u64) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// Make a downloaded piece ours. Called after the hash check, so this is
+    /// where the staged bytes become the have-record -- see
+    /// [`Self::complete_piece`] and [`STAGING_SUFFIX`].
+    fn on_piece_completed(
+        &self,
+        piece_index: librqbit_core::lengths::ValidPieceIndex,
+    ) -> anyhow::Result<()> {
+        self.complete_piece(piece_index.get())
+    }
+
+    /// Whether the data of this piece is still here, complete.
+    ///
+    /// This is what keeps the have-bitfield honest across a crash: librqbit
+    /// starts from the resume data intersected with this, and the intersection
+    /// can only clear bits. It has to be implemented here precisely because
+    /// this store *can* lose a single piece behind librqbit's back -- that is
+    /// what it is for -- and the default answer of "yes, and I would know
+    /// otherwise" is right only for a storage that grows files and never
+    /// punches holes in them.
+    ///
+    /// A piece with no owner answers yes. It lies entirely inside padding or
+    /// zero-length files, nothing ever transfers or writes those bytes, so
+    /// there is no file for [`Self::has_piece`] to find and there never will
+    /// be -- and a piece nothing can write is a piece nothing can lose, which
+    /// is exactly the question being asked. Saying no instead would clear a
+    /// have-bit for a piece no download can ever set again.
+    fn has_piece(
+        &self,
+        piece_index: librqbit_core::lengths::ValidPieceIndex,
+    ) -> anyhow::Result<bool> {
+        let piece = piece_index.get();
+        Ok(self.has_piece(piece) || !self.piece_has_an_owner(piece))
     }
 
     /// Hand the data path to a successor and go dead, which is how librqbit
@@ -520,9 +686,26 @@ mod tests {
     }
 
     /// Write every payload file the way librqbit does: in small chunks whose
-    /// alignment to pieces is whatever the file's own offset makes it. Padding
-    /// files are not written, because librqbit never writes one.
+    /// alignment to pieces is whatever the file's own offset makes it, and then
+    /// complete every piece the writes finished. Padding files are not written,
+    /// because librqbit never writes one.
+    ///
+    /// The completion step is not ceremony. Bytes land under the staging name
+    /// and only [`PieceStore::complete_piece`] makes a piece ours, so a fill
+    /// that skipped it would leave a store with nothing in it as far as
+    /// [`PieceStore::has_piece`] is concerned -- which is the whole point.
     fn fill(store: &PieceStore, global: &[u8], chunk: u64) {
+        write_only(store, global, chunk);
+        for piece in 0..store.layout().piece_count() {
+            if store.piece_has_an_owner(piece) {
+                store.complete_piece(piece).expect("complete");
+            }
+        }
+    }
+
+    /// [`fill`] without the completion step: what a download in flight looks
+    /// like.
+    fn write_only(store: &PieceStore, global: &[u8], chunk: u64) {
         for (file_id, spec) in SPECS.iter().enumerate() {
             if spec.padding {
                 continue;
@@ -644,6 +827,9 @@ mod tests {
         let store = open_store(tmp.path(), piece_length, &specs);
         let payload = vec![0xa5u8; piece_length as usize * 4];
         store.pwrite_all(0, 0, &payload).unwrap();
+        for piece in 0..4 {
+            store.complete_piece(piece).unwrap();
+        }
 
         let before = allocated(tmp.path());
         assert!(
@@ -657,6 +843,164 @@ mod tests {
             "deleting a piece freed {} bytes, not the {piece_length} it held",
             before - after
         );
+    }
+
+    /// Ask the storage trait's own question, which needs a `ValidPieceIndex`
+    /// and therefore the torrent's `Lengths`.
+    fn storage_has_piece(store: &PieceStore, piece: u32) -> bool {
+        let lengths = librqbit_core::lengths::Lengths::new(
+            store.layout().total_length(),
+            store.layout().default_piece_length() as u32,
+        )
+        .expect("lengths");
+        TorrentStorage::has_piece(
+            store,
+            lengths.validate_piece_index(piece).expect("in range"),
+        )
+        .expect("has_piece")
+    }
+
+    /// A piece is ours at one instant and not before: the one where the hash
+    /// check has passed and `on_piece_completed` moves it into place. A wrong
+    /// "yes" here is not a re-download, it is a have-bit standing over bytes
+    /// nothing verified.
+    #[test]
+    fn a_piece_is_not_ours_until_it_is_complete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path(), PIECE_LENGTH, &SPECS);
+        let global = global_bytes(store.layout().total_length());
+
+        // File 0's first chunk. It creates piece 0's file, and the obvious
+        // answer -- "there is a file" -- would say yes for the whole of the
+        // download.
+        store.pwrite_all(0, 0, &global[0..2]).unwrap();
+        assert!(store.staging_path(0).is_file(), "the bytes are on disk");
+        assert!(!store.has_piece(0), "and the piece is not ours yet");
+        assert!(!storage_has_piece(&store, 0));
+
+        write_only(&store, &global, 4);
+        assert!(!store.has_piece(0), "still not, with every byte written");
+        store.complete_piece(0).unwrap();
+        assert!(store.has_piece(0) && storage_has_piece(&store, 0));
+        assert!(
+            !store.staging_path(0).exists(),
+            "and the staged name is gone"
+        );
+        assert_eq!(std::fs::read(store.piece_path(0)).unwrap(), global[0..8]);
+        assert!(!store.has_piece(2), "the others are untouched by it");
+
+        store
+            .complete_piece(0)
+            .expect("completing a piece already in place is not a failure");
+    }
+
+    /// A piece nothing can write is a piece nothing can lose. Piece 1 here is
+    /// the payload end of file 0 plus padding, so it does get a file; the
+    /// question is asked of a torrent shaped so that a piece has no owner at
+    /// all, which is the hole in "presence is the have-set" the module doc
+    /// names.
+    #[test]
+    fn a_piece_no_file_owns_can_never_be_lost() {
+        let specs = [
+            FileSpec::payload(8),
+            FileSpec::padding(8),
+            FileSpec::payload(8),
+        ];
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path(), PIECE_LENGTH, &specs);
+        assert!(store.piece_has_an_owner(0) && store.piece_has_an_owner(2));
+        assert!(!store.piece_has_an_owner(1), "piece 1 is padding alone");
+
+        assert!(!store.has_piece(1), "nothing will ever write it");
+        assert!(
+            storage_has_piece(&store, 1),
+            "so it cannot go missing, and answering no would clear a have-bit \
+             no download could ever set again"
+        );
+        assert!(
+            !storage_has_piece(&store, 0),
+            "a piece with an owner is not"
+        );
+    }
+
+    /// The one time a piece has two copies is a dropped piece being downloaded
+    /// again before the policy layer has deleted the old one, and the read that
+    /// decides whether to keep the new bytes is the hash check itself.
+    #[test]
+    fn a_read_gets_the_newest_copy_of_a_piece() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path(), PIECE_LENGTH, &SPECS);
+        let global = global_bytes(store.layout().total_length());
+        fill(&store, &global, 8);
+
+        // Piece 2 is file 2's alone, and file 2 starts there.
+        let again: Vec<u8> = global[16..24].iter().map(|b| !b).collect();
+        store.pwrite_all(2, 0, &again).unwrap();
+        assert!(
+            store.has_piece(2),
+            "the complete copy is still there: it is what the caller has not \
+             released yet"
+        );
+        let mut buf = [0u8; 8];
+        store.pread_exact(2, 0, &mut buf).unwrap();
+        assert_eq!(buf.to_vec(), again, "a read gets what was written last");
+
+        store.complete_piece(2).unwrap();
+        assert_eq!(std::fs::read(store.piece_path(2)).unwrap(), again);
+        store.pread_exact(2, 0, &mut buf).unwrap();
+        assert_eq!(buf.to_vec(), again);
+    }
+
+    /// The pair above is explained by bookkeeping that does not survive the
+    /// process. What is left after a kill is a half-written copy shadowing a
+    /// piece we really do have -- and the complete file is what makes it ours,
+    /// so peers would be served the shadow. `init` is where that is undone.
+    #[test]
+    fn a_stale_staged_copy_over_a_complete_piece_goes_at_init() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path(), PIECE_LENGTH, &SPECS);
+        let global = global_bytes(store.layout().total_length());
+        fill(&store, &global, 8);
+        store.pwrite_all(2, 0, &[0u8; 3]).unwrap();
+        // And a piece whose only copy is staged: in flight when the process
+        // died, shadowing nothing.
+        store.delete_piece(0).unwrap();
+        store.pwrite_all(0, 0, &global[0..4]).unwrap();
+
+        // What `init` does on the next launch, which is the only place a
+        // half-written piece can be told apart from one being written now.
+        store.discard_shadowing_staged().unwrap();
+
+        assert!(!store.staging_path(2).exists(), "the shadow went");
+        let mut buf = [0u8; 8];
+        store.pread_exact(2, 0, &mut buf).unwrap();
+        assert_eq!(buf, global[16..24], "and the verified piece is what reads");
+        assert!(
+            store.staging_path(0).is_file(),
+            "a staged piece with nothing behind it shadows nothing and stays"
+        );
+        assert!(!store.has_piece(0));
+    }
+
+    /// Deleting a piece takes both copies. Half of a piece nobody wants is
+    /// worth exactly as little as the whole of it.
+    #[test]
+    fn deleting_a_piece_takes_the_staged_copy_with_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path(), PIECE_LENGTH, &SPECS);
+        let global = global_bytes(store.layout().total_length());
+        fill(&store, &global, 8);
+        store.pwrite_all(2, 0, &[0u8; 3]).unwrap();
+        assert!(store.staging_path(2).is_file() && store.piece_path(2).is_file());
+
+        assert!(store.delete_piece(2).unwrap());
+        assert!(!store.staging_path(2).exists() && !store.piece_path(2).exists());
+        assert!(!store.delete_piece(2).unwrap(), "and it stays idempotent");
+
+        // Same for a file being removed, which goes through delete_piece.
+        store.pwrite_all(0, 0, &[0u8; 3]).unwrap();
+        store.remove_file(0, Path::new("f0")).unwrap();
+        assert!(!store.staging_path(0).exists() && !store.piece_path(0).exists());
     }
 
     /// Removing one file must not take a boundary piece its neighbour still
@@ -771,6 +1115,7 @@ mod tests {
         let store = open_store(tmp.path(), piece_length, &specs);
         for piece in 0..pieces {
             store.pwrite_all(0, piece * piece_length, &[7u8]).unwrap();
+            store.complete_piece(piece as u32).unwrap();
         }
 
         let mut buckets = 0usize;
@@ -949,6 +1294,14 @@ mod librqbit_tests {
                     .pwrite_all(file_id, (n * 3000) as u64, chunk)
                     .expect("write");
             }
+        }
+        // Every piece is whole, so promote them all: until that happens the
+        // store holds no piece at all, which is what makes presence mean
+        // complete.
+        for piece in 0..layout.piece_count() {
+            assert!(!store.has_piece(piece), "staged, not ours");
+            store.complete_piece(piece).expect("complete");
+            assert!(store.has_piece(piece));
         }
         empty
             .delete(handle.info_hash().into(), false)
