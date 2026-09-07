@@ -63,9 +63,12 @@ impl CleanSchedule {
 ///
 /// Not a fresh guess: `routes::stream::ensure_download_disk_ready` already
 /// refuses to stream to disk unless this much is free on top of what the
-/// request needs, and degrades that request to memory-only when it is not.
-/// Below this line the server has therefore already decided the disk is
-/// unusable, so it is exactly the line the cleaner must keep the cache out
+/// request needs -- a failed check runs one pass of this cleaner and, if the
+/// disk is still short, answers the stream `507 Insufficient Storage`. (It
+/// used to say it "degraded the request to memory-only"; there is no
+/// memory-only engine, and the fallback re-selected the same disk-backed
+/// one.) Below this line the server has therefore already decided the disk
+/// is unusable, so it is exactly the line the cleaner must keep the cache out
 /// of -- one constant, so the check that gives up on the disk and the
 /// cleaner whose job is to stop it coming to that cannot drift apart. (One
 /// constant, two readings: the cleaner asks `fs4::available_space`, which
