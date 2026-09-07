@@ -935,6 +935,58 @@ struct CacheableEntity {
     validator: EntityValidator,
 }
 
+/// Why a cached head may **not** go in front of the body the origin just
+/// sent, or `None` when it may. One reason per condition, in the words the
+/// log then reports: every one of them ends the same way -- the head is
+/// dropped and the origin's own answer relayed -- so what a reader has to
+/// be told apart is which of them happened.
+///
+/// The conditions themselves are argued for where the join is made; this
+/// only names them.
+fn stitch_refusal(
+    cached: &crate::proxy_cache::Cached,
+    status: StatusCode,
+    res_headers: &HeaderMap,
+    is_playlist: bool,
+    encoded_body: bool,
+) -> Option<&'static str> {
+    if status != StatusCode::PARTIAL_CONTENT {
+        // Including the `200` an origin answers when it ignored the narrowed
+        // range, or when the `If-Range` it honoured found the head stale:
+        // what came back is the whole entity, and there is nothing to put in
+        // front of it.
+        return Some("the origin did not answer a 206, so what it sent is not a tail");
+    }
+    if is_playlist {
+        // Reachable without any narrowing bug: the classification a hit is
+        // put through asks about the type the *store* filed, and this one
+        // asks about the type the origin just sent. An entity that became a
+        // playlist between the two is one whose head we hold and whose tail
+        // is rewritten whole.
+        return Some("the origin answered with a playlist, which is rewritten whole");
+    }
+    if encoded_body {
+        return Some("the origin answered under a content coding the cached head is not in");
+    }
+    if !EntityValidator::of(res_headers)
+        .is_some_and(|validator| validator.filed() == cached.validator)
+    {
+        return Some("the origin named a different entity than the cached head is filed under");
+    }
+    if !res_headers
+        .get(header::CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_content_range)
+        .is_some_and(|(first, _, total)| first == cached.held_to + 1 && total == cached.total)
+    {
+        return Some(
+            "the origin's content-range does not continue the cached head in an entity of the \
+             same length",
+        );
+    }
+    None
+}
+
 /// The response a cache hit is: framing written from what the store holds,
 /// over bytes that came off disk instead of a socket.
 ///
@@ -1870,6 +1922,9 @@ async fn proxy(
     //   entity of the same length;
     // * it is a `206`, under no content coding, and not a playlist.
     //
+    // [`stitch_refusal`] is those conditions, one reason each, in the words
+    // the refusal is then logged in.
+    //
     // An origin that ignored the narrowed range and sent the whole file
     // (`200`) is answered honestly: the head is dropped and the origin's own
     // response relayed, which costs a re-fetch of bytes we held and nothing
@@ -1889,35 +1944,35 @@ async fn proxy(
     // price of narrowing a range against a store that never revalidates. A
     // broken read is a price worth paying; a silent splice is not, because
     // nothing downstream could ever find out it had been paid.
+    //
+    // A tail that turns out to be a **playlist** costs the same and is not a
+    // stale head either: the hit's classification asked about the type the
+    // store filed, and this one also asks about the URL the body came from,
+    // which only the fetch knows -- a redirect to a `.m3u8` is enough to
+    // turn the verdict over between them. What that answers with is a
+    // playlist fragment relayed unrewritten, which is what a `206` of a
+    // playlist always is here.
     let stitched = match cached {
-        Some(cached)
-            if !is_playlist
-                && !encoded_body
-                && status == StatusCode::PARTIAL_CONTENT
-                && EntityValidator::of(&res_headers)
-                    .is_some_and(|validator| validator.filed() == cached.validator)
-                && res_headers
-                    .get(header::CONTENT_RANGE)
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(parse_content_range)
-                    .is_some_and(|(first, _, total)| {
-                        first == cached.held_to + 1 && total == cached.total
-                    }) =>
-        {
-            Some(cached)
-        }
         Some(cached) => {
-            tracing::warn!(
-                url = %fetched_url,
-                status = %status,
-                cached_total = cached.total,
-                content_range = ?res_headers.get(header::CONTENT_RANGE),
-                same_entity = EntityValidator::of(&res_headers)
-                    .is_some_and(|validator| validator.filed() == cached.validator),
-                "the origin did not answer the narrowed range as a part of the entity the \
-                 cache holds; relaying its answer and dropping what was cached"
-            );
-            None
+            match stitch_refusal(&cached, status, &res_headers, is_playlist, encoded_body) {
+                None => Some(cached),
+                // Which of the conditions failed, said in the log rather than
+                // left for a reader to work out from the fields -- a refusal
+                // reported as some other refusal is a wrong answer about a
+                // wrong answer.
+                Some(reason) => {
+                    tracing::warn!(
+                        url = %fetched_url,
+                        status = %status,
+                        cached_total = cached.total,
+                        content_range = ?res_headers.get(header::CONTENT_RANGE),
+                        reason,
+                        "the cached head is not the head of what the origin answered; relaying \
+                         that answer and dropping what was cached"
+                    );
+                    None
+                }
+            }
         }
         None => None,
     };

@@ -766,6 +766,118 @@ fn an_origin_that_ignores_if_range_is_still_not_spliced() -> anyhow::Result<()> 
     Ok(())
 }
 
+/// The one way a cached head can still meet a playlist tail, and the guard
+/// that keeps them apart.
+///
+/// The hit's classification asks about the type the *store* filed; the
+/// fetch's asks about the URL the body came from, and a redirect to a
+/// `.m3u8` is exactly the shape that turns the verdict over between the two
+/// -- an extension-less URL at an indifferent origin (`application/octet-
+/// stream`), an edge that hands the tail off to a playlist path. Nothing is
+/// stale here: same entity, same validator, the `Content-Range` continues
+/// the head to the byte. Only the verdict changed.
+///
+/// So the head is dropped and the origin's own `206` relayed -- a broken
+/// read the player re-reads, which is the documented price -- rather than a
+/// playlist spliced onto bytes that were never classified as one. It is also
+/// the reason the refusal below has to name *which* condition failed: this
+/// one fails none of the others.
+#[test]
+fn a_tail_that_turned_out_to_be_a_playlist_is_not_joined_to_the_head() -> anyhow::Result<()> {
+    let body = playlist_of(4);
+    let total = body.len();
+    let origin = Origin::start_with(move |request: &Request, socket: &mut TcpStream| {
+        let asked = request.range().and_then(|value| {
+            let (first, last) = value.trim_start_matches("bytes=").split_once('-')?;
+            Some((
+                first.parse::<usize>().ok()?,
+                if last.is_empty() {
+                    total - 1
+                } else {
+                    last.parse::<usize>().ok()?
+                },
+            ))
+        });
+        // The tail is somewhere else, and that somewhere names a playlist.
+        // The head is served where it was asked for.
+        if !request.target().contains("/tail.m3u8") && asked.is_some_and(|(first, _)| first > 0) {
+            let _ = socket.write_all(
+                b"HTTP/1.1 302 Found\r\nLocation: /tail.m3u8\r\nContent-Length: 0\r\n\
+                  Connection: close\r\n\r\n",
+            );
+            let _ = socket.flush();
+            return;
+        }
+        let Some((first, last)) = asked else { return };
+        let _ = socket.write_all(
+            format!(
+                "HTTP/1.1 206 Partial Content\r\nAccept-Ranges: bytes\r\n\
+                 Content-Type: application/octet-stream\r\nETag: \"the-stream\"\r\n\
+                 Content-Range: bytes {first}-{last}/{total}\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                last - first + 1
+            )
+            .as_bytes(),
+        );
+        let _ = socket.write_all(&body[first..=last]);
+        let _ = socket.flush();
+    })?;
+    let fixture = fixture_with(origin)?;
+    let origin = format!("http://{}", fixture.origin.addr);
+    let url = format!("{}/proxy/d={}/stream", fixture.base, encode(&origin));
+    let client = reqwest::blocking::Client::new();
+
+    // The head, filed under a type that is not a playlist's and at a URL
+    // that names no extension.
+    let warm = client
+        .get(&url)
+        .header(reqwest::header::RANGE, format!("bytes=0-{}", CHUNK * 2 - 1))
+        .send()?;
+    assert_eq!(warm.bytes()?.len() as u64, CHUNK * 2);
+    fixture.origin.next_request();
+    wait_for_chunks(&fixture, 2);
+
+    let response = client
+        .get(&url)
+        .header(reqwest::header::RANGE, "bytes=0-")
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        header(response.headers(), "content-range"),
+        Some(format!("bytes {}-{}/{total}", CHUNK * 2, total - 1)).as_deref(),
+        "the origin's own answer, not one claiming a head it never described is in front"
+    );
+    let served = response.bytes()?;
+    assert_eq!(served.len() as u64, CHUNK * 2);
+    assert_eq!(
+        &served[..],
+        &playlist_of(4)[(CHUNK * 2) as usize..],
+        "the tail as the origin sent it"
+    );
+
+    assert_eq!(
+        fixture.origin.next_request().range(),
+        Some(format!("bytes={}-{}", CHUNK * 2, total - 1)).as_deref(),
+        "nothing said this was a playlist until the redirect had been followed"
+    );
+    assert!(
+        fixture
+            .origin
+            .next_request()
+            .target()
+            .contains("/tail.m3u8"),
+        "and it was the URL the tail came from that said so"
+    );
+    assert_eq!(
+        cached_chunks(&fixture).len(),
+        2,
+        "a playlist is not filed, so the store still holds only the head"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
 /// A cache hit and a cache miss classify the same request the same way.
 ///
 /// `r=` is deliberately not in the cache key: it never reaches the origin,
