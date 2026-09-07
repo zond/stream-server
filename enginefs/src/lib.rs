@@ -114,6 +114,11 @@ impl Clock {
 
 type EngineRegistry<H> = Arc<RwLock<HashMap<String, Arc<Engine<H>>>>>;
 
+/// Both ends of every relocation in flight, keyed by info hash. Shared with
+/// the detached half of the move, which is what removes its entry -- see
+/// [`BackendEngineFS::relocate_engine`].
+type RelocationRegistry = Arc<parking_lot::Mutex<HashMap<String, Vec<std::path::PathBuf>>>>;
+
 /// Why a shared magnet add ended without an engine. `Clone` (the backend
 /// error is `Arc`-wrapped) so it can be handed to every waiter of the shared
 /// add and kept as the add's failure record.
@@ -484,7 +489,7 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     /// [`Self::begin_relocation`] -- the engine leaves the registry before
     /// the backend touches a file, so this is the only thing naming either
     /// end of the copy while it runs.
-    relocations: parking_lot::Mutex<HashMap<String, Vec<std::path::PathBuf>>>,
+    relocations: RelocationRegistry,
     /// Persisted pins of torrents the backend did not have at startup
     /// (see [`Self::restore_pinned_downloads`]): kept in the persisted file
     /// and applied by the next `pin_download` of the torrent, or dropped by
@@ -622,7 +627,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             magnet_adds: Arc::new(RwLock::new(HashMap::new())),
             downloads_dir: parking_lot::RwLock::new(None),
             pin_locks: parking_lot::Mutex::new(HashMap::new()),
-            relocations: parking_lot::Mutex::new(HashMap::new()),
+            relocations: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             dormant_pins: parking_lot::Mutex::new(BTreeMap::new()),
             free_space_probe: Arc::new(|path| fs4::available_space(path)),
             volume_id_probe: Arc::new(volume_id),
@@ -1349,7 +1354,16 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     }
 
     pub async fn get_engine(&self, info_hash: &str) -> Option<Arc<Engine<B::Handle>>> {
-        let engines = self.engines.read().await;
+        Self::lookup_engine(&self.engines, info_hash).await
+    }
+
+    /// [`Self::get_engine`] over the registry rather than `&self`, for
+    /// [`Self::end_relocation`]'s reason: the caller outlives the request.
+    async fn lookup_engine(
+        engines: &EngineRegistry<B::Handle>,
+        info_hash: &str,
+    ) -> Option<Arc<Engine<B::Handle>>> {
+        let engines = engines.read().await;
         let engine = engines.get(&info_hash.to_lowercase()).cloned();
         if let Some(engine) = &engine {
             engine.touch();
@@ -2748,6 +2762,29 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// re-adds through the registry instead of using a handle to a torrent
     /// that is gone. An engine somebody else published for the hash
     /// meanwhile is theirs to keep.
+    ///
+    /// **The move does not run in the caller's future.** `pin_download`'s
+    /// caller is an awaited axum handler, so a client that hangs up drops it
+    /// wherever it is, and a cross-device copy is minutes of "wherever". Left
+    /// in the caller's future, that drop stopped the copy halfway with the
+    /// torrent already out of the backend, and skipped the settling below
+    /// entirely: the hash stayed parked as an `Adding` entry nothing retries,
+    /// and `relocations` went on naming both ends of the move for the life of
+    /// the process -- so the trees it named, which by then no engine and no
+    /// persisted pin named either, could never be evicted again.
+    ///
+    /// So the copy is spawned and a supervisor settles it however it ends,
+    /// the same shape and for the same reason as [`Self::spawn_magnet_add`]'s:
+    /// the task that calls into the backend is the one that can be slow or
+    /// panic, and the task that puts the registries right touches nothing but
+    /// maps. The caller only waits for the result. A caller that goes away
+    /// loses its answer and nothing else -- the move finishes, the engine is
+    /// published in its new home carrying the pin that asked for it, and the
+    /// waiters parked on the hash get it. What that caller no longer runs is
+    /// the rest of `pin_download`: the pin is not written to
+    /// `pinned-downloads.json`, so it holds until the process ends and is
+    /// forgotten by the next start, which is a download to re-request, not
+    /// bytes nothing can reclaim.
     async fn relocate_engine(
         &self,
         engine: Arc<Engine<B::Handle>>,
@@ -2770,46 +2807,78 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             PendingMagnetAdd::settled_later(engine.info_hash.clone(), trackers.clone().into());
         self.begin_relocation(&engine, &folder, pending.clone())
             .await;
-        let relocated = self
-            .backend
-            .relocate_torrent(&engine.info_hash, placement, trackers)
-            .await;
-        let (result, settled) = match relocated {
-            Ok(handle) => {
-                let engine = self.replace_engine(&engine, handle).await;
-                (Ok(engine.clone()), Ok(engine))
-            }
-            Err(error) => {
-                tracing::warn!(
-                    info_hash = %engine.info_hash,
-                    error = %format!("{error:#}"),
-                    "download_relocate_failed"
-                );
-                let settled = match self.backend.get_torrent(&engine.info_hash).await {
-                    Some(handle) => Ok(self.replace_engine(&engine, handle).await),
-                    None => match self.get_engine(&engine.info_hash).await {
-                        Some(other) => Ok(other),
-                        None => Err(MagnetAddError::Backend {
-                            info_hash: engine.info_hash.clone(),
-                            error: Arc::new(anyhow::anyhow!(
-                                "relocation failed and the torrent is no longer managed: {error:#}"
-                            )),
-                        }),
-                    },
-                };
-                let error = PinDownloadError::Backend(error.context(format!(
-                    "relocating {} into {}",
-                    engine.info_hash,
-                    folder.display()
-                )));
-                (Err(error), settled)
-            }
+
+        let moving = {
+            let backend = self.backend.clone();
+            let info_hash = engine.info_hash.clone();
+            tokio::spawn(async move {
+                backend
+                    .relocate_torrent(&info_hash, placement, trackers)
+                    .await
+            })
         };
-        self.end_relocation(&engine.info_hash, &pending).await;
-        // Whoever awaited the entry: the engine is published (or the hash is
-        // free for a fresh add) by now.
-        let _ = settle.send(settled);
-        result
+        let supervisor = {
+            let backend = self.backend.clone();
+            let engines = self.engines.clone();
+            let adds = self.magnet_adds.clone();
+            let relocations = self.relocations.clone();
+            let clock = self.clock;
+            tokio::spawn(async move {
+                let relocated = match moving.await {
+                    Ok(relocated) => relocated,
+                    // A panic only reaches here in a debug build; the release
+                    // profile's `panic = "abort"` takes the process instead.
+                    // Nothing aborts this handle, so cancellation is not a case.
+                    Err(join_error) => Err(anyhow::anyhow!(
+                        "the relocation task did not finish: {join_error}"
+                    )),
+                };
+                let (result, settled) = match relocated {
+                    Ok(handle) => {
+                        let engine = Self::replace_engine(&engines, clock, &engine, handle).await;
+                        (Ok(engine.clone()), Ok(engine))
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            info_hash = %engine.info_hash,
+                            error = %format!("{error:#}"),
+                            "download_relocate_failed"
+                        );
+                        let settled = match backend.get_torrent(&engine.info_hash).await {
+                            Some(handle) => {
+                                Ok(Self::replace_engine(&engines, clock, &engine, handle).await)
+                            }
+                            None => match Self::lookup_engine(&engines, &engine.info_hash).await {
+                                Some(other) => Ok(other),
+                                None => Err(MagnetAddError::Backend {
+                                    info_hash: engine.info_hash.clone(),
+                                    error: Arc::new(anyhow::anyhow!(
+                                        "relocation failed and the torrent is no longer managed: {error:#}"
+                                    )),
+                                }),
+                            },
+                        };
+                        let error = PinDownloadError::Backend(error.context(format!(
+                            "relocating {} into {}",
+                            engine.info_hash,
+                            folder.display()
+                        )));
+                        (Err(error), settled)
+                    }
+                };
+                Self::end_relocation(&relocations, &adds, &engine.info_hash, &pending).await;
+                // Whoever awaited the entry: the engine is published (or the
+                // hash is free for a fresh add) by now.
+                let _ = settle.send(settled);
+                result
+            })
+        };
+        match supervisor.await {
+            Ok(result) => result,
+            Err(join_error) => Err(PinDownloadError::Backend(anyhow::anyhow!(
+                "the relocation supervisor did not finish: {join_error}"
+            ))),
+        }
     }
 
     /// Take `engine` out of the registry (only while it still is the
@@ -2858,9 +2927,21 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// paths it was protecting. The engine (if any) is published before this,
     /// so a lookup between the two always finds one or the other, and
     /// [`Self::protected_paths`] never stops naming the data it is holding.
-    async fn end_relocation(&self, info_hash: &str, pending: &PendingMagnetAdd<B::Handle>) {
-        self.relocations.lock().remove(info_hash);
-        let mut adds = self.magnet_adds.write().await;
+    ///
+    /// Over the registries rather than `&self`: the only caller is the
+    /// detached supervisor in [`Self::relocate_engine`], which outlives the
+    /// request and so cannot borrow the `EngineFS` it came in on. It is also
+    /// the reason this must never be skippable -- what it undoes is
+    /// [`Self::begin_relocation`], and an entry left behind is a tree the
+    /// cache cleaner may not touch and nothing else names.
+    async fn end_relocation(
+        relocations: &RelocationRegistry,
+        adds: &MagnetAddRegistry<B::Handle>,
+        info_hash: &str,
+        pending: &PendingMagnetAdd<B::Handle>,
+    ) {
+        relocations.lock().remove(info_hash);
+        let mut adds = adds.write().await;
         if matches!(
             adds.get(info_hash).map(|entry| &entry.state),
             Some(MagnetAddState::Adding(current)) if current.id == pending.id
@@ -2870,14 +2951,17 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     }
 
     /// Publish `handle` as the engine for `old`'s hash, carrying the pins.
+    /// Over the registry rather than `&self`, for [`Self::end_relocation`]'s
+    /// reason: the caller outlives the request.
     async fn replace_engine(
-        &self,
+        engines: &EngineRegistry<B::Handle>,
+        clock: Clock,
         old: &Arc<Engine<B::Handle>>,
         handle: B::Handle,
     ) -> Arc<Engine<B::Handle>> {
-        let engine = Arc::new(Engine::new_with_handle(handle, &old.info_hash, self.clock));
+        let engine = Arc::new(Engine::new_with_handle(handle, &old.info_hash, clock));
         *engine.pinned_files.write() = old.pinned_files.read().clone();
-        self.engines
+        engines
             .write()
             .await
             .insert(old.info_hash.clone(), engine.clone());
@@ -5308,6 +5392,73 @@ mod tests {
         assert!(
             !after.contains(&show.join("video-0.mkv")),
             "the source it moved off is cache again: {after:?}"
+        );
+    }
+
+    /// A move, once begun, is nobody's request any more.
+    ///
+    /// `POST /{infoHash}/{fileIdx}/download` is an awaited axum handler, so a
+    /// client that hangs up drops the whole of `pin_download` wherever it
+    /// happens to be -- and a cross-device relocation is minutes of that
+    /// "wherever". Dropped between `begin_relocation` and `end_relocation`,
+    /// the move stopped halfway with the torrent already out of the backend,
+    /// the hash stayed parked in the magnet registry (so every later lookup
+    /// found an `Adding` entry that was already settled with a failure and is
+    /// never retried), and `relocations` kept naming both ends of the move for
+    /// the life of the process -- multi-gigabyte trees that no engine, no
+    /// persisted pin and nothing else could ever name again, and that the
+    /// cache cleaner was therefore forbidden to reclaim forever.
+    ///
+    /// So the move does not run in the caller's future at all: it runs
+    /// detached and is settled by a supervisor, exactly as a magnet add is,
+    /// and the caller only waits for it.
+    #[tokio::test]
+    async fn a_relocation_outlives_the_request_that_started_it() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        let show = enginefs.download_dir.join("show");
+        *counters.output_folder.lock().unwrap() = Some(show.clone());
+        let downloads = enginefs.download_dir.join("offline");
+        enginefs.set_downloads_dir(Some(downloads.clone()));
+        enginefs.backend.hold_relocate.store(true, Ordering::SeqCst);
+
+        {
+            let mut pin = std::pin::pin!(enginefs.pin_download(TEST_HASH, 0, None));
+            tokio::select! {
+                _ = &mut pin => panic!("the move is held; the pin cannot have finished"),
+                () = until(|| relocation_started(&enginefs)) => {}
+            }
+            // The client hangs up here.
+        }
+
+        // The backend finishes the move it was asked for, and everything the
+        // move parked is settled by the half of it the client never held.
+        enginefs.backend.relocate_hold.add_permits(1);
+        assert!(
+            wait_until(TEST_WAIT_BOUND, || enginefs.relocations.lock().is_empty()).await,
+            "the move settled the relocation it began"
+        );
+        let engine = enginefs
+            .get_engine(TEST_HASH)
+            .await
+            .expect("the relocated engine is published");
+        assert_eq!(
+            engine.handle.output_folder(),
+            Some(downloads.join(TEST_HASH)),
+            "in its new home"
+        );
+        assert!(engine.is_pinned(), "with the pin that asked for the move");
+        assert!(
+            enginefs.magnet_adds.read().await.is_empty(),
+            "and the hash is not left parked as an add nothing will ever retry"
+        );
+        let protected = enginefs.protected_paths().await;
+        assert!(
+            !protected.contains(&show.join("video-0.mkv")),
+            "the source it moved off is cache again: {protected:?}"
+        );
+        assert!(
+            !protected.contains(&downloads.join(TEST_HASH)),
+            "and the destination is the engine's to speak for, not a relocation's: {protected:?}"
         );
     }
 
