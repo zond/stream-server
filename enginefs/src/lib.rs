@@ -1676,6 +1676,46 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
     }
 
+    /// [`StreamActivitySnapshot::playback_is_live`] without the snapshot.
+    ///
+    /// The snapshot is the definition -- which of the fields mean "somebody
+    /// is watching" is decided there and tested there -- but building one
+    /// to read three of its fields costs six lock acquisitions and four
+    /// cloned collections, with the `engines` read queued behind any add or
+    /// remove. This is the same three questions asked directly: the
+    /// per-engine reader counts, the stream-response counts and the
+    /// unexpired leases, each behind its own read lock and nothing cloned.
+    /// Short-circuits, so a server with a reader open answers from the
+    /// first. A client polls this every second or two through the activity
+    /// light, which is what makes the difference worth two definitions;
+    /// `narrow_playback_query_agrees_with_the_snapshot` keeps them one.
+    pub async fn playback_is_live(&self) -> bool {
+        let readers_open = self
+            .engines
+            .read()
+            .await
+            .values()
+            .any(|engine| engine.active_streams.load(Ordering::SeqCst) > 0);
+        if readers_open {
+            return true;
+        }
+        if self
+            .active_streams
+            .read()
+            .await
+            .values()
+            .any(|count| *count > 0)
+        {
+            return true;
+        }
+        let now = self.clock.now_secs();
+        self.active_playback_leases
+            .read()
+            .await
+            .values()
+            .any(|lease| playback_lease_is_active(lease, now))
+    }
+
     /// Whether this server is using the connection while nobody is watching
     /// -- one fact, decided here.
     ///
@@ -1693,12 +1733,14 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// over the window as well as now, or the light would blame every viewer
     /// for their own playback the moment they stopped it.
     ///
-    /// Cheap and free of side effects on purpose: it reads the engines that
-    /// exist and two atomics. It creates nothing -- a light that started a
-    /// torrent in order to report on it would be reporting on itself -- so
-    /// it never goes near `get_or_begin_add_magnet`.
+    /// Cheap and free of side effects on purpose: two atomics for the
+    /// traffic, and for playback the three live fields behind their own
+    /// read locks ([`Self::playback_is_live`]), nothing cloned. It creates
+    /// nothing -- a light that started a torrent in order to report on it
+    /// would be reporting on itself -- so it never goes near
+    /// `get_or_begin_add_magnet`.
     pub async fn background_traffic(&self) -> crate::traffic::BackgroundTraffic {
-        let playing = self.stream_activity_snapshot().await.playback_is_live();
+        let playing = self.playback_is_live().await;
         self.traffic_window
             .sample(self.clock.now_secs(), &self.storage_traffic, playing)
     }
@@ -5155,6 +5197,53 @@ mod tests {
             enginefs.stream_activity_snapshot().await.playback_is_live(),
             "a live playback lease is a client that is still there between reads"
         );
+    }
+
+    /// `BackendEngineFS::playback_is_live` is the snapshot's answer without
+    /// the snapshot, so it is checked against the snapshot at every state
+    /// the three live fields can put the server in -- each one on its own,
+    /// since the query short-circuits and a field it never reached would
+    /// pass by accident behind one it did.
+    #[tokio::test]
+    async fn narrow_playback_query_agrees_with_the_snapshot() {
+        let (enginefs, _counters) = test_enginefs_with_file_count(2);
+        async fn both_agree(enginefs: &BackendEngineFS<FakeBackend>, expected: bool, why: &str) {
+            let snapshot = enginefs.stream_activity_snapshot().await.playback_is_live();
+            let narrow = enginefs.playback_is_live().await;
+            assert_eq!(snapshot, expected, "snapshot: {why}");
+            assert_eq!(narrow, expected, "narrow query: {why}");
+        }
+
+        both_agree(&enginefs, false, "nothing has happened yet").await;
+
+        // A reader open on the engine, with no stream response around it.
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        engine.active_streams.fetch_add(1, Ordering::SeqCst);
+        both_agree(&enginefs, true, "an open file reader").await;
+        engine.active_streams.fetch_sub(1, Ordering::SeqCst);
+        both_agree(&enginefs, false, "the reader closed").await;
+
+        // A stream response, which is a separate count.
+        enginefs.on_stream_start(TEST_HASH, 1).await;
+        both_agree(&enginefs, true, "a stream response in flight").await;
+        enginefs.on_stream_end(TEST_HASH, 1).await;
+        both_agree(
+            &enginefs,
+            false,
+            "the response ended, sticky fields notwithstanding",
+        )
+        .await;
+
+        // A lease that has not expired, then one that has.
+        insert_active_lease(&enginefs, 1).await;
+        both_agree(&enginefs, true, "an unexpired playback lease").await;
+        enginefs
+            .active_playback_leases
+            .write()
+            .await
+            .values_mut()
+            .for_each(|lease| lease.expires_at_secs = 0);
+        both_agree(&enginefs, false, "an expired lease is a client that left").await;
     }
 
     /// The conjunction the client's activity light is, end to end: bytes
