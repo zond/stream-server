@@ -1399,238 +1399,127 @@ fn poll_stats(client: &reqwest::blocking::Client, url: &str) -> anyhow::Result<s
     }
 }
 
-/// `ServerHandle::set_background` before any torrent exists is a cheap,
-/// idempotent no-op that only flips the footprint; with a swarm attached it
-/// takes the torrent down to at most `LEAN_PEER_LIMIT` peers without pausing
-/// it, a stream request that arrives while lean is still served -- from the
-/// peers left -- a seeder dialling in meanwhile does not push the swarm back
-/// over the cap, and the return to the foreground lets it grow past the cap
-/// again.
+/// `ServerHandle::set_background` is app-lifecycle wiring, and this is
+/// where the wiring is pinned: the call reaches the torrent session, the
+/// peer cap on the torrent moves with it both ways, nothing is paused, and
+/// a stream request that arrives while lean is still served.
 ///
-/// This is the wiring test, and the only one here that needs a swarm: that
-/// the lifecycle call reaches the engine and that a stream still comes out
-/// while lean. What the cap does to individual peers -- parking them rather
-/// than forgetting them, and re-dialling the parked ones -- is enginefs's
-/// `lean_parks_the_surplus_and_full_re_dials_it`, which can dial *out* to
-/// seeders whose addresses it was handed; the arithmetic of the cap itself
-/// is `footprint_caps_every_torrent_and_the_next_one_added`, which needs no
-/// peers at all. The server cannot be told peer addresses over its API, so
-/// here the seeders dial *it*, on the librqbit listen port
-/// `torrent_listen_addr` reports -- and an incoming peer the server hung up
-/// on is never re-dialled by it (it does not know their listen ports), so
-/// the way back over the cap is a fresh batch dialling in.
+/// No swarm, no network, no peer at all. The footprint is read back through
+/// the engine (`is_background` asks `EngineFS`, which asks the backend, so
+/// a `set_background` that only flipped a flag on the handle fails here),
+/// the cap is read off the very torrent the server holds
+/// (`torrent_peer_limit`, the same librqbit `peer_limit` the enginefs tests
+/// read), and the bytes come from a torrent whose data is already on disk.
 ///
-/// No exact peer count is asserted: how many of a dozen loopback sessions
-/// are connected at any one instant is the network's business and a loaded
-/// runner's, and pinning it is what made this test flaky on CI while it
-/// passed on an idle desktop. Every assertion is a *side* of the cap, and
-/// the precondition -- a swarm bigger than the cap, so there is a surplus to
-/// shed at all -- is waited for on its own and says, when it fails, that the
-/// environment never produced it.
+/// Deliberately not here: what the cap does to individual peers -- hanging
+/// up on the surplus but *parking* it rather than forgetting it, and
+/// re-dialling the parked ones on the way back. That needs a swarm and is
+/// enginefs's `lean_parks_the_surplus_and_full_re_dials_it`, which dials
+/// out to seeders whose addresses it was handed instead of waiting to be
+/// dialled. This test used to grow a swarm of its own -- a dozen loopback
+/// seeders dialling *in*, because the server cannot be told peer addresses
+/// over its API -- and on the Windows CI runner not one of them ever
+/// connected (`peers=0`), so its precondition, more live peers than the
+/// cap, could not be met there at all. The cap's arithmetic
+/// (`LEAN_PEER_LIMIT` on every torrent the session holds and on the next
+/// one added, the *configured* limit back on `Full`) is enginefs's
+/// `footprint_caps_every_torrent_and_the_next_one_added`, which needs no
+/// peers either.
 #[test]
-fn set_background_shrinks_the_swarm_and_still_streams() -> anyhow::Result<()> {
+fn set_background_caps_the_torrent_and_still_streams() -> anyhow::Result<()> {
     const LEAN: usize = enginefs::backend::LEAN_PEER_LIMIT;
-    const SEEDERS: usize = LEAN + 4;
 
+    // Before any torrent exists: safe, idempotent, and only the footprint
+    // moves. Its own server, because the fixture below hands one back with
+    // its torrent already created -- and stopped at the end with that one
+    // rather than here, because a server stopped within milliseconds of
+    // starting trips the tracker-refresher shutdown race
+    // `TrackerManager::take_refresh_task` documents: noise on a worker
+    // thread, but noise a real panic could hide in.
+    let bare_config = tempfile::tempdir()?;
+    let bare_cache = tempfile::tempdir()?;
+    let bare = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(bare_config.path().join("config")),
+        cache_dir: Some(bare_cache.path().join("cache")),
+        ..offline_config()
+    })?;
+    assert!(!bare.is_background());
+    bare.set_background(true);
+    bare.set_background(true);
+    assert!(bare.is_background());
+    bare.set_background(false);
+    assert!(!bare.is_background());
+
+    // A server holding one torrent whose data is already on disk and
+    // hash-checked, so every byte below is served without a peer.
     let config_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
     let src = tempfile::tempdir()?;
-    let content = src.path().join("Movie");
-    std::fs::create_dir_all(&content)?;
-    // Big enough, at the seeders' pace (12 x 16 KiB/s), that the torrent is
-    // still downloading when the assertions are done: ~85 s for 16 MiB, and
-    // lean only slows it down. A torrent that finished would hang up on its
-    // seeders itself, which is not what this test is about.
-    write_payload(&content.join("movie.bin"), 16 * 1024 * 1024);
-    let payload = std::fs::read(content.join("movie.bin"))?;
-    let (torrent, info_hash) = real_torrent(&content);
-
-    let handle = stream_server::start(stream_server::ServerConfig {
-        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
-        config_dir: Some(config_dir.path().join("config")),
-        cache_dir: Some(cache_dir.path().join("cache")),
-        ..offline_config()
-    })?;
-    let base = format!("http://{}", handle.http_addr());
+    let (handle, base, info_hash, idx, payload) =
+        lan_media_server(config_dir.path(), cache_dir.path(), src.path(), None)?;
     let client = bearer_client(&handle)?;
 
-    // Before any torrent: safe, idempotent, and only a flag flips.
-    assert!(!handle.is_background());
-    handle.set_background(true);
-    handle.set_background(true);
-    assert!(handle.is_background());
-    handle.set_background(false);
-    assert!(!handle.is_background());
-
-    client
-        .post(format!("{base}/create"))
-        .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
-        .send()?
-        .error_for_status()?;
-    let stats = stats_after_check(&client, &base, &info_hash)?;
-    let idx = file_index(&stats, "movie.bin");
-    let listen_addr = handle
-        .torrent_listen_addr()
-        .expect("an embedded server listens for peers on an ephemeral port");
-
-    // The swarm: seeders that dial the server.
-    let rt = tokio::runtime::Runtime::new()?;
-    let dial_in = || {
-        rt.block_on(async {
-            let seeder = librqbit::Session::new_with_opts(
-                content.clone(),
-                librqbit::SessionOptions {
-                    dht: None,
-                    persistence: None,
-                    listen: Some(librqbit::ListenerOptions {
-                        listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
-                        ..Default::default()
-                    }),
-                    disable_local_service_discovery: true,
-                    ratelimits: librqbit::limits::LimitsConfig {
-                        upload_bps: std::num::NonZeroU32::new(16 * 1024),
-                        download_bps: None,
-                    },
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("seeder session");
-            let handle = seeder
-                .add_torrent(
-                    librqbit::AddTorrent::from_bytes(bytes::Bytes::from(torrent.clone())),
-                    Some(librqbit::AddTorrentOptions {
-                        output_folder: Some(content.to_str().unwrap().to_owned()),
-                        overwrite: true,
-                        initial_peers: Some(vec![listen_addr]),
-                        ..Default::default()
-                    }),
-                )
-                .await
-                .expect("seeder add")
-                .into_handle()
-                .expect("seeder handle");
-            (seeder, handle)
-        })
-    };
-    let mut seeders: Vec<_> = (0..SEEDERS).map(|_| dial_in()).collect();
-
-    let stats_url = format!("{base}/{info_hash}/stats.json");
-    let stats_now = || -> anyhow::Result<serde_json::Value> {
-        Ok(client.get(&stats_url).send()?.error_for_status()?.json()?)
-    };
-    let wait_for = |what: &str,
-                    pred: &dyn Fn(&serde_json::Value) -> bool|
-     -> anyhow::Result<serde_json::Value> {
-        let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
-        loop {
-            let stats = stats_now()?;
-            if pred(&stats) {
-                return Ok(stats);
-            }
-            anyhow::ensure!(
-                std::time::Instant::now() < deadline,
-                "{what} did not happen within {CHECK_WAIT_BOUND:?}: peers={} peerDiscovery={}",
-                stats["peers"],
-                stats["peerDiscovery"]
-            );
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-    };
-    let peers = |stats: &serde_json::Value| stats["peers"].as_u64().unwrap_or(0) as usize;
-
-    // The precondition, on its own bound: without more live peers than the
-    // lean cap there is no surplus to shed and the rest says nothing. A
-    // failure here is the environment, not `set_background`.
-    let full = wait_for(
-        "the swarm outgrowing the lean cap (the environment never got more \
-         than LEAN_PEER_LIMIT of the seeders connected at once)",
-        &|s| peers(s) > LEAN,
-    )?;
-
-    // Background, right on the heels of that read: the surplus is parked
-    // before the call returns (it is synchronous down to librqbit, which
-    // ranks and hangs up on the surplus there and then and takes the spare
-    // permits away so nothing can go live over the cap behind it), so this
-    // is read straight after rather than waited for. Incoming peers this
-    // server was never told the listen ports of die off on their own, so a
-    // count that only *eventually* falls under the cap says nothing about
-    // the cap -- a bound here passed with the cap change removed.
-    handle.set_background(true);
-    assert!(handle.is_background());
-    let lean = stats_now()?;
-    anyhow::ensure!(
-        peers(&lean) <= LEAN,
-        "{} peers were live before going to the background and {} still are: {}",
-        peers(&full),
-        peers(&lean),
-        lean["peerDiscovery"]
+    // The cap the torrent carries in the foreground is the session's
+    // configured one, which every real profile puts well above the lean
+    // limit -- otherwise going lean would not be a shrink and the rest of
+    // this test would pass on a torrent nothing ever capped.
+    let configured = handle
+        .torrent_peer_limit(&info_hash)
+        .expect("the server holds the torrent it was just given");
+    assert!(
+        configured > LEAN,
+        "the configured cap ({configured}) must be above the lean one ({LEAN})"
     );
-    assert_ne!(lean["phase"], "paused", "{lean}");
 
-    // A stream request while lean is served from the peers left. The head
-    // of the file queues behind whatever the slow seeders were already asked
-    // for, so give it longer than reqwest's 30 s default.
-    let anonymous = reqwest::blocking::Client::builder()
-        .timeout(CHECK_WAIT_BOUND)
-        .build()?;
+    // Background: the footprint reaches the engine and the cap on the
+    // torrent moves with it. Both are read straight after the call rather
+    // than waited for -- it is synchronous down to librqbit.
+    handle.set_background(true);
+    assert!(handle.is_background());
+    assert_eq!(handle.torrent_peer_limit(&info_hash), Some(LEAN));
+
+    // And nothing was paused or dropped on the way: the torrent is still
+    // held, still complete, still ready to play.
+    let lean = file_stats_after_check(&client, &base, &info_hash, idx)?;
+    assert_eq!(lean["phase"], "ready", "{lean}");
+    assert_eq!(lean["files"][idx]["complete"], true, "{lean}");
+
+    // A stream request arriving while lean is served like any other.
+    let anonymous = reqwest::blocking::Client::new();
     let response = anonymous
         .get(format!("{base}/{info_hash}/{idx}"))
         .header(reqwest::header::RANGE, "bytes=0-15")
         .send()?;
     assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
     assert_eq!(response.bytes()?.as_ref(), &payload[0..16]);
-    let still_lean = stats_now()?;
     assert!(
-        peers(&still_lean) <= LEAN,
-        "streaming while lean must not re-grow the swarm: {}",
-        still_lean["peerDiscovery"]
+        handle.is_background(),
+        "serving a stream does not end the background"
+    );
+    assert_eq!(
+        handle.torrent_peer_limit(&info_hash),
+        Some(LEAN),
+        "nor lift the cap"
     );
 
-    // A seeder dialling in while lean does not take the server over the cap:
-    // it is turned away, or -- if peers have died since and there is room --
-    // taken into the room the cap left. Either way the cap holds, so that is
-    // what every sample asserts; its dial ending is only what lets the watch
-    // stop early rather than sit out the window.
-    let (turned_away, turned_away_torrent) = dial_in();
-    let watch_until = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        let capped = stats_now()?;
-        anyhow::ensure!(
-            peers(&capped) <= LEAN,
-            "a seeder dialling in took the server over the lean cap: {}",
-            capped["peerDiscovery"]
-        );
-        let stats = turned_away_torrent.stats();
-        let ended = stats
-            .live
-            .as_ref()
-            .map(|l| l.snapshot.peer_stats.dead + l.snapshot.peer_stats.not_needed);
-        if ended.is_some_and(|ended| ended >= 1) || std::time::Instant::now() >= watch_until {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    drop(turned_away);
-
-    // Foreground: the cap is back, so the swarm may grow past the lean one
-    // again. The seeders the server hung up on cannot be re-dialled from
-    // here (it never learned their listen ports), so a fresh batch dials in
-    // -- the same thing the opening precondition waited for, which is why
-    // this can be waited for the same way.
+    // Foreground: the configured cap comes back -- the value the session
+    // opened with, so a `Full` that restored the backend's own default
+    // would be caught -- and the next range is served the same way.
     handle.set_background(false);
     assert!(!handle.is_background());
-    seeders.extend((0..SEEDERS).map(|_| dial_in()));
-    wait_for(
-        "the swarm growing back past the lean cap (the environment never got \
-         more than LEAN_PEER_LIMIT of the fresh seeders connected at once)",
-        &|s| peers(s) > LEAN,
-    )?;
+    assert_eq!(handle.torrent_peer_limit(&info_hash), Some(configured));
+    let response = anonymous
+        .get(format!("{base}/{info_hash}/{idx}"))
+        .header(reqwest::header::RANGE, "bytes=16-31")
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.bytes()?.as_ref(), &payload[16..32]);
 
-    drop(seeders);
-    drop(rt);
     handle.shutdown()?;
     handle.join()?;
+    bare.shutdown()?;
+    bare.join()?;
     Ok(())
 }
 
@@ -2390,8 +2279,9 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A server with a LAN media listener, its torrent pre-seeded in the cache
-/// root so media requests answer real bytes.
+/// A server whose torrent is pre-seeded in the cache root, so media
+/// requests answer real bytes with no peer anywhere -- and a LAN media
+/// listener on `lan_media_addr` when one is given.
 ///
 /// Returns the handle, the loopback base URL, the info hash, the file index
 /// and the payload the file holds.

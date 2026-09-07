@@ -568,6 +568,27 @@ impl ServerHandle {
         self.state.engine.footprint() == enginefs::backend::Footprint::Lean
     }
 
+    /// The live-peer cap librqbit is enforcing on `info_hash` right now --
+    /// the one lever [`Self::set_background`] moves -- or `None` when this
+    /// server holds no such torrent.
+    ///
+    /// Doc-hidden, not part of the embedder API: it exists so a test can
+    /// watch the footprint arrive on a torrent the server actually holds
+    /// without a swarm to count peers in, reading the same
+    /// `ManagedTorrentShared::peer_limit` the enginefs tests read. Nothing
+    /// is created or started by asking.
+    #[doc(hidden)]
+    pub fn torrent_peer_limit(&self, info_hash: &str) -> Option<usize> {
+        let state = self.state.clone();
+        let info_hash = info_hash.to_lowercase();
+        self.block_on_server(async move {
+            let engine = state.engine.get_engine(&info_hash).await?;
+            Some(engine.handle.handle.shared.peer_limit())
+        })
+        .ok()
+        .flatten()
+    }
+
     /// The address librqbit accepts peer connections on, or `None` when
     /// the session is not listening. With [`TorrentListenPort::Ephemeral`]
     /// this is the port the OS assigned; a fixed range reports the port
