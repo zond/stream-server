@@ -227,10 +227,23 @@ impl PieceStore {
             };
             for entry in entries.flatten() {
                 let staged = entry.path();
-                if staged.extension().is_none_or(|ext| ext != "part") {
+                // Both halves of this go through `STAGING_SUFFIX` rather than
+                // through a spelling of it. What a staged file is called is
+                // one decision, taken in one place by `staging_path`, and a
+                // second copy of it here would let the constant change while
+                // this pass silently stopped finding anything -- which is not
+                // a cosmetic failure: the stale shadow it exists to delete is
+                // exactly what gets a half-written piece served as a verified
+                // one.
+                let Some(complete) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.strip_suffix(STAGING_SUFFIX))
+                    .map(|complete| staged.with_file_name(complete))
+                else {
                     continue;
-                }
-                if staged.with_extension("").is_file() {
+                };
+                if complete.is_file() {
                     let _ = std::fs::remove_file(&staged);
                 }
             }
