@@ -292,8 +292,23 @@ impl ServerHandle {
 
     /// Apply `patch` exactly as `POST /settings` would (same keys, same
     /// validation and merge semantics, same engine update and persistence)
-    /// and return the resulting settings.
+    /// and return the resulting settings. The `bt*` settings report the HTTP
+    /// route puts in its response is available to an embedder through
+    /// [`Self::update_settings_with_report`].
     pub fn update_settings(&self, patch: serde_json::Value) -> anyhow::Result<ServerSettings> {
+        Ok(self.update_settings_with_report(patch)?.0)
+    }
+
+    /// [`Self::update_settings`], also returning the
+    /// [`enginefs::backend::BtSettingsReport`] the torrent session gave for
+    /// the `bt*` values -- the same report the `POST /settings` response
+    /// carries as `btSettings`, so an embedder can tell which of its
+    /// settings took effect, which wait for a restart, and which the backend
+    /// never honours.
+    pub fn update_settings_with_report(
+        &self,
+        patch: serde_json::Value,
+    ) -> anyhow::Result<(ServerSettings, enginefs::backend::BtSettingsReport)> {
         let state = self.state.clone();
         self.block_on_server(async move { routes::system::update_settings(&state, &patch).await })?
     }

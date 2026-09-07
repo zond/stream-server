@@ -3,9 +3,16 @@
 Stream Server exposes BitTorrent privacy and network controls through the
 existing `/settings` API and persists them in `settings.json`. The setting
 names and semantics were originally modeled on a native `libtorrent` backend
-this fork no longer has: `librqbit` is the sole torrent backend today, is
-always built (there is no backend feature flag), and honors these settings
-on a best-effort basis.
+this fork no longer has: `librqbit` is the sole torrent backend today and is
+always built (there is no backend feature flag). Every setting is accepted,
+echoed back and persisted, but not every one reaches librqbit -- some have no
+equivalent knob and some are read only when the session opens. This is not
+"best-effort": which is which is a fixed, per-setting fact, listed in the
+`enginefs::backend::bt_settings_support()` truth table (a test keeps that
+table complete) and summarised in the tables below. A `POST /settings`
+response also carries a `btSettings` report of what your specific update did
+-- `appliedLive`, `pendingRestart`, `notHonoured` -- so a client never has to
+guess whether a setting took effect.
 
 The setting names mirror the JSON keys returned by:
 
@@ -195,11 +202,18 @@ curl -X POST http://127.0.0.1:11470/settings \
 
 - Existing `settings.json` files are read with defaults for missing keys. The new
   keys may not appear on disk until `/settings` is saved.
-- `btEnablePex` can enable PeX dynamically, but disabling PeX for an already
-  running session may require a restart to take full effect.
-- `btListenInterfaces`, `btOutgoingInterfaces`, proxy options, and SSRF/TLS
-  settings are applied by the `librqbit` backend on a best-effort basis; not
-  every knob has an equivalent in every backend.
-- `dhtBootstrapNodes` is the one setting on this page that is not applied to
-  the running session at all -- it is read once, at session construction, so
-  a change takes effect on the next server start.
+- What each `bt*` setting actually does against `librqbit` is fixed per setting,
+  not best-effort. The authority is the `enginefs::backend::bt_settings_support()`
+  truth table, one row per setting: `Live` (applied to the running session now --
+  only `btDownloadSpeedHardLimit`), `NextStart` (read once when the session opens,
+  so a change takes effect on the next server start -- `btEnableDht`, `btEnableLsd`,
+  `btOutgoingInterfaces`, and the SOCKS5 proxy settings), or `NotHonoured` (no
+  librqbit knob at all, with the reason in the row -- `btEnablePex`,
+  `btEncryptionMode`, `btAnonymousMode`, `btValidateHttpsTrackers`,
+  `btSsrfMitigation`, the outgoing-port settings, and the rest). A `POST /settings`
+  response reports which of these buckets each setting you sent fell into, as
+  `btSettings.appliedLive` / `pendingRestart` / `notHonoured`.
+- `btEnablePex` is `NotHonoured`: librqbit has no PeX switch (`ut_pex` is always on
+  for public torrents), so neither enabling nor disabling it changes anything.
+- `dhtBootstrapNodes` is not applied to the running session either -- it is read
+  once, at session construction, so a change takes effect on the next server start.

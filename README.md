@@ -56,7 +56,7 @@ This is not a drop-in replacement for `server.js` — the API surface it exposes
 - **📚 Library API**: an embedder calls `ServerHandle::{settings, update_settings, engine_stats, file_stats, pin_download, unpin_download, downloads, download_path, cache_usage, clean_cache_now}` directly — the same code the HTTP routes run, no HTTP client needed
 - **📊 Stats**: `/stats.json`, `/{infoHash}/stats.json`, `/{infoHash}/{fileIdx}/stats.json` for server status and torrent progress
 - **⚙️ Settings**: runtime-configurable via `/settings`, with the stremio-core-compatible shape
-- **🔒 BitTorrent Privacy Controls**: DHT, PeX, LSD, encryption, interface binding, ports, and proxy settings. See [BitTorrent Settings](docs/bittorrent-settings.md).
+- **🔒 BitTorrent Privacy Controls**: DHT, PeX, LSD, encryption, interface binding, ports, and proxy settings. All accepted and persisted, but each has a fixed effect against `librqbit` — applied live, applied on the next start, or not honoured (no backend knob) — listed per setting in `bt_settings_support()`; a `POST /settings` response reports which bucket each one you sent fell into. See [BitTorrent Settings](docs/bittorrent-settings.md).
 - **📺 LAN media listener**: an optional second listener that serves *media bytes only* to the local network, so a Chromecast can fetch a stream while the control API stays on loopback. Off by default and session-scoped. See [LAN media listener](#lan-media-listener)
 
 ---

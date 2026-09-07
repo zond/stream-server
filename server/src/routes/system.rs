@@ -9,8 +9,8 @@ use axum::{
 use enginefs::backend::librqbit::LibrqbitHandle;
 use enginefs::backend::priorities::BufferProfile;
 use enginefs::backend::{
-    EngineStats, TorrentEncryptionMode, TorrentHandle, TorrentPrivacyConfig, TorrentProxyType,
-    TransferTotals,
+    BtSettingsReport, EngineStats, TorrentEncryptionMode, TorrentHandle, TorrentPrivacyConfig,
+    TorrentProxyType, TransferTotals,
 };
 use enginefs::{EngineFS, EngineLookup, FailedMagnetAdd, PendingMagnetAdd};
 use serde_json::{Value, json};
@@ -841,9 +841,18 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
 /// settings keys; wrong-typed values leave that setting unchanged, except
 /// `downloadsDir`, which is validated and fails the update) into the live
 /// settings, push the torrent-related values into both engines and
-/// persist. Returns the settings as they are afterwards. Shared by the HTTP
-/// handler and `ServerHandle::update_settings`.
-pub async fn update_settings(state: &AppState, payload: &Value) -> anyhow::Result<ServerSettings> {
+/// persist. Returns the settings as they are afterwards, paired with the
+/// [`BtSettingsReport`] the torrent session gave for the `bt*` values --
+/// what applied to the running session now, what waits for the next start,
+/// and what the backend never honours -- so the caller can tell the client
+/// which of its settings took effect rather than echoing them back as if
+/// they all had. Both engines are the same `Arc` in production and are
+/// handed the same values, so their reports match; the engine's is the one
+/// returned. Shared by the HTTP handler and `ServerHandle::update_settings`.
+pub async fn update_settings(
+    state: &AppState,
+    payload: &Value,
+) -> anyhow::Result<(ServerSettings, BtSettingsReport)> {
     tracing::debug!("update_settings: received payload: {:?}", payload);
 
     // `downloadsDir` is the one validated setting: an unusable directory
@@ -1074,8 +1083,10 @@ pub async fn update_settings(state: &AppState, payload: &Value) -> anyhow::Resul
     let updated = settings.clone();
     drop(settings);
 
-    // Apply updated torrent session settings dynamically.
-    state
+    // Apply updated torrent session settings dynamically. The report names
+    // what actually changed on the running session, what waits for a
+    // restart, and what has no backend knob at all.
+    let report = state
         .engine
         .update_torrent_settings(&new_profile, &new_privacy)
         .await;
@@ -1098,7 +1109,7 @@ pub async fn update_settings(state: &AppState, payload: &Value) -> anyhow::Resul
     // Save to disk
     state.save_settings().await?;
 
-    Ok(updated)
+    Ok((updated, report))
 }
 
 pub async fn set_settings(
@@ -1106,7 +1117,12 @@ pub async fn set_settings(
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
     match update_settings(&state, &payload).await {
-        Ok(_) => Json(json!({ "success": true })),
+        // `btSettings` tells the client which of the `bt*` settings it just
+        // sent actually took effect: `appliedLive` on the running session,
+        // `pendingRestart` at the next start, `notHonoured` never (the
+        // backend has no knob -- see `bt_settings_support`). Without it a
+        // 200 reads as "all applied", which for most of these is not true.
+        Ok((_, report)) => Json(json!({ "success": true, "btSettings": report })),
         Err(e) => {
             tracing::error!("Failed to save settings: {}", e);
             Json(json!({ "success": false, "error": e.to_string() }))

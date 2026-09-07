@@ -872,6 +872,90 @@ fn library_api_matches_the_http_control_routes() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `POST /settings` answers with `btSettings`, the report of what the torrent
+/// session actually did with the `bt*` values the client sent: `appliedLive`
+/// (changed on the running session now), `pendingRestart` (a session-start
+/// setting whose value differs from the one the session opened with), and
+/// `notHonoured` (every setting the backend has no knob for, always the full
+/// list). Without it a 200 would read as "everything applied", which for most
+/// of these settings is not true. The library exposes the same report through
+/// `ServerHandle::update_settings_with_report`.
+#[test]
+fn post_settings_reports_which_bt_settings_took_effect() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let handle = stream_server::start(ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_dir.path().join("cache")),
+        ..offline_config()
+    })?;
+    let base = format!("http://{}", handle.http_addr());
+    let client = bearer_client(&handle)?;
+
+    let resp: serde_json::Value = client
+        .post(format!("{base}/settings"))
+        .json(&serde_json::json!({
+            // Live: the one setting the running session can change.
+            "btDownloadSpeedHardLimit": 1_000_000.0,
+            // Session-start: read once when the session opened, so a change
+            // waits for the next start.
+            "btEnableDht": false,
+        }))
+        .send()?
+        .error_for_status()?
+        .json()?;
+
+    assert_eq!(resp["success"], true, "{resp}");
+    let report = &resp["btSettings"];
+    let names = |key: &str| -> Vec<String> {
+        report[key]
+            .as_array()
+            .unwrap_or_else(|| panic!("{key} is an array in {report}"))
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect()
+    };
+    let applied_live = names("appliedLive");
+    let pending_restart = names("pendingRestart");
+    let not_honoured = names("notHonoured");
+
+    // The download limit is applied to the running session.
+    assert!(
+        applied_live.contains(&"btDownloadSpeedHardLimit".to_string()),
+        "{report}"
+    );
+    // btEnableDht is read once at session start, so changing it is pending a
+    // restart.
+    assert!(
+        pending_restart.contains(&"btEnableDht".to_string()),
+        "{report}"
+    );
+    // btEnablePex has no librqbit knob and is always listed as not honoured,
+    // whether or not this call changed it.
+    assert!(
+        not_honoured.contains(&"btEnablePex".to_string()),
+        "{report}"
+    );
+    // The three sets are disjoint: a setting is in exactly one place.
+    for name in &applied_live {
+        assert!(!pending_restart.contains(name) && !not_honoured.contains(name));
+    }
+
+    // The library method returns the same report.
+    let (_settings, rep) =
+        handle.update_settings_with_report(serde_json::json!({ "btEnablePex": false }))?;
+    assert!(rep.not_honoured.contains(&"btEnablePex"), "{rep:?}");
+    assert!(
+        rep.applied_live.contains(&"btDownloadSpeedHardLimit"),
+        "{rep:?}"
+    );
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
 /// On Android the embedding process has no usable home directory: `HOME` is
 /// unset and there is no passwd fallback, so every `dirs`/`directories`
 /// lookup fails. The embedded server must derive every path from the
