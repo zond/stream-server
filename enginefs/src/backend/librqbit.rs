@@ -197,6 +197,29 @@ impl<Op: Send + 'static> DeferredSelection<Op> {
 /// every `LibrqbitHandle` clone (handles are re-created by `get_torrent`).
 type DeferredSelections = Arc<Mutex<HashMap<String, Arc<DeferredSelection<DeferredOp>>>>>;
 
+/// The info hashes this backend has paused for idleness
+/// ([`TorrentHandle::pause_torrent`]), shared by every handle clone like
+/// [`DeferredSelections`].
+///
+/// **A single owner for "paused".** Three things here call librqbit's
+/// `Session::pause`/`unpause` for three different reasons -- the idle pause,
+/// the free-space watch's [`TorrentHandle::stop_for_space`], and the restore
+/// path's [`TorrentHandle::unpause_restored`] -- and librqbit records only
+/// *that* a torrent is paused, never why. Without this set, a stream
+/// starting on a torrent the free-space watch had stopped would unpause it
+/// straight back onto a full volume, and `resume_torrent`, which the engine
+/// layer calls on every playback start, would error on the great majority of
+/// torrents, which are not paused at all.
+///
+/// So [`TorrentHandle::resume_torrent`] lifts exactly the pauses recorded
+/// here and is a no-op for everything else. A `tokio::sync::Mutex` rather
+/// than a `parking_lot` one because the guard is held across librqbit's
+/// `pause`/`unpause`: the pause and the resume of one torrent must not
+/// interleave, or a resume that lands between "pause returned" and "pause
+/// recorded" leaves the torrent paused with nothing left to lift it, and a
+/// player parked on a read that will never complete.
+type IdlePauses = Arc<tokio::sync::Mutex<HashSet<String>>>;
+
 /// Per-torrent pinned file sets (`TorrentHandle::pin_file`), keyed by info
 /// hash and shared by every handle clone for the same reason as
 /// `DeferredSelections`. Consulted by every want-set update so a pinned file
@@ -778,6 +801,8 @@ pub struct LibrqbitBackend {
     /// becomes `true` the day the piece store is the session's default
     /// factory, with no other change here.
     piece_reclaim: bool,
+    /// Which torrents the idle pause owns (see [`IdlePauses`]).
+    idle_pauses: IdlePauses,
     /// The [`Footprint`] in force (see [`TorrentBackend::set_footprint`]).
     /// A mutex rather than an atomic because a footprint change and an add
     /// must not interleave: the add reads the footprint and applies it to
@@ -896,6 +921,7 @@ impl LibrqbitBackend {
         let reported_errors: ReportedErrors = Default::default();
         let stream_positions: StreamPositions = Default::default();
         let swarm_scraper = SwarmScraper::network();
+        let idle_pauses: IdlePauses = Default::default();
         // Restore from session
         let mut restored_handles = session.with_torrents(|iter| {
             let mut map = HashMap::new();
@@ -912,6 +938,7 @@ impl LibrqbitBackend {
                         reported_errors: reported_errors.clone(),
                         stream_positions: stream_positions.clone(),
                         swarm_scraper: swarm_scraper.clone(),
+                        idle_pauses: idle_pauses.clone(),
                     },
                 );
             }
@@ -949,6 +976,7 @@ impl LibrqbitBackend {
                                             reported_errors: reported_errors.clone(),
                                             stream_positions: stream_positions.clone(),
                                             swarm_scraper: swarm_scraper.clone(),
+                                            idle_pauses: idle_pauses.clone(),
                                         },
                                     );
                                 }
@@ -971,6 +999,7 @@ impl LibrqbitBackend {
                 reported_errors,
                 stream_positions,
                 swarm_scraper,
+                idle_pauses,
                 piece_reclaim,
                 footprint: Mutex::new(Footprint::Full),
             },
@@ -1156,6 +1185,7 @@ impl LibrqbitBackend {
         let reported_errors: ReportedErrors = Default::default();
         let stream_positions: StreamPositions = Default::default();
         let swarm_scraper = SwarmScraper::disabled();
+        let idle_pauses: IdlePauses = Default::default();
         let restored_handles = session.with_torrents(|iter| {
             iter.map(|(_id, handle)| {
                 let info_hash = handle.info_hash().as_string();
@@ -1170,6 +1200,7 @@ impl LibrqbitBackend {
                         reported_errors: reported_errors.clone(),
                         stream_positions: stream_positions.clone(),
                         swarm_scraper: swarm_scraper.clone(),
+                        idle_pauses: idle_pauses.clone(),
                     },
                 )
             })
@@ -1186,6 +1217,7 @@ impl LibrqbitBackend {
                 stream_positions,
                 reported_errors,
                 swarm_scraper,
+                idle_pauses,
                 piece_reclaim,
                 footprint: Mutex::new(Footprint::Full),
             },
@@ -1444,6 +1476,9 @@ pub struct LibrqbitHandle {
     stream_positions: StreamPositions,
     /// Backend-wide swarm-scrape cache (see [`SwarmScraper`]).
     swarm_scraper: Arc<SwarmScraper>,
+    /// Backend-wide record of which pauses the idle policy owns (see
+    /// [`IdlePauses`]).
+    idle_pauses: IdlePauses,
 }
 
 /// Put `trackers` into a magnet link as `tr=` params.
@@ -1574,6 +1609,7 @@ impl LibrqbitBackend {
             reported_errors: self.reported_errors.clone(),
             stream_positions: self.stream_positions.clone(),
             swarm_scraper: self.swarm_scraper.clone(),
+            idle_pauses: self.idle_pauses.clone(),
         }
     }
 
@@ -1594,6 +1630,10 @@ impl LibrqbitBackend {
         self.deferred_selections.lock().remove(info_hash);
         self.pinned_files.lock().remove(info_hash);
         self.reported_errors.lock().remove(info_hash);
+        // Or a later add of the same hash would come back believing the idle
+        // policy already owns a pause on it, and the first `resume_torrent`
+        // would try to unpause a live torrent.
+        self.idle_pauses.lock().await.remove(info_hash);
         // `Session::delete(_, false)` only removes empty directories on the
         // delete_files=true branch, so a torrent that never wrote anything
         // (or whose files were cleaned out) would leave its output folder
@@ -1718,6 +1758,7 @@ impl TorrentBackend for LibrqbitBackend {
             reported_errors: self.reported_errors.clone(),
             stream_positions: self.stream_positions.clone(),
             swarm_scraper: self.swarm_scraper.clone(),
+            idle_pauses: self.idle_pauses.clone(),
         })
     }
 
@@ -1875,6 +1916,7 @@ impl TorrentBackend for LibrqbitBackend {
             reported_errors: self.reported_errors.clone(),
             stream_positions: self.stream_positions.clone(),
             swarm_scraper: self.swarm_scraper.clone(),
+            idle_pauses: self.idle_pauses.clone(),
         })
     }
 
@@ -2350,6 +2392,59 @@ impl TorrentHandle for LibrqbitHandle {
     /// a torrent already paused or in the error state, in librqbit's words.
     async fn stop_for_space(&self) -> Result<()> {
         self.session.pause(&self.handle).await
+    }
+
+    /// The idle pause, and it is a real one: the same `Session::pause` the
+    /// free-space watch uses, recorded in [`IdlePauses`] so that
+    /// [`Self::resume_torrent`] and nothing else lifts it.
+    ///
+    /// This used to be the trait's no-op, on the reasoning that pausing
+    /// drops every peer and the swarm cannot be reliably re-acquired after a
+    /// long idle. That reasoning left the policy with nothing behind it. The
+    /// idle pause is reached only with `seedingEnabled=false` and nothing
+    /// playing, so what it is asked to stop is a torrent still fetching a
+    /// film nobody is watching, on a device whose volume it can fill: the
+    /// measured failure was a torrent going 3 MiB -> 12 MiB in three seconds
+    /// with the engine marked `idle_paused`, right through the free-space
+    /// floor, because `pause_torrent` did nothing and the free-space watch
+    /// skips an engine that claims to be paused. Keeping peers we have
+    /// promised not to seed to, for a download the user has stopped
+    /// watching, is not worth a volume.
+    ///
+    /// `Session::unpause` puts the torrent back with its piece map intact --
+    /// no re-check, no re-hash, no progress lost -- and re-dials from
+    /// trackers, the DHT and its initial peers, so the cost of the drop is a
+    /// re-acquisition at the next playback, not a stall.
+    ///
+    /// Errs, like `stop_for_space`, on a torrent already paused or in the
+    /// error state, and records nothing when it does: a pause somebody else
+    /// owns must not become one this can lift.
+    async fn pause_torrent(&self) -> Result<()> {
+        let mut idle_paused = self.idle_pauses.lock().await;
+        self.session.pause(&self.handle).await?;
+        idle_paused.insert(self.info_hash.clone());
+        Ok(())
+    }
+
+    /// Lift an idle pause -- and only an idle pause. The engine layer calls
+    /// this on every playback start, so for the great majority of torrents,
+    /// which this never paused, it must be a cheap and silent no-op: a bare
+    /// `Session::unpause` would error on all of them, and would also lift
+    /// the free-space watch's stop and put a torrent straight back onto a
+    /// volume that has no room, which is the one pause a starting stream
+    /// must not undo (the stream route answers `507` for that torrent
+    /// instead).
+    ///
+    /// The hash is forgotten only on a successful unpause, so a failure
+    /// leaves the pause owned here and the next call tries again.
+    async fn resume_torrent(&self) -> Result<()> {
+        let mut idle_paused = self.idle_pauses.lock().await;
+        if !idle_paused.contains(&self.info_hash) {
+            return Ok(());
+        }
+        self.session.unpause(&self.handle).await?;
+        idle_paused.remove(&self.info_hash);
+        Ok(())
     }
 
     /// `Session::unpause`, for a torrent librqbit restored paused because it
@@ -3067,6 +3162,7 @@ impl Clone for LibrqbitHandle {
             reported_errors: self.reported_errors.clone(),
             stream_positions: self.stream_positions.clone(),
             swarm_scraper: self.swarm_scraper.clone(),
+            idle_pauses: self.idle_pauses.clone(),
         }
     }
 }
@@ -3776,6 +3872,310 @@ mod tests {
         );
     }
 
+    /// `resume_torrent` lifts the idle pause and nothing else.
+    ///
+    /// The engine layer calls it on every playback start, over torrents it
+    /// has no reason to think are paused, and it must never be the thing
+    /// that puts a torrent the free-space watch stopped back onto a volume
+    /// with no room. No swarm needed: this is about which pause each call
+    /// owns, and `is_paused` is the whole answer.
+    #[tokio::test]
+    async fn resume_torrent_lifts_the_idle_pause_and_no_other() {
+        use crate::backend::TorrentHandle;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let payload = dir.join("payload.bin");
+        write_payload(&payload, 16 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+        let (_backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
+        handle.await_initialized().await.expect("the check ends");
+
+        // A torrent nothing paused: silence, not an error. Every playback
+        // start of every torrent takes this path.
+        handle
+            .resume_torrent()
+            .await
+            .expect("resuming a live torrent is a no-op");
+        assert!(!handle.handle.is_paused(), "and it left it live");
+
+        // The free-space watch's stop is not ours to lift.
+        handle.stop_for_space().await.expect("stops for space");
+        wait_until_paused(&handle).await;
+        handle
+            .resume_torrent()
+            .await
+            .expect("resuming is still not an error");
+        assert!(
+            handle.handle.is_paused(),
+            "a stream starting must not unpause a torrent stopped for want of disk"
+        );
+        handle
+            .restart_after_error()
+            .await
+            .expect("the watch lifts its own stop");
+        assert!(!handle.handle.is_paused());
+
+        // Ours, and only ours, comes back.
+        handle.pause_torrent().await.expect("the idle pause pauses");
+        wait_until_paused(&handle).await;
+        assert!(
+            handle.pause_torrent().await.is_err(),
+            "a paused torrent is not paused twice"
+        );
+        handle.resume_torrent().await.expect("and this lifts it");
+        assert!(!handle.handle.is_paused());
+        handle
+            .resume_torrent()
+            .await
+            .expect("a second resume is a no-op again");
+        assert!(!handle.handle.is_paused());
+    }
+
+    /// The idle pause really stops the fetching, and the resume gets the
+    /// pieces back.
+    ///
+    /// This is the half no fake backend can show. `pause_torrent` was the
+    /// trait's no-op here, so with `seedingEnabled=false` the engine marked
+    /// itself `idle_paused` and the torrent went on downloading at full
+    /// rate -- measured at 3 MiB -> 12 MiB in three seconds -- while the
+    /// free-space watch, which skips an engine that claims to be paused,
+    /// left it alone all the way to `ENOSPC`.
+    ///
+    /// A seeder with a fixed upload rate is what makes "did it stop?"
+    /// answerable in a bounded time: the window is first shown to be long
+    /// enough by watching progress move across it, and only then used to
+    /// assert that it does not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_idle_pause_stops_fetching_and_the_resume_keeps_the_pieces() {
+        use crate::backend::TorrentHandle;
+        /// Long enough that the seeder below moves several pieces across
+        /// it. Not a synchronisation sleep: it is the measurement window,
+        /// and the test proves it is wide enough before relying on it.
+        const WINDOW: Duration = Duration::from_secs(2);
+
+        let src = tempfile::tempdir().unwrap();
+        let payload = src.path().join("payload.bin");
+        // Far more than the seeder can push across the whole test, so the
+        // torrent is still fetching at every point an assertion is made; a
+        // torrent that finished would stop fetching for its own reasons.
+        write_payload(&payload, 8 * 1024 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+        let seeder = slow_seeder(src.path(), &torrent_bytes, 128 * 1024).await;
+        let seeder_addr = seeder.listen_addr().expect("the seeder listens");
+
+        let dl = tempfile::tempdir().unwrap();
+        let backend = LibrqbitBackend::new_for_tests(dl.path().to_path_buf())
+            .await
+            .expect("hermetic session");
+        // Straight to the session, for `initial_peers`: with no DHT, no
+        // trackers and no LSD, that address is the only peer this session
+        // will ever know -- which is also what makes the re-dial after the
+        // resume unambiguous.
+        let response = backend
+            .session
+            .add_torrent(
+                librqbit::AddTorrent::from_bytes(bytes::Bytes::from(torrent_bytes.clone())),
+                Some(librqbit::AddTorrentOptions {
+                    overwrite: true,
+                    initial_peers: Some(vec![seeder_addr]),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("add torrent");
+        let (librqbit::AddTorrentResponse::Added(_, inner)
+        | librqbit::AddTorrentResponse::AlreadyManaged(_, inner)) = response
+        else {
+            panic!("expected the torrent to be added");
+        };
+        let handle = backend.wrap(inner);
+
+        // The precondition, and the window's own proof: across one window,
+        // while nothing is paused, bytes arrive. A failure here is the
+        // environment or a window too short to measure anything, not the
+        // pause -- and without it the frozen counter below would prove
+        // nothing at all.
+        let before = handle.handle.stats().progress_bytes;
+        tokio::time::sleep(WINDOW).await;
+        let fetching = handle.handle.stats().progress_bytes;
+        assert!(
+            fetching > before,
+            "no bytes arrived across {WINDOW:?} ({before} -> {fetching}); the seeder never fed this torrent, so there is nothing here to stop"
+        );
+
+        handle.pause_torrent().await.expect("the idle pause pauses");
+        wait_until_paused(&handle).await;
+        let at_pause = handle.handle.stats().progress_bytes;
+        tokio::time::sleep(WINDOW).await;
+        let after = handle.handle.stats().progress_bytes;
+        assert_eq!(
+            after,
+            at_pause,
+            "a paused torrent fetched {} more bytes across the same {WINDOW:?}",
+            after.saturating_sub(at_pause)
+        );
+        assert!(
+            !handle.handle.stats().finished,
+            "the torrent finished on its own; the payload is too small for this test to mean anything"
+        );
+
+        handle
+            .resume_torrent()
+            .await
+            .expect("and the resume lifts it");
+        assert!(!handle.handle.is_paused());
+        assert!(
+            handle.handle.stats().progress_bytes >= at_pause,
+            "the unpause re-checked or re-hashed and lost progress"
+        );
+        // Back to fetching from the same seeder, on its own bound.
+        let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
+        loop {
+            let now = handle.handle.stats().progress_bytes;
+            if now > at_pause {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the resumed torrent never fetched another byte (still {now} of {})",
+                handle.handle.stats().total_bytes
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Poll until librqbit has actually parked the torrent. `Session::pause`
+    /// asks a torrent still in its initial check to pause when the check
+    /// ends, so the state can lag the call.
+    async fn wait_until_paused(handle: &LibrqbitHandle) {
+        let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
+        while !handle.handle.is_paused() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the torrent never reached the paused state"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The medium finding's own scenario, end to end over a real session:
+    /// seeding is off, the stream stops, the idle grace passes -- and the
+    /// torrent must not be downloading any more.
+    ///
+    /// The policy half of this (when `pause_torrent` is called) is pinned by
+    /// the fake-backend tests in `lib.rs`; what those could not see is that
+    /// the call did nothing. Measured before the fix, with the engine marked
+    /// `idle_paused` and the free-space probe pinned at zero bytes free: the
+    /// torrent went 3 MiB -> 12 MiB over the next three seconds, because the
+    /// free-space watch skips an engine that claims to be paused and nothing
+    /// else was stopping it. So this test asserts about the bytes, not about
+    /// a counter of trait calls.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn seeding_off_and_a_stream_that_ended_stops_the_torrent_fetching() {
+        /// The measurement window, proved wide enough before it is relied
+        /// on -- as in `the_idle_pause_stops_fetching_and_the_resume_keeps_the_pieces`.
+        const WINDOW: Duration = Duration::from_secs(2);
+        /// Stands in for `INACTIVE_TORRENT_PAUSE_GRACE`, which is minutes:
+        /// the grace is only a delay before the same code runs, so waiting
+        /// the shipped one out would add its whole length to the test and
+        /// say nothing more. Longer than `WINDOW`, because the precondition
+        /// is measured inside it.
+        const GRACE: Duration = Duration::from_secs(3);
+
+        let src = tempfile::tempdir().unwrap();
+        let payload = src.path().join("payload.bin");
+        write_payload(&payload, 8 * 1024 * 1024).await;
+        let (torrent_bytes, hash) = make_torrent(&payload).await;
+        let seeder = slow_seeder(src.path(), &torrent_bytes, 128 * 1024).await;
+        let seeder_addr = seeder.listen_addr().expect("the seeder listens");
+
+        let dl = tempfile::tempdir().unwrap();
+        let backend = LibrqbitBackend::new_for_tests(dl.path().to_path_buf())
+            .await
+            .expect("hermetic session");
+        // Straight to the session, for `initial_peers` -- the only peer
+        // this session will ever know.
+        let response = backend
+            .session
+            .add_torrent(
+                librqbit::AddTorrent::from_bytes(bytes::Bytes::from(torrent_bytes.clone())),
+                Some(librqbit::AddTorrentOptions {
+                    overwrite: true,
+                    initial_peers: Some(vec![seeder_addr]),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("add torrent");
+        let (librqbit::AddTorrentResponse::Added(_, inner)
+        | librqbit::AddTorrentResponse::AlreadyManaged(_, inner)) = response
+        else {
+            panic!("expected the torrent to be added");
+        };
+        let handle = backend.wrap(inner);
+
+        let efs = crate::BackendEngineFS::new_with_backend(
+            backend,
+            HashMap::from([(hash.clone(), handle.clone())]),
+            dl.path().join("cache"),
+            dl.path().to_path_buf(),
+        );
+        // What the user turned off, and what the viewer just did: a stream
+        // that starts and then ends.
+        efs.seeding_enabled.store(false, Ordering::Relaxed);
+        efs.on_stream_start(&hash, 0).await;
+        efs.on_stream_end(&hash, 0).await;
+        let pause_task = efs.schedule_torrent_pause_after(hash.clone(), GRACE);
+
+        // The precondition, measured inside the grace: with the stream over
+        // and the want-set the stream left behind, this torrent is still
+        // pulling bytes off the seeder. That is the state the finding
+        // describes, and without it there would be nothing for the pause to
+        // stop. Measured with `fetched` -- the cumulative peer-received
+        // counter -- because `progress_bytes` is have-bytes over the
+        // *selected* files and the stream's own reconcile moves it about.
+        let before = TorrentHandle::transfer_totals(&handle).fetched;
+        tokio::time::sleep(WINDOW).await;
+        let fetching = TorrentHandle::transfer_totals(&handle).fetched;
+        assert!(
+            fetching > before,
+            "the torrent was not fetching during the idle grace ({before} -> {fetching}), \
+             so this test cannot show the pause stopping anything"
+        );
+
+        pause_task.await.expect("the pause task ran");
+        let engine = efs
+            .get_engine(&hash)
+            .await
+            .expect("the engine is still there");
+        assert!(
+            engine.idle_paused.load(Ordering::Relaxed),
+            "the engine did not take the idle pause"
+        );
+        assert!(
+            handle.handle.is_paused(),
+            "the engine says idle-paused and the session says the torrent is live -- \
+             which is exactly the state the finding measured"
+        );
+
+        // And the bytes agree with the state. `progress_bytes` is the have
+        // count, which a pause keeps and a fetch grows.
+        let at_pause = handle.handle.stats().progress_bytes;
+        tokio::time::sleep(WINDOW).await;
+        let after = handle.handle.stats().progress_bytes;
+        assert_eq!(
+            after,
+            at_pause,
+            "an idle-paused torrent fetched {} more bytes across {WINDOW:?}",
+            after.saturating_sub(at_pause)
+        );
+        assert!(
+            !handle.handle.stats().finished,
+            "the torrent finished on its own; the payload is too small for this test \
+             to mean anything"
+        );
+    }
+
     /// `stats().sources` must list the trackers the torrent was added with:
     /// it is the only place a client can confirm its `tr=` trackers reached
     /// the engine, since librqbit cannot add trackers after the fact.
@@ -3864,6 +4264,7 @@ mod tests {
             .expect("add torrent");
         let handle = LibrqbitHandle {
             swarm_scraper: SwarmScraper::with_transport(Arc::new(StubTrackers)),
+            idle_pauses: Default::default(),
             ..handle.clone()
         };
 
@@ -3965,6 +4366,7 @@ mod tests {
             stream_positions: Default::default(),
             reported_errors: Default::default(),
             swarm_scraper: SwarmScraper::disabled(),
+            idle_pauses: Default::default(),
         };
 
         // Bounded poll: the initial peer reaches the peer list once the
@@ -6376,6 +6778,7 @@ mod tests {
             reported_errors: backend.reported_errors.clone(),
             stream_positions: backend.stream_positions.clone(),
             swarm_scraper: backend.swarm_scraper.clone(),
+            idle_pauses: backend.idle_pauses.clone(),
         };
 
         let mut stats = handle.stats().await;

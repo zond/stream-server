@@ -1207,6 +1207,15 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                             continue;
                         }
 
+                        // Already stopped, and by an owner with a better
+                        // claim: the free-space watch lifts its own stop
+                        // when the volume recovers, and the backend refuses
+                        // to pause a torrent twice, so pausing here would
+                        // only log a failure every sweep.
+                        if engine.is_stopped_for_space() {
+                            continue;
+                        }
+
                         if engine.idle_paused.swap(true, Ordering::Relaxed) {
                             continue;
                         }
@@ -4015,6 +4024,16 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     tracing::debug!(
                         info_hash = %info_hash,
                         "Skipping idle pause while torrent metadata is unresolved"
+                    );
+                    return;
+                }
+                // The free-space watch already stopped it, and lifts its own
+                // stop when the volume recovers; the backend refuses a
+                // second pause anyway (see `TorrentHandle::stop_for_space`).
+                if engine.is_stopped_for_space() {
+                    tracing::debug!(
+                        info_hash = %info_hash,
+                        "Skipping idle pause: the free-space watch has already stopped this torrent"
                     );
                     return;
                 }

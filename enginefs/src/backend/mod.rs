@@ -235,7 +235,13 @@ pub trait TorrentHandle: Send + Sync + Clone {
     async fn is_file_complete(&self, _file_idx: usize) -> bool {
         false
     }
-    /// Resume torrent activity after an idle pause.
+    /// Lift an idle pause ([`Self::pause_torrent`]) -- and only an idle
+    /// pause. Called on every playback start, so for a torrent this never
+    /// paused it must be a silent no-op rather than an error, and it must
+    /// never lift a stop the free-space watch owns ([`Self::stop_for_space`])
+    /// -- that torrent has nowhere to write and the stream route answers
+    /// `507` for it. A backend that can pause therefore has to record which
+    /// pauses are its idle ones.
     async fn resume_torrent(&self) -> Result<()> {
         Ok(())
     }
@@ -279,17 +285,31 @@ pub trait TorrentHandle: Send + Sync + Clone {
         anyhow::bail!("this backend cannot restart a stopped torrent")
     }
     /// Stop the torrent -- no more reads from peers, no more writes to disk
-    /// -- because the volume it writes to is about to run out. Not the idle
-    /// pause ([`Self::pause_torrent`], a no-op for a backend that would
-    /// rather throttle than lose its peers): this one must actually stop
-    /// the writes, since the alternative is the filesystem stopping them
-    /// with ENOSPC and the backend declaring the torrent dead. Undone by
-    /// [`Self::restart_after_error`]. Errs for a backend that cannot, and
-    /// for a torrent already stopped.
+    /// -- because the volume it writes to is about to run out. Distinct from
+    /// the idle pause ([`Self::pause_torrent`]) not in what it does to the
+    /// torrent (for librqbit both are `Session::pause`) but in who owns it:
+    /// this stop is lifted by [`Self::restart_after_error`] when the space
+    /// comes back, never by [`Self::resume_torrent`] on a starting stream.
+    /// It must actually stop the writes, since the alternative is the
+    /// filesystem stopping them with ENOSPC and the backend declaring the
+    /// torrent dead. Errs for a backend that cannot, and for a torrent
+    /// already stopped -- an idle-paused one included, which is why the
+    /// free-space watch skips those.
     async fn stop_for_space(&self) -> Result<()> {
         anyhow::bail!("this backend cannot stop a torrent for space")
     }
-    /// Pause torrent activity when no stream is currently using it.
+    /// Pause torrent activity when no stream is using it and the user has
+    /// turned seeding off. Reached only through that conjunction, so what it
+    /// stops is a torrent still fetching a film nobody is watching while we
+    /// have promised to upload nothing -- which on a small device is a
+    /// volume filling for no one. A backend that really pauses must record
+    /// the pause as its own, so that [`Self::resume_torrent`] lifts it and a
+    /// [`Self::stop_for_space`] is never mistaken for it.
+    ///
+    /// The default is a no-op, for a backend that would rather throttle than
+    /// lose its peers ([`Self::set_upload_throttled`]); a backend that takes
+    /// it must accept that pausing drops the swarm and the next playback
+    /// re-acquires it.
     async fn pause_torrent(&self) -> Result<()> {
         Ok(())
     }
