@@ -4,7 +4,7 @@ use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::task::AbortHandle;
@@ -360,12 +360,29 @@ pub struct PendingMagnetAdd<H: TorrentHandle> {
     /// (`BackendEngineFS::relocate_engine`): it ends with the move, not
     /// with its pollers, so the sweep leaves it alone.
     abort: Option<AbortHandle>,
+    /// How many lookups found this add already in flight and joined it
+    /// instead of starting their own. The caller that *started* the add
+    /// reads it once the add is done, to learn whether the torrent it got
+    /// back is still its own to tear down -- see `pin_download`, whose
+    /// refused pin removes the torrent it added, and must not when a
+    /// stream request is holding the same engine.
+    joiners: Arc<AtomicUsize>,
 }
 
 /// Registry-wide id source for [`PendingMagnetAdd::id`].
 static NEXT_ADD_ID: AtomicU64 = AtomicU64::new(1);
 
 impl<H: TorrentHandle + 'static> PendingMagnetAdd<H> {
+    /// A lookup that found this add in flight and is about to wait on it.
+    fn joined(&self) {
+        self.joiners.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// How many lookups joined this add so far.
+    pub fn joiners(&self) -> usize {
+        self.joiners.load(Ordering::SeqCst)
+    }
+
     /// An entry settled by hand -- the returned sender resolves `done` --
     /// for a torrent that is briefly without an engine while it is moved
     /// (see `BackendEngineFS::relocate_engine`). A sender dropped without
@@ -392,6 +409,7 @@ impl<H: TorrentHandle + 'static> PendingMagnetAdd<H> {
                 trackers,
                 id: NEXT_ADD_ID.fetch_add(1, Ordering::Relaxed),
                 abort: None,
+                joiners: Arc::new(AtomicUsize::new(0)),
             },
         )
     }
@@ -404,6 +422,37 @@ impl<H: TorrentHandle + 'static> PendingMagnetAdd<H> {
 pub struct FailedMagnetAdd {
     pub error: MagnetAddError,
     pub trackers: Arc<[String]>,
+}
+
+/// What `lookup_or_begin_add_magnet` found, and whether it was this call
+/// that started the add it is reporting -- a joiner and the starter both
+/// see `Adding`, and only the starter may treat the torrent as its own.
+struct Lookup<H: TorrentHandle> {
+    lookup: EngineLookup<H>,
+    started: bool,
+}
+
+impl<H: TorrentHandle> Lookup<H> {
+    /// Something that was already there: an engine, someone else's add, or
+    /// the record of a failed one.
+    fn found(lookup: EngineLookup<H>) -> Self {
+        Self {
+            lookup,
+            started: false,
+        }
+    }
+}
+
+/// The engine a blocking magnet add ended with, and this call's relation to
+/// it (see `BackendEngineFS::add_magnet_placed`).
+struct AddedMagnet<H: TorrentHandle> {
+    engine: Arc<Engine<H>>,
+    /// This call started the add. False for an engine that existed already
+    /// and for an add someone else started and this call joined.
+    started_here: bool,
+    /// Lookups that joined the add while it ran -- each of them holds, or
+    /// is about to hold, the same engine. Zero unless `started_here`.
+    joiners: usize,
 }
 
 /// Non-blocking lookup result of [`BackendEngineFS::get_or_begin_add_magnet`].
@@ -1151,6 +1200,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             TorrentPlacement::default(),
         )
         .await
+        .lookup
     }
 
     /// [`Self::get_or_begin_add_magnet`], waiting for an in-flight add and
@@ -1175,12 +1225,40 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         extra_trackers: Option<Vec<String>>,
         placement: TorrentPlacement,
     ) -> Result<Arc<Engine<B::Handle>>, MagnetAddError> {
-        match self
-            .lookup_or_begin_add_magnet(info_hash, extra_trackers, true, placement)
+        self.add_magnet_placed(info_hash, extra_trackers, placement)
             .await
-        {
-            EngineLookup::Ready(engine) => Ok(engine),
-            EngineLookup::Adding(pending) => pending.done.await,
+            .map(|added| added.engine)
+    }
+
+    /// [`Self::get_or_add_magnet_placed`], also saying whether this call
+    /// is the one that added the torrent and who else has it -- what a
+    /// caller that may tear the torrent down again needs to know.
+    async fn add_magnet_placed(
+        &self,
+        info_hash: &str,
+        extra_trackers: Option<Vec<String>>,
+        placement: TorrentPlacement,
+    ) -> Result<AddedMagnet<B::Handle>, MagnetAddError> {
+        let Lookup { lookup, started } = self
+            .lookup_or_begin_add_magnet(info_hash, extra_trackers, true, placement)
+            .await;
+        match lookup {
+            EngineLookup::Ready(engine) => Ok(AddedMagnet {
+                engine,
+                started_here: false,
+                joiners: 0,
+            }),
+            EngineLookup::Adding(pending) => {
+                let engine = pending.done.clone().await?;
+                Ok(AddedMagnet {
+                    engine,
+                    started_here: started,
+                    // Read after the add is done and the engine published:
+                    // a lookup that arrives later finds the engine, not the
+                    // add, so this is the whole count.
+                    joiners: pending.joiners(),
+                })
+            }
             EngineLookup::Failed(failed) => Err(failed.error),
         }
     }
@@ -1191,10 +1269,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         extra_trackers: Option<Vec<String>>,
         retry_failed: bool,
         placement: TorrentPlacement,
-    ) -> EngineLookup<B::Handle> {
+    ) -> Lookup<B::Handle> {
         let info_hash = info_hash.to_lowercase();
         if let Some(engine) = self.get_engine(&info_hash).await {
-            return EngineLookup::Ready(engine);
+            return Lookup::found(EngineLookup::Ready(engine));
         }
         // Merge before taking the registry lock: the tracker manager may
         // refresh its list over the network.
@@ -1206,15 +1284,20 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         // visible here, and a finished add must not be restarted.
         if let Some(engine) = self.engines.read().await.get(&info_hash).cloned() {
             engine.touch();
-            return EngineLookup::Ready(engine);
+            return Lookup::found(EngineLookup::Ready(engine));
         }
         let now = self.clock.now_secs();
         if let Some(entry) = adds.get(&info_hash) {
             entry.touch(now);
             match &entry.state {
-                MagnetAddState::Adding(pending) => return EngineLookup::Adding(pending.clone()),
+                MagnetAddState::Adding(pending) => {
+                    // Counted under the registry lock, so the add cannot
+                    // finish and publish between the count and the join.
+                    pending.joined();
+                    return Lookup::found(EngineLookup::Adding(pending.clone()));
+                }
                 MagnetAddState::Failed(failed) if !retry_failed => {
-                    return EngineLookup::Failed(failed.clone());
+                    return Lookup::found(EngineLookup::Failed(failed.clone()));
                 }
                 MagnetAddState::Failed(failed) => {
                     debug!(info_hash, error = %failed.error, "Retrying failed magnet add");
@@ -1243,7 +1326,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 last_polled_secs: AtomicU64::new(now),
             },
         );
-        EngineLookup::Adding(pending)
+        Lookup {
+            lookup: EngineLookup::Adding(pending),
+            started: true,
+        }
     }
 
     /// Start the detached, time-bounded backend add for `info_hash` and the
@@ -1362,6 +1448,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             trackers,
             id,
             abort: Some(abort),
+            joiners: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -2073,8 +2160,12 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             Some(folder) => tokio::fs::try_exists(folder).await.unwrap_or(false),
             None => false,
         };
-        let engine = self
-            .get_or_add_magnet_placed(info_hash, extra_trackers.clone(), placement)
+        let AddedMagnet {
+            engine,
+            started_here,
+            joiners,
+        } = self
+            .add_magnet_placed(info_hash, extra_trackers.clone(), placement)
             .await?;
         let checked = self
             .check_pin_preconditions(
@@ -2085,16 +2176,26 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             )
             .await;
         if let Err(error) = checked {
-            // Torn down only when demonstrably this pin's: no engine
-            // existed before the call and the torrent sits in the folder
-            // only pins place under. A torrent in the cache root stays for
-            // the idle sweeper -- it may be a stream request's in-flight
-            // add this call joined (dropping it would fail the stream about
-            // to open on it), and without a downloads dir the two cannot be
-            // told apart. A folder this add created holds nothing but the
-            // placeholder librqbit pre-sized, so it goes too; a folder that
-            // was there before keeps whatever it holds.
-            let placed_by_this_pin = !was_managed
+            // Torn down only when demonstrably this pin's and nobody
+            // else's: this call started the add, nothing joined it while
+            // metadata resolved, and the torrent sits in the folder only
+            // pins place under. Where it sits is not enough on its own --
+            // it is the pin's placement, but a stream request that looked
+            // the hash up meanwhile joined this very add and is holding
+            // the same engine, and dropping the torrent from the backend
+            // fails every read it is about to make (and any it has already
+            // opened). A joined torrent stays for the idle sweeper exactly
+            // as one in the cache root does: a torrent in the cache root
+            // may be a stream request's own add this call joined, and
+            // without a downloads dir the two cannot be told apart. A
+            // folder this add created holds nothing but the placeholder
+            // librqbit pre-sized, so it goes too; a folder that was there
+            // before keeps whatever it holds. What this cannot see is a
+            // lookup that found the *published* engine between the add
+            // finishing and this check -- a window of one free-space probe
+            // rather than of a metadata resolution.
+            let placed_by_this_pin = started_here
+                && joiners == 0
                 && !engine.is_pinned()
                 && folder.is_some()
                 && engine.handle.output_folder() == folder;
@@ -6781,6 +6882,91 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(enginefs.backend.placements.lock().unwrap().len(), 1);
+    }
+
+    /// The other order: the pin's add is the one in flight and a stream
+    /// request joins *it*. The torrent then sits exactly where a pin places
+    /// one, and a teardown keyed on the folder alone removed it from under
+    /// the stream -- with its files -- the moment the pin was refused.
+    /// Whoever joined the add holds the engine, so the refusal leaves the
+    /// torrent for the idle sweeper, as it does in the cache root.
+    #[tokio::test]
+    async fn refused_pin_leaves_the_torrent_a_stream_joined_its_add_for() {
+        let (mut enginefs, _counters) = test_enginefs_unmanaged();
+        enginefs.set_downloads_dir(Some("/offline".into()));
+        enginefs.set_free_space_probe(|_| Ok(0));
+        enginefs.backend.hold_add.store(true, Ordering::SeqCst);
+        let folder = enginefs
+            .download_folder(TEST_HASH)
+            .expect("downloads dir set");
+
+        let stream = async {
+            assert!(
+                wait_until(TEST_WAIT_BOUND, || {
+                    !enginefs.backend.placements.lock().unwrap().is_empty()
+                })
+                .await,
+                "the pin's add reached the backend"
+            );
+            // A stream-shaped lookup: it finds the pin's add and joins it.
+            let joined = match enginefs.get_or_begin_add_magnet(TEST_HASH, None).await {
+                EngineLookup::Adding(pending) => pending,
+                _ => panic!("the stream should have joined the in-flight add"),
+            };
+            assert_eq!(
+                enginefs.backend.placements.lock().unwrap().len(),
+                1,
+                "one add, the pin's, placed under the downloads dir"
+            );
+            enginefs.backend.add_hold.add_permits(1);
+            joined.done.await.expect("the add itself succeeds")
+        };
+        let (result, streamed) = tokio::join!(enginefs.pin_download(TEST_HASH, 0, None), stream);
+        assert!(matches!(
+            result,
+            Err(PinDownloadError::InsufficientSpace { .. })
+        ));
+        assert_eq!(
+            streamed.handle.output_folder(),
+            Some(folder),
+            "the engine the stream holds is the pin-placed one"
+        );
+        let engine = enginefs
+            .get_engine(TEST_HASH)
+            .await
+            .expect("and it is still registered for the stream to read from");
+        assert!(Arc::ptr_eq(&engine, &streamed));
+        assert!(!engine.is_pinned());
+        assert!(
+            enginefs.backend.removed.lock().unwrap().is_empty()
+                && enginefs
+                    .backend
+                    .removed_with_files
+                    .lock()
+                    .unwrap()
+                    .is_empty(),
+            "nothing was torn down from under the stream"
+        );
+
+        // Nobody joined: the same refusal takes the torrent with it, so a
+        // refused pin does not leave a placeholder tree under the downloads
+        // dir either.
+        enginefs.remove_engine(TEST_HASH).await;
+        enginefs.backend.hold_add.store(false, Ordering::SeqCst);
+        assert!(matches!(
+            enginefs.pin_download(TEST_HASH, 0, None).await,
+            Err(PinDownloadError::InsufficientSpace { .. })
+        ));
+        assert!(enginefs.get_engine(TEST_HASH).await.is_none());
+        assert_eq!(
+            enginefs
+                .backend
+                .removed_with_files
+                .lock()
+                .unwrap()
+                .as_slice(),
+            &[TEST_HASH.to_string()]
+        );
     }
 
     /// `LibrqbitBackend` behind a shim that answers a magnet add for a known
