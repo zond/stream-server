@@ -93,12 +93,13 @@
 //! the session's default factory, so this store can only keep it by *being*
 //! that default -- not by being passed to a single add.
 //!
-//! Which is now also where the byte counters behind the client's activity
-//! signal sit ([`crate::traffic`], wrapped around the default factory in
-//! `LibrqbitBackend::new`). So the wiring commit replaces what that wrapper
-//! *wraps*, and does not replace the wrapper: a [`store::PieceStoreFactory`]
-//! installed as the bare default would leave that signal permanently dark,
-//! since nothing else in the tree counts a byte.
+//! Nothing else has a stake in the default factory any more. The client's
+//! activity signal briefly did -- its counters were a storage wrapper around
+//! the default, and this store would have had to go inside it -- until that
+//! wrapper counted the initial check's read-back of every restored torrent
+//! as traffic. The signal now reads librqbit's own peer counters
+//! ([`crate::traffic`]) and never sees the storage, so this factory can be
+//! the bare default, and its own initial-check reads are nobody's traffic.
 //!
 //! **Not settled: a have-bit that is not an announcement.** [`policy`] decides
 //! that only the committed set is advertised and that a window piece is held
