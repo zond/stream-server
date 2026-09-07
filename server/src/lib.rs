@@ -272,28 +272,31 @@ impl ServerHandle {
     }
 
     /// Whether this server is using the connection while nothing is playing
-    /// -- what a client's "working in the background" indicator shows.
+    /// -- what a client's "working in the background" indicator shows, in
+    /// each direction, exactly what `routes::system::background_traffic`
+    /// answers.
     ///
-    /// One fact, not two: bytes through the torrent storage over the last
-    /// window (a peer we are serving, an offline download running with
-    /// nothing on screen, the hash check that download needs) *and* no
-    /// playback over that window. The conjunction is taken in enginefs
-    /// (`BackendEngineFS::background_traffic`) on purpose -- an embedder
-    /// reading the two halves separately would sample them a moment apart
-    /// and get a light that flickers whenever they disagree.
+    /// Two halves and their disjunction, not two signals: `downloading` and
+    /// `uploading` are each "that direction's peer counters grew over the
+    /// last window and nothing was playing over it", `active` is either.
+    /// The conjunction with playback is taken in `routes::system` over both
+    /// engines on purpose -- an embedder reading traffic and playback
+    /// separately would sample them a moment apart and get a light that
+    /// flickers whenever they disagree.
     ///
     /// Library-only: there is no control route for it, because the consumer
     /// is the embedding client rather than anything speaking HTTP, and
     /// `enginefs::traffic::BackgroundTraffic` is `serde`-serializable like
     /// every other type crossing this boundary. Cheap enough to poll every
-    /// second or two -- it reads the engines that already exist and two
-    /// atomics -- and it creates nothing: no engine, no magnet add. The
-    /// verdict only changes when a window closes
-    /// (`enginefs::traffic::TRAFFIC_WINDOW`), so asking faster than that is
-    /// answered from the standing reading.
+    /// second or two -- two atomics per torrent that exists and the three
+    /// live playback fields, nothing built, no idle clock touched -- and it
+    /// creates nothing: no engine, no magnet add. The verdict changes when
+    /// a window closes (`enginefs::traffic::TRAFFIC_WINDOW`) or the moment
+    /// playback is seen, whichever comes first; asking faster than the
+    /// window is otherwise answered from the standing reading.
     pub fn background_traffic(&self) -> anyhow::Result<enginefs::traffic::BackgroundTraffic> {
         let state = self.state.clone();
-        self.block_on_server(async move { state.stream_engine().background_traffic().await })
+        self.block_on_server(async move { routes::system::background_traffic(&state).await })
     }
 
     /// Torrent-level stats, exactly what `GET /{infoHash}/stats.json?tr=...`

@@ -34,6 +34,12 @@ pub struct AppState {
     /// (see `crate::lan_media`). Constructed disabled; `run` replaces it with
     /// one carrying `ServerConfig::lan_media_addr`.
     pub lan_media: Arc<crate::lan_media::LanMedia>,
+    /// The standing reading behind `ServerHandle::background_traffic` (see
+    /// `routes::system::background_traffic`). One per server, not per
+    /// caller: the verdict is a comparison against the last reading, and
+    /// two callers with two of these would each consume windows the other
+    /// never sees.
+    pub traffic_window: Arc<enginefs::traffic::TrafficWindow>,
 }
 
 impl AppState {
@@ -114,6 +120,7 @@ impl AppState {
             proxy_streams: Arc::new(crate::proxy_streams::ProxyStreams::new()),
             proxy_cache,
             lan_media: Arc::new(crate::lan_media::LanMedia::new(None)),
+            traffic_window: Arc::new(enginefs::traffic::TrafficWindow::new()),
         }
     }
 

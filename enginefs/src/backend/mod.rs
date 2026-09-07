@@ -1,5 +1,4 @@
 use anyhow::Result;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncSeek};
 
@@ -90,18 +89,6 @@ pub trait TorrentBackend: Send + Sync {
     /// DHT", the right answer for a backend that has none.
     fn dht_status(&self) -> DhtStatus {
         DhtStatus::default()
-    }
-    /// The bytes this backend's storage has moved this process (see
-    /// [`crate::traffic`]), which is what says whether we are using the
-    /// connection at all.
-    ///
-    /// The default is counters nothing increments. That reads as "nothing is
-    /// moving", which is the only safe answer a backend that does not meter
-    /// its storage can give: the signal built on this is a claim about
-    /// somebody's connection, and a backend that cannot support the claim
-    /// must not make it.
-    fn storage_traffic(&self) -> Arc<crate::traffic::StorageTraffic> {
-        crate::traffic::StorageTraffic::uncounted()
     }
     fn set_seeding_enabled(&self, _enabled: bool) {}
 }

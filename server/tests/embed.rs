@@ -424,14 +424,19 @@ fn background_traffic_is_dark_on_an_idle_server() -> anyhow::Result<()> {
 
     let traffic = handle.background_traffic()?;
     assert!(!traffic.active, "nothing has been asked of this server yet");
-    assert!(!traffic.moving && !traffic.playing);
-    assert_eq!(traffic.bytes_read, 0);
-    assert_eq!(traffic.bytes_written, 0);
+    assert!(!traffic.downloading && !traffic.uploading && !traffic.playing);
+    assert_eq!(traffic.bytes_downloaded, 0);
+    assert_eq!(traffic.bytes_uploaded, 0);
     assert!(traffic.window_secs > 0, "the window has to be a duration");
 
-    // It crosses FFI as JSON like every other type on this boundary.
+    // It crosses FFI as JSON like every other type on this boundary, and
+    // these are the names the app reads.
     let json = serde_json::to_value(&traffic)?;
-    assert_eq!(json["active"], serde_json::json!(false));
+    for half in ["active", "downloading", "uploading", "playing"] {
+        assert_eq!(json[half], serde_json::json!(false), "{half}");
+    }
+    assert_eq!(json["bytes_downloaded"], serde_json::json!(0));
+    assert_eq!(json["bytes_uploaded"], serde_json::json!(0));
 
     // And it created nothing on the way: `/stats.json` still knows no torrent
     // (its non-torrent keys are `dht`, and `sys` only when asked for).

@@ -10,26 +10,79 @@ use enginefs::backend::librqbit::LibrqbitHandle;
 use enginefs::backend::priorities::BufferProfile;
 use enginefs::backend::{
     EngineStats, TorrentEncryptionMode, TorrentHandle, TorrentPrivacyConfig, TorrentProxyType,
+    TransferTotals,
 };
-use enginefs::{EngineLookup, FailedMagnetAdd, PendingMagnetAdd};
+use enginefs::{EngineFS, EngineLookup, FailedMagnetAdd, PendingMagnetAdd};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-async fn combined_engine_stats(
+/// One per-torrent reading over both engines, keyed by info hash.
+///
+/// The server holds two `EngineFS` instances -- `engine` and
+/// `download_engine`, one and the same `Arc` when no disk-backed engine
+/// came up -- and anything that reports "every torrent" has to ask both, or
+/// a background download is invisible to it. Direct playback and download
+/// requests use `download_engine` when disk-backed mode is available, so
+/// its entry wins a duplicate hash: that is where the active transfer is.
+/// The one merge, shared by `/stats.json` and the activity light, so the
+/// two cannot disagree about which torrents exist.
+async fn combined_per_torrent<T>(
     state: &AppState,
-) -> HashMap<String, enginefs::backend::EngineStats> {
-    let mut engines = state.engine.get_all_statistics().await;
-    let download_engines = state.download_engine.get_all_statistics().await;
+    per_engine: impl AsyncFn(&EngineFS) -> HashMap<String, T>,
+) -> HashMap<String, T> {
+    let engines = per_engine(&state.engine).await;
+    let download_engines = per_engine(&state.download_engine).await;
+    prefer_download_engine(engines, download_engines)
+}
 
-    // Direct playback/download requests use download_engine when disk-backed
-    // mode is available. Prefer those stats for duplicate info hashes so UI
-    // speed/peer counters reflect the active transfer.
-    for (hash, stats) in download_engines {
-        engines.insert(hash, stats);
+/// The merge rule of [`combined_per_torrent`] on its own, so it can be
+/// tested without two engines: everything from both, the download engine's
+/// entry standing for a hash in both.
+fn prefer_download_engine<T>(
+    mut engines: HashMap<String, T>,
+    download_engines: HashMap<String, T>,
+) -> HashMap<String, T> {
+    for (hash, entry) in download_engines {
+        engines.insert(hash, entry);
     }
-
     engines
+}
+
+async fn combined_engine_stats(state: &AppState) -> HashMap<String, EngineStats> {
+    combined_per_torrent(state, async |engine| engine.get_all_statistics().await).await
+}
+
+/// Whether this server is using the connection while nothing is playing,
+/// in each direction -- what a client's "working in the background" light
+/// shows. Shared with [`crate::ServerHandle::background_traffic`]; there is
+/// no route, since the consumer is the embedding client.
+///
+/// The conjunction is taken here, over both engines, and handed over as one
+/// value on purpose: an embedder reading traffic and playback separately
+/// would sample them a moment apart across FFI and get a light that
+/// flickers whenever they disagree. *Traffic* is the sum of every existing
+/// torrent's own peer counters ([`enginefs::backend::TransferTotals`],
+/// through the same merge `/stats.json` uses) compared against the last
+/// reading; *nothing playing* is [`EngineFS::playback_is_live`] of either
+/// engine, held over the window and not just now (see
+/// [`enginefs::traffic::TrafficWindow::sample`]).
+///
+/// Cheap and a peek, so it can be polled every second or two for the life
+/// of the process: two atomics per torrent that exists and the three live
+/// playback fields, no snapshot built, no idle clock touched (a reading
+/// that counted as a poll would hold every torrent out of the idle sweep,
+/// and the light would be lit by the seeding it caused). It creates
+/// nothing -- no engine, no magnet add -- so it never goes near
+/// `stats_target`.
+pub async fn background_traffic(state: &AppState) -> enginefs::traffic::BackgroundTraffic {
+    let totals = combined_per_torrent(state, async |engine| engine.transfer_totals().await)
+        .await
+        .into_values()
+        .fold(TransferTotals::default(), TransferTotals::plus);
+    let playing =
+        state.engine.playback_is_live().await || state.download_engine.playback_is_live().await;
+    state.traffic_window.sample(totals, playing)
 }
 
 #[derive(serde::Deserialize)]
@@ -1344,6 +1397,30 @@ pub async fn get_file_stats(
 
 #[cfg(test)]
 mod tests {
+    /// Both engines' torrents are in the merged view, and a hash in both is
+    /// the download engine's -- the rule `/stats.json` and the activity
+    /// light share, so a background download can be invisible to neither.
+    #[test]
+    fn the_merge_keeps_both_engines_and_prefers_the_download_engine() {
+        use super::prefer_download_engine;
+        use std::collections::HashMap;
+        let engines = HashMap::from([("a".to_string(), 1), ("both".to_string(), 2)]);
+        let download_engines = HashMap::from([("both".to_string(), 20), ("d".to_string(), 30)]);
+        let merged = prefer_download_engine(engines, download_engines);
+        assert_eq!(
+            merged,
+            HashMap::from([
+                ("a".to_string(), 1),
+                ("both".to_string(), 20),
+                ("d".to_string(), 30)
+            ])
+        );
+        // The same `Arc` on both sides -- the server with no disk-backed
+        // engine -- is one set of torrents, not a doubled one.
+        let same = HashMap::from([("a".to_string(), 7)]);
+        assert_eq!(prefer_download_engine(same.clone(), same.clone()), same);
+    }
+
     /// `downloadsDir` must be absolute and usable: relative, empty and
     /// file-shadowed paths are refused, a missing directory is created,
     /// the probe leaves nothing behind, and what comes back is the plain
