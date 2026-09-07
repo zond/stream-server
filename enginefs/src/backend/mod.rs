@@ -750,6 +750,49 @@ impl Default for TorrentPrivacyConfig {
     }
 }
 
+/// Where a `bt*` setting ends up in the backend -- the answer a client is
+/// owed for every one of them, since every one is accepted, echoed back and
+/// persisted whether or not anything reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BtSettingEffect {
+    /// Applied to the running session the moment it is set.
+    Live,
+    /// Read once when the session opens; a change waits for the next start.
+    NextStart,
+    /// Accepted and persisted, and reaches nothing: the backend has no knob
+    /// for it. The note says what stands instead.
+    NotHonoured,
+}
+
+/// One row of the backend's `bt*` truth table (see
+/// `librqbit::bt_settings_support`): the setting's JSON key, what setting
+/// it does, and why that is so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BtSettingSupport {
+    pub setting: &'static str,
+    pub effect: BtSettingEffect,
+    pub note: &'static str,
+}
+
+/// What one settings update did to the torrent session, keyed by the
+/// settings' JSON names, so the response can say it instead of a bare
+/// echo of the request.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BtSettingsReport {
+    /// Applied to the running session by this call.
+    pub applied_live: Vec<&'static str>,
+    /// Session-start settings whose value now differs from the one the
+    /// running session opened with: they take effect at the next start.
+    pub pending_restart: Vec<&'static str>,
+    /// Settings the backend never reads. Always the full list, whether or
+    /// not the call changed them: the point is that a client can never
+    /// mistake their acceptance for an effect.
+    pub not_honoured: Vec<&'static str>,
+}
+
 /// Ports the standalone binary tries, in order, for librqbit's incoming
 /// BitTorrent listener ([`TorrentListenPort::Fixed`] default). Mirrors the
 /// pre-9.0.1 librqbit `listen_port_range: 42000..42010` fallback.

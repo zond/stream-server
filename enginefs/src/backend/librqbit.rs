@@ -1,9 +1,10 @@
 use crate::backend::dht_bootstrap::{self, BootstrapResolvers};
 use crate::backend::{
-    BackendFileInfo, BackendMemoryDiagnostics, DhtStatus, DroppedFilePieces, EngineStats,
-    FileStreamTrait, Growler, PeerDiscovery, PeerSearch, PieceReadiness, Source, StartupPhase,
-    StatsFile, StatsOptions, SwarmCap, TorrentBackend, TorrentFilePriorityPlan, TorrentHandle,
-    TorrentListenPort, TorrentPlacement, TorrentSource, TransferTotals,
+    BackendFileInfo, BackendMemoryDiagnostics, BtSettingEffect, BtSettingSupport, BtSettingsReport,
+    DhtStatus, DroppedFilePieces, EngineStats, FileStreamTrait, Growler, PeerDiscovery, PeerSearch,
+    PieceReadiness, Source, StartupPhase, StatsFile, StatsOptions, SwarmCap, TorrentBackend,
+    TorrentFilePriorityPlan, TorrentHandle, TorrentListenPort, TorrentPlacement,
+    TorrentPrivacyConfig, TorrentProxyType, TorrentSource, TorrentSpeedProfile, TransferTotals,
 };
 use crate::scrape::SwarmScraper;
 use anyhow::{Context, Result};
@@ -391,8 +392,362 @@ pub async fn effective_dht_bootstrap_addrs(
         .await
 }
 
+/// What of the `bt*` settings librqbit can actually be handed, in
+/// librqbit's own terms. Built from the settings by
+/// [`SessionTuning::from_settings`]; every field but `download_bps` is read
+/// once, at `Session::new`, and a later change waits for the next start.
+///
+/// The settings' names and semantics are libtorrent's, and most have no
+/// counterpart here -- see [`bt_settings_support`] for the row-by-row
+/// account. This struct is the part that does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionTuning {
+    /// `btEnableDht`: off means the session has no DHT at all.
+    pub dht: bool,
+    /// `btEnableLsd`: local service discovery multicast.
+    pub lsd: bool,
+    /// The `btProxy*` settings as the one URL librqbit takes,
+    /// `socks5://[user:pass@]host:port` -- see [`socks5_proxy_url`] for
+    /// what qualifies. Peer connections and HTTP(S) tracker requests go
+    /// through it; UDP trackers and the DHT cannot.
+    pub proxy_url: Option<String>,
+    /// `btDownloadSpeedHardLimit`, bytes per second; the one knob librqbit
+    /// changes on a running session.
+    pub download_bps: Option<std::num::NonZeroU32>,
+    /// `btMaxConnections`, as the per-torrent peer limit
+    /// [`TorrentSpeedProfile::effective_connection_limits`] derives from it.
+    pub peer_limit: Option<usize>,
+    /// `btOutgoingInterfaces`, when it names one network interface (an
+    /// `SO_BINDTODEVICE` name, not an address) -- see [`bind_device_name`].
+    pub bind_device: Option<String>,
+}
+
+impl Default for SessionTuning {
+    /// librqbit's own defaults, which are also the settings' defaults.
+    fn default() -> Self {
+        Self {
+            dht: true,
+            lsd: true,
+            proxy_url: None,
+            download_bps: None,
+            peer_limit: None,
+            bind_device: None,
+        }
+    }
+}
+
+impl SessionTuning {
+    /// The settings, reduced to what the session can take. Anything a
+    /// setting asks for that does not fit (a SOCKS4 proxy, an interface
+    /// given as an address) is left at librqbit's default and logged: it
+    /// is a value the session would otherwise refuse to start with.
+    pub fn from_settings(profile: &TorrentSpeedProfile, privacy: &TorrentPrivacyConfig) -> Self {
+        Self {
+            dht: privacy.bt_enable_dht,
+            lsd: privacy.bt_enable_lsd,
+            proxy_url: socks5_proxy_url(privacy),
+            download_bps: download_bps(profile),
+            peer_limit: Some(profile.effective_connection_limits().1 as usize),
+            bind_device: bind_device_name(&privacy.bt_outgoing_interfaces),
+        }
+    }
+
+    /// The settings' JSON keys whose session-start value differs between
+    /// `self` (what the session opened with) and `wanted` -- what a change
+    /// has to wait for the next start for.
+    fn pending_restart(&self, wanted: &Self) -> Vec<&'static str> {
+        let mut pending = Vec::new();
+        if self.dht != wanted.dht {
+            pending.push(BT_ENABLE_DHT);
+        }
+        if self.lsd != wanted.lsd {
+            pending.push(BT_ENABLE_LSD);
+        }
+        if self.proxy_url != wanted.proxy_url {
+            pending.extend(BT_PROXY_SETTINGS);
+        }
+        if self.peer_limit != wanted.peer_limit {
+            pending.push(BT_MAX_CONNECTIONS);
+        }
+        if self.bind_device != wanted.bind_device {
+            pending.push(BT_OUTGOING_INTERFACES);
+        }
+        pending
+    }
+}
+
+const BT_ENABLE_DHT: &str = "btEnableDht";
+const BT_ENABLE_LSD: &str = "btEnableLsd";
+const BT_MAX_CONNECTIONS: &str = "btMaxConnections";
+const BT_OUTGOING_INTERFACES: &str = "btOutgoingInterfaces";
+const BT_DOWNLOAD_SPEED_HARD_LIMIT: &str = "btDownloadSpeedHardLimit";
+/// The settings that together make the one proxy URL.
+const BT_PROXY_SETTINGS: [&str; 5] = [
+    "btProxyType",
+    "btProxyHost",
+    "btProxyPort",
+    "btProxyUsername",
+    "btProxyPassword",
+];
+
+/// The `btProxy*` settings as librqbit's `socks5://[user:pass@]host:port`,
+/// or nothing.
+///
+/// librqbit speaks SOCKS5 and nothing else (`SocksProxyConfig::parse`
+/// rejects any other scheme, and a URL it rejects fails `Session::new`,
+/// i.e. the server does not start), so `socks4`, `http` and `httpPassword`
+/// yield nothing here and are reported as not honoured. Credentials go in
+/// for `socks5Password` only, percent-encoded so a `@` or `:` in them
+/// cannot re-shape the URL; an IPv6 host literal is bracketed. The result
+/// is parsed back the way librqbit will parse it before it is trusted --
+/// a host that does not survive `Url::parse` is dropped with a warning
+/// rather than handed to a session that would refuse to open.
+pub fn socks5_proxy_url(privacy: &TorrentPrivacyConfig) -> Option<String> {
+    let with_credentials = match privacy.bt_proxy_type {
+        TorrentProxyType::Socks5 => false,
+        TorrentProxyType::Socks5Password => true,
+        TorrentProxyType::None
+        | TorrentProxyType::Socks4
+        | TorrentProxyType::Http
+        | TorrentProxyType::HttpPassword => return None,
+    };
+    let host = privacy.bt_proxy_host.trim();
+    if host.is_empty() || privacy.bt_proxy_port == 0 {
+        return None;
+    }
+    let host = if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let credentials = if with_credentials {
+        format!(
+            "{}:{}@",
+            urlencoding::encode(&privacy.bt_proxy_username),
+            urlencoding::encode(&privacy.bt_proxy_password)
+        )
+    } else {
+        String::new()
+    };
+    let url = format!("socks5://{credentials}{host}:{}", privacy.bt_proxy_port);
+    match url::Url::parse(&url) {
+        Ok(parsed) if parsed.host_str().is_some() && parsed.port().is_some() => Some(url),
+        _ => {
+            warn!(
+                host = privacy.bt_proxy_host,
+                port = privacy.bt_proxy_port,
+                "btProxyHost does not make a proxy URL librqbit can parse; the proxy is not applied"
+            );
+            None
+        }
+    }
+}
+
+/// `btOutgoingInterfaces` as librqbit's `bind_device_name`, or nothing.
+///
+/// librqbit binds with `SO_BINDTODEVICE` (`IP_BOUND_IF` on macOS), which
+/// takes one interface *name*; the setting allows a comma-separated list of
+/// names or addresses, so exactly one entry that is not an address is
+/// honoured and anything else is logged and left unbound. A name the OS
+/// does not know fails `Session::new` (and any name does on Windows), which
+/// `LibrqbitBackend::new_with_settings` answers by starting without it.
+pub fn bind_device_name(outgoing_interfaces: &str) -> Option<String> {
+    let value = outgoing_interfaces.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value.contains(',') {
+        warn!(
+            value,
+            "btOutgoingInterfaces lists several interfaces; librqbit binds to one, so none is applied"
+        );
+        return None;
+    }
+    if value.parse::<std::net::IpAddr>().is_ok() {
+        warn!(
+            value,
+            "btOutgoingInterfaces is an address; librqbit binds by interface name, so it is not applied"
+        );
+        return None;
+    }
+    Some(value.to_string())
+}
+
+/// `btDownloadSpeedHardLimit` (bytes per second, `0` = unlimited) as the
+/// rate limiter's `NonZeroU32`.
+fn download_bps(profile: &TorrentSpeedProfile) -> Option<std::num::NonZeroU32> {
+    let bps = profile.bt_download_speed_hard_limit;
+    // A NaN or a negative number is "no limit" too: `as u32` would make
+    // either a 0, and NonZeroU32 turns that into None, but say it here.
+    if bps.is_nan() || bps <= 0.0 {
+        return None;
+    }
+    std::num::NonZeroU32::new(bps.min(u32::MAX as f64) as u32)
+}
+
+/// The truth table for the `bt*` settings against the librqbit this crate
+/// pins: what each one does, and why. Every setting is accepted, echoed
+/// back and persisted whether or not anything reads it; this is what lets
+/// the settings response, the schema and the docs say which is which.
+/// A row changes when the mapping in [`SessionTuning::from_settings`] does,
+/// and the test `every_bt_setting_has_a_row_in_the_truth_table` keeps the
+/// two lists the same length.
+pub fn bt_settings_support() -> &'static [BtSettingSupport] {
+    use BtSettingEffect::{Live, NextStart, NotHonoured};
+    const TABLE: &[BtSettingSupport] = &[
+        BtSettingSupport {
+            setting: BT_ENABLE_DHT,
+            effect: NextStart,
+            note: "the DHT is created with the session: off means no DHT at all",
+        },
+        BtSettingSupport {
+            setting: "btEnablePex",
+            effect: NotHonoured,
+            note: "librqbit has no PeX switch; ut_pex is always on for public torrents",
+        },
+        BtSettingSupport {
+            setting: BT_ENABLE_LSD,
+            effect: NextStart,
+            note: "local service discovery multicast is on or off for the whole session",
+        },
+        BtSettingSupport {
+            setting: "btEncryptionMode",
+            effect: NotHonoured,
+            note: "librqbit speaks plain BitTorrent only (no MSE/PE): 'require' cannot be met \
+                   and 'disable' is what always stands",
+        },
+        BtSettingSupport {
+            setting: "btAnonymousMode",
+            effect: NotHonoured,
+            note: "no equivalent; the client name and peer id are librqbit's own",
+        },
+        BtSettingSupport {
+            setting: "btAllowMultipleConnectionsPerIp",
+            effect: NotHonoured,
+            note: "librqbit has no per-IP connection rule",
+        },
+        BtSettingSupport {
+            setting: "btListenInterfaces",
+            effect: NotHonoured,
+            note: "the incoming listener is the launch configuration's TorrentListenPort \
+                   (42000-42010 for the binary, ephemeral when embedded), never this setting",
+        },
+        BtSettingSupport {
+            setting: BT_OUTGOING_INTERFACES,
+            effect: NextStart,
+            note: "one interface name, bound with SO_BINDTODEVICE; an address or a list is not \
+                   applied, and a name the OS rejects starts the session unbound",
+        },
+        BtSettingSupport {
+            setting: "btOutgoingPort",
+            effect: NotHonoured,
+            note: "librqbit lets the OS pick outgoing ports",
+        },
+        BtSettingSupport {
+            setting: "btNumOutgoingPorts",
+            effect: NotHonoured,
+            note: "librqbit lets the OS pick outgoing ports",
+        },
+        BtSettingSupport {
+            setting: "btProxyType",
+            effect: NextStart,
+            note: "socks5 and socks5Password only; socks4, http and httpPassword are not \
+                   applied",
+        },
+        BtSettingSupport {
+            setting: "btProxyHost",
+            effect: NextStart,
+            note: "with btProxyType and btProxyPort, the one SOCKS5 proxy peer connections \
+                   and HTTP(S) tracker requests go through",
+        },
+        BtSettingSupport {
+            setting: "btProxyPort",
+            effect: NextStart,
+            note: "see btProxyHost",
+        },
+        BtSettingSupport {
+            setting: "btProxyUsername",
+            effect: NextStart,
+            note: "sent for socks5Password only",
+        },
+        BtSettingSupport {
+            setting: "btProxyPassword",
+            effect: NextStart,
+            note: "sent for socks5Password only",
+        },
+        BtSettingSupport {
+            setting: "btProxyHostnames",
+            effect: NotHonoured,
+            note: "peers are addresses, and tracker hostnames are resolved locally (socks5, \
+                   not socks5h)",
+        },
+        BtSettingSupport {
+            setting: "btProxyPeerConnections",
+            effect: NotHonoured,
+            note: "peer connections always go through a configured proxy",
+        },
+        BtSettingSupport {
+            setting: "btProxyTrackerConnections",
+            effect: NotHonoured,
+            note: "HTTP(S) tracker requests always go through a configured proxy; UDP trackers \
+                   and the DHT never can",
+        },
+        BtSettingSupport {
+            setting: "btProxySendHostInConnect",
+            effect: NotHonoured,
+            note: "an HTTP CONNECT proxy option, and librqbit has no HTTP proxy",
+        },
+        BtSettingSupport {
+            setting: "btValidateHttpsTrackers",
+            effect: NotHonoured,
+            note: "HTTPS tracker certificates are always validated; that cannot be turned off",
+        },
+        BtSettingSupport {
+            setting: "btSsrfMitigation",
+            effect: NotHonoured,
+            note: "no equivalent",
+        },
+        BtSettingSupport {
+            setting: BT_DOWNLOAD_SPEED_HARD_LIMIT,
+            effect: Live,
+            note: "the session's download rate limiter, bytes per second, 0 for none",
+        },
+        BtSettingSupport {
+            setting: "btDownloadSpeedSoftLimit",
+            effect: NotHonoured,
+            note: "librqbit has one download limit, not a soft and a hard one",
+        },
+        BtSettingSupport {
+            setting: "btHandshakeTimeout",
+            effect: NotHonoured,
+            note: "librqbit has a connect timeout (10 s here) and a read/write timeout (30 s); \
+                   neither is a handshake timeout, and the second would drop idle peers",
+        },
+        BtSettingSupport {
+            setting: "btRequestTimeout",
+            effect: NotHonoured,
+            note: "librqbit's request timing is its own",
+        },
+        BtSettingSupport {
+            setting: BT_MAX_CONNECTIONS,
+            effect: NextStart,
+            note: "the per-torrent peer limit TorrentSpeedProfile::effective_connection_limits \
+                   derives from it (40 to 200 peers; 200 for the default 800)",
+        },
+        BtSettingSupport {
+            setting: "btMinPeersForStable",
+            effect: NotHonoured,
+            note: "nothing reads it; stats echo librqbit's fixed peer-search figures",
+        },
+    ];
+    TABLE
+}
+
 pub struct LibrqbitBackend {
     pub session: Arc<Session>,
+    /// What the session was opened with, to say which of a later settings
+    /// change is waiting for the next start ([`Self::apply_settings`]).
+    started_with: SessionTuning,
     /// Sticky "the DHT routing table has been non-empty at least once this
     /// session", latched by [`LibrqbitBackend::dht_status`]. librqbit keeps
     /// no such flag -- `DhtStats` is instantaneous sizes only -- and the
@@ -416,7 +771,9 @@ impl LibrqbitBackend {
     /// incoming peers on `listen_port` (see [`TorrentListenPort`]) and
     /// seeding its DHT routing table from `dht_bootstrap_nodes` when cold
     /// (empty uses [`DEFAULT_DHT_BOOTSTRAP_NODES`]; see
-    /// [`resolve_dht_bootstrap_nodes`]).
+    /// [`resolve_dht_bootstrap_nodes`]), with librqbit's own defaults for
+    /// everything the `bt*` settings could tune --
+    /// [`Self::new_with_settings`] takes those.
     ///
     /// Whatever that list ends up being, `bootstrap_resolvers` turns its
     /// names into address literals before librqbit sees them -- see
@@ -430,94 +787,57 @@ impl LibrqbitBackend {
         dht_bootstrap_nodes: Vec<String>,
         bootstrap_resolvers: BootstrapResolvers,
     ) -> Result<(Self, HashMap<String, LibrqbitHandle>)> {
+        Self::new_with_settings(
+            download_dir,
+            listen_port,
+            dht_bootstrap_nodes,
+            bootstrap_resolvers,
+            SessionTuning::default(),
+        )
+        .await
+    }
+
+    /// [`Self::new`] with the `bt*` settings the session can take
+    /// ([`SessionTuning`]). Read once, here: librqbit configures a session
+    /// when it opens it, and only the download rate limit can be changed
+    /// afterwards ([`Self::apply_settings`]).
+    ///
+    /// A bind device the OS rejects fails `Session::new` outright, and so
+    /// does every bind device on Windows. That is a setting the user typed,
+    /// and a server that does not start over it helps nobody, so the
+    /// session is opened again without it and the fact is logged at warn --
+    /// the client sees it in the report the next settings update returns,
+    /// as `btOutgoingInterfaces` pending a restart that will not help
+    /// either.
+    pub async fn new_with_settings(
+        download_dir: PathBuf,
+        listen_port: TorrentListenPort,
+        dht_bootstrap_nodes: Vec<String>,
+        bootstrap_resolvers: BootstrapResolvers,
+        tuning: SessionTuning,
+    ) -> Result<(Self, HashMap<String, LibrqbitHandle>)> {
         tokio::fs::create_dir_all(&download_dir).await?;
         debug!(path = ?download_dir, "Storing downloads");
 
-        // librqbit 9.0.1's ListenerOptions binds a single address instead of
-        // the old `listen_port_range: 42000..42010`, so a `Fixed` range's
-        // port-fallback is done here: try each port in order and keep the
-        // first that binds. `Ephemeral` is the single candidate 0, which
-        // librqbit itself defaults to and resolves to the bound port.
         let bootstrap_addrs =
             effective_dht_bootstrap_addrs(&dht_bootstrap_nodes, &bootstrap_resolvers).await;
-        let upnp_forwarding = listen_port.wants_upnp_forwarding();
-        let session = {
-            let mut last_err = None;
-            let mut session = None;
-            for port in listen_port.candidates() {
-                let session_opts = librqbit::SessionOptions {
-                    listen: Some(librqbit::ListenerOptions {
-                        listen_addr: (std::net::Ipv6Addr::UNSPECIFIED, port).into(),
-                        // Only for a fixed, repeatable port -- see
-                        // `TorrentListenPort::wants_upnp_forwarding`. An
-                        // ephemeral listener would ask the router for a
-                        // mapping it can never reuse, and on the Android
-                        // embed the request cannot succeed at all while
-                        // librqbit's forwarder retries (and WARNs) forever.
-                        enable_upnp_port_forwarding: upnp_forwarding,
-                        ..Default::default()
-                    }),
-                    persistence: Some(librqbit::SessionPersistenceConfig::Json {
-                        folder: Some(download_dir.clone()),
-                    }),
-                    // Persist each torrent's verified-piece bitfield
-                    // (`<info hash>.bitv` in the persistence folder) so a
-                    // restart validates a sample of pieces instead of
-                    // re-hashing every file; a corrupted sample falls back
-                    // to the full check. Matters most for pinned offline
-                    // downloads, which are large and restart-resident.
-                    fastresume: true,
-                    // Pin the DHT routing-table dump next to the session
-                    // state. librqbit's default resolves through
-                    // `directories::ProjectDirs` (HOME/XDG), which has no
-                    // answer on Android and would fail `Session::new`.
-                    // `bootstrap_addrs` is `DEFAULT_DHT_BOOTSTRAP_NODES`
-                    // (or the operator's `dhtBootstrapNodes` override),
-                    // already turned into address literals wherever DNS
-                    // managed it -- see `dht_bootstrap`.
-                    dht: Some(librqbit::DhtSessionConfig {
-                        bootstrap_addrs: Some(bootstrap_addrs.clone()),
-                        persistence: Some(librqbit::dht::DhtPersistenceConfig {
-                            config_filename: Some(download_dir.join("dht.json")),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }),
-                    connect: Some(librqbit::ConnectionOptions {
-                        peer_opts: Some(librqbit::PeerConnectionOptions {
-                            connect_timeout: Some(Duration::from_secs(10)),
-                            read_write_timeout: Some(Duration::from_secs(30)),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }),
-                    // No `default_storage_factory`: librqbit's own filesystem
-                    // storage. The default factory is the one a restored
-                    // torrent comes back on -- the persisted record names no
-                    // storage -- so when the piece store is wired in it goes
-                    // here, as the default, and nowhere else.
-                    ..Default::default()
-                };
-                match Session::new_with_opts(download_dir.clone(), session_opts).await {
-                    Ok(s) => {
-                        session = Some(s);
-                        break;
-                    }
-                    Err(e) => {
-                        debug!(port, error = %e, "librqbit listen port unavailable; trying next");
-                        last_err = Some(e);
-                    }
+        let mut tuning = tuning;
+        let session = loop {
+            match Self::open_session(&download_dir, &listen_port, &bootstrap_addrs, &tuning).await {
+                Ok(session) => break session,
+                Err(error) if tuning.bind_device.is_some() => {
+                    warn!(
+                        interface = ?tuning.bind_device,
+                        error = %format!("{error:#}"),
+                        "librqbit could not open a session bound to btOutgoingInterfaces; \
+                         starting unbound"
+                    );
+                    tuning.bind_device = None;
                 }
-            }
-            match session {
-                Some(s) => s,
-                None => {
-                    return Err(last_err.unwrap_or_else(|| {
-                        anyhow::anyhow!("no librqbit listen port available in {listen_port:?}")
-                    }));
-                }
+                Err(error) => return Err(error),
             }
         };
+        let started_with = tuning;
         let deferred_selections: DeferredSelections = Default::default();
         let pinned_files: PinnedFiles = Default::default();
         let reported_errors: ReportedErrors = Default::default();
@@ -590,6 +910,7 @@ impl LibrqbitBackend {
         Ok((
             Self {
                 session,
+                started_with,
                 dht_ever_bootstrapped: AtomicBool::new(false),
                 download_dir,
                 deferred_selections,
@@ -600,6 +921,135 @@ impl LibrqbitBackend {
             },
             restored_handles,
         ))
+    }
+
+    /// One attempt at `Session::new_with_opts` over the ports `listen_port`
+    /// allows, with `tuning` applied.
+    ///
+    /// librqbit 9.0.1's ListenerOptions binds a single address instead of
+    /// the old `listen_port_range: 42000..42010`, so a `Fixed` range's
+    /// port-fallback is done here: try each port in order and keep the
+    /// first that binds. `Ephemeral` is the single candidate 0, which
+    /// librqbit itself defaults to and resolves to the bound port.
+    async fn open_session(
+        download_dir: &std::path::Path,
+        listen_port: &TorrentListenPort,
+        bootstrap_addrs: &[String],
+        tuning: &SessionTuning,
+    ) -> Result<Arc<Session>> {
+        let upnp_forwarding = listen_port.wants_upnp_forwarding();
+        let mut last_err = None;
+        for port in listen_port.candidates() {
+            let session_opts = librqbit::SessionOptions {
+                listen: Some(librqbit::ListenerOptions {
+                    listen_addr: (std::net::Ipv6Addr::UNSPECIFIED, port).into(),
+                    // Only for a fixed, repeatable port -- see
+                    // `TorrentListenPort::wants_upnp_forwarding`. An
+                    // ephemeral listener would ask the router for a
+                    // mapping it can never reuse, and on the Android
+                    // embed the request cannot succeed at all while
+                    // librqbit's forwarder retries (and WARNs) forever.
+                    enable_upnp_port_forwarding: upnp_forwarding,
+                    ..Default::default()
+                }),
+                persistence: Some(librqbit::SessionPersistenceConfig::Json {
+                    folder: Some(download_dir.to_path_buf()),
+                }),
+                // Persist each torrent's verified-piece bitfield
+                // (`<info hash>.bitv` in the persistence folder) so a
+                // restart validates a sample of pieces instead of
+                // re-hashing every file; a corrupted sample falls back
+                // to the full check. Matters most for pinned offline
+                // downloads, which are large and restart-resident.
+                fastresume: true,
+                // Pin the DHT routing-table dump next to the session
+                // state. librqbit's default resolves through
+                // `directories::ProjectDirs` (HOME/XDG), which has no
+                // answer on Android and would fail `Session::new`.
+                // `bootstrap_addrs` is `DEFAULT_DHT_BOOTSTRAP_NODES`
+                // (or the operator's `dhtBootstrapNodes` override),
+                // already turned into address literals wherever DNS
+                // managed it -- see `dht_bootstrap`. `btEnableDht` off
+                // is `None`: librqbit has no DHT to switch off later.
+                dht: tuning.dht.then(|| librqbit::DhtSessionConfig {
+                    bootstrap_addrs: Some(bootstrap_addrs.to_vec()),
+                    persistence: Some(librqbit::dht::DhtPersistenceConfig {
+                        config_filename: Some(download_dir.join("dht.json")),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                disable_local_service_discovery: !tuning.lsd,
+                connect: Some(librqbit::ConnectionOptions {
+                    // See `socks5_proxy_url`: peer connections and HTTP(S)
+                    // tracker requests go through it.
+                    proxy_url: tuning.proxy_url.clone(),
+                    // The backend's own constants, not `btHandshakeTimeout`
+                    // / `btRequestTimeout`: neither of these is what those
+                    // settings mean (see `bt_settings_support`), and a
+                    // read/write timeout of the request timeout's 10 s
+                    // would disconnect every idle peer between keep-alives.
+                    peer_opts: Some(librqbit::PeerConnectionOptions {
+                        connect_timeout: Some(Duration::from_secs(10)),
+                        read_write_timeout: Some(Duration::from_secs(30)),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ratelimits: librqbit::limits::LimitsConfig {
+                    download_bps: tuning.download_bps,
+                    upload_bps: None,
+                },
+                // Per torrent -- librqbit has no session-wide count -- and
+                // applied to each torrent as it is added, which is why a
+                // change waits for the next start.
+                peer_limit: tuning.peer_limit,
+                bind_device_name: tuning.bind_device.clone(),
+                // No `default_storage_factory`: librqbit's own filesystem
+                // storage. The default factory is the one a restored
+                // torrent comes back on -- the persisted record names no
+                // storage -- so when the piece store is wired in it goes
+                // here, as the default, and nowhere else.
+                ..Default::default()
+            };
+            match Session::new_with_opts(download_dir.to_path_buf(), session_opts).await {
+                Ok(session) => return Ok(session),
+                Err(e) => {
+                    debug!(port, error = %e, "librqbit listen port unavailable; trying next");
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            anyhow::anyhow!("no librqbit listen port available in {listen_port:?}")
+        }))
+    }
+
+    /// Apply a settings change to the running session, and say what
+    /// happened to every `bt*` setting: the download limit changes now
+    /// (librqbit's rate limiter is swappable), the session-start ones are
+    /// compared with what this session opened with and reported as waiting
+    /// for the next start when they differ, and the ones librqbit has no
+    /// knob for are listed as such every time -- see
+    /// [`bt_settings_support`] for why each is where it is.
+    pub fn apply_settings(
+        &self,
+        profile: &TorrentSpeedProfile,
+        privacy: &TorrentPrivacyConfig,
+    ) -> BtSettingsReport {
+        let wanted = SessionTuning::from_settings(profile, privacy);
+        self.session
+            .ratelimits
+            .set_download_bps(wanted.download_bps);
+        BtSettingsReport {
+            applied_live: vec![BT_DOWNLOAD_SPEED_HARD_LIMIT],
+            pending_restart: self.started_with.pending_restart(&wanted),
+            not_honoured: bt_settings_support()
+                .iter()
+                .filter(|row| row.effect == BtSettingEffect::NotHonoured)
+                .map(|row| row.setting)
+                .collect(),
+        }
     }
 
     /// Hermetic constructor for tests: no listen port, no DHT, no persistence,
@@ -619,6 +1069,7 @@ impl LibrqbitBackend {
         let session = Session::new_with_opts(download_dir.clone(), session_opts).await?;
         Ok(Self {
             session,
+            started_with: SessionTuning::default(),
             dht_ever_bootstrapped: AtomicBool::new(false),
             download_dir,
             deferred_selections: Default::default(),
@@ -2549,6 +3000,306 @@ mod tests {
         assert_ne!(pa, 0);
         assert_ne!(pb, 0);
         assert_ne!(pa, pb, "each ephemeral session gets its own port");
+    }
+
+    fn privacy_with_proxy(kind: TorrentProxyType, host: &str, port: u16) -> TorrentPrivacyConfig {
+        TorrentPrivacyConfig {
+            bt_proxy_type: kind,
+            bt_proxy_host: host.to_string(),
+            bt_proxy_port: port,
+            bt_proxy_username: "us:er".to_string(),
+            bt_proxy_password: "p@ss".to_string(),
+            ..TorrentPrivacyConfig::default()
+        }
+    }
+
+    /// The settings librqbit can take, reduced to what it takes them as --
+    /// and the ones it cannot, left at its defaults instead of handed to a
+    /// session that would refuse to open over them.
+    #[test]
+    fn session_tuning_takes_what_librqbit_has_a_knob_for() {
+        use TorrentProxyType::*;
+        let defaults = SessionTuning::from_settings(
+            &TorrentSpeedProfile::default(),
+            &TorrentPrivacyConfig::default(),
+        );
+        assert_eq!(
+            defaults,
+            SessionTuning {
+                // The default 800 connections is 200 peers per torrent.
+                peer_limit: Some(200),
+                ..SessionTuning::default()
+            }
+        );
+
+        // SOCKS5 goes through, with credentials only for the password kind,
+        // percent-encoded so a ':' or '@' in them cannot re-shape the URL.
+        let proxied = |kind| socks5_proxy_url(&privacy_with_proxy(kind, "proxy.example", 1080));
+        assert_eq!(
+            proxied(Socks5).as_deref(),
+            Some("socks5://proxy.example:1080")
+        );
+        assert_eq!(
+            proxied(Socks5Password).as_deref(),
+            Some("socks5://us%3Aer:p%40ss@proxy.example:1080")
+        );
+        for other in [None, Socks4, Http, HttpPassword] {
+            assert_eq!(
+                proxied(other),
+                Option::None,
+                "{other:?} has no librqbit equivalent"
+            );
+        }
+        assert_eq!(
+            socks5_proxy_url(&privacy_with_proxy(Socks5, "::1", 1080)).as_deref(),
+            Some("socks5://[::1]:1080"),
+            "an IPv6 literal is bracketed"
+        );
+        assert_eq!(
+            socks5_proxy_url(&privacy_with_proxy(Socks5, "", 1080)),
+            Option::None
+        );
+        assert_eq!(
+            socks5_proxy_url(&privacy_with_proxy(Socks5, "proxy", 0)),
+            Option::None
+        );
+        assert_eq!(
+            socks5_proxy_url(&privacy_with_proxy(Socks5, "not a host", 1080)),
+            Option::None,
+            "a host librqbit's parser would reject is not handed to it"
+        );
+
+        // One interface name; an address or a list is not a bind device.
+        assert_eq!(bind_device_name(" tun0 ").as_deref(), Some("tun0"));
+        assert_eq!(bind_device_name(""), Option::None);
+        assert_eq!(bind_device_name("192.168.1.25"), Option::None);
+        assert_eq!(bind_device_name("fe80::1"), Option::None);
+        assert_eq!(bind_device_name("tun0,wg0"), Option::None);
+
+        // The hard limit is bytes per second; 0 is none.
+        let limited = TorrentSpeedProfile {
+            bt_download_speed_hard_limit: 1_500_000.0,
+            bt_max_connections: 100,
+            ..TorrentSpeedProfile::default()
+        };
+        let tuning = SessionTuning::from_settings(
+            &limited,
+            &TorrentPrivacyConfig {
+                bt_enable_dht: false,
+                bt_enable_lsd: false,
+                bt_outgoing_interfaces: "tun0".to_string(),
+                ..privacy_with_proxy(Socks5, "127.0.0.1", 1080)
+            },
+        );
+        assert_eq!(
+            tuning,
+            SessionTuning {
+                dht: false,
+                lsd: false,
+                proxy_url: Some("socks5://127.0.0.1:1080".to_string()),
+                download_bps: std::num::NonZeroU32::new(1_500_000),
+                peer_limit: Some(40),
+                bind_device: Some("tun0".to_string()),
+            }
+        );
+        assert_eq!(
+            defaults.pending_restart(&tuning),
+            vec![
+                "btEnableDht",
+                "btEnableLsd",
+                "btProxyType",
+                "btProxyHost",
+                "btProxyPort",
+                "btProxyUsername",
+                "btProxyPassword",
+                "btMaxConnections",
+                "btOutgoingInterfaces",
+            ],
+            "everything but the live limit waits for the next start"
+        );
+        assert!(defaults.pending_restart(&defaults).is_empty());
+    }
+
+    /// The truth table names every `bt*` setting the settings structs
+    /// carry, once, and nothing else -- so a setting added to either struct
+    /// without a row here fails this instead of joining the silently
+    /// accepted.
+    #[test]
+    fn every_bt_setting_has_a_row_in_the_truth_table() {
+        let profile = serde_json::to_value(TorrentSpeedProfile::default()).unwrap();
+        let privacy = serde_json::to_value(TorrentPrivacyConfig::default()).unwrap();
+        let mut settings: Vec<String> = profile
+            .as_object()
+            .unwrap()
+            .keys()
+            .chain(privacy.as_object().unwrap().keys())
+            .cloned()
+            .collect();
+        settings.sort();
+        let mut rows: Vec<String> = bt_settings_support()
+            .iter()
+            .map(|row| row.setting.to_string())
+            .collect();
+        rows.sort();
+        assert_eq!(rows, settings);
+        for row in bt_settings_support() {
+            assert!(!row.note.is_empty(), "{} says why", row.setting);
+            assert!(!row.note.contains("  "), "{}: {:?}", row.setting, row.note);
+        }
+    }
+
+    /// The session opens the way the settings say: no DHT, the peer limit
+    /// the connection count derives, the download limit -- and the limit is
+    /// the one thing a later update changes on the running session, which
+    /// the report says, along with what waits for a restart.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_opens_with_the_settings_and_changes_the_limit_live() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = TorrentSpeedProfile {
+            bt_download_speed_hard_limit: 2_000_000.0,
+            bt_max_connections: 400,
+            ..TorrentSpeedProfile::default()
+        };
+        let privacy = TorrentPrivacyConfig {
+            bt_enable_dht: false,
+            ..TorrentPrivacyConfig::default()
+        };
+        let (backend, _) = LibrqbitBackend::new_with_settings(
+            tmp.path().to_path_buf(),
+            TorrentListenPort::Ephemeral,
+            Vec::new(),
+            BootstrapResolvers::offline(),
+            SessionTuning::from_settings(&profile, &privacy),
+        )
+        .await
+        .expect("session");
+        assert!(
+            backend.session.get_dht().is_none(),
+            "btEnableDht off is no DHT"
+        );
+        assert_eq!(backend.session.peer_limit, Some(100));
+        assert_eq!(
+            backend.session.ratelimits.get_download_bps(),
+            std::num::NonZeroU32::new(2_000_000)
+        );
+
+        // The limit moves at once; the DHT coming back waits.
+        let report = backend.apply_settings(
+            &TorrentSpeedProfile {
+                bt_download_speed_hard_limit: 0.0,
+                ..profile.clone()
+            },
+            &TorrentPrivacyConfig::default(),
+        );
+        assert_eq!(backend.session.ratelimits.get_download_bps(), Option::None);
+        assert_eq!(report.applied_live, vec!["btDownloadSpeedHardLimit"]);
+        assert_eq!(report.pending_restart, vec!["btEnableDht"]);
+        assert!(report.not_honoured.contains(&"btEncryptionMode"));
+        assert!(report.not_honoured.contains(&"btProxyPeerConnections"));
+        assert!(!report.not_honoured.contains(&"btEnableDht"));
+
+        // Nothing changed: nothing pending, the limit re-applied as it was.
+        let report = backend.apply_settings(&profile, &privacy);
+        assert!(report.pending_restart.is_empty(), "{report:?}");
+        assert_eq!(
+            backend.session.ratelimits.get_download_bps(),
+            std::num::NonZeroU32::new(2_000_000)
+        );
+    }
+
+    /// A bind device the OS does not know fails `Session::new`; the backend
+    /// starts without it rather than not at all, and says so in the report.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unknown_outgoing_interface_starts_the_session_unbound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let privacy = TorrentPrivacyConfig {
+            bt_enable_dht: false,
+            bt_outgoing_interfaces: "no-such-interface-enginefs".to_string(),
+            ..TorrentPrivacyConfig::default()
+        };
+        let tuning = SessionTuning::from_settings(&TorrentSpeedProfile::default(), &privacy);
+        assert_eq!(
+            tuning.bind_device.as_deref(),
+            Some("no-such-interface-enginefs")
+        );
+        let (backend, _) = LibrqbitBackend::new_with_settings(
+            tmp.path().to_path_buf(),
+            TorrentListenPort::Ephemeral,
+            Vec::new(),
+            BootstrapResolvers::offline(),
+            tuning,
+        )
+        .await
+        .expect("the session opens unbound");
+        assert_eq!(backend.started_with.bind_device, Option::None);
+        let report = backend.apply_settings(&TorrentSpeedProfile::default(), &privacy);
+        assert_eq!(
+            report.pending_restart,
+            vec!["btOutgoingInterfaces"],
+            "the setting reads as not applied to this session"
+        );
+    }
+
+    /// The proxy is not a field that was set; it is where the packets go.
+    /// A listener stands in for the SOCKS5 proxy, a torrent is given a peer
+    /// to connect to, and what arrives at the listener is a SOCKS5 greeting
+    /// -- librqbit connecting to the peer through the proxy rather than to
+    /// the peer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn peer_connections_go_through_the_configured_socks5_proxy() {
+        use tokio::io::AsyncReadExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let proxy = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let proxy_port = proxy.local_addr().unwrap().port();
+        let privacy = TorrentPrivacyConfig {
+            bt_enable_dht: false,
+            bt_enable_lsd: false,
+            ..privacy_with_proxy(TorrentProxyType::Socks5, "127.0.0.1", proxy_port)
+        };
+        let (backend, _) = LibrqbitBackend::new_with_settings(
+            tmp.path().join("dl"),
+            TorrentListenPort::Ephemeral,
+            Vec::new(),
+            BootstrapResolvers::offline(),
+            SessionTuning::from_settings(&TorrentSpeedProfile::default(), &privacy),
+        )
+        .await
+        .expect("session");
+
+        // An unseeded torrent with one peer to try. Loopback port 9 is the
+        // discard port: with no proxy the connection would go there and be
+        // refused; with one it goes to the listener above.
+        write_payload(&tmp.path().join("payload.bin"), 16 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&tmp.path().join("payload.bin")).await;
+        backend
+            .session
+            .add_torrent(
+                librqbit::AddTorrent::from_bytes(bytes::Bytes::from(torrent_bytes)),
+                Some(librqbit::AddTorrentOptions {
+                    overwrite: true,
+                    initial_peers: Some(vec![(std::net::Ipv4Addr::LOCALHOST, 9).into()]),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("add torrent");
+
+        let (mut conn, _) = tokio::time::timeout(TEST_WAIT_BOUND, proxy.accept())
+            .await
+            .expect("librqbit reaches the proxy for its peer")
+            .expect("accept");
+        let mut greeting = [0u8; 2];
+        tokio::time::timeout(TEST_WAIT_BOUND, conn.read_exact(&mut greeting))
+            .await
+            .expect("a greeting arrives")
+            .expect("read");
+        assert_eq!(greeting[0], 0x05, "SOCKS version 5: {greeting:?}");
+        assert!(
+            greeting[1] >= 1,
+            "at least one auth method offered: {greeting:?}"
+        );
     }
 
     /// Write `len` patterned bytes to `path` (deterministic, non-trivial data

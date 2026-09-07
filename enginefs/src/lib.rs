@@ -3771,20 +3771,29 @@ impl BackendEngineFS<LibrqbitBackend> {
         Ok(efs)
     }
 
-    /// Only `config.listen_port` and `config.dht_bootstrap_nodes` are
-    /// consumed here: librqbit takes the rest of its settings from the
-    /// session defaults (see `update_torrent_settings`).
+    /// What of `config` reaches librqbit: `listen_port`,
+    /// `dht_bootstrap_nodes` and `dht_bootstrap_dns` as the session's
+    /// listener and DHT, and of `speed_profile` and `privacy` exactly what
+    /// [`crate::backend::librqbit::SessionTuning::from_settings`] can
+    /// express -- the rest of the `bt*` settings has no librqbit knob, and
+    /// [`crate::backend::librqbit::bt_settings_support`] says so setting by
+    /// setting. All of it is read once, here; `update_torrent_settings` is
+    /// what a later change gets.
     pub async fn new_with_storage(
         root_dir: std::path::PathBuf,
         config: crate::backend::BackendConfig,
         tracker_storage: Option<Arc<dyn crate::trackers::TrackerStorage>>,
     ) -> Result<Self> {
         let download_dir = root_dir.join("rqbit-downloads");
-        let (backend, restored) = LibrqbitBackend::new(
+        let (backend, restored) = LibrqbitBackend::new_with_settings(
             download_dir.clone(),
             config.listen_port,
             config.dht_bootstrap_nodes,
             config.dht_bootstrap_dns.resolvers_in(&download_dir),
+            crate::backend::librqbit::SessionTuning::from_settings(
+                &config.speed_profile,
+                &config.privacy,
+            ),
         )
         .await?;
         let efs = Self::new_with_backend_and_storage(
@@ -3809,16 +3818,26 @@ impl BackendEngineFS<LibrqbitBackend> {
         Self::new_with_storage(root_dir, config, tracker_storage).await
     }
 
-    /// librqbit does not support reconfiguring a live session; settings apply
-    /// on the next restart.
+    /// Push a `bt*` settings change at the running session and report what
+    /// became of it ([`crate::backend::BtSettingsReport`]): the download
+    /// limit is applied now, a session-start setting that changed is
+    /// listed as waiting for the next start, and the settings librqbit has
+    /// no knob for are listed as not honoured -- every time, so the answer
+    /// a client gets is never a bare echo of what it sent. Until this
+    /// returned something, every one of these settings was accepted,
+    /// persisted and documented, and none reached librqbit.
     pub async fn update_torrent_settings(
         &self,
-        _profile: &crate::backend::TorrentSpeedProfile,
-        _privacy: &crate::backend::TorrentPrivacyConfig,
-    ) {
-        tracing::debug!(
-            "librqbit backend does not support dynamic session settings; they apply on restart"
+        profile: &crate::backend::TorrentSpeedProfile,
+        privacy: &crate::backend::TorrentPrivacyConfig,
+    ) -> crate::backend::BtSettingsReport {
+        let report = self.backend.apply_settings(profile, privacy);
+        tracing::info!(
+            applied_live = ?report.applied_live,
+            pending_restart = ?report.pending_restart,
+            "torrent session settings updated"
         );
+        report
     }
 
     pub fn set_seeding_enabled(&self, enabled: bool) {
