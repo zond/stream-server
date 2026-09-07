@@ -3,6 +3,12 @@ name = "enginefs"
 version = "0.1.8"
 edition = "2024"
 
+[features]
+# Lets a test register an extra trust anchor, so `server`'s proxy tests can
+# stand up an HTTPS origin whose chain actually verifies. Off in every release
+# build; `server` turns it on through its dev-dependency only.
+test-roots = []
+
 [dependencies]
 # default-features=false + rust-tls keeps the whole crypto stack on rustls +
 # aws-lc-rs: librqbit's `rust-tls` feature switches its SHA1 piece-hasher from
@@ -61,3 +67,11 @@ tempfile = "3.23.0"
 # Paused-clock machinery for `#[tokio::test(start_paused = true)]`; nothing in
 # the library itself pauses or advances time, so it must not ship in release.
 tokio = { version = "1.42.0", features = ["test-util"] }
+
+# Reads the OS trust store off Android, once, so a device or organisation that
+# installed its own CA keeps verifying (see `http_client`). Already in the
+# graph under `rustls-platform-verifier`, so this pulls in nothing new. Android
+# has no such store to read -- its CAs are PEM files `http_client` reads
+# directly -- and this crate does not build for it.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+rustls-native-certs = "0.8"
