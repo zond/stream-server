@@ -93,6 +93,13 @@
 //! the session's default factory, so this store can only keep it by *being*
 //! that default -- not by being passed to a single add.
 //!
+//! Which is now also where the byte counters behind the client's activity
+//! signal sit ([`crate::traffic`], wrapped around the default factory in
+//! `LibrqbitBackend::new`). So the wiring commit replaces what that wrapper
+//! *wraps*, and does not replace the wrapper: a [`store::PieceStoreFactory`]
+//! installed as the bare default would leave that signal permanently dark,
+//! since nothing else in the tree counts a byte.
+//!
 //! **Not settled: a have-bit that is not an announcement.** [`policy`] decides
 //! that only the committed set is advertised and that a window piece is held
 //! and readable and *not* announced. That is not expressible through the

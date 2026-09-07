@@ -314,6 +314,7 @@ An embedder holds a `ServerHandle` (from `stream_server::start`) and never needs
 | `cache_usage() -> Result<CacheUsage>` | `GET /cache.json` — what the cache occupies against its limit right now, without evicting anything. See [Cache usage and cleaning](#cache-usage-and-cleaning) |
 | `clean_cache_now() -> Result<EvictionReport>` | `POST /cache/clean` — run one eviction pass immediately and report what it freed, with the same protections as the scheduled sweep. See [Cache usage and cleaning](#cache-usage-and-cleaning) |
 | `close_proxy_streams(token: &str) -> usize` | `POST /proxy-streams/{token}/close` — end every proxied stream the client marked with `token`, retire the token, and answer how many streams that was. See [Ending a proxied stream](#ending-a-proxied-stream) |
+| `background_traffic() -> Result<BackgroundTraffic>` | no route — the one signal a client's "working in the background" indicator reads: `{active, moving, playing, bytes_read, bytes_written, window_secs}`. See [Background activity](#background-activity) |
 | `proxy_streams_live() -> usize` | how many proxied streams are being read right now, over all tokens — the number of players attached through `/proxy` |
 | `set_lan_media(enabled: bool) -> Result<Option<SocketAddr>>` | start/stop the [LAN media listener](#lan-media-listener); returns its bound address afterwards. Refused while the `lanMediaEnabled` setting is false or `ServerConfig::lan_media_addr` is unset |
 | `lan_media_addr() -> Option<SocketAddr>` / `lan_media_running() -> bool` | where that listener is bound right now, and whether it is running at all |
@@ -321,6 +322,19 @@ An embedder holds a `ServerHandle` (from `stream_server::start`) and never needs
 | `lan_media_base_url(for_peer: IpAddr) -> Option<Url>` | the base URL to hand a receiver at `for_peer` — host = the local interface on its subnet, or the best-ranked one when nothing matches. `None` while the listener is off |
 
 The HTTP handlers and these methods call the same functions (`routes::system::{engine_stats, file_stats, update_settings}`, `routes::downloads::{pin_download, unpin_download, downloads, download_path}`, `routes::cache::{cache_usage, clean_cache_now}`, `proxy_streams::ProxyStreams::close`), so they cannot drift; `server/tests/embed.rs` compares them.
+
+### Background activity
+
+`ServerHandle::background_traffic()` answers one question: **is this server using your connection while you are not watching?** Serving a peer, an offline download running with nothing on screen, and the hash check of a piece that download just fetched are all the same fact to a viewer, so there is deliberately no taxonomy of who is at the other end — one boolean, `active`, and a light to hang off it.
+
+It is one call rather than two on purpose. The halves are measured differently — traffic is a byte counter compared against an earlier reading, playback is state the engine already keeps — and a client sampling them separately across an FFI boundary would take them a moment apart and flicker on every disagreement. The conjunction is taken in the engine, where they cannot disagree.
+
+- **What is counted**: bytes through the torrent storage, both directions (`bytes_read`, `bytes_written`, totals since the process started). Everything above crosses it, so there is one counter rather than one per source.
+- **Over what window**: five seconds (`window_secs`). A counter that has not grown since the last reading is the measurement; a single sample of a total is not a rate. So nothing is reported until one window has closed — the first call is a baseline — and a torrent that is connected but stalled reads as idle, because this is a light about traffic. If nobody asks for a long stretch (a backgrounded app, a suspended phone) the reading is used as a fresh baseline instead of a verdict about minutes nobody observed.
+- **What "not watching" means**: no open stream and no live playback lease, over the window as well as right now. The bytes a player's own read moved stay in the totals after playback ends, so a signal that only asked about *now* would accuse the background of the viewer's own film every time they stopped it. The cost of getting that right is that after playback ends the light can take up to two windows to come on for traffic that really is unattended.
+- `moving` and `playing` are the two halves, offered so the answer can be explained rather than only shown; `active` is `moving && !playing` with the window rule above applied.
+
+Asking is cheap — the engines that already exist, plus two atomics — and creates nothing: no engine, no magnet add. Polling once a second or two is fine; the verdict only changes when a window closes, so asking faster is answered from the standing reading.
 
 ### Offline downloads
 
