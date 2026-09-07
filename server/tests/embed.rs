@@ -1401,31 +1401,47 @@ fn poll_stats(client: &reqwest::blocking::Client, url: &str) -> anyhow::Result<s
 
 /// `ServerHandle::set_background` before any torrent exists is a cheap,
 /// idempotent no-op that only flips the footprint; with a swarm attached it
-/// shrinks the torrent to `LEAN_PEER_LIMIT` peers without pausing it, a
-/// stream request that arrives while lean is still served -- from the
-/// peers left -- and the return to the foreground lets the swarm back.
+/// takes the torrent down to at most `LEAN_PEER_LIMIT` peers without pausing
+/// it, a stream request that arrives while lean is still served -- from the
+/// peers left -- a seeder dialling in meanwhile does not push the swarm back
+/// over the cap, and the return to the foreground lets it grow past the cap
+/// again.
 ///
-/// The server cannot be told peer addresses over its API, so the seeders
-/// dial *it*, on the librqbit listen port `torrent_listen_addr` reports.
-/// Incoming peers the server hung up on are not re-dialled by it (it does
-/// not know their listen ports), and a seeder that was dropped does not
-/// try again either (it is finished, and librqbit parks a finished
-/// torrent's dead peers) -- so the return to the foreground is shown by
-/// what the cap lets in: a seeder that dials in while lean is turned away,
-/// four that dial in afterwards are taken. The re-dial of parked *outgoing*
-/// peers is the enginefs test's business.
+/// This is the wiring test, and the only one here that needs a swarm: that
+/// the lifecycle call reaches the engine and that a stream still comes out
+/// while lean. What the cap does to individual peers -- parking them rather
+/// than forgetting them, and re-dialling the parked ones -- is enginefs's
+/// `lean_parks_the_surplus_and_full_re_dials_it`, which can dial *out* to
+/// seeders whose addresses it was handed; the arithmetic of the cap itself
+/// is `footprint_caps_every_torrent_and_the_next_one_added`, which needs no
+/// peers at all. The server cannot be told peer addresses over its API, so
+/// here the seeders dial *it*, on the librqbit listen port
+/// `torrent_listen_addr` reports -- and an incoming peer the server hung up
+/// on is never re-dialled by it (it does not know their listen ports), so
+/// the way back over the cap is a fresh batch dialling in.
+///
+/// No exact peer count is asserted: how many of a dozen loopback sessions
+/// are connected at any one instant is the network's business and a loaded
+/// runner's, and pinning it is what made this test flaky on CI while it
+/// passed on an idle desktop. Every assertion is a *side* of the cap, and
+/// the precondition -- a swarm bigger than the cap, so there is a surplus to
+/// shed at all -- is waited for on its own and says, when it fails, that the
+/// environment never produced it.
 #[test]
 fn set_background_shrinks_the_swarm_and_still_streams() -> anyhow::Result<()> {
-    const SEEDERS: usize = enginefs::backend::LEAN_PEER_LIMIT + 4;
+    const LEAN: usize = enginefs::backend::LEAN_PEER_LIMIT;
+    const SEEDERS: usize = LEAN + 4;
 
     let config_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
     let src = tempfile::tempdir()?;
     let content = src.path().join("Movie");
     std::fs::create_dir_all(&content)?;
-    // Big enough, at the seeders' pace (12 x 64 KiB/s), to still be
-    // downloading when the assertions are done: ~40 s for 32 MiB.
-    write_payload(&content.join("movie.bin"), 32 * 1024 * 1024);
+    // Big enough, at the seeders' pace (12 x 16 KiB/s), that the torrent is
+    // still downloading when the assertions are done: ~85 s for 16 MiB, and
+    // lean only slows it down. A torrent that finished would hang up on its
+    // seeders itself, which is not what this test is about.
+    write_payload(&content.join("movie.bin"), 16 * 1024 * 1024);
     let payload = std::fs::read(content.join("movie.bin"))?;
     let (torrent, info_hash) = real_torrent(&content);
 
@@ -1472,7 +1488,7 @@ fn set_background_shrinks_the_swarm_and_still_streams() -> anyhow::Result<()> {
                     }),
                     disable_local_service_discovery: true,
                     ratelimits: librqbit::limits::LimitsConfig {
-                        upload_bps: std::num::NonZeroU32::new(64 * 1024),
+                        upload_bps: std::num::NonZeroU32::new(16 * 1024),
                         download_bps: None,
                     },
                     ..Default::default()
@@ -1500,13 +1516,15 @@ fn set_background_shrinks_the_swarm_and_still_streams() -> anyhow::Result<()> {
     let mut seeders: Vec<_> = (0..SEEDERS).map(|_| dial_in()).collect();
 
     let stats_url = format!("{base}/{info_hash}/stats.json");
+    let stats_now = || -> anyhow::Result<serde_json::Value> {
+        Ok(client.get(&stats_url).send()?.error_for_status()?.json()?)
+    };
     let wait_for = |what: &str,
                     pred: &dyn Fn(&serde_json::Value) -> bool|
      -> anyhow::Result<serde_json::Value> {
         let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
         loop {
-            let stats: serde_json::Value =
-                client.get(&stats_url).send()?.error_for_status()?.json()?;
+            let stats = stats_now()?;
             if pred(&stats) {
                 return Ok(stats);
             }
@@ -1520,17 +1538,20 @@ fn set_background_shrinks_the_swarm_and_still_streams() -> anyhow::Result<()> {
         }
     };
     let peers = |stats: &serde_json::Value| stats["peers"].as_u64().unwrap_or(0) as usize;
-    let known =
-        |stats: &serde_json::Value| stats["peerDiscovery"]["known"].as_u64().unwrap_or(0) as usize;
 
-    wait_for("every seeder connecting", &|s| peers(s) == SEEDERS)?;
+    // The precondition, on its own bound: without more live peers than the
+    // lean cap there is no surplus to shed and the rest says nothing. A
+    // failure here is the environment, not `set_background`.
+    wait_for(
+        "the swarm outgrowing the lean cap (the environment never got more \
+         than LEAN_PEER_LIMIT of the seeders connected at once)",
+        &|s| peers(s) > LEAN,
+    )?;
 
-    // Background: the surplus hangs up, stays known (parked, not forgotten),
-    // and nothing is paused.
+    // Background: the surplus hangs up, and nothing is paused.
     handle.set_background(true);
-    let lean = wait_for("the surplus hanging up", &|s| {
-        peers(s) == enginefs::backend::LEAN_PEER_LIMIT && known(s) == SEEDERS
-    })?;
+    assert!(handle.is_background());
+    let lean = wait_for("the surplus hanging up", &|s| peers(s) <= LEAN)?;
     assert_ne!(lean["phase"], "paused", "{lean}");
 
     // A stream request while lean is served from the peers left. The head
@@ -1545,48 +1566,52 @@ fn set_background_shrinks_the_swarm_and_still_streams() -> anyhow::Result<()> {
         .send()?;
     assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
     assert_eq!(response.bytes()?.as_ref(), &payload[0..16]);
-    let still_lean: serde_json::Value = client.get(&stats_url).send()?.json()?;
+    let still_lean = stats_now()?;
     assert!(
-        peers(&still_lean) <= enginefs::backend::LEAN_PEER_LIMIT,
+        peers(&still_lean) <= LEAN,
         "streaming while lean must not re-grow the swarm: {}",
         still_lean["peerDiscovery"]
     );
 
-    // A seeder dialling in while lean is turned away: its connection to the
-    // server ends without ever going live, and the server stays at the cap.
+    // A seeder dialling in while lean does not take the server over the cap:
+    // it is turned away, or -- if peers have died since and there is room --
+    // taken into the room the cap left. Either way the cap holds, so that is
+    // what every sample asserts; its dial ending is only what lets the watch
+    // stop early rather than sit out the window.
     let (turned_away, turned_away_torrent) = dial_in();
-    let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
+    let watch_until = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
+        let capped = stats_now()?;
+        anyhow::ensure!(
+            peers(&capped) <= LEAN,
+            "a seeder dialling in took the server over the lean cap: {}",
+            capped["peerDiscovery"]
+        );
         let stats = turned_away_torrent.stats();
         let ended = stats
             .live
             .as_ref()
             .map(|l| l.snapshot.peer_stats.dead + l.snapshot.peer_stats.not_needed);
-        if ended.is_some_and(|ended| ended >= 1) {
+        if ended.is_some_and(|ended| ended >= 1) || std::time::Instant::now() >= watch_until {
             break;
         }
-        anyhow::ensure!(
-            std::time::Instant::now() < deadline,
-            "the extra seeder's dial-in never ended: {stats}"
-        );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    let capped: serde_json::Value = client.get(&stats_url).send()?.json()?;
-    assert_eq!(
-        peers(&capped),
-        enginefs::backend::LEAN_PEER_LIMIT,
-        "{}",
-        capped["peerDiscovery"]
-    );
     drop(turned_away);
 
-    // Foreground: the cap is back, and seeders dialling in now are taken.
+    // Foreground: the cap is back, so the swarm may grow past the lean one
+    // again. The seeders the server hung up on cannot be re-dialled from
+    // here (it never learned their listen ports), so a fresh batch dials in
+    // -- the same thing the opening precondition waited for, which is why
+    // this can be waited for the same way.
     handle.set_background(false);
     assert!(!handle.is_background());
-    seeders.extend((0..SEEDERS - enginefs::backend::LEAN_PEER_LIMIT).map(|_| dial_in()));
-    wait_for("the swarm growing back past the lean cap", &|s| {
-        peers(s) == SEEDERS
-    })?;
+    seeders.extend((0..SEEDERS).map(|_| dial_in()));
+    wait_for(
+        "the swarm growing back past the lean cap (the environment never got \
+         more than LEAN_PEER_LIMIT of the fresh seeders connected at once)",
+        &|s| peers(s) > LEAN,
+    )?;
 
     drop(seeders);
     drop(rt);
