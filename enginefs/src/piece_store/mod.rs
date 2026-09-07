@@ -70,7 +70,7 @@ pub mod sweep;
 
 pub use layout::{FileSpec, PieceLayout, Segment};
 pub use store::{MissingPiece, PIECES_PER_DIRECTORY, PieceStore, PieceStoreFactory, layout_of};
-pub use sweep::{SweepReport, sweep_unadopted};
+pub use sweep::{SweepReport, session_recorded_hashes, sweep_unadopted};
 
 /// The store's directory inside a torrent cache root.
 ///

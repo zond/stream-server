@@ -2403,8 +2403,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     }
 
     /// Reconcile the piece store against what this session actually holds:
-    /// every torrent's pieces under [`piece_store::root_in`] that no restored
-    /// engine and no pin claims are deleted.
+    /// every torrent's pieces under [`piece_store::root_in`] that nothing
+    /// claims are deleted.
     ///
     /// Cleanup that only runs on the way out is cleanup that does not run.
     /// Android kills a backgrounded app without ceremony, so the process dies
@@ -2414,6 +2414,24 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// that asks the engine what it holds, and nothing would ever reclaim it:
     /// exactly the invisible disk usage one file per piece exists to stop
     /// producing.
+    ///
+    /// A claim is *anything the session still has a record of*, never merely
+    /// what came up on this boot. Three sources, and the third is the one that
+    /// makes the difference between a sweep and a data loss:
+    ///
+    /// 1. The restored engines.
+    /// 2. The dormant pins -- a pin whose torrent the backend did not restore
+    ///    has no engine at all, and its data is the offline download the user
+    ///    is waiting to come back.
+    /// 3. Whatever librqbit's own session persistence still records
+    ///    ([`piece_store::session_recorded_hashes`]): `session.json` and the
+    ///    per-torrent `<hash>.bitv` / `.torrent` files in the persistence
+    ///    folder, which is this engine's `download_dir`. A torrent librqbit
+    ///    persisted and failed to restore on this boot -- an output volume
+    ///    that is not mounted, an add that errored -- is in neither 1 nor 2,
+    ///    and deleting its pieces would destroy a download the session's own
+    ///    records still point at, on a boot where the *only* thing wrong was
+    ///    the restore.
     ///
     /// Called once at startup, after the backend has restored its torrents and
     /// [`Self::restore_pinned_downloads`] has read the pin file, and before any
@@ -2435,7 +2453,12 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 .map(|info_hash| info_hash.to_lowercase()),
         );
         let root = crate::piece_store::root_in(&self.download_dir);
+        let persistence_folder = self.download_dir.clone();
         match tokio::task::spawn_blocking(move || {
+            let mut adopted = adopted;
+            adopted.extend(crate::piece_store::session_recorded_hashes(
+                &persistence_folder,
+            ));
             crate::piece_store::sweep_unadopted(&root, &adopted)
         })
         .await
@@ -6212,6 +6235,75 @@ mod tests {
             "and running it again on the next launch does nothing"
         );
         assert!(pieces.join(TEST_HASH).is_dir());
+    }
+
+    /// A torrent librqbit persisted but did not restore on this boot is still
+    /// the session's, and its pieces are not the sweep's to take.
+    ///
+    /// A restore is allowed to fail -- the volume it writes to is not mounted
+    /// yet, its `.torrent` will not parse, the add errored -- and none of that
+    /// says anything about the data. `session.json` and the `<hash>.bitv`
+    /// fastresume bitfield still name the torrent, so a claim set built from
+    /// the engines that happened to come up would delete a whole download out
+    /// from under the record that still refers to it. The claim has to be
+    /// "what the session still has a record of", not "what came up this time".
+    #[tokio::test]
+    async fn the_startup_sweep_keeps_the_pieces_of_a_torrent_the_session_still_records() {
+        const ORPHAN_HASH: &str = "1111111111111111111111111111111111111111";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let download_dir = root.join("rqbit-downloads");
+        // Nothing came up: no restored handle, no pin. Only librqbit's own
+        // persistence records, which is the whole point.
+        let enginefs = BackendEngineFS::new_with_backend(
+            FakeBackend::new(Vec::new()),
+            HashMap::new(),
+            root.join("cache"),
+            download_dir.clone(),
+        );
+        std::fs::create_dir_all(&download_dir).unwrap();
+        std::fs::write(
+            download_dir.join("session.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "torrents": {
+                    "0": {
+                        "info_hash": TEST_HASH,
+                        "trackers": [],
+                        "output_folder": download_dir.join(TEST_HASH),
+                        "only_files": null,
+                        "is_paused": false,
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // A torrent whose entry `session.json` has lost but whose fastresume
+        // bitfield is still there: the have-record of a real download, and
+        // reason enough not to delete what it describes.
+        std::fs::write(download_dir.join(format!("{OTHER_HASH}.bitv")), [0u8; 8]).unwrap();
+
+        let pieces = crate::piece_store::root_in(&enginefs.download_dir);
+        for hash in [TEST_HASH, OTHER_HASH, ORPHAN_HASH] {
+            let dir = pieces.join(hash).join("0");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("0"), [1u8; 1024]).unwrap();
+        }
+
+        let report = enginefs.sweep_unadopted_pieces().await;
+        assert_eq!(report.removed, 1, "{report:?}");
+        assert!(
+            pieces.join(TEST_HASH).is_dir(),
+            "`session.json` still records this torrent"
+        );
+        assert!(
+            pieces.join(OTHER_HASH).is_dir(),
+            "and the fastresume bitfield records this one"
+        );
+        assert!(
+            !pieces.join(ORPHAN_HASH).exists(),
+            "no record of any kind claims this"
+        );
     }
 
     /// Pins are written to `pinned-downloads.json` on every change and

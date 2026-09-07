@@ -16,6 +16,13 @@
 //!
 //! It is idempotent by construction: it deletes what is not claimed, and a
 //! second pass finds the same claims and nothing left to delete.
+//!
+//! What may claim a torrent is therefore the whole of the question. It is not
+//! "what came up on this boot": a restore is allowed to fail -- the volume the
+//! torrent writes to is not mounted, its `.torrent` will not parse, the add
+//! errored -- and the failure says nothing at all about the data. The claim is
+//! *what the session still has a record of*, which is what
+//! [`session_recorded_hashes`] reads off disk.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -32,6 +39,91 @@ pub struct SweepReport {
     /// Entries that could not be removed. Logged, never fatal: a sweep that
     /// trips over one directory must still do the rest.
     pub errors: usize,
+}
+
+/// Info hashes librqbit's session persistence still has a record of, read
+/// straight out of its folder (which is the engine's `download_dir` -- see
+/// `LibrqbitBackend::new`, which hands `SessionPersistenceConfig::Json` that
+/// same path).
+///
+/// Two records, because either can outlive the other and each on its own is
+/// reason enough not to delete a download:
+///
+/// * `session.json`, the session database: a `torrents` map of
+///   `SerializedTorrent`, of which only `info_hash` matters here.
+/// * `<info hash>.bitv` and `<info hash>.torrent`, the per-torrent fastresume
+///   bitfield and metadata file. A `session.json` that is truncated, half
+///   written or unparseable takes every claim in it down with it, and these
+///   are what is left; conversely a torrent added seconds before the process
+///   died has a session entry and no bitfield yet.
+///
+/// Anything unreadable is a warning and no claim, never an error: a sweep must
+/// still run. That direction is the safe one only because it is paired with
+/// the second record -- losing *both* is the one case that can still take a
+/// torrent's pieces, and by then the session has forgotten the torrent too.
+pub fn session_recorded_hashes(persistence_folder: &Path) -> HashSet<String> {
+    #[derive(serde::Deserialize)]
+    struct SessionDatabase {
+        #[serde(default)]
+        torrents: std::collections::HashMap<String, SerializedTorrent>,
+    }
+    #[derive(serde::Deserialize)]
+    struct SerializedTorrent {
+        info_hash: String,
+    }
+
+    let mut hashes = HashSet::new();
+    let db_path = persistence_folder.join("session.json");
+    match std::fs::read(&db_path) {
+        Ok(bytes) => match serde_json::from_slice::<SessionDatabase>(&bytes) {
+            Ok(db) => hashes.extend(
+                db.torrents
+                    .into_values()
+                    .filter_map(|torrent| info_hash_of(&torrent.info_hash)),
+            ),
+            Err(error) => tracing::warn!(
+                path = %db_path.display(),
+                %error,
+                "could not read the session database; the per-torrent records are the only claims left"
+            ),
+        },
+        // No session database is the ordinary first-launch state.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(
+            path = %db_path.display(),
+            %error,
+            "could not open the session database; the per-torrent records are the only claims left"
+        ),
+    }
+
+    match std::fs::read_dir(persistence_folder) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                if let Some((stem, "bitv" | "torrent")) = name.rsplit_once('.')
+                    && let Some(hash) = info_hash_of(stem)
+                {
+                    hashes.insert(hash);
+                }
+            }
+        }
+        Err(error) => tracing::warn!(
+            path = %persistence_folder.display(),
+            %error,
+            "could not read the session persistence folder"
+        ),
+    }
+    hashes
+}
+
+/// `name` as a lowercase info hash, or `None` when it is not one. The same
+/// shape `cache_cleaner::is_session_artifact` recognises: forty hex digits.
+fn info_hash_of(name: &str) -> Option<String> {
+    (name.len() == 40 && name.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| name.to_ascii_lowercase())
 }
 
 /// Remove every torrent's pieces under `root` except those whose lowercase
@@ -196,6 +288,55 @@ mod tests {
         assert!(!root.join("scratch.tmp").exists());
         assert!(!root.join("not-a-hash").exists());
         assert!(root.join(ADOPTED).is_dir());
+    }
+
+    /// The claim that keeps a download alive on a boot where the restore
+    /// failed: librqbit's own records, read off disk. Both of them, because
+    /// either can be the only one left.
+    #[test]
+    fn the_sessions_own_records_are_claims() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path();
+        std::fs::write(
+            folder.join("session.json"),
+            serde_json::json!({
+                "torrents": { "0": { "info_hash": ADOPTED }, "7": { "info_hash": DORMANT } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // Recorded by a per-torrent file alone -- `session.json` has no entry
+        // for it, which is what a truncated flush or a torrent added between
+        // two flushes leaves.
+        std::fs::write(folder.join(format!("{ORPHAN}.bitv")), [0u8; 8]).unwrap();
+        // Debris that is not a record of anything.
+        std::fs::write(folder.join("notes.bitv"), b"x").unwrap();
+        std::fs::write(folder.join("dht.json"), b"{}").unwrap();
+
+        assert_eq!(
+            session_recorded_hashes(folder),
+            claims(&[ADOPTED, DORMANT, ORPHAN])
+        );
+    }
+
+    /// A session database that will not parse must not silently un-claim
+    /// every torrent in it. It costs a warning and the per-torrent records
+    /// carry the claims instead -- which is the whole reason both are read.
+    #[test]
+    fn an_unreadable_session_database_falls_back_to_the_per_torrent_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path();
+        std::fs::write(folder.join("session.json"), b"{\"torrents\": {\"0\": ").unwrap();
+        std::fs::write(folder.join(format!("{ADOPTED}.torrent")), b"d4:infod").unwrap();
+
+        assert_eq!(session_recorded_hashes(folder), claims(&[ADOPTED]));
+    }
+
+    #[test]
+    fn a_folder_with_no_session_in_it_records_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(session_recorded_hashes(tmp.path()).is_empty());
+        assert!(session_recorded_hashes(&tmp.path().join("never")).is_empty());
     }
 
     #[test]
