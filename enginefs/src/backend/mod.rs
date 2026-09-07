@@ -91,6 +91,19 @@ pub trait TorrentBackend: Send + Sync {
         DhtStatus::default()
     }
     fn set_seeding_enabled(&self, _enabled: bool) {}
+    /// Whether adds here set piece reclaim, which the backend can only do on
+    /// a storage that can release a single piece. When it does, a torrent
+    /// the backend *restores* at startup comes back paused whatever it was
+    /// doing at shutdown -- its per-session want-set did not survive, so
+    /// librqbit forces it paused until the caller re-applies the want-set --
+    /// and the engine layer unpauses it once the pins are back (see
+    /// [`BackendEngineFS::resume_restored_torrents`]). The default is `false`
+    /// (a backend whose storage keeps whole files cannot reclaim, and its
+    /// restored torrents keep whatever paused state they had), which is also
+    /// how the shipped session runs today.
+    fn sets_piece_reclaim(&self) -> bool {
+        false
+    }
 }
 
 /// What one torrent has moved over the connection: bytes received from peers
@@ -213,6 +226,17 @@ pub trait TorrentHandle: Send + Sync + Clone {
     /// Resume torrent activity after an idle pause.
     async fn resume_torrent(&self) -> Result<()> {
         Ok(())
+    }
+    /// Un-stop a torrent the backend restored *paused* (see
+    /// [`TorrentBackend::sets_piece_reclaim`]) once the caller has re-applied
+    /// its want-set. Distinct from [`Self::resume_torrent`], which lifts an
+    /// idle/seeding throttle and does not restart a stopped torrent: this
+    /// starts a paused torrent going again. Called only on a torrent the
+    /// backend restored, and only by a backend that restores paused, so the
+    /// default -- for a backend that does neither -- errs rather than
+    /// pretend it un-paused something.
+    async fn unpause_restored(&self) -> Result<()> {
+        anyhow::bail!("this backend does not restore torrents paused")
     }
     /// Whether the backend stopped this torrent because the volume it writes
     /// to ran out of space -- the one torrent error that is a statement about

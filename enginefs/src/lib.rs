@@ -2711,6 +2711,59 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         restored
     }
 
+    /// Unpause the torrents the backend restored at startup, once their pins
+    /// are back.
+    ///
+    /// A backend that sets piece reclaim
+    /// ([`crate::backend::TorrentBackend::sets_piece_reclaim`]) restores
+    /// every torrent paused, whatever it was doing when the process died:
+    /// the per-session piece-level want-set did not survive the record, so
+    /// librqbit forces a restored reclaim torrent paused and wanting every
+    /// hole in the storage until the caller re-applies the want-set, or a
+    /// seeder reaching it would refill a hole the caller was about to drop.
+    /// The want-set this layer re-applies is the pins
+    /// ([`Self::restore_pinned_downloads`], run just before this) and the
+    /// `only_files` selection librqbit persists with the torrent; there is
+    /// no piece-level want-set to re-apply here, because the retention
+    /// policy that would compute one is not wired into the session yet (see
+    /// [`crate::piece_store`]). So once the pins are back, the torrents are
+    /// unpaused -- otherwise a restart would come up with every torrent
+    /// stopped, downloading and seeding nothing. The seeding-disabled and
+    /// idle policies pause again from here whatever should not be running.
+    ///
+    /// A no-op unless the backend sets piece reclaim: the shipped session's
+    /// filesystem storage cannot reclaim, so its restored torrents were
+    /// never force-paused and keep whatever paused state they had.
+    ///
+    /// Called once at startup, after [`Self::restore_pinned_downloads`] and
+    /// before any route can add anything -- the engines here are exactly the
+    /// restored torrents.
+    pub async fn resume_restored_torrents(&self) {
+        if !self.backend.sets_piece_reclaim() {
+            return;
+        }
+        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
+        let mut resumed = 0usize;
+        for engine in engines {
+            match engine.handle.unpause_restored().await {
+                Ok(()) => {
+                    engine.idle_paused.store(false, Ordering::Relaxed);
+                    resumed += 1;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        info_hash = %engine.info_hash,
+                        error = %format!("{error:#}"),
+                        "could not resume a restored torrent; it stays paused"
+                    );
+                }
+            }
+        }
+        if resumed > 0 {
+            tracing::info!(resumed, "restored_torrents_resumed");
+        }
+    }
+
     /// Reconcile the piece store against what this session actually holds:
     /// every torrent's pieces under [`piece_store::root_in`] that nothing
     /// claims are deleted.
@@ -3768,6 +3821,7 @@ impl BackendEngineFS<LibrqbitBackend> {
         .await?;
         let efs = Self::new_with_backend(backend, restored, root_dir.join("cache"), download_dir);
         efs.restore_pinned_downloads().await;
+        efs.resume_restored_torrents().await;
         efs.sweep_unadopted_pieces().await;
         Ok(efs)
     }
@@ -3805,6 +3859,7 @@ impl BackendEngineFS<LibrqbitBackend> {
             tracker_storage,
         );
         efs.restore_pinned_downloads().await;
+        efs.resume_restored_torrents().await;
         efs.sweep_unadopted_pieces().await;
         Ok(efs)
     }
@@ -7186,7 +7241,13 @@ mod tests {
         std::fs::write(folder.join("e1.bin"), payload(1)).unwrap();
         std::fs::write(folder.join("e2.bin"), payload(2)).unwrap();
 
-        let inner = LibrqbitBackend::new_for_tests(tmp.path().join("dl"))
+        // The per-file delete forgets the deleted file's pieces from
+        // librqbit's have-set, which needs `piece_reclaim` -- so the session
+        // must run on a storage that can release a piece. (The shipped
+        // filesystem session cannot, and there the delete degrades to
+        // bytes-gone-but-have-set-stale-until-restart -- covered by
+        // `dropping_pieces_without_reclaim_is_refused_by_name`.)
+        let inner = LibrqbitBackend::new_for_tests_reclaiming(tmp.path().join("dl"))
             .await
             .expect("hermetic session");
         let mut enginefs = BackendEngineFS::new_with_backend(

@@ -764,6 +764,48 @@ pub struct LibrqbitBackend {
     /// Backend-wide tracker-scrape cache, shared by every handle so one
     /// torrent is scraped once however many handles report on it.
     swarm_scraper: Arc<SwarmScraper>,
+    /// Whether every add here sets `AddTorrentOptions::piece_reclaim` -- the
+    /// option that makes `ManagedTorrent::drop_pieces`, and so
+    /// [`LibrqbitHandle::drop_file_pieces`], available on the torrent.
+    /// Decided once, when the session opens, by asking the storage factory
+    /// the session hands its torrents ([`session_can_release_pieces`]):
+    /// librqbit refuses the option on a storage that cannot release a
+    /// single piece, because with one drop frees nothing, and the session as
+    /// it runs today uses librqbit's filesystem storage, which writes whole
+    /// files and answers no. So today this is `false`, `drop_file_pieces`
+    /// is refused by name, and the delete path degrades as its doc says; it
+    /// becomes `true` the day the piece store is the session's default
+    /// factory, with no other change here.
+    piece_reclaim: bool,
+}
+
+/// Whether the storage the session gives a torrent that names none can
+/// release a single piece -- and so whether the adds here may set
+/// `AddTorrentOptions::piece_reclaim`, which `Session::add_torrent` refuses
+/// otherwise, naming the factory. Asked of the factory the session really
+/// uses: the one installed as `default_storage_factory`, or librqbit's own
+/// filesystem storage when that is `None` -- the same fallback
+/// `Session::add_torrent` makes. Never assumed from the type: the promise is
+/// the factory's to make ([`librqbit::storage::StorageFactory::ensure_can_release_pieces`]).
+fn session_can_release_pieces(
+    default_storage: Option<&librqbit::storage::BoxStorageFactory>,
+) -> bool {
+    use librqbit::storage::StorageFactory;
+    let answer = match default_storage {
+        Some(factory) => factory.ensure_can_release_pieces(),
+        None => librqbit::storage::filesystem::FilesystemStorageFactory::default()
+            .ensure_can_release_pieces(),
+    };
+    match answer {
+        Ok(()) => true,
+        Err(reason) => {
+            debug!(
+                reason = %format!("{reason:#}"),
+                "the session's storage cannot release single pieces; torrents are added without piece_reclaim"
+            );
+            false
+        }
+    }
 }
 
 impl LibrqbitBackend {
@@ -838,6 +880,9 @@ impl LibrqbitBackend {
             }
         };
         let started_with = tuning;
+        // `open_session` installs no `default_storage_factory` (see there),
+        // so the storage asked here is librqbit's own filesystem storage.
+        let piece_reclaim = session_can_release_pieces(None);
         let deferred_selections: DeferredSelections = Default::default();
         let pinned_files: PinnedFiles = Default::default();
         let reported_errors: ReportedErrors = Default::default();
@@ -918,6 +963,7 @@ impl LibrqbitBackend {
                 reported_errors,
                 stream_positions,
                 swarm_scraper,
+                piece_reclaim,
             },
             restored_handles,
         ))
@@ -1057,27 +1103,170 @@ impl LibrqbitBackend {
     /// network. Not compiled into release builds.
     #[cfg(test)]
     pub async fn new_for_tests(download_dir: PathBuf) -> Result<Self> {
+        let (backend, _restored) =
+            Self::new_for_tests_with(download_dir, TestSessionOptions::default()).await?;
+        Ok(backend)
+    }
+
+    /// [`Self::new_for_tests`] with what a test may turn on: a storage
+    /// factory of its own as the session default, persistence, a loopback
+    /// listener. Still no DHT and no UPnP, and still a session that never
+    /// touches anything outside `download_dir` and the loopback interface.
+    /// The torrents it restores from a persisted session are returned like
+    /// [`Self::new_with_settings`] returns them.
+    #[cfg(test)]
+    pub async fn new_for_tests_with(
+        download_dir: PathBuf,
+        opts: TestSessionOptions,
+    ) -> Result<(Self, HashMap<String, LibrqbitHandle>)> {
         tokio::fs::create_dir_all(&download_dir).await?;
         let session_opts = librqbit::SessionOptions {
-            // dht: None disables DHT and its persistence together; listen: None
-            // never binds a port; persistence: None keeps the session hermetic.
+            // dht: None disables DHT and its persistence together.
             dht: None,
-            listen: None,
-            persistence: None,
+            listen: opts.listen_loopback.then(|| librqbit::ListenerOptions {
+                listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                ..Default::default()
+            }),
+            persistence: opts
+                .persist
+                .then(|| librqbit::SessionPersistenceConfig::Json {
+                    folder: Some(download_dir.clone()),
+                }),
+            fastresume: opts.persist,
+            default_storage_factory: opts
+                .default_storage
+                .as_ref()
+                .map(librqbit::storage::StorageFactory::clone_box),
             ..Default::default()
         };
+        // Same question, same factory, as `new_with_settings` asks.
+        let piece_reclaim = session_can_release_pieces(opts.default_storage.as_ref());
         let session = Session::new_with_opts(download_dir.clone(), session_opts).await?;
-        Ok(Self {
-            session,
-            started_with: SessionTuning::default(),
-            dht_ever_bootstrapped: AtomicBool::new(false),
+        let deferred_selections: DeferredSelections = Default::default();
+        let pinned_files: PinnedFiles = Default::default();
+        let reported_errors: ReportedErrors = Default::default();
+        let stream_positions: StreamPositions = Default::default();
+        let swarm_scraper = SwarmScraper::disabled();
+        let restored_handles = session.with_torrents(|iter| {
+            iter.map(|(_id, handle)| {
+                let info_hash = handle.info_hash().as_string();
+                (
+                    info_hash.clone(),
+                    LibrqbitHandle {
+                        handle: handle.clone(),
+                        info_hash,
+                        session: session.clone(),
+                        deferred_selections: deferred_selections.clone(),
+                        pinned_files: pinned_files.clone(),
+                        reported_errors: reported_errors.clone(),
+                        stream_positions: stream_positions.clone(),
+                        swarm_scraper: swarm_scraper.clone(),
+                    },
+                )
+            })
+            .collect()
+        });
+        Ok((
+            Self {
+                session,
+                started_with: SessionTuning::default(),
+                dht_ever_bootstrapped: AtomicBool::new(false),
+                download_dir,
+                deferred_selections,
+                pinned_files,
+                stream_positions,
+                reported_errors,
+                swarm_scraper,
+                piece_reclaim,
+            },
+            restored_handles,
+        ))
+    }
+}
+
+/// What [`LibrqbitBackend::new_for_tests_with`] lets a test switch on.
+#[cfg(test)]
+#[derive(Default)]
+pub struct TestSessionOptions {
+    /// The session's default storage factory. `None` is librqbit's
+    /// filesystem storage, as in production.
+    pub default_storage: Option<librqbit::storage::BoxStorageFactory>,
+    /// Persist the session (`session.json`, the `.bitv` bitfields) under
+    /// the download dir, so a second backend opened over the same dir
+    /// restores its torrents -- a restart.
+    pub persist: bool,
+    /// Accept incoming peers on an ephemeral loopback port, so a seeder a
+    /// test runs can come to the torrent.
+    pub listen_loopback: bool,
+}
+
+/// A filesystem storage that also *claims* it can release a single piece, so
+/// a hermetic test can seed a torrent from real files on disk (which the
+/// piece store cannot do without a download) *and* have the session set
+/// `piece_reclaim` and so exercise the reclaim/drop API.
+///
+/// It is a shim, honest for what it is used for: `drop_pieces` is librqbit's
+/// own have-set bookkeeping and needs no storage cooperation to forget a
+/// piece, which is what these tests check. Reclaiming the *bytes* one piece
+/// at a time is the real piece store's job and is tested against it in
+/// `piece_store`; over a whole-file filesystem storage a drop frees nothing,
+/// which is exactly why the shipped session runs with reclaim off. It also
+/// forwards `ensure_persistable` (the filesystem storage keeps that
+/// promise), so a persistent session accepts it -- what the restart test
+/// needs.
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct ReclaimableFilesystemFactory(librqbit::storage::filesystem::FilesystemStorageFactory);
+
+#[cfg(test)]
+impl librqbit::storage::StorageFactory for ReclaimableFilesystemFactory {
+    type Storage = librqbit::storage::filesystem::FilesystemStorage;
+
+    fn create(
+        &self,
+        shared: &librqbit::ManagedTorrentShared,
+        metadata: &librqbit::TorrentMetadata,
+    ) -> anyhow::Result<Self::Storage> {
+        self.0.create(shared, metadata)
+    }
+
+    fn ensure_persistable(&self) -> anyhow::Result<()> {
+        self.0.ensure_persistable()
+    }
+
+    fn ensure_can_release_pieces(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn clone_box(&self) -> librqbit::storage::BoxStorageFactory {
+        use librqbit::storage::StorageFactoryExt;
+        self.clone().boxed()
+    }
+}
+
+/// A boxed [`ReclaimableFilesystemFactory`], the reclaim-capable storage the
+/// tests that need `piece_reclaim` over real files hand to a test session.
+#[cfg(test)]
+pub fn reclaimable_storage() -> librqbit::storage::BoxStorageFactory {
+    use librqbit::storage::StorageFactoryExt;
+    ReclaimableFilesystemFactory::default().boxed()
+}
+
+#[cfg(test)]
+impl LibrqbitBackend {
+    /// A hermetic backend whose session can release pieces (so every add
+    /// sets `piece_reclaim` and `drop_file_pieces` works), for the tests that
+    /// need the reclaim path over a filesystem-seeded torrent.
+    pub async fn new_for_tests_reclaiming(download_dir: PathBuf) -> Result<Self> {
+        let (backend, _restored) = Self::new_for_tests_with(
             download_dir,
-            deferred_selections: Default::default(),
-            pinned_files: Default::default(),
-            stream_positions: Default::default(),
-            reported_errors: Default::default(),
-            swarm_scraper: SwarmScraper::disabled(),
-        })
+            TestSessionOptions {
+                default_storage: Some(reclaimable_storage()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        Ok(backend)
     }
 }
 
@@ -1399,6 +1588,10 @@ impl LibrqbitBackend {
 impl TorrentBackend for LibrqbitBackend {
     type Handle = LibrqbitHandle;
 
+    fn sets_piece_reclaim(&self) -> bool {
+        self.piece_reclaim
+    }
+
     async fn add_torrent(
         &self,
         source: TorrentSource,
@@ -1448,11 +1641,14 @@ impl TorrentBackend for LibrqbitBackend {
                     // leaves it advertising pieces whose bytes are gone.
                     // Nothing drops anything on its own with it on; it only
                     // opens the API, at the price of a read lock per Have
-                    // the torrent announces. Not persisted: a torrent the
-                    // session restores at startup comes back without it
-                    // (`SerializedTorrent::into_add_torrent` builds default
-                    // options), which `drop_file_pieces` reports.
-                    piece_reclaim: true,
+                    // the torrent announces. Set only when the session's
+                    // storage can release a single piece (see the field):
+                    // librqbit refuses the option otherwise, and would
+                    // refuse the whole add with it. Persisted with the
+                    // torrent, and a restored torrent that has it comes
+                    // back paused whatever it was doing at shutdown -- see
+                    // `BackendEngineFS::resume_restored_torrents`.
+                    piece_reclaim: self.piece_reclaim,
                     ..Default::default()
                 }),
             )
@@ -2039,6 +2235,17 @@ impl TorrentHandle for LibrqbitHandle {
         self.session.unpause(&self.handle).await
     }
 
+    /// `Session::unpause`, for a torrent librqbit restored paused because it
+    /// was added with `piece_reclaim` (the fork forces a restored reclaim
+    /// torrent paused; see [`AddTorrentOptions::piece_reclaim`] in the fork
+    /// and [`LibrqbitBackend`]'s field). Its `Paused(_)` arm takes it live
+    /// synchronously, clearing the paused flag. Errs if the torrent is not
+    /// paused (already live), which the engine layer only avoids by calling
+    /// this on freshly restored torrents alone.
+    async fn unpause_restored(&self) -> Result<()> {
+        self.session.unpause(&self.handle).await
+    }
+
     /// Deliberate no-op: librqbit (zond/rqbit `feat/configurable-stream-lookahead`)
     /// has no API to add trackers to a torrent that is already managed. The
     /// tracker set lives in `ManagedTorrentShared::trackers`, a plain
@@ -2248,18 +2455,19 @@ impl TorrentHandle for LibrqbitHandle {
     /// would be a lie -- and comes back through the neighbour's selection
     /// once the claim is released.
     ///
-    /// Two states refuse. A torrent that is not live (still hash-checking,
-    /// or paused) has no live have-set to edit. And a torrent restored from
-    /// the session's records at startup was re-added without
-    /// `piece_reclaim` (`add_torrent_placed` sets it; the restore path
-    /// builds default options), so librqbit answers `PieceReclaimDisabled`
-    /// for it however long it has been running. Both are reported, not
-    /// hidden: the caller deletes the bytes regardless, and until the next
-    /// restart librqbit believes it has them. The restart heals it -- the
-    /// fastresume validation hash-checks at least one claimed piece of every
-    /// file, the deleted file reads back empty, and the whole torrent is
-    /// re-checked from disk -- and the pieces stay out of the want-set
-    /// because `only_files` is persisted without the file.
+    /// Two states refuse. A torrent that is still hash-checking (or stopped
+    /// with an error) has no have-set to edit. And a torrent added without
+    /// `piece_reclaim` -- which is every torrent on the shipped session,
+    /// whose filesystem storage cannot release a single piece, so
+    /// `add_torrent_placed` never sets the option (see
+    /// [`LibrqbitBackend`]'s `piece_reclaim` field) -- has librqbit answer
+    /// `PieceReclaimDisabled` however long it has been running. Both are
+    /// reported, not hidden: the caller deletes the bytes regardless, and
+    /// until the next restart librqbit believes it has them. The restart
+    /// heals it -- the fastresume validation hash-checks at least one
+    /// claimed piece of every file, the deleted file reads back empty, and
+    /// the whole torrent is re-checked from disk -- and the pieces stay out
+    /// of the want-set because `only_files` is persisted without the file.
     async fn drop_file_pieces(&self, file_idx: usize) -> Result<Option<DroppedFilePieces>> {
         let range = self
             .handle
@@ -2273,9 +2481,9 @@ impl TorrentHandle for LibrqbitHandle {
                     .is_some_and(|e| matches!(e, librqbit::Error::PieceReclaimDisabled)) =>
             {
                 return Err(e.context(
-                    "the torrent was restored from the session's records, which come back \
-                     without piece reclaim (AddTorrentOptions::piece_reclaim is not \
-                     persisted), so librqbit cannot forget the pieces before the next restart",
+                    "this torrent was added without piece reclaim -- the session's storage \
+                     cannot release a single piece, so AddTorrentOptions::piece_reclaim is \
+                     off -- and librqbit will not forget a piece it has before the next restart",
                 ));
             }
             Err(e) => return Err(e.context("librqbit could not forget the file's pieces")),
@@ -3353,6 +3561,32 @@ mod tests {
         let backend = LibrqbitBackend::new_for_tests(download_dir.to_path_buf())
             .await
             .expect("hermetic session");
+        let handle = backend
+            .add_torrent(TorrentSource::Bytes(torrent_bytes.to_vec()), vec![])
+            .await
+            .expect("add torrent");
+        (backend, handle)
+    }
+
+    /// [`backend_with_torrent`] whose session can release pieces, so the
+    /// torrent is added with `piece_reclaim` and `drop_file_pieces` works.
+    pub(super) async fn reclaiming_backend_with_torrent(
+        download_dir: &std::path::Path,
+        torrent_bytes: &[u8],
+    ) -> (LibrqbitBackend, LibrqbitHandle) {
+        let (backend, _restored) = LibrqbitBackend::new_for_tests_with(
+            download_dir.to_path_buf(),
+            TestSessionOptions {
+                default_storage: Some(reclaimable_storage()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("hermetic session");
+        assert!(
+            backend.sets_piece_reclaim(),
+            "this storage promises it can release pieces"
+        );
         let handle = backend
             .add_torrent(TorrentSource::Bytes(torrent_bytes.to_vec()), vec![])
             .await
@@ -4940,7 +5174,11 @@ mod tests {
         write_payload(&content_dir.join("a.bin"), 40 * 1024).await;
         write_payload(&content_dir.join("b.bin"), 56 * 1024).await;
         let (torrent_bytes, _hash) = make_torrent(&content_dir).await;
-        let (_backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
+        // Reclaim is what makes drop_file_pieces available, and it is set
+        // only on a storage that can release a piece -- so this test needs
+        // one, where the plain filesystem session (reclaim off) would refuse
+        // the drop (see `dropping_pieces_without_reclaim_is_refused_by_name`).
+        let (_backend, handle) = reclaiming_backend_with_torrent(&dir, &torrent_bytes).await;
         handle.handle.wait_until_initialized().await.unwrap();
         let lengths: Vec<u64> = handle
             .handle
@@ -5017,23 +5255,163 @@ mod tests {
         );
     }
 
-    /// A torrent added without `piece_reclaim` -- which is what the session
-    /// restores at startup, since `SerializedTorrent::into_add_torrent`
-    /// builds default options -- cannot forget a piece, and the refusal
+    /// A reclaim torrent the session restores comes back paused whatever it
+    /// was doing at shutdown (librqbit forces it, and we persist
+    /// `piece_reclaim`), and the engine layer's `resume_restored_torrents`
+    /// unpauses it once the pins are back -- so it goes on downloading. A
+    /// torrent left paused would download nothing; here a seeder reaches the
+    /// resumed torrent and it finishes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restored_reclaim_torrent_is_resumed_and_downloads() {
+        use crate::backend::TorrentBackend;
+        let tmp = tempfile::tempdir().unwrap();
+
+        // The payload, and a single-file torrent of it, whole pieces so the
+        // filesystem ordering never matters.
+        let content = tmp.path().join("content");
+        tokio::fs::create_dir_all(&content).await.unwrap();
+        write_payload(&content.join("movie.bin"), 256 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&content.join("movie.bin")).await;
+
+        let client_dir = tmp.path().join("client");
+        let opts = || TestSessionOptions {
+            default_storage: Some(reclaimable_storage()),
+            persist: true,
+            listen_loopback: true,
+        };
+
+        // First run: a client that can reclaim (so `piece_reclaim` is set and
+        // persisted) and persists its session, with no data and no peers --
+        // the torrent is added incomplete.
+        {
+            let (backend, restored) =
+                LibrqbitBackend::new_for_tests_with(client_dir.clone(), opts())
+                    .await
+                    .unwrap();
+            assert!(backend.sets_piece_reclaim());
+            assert!(restored.is_empty(), "nothing to restore yet");
+            let handle = backend
+                .add_torrent(TorrentSource::Bytes(torrent_bytes.clone()), vec![])
+                .await
+                .unwrap();
+            handle.handle.wait_until_initialized().await.unwrap();
+            assert!(
+                !handle.handle.stats().finished,
+                "no data and no peers, so nothing is had"
+            );
+            // Let persistence write the record and the bitfield before the
+            // session is dropped, so the restart has something to restore.
+            let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
+            let session_json = client_dir.join("session.json");
+            while !session_json.exists() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(session_json.exists(), "the session was persisted");
+        }
+
+        // Restart: a new client over the same dir restores the torrent, and a
+        // reclaim torrent comes back paused.
+        let (backend, restored) = LibrqbitBackend::new_for_tests_with(client_dir.clone(), opts())
+            .await
+            .unwrap();
+        assert_eq!(restored.len(), 1, "the torrent came back");
+        let hash = restored.keys().next().unwrap().clone();
+        restored[&hash]
+            .handle
+            .wait_until_initialized()
+            .await
+            .unwrap();
+        assert!(
+            restored[&hash].handle.is_paused(),
+            "a restored reclaim torrent comes back paused"
+        );
+        let client_addr = backend
+            .session
+            .listen_addr()
+            .expect("the client listens for the seeder");
+
+        // The engine layer unpauses restored torrents once pins are back.
+        let efs = crate::BackendEngineFS::new_with_backend(
+            backend,
+            restored,
+            client_dir.join("cache"),
+            client_dir.clone(),
+        );
+        efs.restore_pinned_downloads().await;
+        efs.resume_restored_torrents().await;
+
+        let engine = efs.get_engine(&hash).await.expect("the restored engine");
+        assert!(
+            !engine.handle.handle.is_paused(),
+            "the restored torrent was unpaused"
+        );
+
+        // A seeder with the whole file dials the resumed client, which then
+        // downloads it -- the point being that a paused torrent would not.
+        let seeder = librqbit::Session::new_with_opts(
+            content.clone(),
+            librqbit::SessionOptions {
+                dht: None,
+                persistence: None,
+                listen: Some(librqbit::ListenerOptions {
+                    listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seeder session");
+        seeder
+            .add_torrent(
+                librqbit::AddTorrent::from_bytes(bytes::Bytes::from(torrent_bytes.clone())),
+                Some(librqbit::AddTorrentOptions {
+                    paused: false,
+                    output_folder: Some(content.to_str().unwrap().to_owned()),
+                    overwrite: true,
+                    // The seeder dials the client, which is listening.
+                    initial_peers: Some(vec![client_addr]),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("seeder add");
+
+        let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
+        loop {
+            if engine.handle.handle.stats().finished {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the resumed torrent never finished downloading: {}",
+                engine.handle.handle.stats()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// A torrent added without `piece_reclaim` -- which is every torrent on
+    /// the shipped session, whose filesystem storage cannot release a piece
+    /// so the option is never set -- cannot forget a piece, and the refusal
     /// says why rather than reading as a generic backend error. The delete
     /// path logs it and goes on deleting; the next restart re-checks the
     /// torrent from disk.
     #[tokio::test(flavor = "multi_thread")]
-    async fn dropping_pieces_of_a_restored_torrent_is_refused_by_name() {
+    async fn dropping_pieces_without_reclaim_is_refused_by_name() {
         use crate::backend::TorrentHandle;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
         write_payload(&dir.join("payload.bin"), 32 * 1024).await;
         let (torrent_bytes, _hash) = make_torrent(&dir.join("payload.bin")).await;
+        // The shipped session's filesystem storage cannot release a piece,
+        // so `new_for_tests` opens with reclaim off, as production does.
         let backend = LibrqbitBackend::new_for_tests(dir.clone())
             .await
             .expect("hermetic session");
-        // Straight to the session with the options a restore builds.
+        assert!(!backend.sets_piece_reclaim());
+        // Straight to the session with default options, as this session's
+        // every add and every restore builds them.
         let response = backend
             .session
             .add_torrent(
@@ -5062,7 +5440,7 @@ mod tests {
             .await
             .expect_err("no reclaim on this torrent");
         let text = format!("{error:#}");
-        assert!(text.contains("restored from the session"), "{text}");
+        assert!(text.contains("added without piece reclaim"), "{text}");
         assert!(text.contains("piece_reclaim"), "{text}");
         assert_eq!(
             handle.handle.stats().file_progress,

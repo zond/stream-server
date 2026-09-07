@@ -93,6 +93,21 @@
 //! the session's default factory, so this store can only keep it by *being*
 //! that default -- not by being passed to a single add.
 //!
+//! **Settled: reclaim capability.** The rev this crate pins adds a second
+//! factory promise, `StorageFactory::ensure_can_release_pieces`, and
+//! `Session::add_torrent` refuses `AddTorrentOptions::piece_reclaim` on a
+//! factory that does not make it -- because `drop_pieces` frees nothing on a
+//! storage that cannot let one piece go. [`store::PieceStoreFactory`] *does*
+//! make this one: a piece is a file, and releasing it is
+//! [`store::PieceStore::delete_piece`]. That is a statement about the layout
+//! alone, true whether or not this is the default factory, unlike
+//! `ensure_persistable` above. It is why the shipped session -- which runs on
+//! librqbit's filesystem storage, whole files, no reclaim -- adds every
+//! torrent with `piece_reclaim` *off* today (`LibrqbitBackend` asks the
+//! session's storage and finds it cannot release), and `drop_file_pieces`
+//! degrades by name; the day this store is the default the same question
+//! answers yes and reclaim turns on with no other change.
+//!
 //! Nothing else has a stake in the default factory any more. The client's
 //! activity signal briefly did -- its counters were a storage wrapper around
 //! the default, and this store would have had to go inside it -- until that

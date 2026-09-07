@@ -660,6 +660,16 @@ impl TorrentStorage for PieceStore {
     /// Make a downloaded piece ours. Called after the hash check, so this is
     /// where the staged bytes become the have-record -- see
     /// [`Self::complete_piece`] and [`STAGING_SUFFIX`].
+    ///
+    /// At the pinned rev librqbit runs this *before* it sets the piece's
+    /// have-bit, and treats an `Err` here as fatal to the torrent rather
+    /// than advertise a piece it could not commit -- so "presence means
+    /// complete" is now exactly the contract librqbit relies on: nothing is
+    /// counted, advertised, served or readable through a stream until the
+    /// rename here has returned `Ok`, and a rename that fails stops the
+    /// torrent instead of leaving a have-bit over a half-committed piece.
+    /// The staging-then-rename this store already did is what makes that
+    /// safe, unchanged.
     fn on_piece_completed(
         &self,
         piece_index: librqbit_core::lengths::ValidPieceIndex,
@@ -776,6 +786,30 @@ impl StorageFactory for PieceStoreFactory {
             Arc::new(layout),
         ))
     }
+
+    /// Yes: this store is one file per piece, and releasing a piece is
+    /// deleting its file ([`PieceStore::delete_piece`]) -- exactly what
+    /// [`librqbit::AddTorrentOptions::piece_reclaim`] needs, and what
+    /// `has_piece` answers from afterwards. So a torrent added on this
+    /// factory may set `piece_reclaim`, and `drop_pieces` frees real bytes.
+    /// This is a statement about the storage layout alone and is true
+    /// whether or not the factory is the session default.
+    fn ensure_can_release_pieces(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    // ensure_persistable stays the trait's default -- a bail naming this
+    // factory -- deliberately, and it is not the same promise as the one
+    // above. It asks whether a *restart* finds the data again, and a
+    // restart replays the persisted record onto the session's *default*
+    // factory (the record names an output folder and a file selection, no
+    // storage), so this store can only keep that promise by *being* that
+    // default. It is not wired in as the default yet (see the module doc's
+    // "Not wired into the session yet"), so promising persistability now
+    // would have a persistent session accept an add whose data the next
+    // restart would look for on the filesystem factory and not find. The
+    // wiring commit that makes this the default is what may make the
+    // promise.
 
     fn clone_box(&self) -> librqbit::storage::BoxStorageFactory {
         use librqbit::storage::StorageFactoryExt;
