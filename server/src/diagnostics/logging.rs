@@ -236,6 +236,9 @@ where
     })
 }
 
+/// The one INFO line that says what this process is: version, paths, and the
+/// command line it was started with. Written to every log file, the
+/// append-only archive included.
 pub fn log_startup_context(
     config_dir: &Path,
     cache_dir: &Path,
@@ -244,10 +247,39 @@ pub fn log_startup_context(
     archive_log: &Path,
     json_log: &Path,
 ) {
+    log_startup_context_with_args(
+        config_dir,
+        cache_dir,
+        log_dir,
+        human_log,
+        archive_log,
+        json_log,
+        std::env::args(),
+    );
+}
+
+/// [`log_startup_context`] over a given command line rather than the
+/// process's own, so a test can see what the line would carry.
+///
+/// The command line goes through [`redacted_args`] first. `main`'s
+/// `parse_cli` consumes `--token`, but this reads argv from the OS again, so
+/// nothing upstream has scrubbed it; the value is a bearer token that grants
+/// the whole control API, and the diagnostics log is what a user pastes to
+/// a stranger when asking for help. Everything else on the line is a path
+/// or a version, all of which the log names elsewhere already.
+fn log_startup_context_with_args(
+    config_dir: &Path,
+    cache_dir: &Path,
+    log_dir: &Path,
+    human_log: &Path,
+    archive_log: &Path,
+    json_log: &Path,
+    args: impl IntoIterator<Item = String>,
+) {
     let exe_path = std::env::current_exe()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
-    let args = std::env::args().collect::<Vec<_>>();
+    let args = redacted_args(args);
 
     tracing::info!(
         server.version = env!("CARGO_PKG_VERSION"),
@@ -263,6 +295,32 @@ pub fn log_startup_context(
         args = ?args,
         "server startup context"
     );
+}
+
+/// What stands in for a secret in the log.
+const REDACTED: &str = "<redacted>";
+
+/// The command line as the log may show it: the value of `--token`, in
+/// either spelling (`--token <t>`, `--token=<t>`), replaced by
+/// [`REDACTED`]. Redaction is by flag name, never by what the value looks
+/// like -- a token an operator chose can be short, or a word.
+fn redacted_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut redacted = Vec::new();
+    let mut value_is_secret = false;
+    for arg in args {
+        if value_is_secret {
+            redacted.push(REDACTED.to_string());
+            value_is_secret = false;
+        } else if arg == "--token" {
+            value_is_secret = true;
+            redacted.push(arg);
+        } else if arg.starts_with("--token=") {
+            redacted.push(format!("--token={REDACTED}"));
+        } else {
+            redacted.push(arg);
+        }
+    }
+    redacted
 }
 
 pub fn install_native_crash_handler(log_dir: &Path) {
@@ -367,3 +425,80 @@ unsafe extern "system" fn windows_exception_filter(
 
 pub const MEMORY_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(60);
 pub const MEMORY_GROWTH_ALERT_BYTES: u64 = 128 * 1024 * 1024;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// Everything a scoped subscriber wrote, so a test can grep the line
+    /// exactly as it would land in the log files.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    #[test]
+    fn the_token_is_redacted_in_both_spellings_and_nothing_else_is_touched() {
+        assert_eq!(
+            redacted_args(strings(&["server", "--token", "hunter2", "--tui"])),
+            strings(&["server", "--token", REDACTED, "--tui"])
+        );
+        assert_eq!(
+            redacted_args(strings(&["--token=hunter2", "--no-auth"])),
+            strings(&["--token=<redacted>", "--no-auth"])
+        );
+        // A trailing `--token` with no value (parse_cli rejects it, but the
+        // process gets this far first) leaves nothing to redact and adds
+        // nothing.
+        assert_eq!(redacted_args(strings(&["--token"])), strings(&["--token"]));
+    }
+
+    /// The startup line, rendered by a real subscriber the way the log
+    /// files render it, carries the flag and not the secret -- the check
+    /// the README's "the token never passes through `tracing`" rests on.
+    #[test]
+    fn the_startup_line_does_not_carry_the_token() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let dir = Path::new("nowhere");
+        tracing::subscriber::with_default(subscriber, || {
+            log_startup_context_with_args(
+                dir,
+                dir,
+                dir,
+                dir,
+                dir,
+                dir,
+                strings(&[
+                    "server",
+                    "--token",
+                    "s3cret-flag-value",
+                    "--token=s3cret-eq-value",
+                ]),
+            );
+        });
+        let line = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(line.contains("server startup context"), "{line}");
+        assert!(line.contains("--token"), "the flag itself stays: {line}");
+        assert!(!line.contains("s3cret-flag-value"), "{line}");
+        assert!(!line.contains("s3cret-eq-value"), "{line}");
+    }
+}
