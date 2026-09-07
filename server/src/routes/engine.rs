@@ -32,13 +32,88 @@ pub struct PeerSearchBody {
     pub sources: Vec<String>,
 }
 
+/// What a `POST /create` names, sorted into what has to happen to it.
+///
+/// stremio-core sends `/create` with a torrent-file `blob` and routes
+/// magnets to `/{infoHash}/create`; nothing shipped sends a magnet in
+/// `from`. But `from` accepts one -- a `magnet:` link or a bare 40-hex
+/// hash, both of which librqbit's `Session::add_torrent` treats as a magnet
+/// -- and a magnet may never go through `EngineFS::add_torrent` from a
+/// route: librqbit resolves metadata inside that call, with no timeout of
+/// its own, and the add is invisible to the registry that bounds every
+/// other magnet add at `METADATA_RESOLVE_TIMEOUT` and lets a stats poll for
+/// the same hash join it instead of starting a second resolve. (Measured:
+/// `{"from": <hash>}` for a hash with no swarm did not answer in two
+/// minutes while `/{infoHash}/stats.json` at the same time reported its own,
+/// separate `resolvingMetadata` add.) So a magnet is recognised here and
+/// sent down the registry path with the link's own `tr=` trackers merged
+/// in; a torrent file, by blob or by `http(s)` URL, keeps `add_torrent`.
+enum CreateSource {
+    /// A `magnet:` link or bare info hash: the registry path.
+    Magnet {
+        info_hash: String,
+        trackers: Vec<String>,
+    },
+    /// Torrent-file bytes, or a URL the backend fetches them from.
+    TorrentFile(enginefs::backend::TorrentSource),
+}
+
+impl CreateSource {
+    /// Sort `from` the way librqbit's own `Magnet::parse` would: a bare
+    /// 40-hex hash is a magnet (the same check `magnet_with_trackers` makes
+    /// before it upgrades one), and so is a `magnet:` URL naming a v1 hash
+    /// in `xt=urn:btih:`, whose `tr=` values are the link's trackers.
+    /// Anything else -- an `http(s)` URL, a v2-only magnet -- is left to
+    /// `add_torrent` as before.
+    fn from_link(from: String) -> Self {
+        if is_info_hash(&from) {
+            return Self::Magnet {
+                info_hash: from.to_lowercase(),
+                trackers: Vec::new(),
+            };
+        }
+        if let Ok(url) = url::Url::parse(&from)
+            && url.scheme() == "magnet"
+        {
+            let mut info_hash = None;
+            let mut trackers = Vec::new();
+            for (key, value) in url.query_pairs() {
+                match key.as_ref() {
+                    "xt" => {
+                        if let Some(hash) = value.strip_prefix("urn:btih:")
+                            && is_info_hash(hash)
+                        {
+                            info_hash = Some(hash.to_lowercase());
+                        }
+                    }
+                    "tr" => trackers.push(value.into_owned()),
+                    _ => {}
+                }
+            }
+            if let Some(info_hash) = info_hash {
+                return Self::Magnet {
+                    info_hash,
+                    trackers,
+                };
+            }
+        }
+        Self::TorrentFile(enginefs::backend::TorrentSource::Url(from))
+    }
+}
+
+/// A 40-digit hex string: a v1 info hash as the routes and the registry
+/// spell it.
+fn is_info_hash(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 pub async fn create_engine(
     State(state): State<AppState>,
     Json(payload): Json<CreateEngineRequest>,
 ) -> impl IntoResponse {
     let source = if let Some(hex_str) = payload.torrent {
         match hex::decode(hex_str) {
-            Ok(bytes) => enginefs::backend::TorrentSource::Bytes(bytes),
+            Ok(bytes) => CreateSource::TorrentFile(enginefs::backend::TorrentSource::Bytes(bytes)),
             Err(e) => {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -47,7 +122,7 @@ pub async fn create_engine(
             }
         }
     } else if let Some(from) = payload.from {
-        enginefs::backend::TorrentSource::Url(from)
+        CreateSource::from_link(from)
     } else {
         return (
             StatusCode::BAD_REQUEST,
@@ -55,28 +130,54 @@ pub async fn create_engine(
         );
     };
 
-    let trackers = merged_trackers(payload.announce, payload.peer_search);
+    let mut trackers = merged_trackers(payload.announce, payload.peer_search);
     let file_must_include = payload.file_must_include;
     let guess = parse_guess_file_idx(payload.guess_file_idx.as_ref());
 
-    match state
-        .stream_engine()
-        .add_torrent(source, Some(trackers))
-        .await
-    {
-        Ok(engine) => {
-            let stats = stats_with_guess(&engine, &file_must_include, guess).await;
-            (StatusCode::OK, Json(stats))
+    let engine = match source {
+        CreateSource::Magnet {
+            info_hash,
+            trackers: link_trackers,
+        } => {
+            trackers = compat::normalize_tracker_sources(
+                trackers.into_iter().chain(link_trackers).collect(),
+            );
+            match state
+                .stream_engine()
+                .get_or_add_magnet(&info_hash, Some(trackers))
+                .await
+            {
+                Ok(engine) => engine,
+                Err(e) => return magnet_create_failure(&info_hash, &e),
+            }
         }
-        // stremio-video's createTorrent.js checks resp.ok before reading the
-        // body (createTorrent.js:62); a 200 here on failure leaves
-        // guessedFileIdx undefined and produces a broken /{infoHash}/undefined
-        // stream URL, so fail with a non-2xx status instead.
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        ),
-    }
+        CreateSource::TorrentFile(source) => {
+            match state
+                .stream_engine()
+                .add_torrent(source, Some(trackers))
+                .await
+            {
+                Ok(engine) => engine,
+                // stremio-video's createTorrent.js checks resp.ok before
+                // reading the body (createTorrent.js:62); a 200 here on
+                // failure leaves guessedFileIdx undefined and produces a
+                // broken /{infoHash}/undefined stream URL, so fail with a
+                // non-2xx status instead. The body is a fixed string like
+                // every other torrent-creation failure's: the error is
+                // logged here in full and never echoed, since a backend
+                // error can carry the cache root's path.
+                Err(e) => {
+                    tracing::error!(error = %format!("{e:#}"), "create_engine failed to add torrent");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": "Failed to add torrent" })),
+                    );
+                }
+            }
+        }
+    };
+    let stats = stats_with_guess(&engine, &file_must_include, guess).await;
+    (StatusCode::OK, Json(stats))
 }
 
 /// Stremio-core /{infoHash}/create endpoint for magnet links.
@@ -236,6 +337,48 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `from` that librqbit would treat as a magnet -- a link, or a bare
+    /// info hash -- takes the registry path, with the link's trackers;
+    /// anything else is a torrent file to fetch.
+    #[test]
+    fn create_source_sorts_magnets_from_torrent_files() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        match CreateSource::from_link(format!(
+            "magnet:?xt=urn:btih:{hash}&tr=udp%3A%2F%2Fone%3A6969%2Fannounce&dn=x"
+        )) {
+            CreateSource::Magnet {
+                info_hash,
+                trackers,
+            } => {
+                assert_eq!(info_hash, hash);
+                assert_eq!(trackers, ["udp://one:6969/announce"]);
+            }
+            CreateSource::TorrentFile(_) => panic!("a magnet link is a magnet"),
+        }
+        match CreateSource::from_link(hash.to_uppercase()) {
+            CreateSource::Magnet {
+                info_hash,
+                trackers,
+            } => {
+                assert_eq!(info_hash, hash, "lowercased, as the registry keys it");
+                assert!(trackers.is_empty());
+            }
+            CreateSource::TorrentFile(_) => panic!("a bare info hash is a magnet to librqbit"),
+        }
+        for url in [
+            "https://example.invalid/film.torrent",
+            "ftp://example.invalid/x.torrent",
+            "not a url at all",
+        ] {
+            match CreateSource::from_link(url.to_string()) {
+                CreateSource::TorrentFile(enginefs::backend::TorrentSource::Url(kept)) => {
+                    assert_eq!(kept, url)
+                }
+                _ => panic!("{url} is not a magnet"),
+            }
+        }
+    }
 
     fn parse(value: serde_json::Value) -> Option<SeriesInfo> {
         parse_guess_file_idx(Some(&value))

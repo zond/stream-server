@@ -557,6 +557,84 @@ fn create_engine_reports_failure_with_non_2xx_status() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A magnet in `POST /create`'s `from` -- a link or a bare info hash --
+/// goes through the shared, timed magnet registry like `/{infoHash}/create`
+/// and the stream route, never through `EngineFS::add_torrent`: a stats
+/// poll arriving while the create still resolves sees that very add, with
+/// the link's own `tr=` trackers. (Through `add_torrent` the create would
+/// hang unbounded on librqbit's own resolve and the poll would start a
+/// second, tracker-less one.)
+#[test]
+fn create_from_a_magnet_joins_the_shared_registry_add() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_dir.path().join("cache")),
+        ..offline_config()
+    })?;
+    let base = format!("http://{}", handle.http_addr());
+    let client = bearer_client(&handle)?;
+    let impatient = bearer_client_builder(&handle)
+        .timeout(std::time::Duration::from_secs(2))
+        .build()?;
+
+    // Neither magnet resolves -- no peers, an unreachable tracker -- so each
+    // create blocks past the client's patience while its add lives on in
+    // the registry, where the stats poll finds it.
+    let link_hash = "aabbccddeeff00112233445566778899aabbccdd";
+    let link_tracker = "udp://from-link.invalid:6969/announce";
+    let bare_hash = "bbccddeeff00112233445566778899aabbccddee";
+    let bare_tracker = "udp://from-bare.invalid:6969/announce";
+    for (body, hash, tracker) in [
+        (
+            serde_json::json!({
+                "from": format!(
+                    "magnet:?xt=urn:btih:{link_hash}&tr={}",
+                    urlencoding::encode(link_tracker)
+                )
+            }),
+            link_hash,
+            link_tracker,
+        ),
+        (
+            serde_json::json!({
+                "from": bare_hash,
+                "peerSearch": { "sources": [format!("tracker:{bare_tracker}")] }
+            }),
+            bare_hash,
+            bare_tracker,
+        ),
+    ] {
+        let created = impatient.post(format!("{base}/create")).json(&body).send();
+        assert!(
+            created.is_err(),
+            "create must wait for metadata, got {created:?}"
+        );
+        let stats: serde_json::Value = client
+            .get(format!("{base}/{hash}/stats.json"))
+            .send()?
+            .error_for_status()?
+            .json()?;
+        assert_eq!(stats["phase"], "resolvingMetadata", "{stats}");
+        let sources: Vec<&str> = stats["sources"]
+            .as_array()
+            .expect("sources array")
+            .iter()
+            .filter_map(|s| s["url"].as_str())
+            .collect();
+        assert!(
+            sources.contains(&tracker),
+            "the stats poll must find the add /create started, with its trackers; got {sources:?}"
+        );
+    }
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
 /// Builds a minimal valid multi-file .torrent (bencoded metainfo) so the
 /// create endpoint can resolve metadata without touching the network.
 /// File order: 0 = S01E01 (largest video), 1 = S01E02, 2 = readme.txt.
