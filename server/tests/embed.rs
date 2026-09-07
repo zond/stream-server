@@ -1542,16 +1542,30 @@ fn set_background_shrinks_the_swarm_and_still_streams() -> anyhow::Result<()> {
     // The precondition, on its own bound: without more live peers than the
     // lean cap there is no surplus to shed and the rest says nothing. A
     // failure here is the environment, not `set_background`.
-    wait_for(
+    let full = wait_for(
         "the swarm outgrowing the lean cap (the environment never got more \
          than LEAN_PEER_LIMIT of the seeders connected at once)",
         &|s| peers(s) > LEAN,
     )?;
 
-    // Background: the surplus hangs up, and nothing is paused.
+    // Background, right on the heels of that read: the surplus is parked
+    // before the call returns (it is synchronous down to librqbit, which
+    // ranks and hangs up on the surplus there and then and takes the spare
+    // permits away so nothing can go live over the cap behind it), so this
+    // is read straight after rather than waited for. Incoming peers this
+    // server was never told the listen ports of die off on their own, so a
+    // count that only *eventually* falls under the cap says nothing about
+    // the cap -- a bound here passed with the cap change removed.
     handle.set_background(true);
     assert!(handle.is_background());
-    let lean = wait_for("the surplus hanging up", &|s| peers(s) <= LEAN)?;
+    let lean = stats_now()?;
+    anyhow::ensure!(
+        peers(&lean) <= LEAN,
+        "{} peers were live before going to the background and {} still are: {}",
+        peers(&full),
+        peers(&lean),
+        lean["peerDiscovery"]
+    );
     assert_ne!(lean["phase"], "paused", "{lean}");
 
     // A stream request while lean is served from the peers left. The head

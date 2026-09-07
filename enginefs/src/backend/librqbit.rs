@@ -5862,7 +5862,7 @@ mod tests {
         // The precondition, on its own bound: without more live peers than
         // the lean cap there is no surplus to park and the test has nothing
         // to say. A failure here is the environment, not the footprint.
-        wait_for(
+        let full = wait_for(
             &handle,
             "the swarm outgrowing the lean cap (the environment never \
              connected more than LEAN_PEER_LIMIT of the seeders)",
@@ -5870,16 +5870,24 @@ mod tests {
         )
         .await;
 
-        // Lean: the cap moves at once (no network in that), and the peers
-        // over it are asked to hang up.
+        // Lean, right on the heels of that read: the surplus is parked
+        // before the call returns (librqbit ranks and hangs up on it there
+        // and then, and takes the spare permits away so nothing can go live
+        // over the cap behind it), so this is read straight after rather
+        // than waited for. A count that only *eventually* falls under the
+        // cap is one the swarm shed on its own, which is what a bound here
+        // would have accepted.
         backend.set_footprint(Footprint::Lean);
         assert_eq!(backend.footprint(), Footprint::Lean);
         assert_eq!(handle.handle.shared.peer_limit(), LEAN_PEER_LIMIT);
-
-        let lean = wait_for(&handle, "the surplus hanging up", |s| {
-            (s.peers as usize) <= LEAN_PEER_LIMIT
-        })
-        .await;
+        let lean = TorrentHandle::stats(&handle).await;
+        assert!(
+            (lean.peers as usize) <= LEAN_PEER_LIMIT,
+            "{} peers were live before going lean and {} still are: {:?}",
+            full.peers,
+            lean.peers,
+            lean.peer_discovery
+        );
         // Parked, not forgotten: the pruning a lean does runs *before* the
         // cap drops, so the peers that were live a moment ago survive it,
         // and the table still holds more addresses than the cap now lets be
