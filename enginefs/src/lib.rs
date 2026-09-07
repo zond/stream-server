@@ -2372,6 +2372,52 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         restored
     }
 
+    /// Reconcile the piece store against what this session actually holds:
+    /// every torrent's pieces under [`piece_store::root_in`] that no restored
+    /// engine and no pin claims are deleted.
+    ///
+    /// Cleanup that only runs on the way out is cleanup that does not run.
+    /// Android kills a backgrounded app without ceremony, so the process dies
+    /// between a torrent being added and anything recording that it exists,
+    /// and between a torrent being removed and its pieces going with it. What
+    /// is left behind is not visible as a download, is not counted by anything
+    /// that asks the engine what it holds, and nothing would ever reclaim it:
+    /// exactly the invisible disk usage one file per piece exists to stop
+    /// producing.
+    ///
+    /// Called once at startup, after the backend has restored its torrents and
+    /// [`Self::restore_pinned_downloads`] has read the pin file, and before any
+    /// route can add anything. That ordering is what makes it safe -- a
+    /// torrent being added concurrently would have a directory and not yet a
+    /// claim.
+    pub async fn sweep_unadopted_pieces(&self) -> crate::piece_store::SweepReport {
+        let mut adopted: std::collections::HashSet<String> = self
+            .engines
+            .read()
+            .await
+            .keys()
+            .map(|info_hash| info_hash.to_lowercase())
+            .collect();
+        adopted.extend(
+            self.dormant_pins
+                .lock()
+                .keys()
+                .map(|info_hash| info_hash.to_lowercase()),
+        );
+        let root = crate::piece_store::root_in(&self.download_dir);
+        match tokio::task::spawn_blocking(move || {
+            crate::piece_store::sweep_unadopted(&root, &adopted)
+        })
+        .await
+        {
+            Ok(report) => report,
+            Err(error) => {
+                tracing::warn!(%error, "the piece store sweep did not finish");
+                crate::piece_store::SweepReport::default()
+            }
+        }
+    }
+
     /// Every pinned download, ordered by info hash then file index.
     pub async fn pinned_downloads(&self) -> Vec<PinnedDownload> {
         let engines = self.engines.read().await;
@@ -3204,6 +3250,7 @@ impl BackendEngineFS<LibrqbitBackend> {
         .await?;
         let efs = Self::new_with_backend(backend, restored, root_dir.join("cache"), download_dir);
         efs.restore_pinned_downloads().await;
+        efs.sweep_unadopted_pieces().await;
         Ok(efs)
     }
 
@@ -3231,6 +3278,7 @@ impl BackendEngineFS<LibrqbitBackend> {
             tracker_storage,
         );
         efs.restore_pinned_downloads().await;
+        efs.sweep_unadopted_pieces().await;
         Ok(efs)
     }
 
@@ -6019,6 +6067,63 @@ mod tests {
     /// re-applied at startup to the torrents the backend restored; pins of
     /// files that do not exist are dropped and the file rewritten; an
     /// unreadable file is ignored.
+    /// What the startup sweep must and must not take. The claims come from
+    /// two places, and both have to count: the torrents the backend restored,
+    /// and the pins it did not -- a dormant pin has no engine, so a sweep that
+    /// asked only the engine registry would delete the offline download the
+    /// user is waiting to come back.
+    #[tokio::test]
+    async fn the_startup_sweep_keeps_what_the_session_and_the_pins_claim() {
+        const ORPHAN_HASH: &str = "1111111111111111111111111111111111111111";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let handle = FakeHandle {
+            info_hash: TEST_HASH.to_string(),
+            counters: Arc::new(FakeCounters::default()),
+            files: vec![BackendFileInfo {
+                name: "video-0.mkv".to_string(),
+                length: 100,
+            }],
+            init: FakeInit::new(true, Duration::from_secs(60)),
+        };
+        let enginefs = BackendEngineFS::new_with_backend(
+            FakeBackend::new(vec![handle.clone()]),
+            HashMap::from([(TEST_HASH.to_string(), handle)]),
+            root.join("cache"),
+            root.join("downloads"),
+        );
+        // A pin of a torrent the backend did not restore: dormant, and its
+        // data has to survive anyway.
+        std::fs::create_dir_all(root.join("downloads")).unwrap();
+        std::fs::write(
+            enginefs.pinned_downloads_path(),
+            serde_json::to_vec(&serde_json::json!({ OTHER_HASH: [0] })).unwrap(),
+        )
+        .unwrap();
+        enginefs.restore_pinned_downloads().await;
+        assert_eq!(enginefs.dormant_pinned_downloads().len(), 1);
+
+        let pieces = crate::piece_store::root_in(&enginefs.download_dir);
+        for hash in [TEST_HASH, OTHER_HASH, ORPHAN_HASH] {
+            let dir = pieces.join(hash).join("0");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("0"), [1u8; 1024]).unwrap();
+        }
+
+        let report = enginefs.sweep_unadopted_pieces().await;
+        assert_eq!(report.removed, 1, "{report:?}");
+        assert!(pieces.join(TEST_HASH).is_dir(), "the restored torrent's");
+        assert!(pieces.join(OTHER_HASH).is_dir(), "the dormant pin's");
+        assert!(!pieces.join(ORPHAN_HASH).exists(), "nothing claims this");
+
+        assert_eq!(
+            enginefs.sweep_unadopted_pieces().await,
+            crate::piece_store::SweepReport::default(),
+            "and running it again on the next launch does nothing"
+        );
+        assert!(pieces.join(TEST_HASH).is_dir());
+    }
+
     #[tokio::test]
     async fn pinned_downloads_are_persisted_and_restored() {
         let tmp = tempfile::tempdir().unwrap();

@@ -27,7 +27,7 @@
 //! [`layout`] is the arithmetic -- `(file_id, offset)` to `(piece,
 //! offset_in_piece)` -- with no filesystem and no librqbit types in it.
 //! [`store`] is the [`librqbit::storage::TorrentStorage`] implementation over
-//! it. The launch-time reconcile of the store against the session follows.
+//! it. [`sweep`] reconciles the store against the session at launch.
 //!
 //! # Not wired into the session yet, and why
 //!
@@ -55,6 +55,24 @@
 
 pub mod layout;
 pub mod store;
+pub mod sweep;
 
 pub use layout::{FileSpec, PieceLayout, Segment};
 pub use store::{MissingPiece, PIECES_PER_DIRECTORY, PieceStore, PieceStoreFactory, layout_of};
+pub use sweep::{SweepReport, sweep_unadopted};
+
+/// The store's directory inside a torrent cache root.
+///
+/// Dot-prefixed like the engine's other private subdirectories (`.cache`,
+/// `.metadata`) so that a torrent named `pieces` cannot land on top of it.
+///
+/// Inside the cache root rather than beside it, deliberately: piece files are
+/// cache, and the cache cleaner has to be able to see and count them. It is
+/// not one of `cache_cleaner::is_session_artifact`'s exempt directories for
+/// the same reason -- pieces are exactly what a full disk should be reclaiming.
+pub const PIECE_STORE_DIR: &str = ".pieces";
+
+/// Where a torrent cache root keeps its piece store.
+pub fn root_in(download_dir: &std::path::Path) -> std::path::PathBuf {
+    download_dir.join(PIECE_STORE_DIR)
+}
