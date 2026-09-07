@@ -237,12 +237,18 @@ mod tests {
     /// The single-process refresh reads what the periodic line needs: this
     /// process's memory. A refresh kind without memory in it would leave the
     /// figure at zero and the growth alert blind, quietly.
+    ///
+    /// Both figures are asserted non-zero and nothing more. On Unix the
+    /// virtual size is at least the resident set, but on Windows sysinfo's
+    /// `virtual_memory()` is the pagefile commit, which a process whose pages
+    /// are mostly file-backed keeps *below* its working set -- CI's first
+    /// Windows run of this test failed on exactly that relation.
     #[test]
     fn the_process_snapshot_reads_this_process_s_memory() {
         let snapshot = process_memory_snapshot();
         assert_eq!(snapshot.pid, std::process::id());
         assert!(snapshot.rss_bytes > 0, "a running process occupies memory");
-        assert!(snapshot.virtual_memory_bytes >= snapshot.rss_bytes);
+        assert!(snapshot.virtual_memory_bytes > 0, "and has a virtual size");
     }
 
     /// The cache figures are the cleaner's, read back: nothing before a pass,
