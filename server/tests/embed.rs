@@ -896,8 +896,9 @@ fn post_settings_reports_which_bt_settings_took_effect() -> anyhow::Result<()> {
     let resp: serde_json::Value = client
         .post(format!("{base}/settings"))
         .json(&serde_json::json!({
-            // Live: the one setting the running session can change.
+            // Live: the two settings the running session can change.
             "btDownloadSpeedHardLimit": 1_000_000.0,
+            "btMaxConnections": 400,
             // Session-start: read once when the session opened, so a change
             // waits for the next start.
             "btEnableDht": false,
@@ -923,6 +924,14 @@ fn post_settings_reports_which_bt_settings_took_effect() -> anyhow::Result<()> {
     // The download limit is applied to the running session.
     assert!(
         applied_live.contains(&"btDownloadSpeedHardLimit".to_string()),
+        "{report}"
+    );
+    // So is the peer limit: it used to be `pendingRestart`, because the cap
+    // was a session option, and it is now the same runtime lever the
+    // background footprint uses. A client that shows "restart to apply"
+    // from this list must stop showing it for this setting.
+    assert!(
+        applied_live.contains(&"btMaxConnections".to_string()),
         "{report}"
     );
     // btEnableDht is read once at session start, so changing it is pending a
