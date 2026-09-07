@@ -81,19 +81,22 @@ impl Abandonment {
 
 /// The core cache controller
 ///
-/// The backing file is a [`NamedTempFile`] that is deleted when its last
-/// owner drops. Ownership is shared between the cache and its [`CacheWriter`]
-/// (see the `temp_file` fields), so the file outlives whichever of the two
-/// goes first. The archive handlers hand the cache to the caller, who keeps
-/// it for as long as the member should stay extracted (`ArchiveSource`
+/// The backing file is a [`NamedTempFile`] owned by the cache alone (shared
+/// only among clones of it), so its name is unlinked from the directory the
+/// moment the last clone drops -- with the `ArchiveSource` that kept it, in
+/// practice. The [`CacheWriter`] does not own the name: it holds a handle of
+/// its own onto the file (see its `handle` field), which is all a writer
+/// moved into a background extraction task that may not start until later
+/// needs, and which is why a name can be gone while its bytes are still
+/// being written. The archive handlers hand the cache to the caller, who
+/// keeps it for as long as the member should stay extracted (`ArchiveSource`
 /// keeps one per member for the life of the session) and takes readers from
-/// it; the writer is moved into a background extraction task that may not
-/// start until later.
+/// it.
 #[derive(Clone)]
 pub struct ProgressiveCache {
     state_rx: watch::Receiver<StateSnapshot>,
     temp_path: PathBuf,
-    // Keep the temp file alive while the cache exists
+    /// The one owner of the file's name: unlinked when the last clone drops.
     _temp_file_handle: Arc<NamedTempFile>,
     total_size: Option<u64>,
     notify: Arc<Notify>,
@@ -125,7 +128,7 @@ impl ProgressiveCache {
         total_size: Option<u64>,
     ) -> io::Result<(Self, CacheWriter)> {
         let temp_path = temp_file.path().to_path_buf();
-        let handle = Arc::new(temp_file);
+        let writer_handle = temp_file.as_file().try_clone()?;
 
         let initial_state = StateSnapshot {
             written_bytes: 0,
@@ -149,7 +152,7 @@ impl ProgressiveCache {
             file: writer_file,
             _video_file_size: total_size,
             notify: notify.clone(),
-            temp_file: handle.clone(),
+            handle: writer_handle,
             abandonment: Abandonment::new(readers.clone(), ABANDONED_AFTER),
         };
 
@@ -157,7 +160,7 @@ impl ProgressiveCache {
             ProgressiveCache {
                 state_rx: rx,
                 temp_path,
-                _temp_file_handle: handle,
+                _temp_file_handle: Arc::new(temp_file),
                 total_size,
                 notify,
                 readers,
@@ -195,12 +198,22 @@ pub struct CacheWriter {
     file: File,
     _video_file_size: Option<u64>,
     notify: Arc<Notify>,
-    /// Co-owns the temp file with the [`ProgressiveCache`]: the writer is
-    /// typically moved into a background task that starts after the cache
-    /// (and often the reader) has been dropped, and it must not find its own
-    /// file already deleted. Also the source of handle dups for
-    /// [`Self::try_clone_sync`].
-    temp_file: Arc<NamedTempFile>,
+    /// The writer's own handle onto the file, dup'd from the temp file when
+    /// the cache was made, and the source of handle dups for
+    /// [`Self::try_clone_sync`]. A handle and not a share in the
+    /// [`NamedTempFile`]: the writer is typically moved into a background
+    /// task that starts after the cache (and often the reader) has been
+    /// dropped, and it must not find its file gone -- a handle it already
+    /// holds cannot be -- but it must not keep the *name* either. A writer
+    /// that co-owned the name kept it in the directory until its task
+    /// unwound, which is after `finish` has told every reader the member is
+    /// complete, so a holder that dropped the cache the instant its readers
+    /// were done could still find the file listed (a test did, on a loaded
+    /// CI runner). Now the name goes with the cache, synchronously; a writer
+    /// still running writes into an unlinked file until the readers count
+    /// tells it nobody is reading ([`ABANDONED_AFTER`]), and the bytes are
+    /// reclaimed when it drops the handle.
+    handle: std::fs::File,
     abandonment: Abandonment,
 }
 
@@ -273,17 +286,17 @@ impl CacheWriter {
     /// Create a synchronous writer that shares the same state.
     /// Useful for legacy/sync libraries like 7z or unrar.
     ///
-    /// The file handle is duplicated from the temp file this writer co-owns
-    /// rather than re-opened by path. Re-opening by path raced the cache's
-    /// drop: a blocking extraction task that started after `open_file` had
-    /// returned (and dropped the `ProgressiveCache`) found the temp file
-    /// already unlinked — `No such file or directory` on Linux, `Access is
-    /// denied` on Windows where the delete is pending on the open handles.
-    /// A dup cannot fail that way, and the writer's shared ownership keeps the
-    /// file on disk regardless. (The dup shares its file offset with the
-    /// underlying temp file handle, which nothing else writes through.)
+    /// The file handle is duplicated from the one this writer holds rather
+    /// than re-opened by path. Re-opening by path raced the cache's drop: a
+    /// blocking extraction task that started after `open_file` had returned
+    /// (and dropped the `ProgressiveCache`) found the temp file already
+    /// unlinked — `No such file or directory` on Linux, `Access is denied`
+    /// on Windows where the delete is pending on the open handles. A dup of
+    /// an open handle cannot fail that way, whether or not the name is still
+    /// there. (The dup shares its file offset with the writer's handle,
+    /// which nothing else writes through.)
     pub fn try_clone_sync(&self) -> io::Result<SyncCacheWriter> {
-        let file = self.temp_file.as_file().try_clone()?;
+        let file = self.handle.try_clone()?;
 
         Ok(SyncCacheWriter {
             state_tx: self.state_tx.clone(),
@@ -623,20 +636,36 @@ mod tests {
         assert_eq!(&second, b"67890");
     }
 
+    /// The extraction files under `dir`.
+    fn extractions(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect()
+    }
+
     #[tokio::test]
     async fn sync_writer_outlives_dropped_cache() {
         let dir = tempfile::tempdir().unwrap();
         // Regression for the "Failed to open cache writer: No such file or
-        // directory / Access is denied" flake: archive handlers return only the
-        // reader from `open_file` and drop the `ProgressiveCache` immediately,
-        // while the writer is moved into a blocking extraction task that may
-        // start later. The writer must still be able to produce a sync clone
-        // and stream into the file after the cache is gone.
+        // directory / Access is denied" flake: a caller with nothing to keep
+        // the cache in (`OpenedMember::into_reader`) takes the reader and
+        // drops the `ProgressiveCache` immediately, while the writer is moved
+        // into a blocking extraction task that may start later. The writer
+        // must still be able to produce a sync clone and stream into the file
+        // after the cache is gone -- through a handle of its own, because the
+        // name is the cache's alone and is unlinked with it, not kept until
+        // the writer's task happens to unwind.
         let (cache, writer) = ProgressiveCache::new_in_dir(dir.path(), Some(5))
             .await
             .unwrap();
         let mut reader = cache.reader().await.unwrap();
+        assert_eq!(extractions(dir.path()).len(), 1);
         drop(cache);
+        assert!(
+            extractions(dir.path()).is_empty(),
+            "the name goes with the cache, whatever the writer is up to"
+        );
 
         let mut sync = writer
             .try_clone_sync()

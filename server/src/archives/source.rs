@@ -37,9 +37,14 @@ pub struct ArchiveSource {
     _download: Option<NamedTempFile>,
     cache_config: CacheConfig,
     /// The members extracted so far, by name -- see [`Self::open_member`].
-    /// Held for the life of the source, so their files are too; the mutex
-    /// is held across an open so two requests racing for a member that is
-    /// not there yet start one extraction, not two.
+    /// Held for the life of the source, so their files are too: each cache
+    /// is the one owner of its file's name, so dropping the last
+    /// `Arc<ArchiveSource>` unlinks every extraction at once, whether or not
+    /// an extraction task is still running -- one that is writes on into a
+    /// file with no name until it sees nobody is reading
+    /// (`cache::ABANDONED_AFTER`) and gives up, and those bytes are reclaimed
+    /// when it does. The mutex is held across an open so two requests racing
+    /// for a member that is not there yet start one extraction, not two.
     members: Mutex<HashMap<String, ProgressiveCache>>,
 }
 
@@ -246,7 +251,9 @@ mod tests {
     /// Three opens of one member -- a player's head, tail and seek -- are
     /// one extraction and one file on disk, and every reader gets the
     /// member; a different member is its own extraction. Dropping the
-    /// source drops them all.
+    /// source unlinks them all, then and there -- not once the extraction
+    /// tasks, which have already reported completion, get around to
+    /// unwinding.
     #[tokio::test]
     async fn a_member_is_extracted_once_per_source() {
         let root = tempfile::tempdir().unwrap();
