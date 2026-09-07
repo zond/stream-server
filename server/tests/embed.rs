@@ -1399,6 +1399,202 @@ fn poll_stats(client: &reqwest::blocking::Client, url: &str) -> anyhow::Result<s
     }
 }
 
+/// `ServerHandle::set_background` before any torrent exists is a cheap,
+/// idempotent no-op that only flips the footprint; with a swarm attached it
+/// shrinks the torrent to `LEAN_PEER_LIMIT` peers without pausing it, a
+/// stream request that arrives while lean is still served -- from the
+/// peers left -- and the return to the foreground lets the swarm back.
+///
+/// The server cannot be told peer addresses over its API, so the seeders
+/// dial *it*, on the librqbit listen port `torrent_listen_addr` reports.
+/// Incoming peers the server hung up on are not re-dialled by it (it does
+/// not know their listen ports), and a seeder that was dropped does not
+/// try again either (it is finished, and librqbit parks a finished
+/// torrent's dead peers) -- so the return to the foreground is shown by
+/// what the cap lets in: a seeder that dials in while lean is turned away,
+/// four that dial in afterwards are taken. The re-dial of parked *outgoing*
+/// peers is the enginefs test's business.
+#[test]
+fn set_background_shrinks_the_swarm_and_still_streams() -> anyhow::Result<()> {
+    const SEEDERS: usize = enginefs::backend::LEAN_PEER_LIMIT + 4;
+
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    let content = src.path().join("Movie");
+    std::fs::create_dir_all(&content)?;
+    // Big enough, at the seeders' pace (12 x 64 KiB/s), to still be
+    // downloading when the assertions are done: ~40 s for 32 MiB.
+    write_payload(&content.join("movie.bin"), 32 * 1024 * 1024);
+    let payload = std::fs::read(content.join("movie.bin"))?;
+    let (torrent, info_hash) = real_torrent(&content);
+
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_dir.path().join("cache")),
+        ..offline_config()
+    })?;
+    let base = format!("http://{}", handle.http_addr());
+    let client = bearer_client(&handle)?;
+
+    // Before any torrent: safe, idempotent, and only a flag flips.
+    assert!(!handle.is_background());
+    handle.set_background(true);
+    handle.set_background(true);
+    assert!(handle.is_background());
+    handle.set_background(false);
+    assert!(!handle.is_background());
+
+    client
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
+        .send()?
+        .error_for_status()?;
+    let stats = stats_after_check(&client, &base, &info_hash)?;
+    let idx = file_index(&stats, "movie.bin");
+    let listen_addr = handle
+        .torrent_listen_addr()
+        .expect("an embedded server listens for peers on an ephemeral port");
+
+    // The swarm: seeders that dial the server.
+    let rt = tokio::runtime::Runtime::new()?;
+    let dial_in = || {
+        rt.block_on(async {
+            let seeder = librqbit::Session::new_with_opts(
+                content.clone(),
+                librqbit::SessionOptions {
+                    dht: None,
+                    persistence: None,
+                    listen: Some(librqbit::ListenerOptions {
+                        listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                        ..Default::default()
+                    }),
+                    disable_local_service_discovery: true,
+                    ratelimits: librqbit::limits::LimitsConfig {
+                        upload_bps: std::num::NonZeroU32::new(64 * 1024),
+                        download_bps: None,
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seeder session");
+            let handle = seeder
+                .add_torrent(
+                    librqbit::AddTorrent::from_bytes(bytes::Bytes::from(torrent.clone())),
+                    Some(librqbit::AddTorrentOptions {
+                        output_folder: Some(content.to_str().unwrap().to_owned()),
+                        overwrite: true,
+                        initial_peers: Some(vec![listen_addr]),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .expect("seeder add")
+                .into_handle()
+                .expect("seeder handle");
+            (seeder, handle)
+        })
+    };
+    let mut seeders: Vec<_> = (0..SEEDERS).map(|_| dial_in()).collect();
+
+    let stats_url = format!("{base}/{info_hash}/stats.json");
+    let wait_for = |what: &str,
+                    pred: &dyn Fn(&serde_json::Value) -> bool|
+     -> anyhow::Result<serde_json::Value> {
+        let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
+        loop {
+            let stats: serde_json::Value =
+                client.get(&stats_url).send()?.error_for_status()?.json()?;
+            if pred(&stats) {
+                return Ok(stats);
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "{what} did not happen within {CHECK_WAIT_BOUND:?}: peers={} peerDiscovery={}",
+                stats["peers"],
+                stats["peerDiscovery"]
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    };
+    let peers = |stats: &serde_json::Value| stats["peers"].as_u64().unwrap_or(0) as usize;
+    let known =
+        |stats: &serde_json::Value| stats["peerDiscovery"]["known"].as_u64().unwrap_or(0) as usize;
+
+    wait_for("every seeder connecting", &|s| peers(s) == SEEDERS)?;
+
+    // Background: the surplus hangs up, stays known (parked, not forgotten),
+    // and nothing is paused.
+    handle.set_background(true);
+    let lean = wait_for("the surplus hanging up", &|s| {
+        peers(s) == enginefs::backend::LEAN_PEER_LIMIT && known(s) == SEEDERS
+    })?;
+    assert_ne!(lean["phase"], "paused", "{lean}");
+
+    // A stream request while lean is served from the peers left. The head
+    // of the file queues behind whatever the slow seeders were already asked
+    // for, so give it longer than reqwest's 30 s default.
+    let anonymous = reqwest::blocking::Client::builder()
+        .timeout(CHECK_WAIT_BOUND)
+        .build()?;
+    let response = anonymous
+        .get(format!("{base}/{info_hash}/{idx}"))
+        .header(reqwest::header::RANGE, "bytes=0-15")
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.bytes()?.as_ref(), &payload[0..16]);
+    let still_lean: serde_json::Value = client.get(&stats_url).send()?.json()?;
+    assert!(
+        peers(&still_lean) <= enginefs::backend::LEAN_PEER_LIMIT,
+        "streaming while lean must not re-grow the swarm: {}",
+        still_lean["peerDiscovery"]
+    );
+
+    // A seeder dialling in while lean is turned away: its connection to the
+    // server ends without ever going live, and the server stays at the cap.
+    let (turned_away, turned_away_torrent) = dial_in();
+    let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
+    loop {
+        let stats = turned_away_torrent.stats();
+        let ended = stats
+            .live
+            .as_ref()
+            .map(|l| l.snapshot.peer_stats.dead + l.snapshot.peer_stats.not_needed);
+        if ended.is_some_and(|ended| ended >= 1) {
+            break;
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the extra seeder's dial-in never ended: {stats}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let capped: serde_json::Value = client.get(&stats_url).send()?.json()?;
+    assert_eq!(
+        peers(&capped),
+        enginefs::backend::LEAN_PEER_LIMIT,
+        "{}",
+        capped["peerDiscovery"]
+    );
+    drop(turned_away);
+
+    // Foreground: the cap is back, and seeders dialling in now are taken.
+    handle.set_background(false);
+    assert!(!handle.is_background());
+    seeders.extend((0..SEEDERS - enginefs::backend::LEAN_PEER_LIMIT).map(|_| dial_in()));
+    wait_for("the swarm growing back past the lean cap", &|s| {
+        peers(s) == SEEDERS
+    })?;
+
+    drop(seeders);
+    drop(rt);
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
 /// A persisted `downloadsDir` that is unusable at startup (its path is a
 /// file now) is cleared in the settings file, not only in memory: an
 /// embedder reading the file sees what `settings()` says, and the next

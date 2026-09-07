@@ -527,6 +527,55 @@ impl ServerHandle {
         self.state.proxy_streams.close(token)
     }
 
+    /// Tell the server whether the app it lives in is in the background.
+    ///
+    /// `true` puts the torrent session on a lean footprint
+    /// ([`enginefs::backend::Footprint::Lean`]): every torrent keeps
+    /// running -- it goes on seeding, and a pinned download goes on
+    /// downloading -- but with [`enginefs::backend::LEAN_PEER_LIMIT`] peers
+    /// instead of the configured limit, the surplus hung up least useful
+    /// first, and its peer table pruned of the addresses kept only to
+    /// avoid re-dialling them. That is the share of a backgrounded server's
+    /// memory that was measured to be both the largest and the one still
+    /// growing (per-peer buffers, tasks and table entries), and the OS's
+    /// low-memory killer takes the fattest background process first.
+    /// Nothing is paused and nothing on disk is touched, so a stream
+    /// request that arrives while lean is served like any other, from
+    /// fewer peers. `false` restores the configured limit; the parked
+    /// peers are the first re-dialled.
+    ///
+    /// Call it from the app's lifecycle hooks (hidden/paused → `true`,
+    /// resumed → `false`). Idempotent, cheap, synchronous (no runtime
+    /// hop: atomics, a read lock per torrent and one message per surplus
+    /// peer), and safe before any torrent exists -- a torrent added while
+    /// lean starts lean. The app's own side of going to the background
+    /// (pausing the player, dropping image caches) is the app's business.
+    pub fn set_background(&self, background: bool) {
+        let footprint = if background {
+            enginefs::backend::Footprint::Lean
+        } else {
+            enginefs::backend::Footprint::Full
+        };
+        self.state.engine.set_footprint(footprint);
+        if !Arc::ptr_eq(&self.state.engine, &self.state.download_engine) {
+            self.state.download_engine.set_footprint(footprint);
+        }
+    }
+
+    /// Whether [`Self::set_background`] last put the server in the
+    /// background.
+    pub fn is_background(&self) -> bool {
+        self.state.engine.footprint() == enginefs::backend::Footprint::Lean
+    }
+
+    /// The address librqbit accepts peer connections on, or `None` when
+    /// the session is not listening. With [`TorrentListenPort::Ephemeral`]
+    /// this is the port the OS assigned; a fixed range reports the port
+    /// that was free.
+    pub fn torrent_listen_addr(&self) -> Option<SocketAddr> {
+        self.state.engine.backend.session.listen_addr()
+    }
+
     /// How many proxied streams are being read right now, over all tokens:
     /// the number of players actually attached to this server through
     /// `/proxy`, which nothing outside the process could work out before.
