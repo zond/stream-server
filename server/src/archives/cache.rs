@@ -35,15 +35,11 @@ pub struct ProgressiveCache {
 }
 
 impl ProgressiveCache {
-    /// Create a new ProgressiveCache using system temp directory
-    pub async fn new(total_size: Option<u64>) -> io::Result<(Self, CacheWriter)> {
-        // We use std NamedTempFile to create the path and handle, but open with tokio
-        let temp_file = NamedTempFile::new()?;
-        Self::from_temp_file(temp_file, total_size).await
-    }
-
-    /// Create a new ProgressiveCache in a specific directory
-    /// This allows respecting the user's cache_root setting
+    /// Create a new ProgressiveCache in a specific directory -- the archive
+    /// scratch directory under the cache root (`CacheConfig::scratch_dir`),
+    /// created if missing. There is deliberately no constructor for the
+    /// system temp dir: what is written here is cache, and the cleaner only
+    /// governs what is under the cache root.
     pub async fn new_in_dir(
         dir: &std::path::Path,
         total_size: Option<u64>,
@@ -415,12 +411,15 @@ mod tests {
 
     #[tokio::test]
     async fn reads_all_written_bytes_in_order() {
+        let dir = tempfile::tempdir().unwrap();
         // Writer produces the whole stream (flushed so it is physically on disk)
         // and finishes; the reader must return every byte in order and then hit
         // EOF. Driven sequentially in one task for a simple, deterministic check
         // (finish() flushes before publishing completion, so no explicit flush is
         // required for correctness here).
-        let (cache, mut writer) = ProgressiveCache::new(None).await.unwrap();
+        let (cache, mut writer) = ProgressiveCache::new_in_dir(dir.path(), None)
+            .await
+            .unwrap();
         let mut reader = cache.reader().await.unwrap();
 
         writer.write_all(b"hello ").await.unwrap();
@@ -435,6 +434,7 @@ mod tests {
 
     #[tokio::test]
     async fn finish_right_after_buffered_write_reads_full_tail() {
+        let dir = tempfile::tempdir().unwrap();
         // Regression for the tail-truncation race: the async writer bumps
         // `written_bytes` when tokio *buffers* a write, before those bytes are
         // flushed to disk. When `finish()` lands right after such a buffered
@@ -451,9 +451,10 @@ mod tests {
         let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i % 251) as u8).collect();
 
         for iter in 0..250 {
-            let (cache, mut writer) = ProgressiveCache::new(Some(PAYLOAD_LEN as u64))
-                .await
-                .unwrap();
+            let (cache, mut writer) =
+                ProgressiveCache::new_in_dir(dir.path(), Some(PAYLOAD_LEN as u64))
+                    .await
+                    .unwrap();
             let mut reader = cache.reader().await.unwrap();
 
             let payload_for_writer = payload.clone();
@@ -488,13 +489,16 @@ mod tests {
 
     #[tokio::test]
     async fn reader_reads_appended_bytes_after_catching_up_to_eof() {
+        let dir = tempfile::tempdir().unwrap();
         // The reader drains all currently-written bytes (reaching the file's
         // physical end), then the writer appends more and finishes. The reader
         // must go on to read the appended tail rather than stopping at the
         // earlier end. Guards the grow-after-EOF continuation. (The dedicated
         // finish_right_after_buffered_write_reads_full_tail test covers the
         // finish-without-explicit-flush path that the truncation fix resolved.)
-        let (cache, mut writer) = ProgressiveCache::new(None).await.unwrap();
+        let (cache, mut writer) = ProgressiveCache::new_in_dir(dir.path(), None)
+            .await
+            .unwrap();
         let mut reader = cache.reader().await.unwrap();
 
         writer.write_all(b"12345").await.unwrap();
@@ -514,13 +518,16 @@ mod tests {
 
     #[tokio::test]
     async fn sync_writer_outlives_dropped_cache() {
+        let dir = tempfile::tempdir().unwrap();
         // Regression for the "Failed to open cache writer: No such file or
         // directory / Access is denied" flake: archive handlers return only the
         // reader from `open_file` and drop the `ProgressiveCache` immediately,
         // while the writer is moved into a blocking extraction task that may
         // start later. The writer must still be able to produce a sync clone
         // and stream into the file after the cache is gone.
-        let (cache, writer) = ProgressiveCache::new(Some(5)).await.unwrap();
+        let (cache, writer) = ProgressiveCache::new_in_dir(dir.path(), Some(5))
+            .await
+            .unwrap();
         let mut reader = cache.reader().await.unwrap();
         drop(cache);
 
@@ -537,7 +544,10 @@ mod tests {
 
     #[tokio::test]
     async fn set_error_propagates_to_reader() {
-        let (cache, writer) = ProgressiveCache::new(None).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (cache, writer) = ProgressiveCache::new_in_dir(dir.path(), None)
+            .await
+            .unwrap();
         let mut reader = cache.reader().await.unwrap();
 
         writer.set_error("boom".into());
@@ -550,7 +560,10 @@ mod tests {
 
     #[tokio::test]
     async fn seek_from_end_lands_and_reads_from_offset() {
-        let (cache, mut writer) = ProgressiveCache::new(Some(10)).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (cache, mut writer) = ProgressiveCache::new_in_dir(dir.path(), Some(10))
+            .await
+            .unwrap();
         let mut reader = cache.reader().await.unwrap();
 
         writer.write_all(b"0123456789").await.unwrap();
@@ -570,7 +583,10 @@ mod tests {
 
     #[tokio::test]
     async fn seek_from_end_without_total_size_errors() {
-        let (cache, _writer) = ProgressiveCache::new(None).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (cache, _writer) = ProgressiveCache::new_in_dir(dir.path(), None)
+            .await
+            .unwrap();
         let mut reader = cache.reader().await.unwrap();
 
         let err = reader.seek(SeekFrom::End(-1)).await.unwrap_err();
@@ -579,7 +595,10 @@ mod tests {
 
     #[tokio::test]
     async fn seek_current_negative_past_zero_errors() {
-        let (cache, _writer) = ProgressiveCache::new(None).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (cache, _writer) = ProgressiveCache::new_in_dir(dir.path(), None)
+            .await
+            .unwrap();
         let mut reader = cache.reader().await.unwrap();
 
         let err = reader.seek(SeekFrom::Current(-5)).await.unwrap_err();

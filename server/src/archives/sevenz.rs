@@ -20,15 +20,6 @@ pub struct SevenZHandler {
 }
 
 impl SevenZHandler {
-    #[allow(dead_code)]
-    pub fn new(path: PathBuf) -> Self {
-        Self {
-            path: Some(path),
-            _reader: Arc::new(Mutex::new(None)),
-            cache_config: CacheConfig::default(),
-        }
-    }
-
     pub fn new_with_config(path: PathBuf, cache_config: CacheConfig) -> Self {
         Self {
             path: Some(path),
@@ -37,11 +28,14 @@ impl SevenZHandler {
         }
     }
 
-    pub fn new_with_reader(reader: Box<dyn AsyncSeekableReader>) -> Self {
+    pub fn new_with_reader(
+        reader: Box<dyn AsyncSeekableReader>,
+        cache_config: CacheConfig,
+    ) -> Self {
         Self {
             path: None,
             _reader: Arc::new(Mutex::new(Some(reader))),
-            cache_config: CacheConfig::default(),
+            cache_config,
         }
     }
 }
@@ -159,9 +153,10 @@ impl ArchiveReader for SevenZHandler {
         })
         .await??;
 
-        // Create cache in the configured cache directory
-        let cache_dir = self.cache_config.get_dir_or_temp();
-        let (cache, writer) = ProgressiveCache::new_in_dir(&cache_dir, Some(file_size)).await?;
+        // The extracted member lands under the cache root, where the cleaner
+        // counts it (see `CacheConfig::scratch_dir`).
+        let (cache, writer) =
+            ProgressiveCache::new_in_dir(&self.cache_config.scratch_dir(), Some(file_size)).await?;
 
         // Decompress in the background on the blocking pool, streaming into the
         // progressive cache so the returned reader can serve data immediately.
@@ -259,7 +254,7 @@ mod tests {
         SevenZHandler::new_with_config(
             archive,
             CacheConfig {
-                cache_dir: Some(dir.path().to_path_buf()),
+                cache_dir: dir.path().to_path_buf(),
                 _cache_size: 0,
             },
         )

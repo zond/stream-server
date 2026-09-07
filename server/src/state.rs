@@ -22,7 +22,9 @@ pub struct AppState {
     pub http_addr: SocketAddr,
     /// Bearer token the control routes require; `None` leaves them open.
     pub auth_token: Option<Arc<str>>,
-    pub archive_cache: Arc<dashmap::DashMap<String, crate::archives::ArchiveSession>>,
+    /// Archive sessions, swept when idle (see `crate::archives::sessions`);
+    /// a swept session's downloaded archive goes with it.
+    pub archive_cache: crate::archives::sessions::Sessions<crate::archives::ArchiveSession>,
     /// NZB sessions, swept when idle (see `crate::archives::sessions`).
     pub nzb_sessions:
         crate::archives::sessions::Sessions<crate::archives::nzb::session::NzbSession>,
@@ -129,7 +131,9 @@ impl AppState {
             base_url: "http://127.0.0.1:11470".to_string(),
             http_addr: SocketAddr::from(([127, 0, 0, 1], 11470)),
             auth_token: None,
-            archive_cache: Arc::new(dashmap::DashMap::new()),
+            archive_cache: crate::archives::sessions::Sessions::new(
+                crate::archives::SESSION_IDLE_TIMEOUT,
+            ),
             nzb_sessions: crate::archives::sessions::Sessions::new(
                 crate::archives::SESSION_IDLE_TIMEOUT,
             ),

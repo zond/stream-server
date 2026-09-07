@@ -1,4 +1,6 @@
-use super::{ArchiveEntry, ArchiveReader, AsyncSeekableReader, cache::ProgressiveCache};
+use super::{
+    ArchiveEntry, ArchiveReader, AsyncSeekableReader, CacheConfig, cache::ProgressiveCache,
+};
 use anyhow::{Result, anyhow};
 use std::path::PathBuf;
 
@@ -6,11 +8,12 @@ use flate2::read::GzDecoder;
 
 pub struct TgzHandler {
     path: PathBuf,
+    cache_config: CacheConfig,
 }
 
 impl TgzHandler {
-    pub fn new(path: PathBuf) -> Self {
-        Self { path }
+    pub fn new(path: PathBuf, cache_config: CacheConfig) -> Self {
+        Self { path, cache_config }
     }
 }
 
@@ -60,7 +63,10 @@ impl ArchiveReader for TgzHandler {
         // ProgressiveCache `new` takes explicit size.
         // We can just use `None` size.
 
-        let (cache, writer) = ProgressiveCache::new(None).await?;
+        // The extracted member lands under the cache root, where the cleaner
+        // counts it (see `CacheConfig::scratch_dir`).
+        let (cache, writer) =
+            ProgressiveCache::new_in_dir(&self.cache_config.scratch_dir(), None).await?;
 
         std::thread::spawn(move || {
             // Extraction runs on a plain OS thread, so it cannot await the async

@@ -1,4 +1,4 @@
-use crate::archives::ArchiveSession;
+use crate::archives::{self, ArchiveSession, ArchiveSource, CacheConfig};
 use crate::routes::compat;
 use crate::routes::util::parse_range;
 use crate::state::AppState;
@@ -11,9 +11,11 @@ use axum::{
     routing::get,
 };
 use enginefs::backend::TorrentHandle;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
@@ -107,47 +109,40 @@ fn is_unsupported_rar(path: &std::path::Path) -> bool {
     path.to_string_lossy().to_lowercase().ends_with(".rar")
 }
 
-async fn resolve_path(url: &str) -> Result<PathBuf, StatusCode> {
+/// Where the archive handlers write, from the live settings: the cache root
+/// (see `CacheConfig::scratch_dir` for what goes under it).
+async fn archive_cache_config(state: &AppState) -> CacheConfig {
+    let settings = state.settings.read().await;
+    CacheConfig {
+        cache_dir: PathBuf::from(&settings.cache_root),
+        _cache_size: crate::routes::system::cache_size_bytes(settings.cache_size),
+    }
+}
+
+/// The archive `url` names, as a source a session can own: the one an
+/// existing session already holds when there is one, else a fresh download
+/// (http/https) or the local path itself.
+///
+/// Sharing is by the origin string. A player that re-plays a title sends the
+/// same `/create` again, and before this every send downloaded the whole
+/// archive again beside the last copy.
+async fn resolve_source(
+    state: &AppState,
+    url: &str,
+    cache_config: CacheConfig,
+) -> Result<Arc<ArchiveSource>, StatusCode> {
+    if let Some(existing) = state
+        .archive_cache
+        .find(|session| session.source.origin() == url)
+    {
+        tracing::info!(
+            origin = url,
+            "reusing the archive an existing session holds"
+        );
+        return Ok(existing.source.clone());
+    }
     if url.starts_with("http://") || url.starts_with("https://") {
-        tracing::info!("Downloading archive from URL: {}", url);
-        let response = reqwest::get(url).await.map_err(|e| {
-            tracing::error!("Failed to fetch URL {}: {}", url, e);
-            StatusCode::BAD_REQUEST
-        })?;
-
-        if !response.status().is_success() {
-            tracing::error!("URL {} returned status {}", url, response.status());
-            return Err(StatusCode::NOT_FOUND);
-        }
-
-        let mut content = response.bytes_stream();
-        let temp_file = tempfile::NamedTempFile::new().map_err(|e| {
-            tracing::error!("Failed to create temp file: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-        let (file, path) = temp_file.keep().map_err(|e| {
-            tracing::error!("Failed to persist temp file: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-        let mut async_file = tokio::fs::File::from_std(file);
-
-        use futures_util::StreamExt;
-        while let Some(chunk) = content.next().await {
-            let chunk = chunk.map_err(|e| {
-                tracing::error!("Download stream error: {}", e);
-                StatusCode::BAD_GATEWAY
-            })?;
-            use tokio::io::AsyncWriteExt;
-            async_file.write_all(&chunk).await.map_err(|e| {
-                tracing::error!("Failed to write to temp file: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-        }
-
-        tracing::info!("Downloaded {} to {:?}", url, path);
-        Ok(path)
+        download_archive(url, cache_config).await.map(Arc::new)
     } else {
         let path = PathBuf::from(url);
         if !path.exists() {
@@ -155,8 +150,113 @@ async fn resolve_path(url: &str) -> Result<PathBuf, StatusCode> {
             // For torrent relative paths, this function is used by 'create' which assumes local or http.
             return Err(StatusCode::NOT_FOUND);
         }
-        Ok(path)
+        Ok(Arc::new(ArchiveSource::local(
+            path,
+            url.to_string(),
+            cache_config,
+        )))
     }
+}
+
+/// How much of a download is read before its file is named: enough to hold
+/// every signature `archives::archive_suffix_from_magic` looks for.
+const SNIFF_BYTES: usize = 512;
+
+/// Fetch `url` whole into a scratch file under the cache root and hand it
+/// back owned, so it is deleted with the last session holding it.
+///
+/// The file needs an archive suffix, because that is how the reader is
+/// chosen -- a download that went without one (every download used to)
+/// could never be opened, and the create failed after the whole transfer.
+/// The URL's own suffix is used when it has a recognised one; otherwise the
+/// first bytes of the body say what it is, and a body that is neither is
+/// `415` before it is stored. Nothing is kept on any error: the scratch
+/// file is a `NamedTempFile` until the source takes it.
+async fn download_archive(
+    url: &str,
+    cache_config: CacheConfig,
+) -> Result<ArchiveSource, StatusCode> {
+    tracing::info!("Downloading archive from URL: {}", url);
+    let response = reqwest::get(url).await.map_err(|e| {
+        tracing::error!("Failed to fetch URL {}: {}", url, e);
+        StatusCode::BAD_REQUEST
+    })?;
+
+    if !response.status().is_success() {
+        tracing::error!("URL {} returned status {}", url, response.status());
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let mut content = response.bytes_stream();
+    let mut head = Vec::with_capacity(SNIFF_BYTES);
+    while head.len() < SNIFF_BYTES {
+        match content.next().await {
+            Some(chunk) => head.extend_from_slice(&chunk.map_err(|e| {
+                tracing::error!("Download stream error: {}", e);
+                StatusCode::BAD_GATEWAY
+            })?),
+            None => break,
+        }
+    }
+
+    let suffix = archives::archive_suffix(&url_file_name(url))
+        .or_else(|| archives::archive_suffix_from_magic(&head))
+        .ok_or_else(|| {
+            tracing::warn!(
+                url,
+                "the URL names no archive format and the bytes are not one"
+            );
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        })?;
+
+    let file = archives::scratch_file(&cache_config, suffix).map_err(|e| {
+        tracing::error!("Failed to create archive scratch file: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let std_handle = file.as_file().try_clone().map_err(|e| {
+        tracing::error!("Failed to open archive scratch file: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let mut async_file = tokio::fs::File::from_std(std_handle);
+
+    let write_error = |e: std::io::Error| {
+        tracing::error!("Failed to write archive scratch file: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    async_file.write_all(&head).await.map_err(write_error)?;
+    while let Some(chunk) = content.next().await {
+        let chunk = chunk.map_err(|e| {
+            tracing::error!("Download stream error: {}", e);
+            StatusCode::BAD_GATEWAY
+        })?;
+        async_file.write_all(&chunk).await.map_err(write_error)?;
+    }
+    async_file.flush().await.map_err(write_error)?;
+
+    tracing::info!("Downloaded {} to {:?}", url, file.path());
+    Ok(ArchiveSource::downloaded(
+        file,
+        url.to_string(),
+        cache_config,
+    ))
+}
+
+/// The last path segment of `url`, percent-decoded -- what a suffix would
+/// be on, without the query a `?dl=1` would otherwise end it with -- or the
+/// whole URL when it does not parse.
+fn url_file_name(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|parsed| {
+            parsed.path_segments().and_then(|mut segments| {
+                segments.next_back().map(|segment| {
+                    urlencoding::decode(segment)
+                        .map(|decoded| decoded.into_owned())
+                        .unwrap_or_else(|_| segment.to_string())
+                })
+            })
+        })
+        .unwrap_or_else(|| url.to_string())
 }
 
 fn parse_create_request(
@@ -250,23 +350,14 @@ fn archive_url_from_value(value: &serde_json::Value) -> Option<String> {
 }
 
 async fn select_archive_file(
-    state: &AppState,
-    path: &std::path::Path,
+    source: &ArchiveSource,
     request: &ArchiveCreateRequest,
 ) -> Result<Option<String>, StatusCode> {
-    let settings = state.settings.read().await;
-    let cache_config = crate::archives::CacheConfig {
-        cache_dir: Some(std::path::PathBuf::from(&settings.cache_root)),
-        _cache_size: crate::routes::system::cache_size_bytes(settings.cache_size),
-    };
-    drop(settings);
-
-    let reader = crate::archives::get_archive_reader_with_config(path, cache_config)
-        .await
-        .map_err(|err| {
-            tracing::error!(path = %path.display(), error = %err, "failed to create archive reader");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let path = source.path();
+    let reader = source.reader().await.map_err(|err| {
+        tracing::error!(path = %path.display(), error = %err, "failed to create archive reader");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     let entries = reader.list_files().await.map_err(|err| {
         tracing::error!(path = %path.display(), error = %err, "failed to list archive files");
         StatusCode::INTERNAL_SERVER_ERROR
@@ -350,17 +441,21 @@ async fn create_session_internal(
         return (StatusCode::BAD_REQUEST, "No archive URL provided").into_response();
     };
 
-    let path = match resolve_path(url).await {
-        Ok(path) => path,
+    let cache_config = archive_cache_config(&state).await;
+    let source = match resolve_source(&state, url, cache_config).await {
+        Ok(source) => source,
         Err(status) => return (status, "Failed to resolve archive URL").into_response(),
     };
 
     #[cfg(not(feature = "rar"))]
-    if is_unsupported_rar(&path) {
+    if is_unsupported_rar(source.path()) {
         return rar_disabled_response();
     }
 
-    let selected_file = match select_archive_file(&state, &path, &payload).await {
+    // A failure from here on drops `source`, and with it a download nothing
+    // else holds -- the file goes, rather than staying on disk with no
+    // session to name it.
+    let selected_file = match select_archive_file(&source, &payload).await {
         Ok(file) => file,
         Err(status) => return (status, "Failed to select archive file").into_response(),
     };
@@ -368,9 +463,8 @@ async fn create_session_internal(
     state.archive_cache.insert(
         key.clone(),
         ArchiveSession {
-            path,
+            source,
             selected_file: selected_file.clone(),
-            created: std::time::Instant::now(),
         },
     );
 
@@ -444,6 +538,12 @@ async fn stream_file(
     file_path_in_archive: &str,
     headers: &header::HeaderMap,
 ) -> Result<Response, StatusCode> {
+    let cache_config = archive_cache_config(state).await;
+    // The session this request reads from, leased for as long as the
+    // response body lives (see `archives::sessions`); `None` for the
+    // torrent-backed form, which has no session.
+    let mut session_in_use = None;
+
     // 1. Determine Input Source
     let archive_reader: Box<dyn crate::archives::ArchiveReader> = if key.starts_with("torrent:") {
         // Format: torrent:<info_hash>/path/to/archive
@@ -527,9 +627,16 @@ async fn stream_file(
                 // We need to ensure wrapped_reader is `AsyncSeekableReader`.
                 // Ideally `ArchiveReader` accepts `Box<dyn AsyncSeekableReader>`.
 
+                // The reader is chosen by the archive's extension, not its
+                // whole path.
+                let extension = archive_internal_path
+                    .rsplit_once('.')
+                    .map(|(_, extension)| extension)
+                    .unwrap_or("");
                 crate::archives::get_archive_reader_from_stream(
                     wrapped_reader,
-                    &archive_internal_path,
+                    extension,
+                    cache_config,
                 )
                 .map_err(|e| {
                     tracing::error!("Failed to create stream reader: {}", e);
@@ -543,29 +650,23 @@ async fn stream_file(
         }
     } else {
         // Local Session
-        // Build cache config from app state settings
-        let settings = state.settings.read().await;
-        let cache_config = crate::archives::CacheConfig {
-            cache_dir: Some(std::path::PathBuf::from(&settings.cache_root)),
-            _cache_size: crate::routes::system::cache_size_bytes(settings.cache_size),
-        };
-        drop(settings);
-
-        let session_map = state.archive_cache.clone();
-        let session = session_map.get(key).ok_or(StatusCode::NOT_FOUND)?;
-        let path = session.path.clone();
+        let session = state.archive_cache.get(key).ok_or(StatusCode::NOT_FOUND)?;
 
         #[cfg(not(feature = "rar"))]
-        if is_unsupported_rar(&path) {
+        if is_unsupported_rar(session.source.path()) {
             return Ok(rar_disabled_response());
         }
 
-        crate::archives::get_archive_reader_with_config(&path, cache_config)
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to create reader for {:?}: {}", path, e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?
+        let reader = session.source.reader().await.map_err(|e| {
+            tracing::error!(
+                "Failed to create reader for {:?}: {}",
+                session.source.path(),
+                e
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        session_in_use = Some(session);
+        reader
     };
 
     // 2. Open Entry
@@ -607,8 +708,13 @@ async fn stream_file(
     // Limit reader
     let limited_reader = reader.take(len);
 
-    // Convert to Body stream
-    let body = Body::from_stream(media_body(limited_reader));
+    // Convert to Body stream. The session lease rides inside it: the
+    // session is in use for as long as the player reads, and its idle clock
+    // starts when the body is dropped.
+    let body = Body::from_stream(media_body(limited_reader).map(move |chunk| {
+        let _in_use = &session_in_use;
+        chunk
+    }));
 
     // 5. Build Response
     let mime = mime_guess::from_path(file_path_in_archive).first_or_octet_stream();
@@ -644,5 +750,16 @@ mod tests {
         let mut body = media_body(std::io::Cursor::new(data));
         let first = body.next().await.expect("a chunk").expect("no error");
         assert_eq!(first.len(), MEDIA_BODY_CHUNK_BYTES);
+    }
+
+    #[test]
+    fn the_file_name_is_the_last_path_segment_without_the_query() {
+        assert_eq!(
+            url_file_name("http://h/dl/Show.S01.rar?token=abc&dl=1"),
+            "Show.S01.rar"
+        );
+        assert_eq!(url_file_name("http://h/dl/a%20b.zip"), "a b.zip");
+        assert_eq!(url_file_name("http://h/download?id=1"), "download");
+        assert_eq!(url_file_name("not a url"), "not a url");
     }
 }

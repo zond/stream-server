@@ -1,4 +1,6 @@
-use super::{ArchiveEntry, ArchiveReader, AsyncSeekableReader, cache::ProgressiveCache};
+use super::{
+    ArchiveEntry, ArchiveReader, AsyncSeekableReader, CacheConfig, cache::ProgressiveCache,
+};
 use anyhow::{Result, anyhow};
 use async_zip::tokio::read::seek::ZipFileReader;
 use std::path::PathBuf;
@@ -13,20 +15,26 @@ pub struct ZipHandler {
     path: Option<PathBuf>,
     // Wrap in Arc<Mutex<Option>> to allow taking it out in `open_file` (one-shot)
     reader: Arc<Mutex<Option<Box<dyn AsyncSeekableReader>>>>,
+    cache_config: CacheConfig,
 }
 
 impl ZipHandler {
-    pub fn new(path: PathBuf) -> Self {
+    pub fn new(path: PathBuf, cache_config: CacheConfig) -> Self {
         Self {
             path: Some(path),
             reader: Arc::new(Mutex::new(None)),
+            cache_config,
         }
     }
 
-    pub fn new_with_reader(reader: Box<dyn AsyncSeekableReader>) -> Self {
+    pub fn new_with_reader(
+        reader: Box<dyn AsyncSeekableReader>,
+        cache_config: CacheConfig,
+    ) -> Self {
         Self {
             path: None,
             reader: Arc::new(Mutex::new(Some(reader))),
+            cache_config,
         }
     }
 }
@@ -110,8 +118,11 @@ impl ArchiveReader for ZipHandler {
         let entry = archive.file().entries().get(index).unwrap();
         let size = entry.uncompressed_size();
 
-        // Use ProgressiveCache for robust seeking
-        let (cache, mut writer) = ProgressiveCache::new(Some(size)).await?;
+        // Use ProgressiveCache for robust seeking. The extracted member lands
+        // under the cache root, where the cleaner counts it (see
+        // `CacheConfig::scratch_dir`).
+        let (cache, mut writer) =
+            ProgressiveCache::new_in_dir(&self.cache_config.scratch_dir(), Some(size)).await?;
 
         tokio::spawn(async move {
             let entry_reader = archive.reader_with_entry(index).await;

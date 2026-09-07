@@ -1,6 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::io::{AsyncRead, AsyncSeek};
 
 pub mod bridge;
@@ -10,9 +10,12 @@ pub mod nzb;
 pub mod rar;
 pub mod sessions;
 pub mod sevenz;
+pub mod source;
 pub mod tar;
 pub mod tgz;
 pub mod zip;
+
+pub use source::{ArchiveSession, ArchiveSource};
 
 /// How long an archive or NZB session outlives its last use before it is
 /// swept, with what it owns (see [`sessions`]).
@@ -44,37 +47,88 @@ pub struct ArchiveEntry {
     pub is_dir: bool,
 }
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct ArchiveSession {
-    pub path: std::path::PathBuf,
-    pub selected_file: Option<String>,
-    pub created: std::time::Instant,
-}
-
-/// Configuration for archive caching behavior
+/// Where the archive handlers write: the cache root, and under it the one
+/// directory everything of theirs goes in.
 #[derive(Debug, Clone)]
 pub struct CacheConfig {
-    /// Directory where cache files should be written
-    pub cache_dir: Option<std::path::PathBuf>,
+    /// The cache root -- the directory the cache cleaner walks.
+    pub cache_dir: PathBuf,
     /// Maximum cache size in bytes (0 = disabled)
     pub _cache_size: u64,
 }
 
+/// The directory under the cache root that holds what the archive routes put
+/// on disk: archives downloaded whole, and members extracted from them.
+///
+/// Under the cache root, and not the system temp dir, on purpose. Nothing
+/// here is precious -- every byte can be fetched or extracted again from
+/// what the session names -- so it should be cache to the cleaner like
+/// everything else: counted against the limit, aged by mtime, evicted when
+/// the disk is short, no protection. The system temp dir gave none of that
+/// and, on Android, is not writable by an app at all. The name may not be
+/// `.cache` or `.metadata`: `cache_cleaner::is_session_artifact` exempts any
+/// path with either component in it, and a directory the cleaner exempts is
+/// unbounded disk nobody counts.
+pub const SCRATCH_DIR_NAME: &str = ".archives";
+
 impl CacheConfig {
-    /// Get the cache directory, falling back to system temp if not configured
-    pub fn get_dir_or_temp(&self) -> std::path::PathBuf {
-        self.cache_dir.clone().unwrap_or_else(std::env::temp_dir)
+    /// `<cache root>/.archives` -- see [`SCRATCH_DIR_NAME`].
+    pub fn scratch_dir(&self) -> PathBuf {
+        self.cache_dir.join(SCRATCH_DIR_NAME)
     }
 }
 
-impl Default for CacheConfig {
-    fn default() -> Self {
-        Self {
-            cache_dir: None,
-            _cache_size: 10 * 1024 * 1024 * 1024, // 10GB default
-        }
+/// The suffixes the readers are chosen by, longest first so `.tar.gz` is
+/// found before `.gz` would not be.
+const ARCHIVE_SUFFIXES: [&str; 7] = [".tar.gz", ".tgz", ".zip", ".rar", ".7z", ".tar", ".nzb"];
+
+/// The recognised archive suffix `name` ends with (case-insensitively), as
+/// written in [`ARCHIVE_SUFFIXES`], or `None` when it has none. `name` may
+/// be a whole path or URL path; only its end is looked at.
+pub fn archive_suffix(name: &str) -> Option<&'static str> {
+    let lower = name.to_lowercase();
+    ARCHIVE_SUFFIXES
+        .iter()
+        .copied()
+        .find(|suffix| lower.ends_with(suffix))
+}
+
+/// The archive suffix the first bytes of a file say it should have, by the
+/// signatures the formats put at their start (tar's `ustar` is at offset
+/// 257, so `head` should be at least that long to find one).
+///
+/// A download is named by the URL it came from, and a URL that ends in an
+/// id rather than a filename says nothing about the format -- while the
+/// bytes always do. NZB is XML and has no signature to find here.
+pub fn archive_suffix_from_magic(head: &[u8]) -> Option<&'static str> {
+    if head.starts_with(b"Rar!\x1a\x07") {
+        Some(".rar")
+    } else if head.starts_with(b"PK\x03\x04") {
+        Some(".zip")
+    } else if head.starts_with(b"7z\xbc\xaf\x27\x1c") {
+        Some(".7z")
+    } else if head.starts_with(b"\x1f\x8b") {
+        Some(".tar.gz")
+    } else if head.len() >= 262 && &head[257..262] == b"ustar" {
+        Some(".tar")
+    } else {
+        None
     }
+}
+
+/// A new, uniquely named file in the scratch directory with the given
+/// archive suffix, for a download to land in. Deleted when dropped, so a
+/// download that fails part way leaves nothing behind.
+pub fn scratch_file(
+    cache_config: &CacheConfig,
+    suffix: &str,
+) -> std::io::Result<tempfile::NamedTempFile> {
+    let dir = cache_config.scratch_dir();
+    std::fs::create_dir_all(&dir)?;
+    tempfile::Builder::new()
+        .prefix("archive_")
+        .suffix(suffix)
+        .tempfile_in(dir)
 }
 
 /// Trait combining AsyncRead, AsyncSeek, Send, Sync, and Unpin for trait objects
@@ -96,79 +150,148 @@ pub async fn get_archive_reader_with_config(
     path: &Path,
     cache_config: CacheConfig,
 ) -> Result<Box<dyn ArchiveReader>> {
-    let path_str = path.to_string_lossy().to_lowercase();
-
-    // For local files, we open them here to pass into the new async handlers if possible,
-    // OR the handlers themselves open the file (backward compat logic).
-    // But since we are rewriting handlers to be async, let's try to unify.
-    // However, some handlers (like unrar wrapper) might still want a path.
-    // For now, we'll keep the path-based factory but implementation might change.
-
-    if path_str.ends_with(".zip") {
-        tracing::info!("Archive detected: ZIP at {:?}", path);
-        Ok(Box::new(zip::ZipHandler::new(path.to_path_buf())))
-    } else if path_str.ends_with(".rar") {
-        #[cfg(feature = "rar")]
-        {
-            tracing::info!(
-                "Archive detected: RAR at {:?}, cache_dir={:?}",
-                path,
-                cache_config.cache_dir
-            );
-            Ok(Box::new(rar::RarHandler::new_with_config(
+    // The reader is chosen by suffix, which is why a download has to be
+    // given one (`scratch_file`).
+    match archive_suffix(&path.to_string_lossy()) {
+        Some(".zip") => {
+            tracing::info!("Archive detected: ZIP at {:?}", path);
+            Ok(Box::new(zip::ZipHandler::new(
                 path.to_path_buf(),
                 cache_config,
             )))
         }
-        #[cfg(not(feature = "rar"))]
-        {
-            tracing::warn!(
-                "RAR archive requested but RAR support is not compiled in: {:?}",
-                path
-            );
-            Err(anyhow::anyhow!(RAR_DISABLED_ERROR))
+        Some(".rar") => {
+            #[cfg(feature = "rar")]
+            {
+                tracing::info!(
+                    "Archive detected: RAR at {:?}, cache_dir={:?}",
+                    path,
+                    cache_config.cache_dir
+                );
+                Ok(Box::new(rar::RarHandler::new_with_config(
+                    path.to_path_buf(),
+                    cache_config,
+                )))
+            }
+            #[cfg(not(feature = "rar"))]
+            {
+                tracing::warn!(
+                    "RAR archive requested but RAR support is not compiled in: {:?}",
+                    path
+                );
+                Err(anyhow::anyhow!(RAR_DISABLED_ERROR))
+            }
         }
-    } else if path_str.ends_with(".7z") {
-        tracing::info!(
-            "Archive detected: 7z at {:?}, cache_dir={:?}",
-            path,
-            cache_config.cache_dir
-        );
-        Ok(Box::new(sevenz::SevenZHandler::new_with_config(
-            path.to_path_buf(),
-            cache_config,
-        )))
-    } else if path_str.ends_with(".tar") {
-        tracing::info!("Archive detected: TAR at {:?}", path);
-        Ok(Box::new(tar::TarHandler::new(path.to_path_buf()))) // TODO: Async Tar
-    } else if path_str.ends_with(".tar.gz") || path_str.ends_with(".tgz") {
-        tracing::info!("Archive detected: TGZ at {:?}", path);
-        Ok(Box::new(tgz::TgzHandler::new(path.to_path_buf()))) // TODO: Async Tgz
-    } else if path_str.ends_with(".nzb") {
-        tracing::info!("Archive detected: NZB at {:?}", path);
-        Ok(Box::new(nzb::NzbHandler::new(path.to_path_buf())))
-    } else {
-        tracing::info!("Normal file detected (not an archive): {:?}", path);
-        Err(anyhow::anyhow!(
-            "Unsupported archive type: {:?}",
-            path.extension()
-        ))
+        Some(".7z") => {
+            tracing::info!(
+                "Archive detected: 7z at {:?}, cache_dir={:?}",
+                path,
+                cache_config.cache_dir
+            );
+            Ok(Box::new(sevenz::SevenZHandler::new_with_config(
+                path.to_path_buf(),
+                cache_config,
+            )))
+        }
+        Some(".tar") => {
+            tracing::info!("Archive detected: TAR at {:?}", path);
+            Ok(Box::new(tar::TarHandler::new(path.to_path_buf()))) // TODO: Async Tar
+        }
+        Some(".tar.gz" | ".tgz") => {
+            tracing::info!("Archive detected: TGZ at {:?}", path);
+            Ok(Box::new(tgz::TgzHandler::new(
+                path.to_path_buf(),
+                cache_config,
+            ))) // TODO: Async Tgz
+        }
+        Some(".nzb") => {
+            tracing::info!("Archive detected: NZB at {:?}", path);
+            Ok(Box::new(nzb::NzbHandler::new(path.to_path_buf())))
+        }
+        Some(_) | None => {
+            tracing::info!("Normal file detected (not an archive): {:?}", path);
+            Err(anyhow::anyhow!(
+                "Unsupported archive type: {:?}",
+                path.extension()
+            ))
+        }
     }
 }
 
 pub fn get_archive_reader_from_stream(
     reader: Box<dyn AsyncSeekableReader>,
     extension: &str,
+    cache_config: CacheConfig,
 ) -> Result<Box<dyn ArchiveReader>> {
     let ext = extension.to_lowercase();
     if ext == "zip" {
-        Ok(Box::new(zip::ZipHandler::new_with_reader(reader)))
+        Ok(Box::new(zip::ZipHandler::new_with_reader(
+            reader,
+            cache_config,
+        )))
     } else if ext == "7z" {
-        Ok(Box::new(sevenz::SevenZHandler::new_with_reader(reader)))
+        Ok(Box::new(sevenz::SevenZHandler::new_with_reader(
+            reader,
+            cache_config,
+        )))
     } else {
         Err(anyhow::anyhow!(
             "Unsupported archive type for streaming: .{}",
             ext
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_suffix_is_found_at_the_end_whatever_the_case_or_the_prefix() {
+        assert_eq!(archive_suffix("Movie.RAR"), Some(".rar"));
+        assert_eq!(archive_suffix("/tmp/archive_x9.7z"), Some(".7z"));
+        assert_eq!(archive_suffix("/dl/show.tar.gz"), Some(".tar.gz"));
+        assert_eq!(archive_suffix("show.tgz"), Some(".tgz"));
+        assert_eq!(archive_suffix("index.nzb"), Some(".nzb"));
+        assert_eq!(archive_suffix("/download?id=1"), None);
+        assert_eq!(archive_suffix("movie.mkv"), None);
+        assert_eq!(archive_suffix("archive.zip.txt"), None);
+    }
+
+    #[test]
+    fn the_first_bytes_name_the_format_a_suffixless_url_did_not() {
+        assert_eq!(
+            archive_suffix_from_magic(b"Rar!\x1a\x07\x01\x00rest"),
+            Some(".rar")
+        );
+        assert_eq!(archive_suffix_from_magic(b"PK\x03\x04rest"), Some(".zip"));
+        assert_eq!(
+            archive_suffix_from_magic(b"7z\xbc\xaf\x27\x1c\x00\x04"),
+            Some(".7z")
+        );
+        assert_eq!(archive_suffix_from_magic(b"\x1f\x8b\x08"), Some(".tar.gz"));
+        let mut tar = vec![0u8; 512];
+        tar[257..262].copy_from_slice(b"ustar");
+        assert_eq!(archive_suffix_from_magic(&tar), Some(".tar"));
+        assert_eq!(archive_suffix_from_magic(b"<html>"), None);
+        assert_eq!(archive_suffix_from_magic(b""), None);
+    }
+
+    /// A scratch file lands under `<cache root>/.archives` with the suffix
+    /// the reader dispatch needs, and goes when dropped.
+    #[test]
+    fn a_scratch_file_is_under_the_cache_root_and_is_deleted_on_drop() {
+        let root = tempfile::tempdir().unwrap();
+        let config = CacheConfig {
+            cache_dir: root.path().to_path_buf(),
+            _cache_size: 0,
+        };
+        let file = scratch_file(&config, ".zip").unwrap();
+        let path = file.path().to_path_buf();
+        assert_eq!(path.parent(), Some(root.path().join(".archives").as_path()));
+        assert_eq!(archive_suffix(&path.to_string_lossy()), Some(".zip"));
+        assert!(path.exists());
+        drop(file);
+        assert!(!path.exists());
     }
 }
