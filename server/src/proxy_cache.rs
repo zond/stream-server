@@ -201,12 +201,15 @@ impl ProxyCache {
     ///   *the response the player is handed*, and not one byte of what the
     ///   origin sends. What is stored here is origin bytes, and both things
     ///   `r=` does to them are done to a hit exactly as to a fetch: the
-    ///   playlist verdict is `routes::proxy::is_a_playlist`, asked by the
-    ///   hit before it answers, and the overrides are
+    ///   playlist verdict is `routes::proxy::is_a_playlist`, asked of
+    ///   **every** hit -- whole or partial -- before it answers and before a
+    ///   fetch is narrowed against it, and the overrides are
     ///   `apply_custom_response_headers`, applied by both. That is what the
-    ///   omission rests on, and it is load-bearing: while a hit answered
-    ///   before the classification, an `r=` that turned the verdict over got
-    ///   the rewrite on a miss and the origin's own body on a hit, which is
+    ///   omission rests on, and it is load-bearing at both ends: while a
+    ///   full hit answered before the classification, an `r=` that turned the
+    ///   verdict over got the rewrite on a miss and the origin's own body on
+    ///   a hit; while a partial hit narrowed before it, the same `r=` got a
+    ///   raw unrewritten tail of a range the player never asked for. Both are
     ///   this key promising something it did not do. (The note is here
     ///   because the design this was built from asserted the opposite. A
     ///   cache of assembled *responses* would have to key on it.)

@@ -828,9 +828,10 @@ impl EntityValidator {
         format!("{}:{}", self.header.as_str(), self.value)
     }
 
-    /// The other direction, for the one caller that has a filed validator
-    /// and no response to read: a full cache hit, labelling the bytes it is
-    /// about to serve. `None` for anything this did not write.
+    /// The other direction, for the callers that have a filed validator and
+    /// no response to read it from: a hit labelling the bytes it is about to
+    /// serve, and the narrowed fetch asking `If-Range` under the validator
+    /// its head is filed by. `None` for anything this did not write.
     fn from_filed(filed: &str) -> Option<Self> {
         let (name, value) = filed.split_once(':')?;
         let header = HeaderName::from_bytes(name.as_bytes()).ok()?;
