@@ -321,12 +321,18 @@ impl RetentionPolicy {
     /// the piece files themselves. Pieces outside this file's range are not
     /// this policy's to touch and are skipped, not reclaimed.
     ///
-    /// A held piece outside the window is reclaimed whatever else is true of
-    /// it; it is *committed* instead only if the previous pass's window
-    /// covered it, because that is what makes it a piece the window released
-    /// rather than one it has never reached (see [`Self::covered`]). So the
-    /// first pass of a stream commits nothing: no window has covered anything
-    /// yet.
+    /// Three things can happen to a held piece of this file, not two. A piece
+    /// already in the committed set is **left alone** -- not reclaimed, and
+    /// not committed a second time -- because nothing here ever takes a
+    /// committed piece back (see [`Decision::committed`]); a caller that reads
+    /// this as two outcomes and reclaims whatever is outside the window
+    /// deletes the pieces it is advertising, which is the advertise-then-
+    /// refuse the whole policy exists to avoid. Any *other* held piece outside
+    /// the window is **committed** if the previous pass's window covered it --
+    /// that is what makes it a piece the window released rather than one it
+    /// has never reached (see [`Self::covered`]) -- and **reclaimed** if not.
+    /// So the first pass of a stream commits nothing: no window has covered
+    /// anything yet.
     ///
     /// Idempotent for a fixed playhead and a fixed `held`: the second call
     /// commits nothing new and reclaims the same pieces, because a reclaim is
