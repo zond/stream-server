@@ -260,7 +260,7 @@ The HTTP surface is deliberately small and split in two by `build_router()` (`se
 | GET | `/network-info`, `/device-info` | TOKEN | stremio-core `StreamingServer` |
 | GET | `/casting` | TOKEN | stremio-core playback devices (always `[]` — no casting). No trailing slash: `/casting/` is an unknown path (`404`) |
 | POST | `/casting/{devID}/player` | TOKEN | stremio-core `play_on_device`; answers `501` because casting is not implemented |
-| GET | `/get-https?authKey=…&ipAddress=…` | TOKEN | stremio-core remote-HTTPS certificate fetch |
+| GET | `/get-https?authKey=…&ipAddress=…` | TOKEN | stremio-core remote-HTTPS certificate fetch: fetches the certificate, writes it to the config dir, starts (or restarts) the HTTPS listener on `ServerConfig::https_addr` with it, and answers with **that listener's** port. `501` when no HTTPS address is configured (`embedded()`, the Android embed) — nothing is written and no network call is made |
 | POST | `/{infoHash}/{fileIdx}/download` | TOKEN | offline downloads — pin the file; optional body `{"trackers":[…]}` (`sources`/`announce` accepted too), answer is a `DownloadInfo`. See [Offline downloads](#offline-downloads) |
 | DELETE | `/{infoHash}/{fileIdx}/download?deleteFiles=1` | TOKEN | offline downloads — drop the pin, and with `deleteFiles` the data too |
 | GET | `/downloads.json` | TOKEN | offline downloads — every pinned file |
@@ -305,6 +305,8 @@ An embedder holds a `ServerHandle` (from `stream_server::start`) and never needs
 | `base_url() -> &str` | `settings.baseUrl` |
 | `settings() -> Result<ServerSettings>` | `GET /settings` → `values` |
 | `update_settings(patch: serde_json::Value) -> Result<ServerSettings>` | `POST /settings` (same keys, validation, engine update and persistence); returns the settings afterwards |
+| `install_https_certificate(cert_pem: &str, key_pem: &str) -> Result<SocketAddr>` | the serving half of `GET /get-https`: write the PEMs to the config dir and start — or restart, so the new certificate is the one presented — the HTTPS listener on `ServerConfig::https_addr`; returns its bound address. Refused when no HTTPS address is configured |
+| `https_addr() -> Option<SocketAddr>` | where the HTTPS listener is bound; `None` until a certificate has been installed (or found on disk at startup), and always when `https_addr` is unset |
 | `engine_stats(info_hash, trackers: &[String]) -> Result<EngineStats>` | `GET /{infoHash}/stats.json?tr=…` — including creating the engine with `trackers` when it is the first request for the hash and answering `resolvingMetadata` at once. `trackers` are normalised inside the shared function exactly like `tr=` (`tracker:` prefix stripped, `dht:` dropped, trimmed), so a stream's `sources` array can be passed as is |
 | `file_stats(info_hash, file_idx: usize, trackers) -> Result<EngineStats>` | `GET /{infoHash}/{fileIdx}/stats.json?tr=…`; the route's `404` is a `FileNotFound` error |
 | `pin_download(info_hash, file_idx: usize, trackers) -> Result<DownloadInfo>` | `POST /{infoHash}/{fileIdx}/download` — pin the file as an offline download (see [Offline downloads](#offline-downloads)); `trackers` are normalised as for `engine_stats` |

@@ -75,6 +75,7 @@ mod archives;
 mod auth;
 mod cache_cleaner;
 mod diagnostics;
+mod https;
 mod lan_media;
 mod proxy_cache;
 mod proxy_streams;
@@ -252,6 +253,41 @@ impl ServerHandle {
     pub fn settings(&self) -> anyhow::Result<ServerSettings> {
         let state = self.state.clone();
         self.block_on_server(async move { state.settings.read().await.clone() })
+    }
+
+    /// Where the HTTPS listener is bound, or `None` while it is not running
+    /// -- which is the case until `/get-https` (or
+    /// [`Self::install_https_certificate`]) has put a certificate on disk,
+    /// and always when [`ServerConfig::https_addr`] is unset. With a
+    /// configured port of `0` this is the port the OS assigned.
+    pub fn https_addr(&self) -> Option<SocketAddr> {
+        let state = self.state.clone();
+        self.block_on_server(async move { state.https.bound_addr().await })
+            .ok()
+            .flatten()
+    }
+
+    /// Serve `cert_pem`/`key_pem` over HTTPS: written to the config dir and
+    /// the HTTPS listener started -- or restarted, so the new certificate is
+    /// the one presented -- on [`ServerConfig::https_addr`]. Returns the
+    /// bound address. This is the second half of `GET /get-https`, which
+    /// fetches the certificate from Stremio's API first; an embedder that
+    /// obtains a certificate some other way installs it here. Refused when
+    /// no HTTPS address is configured.
+    pub fn install_https_certificate(
+        &self,
+        cert_pem: &str,
+        key_pem: &str,
+    ) -> anyhow::Result<SocketAddr> {
+        let state = self.state.clone();
+        let cert_pem = cert_pem.to_string();
+        let key_pem = key_pem.to_string();
+        self.block_on_server(async move {
+            state
+                .https
+                .install_certificate(&state, &cert_pem, &key_pem)
+                .await
+        })?
     }
 
     /// Apply `patch` exactly as `POST /settings` would (same keys, same
@@ -883,6 +919,7 @@ pub async fn run(
     state.http_addr = public_http_addr;
     state.auth_token = cfg.auth.resolve()?.map(Arc::from);
     state.lan_media = Arc::new(lan_media::LanMedia::new(cfg.lan_media_addr));
+    state.https = Arc::new(https::HttpsListener::new(cfg.https_addr, &config_dir));
     match state.auth_token.as_deref() {
         Some(token) => {
             tracing::info!("control API requires `Authorization: Bearer <token>`");
@@ -1007,6 +1044,16 @@ pub async fn run(
     // error and nobody else's; the handle below is for the stop at shutdown.
     let lan_media = state.lan_media.clone();
 
+    // The HTTPS listener comes up at boot only when an earlier `/get-https`
+    // left its certificate on disk; otherwise that route starts it when it
+    // fetches one (see `https`). The same control block serves both, so the
+    // route answers with the port that is actually bound. Before the ready
+    // signal, like the plain listener: a configured address with a
+    // certificate is either serving or has failed the start by the time
+    // `start` hands back a handle.
+    let https_listener = state.https.clone();
+    https_listener.start_if_certificate_present(&state).await?;
+
     tracing::info!("listening on {}", bound_http_addr);
     if cfg.print_startup {
         println!("listening on {}", bound_http_addr);
@@ -1041,39 +1088,6 @@ pub async fn run(
 
         let _ = shutdown_started_tx.send(source);
     };
-
-    let https_cert_path = config_dir.join("https-cert.pem");
-    let https_key_path = config_dir.join("https-key.pem");
-
-    if let Some(https_addr) = cfg.https_addr {
-        if https_cert_path.exists() && https_key_path.exists() {
-            tracing::info!("Found HTTPS certificates, starting HTTPS server on {https_addr}");
-            let https_app = app.clone();
-            let https_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
-                https_cert_path,
-                https_key_path,
-            )
-            .await?;
-
-            background_tasks.push(diagnostics::logging::spawn_logged(
-                "https-server",
-                async move {
-                    if let Err(e) = axum_server::bind_rustls(https_addr, https_config)
-                        .serve(https_app.into_make_service_with_connect_info::<SocketAddr>())
-                        .await
-                    {
-                        tracing::error!("HTTPS server error: {}", e);
-                    }
-                },
-            ));
-        } else {
-            tracing::info!(
-                "No HTTPS certificates found in {:?}, skipping HTTPS server on {:?}",
-                config_dir,
-                https_addr
-            );
-        }
-    }
 
     let server = axum::serve(
         listener,
@@ -1123,6 +1137,7 @@ pub async fn run(
         task.abort();
     }
     lan_media.stop().await;
+    https_listener.stop().await;
 
     Ok(shutdown_source)
 }

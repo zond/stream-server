@@ -1114,6 +1114,21 @@ pub async fn set_settings(
     }
 }
 
+/// stremio-core's remote-HTTPS certificate fetch: get a certificate for
+/// `ipAddress` from Stremio's API with the user's `authKey`, serve it, and
+/// answer with the domain the certificate is for and **the port a TLS
+/// handshake will succeed on** -- the client builds
+/// `https://<domain>:<port>` from nothing else. The serving half is
+/// `crate::https::HttpsListener::install_certificate`, shared with
+/// `ServerHandle::install_https_certificate`; the port in the answer is the
+/// address that call bound, never the plain-HTTP port and never a number
+/// read off the configuration.
+///
+/// Refused with `501` before any network call when the server has no HTTPS
+/// address configured (`ServerConfig::embedded`, and so the Android embed):
+/// there is nothing here the certificate could be served on, and writing
+/// its private key to disk anyway -- what this used to do -- left a key
+/// nothing would ever use.
 pub async fn get_https(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -1126,6 +1141,13 @@ pub async fn get_https(
         Some(key) => key,
         None => return (StatusCode::BAD_REQUEST, "Missing authKey").into_response(),
     };
+    if state.https.configured_addr().is_none() {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "This server has no HTTPS listener configured, so remote HTTPS is not available",
+        )
+            .into_response();
+    }
 
     let client = reqwest::Client::new();
     let api_url = "https://api.strem.io/api/certificateGet";
@@ -1179,22 +1201,30 @@ pub async fn get_https(
         }
     };
 
-    // Save to disk for main.rs HTTPS listener
-    if let (Some(cert), Some(key)) = (
+    let (Some(cert), Some(key)) = (
         cert_data["certificate"].as_str(),
         cert_data["privateKey"].as_str(),
-    ) {
-        let cert_path = state.config_dir.join("https-cert.pem");
-        let key_path = state.config_dir.join("https-key.pem");
-
-        if let Err(e) = tokio::fs::write(&cert_path, cert).await {
-            tracing::error!("Failed to write https-cert.pem: {}", e);
+    ) else {
+        return (
+            StatusCode::NOT_FOUND,
+            "Certificate response carries no certificate and key",
+        )
+            .into_response();
+    };
+    // The answer is only as good as the listener behind it, so a certificate
+    // that will not load or a port that will not bind is this request's
+    // failure, not a line in the log and a port that speaks HTTP.
+    let bound = match state.https.install_certificate(&state, cert, key).await {
+        Ok(bound) => bound,
+        Err(error) => {
+            tracing::error!(error = %format!("{error:#}"), "get_https: could not serve the certificate");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "The certificate was fetched but the HTTPS listener could not be started",
+            )
+                .into_response();
         }
-        if let Err(e) = tokio::fs::write(&key_path, key).await {
-            tracing::error!("Failed to write https-key.pem: {}", e);
-        }
-        tracing::info!("Saved HTTPS certificates to {:?}", state.config_dir);
-    }
+    };
 
     let domain = format!(
         "{}-{}",
@@ -1205,11 +1235,10 @@ pub async fn get_https(
             .replace("*", "")
     );
 
-    // We should save this to disk, but for the API response:
     Json(json!({
         "ipAddress": ip_address,
         "domain": domain,
-        "port": state.http_addr.port()
+        "port": bound.port()
     }))
     .into_response()
 }
