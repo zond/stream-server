@@ -513,7 +513,8 @@ impl ServerHandle {
             }
             anyhow::ensure!(
                 state.settings.read().await.lan_media_enabled,
-                "the lanMediaEnabled setting forbids the LAN media listener;                  set it through POST /settings (or update_settings) first"
+                "the lanMediaEnabled setting forbids the LAN media listener; \
+                 set it through POST /settings (or update_settings) first"
             );
             state.lan_media.start(&state).await.map(Some)
         })?

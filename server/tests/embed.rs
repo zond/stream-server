@@ -2451,7 +2451,12 @@ fn set_lan_media_toggles_the_listener_and_the_setting_can_forbid_it() -> anyhow:
     // Starting again is refused while the setting forbids it (the default).
     assert!(!handle.settings()?.lan_media_enabled);
     let error = handle.set_lan_media(true).unwrap_err().to_string();
-    assert!(error.contains("lanMediaEnabled"), "{error}");
+    assert_eq!(
+        error,
+        "the lanMediaEnabled setting forbids the LAN media listener; \
+         set it through POST /settings (or update_settings) first",
+        "the whole sentence, so a lost line continuation cannot leave a gap in it"
+    );
     assert!(!handle.lan_media_running());
 
     // Permitted, it comes back -- on a fresh OS-assigned port -- and serves
