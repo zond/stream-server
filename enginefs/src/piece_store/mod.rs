@@ -56,10 +56,10 @@
 //!
 //! # Not wired into the session yet, and why
 //!
-//! [`store::PieceStoreFactory`] is not passed to librqbit anywhere. Two things
-//! had to be decided in the rqbit fork before it could be, and both were about
-//! the have-set rather than about storage. One of them is settled at the rev
-//! this crate pins; the other is not.
+//! [`store::PieceStoreFactory`] is not passed to librqbit anywhere. Three
+//! things had to be decided in the rqbit fork before it could be, and all
+//! three are about the have-set rather than about storage. One of them is
+//! settled at the rev this crate pins; two are not.
 //!
 //! **Settled.** `initial_check` walks files in order and, on the first read
 //! error in a file, marks the rest of that file not-have without reading it. A
@@ -72,23 +72,41 @@
 //! fail ([`store::MissingPiece`]) rather than return zeroes, or a hash check
 //! would call a hole a verified piece, and it does.
 //!
-//! **Not settled.** `JsonSessionPersistenceStore::update_db` refuses to
-//! persist a torrent whose storage factory is not `FilesystemStorageFactory`,
-//! and this session runs with persistence on (`LibrqbitBackend::new` hands it
-//! `SessionPersistenceConfig::Json`), so an add with this factory fails
-//! outright. What the refusal is really about is what the record omits: a
-//! `SerializedTorrent` names an output folder and a file selection and no
-//! storage at all, so a restart replays it onto the session's *default*
-//! factory. The fork's answer is a `StorageFactory::ensure_persistable`
-//! promise -- a restart finds this data again, and the have-bitfield will not
-//! outlive it -- which this store can make and the filesystem one already
-//! keeps. That commit exists on the fork's `pinned` branch but has not been
-//! pushed, so there is no rev to move to: bumping the pin to an unpushed
-//! commit would not build anywhere else, and this repo's rev is bumped
-//! deliberately. Until it is, nothing here can be handed to a torrent.
+//! **Not settled: persistence.** `JsonSessionPersistenceStore::update_db`
+//! refuses to persist a torrent whose storage factory is not
+//! `FilesystemStorageFactory`, and this session runs with persistence on
+//! (`LibrqbitBackend::new` hands it `SessionPersistenceConfig::Json`), so an
+//! add with this factory fails outright. What the refusal is really about is
+//! what the record omits: a `SerializedTorrent` names an output folder and a
+//! file selection and no storage at all, so a restart replays it onto the
+//! session's *default* factory. The fork's answer is a
+//! `StorageFactory::ensure_persistable` promise -- a restart finds this data
+//! again, and the have-bitfield will not outlive it -- which this store can
+//! make and the filesystem one already keeps. That commit exists on the fork's
+//! `pinned` branch but has not been pushed, so there is no rev to move to:
+//! bumping the pin to an unpushed commit would not build anywhere else, and
+//! this repo's rev is bumped deliberately. Until it is, nothing here can be
+//! handed to a torrent.
 //!
-//! Both are exercised below rather than assumed: the storage is driven through
-//! a real librqbit session's own initial check.
+//! **Not settled: a have-bit that is not an announcement.** [`policy`] decides
+//! that only the committed set is advertised and that a window piece is held
+//! and readable and *not* announced. That is not expressible through the
+//! fork's API today: `have` implies announced on both paths -- the `have`
+//! broadcast (`should_transmit_have` reaching
+//! `TorrentStateLive::should_advertise_have`) and the handshake bitfield,
+//! which serialises `get_have_pieces()` whole -- and a window piece has to be
+//! `have` for the stream to read it. `drop_pieces` gives *not* have, not
+//! wanted, not advertised, so there is no third state to put a window piece
+//! in. A store wired up without one would announce every window piece and
+//! withdraw it again as the window moved, which is the advertise-then-refuse
+//! the policy exists to avoid -- so this blocks the policy reaching a swarm
+//! even once persistence stops blocking the storage reaching a torrent.
+//! Nothing in this crate can lift it.
+//!
+//! The first two are exercised below rather than assumed: the storage is
+//! driven through a real librqbit session's own initial check. The third
+//! cannot be -- there is no API to observe an announcement separately from a
+//! have-bit, which is the whole of the problem.
 
 pub mod layout;
 pub mod policy;

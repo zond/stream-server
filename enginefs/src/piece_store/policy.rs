@@ -30,12 +30,29 @@
 //!   pieces we already hold -- nothing here ever asks for a byte outside the
 //!   playhead -- and once a piece is in it, it stays.
 //!
-//! **Only what is committed is advertised.** That is the whole of being a good
-//! citizen here: a piece we might reclaim is never announced, so we never
-//! advertise-then-refuse, which is what gets a client choked. A window piece is
-//! held and readable and *not* announced, because the window moves and it will
-//! go. On a small volume that means we honestly seed little; on a roomy one we
-//! seed everything.
+//! **Only what is committed is advertised** -- once an engine can be told
+//! that. That is the whole of being a good citizen here: a piece we might
+//! reclaim is never announced, so we never advertise-then-refuse, which is
+//! what gets a client choked. A window piece would be held and readable and
+//! *not* announced, because the window moves and it will go. On a small volume
+//! that means we honestly seed little; on a roomy one we seed everything.
+//!
+//! **That last part is a decision, not yet a behaviour, and nothing in this
+//! module can make it one.** At the rev this crate pins, `have` implies
+//! announced on both paths out of librqbit -- the `have` broadcast
+//! (`should_transmit_have` reaching `TorrentStateLive::should_advertise_have`)
+//! and the handshake bitfield, which serialises `get_have_pieces()` whole --
+//! and a window piece has to be `have` for the stream to read it.
+//! `drop_pieces` gives *not* have, not wanted, not advertised; there is no
+//! have-readable-unannounced third state to put a window piece in. So
+//! [`RetentionPolicy::advertised`] is what a peer *should* be shown and not
+//! what one is shown: wiring this policy to a torrent today would announce
+//! every window piece and withdraw it again a few seconds later, which is
+//! precisely the advertise-then-refuse the rule exists to avoid. The third
+//! state is a fork change, it is one of the two things [`super`] is waiting
+//! on, and until it lands nothing here is wired up -- so the policy decides
+//! the honest thing rather than a weaker thing a wiring commit would have to
+//! undo.
 //!
 //! # Two choices worth stating, because they look arbitrary
 //!
@@ -255,6 +272,10 @@ impl RetentionPolicy {
     }
 
     /// The committed set: what may be advertised, and nothing else may.
+    ///
+    /// *May be*, not *is*. Nothing reads this yet, and the engine has no way
+    /// to be told it -- `have` implies announced at the rev we pin, so a
+    /// window piece is announced by being readable. See the module docs.
     pub fn advertised(&self) -> &BTreeSet<u32> {
         &self.committed
     }
