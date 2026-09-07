@@ -792,12 +792,15 @@ pub async fn run(
         ..routes::system::ServerSettings::default()
     };
 
-    let settings = AppState::load_settings(&config_dir, &default_settings);
+    // One `SettingsFile` for the process: the tracker refresher writes
+    // through it from here on, and `AppState` takes the same one below, so
+    // the two never race for the file (see `state::SettingsFile`).
+    let settings_file = Arc::new(state::SettingsFile::new(config_dir.join("settings.json")));
+    let settings = settings_file.load(&default_settings);
     let settings_arc = Arc::new(tokio::sync::RwLock::new(settings.clone()));
-    let settings_path = config_dir.join("settings.json");
     let tracker_storage = Arc::new(state::TrackerStorageBridge::new(
         settings_arc.clone(),
-        settings_path.clone(),
+        settings_file.clone(),
     ));
 
     let backend_config = enginefs::backend::BackendConfig {
@@ -875,6 +878,7 @@ pub async fn run(
         config_dir.clone(),
         log_dir.clone(),
     );
+    state.settings_file = settings_file;
     state.base_url = base_url.clone();
     state.http_addr = public_http_addr;
     state.auth_token = cfg.auth.resolve()?.map(Arc::from);
