@@ -664,9 +664,12 @@ impl Cached {
                     Err(error) => return Some((Err(error), last + 1)),
                 };
                 let to = last.min(start + want - 1);
-                let served = Bytes::copy_from_slice(
-                    &bytes[(offset - start) as usize..=(to - start) as usize],
-                );
+                // The read's own allocation is the body's: `slice` shares
+                // it, where copying the wanted span out was a second 256 KiB
+                // allocation and memcpy per chunk served, and twice the
+                // chunk in flight at once.
+                let served =
+                    Bytes::from(bytes).slice((offset - start) as usize..=(to - start) as usize);
                 Some((Ok(served), to + 1))
             }
         })
@@ -709,6 +712,14 @@ impl Filler {
                 }
                 self.collecting = Some(index);
                 self.buffer.clear();
+                // The whole chunk's room, once. The finished buffer is handed
+                // to the write task below rather than copied, which leaves
+                // this one with no capacity at all, and a body arrives in
+                // pieces of 8 or 16 KiB -- so without this the buffer grew
+                // from the first piece's size by doubling, several
+                // reallocations and about one extra copy of the chunk per
+                // chunk written.
+                self.buffer.reserve_exact(want as usize);
             }
             if self.collecting == Some(index) {
                 self.buffer.extend_from_slice(&bytes[..take]);
@@ -1354,6 +1365,54 @@ mod tests {
         assert!(!chunk_path(&dir, 0).exists(), "its first bytes never came");
         assert!(chunk_path(&dir, 1).is_file());
         assert!(!chunk_path(&dir, 2).exists(), "the body ran out first");
+    }
+
+    /// A chunk is collected into one allocation of its own size, however
+    /// small the pieces it arrives in: the buffer is handed to the write
+    /// task whole, so the next chunk starts from nothing, and left to grow by
+    /// doubling from an 8 KiB piece it reallocated -- and copied -- its way
+    /// to 256 KiB on every chunk of every stream.
+    #[tokio::test]
+    async fn a_chunk_is_collected_into_one_allocation_of_its_own_size() {
+        const PIECE: usize = 8 * 1024;
+
+        let (_root, cache) = cache();
+        let entry = entry_of(&cache, "https://host/film.mkv");
+        let total = CHUNK_BYTES * 2;
+        let mut filler = entry.fill(total, "video/mp4", VALIDATOR, 0);
+        let piece = vec![5u8; PIECE];
+
+        for chunk in 0..2u64 {
+            filler.take(&piece);
+            let capacity = filler.buffer.capacity();
+            let allocation = filler.buffer.as_ptr();
+            assert_eq!(
+                capacity as u64, CHUNK_BYTES,
+                "chunk {chunk}: the first piece reserves the whole chunk"
+            );
+            for _ in 1..(CHUNK_BYTES as usize / PIECE) - 1 {
+                filler.take(&piece);
+                assert_eq!(
+                    filler.buffer.capacity(),
+                    capacity,
+                    "chunk {chunk}: no regrowth"
+                );
+                assert_eq!(
+                    filler.buffer.as_ptr(),
+                    allocation,
+                    "chunk {chunk}: and so no move of what was collected"
+                );
+            }
+            // The last piece completes the chunk, which goes to the writer;
+            // the next chunk starts with an empty buffer and reserves again.
+            filler.take(&piece);
+            assert_eq!(filler.collecting, None);
+            assert_eq!(
+                filler.buffer.capacity(),
+                0,
+                "the allocation went with the chunk"
+            );
+        }
     }
 
     /// The sweep's whole job: a chunk that was being written when the
