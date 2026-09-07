@@ -719,6 +719,14 @@ impl CacheUsage {
     /// folds the same way and for the same reasons -- `limit_bytes`
     /// especially: an uncapped volume leaves the run as a whole uncapped,
     /// because its occupancy is in `total_bytes` and nothing bounds it.
+    ///
+    /// Note what that costs, and why it costs nothing here: summed
+    /// `total_bytes` against summed `limit_bytes` cannot say whether a
+    /// *volume* is over, because a roomy one's slack pays off a full one's
+    /// shortfall. Usage asks no such question -- it reports numbers and
+    /// leaves the reading to the client. Anything added here that does ask it
+    /// needs a per-volume figure carried through the fold, the way
+    /// [`EvictionReport::over_limit`] is.
     fn combined_with(self, other: Self) -> Self {
         Self {
             total_bytes: self.total_bytes.saturating_add(other.total_bytes),
@@ -827,6 +835,20 @@ pub struct EvictionReport {
     /// the sentinel it silenced [`Self::shortfall_message`] on the one
     /// device that needed it and told a client the cache was unlimited.
     pub limit: Option<u64>,
+    /// How far over its cap this run ended, and the only thing
+    /// [`Self::shortfall_message`] reads: `total - limit` for one volume's
+    /// run, and the *sum* of that across the volumes that are over once runs
+    /// are folded together.
+    ///
+    /// Kept rather than derived from `total` and `limit`, because after the
+    /// fold neither of those describes any volume any more. Their sums say
+    /// what the device holds and what it was allowed in total, which is what
+    /// a client shows; they cannot say whether some volume is stuck, and
+    /// deriving the answer from them let a system disk's slack pay off a
+    /// download drive that was full -- one report saying the pass had got
+    /// under the limit while the drive it could not write to was over its own
+    /// by exactly as much as before.
+    pub over_limit: u64,
 }
 
 impl EvictionReport {
@@ -835,10 +857,14 @@ impl EvictionReport {
     ///
     /// Sizes add. The limits add only while every volume has one: an uncapped
     /// volume's occupancy is in `total` with nothing bounding it, so an
-    /// aggregate cap would be a number the run never enforced, and
-    /// [`Self::shortfall_message`] would warn about a shortfall no volume has.
-    /// The shortfall a volume really has is warned about by the run that found
-    /// it, where the numbers are still one volume's own.
+    /// aggregate cap would be a number the run never enforced.
+    ///
+    /// Shortfalls add too, and separately -- that is what `over_limit` is
+    /// for. Summed `total` against summed `limit` is not the question "is any
+    /// volume still stuck?": a system disk with room to spare subsidises a
+    /// download drive that is full, and the fold answers that the pass got
+    /// under the limit while the drive nothing can write to is over its own
+    /// cap by exactly as much as it was.
     fn combined_with(self, other: Self) -> Self {
         Self {
             total: self.total.saturating_add(other.total),
@@ -850,6 +876,7 @@ impl EvictionReport {
                 .limit
                 .zip(other.limit)
                 .map(|(a, b)| a.saturating_add(b)),
+            over_limit: self.over_limit.saturating_add(other.over_limit),
         }
     }
 
@@ -876,17 +903,22 @@ impl EvictionReport {
     /// that the rest of the cache belongs to a live or pinned torrent.
     /// Since the downloads dir is walked too, that now includes an offline
     /// download the user has not unpinned.
-    /// `None` when the run got under the limit (or had none).
+    /// `None` when every volume the run covered got under its limit (or had
+    /// none).
+    ///
+    /// It reads [`Self::over_limit`] and not `total` against `limit`, so that
+    /// one volume being stuck survives being folded together with volumes
+    /// that are fine -- the numbers it reports are how far over the pass
+    /// ended and what it could not touch, both of which add up honestly.
     pub fn shortfall_message(&self) -> Option<String> {
-        let limit = self.limit?;
-        if self.total <= limit {
+        if self.over_limit == 0 {
             return None;
         }
         Some(format!(
-            "Cache size {} still exceeds limit {} after freeing {} bytes from {} files: \
+            "Cache is {} bytes over its limit after freeing {} bytes from {} files: \
              {} bytes in {} files are protected (a live torrent is writing them, or a pinned \
              download keeps them) and cannot be evicted",
-            self.total, limit, self.freed, self.deleted, self.protected, self.protected_files,
+            self.over_limit, self.freed, self.deleted, self.protected, self.protected_files,
         ))
     }
 }
@@ -1089,6 +1121,7 @@ async fn evict(
         freed: freed_space + aged_out_bytes,
         deleted: deleted_count + aged_out_files,
         limit,
+        over_limit: limit.map_or(0, |limit| total_size.saturating_sub(limit)),
     };
     if let Some(message) = report.shortfall_message() {
         warn!("{message}");
@@ -2091,10 +2124,12 @@ mod tests {
         assert_eq!(report.protected_files, 2);
         assert_eq!(report.total, protected_bytes);
 
+        assert_eq!(report.over_limit, protected_bytes - limit);
         let message = report.shortfall_message().expect("still over the limit");
         assert!(
             message.contains(&format!(
-                "Cache size {protected_bytes} still exceeds limit {limit}"
+                "Cache is {} bytes over its limit",
+                protected_bytes - limit
             )),
             "{message}"
         );
@@ -2139,6 +2174,7 @@ mod tests {
         let over = EvictionReport {
             total: 30,
             limit: Some(20),
+            over_limit: 10,
             protected: 25,
             protected_files: 3,
             freed: 5,
@@ -2155,6 +2191,7 @@ mod tests {
             protected: 4096,
             protected_files: 1,
             limit: Some(0),
+            over_limit: 4096,
             ..EvictionReport::default()
         };
         assert!(
@@ -2207,6 +2244,47 @@ mod tests {
         assert!(recovery.has_new_work(&only_b));
     }
 
+    /// A run is one report to the client, but a shortfall is one volume's.
+    ///
+    /// Folding summed `total` against summed `limit`, so a system disk with
+    /// room to spare could pay off a download drive that is full: the client
+    /// asked whether cleaning had got the device under its limit, was told
+    /// yes, and the drive it could not write to was over its own cap by
+    /// exactly as much as before.
+    #[test]
+    fn one_volumes_shortfall_survives_another_volumes_slack() {
+        let full = EvictionReport {
+            total: 100,
+            protected: 100,
+            protected_files: 1,
+            freed: 0,
+            deleted: 0,
+            limit: Some(50),
+            over_limit: 50,
+        };
+        let roomy = EvictionReport {
+            total: 10,
+            limit: Some(1000),
+            ..EvictionReport::default()
+        };
+        assert!(
+            full.shortfall_message().is_some(),
+            "the volume that is over says so on its own"
+        );
+        assert_eq!(roomy.shortfall_message(), None);
+
+        let combined = full.clone().combined_with(roomy.clone());
+        assert!(
+            combined.shortfall_message().is_some(),
+            "and the pass as a whole still says it: {combined:?}"
+        );
+        assert_eq!(
+            roomy.clone().combined_with(roomy).shortfall_message(),
+            None,
+            "two volumes with room are still a pass with nothing to report"
+        );
+    }
+
     /// The shape the two sentinels cross the wire in. `POST /cache/clean`,
     /// `ServerHandle::clean_cache_now` and the FFI call behind the app's
     /// storage screen all read this JSON, and the app distinguishes "no cap"
@@ -2225,6 +2303,16 @@ mod tests {
         assert_eq!(json(None), serde_json::Value::Null, "no cap at all");
         assert_eq!(json(Some(0)), serde_json::json!(0), "a cap of nothing");
         assert_eq!(json(Some(1024)), serde_json::json!(1024));
+
+        // And the shortfall beside it, camelCase like the rest: it is what a
+        // client has to read to know some volume is stuck, since after a fold
+        // `total` against `limit` cannot tell it.
+        let over = serde_json::to_value(EvictionReport {
+            over_limit: 4096,
+            ..EvictionReport::default()
+        })
+        .unwrap();
+        assert_eq!(over["overLimit"], serde_json::json!(4096));
 
         // And back, since the same type is what a library embedder reads.
         for limit in [None, Some(0), Some(1024)] {
@@ -2509,6 +2597,7 @@ mod tests {
             protected: 4096,
             protected_files: 1,
             limit: Some(1024),
+            over_limit: 3072,
             ..EvictionReport::default()
         };
         assert!(!freed_nothing.made_room());
