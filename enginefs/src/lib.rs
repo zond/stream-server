@@ -1779,10 +1779,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// The snapshot is the definition -- which of the fields mean "somebody
     /// is watching" is decided there and tested there -- but building one
     /// to read three of its fields costs six lock acquisitions and four
-    /// cloned collections, with the `engines` read queued behind any add or
-    /// remove. This is the same three questions asked directly: the
-    /// per-engine reader counts, the stream-response counts and the
-    /// unexpired leases, each behind its own read lock and nothing cloned.
+    /// cloned collections. This is the same three questions asked directly:
+    /// the per-engine reader counts, the stream-response counts and the
+    /// unexpired leases, three read locks (the `engines` one included, so
+    /// this too queues behind an add or remove -- the saving is the other
+    /// three locks and the clones, not that wait) and nothing cloned.
     /// Short-circuits, so a server with a reader open answers from the
     /// first. A client polls this every second or two through the activity
     /// light, which is what makes the difference worth two definitions;

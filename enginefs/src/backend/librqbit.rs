@@ -1693,8 +1693,12 @@ impl TorrentHandle for LibrqbitHandle {
             .and_then(|m| m.info.name().map(|n| n.to_string()))
     }
 
-    /// Two atomics off the live state; zero in every other state, because
-    /// that is where librqbit keeps them (`TorrentStateLive::stats`). Not
+    /// Two counters off the live state, read through librqbit's
+    /// `stats_snapshot()` -- which loads its handful of torrent-level
+    /// atomics and the aggregate peer counters, because
+    /// `TorrentStateLive::stats` is private at the pinned rev; cheap and
+    /// side-effect free, but a snapshot, not two loads. Zero in every other
+    /// state, because the live state is where librqbit keeps them. Not
     /// `progress_bytes`: while a torrent initializes that mirrors the hash
     /// check's `checked_bytes`, which is disk read back, not a peer.
     fn transfer_totals(&self) -> TransferTotals {

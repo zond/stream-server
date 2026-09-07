@@ -22,8 +22,16 @@
 //! counts per torrent for exactly this purpose -- bytes received from peers
 //! and bytes sent to them, [`crate::backend::TransferTotals`] -- summed over
 //! the torrents that exist and compared against an earlier reading of the
-//! same sum. That is what `/stats.json` reports too, so the light and the
-//! stats can never say two different things about one torrent.
+//! same sum. Note that this is *not* what `/stats.json` reports: its
+//! `downloaded` is librqbit's `progress_bytes`, the have-bytes, which the
+//! initial check drives from 0 to the payload's length without a peer
+//! being asked for anything, and the peer-received counter the light reads
+//! (`fetched_bytes`) is exposed nowhere else. So on a restart with saved
+//! torrents the stats show `downloaded` growing while the light stays
+//! dark, and that disagreement is the point: one describes the disk, the
+//! other the connection. What the two do share is the set of torrents they
+//! sum over -- the same merge, so a torrent cannot be in one and not the
+//! other.
 //!
 //! The counters are the live state's, so a torrent that pauses or is removed
 //! takes its bytes out of the sum; a sum that dropped reads as "not grown",
@@ -35,11 +43,12 @@
 //!
 //! [`TrafficWindow`] is arithmetic over two readings and a flag: it knows
 //! nothing about engines, and it is fed by whoever can see all of them. The
-//! server holds two engine instances, so the sum and the conjunction with
-//! "nothing playing" are taken there, in one place, and handed over as one
-//! [`BackgroundTraffic`] -- never as two signals for a client to combine,
-//! because two signals crossing an FFI boundary are sampled a moment apart
-//! and a light driven by the pair flickers on every disagreement.
+//! server's state has two engine fields (one instance behind both in
+//! production), so the sum and the conjunction with "nothing playing" are
+//! taken there, in one place, and handed over as one [`BackgroundTraffic`]
+//! -- never as two signals for a client to combine, because two signals
+//! crossing an FFI boundary are sampled a moment apart and a light driven
+//! by the pair flickers on every disagreement.
 
 use std::time::Duration;
 
@@ -120,8 +129,8 @@ pub struct BackgroundTraffic {
 ///
 /// It carries its own epoch (a `tokio::time::Instant`, so it follows a paused
 /// test clock) rather than borrowing an engine's: the server that owns one
-/// of these has two engines with two clocks, and the window has to be judged
-/// against one.
+/// of these has two engine fields, each with a clock of its own, and the
+/// window has to be judged against one clock whatever those fields hold.
 #[derive(Debug)]
 pub struct TrafficWindow {
     epoch: tokio::time::Instant,

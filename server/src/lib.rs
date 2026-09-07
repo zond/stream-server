@@ -319,8 +319,8 @@ impl ServerHandle {
     /// Two halves and their disjunction, not two signals: `downloading` and
     /// `uploading` are each "that direction's peer counters grew over the
     /// last window and nothing was playing over it", `active` is either.
-    /// The conjunction with playback is taken in `routes::system` over both
-    /// engines on purpose -- an embedder reading traffic and playback
+    /// The conjunction with playback is taken in `routes::system` over the
+    /// engine fields on purpose -- an embedder reading traffic and playback
     /// separately would sample them a moment apart and get a light that
     /// flickers whenever they disagree.
     ///
@@ -328,9 +328,10 @@ impl ServerHandle {
     /// is the embedding client rather than anything speaking HTTP, and
     /// `enginefs::traffic::BackgroundTraffic` is `serde`-serializable like
     /// every other type crossing this boundary. Cheap enough to poll every
-    /// second or two -- two atomics per torrent that exists and the three
-    /// live playback fields, nothing built, no idle clock touched -- and it
-    /// creates nothing: no engine, no magnet add. The verdict changes when
+    /// second or two -- per torrent that exists, one read of librqbit's live
+    /// stats snapshot (a handful of counters) and the three live playback
+    /// fields, nothing built, no idle clock touched -- and it creates
+    /// nothing: no engine, no magnet add. The verdict changes when
     /// a window closes (`enginefs::traffic::TRAFFIC_WINDOW`) or the moment
     /// playback is seen, whichever comes first; asking faster than the
     /// window is otherwise answered from the standing reading.
