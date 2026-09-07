@@ -667,13 +667,31 @@ pub enum StartupPhase {
 /// fattest background process first. The session keeps every torrent
 /// running -- **seeding goes on**, downloads in progress go on -- but with
 /// [`LEAN_PEER_LIMIT`] peers per torrent instead of the configured limit,
-/// and with its peer table pruned of the addresses it was keeping only to
-/// remember not to dial them again. Nothing is paused, nothing on disk is
-/// touched, and a stream request that arrives while lean is served like
-/// any other, just from fewer peers.
+/// and with its peer table pruned of every `Dead` and `NotNeeded` entry.
+/// Nothing is paused, nothing on disk is touched, and a stream request
+/// that arrives while lean is served like any other, just from fewer
+/// peers.
 ///
-/// [`Footprint::Full`] restores the configured limit; the peers the lean
-/// cap parked are the first re-dialled.
+/// **What the pruning costs.** Only the `NotNeeded` half is free: those
+/// are peers we hung up on because there was nothing to exchange, and the
+/// table was keeping them to remember not to dial them again. A `Dead`
+/// entry is the opposite -- a peer that died and is waiting out a backoff
+/// *to be re-dialled* -- and forgetting one cancels that: the pending
+/// reconnect finds no entry and does nothing, so the peer comes back only
+/// when a tracker, the DHT or PEX names it again, or when it dials us.
+/// Both halves go anyway, because the table is what lean is shrinking (a
+/// real one held 4224 addresses after a single download, each with its
+/// counters and backoff state) and a reconnect is the last thing a
+/// backgrounded app wants to keep on a timer. The fork offers no
+/// state-filtered variant, and asking for one would trade the larger half
+/// of the saving for reconnects we are trying not to make.
+///
+/// [`Footprint::Full`] restores the configured limit and re-queues the
+/// peers the lean cap parked -- onto the **tail of the same FIFO queue**
+/// that every tracker, DHT and PEX address goes onto, so they are not
+/// jumped to the front: with a backlog waiting they are dialled after it.
+/// It also re-queues every *other* `NotNeeded` outgoing peer, not only the
+/// ones the cap parked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Footprint {

@@ -534,15 +534,25 @@ impl ServerHandle {
     /// running -- it goes on seeding, and a pinned download goes on
     /// downloading -- but with [`enginefs::backend::LEAN_PEER_LIMIT`] peers
     /// instead of the configured limit, the surplus hung up least useful
-    /// first, and its peer table pruned of the addresses kept only to
-    /// avoid re-dialling them. That is the share of a backgrounded server's
-    /// memory that was measured to be both the largest and the one still
-    /// growing (per-peer buffers, tasks and table entries), and the OS's
-    /// low-memory killer takes the fattest background process first.
-    /// Nothing is paused and nothing on disk is touched, so a stream
-    /// request that arrives while lean is served like any other, from
-    /// fewer peers. `false` restores the configured limit; the parked
-    /// peers are the first re-dialled.
+    /// first, and its peer table pruned of every `Dead` and `NotNeeded`
+    /// entry. That is the share of a backgrounded server's memory that was
+    /// measured to be both the largest and the one still growing (per-peer
+    /// buffers, tasks and table entries), and the OS's low-memory killer
+    /// takes the fattest background process first. Nothing is paused and
+    /// nothing on disk is touched, so a stream request that arrives while
+    /// lean is served like any other, from fewer peers.
+    ///
+    /// The pruning is not free, and only its `NotNeeded` half is cheap:
+    /// those peers were hung up on and the table kept them to remember not
+    /// to dial them again, while a `Dead` entry is a peer waiting out a
+    /// backoff *to be re-dialled*, and forgetting one cancels that
+    /// reconnect -- it returns when a source names it again or it dials us.
+    /// See [`enginefs::backend::Footprint`] for why both go.
+    ///
+    /// `false` restores the configured limit and re-queues the parked
+    /// peers, onto the tail of the same queue every discovered address
+    /// joins: they come back, but behind whatever backlog is already
+    /// waiting, not first.
     ///
     /// Call it from the app's lifecycle hooks (hidden/paused → `true`,
     /// resumed → `false`). Idempotent, cheap, synchronous (no runtime
