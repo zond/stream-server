@@ -7,6 +7,7 @@ use crate::backend::{
 };
 use crate::scrape::SwarmScraper;
 use anyhow::{Context, Result};
+use librqbit::storage::StorageFactoryExt;
 use librqbit::{ManagedTorrent, ManagedTorrentState, Session};
 use parking_lot::Mutex;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -409,6 +410,10 @@ pub struct LibrqbitBackend {
     /// Backend-wide tracker-scrape cache, shared by every handle so one
     /// torrent is scraped once however many handles report on it.
     swarm_scraper: Arc<SwarmScraper>,
+    /// The bytes every torrent's storage has moved, counted by the wrapper
+    /// this session's default storage factory is -- see
+    /// [`LibrqbitBackend::storage_traffic`].
+    storage_traffic: Arc<crate::traffic::StorageTraffic>,
 }
 
 impl LibrqbitBackend {
@@ -441,6 +446,7 @@ impl LibrqbitBackend {
         let bootstrap_addrs =
             effective_dht_bootstrap_addrs(&dht_bootstrap_nodes, &bootstrap_resolvers).await;
         let upnp_forwarding = listen_port.wants_upnp_forwarding();
+        let storage_traffic = crate::traffic::StorageTraffic::new();
         let session = {
             let mut last_err = None;
             let mut session = None;
@@ -491,6 +497,21 @@ impl LibrqbitBackend {
                         }),
                         ..Default::default()
                     }),
+                    // librqbit's own filesystem storage, with the byte
+                    // counters wrapped around it (see `crate::traffic`).
+                    // The *default* factory rather than a per-add one, on
+                    // purpose: what a torrent comes back on after a restart
+                    // is the session default, so this is the only place a
+                    // wrapper covers every torrent -- the restored ones
+                    // included -- and it is where the piece store will have
+                    // to go for the same reason.
+                    default_storage_factory: Some(
+                        crate::traffic::CountingStorageFactory::new(
+                            librqbit::storage::filesystem::FilesystemStorageFactory::default(),
+                            storage_traffic.clone(),
+                        )
+                        .boxed(),
+                    ),
                     ..Default::default()
                 };
                 match Session::new_with_opts(download_dir.clone(), session_opts).await {
@@ -592,6 +613,7 @@ impl LibrqbitBackend {
                 reported_errors,
                 stream_positions,
                 swarm_scraper,
+                storage_traffic,
             },
             restored_handles,
         ))
@@ -603,12 +625,22 @@ impl LibrqbitBackend {
     #[cfg(test)]
     pub async fn new_for_tests(download_dir: PathBuf) -> Result<Self> {
         tokio::fs::create_dir_all(&download_dir).await?;
+        let storage_traffic = crate::traffic::StorageTraffic::new();
         let session_opts = librqbit::SessionOptions {
             // dht: None disables DHT and its persistence together; listen: None
             // never binds a port; persistence: None keeps the session hermetic.
             dht: None,
             listen: None,
             persistence: None,
+            // The same metered storage the production session runs, so a
+            // test cannot pass over a wrapper the real session would trip on.
+            default_storage_factory: Some(
+                crate::traffic::CountingStorageFactory::new(
+                    librqbit::storage::filesystem::FilesystemStorageFactory::default(),
+                    storage_traffic.clone(),
+                )
+                .boxed(),
+            ),
             ..Default::default()
         };
         let session = Session::new_with_opts(download_dir.clone(), session_opts).await?;
@@ -621,6 +653,7 @@ impl LibrqbitBackend {
             stream_positions: Default::default(),
             reported_errors: Default::default(),
             swarm_scraper: SwarmScraper::disabled(),
+            storage_traffic,
         })
     }
 }
@@ -1165,6 +1198,18 @@ impl TorrentBackend for LibrqbitBackend {
             nodes_v6,
             ever_bootstrapped: self.dht_ever_bootstrapped.load(Ordering::Relaxed),
         }
+    }
+
+    /// What every torrent's storage has read and written this process. Two
+    /// relaxed atomic loads; the counting itself is in
+    /// [`crate::traffic::CountingStorage`], which this session's default
+    /// storage factory builds around librqbit's filesystem storage.
+    ///
+    /// An add that carries a storage factory of its own is outside it, since
+    /// nothing then goes through the default. Nothing on the production path
+    /// does that.
+    fn storage_traffic(&self) -> Arc<crate::traffic::StorageTraffic> {
+        self.storage_traffic.clone()
     }
 }
 
@@ -2479,6 +2524,34 @@ mod tests {
 
         let (_backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
         assert!(!handle.is_out_of_space().await);
+    }
+
+    /// The session's own storage is the counted one, and it is the *default*
+    /// factory rather than something handed to one add: a torrent restored
+    /// from persistence brings no factory with it, so anything hung off the
+    /// add path would miss every torrent that outlived a restart. librqbit's
+    /// initial check reads back each piece of data that is already on disk,
+    /// through whatever storage the torrent got -- so a session whose default
+    /// lost the counter reads zero here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_sessions_own_storage_counts_the_bytes_it_moves() {
+        use crate::backend::TorrentBackend;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let payload = dir.join("payload.bin");
+        let len = 96 * 1024;
+        write_payload(&payload, len).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+
+        let (backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
+        handle.handle.wait_until_initialized().await.unwrap();
+
+        assert!(
+            backend.storage_traffic().bytes_read() >= len as u64,
+            "the initial check read {len} bytes of already-present data through the \
+             storage and the counter saw {}",
+            backend.storage_traffic().bytes_read()
+        );
     }
 
     /// `stats().sources` must list the trackers the torrent was added with:
