@@ -49,9 +49,9 @@
 //! what one is shown: wiring this policy to a torrent today would announce
 //! every window piece and withdraw it again a few seconds later, which is
 //! precisely the advertise-then-refuse the rule exists to avoid. The third
-//! state is a fork change, it is one of the two things [`super`] is waiting
-//! on, and until it lands nothing here is wired up -- so the policy decides
-//! the honest thing rather than a weaker thing a wiring commit would have to
+//! state is a fork change, it is the one thing [`super`] is still waiting on,
+//! and until it lands nothing here is wired up -- so the policy decides the
+//! honest thing rather than a weaker thing a wiring commit would have to
 //! undo.
 //!
 //! # Two choices worth stating, because they look arbitrary
