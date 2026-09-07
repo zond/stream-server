@@ -753,6 +753,99 @@ fn an_origin_that_ignores_if_range_is_still_not_spliced() -> anyhow::Result<()> 
     Ok(())
 }
 
+/// A cache hit and a cache miss are the same request answered the same way.
+///
+/// `r=` is deliberately not in the cache key: it never reaches the origin,
+/// so it cannot vary the bytes stored. What it *can* vary is the verdict on
+/// what those bytes are -- `r=Content-Type:application/x-mpegURL` is what
+/// stremio-core sends for an HLS stream, and it forces the playlist rewrite
+/// over an origin that mislabels. A hit that answered before that
+/// classification was reached served the very body the rewrite exists to
+/// replace, so the same URL played through the proxy on a miss and bypassed
+/// it on a hit -- which is what keeping `r=` out of the key promises does
+/// not happen.
+#[test]
+fn a_cache_hit_is_classified_the_way_a_miss_is() -> anyhow::Result<()> {
+    // A playlist the origin labels `video/mp4`, four whole chunks of it, so
+    // the store keeps it and a request with no `Range` can be answered from
+    // the store entire.
+    let mut playlist = "#EXTM3U\n#EXT-X-VERSION:3\n".to_string();
+    for line in 0..40_000 {
+        playlist.push_str(&format!("#EXTINF:4.0,\nsegment-{line}.ts\n"));
+    }
+    playlist.truncate((CHUNK * 4) as usize);
+    let body = playlist.clone().into_bytes();
+    let origin = Origin::start_with(move |request: &Request, socket: &mut TcpStream| {
+        let _ = socket.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nAccept-Ranges: bytes\r\nContent-Type: video/mp4\r\n\
+                 ETag: \"the-list\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        if request.line.starts_with("GET") {
+            let _ = socket.write_all(&body);
+        }
+        let _ = socket.flush();
+    })?;
+    let fixture = fixture_with(origin)?;
+    let origin = format!("http://{}", fixture.origin.addr);
+    let client = reqwest::blocking::Client::new();
+    let forced = encode("Content-Type:application/x-mpegURL");
+    let proxied = |path: &str, force: bool| {
+        if force {
+            format!(
+                "{}/proxy/d={}&r={forced}{path}",
+                fixture.base,
+                encode(&origin)
+            )
+        } else {
+            format!("{}/proxy/d={}{path}", fixture.base, encode(&origin))
+        }
+    };
+
+    // The miss: never fetched before, so it is classified as it is fetched.
+    let missed = client.get(proxied("/cold.mp4", true)).send()?;
+    fixture.origin.next_request();
+    let missed_status = missed.status();
+    let missed_ranges = header(missed.headers(), "accept-ranges").map(str::to_string);
+    let missed_body = missed.text()?;
+    assert!(
+        missed_body.contains("/proxy/d="),
+        "a forced mpegurl type is what makes this a playlist, and a playlist is rewritten"
+    );
+
+    // The hit: the same origin bytes, filled without `r=` and asked for with
+    // it.
+    let warm = client.get(proxied("/warm.mp4", false)).send()?;
+    assert_eq!(warm.bytes()?.len() as u64, CHUNK * 4);
+    fixture.origin.next_request();
+    wait_for_chunks(&fixture, 4);
+
+    let hit = client.get(proxied("/warm.mp4", true)).send()?;
+    assert_eq!(hit.status(), missed_status);
+    assert_eq!(
+        header(hit.headers(), "accept-ranges").map(str::to_string),
+        missed_ranges,
+        "a rewritten body is not one to range into, however its bytes were found"
+    );
+    let hit_body = hit.text()?;
+    assert!(
+        hit_body.contains("/proxy/d="),
+        "the store holds origin bytes; what is done with them is the same question \
+         on a hit as on a fetch"
+    );
+    assert_eq!(
+        hit_body.replace("/warm.mp4", "/cold.mp4"),
+        missed_body,
+        "and the same answer"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
 /// Two players reading the same stream at different offsets. Neither is in
 /// the other's key -- `p=` is the client's name for its own player and is
 /// never part of what the cache is filed under -- so what one of them fetched

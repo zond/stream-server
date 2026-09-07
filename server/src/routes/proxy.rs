@@ -291,6 +291,75 @@ fn cannot_be_a_playlist(content_type: &str) -> bool {
         .any(|medium| essence.starts_with(medium))
 }
 
+/// Whether the body a response carries is a playlist this route rewrites.
+///
+/// **One function because there are two places the question is asked**, and
+/// they used to answer it differently. A fetch asks it about what just
+/// arrived; a full cache hit asks it about what is on disk, before a byte of
+/// that is served -- and a hit that skipped the question served the very body
+/// the rewrite exists to replace, so one URL played through the proxy on a
+/// miss and bypassed it on a hit. That split is also what made keeping `r=`
+/// out of the cache key wrong, since `r=` is the input that can turn the
+/// verdict over: see [`crate::proxy_cache::ProxyCache::entry`].
+///
+/// Both URLs are asked, because either one alone has a blind spot. The
+/// URL the *caller* named is the one an HLS player knows it asked for,
+/// and it is the only evidence left when a redirect lands on an
+/// extension-less URL an indifferent origin labels
+/// `application/octet-stream` -- testing the fetched path alone stopped
+/// rewriting that stream at all. The URL the body *came from* is the one
+/// that catches the other direction, a caller naming an extension-less
+/// URL that redirects to a `.m3u8`. The reference tests only the
+/// pre-redirect path (its `dest` is the router's, untouched by the
+/// redirect loop) and leans on its content-type arm for the rest.
+///
+/// But a name is only evidence, and the body gets a veto: a URL that
+/// ends `.m3u8` and answers with an MP4 is an MP4. Measured -- a caller
+/// naming `/s/index.m3u8`, the origin redirecting to `/movie.mp4` and
+/// serving 39,998 bytes of `video/mp4` -- the response lost its
+/// `Content-Length`, claimed `Accept-Ranges: none`, dropped
+/// `Content-Range`, `ETag` and `Last-Modified`, turned a `206` into a
+/// `200`, and ran the video through the line rewriter; ffmpeg then
+/// failed on it. **The reference has the same weakness and we are
+/// deliberately not keeping it**: its `path.extname(dest.pathname)` is
+/// the pre-redirect, caller-named path, so nothing there stops a named
+/// `.m3u8` that serves a film. See [`cannot_be_a_playlist`] for what
+/// counts as a veto.
+///
+/// Only the *origin's* type vetoes, because only the origin has seen the
+/// bytes. What a caller forces with `r=Content-Type` may add the
+/// playlist verdict and may never take it away -- which is exactly what
+/// the reference's OR of two arms buys, and what merging `r=` into one
+/// effective type here threw away. Measured: an origin serving
+/// `application/x-mpegURL` and a caller sending
+/// `r=Content-Type:video/mp4` -- a perfectly ordinary thing for an addon
+/// to say about the stream it describes -- had the playlist relayed
+/// verbatim, so the player then fetched every segment straight from the
+/// origin, without the `h=` those segments needed and without the `p=` a
+/// close is addressed by. An empty `r=Content-Type:` did the same, by
+/// shadowing the origin's type with nothing at all. `r=` is an escape
+/// hatch *into* the rewrite; it was acting as an escape hatch out of it.
+///
+/// Which of the two URLs a hit can ask about is the one thing that differs
+/// between the callers, and it is `fetched_url`: there is no fetch on a hit
+/// to have one, so it is `None` there. That cannot change the answer about
+/// anything the store holds. It appears only in the arm that *adds* the
+/// verdict, and a body that ever got the verdict was never stored (see
+/// [`cacheable_entity`]) -- so for stored bytes the arm it feeds was false
+/// when they were filed and is false again now. The caller's own URL is in
+/// the cache key, which makes it the same URL on both paths by construction.
+fn is_a_playlist(
+    url: &Url,
+    fetched_url: Option<&Url>,
+    origin_content_type: &str,
+    forced_content_type: Option<&str>,
+) -> bool {
+    origin_content_type.contains("mpegurl")
+        || forced_content_type.is_some_and(|forced| forced.contains("mpegurl"))
+        || ((names_a_playlist(url) || fetched_url.is_some_and(names_a_playlist))
+            && !cannot_be_a_playlist(origin_content_type))
+}
+
 fn http_client() -> Option<&'static Client> {
     HTTP_CLIENT
         .get_or_init(|| {
@@ -1314,6 +1383,9 @@ async fn proxy(
     // film is thousands, so it goes to the blocking pool rather than onto
     // the reactor.
     let ranged = headers.contains_key(header::RANGE);
+    // Needed before the lookup, not after it: it is an input to the playlist
+    // verdict, and a full hit has to reach that verdict before it answers.
+    let forced_content_type = forced_content_type(&params.response_headers);
     let cache_entry = state.proxy_cache.entry(
         &method,
         &url,
@@ -1344,9 +1416,32 @@ async fn proxy(
     };
 
     // The whole of what was asked for is here. Nothing is fetched, and the
-    // origin never learns this read happened.
+    // origin never learns this read happened -- **unless this request is one
+    // whose body we would replace**, which is the one question that has to be
+    // settled before a hit may answer.
+    //
+    // The store never holds a playlist ([`cacheable_entity`] refuses one),
+    // but whether a stored body *is* one is not decided by the stored bytes
+    // alone: `r=Content-Type:application/x-mpegURL` -- what stremio-core
+    // sends for an HLS stream -- forces the verdict over an origin that
+    // mislabels, and `r=` is deliberately not in the cache key. So the same
+    // URL was rewritten on a miss and relayed raw on a hit, which is the
+    // rewrite failing exactly for the second player of a stream. Asking
+    // [`is_a_playlist`] here, with the same inputs the fetch would give it,
+    // is what makes the key's promise true: the store keeps origin bytes, and
+    // what is done with them is one question with one answer. A hit that
+    // would be a playlist steps aside and the origin is fetched and
+    // rewritten.
     let cached = match cached {
-        Some(cached) if cached.complete() => {
+        Some(cached)
+            if cached.complete()
+                && !is_a_playlist(
+                    &url,
+                    None,
+                    &cached.content_type.to_ascii_lowercase(),
+                    forced_content_type.as_deref(),
+                ) =>
+        {
             tracing::debug!(
                 url = %url,
                 first = cached.first,
@@ -1360,6 +1455,13 @@ async fn proxy(
                 ranged,
                 cached,
             );
+        }
+        Some(cached) if cached.complete() => {
+            tracing::debug!(
+                url = %url,
+                "this request would rewrite the body the cache holds; fetching it instead"
+            );
+            None
         }
         held => held,
     };
@@ -1645,54 +1747,16 @@ async fn proxy(
     let status = response.status();
     let res_headers = response.headers().clone();
 
-    // The caller's forced type and the origin's own, asked separately: see
-    // the three arms below, and [`forced_content_type`] for why merging
-    // them was the bug.
-    let forced_content_type = forced_content_type(&params.response_headers);
+    // The origin's own type, beside the caller's forced one from above:
+    // asked separately, see [`forced_content_type`] for why merging them was
+    // the bug.
     let origin_content_type = origin_content_type(&res_headers);
-    // Both URLs are asked, because either one alone has a blind spot. The
-    // URL the *caller* named is the one an HLS player knows it asked for,
-    // and it is the only evidence left when a redirect lands on an
-    // extension-less URL an indifferent origin labels
-    // `application/octet-stream` -- testing the fetched path alone stopped
-    // rewriting that stream at all. The URL the body *came from* is the one
-    // that catches the other direction, a caller naming an extension-less
-    // URL that redirects to a `.m3u8`. The reference tests only the
-    // pre-redirect path (its `dest` is the router's, untouched by the
-    // redirect loop) and leans on its content-type arm for the rest.
-    //
-    // But a name is only evidence, and the body gets a veto: a URL that
-    // ends `.m3u8` and answers with an MP4 is an MP4. Measured -- a caller
-    // naming `/s/index.m3u8`, the origin redirecting to `/movie.mp4` and
-    // serving 39,998 bytes of `video/mp4` -- the response lost its
-    // `Content-Length`, claimed `Accept-Ranges: none`, dropped
-    // `Content-Range`, `ETag` and `Last-Modified`, turned a `206` into a
-    // `200`, and ran the video through the line rewriter; ffmpeg then
-    // failed on it. **The reference has the same weakness and we are
-    // deliberately not keeping it**: its `path.extname(dest.pathname)` is
-    // the pre-redirect, caller-named path, so nothing there stops a named
-    // `.m3u8` that serves a film. See [`cannot_be_a_playlist`] for what
-    // counts as a veto.
-    //
-    // Only the *origin's* type vetoes, because only the origin has seen the
-    // bytes. What a caller forces with `r=Content-Type` may add the
-    // playlist verdict and may never take it away -- which is exactly what
-    // the reference's OR of two arms buys, and what merging `r=` into one
-    // effective type here threw away. Measured: an origin serving
-    // `application/x-mpegURL` and a caller sending
-    // `r=Content-Type:video/mp4` -- a perfectly ordinary thing for an addon
-    // to say about the stream it describes -- had the playlist relayed
-    // verbatim, so the player then fetched every segment straight from the
-    // origin, without the `h=` those segments needed and without the `p=` a
-    // close is addressed by. An empty `r=Content-Type:` did the same, by
-    // shadowing the origin's type with nothing at all. `r=` is an escape
-    // hatch *into* the rewrite; it was acting as an escape hatch out of it.
-    let is_playlist = origin_content_type.contains("mpegurl")
-        || forced_content_type
-            .as_deref()
-            .is_some_and(|forced| forced.contains("mpegurl"))
-        || ((names_a_playlist(&url) || names_a_playlist(&fetched_url))
-            && !cannot_be_a_playlist(&origin_content_type));
+    let is_playlist = is_a_playlist(
+        &url,
+        Some(&fetched_url),
+        &origin_content_type,
+        forced_content_type.as_deref(),
+    );
 
     // A body under a content coding we cannot decode is a body we must not
     // rewrite: the lines are not text yet. We relay it whole instead --
