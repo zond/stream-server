@@ -275,7 +275,7 @@ async fn stream_nzb_file(
     if let Some(session) = state.nzb_sessions.get(&key) {
         match session.stream_file(&file) {
             Ok(stream) => {
-                let reader_stream = tokio_util::io::ReaderStream::new(stream);
+                let reader_stream = crate::routes::archive::media_body(stream);
                 return Ok(Response::builder()
                     .header(
                         "transferMode.dlna.org",

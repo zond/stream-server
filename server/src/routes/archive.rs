@@ -33,6 +33,22 @@ struct CreateQuery {
     lz: Option<String>,
 }
 
+/// How much a member body asks its reader for per chunk.
+///
+/// `ReaderStream::new` reads 4 KiB at a time, and for an archive member that
+/// is 4 KiB per `spawn_blocking` round trip through the progressive cache's
+/// `tokio::fs::File`, per boxed future, per socket write -- measured at some
+/// fourteen times the CPU per byte of a 256 KiB read on a desktop core, on
+/// what is the streaming hot path of the weakest devices this runs on. The
+/// same figure the torrent stream route reads with (`routes::stream`), and
+/// the same 256 KiB per active stream it costs.
+pub(crate) const MEDIA_BODY_CHUNK_BYTES: usize = 256 * 1024;
+
+/// The response body for a media reader: [`MEDIA_BODY_CHUNK_BYTES`] per read.
+pub(crate) fn media_body<R: tokio::io::AsyncRead>(reader: R) -> ReaderStream<R> {
+    ReaderStream::with_capacity(reader, MEDIA_BODY_CHUNK_BYTES)
+}
+
 #[derive(Debug)]
 struct ArchiveCreateRequest {
     urls: Vec<String>,
@@ -592,8 +608,7 @@ async fn stream_file(
     let limited_reader = reader.take(len);
 
     // Convert to Body stream
-    let stream = ReaderStream::new(limited_reader);
-    let body = Body::from_stream(stream);
+    let body = Body::from_stream(media_body(limited_reader));
 
     // 5. Build Response
     let mime = mime_guess::from_path(file_path_in_archive).first_or_octet_stream();
@@ -614,4 +629,20 @@ async fn stream_file(
     }
 
     Ok(builder.body(body).unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::StreamExt;
+
+    /// A body over a reader that can fill whatever it is handed is read in
+    /// media-sized chunks, not the 4 KiB `ReaderStream::new` would ask for.
+    #[tokio::test]
+    async fn a_member_body_is_read_in_media_sized_chunks() {
+        let data = vec![7u8; 3 * MEDIA_BODY_CHUNK_BYTES + 1];
+        let mut body = media_body(std::io::Cursor::new(data));
+        let first = body.next().await.expect("a chunk").expect("no error");
+        assert_eq!(first.len(), MEDIA_BODY_CHUNK_BYTES);
+    }
 }
