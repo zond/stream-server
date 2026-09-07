@@ -442,6 +442,10 @@ struct CacheRoots {
     /// One entry per volume the walked roots live on. Usually one.
     budgets: Vec<CacheBudget>,
     protected_paths: HashSet<std::path::PathBuf>,
+    /// Files to evict before any other -- what a dead torrent left behind
+    /// (`EvictionClasses::dead`). Ordinary cache in every other respect:
+    /// walked, counted, aged; they only sort to the front of the size rule.
+    evict_first: HashSet<std::path::PathBuf>,
     /// Directories the cleaner was handed and may therefore never delete,
     /// however empty eviction leaves them -- see [`remove_empty_parents`].
     /// Every root *before* [`outermost`] collapsed them, which is the point:
@@ -572,10 +576,16 @@ async fn cache_roots(state: &AppState) -> CacheRoots {
 
     // Everything a live engine writes, at the paths the backend reports (a
     // pinned engine stays live, so its data is protected for as long as
-    // the pin holds).
-    let mut protected_paths: HashSet<_> =
-        state.engine.protected_paths().await.into_iter().collect();
-    protected_paths.extend(state.download_engine.protected_paths().await);
+    // the pin holds) -- and, from the same walk of the engines, what a dead
+    // one left behind, which goes first.
+    let mut classes = state.engine.eviction_classes().await;
+    if !Arc::ptr_eq(&state.engine, &state.download_engine) {
+        let more = state.download_engine.eviction_classes().await;
+        classes.protected.extend(more.protected);
+        classes.dead.extend(more.dead);
+    }
+    let protected_paths: HashSet<_> = classes.protected.into_iter().collect();
+    let evict_first: HashSet<_> = classes.dead.into_iter().collect();
 
     // One budget per volume, each collapsed to its outermost roots. The two
     // engines normally share one directory and the downloads dir is under it,
@@ -600,6 +610,7 @@ async fn cache_roots(state: &AppState) -> CacheRoots {
     CacheRoots {
         budgets,
         protected_paths,
+        evict_first,
         keep_dirs,
         boundaries,
     }
@@ -631,6 +642,7 @@ pub(crate) async fn clean_cache(state: &AppState) -> anyhow::Result<EvictionRepo
             evict(
                 &budget.roots,
                 &roots.protected_paths,
+                &roots.evict_first,
                 &roots.keep_dirs,
                 &roots.boundaries,
                 budget.limit,
@@ -984,7 +996,11 @@ impl EvictionReport {
 /// Walk `download_dirs` and evict what is neither protected nor a session
 /// artefact: first every file older than 30 days, then -- while the rest
 /// exceeds what [`CacheLimit::effective`] allows for the occupancy found --
-/// the least recently modified files.
+/// the files in `evict_first`, and then the least recently modified of the
+/// rest. `evict_first` is what a dead torrent left behind
+/// (`EvictionClasses::dead`): bytes nothing will read or resume into, which
+/// on a full device are what stands between the user and the next stream,
+/// so they go before a film somebody might watch again.
 /// Sizes are occupancy, not apparent length (see [`occupied_bytes`]).
 ///
 /// Every root handed in is walked to the bottom, the downloads dir included
@@ -1000,6 +1016,7 @@ impl EvictionReport {
 async fn evict(
     download_dirs: &[std::path::PathBuf],
     protected_paths: &HashSet<std::path::PathBuf>,
+    evict_first: &HashSet<std::path::PathBuf>,
     keep_dirs: &HashSet<std::path::PathBuf>,
     boundaries: &HashSet<std::path::PathBuf>,
     limit: CacheLimit,
@@ -1017,6 +1034,7 @@ async fn evict(
     let walk = WalkInputs {
         download_dirs: download_dirs.to_vec(),
         protected_paths: protected_paths.clone(),
+        evict_first: evict_first.clone(),
         boundaries: boundaries.clone(),
         max_age: Duration::from_secs(30 * 24 * 60 * 60),
         now: std::time::SystemTime::now(),
@@ -1082,7 +1100,8 @@ async fn evict(
             total_size, limit
         );
 
-        // Oldest first: the walk sorted them.
+        // What a dead torrent left behind first, then oldest first: the
+        // walk sorted them.
         for (path, size, _) in files {
             if total_size <= limit {
                 break;
@@ -1153,6 +1172,9 @@ async fn evict(
 struct WalkInputs {
     download_dirs: Vec<std::path::PathBuf>,
     protected_paths: HashSet<std::path::PathBuf>,
+    /// Sorted to the front of the size rule, whatever their age -- see
+    /// [`evict`].
+    evict_first: HashSet<std::path::PathBuf>,
     boundaries: HashSet<std::path::PathBuf>,
     /// The age rule: a file last modified longer ago than this goes.
     max_age: Duration,
@@ -1162,9 +1184,11 @@ struct WalkInputs {
 /// What the walk found, sorted into what [`evict`] does with it. Sizes are
 /// occupancy ([`occupied_bytes`]).
 struct Walked {
-    /// Evictable by the size rule, oldest modification first, with the
-    /// occupancy and modification time of each. A file whose time could not
-    /// be read sorts oldest -- it is counted, and the first to go.
+    /// Evictable by the size rule, in the order the rule takes them: what a
+    /// dead torrent left behind first, then oldest modification first, with
+    /// the occupancy and modification time of each. A file whose time could
+    /// not be read sorts oldest -- it is counted, and the first of its class
+    /// to go.
     files: Vec<(std::path::PathBuf, u64, std::time::SystemTime)>,
     /// Past the age rule, to be deleted whatever the size rule says.
     aged_out: Vec<(std::path::PathBuf, u64)>,
@@ -1240,8 +1264,11 @@ impl WalkInputs {
                 }
             }
         }
-        // Oldest first, for the size rule.
-        walked.files.sort_by_key(|(_, _, modified)| *modified);
+        // The size rule's order: a dead torrent's files first, then oldest
+        // first. The sort is stable, so equal keys keep the walk's order.
+        walked.files.sort_by_key(|(path, _, modified)| {
+            (!is_path_protected(path, &self.evict_first), *modified)
+        });
         walked
     }
 }
@@ -1438,7 +1465,15 @@ mod tests {
         limit: CacheLimit,
     ) -> anyhow::Result<EvictionReport> {
         let keep: HashSet<PathBuf> = download_dirs.iter().cloned().collect();
-        evict(download_dirs, protected_paths, &keep, &keep, limit).await
+        evict(
+            download_dirs,
+            protected_paths,
+            &HashSet::new(),
+            &keep,
+            &keep,
+            limit,
+        )
+        .await
     }
 
     /// [`scan_usage`] for one budget whose roots are the only ones walked.
@@ -1715,6 +1750,7 @@ mod tests {
         evict(
             std::slice::from_ref(&root),
             &HashSet::new(),
+            &HashSet::new(),
             &keep,
             &HashSet::from([root.clone()]),
             CacheLimit::configured(0),
@@ -1898,6 +1934,7 @@ mod tests {
         evict(
             &budgets[0].roots,
             &HashSet::new(),
+            &HashSet::new(),
             &keep,
             &boundaries,
             CacheLimit::configured(0),
@@ -2042,6 +2079,70 @@ mod tests {
         .await
         .unwrap();
         assert!(pinned.is_file(), "and the size rule");
+    }
+
+    /// What a dead torrent left behind is the first thing the size rule
+    /// takes, however recently it was written: on the television that
+    /// prompted this, two torrents that had died of a storage bug held
+    /// 700 MB the cleaner reported as protected, and every later stream
+    /// failed for the space. Ordinary cache -- a film somebody might watch
+    /// again -- goes only once those are gone.
+    #[tokio::test]
+    async fn a_dead_torrents_files_go_before_anything_else() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("rqbit-downloads");
+        let old_film = root.join("Old").join("film.mkv");
+        write_aged(
+            &old_film,
+            &[0u8; 8192],
+            Duration::from_secs(7 * 24 * 60 * 60),
+        );
+        let dead = root.join("Dead").join("film.mkv");
+        write_aged(&dead, &[0u8; 8192], Duration::from_secs(60));
+        let dead_occupancy = occupancy(&dead);
+        let occupied = occupancy(&old_film) + dead_occupancy;
+        let keep: HashSet<PathBuf> = HashSet::from([root.clone()]);
+
+        // Room for exactly one of the two: by age alone the old film would
+        // go; the dead torrent's file goes instead.
+        let report = evict(
+            std::slice::from_ref(&root),
+            &HashSet::new(),
+            &HashSet::from([dead.clone()]),
+            &keep,
+            &keep,
+            CacheLimit::configured(occupied - dead_occupancy / 2),
+        )
+        .await
+        .unwrap();
+        assert!(!dead.exists(), "the dead torrent's file went first");
+        assert!(old_film.is_file(), "and the older film stayed");
+        assert_eq!(report.deleted, 1);
+        assert_eq!(report.freed, dead_occupancy);
+
+        // Its whole directory qualifies, as protection would: a dead
+        // multi-file torrent is named by its folder.
+        let dead_dir = root.join("DeadShow");
+        let e1 = dead_dir.join("e1.mkv");
+        let e2 = dead_dir.join("e2.mkv");
+        write_aged(&e1, &[0u8; 4096], Duration::from_secs(30));
+        write_aged(&e2, &[0u8; 4096], Duration::from_secs(30));
+        let report = evict(
+            std::slice::from_ref(&root),
+            &HashSet::new(),
+            &HashSet::from([dead_dir.clone()]),
+            &keep,
+            &keep,
+            CacheLimit::configured(occupancy(&old_film) + occupancy(&e1)),
+        )
+        .await
+        .unwrap();
+        assert!(old_film.is_file());
+        assert_eq!(report.deleted, 1, "one episode was enough");
+        assert!(
+            !(e1.exists() && e2.exists()),
+            "and it came from the dead torrent's folder"
+        );
     }
 
     /// librqbit pre-allocates each file it wants at its full length, so the

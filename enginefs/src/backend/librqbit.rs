@@ -2225,6 +2225,15 @@ impl TorrentHandle for LibrqbitHandle {
         })
     }
 
+    /// librqbit's `Error` state, whatever put it there: an ENOSPC write, a
+    /// storage that failed its check, a write past what the platform's
+    /// `off_t` can address. The one lock read `is_out_of_space` does, minus
+    /// the classification.
+    async fn is_in_error_state(&self) -> bool {
+        self.handle
+            .with_state(|state| matches!(state, ManagedTorrentState::Error(_)))
+    }
+
     /// `Session::unpause` -> `ManagedTorrent::start`, whose `Error(_)` arm
     /// rebuilds the storage, re-checks what is on disk and goes live again
     /// (librqbit e314d8b, `torrent_state/mod.rs`). The re-check is what makes
@@ -3609,6 +3618,7 @@ mod tests {
 
         let (_backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
         assert!(!handle.is_out_of_space().await);
+        assert!(!handle.is_in_error_state().await);
     }
 
     /// `stats().sources` must list the trackers the torrent was added with:
@@ -5843,6 +5853,10 @@ mod tests {
             stats = handle.stats().await;
         }
         assert_eq!(stats.phase, StartupPhase::Error, "{:?}", stats.phase);
+        assert!(
+            handle.is_in_error_state().await && !handle.is_out_of_space().await,
+            "a storage failure is the error state, and not the device's fault"
+        );
         let reported = stats.error.expect("the reason reaches the client");
         assert!(!reported.is_empty());
         assert!(

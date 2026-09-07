@@ -672,6 +672,28 @@ pub struct EngineDiagnosticsSnapshot {
     pub memory: BackendMemoryDiagnostics,
 }
 
+/// What the engines tell the cache cleaner about the files they own --
+/// `BackendEngineFS::eviction_classes`.
+///
+/// Every path is one the cleaner may meet on its walk; a path in no class
+/// is ordinary cache, evicted by age. The classes are disjoint by
+/// construction: an engine's files land in exactly one of them.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct EvictionClasses {
+    /// May not be evicted: every live engine's files, the placement folder
+    /// of every dormant pin, both ends of every relocation in flight -- what
+    /// `protected_paths` has always returned.
+    pub protected: Vec<std::path::PathBuf>,
+    /// Should go before anything else: the files of an unpinned torrent the
+    /// backend stopped with an error that is *not* a want of space. Nothing
+    /// will restart it, so nothing will ever read these bytes again, and on
+    /// a full device they are exactly what keeps the next stream from
+    /// starting. Still walked, counted and deleted by the cleaner like any
+    /// other file -- the backend's error state holds no open handle on them
+    /// -- only sorted to the front of the eviction order.
+    pub dead: Vec<std::path::PathBuf>,
+}
+
 pub type EngineFS = BackendEngineFS<LibrqbitBackend>;
 
 impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
@@ -1532,7 +1554,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
 
     /// What the cache cleaner may not evict.
     ///
-    /// Every registry engine's files, at the path the backend reports
+    /// Every registry engine's files -- bar a dead one's, see
+    /// [`Self::eviction_classes`] -- at the path the backend reports
     /// (`TorrentHandle::file_path`, or the output folder joined with the
     /// file's name when the backend knows the folder but not the path),
     /// `<download_dir>/<name>` for a backend that knows neither. A torrent
@@ -1567,20 +1590,47 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// cleaner would walk the tree being written into and the tree being read
     /// out of, with nothing protecting either.
     pub async fn protected_paths(&self) -> Vec<std::path::PathBuf> {
+        self.eviction_classes().await.protected
+    }
+
+    /// [`Self::protected_paths`] together with what the same walk of the
+    /// engines says the cleaner *should* take: see [`EvictionClasses`].
+    ///
+    /// A torrent in the backend's error state for a reason that is not a
+    /// want of space is dead. Nothing restarts it -- the cleaner's recovery
+    /// is for the out-of-space case alone, and the error would only recur
+    /// -- so its files are bytes no one will ever read or resume into, and
+    /// they used to be protected all the same, because protection was "every
+    /// engine in the registry". On the television that prompted this two
+    /// torrents that had died of a storage bug held 700 MB between them,
+    /// the cleaner reported them protected, and every later stream failed
+    /// for the space they held. A *pinned* dead torrent stays protected: the
+    /// user asked for those bytes, and an unpin is how they say otherwise.
+    pub async fn eviction_classes(&self) -> EvictionClasses {
         let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
         let pieces = crate::piece_store::root_in(&self.download_dir);
-        let mut paths = Vec::new();
+        let mut classes = EvictionClasses::default();
         for engine in engines {
-            paths.extend(self.engine_paths(&engine).await);
-        }
-        for pin in self.dormant_pinned_downloads() {
-            paths.push(pieces.join(&pin.info_hash));
-            if let Some(folder) = self.download_folder(&pin.info_hash) {
-                paths.push(folder);
+            let dead = !engine.is_pinned()
+                && engine.handle.is_in_error_state().await
+                && !engine.handle.is_out_of_space().await;
+            let paths = self.engine_paths(&engine).await;
+            if dead {
+                classes.dead.extend(paths);
+            } else {
+                classes.protected.extend(paths);
             }
         }
-        paths.extend(self.relocations.lock().values().flatten().cloned());
-        paths
+        for pin in self.dormant_pinned_downloads() {
+            classes.protected.push(pieces.join(&pin.info_hash));
+            if let Some(folder) = self.download_folder(&pin.info_hash) {
+                classes.protected.push(folder);
+            }
+        }
+        classes
+            .protected
+            .extend(self.relocations.lock().values().flatten().cloned());
+        classes
     }
 
     /// Every path `engine`'s data can be at: its directory in the piece store
@@ -3996,6 +4046,10 @@ mod tests {
         /// Test knob: the backend stopped this torrent because the volume is
         /// full, as librqbit does on an ENOSPC write.
         out_of_space: AtomicBool,
+        /// Test knob: the backend stopped this torrent with an error (of
+        /// any kind -- `out_of_space` says which). A dead torrent is this
+        /// set and `out_of_space` clear.
+        in_error_state: AtomicBool,
         /// What the fake torrent has moved over the connection, reported
         /// through `transfer_totals()`; a test adds to these where peers
         /// would.
@@ -4394,6 +4448,11 @@ mod tests {
 
         async fn is_out_of_space(&self) -> bool {
             self.counters.out_of_space.load(Ordering::SeqCst)
+        }
+
+        async fn is_in_error_state(&self) -> bool {
+            self.counters.in_error_state.load(Ordering::SeqCst)
+                || self.counters.out_of_space.load(Ordering::SeqCst)
         }
 
         async fn restart_after_error(&self) -> Result<()> {
@@ -6371,6 +6430,51 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(counters.restart_after_error.load(Ordering::SeqCst), 1);
+    }
+
+    /// A torrent the backend stopped with an error nothing will retry is
+    /// dead, and its files are the cleaner's to take first -- they used to
+    /// be protected like a live engine's, which on a full television kept
+    /// 700 MB of two dead torrents' bytes from every later stream. One that
+    /// died of a full disk is not dead (the cleaner's recovery restarts it
+    /// once there is room), and a pinned one stays protected however it
+    /// died: an unpin is how the user gives those bytes up.
+    #[tokio::test]
+    async fn a_dead_torrents_files_are_the_cleaners_to_take_first() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        let root = enginefs.download_dir.clone();
+        let pieces = crate::piece_store::root_in(&root).join(TEST_HASH);
+        let files = vec![
+            pieces.clone(),
+            root.join("video-0.mkv"),
+            root.join("video-1.mkv"),
+        ];
+
+        let live = enginefs.eviction_classes().await;
+        assert_eq!(live.protected, files, "a live torrent is protected");
+        assert!(live.dead.is_empty());
+
+        counters.in_error_state.store(true, Ordering::SeqCst);
+        let dead = enginefs.eviction_classes().await;
+        assert!(dead.protected.is_empty(), "a dead one protects nothing");
+        assert_eq!(dead.dead, files, "and its files go first");
+        assert!(
+            enginefs.protected_paths().await.is_empty(),
+            "protected_paths is the same walk"
+        );
+
+        // Out of space is not dead: the recovery restarts that one.
+        counters.out_of_space.store(true, Ordering::SeqCst);
+        let stopped = enginefs.eviction_classes().await;
+        assert_eq!(stopped.protected, files);
+        assert!(stopped.dead.is_empty());
+        counters.out_of_space.store(false, Ordering::SeqCst);
+
+        // Pinned and dead: the pin outranks the death.
+        enginefs.pin_download(TEST_HASH, 1, None).await.unwrap();
+        let pinned = enginefs.eviction_classes().await;
+        assert_eq!(pinned.protected, files);
+        assert!(pinned.dead.is_empty());
     }
 
     /// A dormant pin has no engine, so nothing in the engine walk names it --

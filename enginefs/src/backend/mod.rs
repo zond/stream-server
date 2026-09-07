@@ -247,6 +247,17 @@ pub trait TorrentHandle: Send + Sync + Clone {
     async fn is_out_of_space(&self) -> bool {
         false
     }
+    /// Whether the backend has stopped this torrent with an error of any
+    /// kind -- its error state, where nothing is read or written until
+    /// something restarts it. Together with [`Self::is_out_of_space`] this
+    /// tells a torrent that died of the device (worth reclaiming space for)
+    /// from one that died of itself (a storage bug, an unwritable folder),
+    /// whose files nothing will ever resume into. As cheap as that one: it
+    /// reads state the backend already holds. `false` for a backend with no
+    /// such state.
+    async fn is_in_error_state(&self) -> bool {
+        false
+    }
     /// Put a torrent the backend stopped with an error back to work, after
     /// whatever caused the error has been dealt with. Errs for a backend that
     /// cannot restart one, so a caller never mistakes silence for recovery.
