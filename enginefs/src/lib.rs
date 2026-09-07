@@ -119,6 +119,11 @@ type EngineRegistry<H> = Arc<RwLock<HashMap<String, Arc<Engine<H>>>>>;
 /// [`BackendEngineFS::relocate_engine`].
 type RelocationRegistry = Arc<parking_lot::Mutex<HashMap<String, Vec<std::path::PathBuf>>>>;
 
+/// The guard on one info hash's pin lock, owned rather than borrowed so it
+/// can be handed to a task that outlives the request that took it -- see
+/// [`BackendEngineFS::pin_download`] and [`BackendEngineFS::relocate_engine`].
+type PinGuard = tokio::sync::OwnedMutexGuard<()>;
+
 /// How the backend's half of a relocation ended, for the half that settles
 /// it ([`BackendEngineFS::relocate_engine`]).
 enum Relocated<H> {
@@ -1907,6 +1912,14 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// relocate, fail, and could tear down the engine the first one has
     /// just published. Serialised, the second caller simply sees the torrent
     /// already in place.
+    ///
+    /// The guard is owned, and for the length of a relocation it belongs to
+    /// the move rather than to this call ([`Self::relocate_engine`]). What
+    /// it guards is the window in which the hash has no engine, and the move
+    /// outlives the request that asked for it, so the lock has to outlive it
+    /// too: a caller that goes away leaves the guard with the move, which
+    /// drops it once the successor is published, and one that stays gets it
+    /// back with the result and finishes under it.
     pub async fn pin_download(
         &self,
         info_hash: &str,
@@ -1915,9 +1928,9 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     ) -> Result<Arc<Engine<B::Handle>>, PinDownloadError> {
         let info_hash = info_hash.to_lowercase();
         let lock = self.pin_lock(&info_hash);
-        let guard = lock.lock().await;
+        let mut guard = Some(Arc::clone(&lock).lock_owned().await);
         let result = self
-            .pin_download_locked(&info_hash, file_idx, extra_trackers)
+            .pin_download_locked(&info_hash, file_idx, extra_trackers, &mut guard)
             .await;
         drop(guard);
         self.release_pin_lock(&info_hash, lock);
@@ -1937,7 +1950,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
 
     /// Drop the map's entry for a released [`Self::pin_lock`] when nobody
     /// is waiting for it (`lock` is ours plus the map's -- a waiter holds
-    /// its own clone, which keeps the entry alive).
+    /// its own clone, and so does a guard a relocation is still holding,
+    /// either of which keeps the entry alive).
     fn release_pin_lock(&self, info_hash: &str, lock: Arc<tokio::sync::Mutex<()>>) {
         let mut locks = self.pin_locks.lock();
         if Arc::strong_count(&lock) == 2 {
@@ -1945,12 +1959,15 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
     }
 
-    /// [`Self::pin_download`] with the per-hash lock held.
+    /// [`Self::pin_download`] with the per-hash lock held. `pin_guard` is
+    /// that lock's guard: a relocation takes it for the length of the move
+    /// and returns it here if this call is still around to receive it.
     async fn pin_download_locked(
         &self,
         info_hash: &str,
         file_idx: usize,
         extra_trackers: Option<Vec<String>>,
+        pin_guard: &mut Option<PinGuard>,
     ) -> Result<Arc<Engine<B::Handle>>, PinDownloadError> {
         let folder = self.download_folder(info_hash);
         let placement = TorrentPlacement {
@@ -2018,7 +2035,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     .output_folder()
                     .is_some_and(|current| current != folder) =>
             {
-                self.relocate_engine(engine.clone(), folder, extra_trackers)
+                self.relocate_engine(engine.clone(), folder, extra_trackers, pin_guard)
                     .await
             }
             _ => Ok(engine.clone()),
@@ -2807,6 +2824,13 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// before anything is recorded at all: a caller dropped in the middle of
     /// that has begun nothing.
     ///
+    /// The per-hash pin lock travels with the move for the same reason: the
+    /// caller hands its guard over and takes it back with the result. The
+    /// lock is what keeps an unpin out of the window where the hash has no
+    /// engine, and an unpin that got in would delete the tree being copied
+    /// into as a dormant pin's leftovers -- after which this would publish
+    /// the download again, pinned, protected and without its files.
+    ///
     /// The caller only waits for the result. A caller that goes away
     /// loses its answer and nothing else -- the move finishes, the engine is
     /// published in its new home carrying the pin that asked for it, and the
@@ -2820,6 +2844,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         engine: Arc<Engine<B::Handle>>,
         folder: std::path::PathBuf,
         extra_trackers: Option<Vec<String>>,
+        pin_guard: &mut Option<PinGuard>,
     ) -> Result<Arc<Engine<B::Handle>>, PinDownloadError> {
         let wanted = engine.pinned_files.read().clone();
         let placement = TorrentPlacement {
@@ -2877,6 +2902,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             let adds = self.magnet_adds.clone();
             let relocations = self.relocations.clone();
             let clock = self.clock;
+            let held = pin_guard.take();
             tokio::spawn(async move {
                 let relocated = match moving.await {
                     Ok(relocated) => relocated,
@@ -2932,11 +2958,16 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 // Whoever awaited the entry: the engine is published (or the
                 // hash is free for a fresh add) by now.
                 let _ = settle.send(settled);
-                result
+                // The pin lock goes back to the caller with the result, or
+                // is released here with this task if the caller is gone.
+                (result, held)
             })
         };
         match supervisor.await {
-            Ok(result) => result,
+            Ok((result, held)) => {
+                *pin_guard = held;
+                result
+            }
             Err(join_error) => Err(PinDownloadError::Backend(anyhow::anyhow!(
                 "the relocation supervisor did not finish: {join_error}"
             ))),
@@ -5598,6 +5629,85 @@ mod tests {
         );
     }
 
+    /// A remove-download issued while a move nobody is waiting for is still
+    /// running waits for it, as it waits for a pin the caller is still
+    /// holding.
+    ///
+    /// The per-hash lock is what makes `unpin_download` apply to the pin it
+    /// raced rather than to the hole in the middle of it: for the length of
+    /// a relocation the hash has no engine, so an unpin that gets through
+    /// finds none, reports that nothing was pinned, and deletes
+    /// `<downloadsDir>/<hash>` -- the tree the backend is copying into --
+    /// as a dormant pin's leftovers. The move then publishes its successor
+    /// with the pin carried over, and the download the user just removed is
+    /// live, pinned, protected from the cleaner and missing its files.
+    ///
+    /// Detaching the move opened exactly that: the lock was held by the
+    /// request, and the request was gone. It is held by the move instead.
+    #[tokio::test]
+    async fn an_unpin_waits_for_a_move_the_request_walked_away_from() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        let show = enginefs.download_dir.join("show");
+        *counters.output_folder.lock().unwrap() = Some(show.clone());
+        let downloads = enginefs.download_dir.join("offline");
+        enginefs.set_downloads_dir(Some(downloads.clone()));
+        enginefs.backend.hold_relocate.store(true, Ordering::SeqCst);
+
+        {
+            let mut pin = std::pin::pin!(enginefs.pin_download(TEST_HASH, 0, None));
+            tokio::select! {
+                _ = &mut pin => panic!("the move is held; the pin cannot have finished"),
+                () = until(|| relocation_started(&enginefs)) => {}
+            }
+            // The client hangs up; the backend copies on.
+        }
+
+        let mut unpin = std::pin::pin!(enginefs.unpin_download(TEST_HASH, 0, true));
+        tokio::select! {
+            _ = &mut unpin => {
+                panic!("the unpin ran into the middle of the move instead of waiting for it")
+            }
+            // The map's `Arc` and the move's guard are two; a third means
+            // the unpin has taken the lock too and is parked on it, which
+            // is the interleaving under test.
+            () = until(|| {
+                enginefs
+                    .pin_locks
+                    .lock()
+                    .get(TEST_HASH)
+                    .is_some_and(|lock| Arc::strong_count(lock) >= 3)
+            }) => {}
+        }
+
+        enginefs.backend.relocate_hold.add_permits(1);
+        let outcome = unpin
+            .await
+            .expect("the unpin applies once the move is done");
+        assert!(
+            outcome.unpinned,
+            "it found the pin the move carried into the new engine"
+        );
+        assert!(outcome.deleted_files, "and the data went with it");
+        assert_eq!(
+            enginefs
+                .backend
+                .removed_with_files
+                .lock()
+                .unwrap()
+                .as_slice(),
+            &[TEST_HASH.to_string()],
+            "the torrent left the backend rather than its folder being pulled out from under it"
+        );
+        assert!(
+            enginefs.get_engine(TEST_HASH).await.is_none(),
+            "nothing is left running for a download the user removed"
+        );
+        assert!(
+            enginefs.pinned_downloads().await.is_empty(),
+            "and nothing is left pinned"
+        );
+    }
+
     /// When a relocation fails and the torrent is gone from the backend,
     /// only the registry entry the call started from is dropped -- an
     /// engine someone else published for the hash meanwhile stays -- and
@@ -7335,16 +7445,18 @@ mod tests {
                 .unpinned
         };
         let release = async {
-            // The pin holds the per-hash lock and the map holds the `Arc`;
-            // a third reference means the unpin has taken it too and is
-            // parked on it -- exactly the interleaving under test.
+            // The pin holds the per-hash lock twice over (the `Arc` it
+            // took and the owned guard it can hand to a relocation) and the
+            // map holds it once; a fourth reference means the unpin has
+            // taken it too and is parked on it -- exactly the interleaving
+            // under test.
             assert!(
                 wait_until(TEST_WAIT_BOUND, || {
                     enginefs
                         .pin_locks
                         .lock()
                         .get(TEST_HASH)
-                        .is_some_and(|lock| Arc::strong_count(lock) >= 3)
+                        .is_some_and(|lock| Arc::strong_count(lock) >= 4)
                 })
                 .await,
                 "the unpin queued behind the in-flight pin"
