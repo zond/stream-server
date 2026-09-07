@@ -468,7 +468,7 @@ So there is a **second listener** instead, and it serves media routes only.
 
 | | |
 |---|---|
-| **What it exposes** | An explicit allow-list (`lan_media_routes()` in [`server/src/lib.rs`](server/src/lib.rs)), not `media_router()` itself: `/{infoHash}/{fileIdx}`, `/stream/…`, the archive/NZB media routes and the `/local-addon` stub. `/proxy` and `/ftp` are deliberately excluded — see below |
+| **What it exposes** | An explicit allow-list (`lan_media_routes()` in [`server/src/lib.rs`](server/src/lib.rs)), not `media_router()` itself: exactly what a cast receiver needs, which is the bytes of something this device already has. `/{infoHash}/{fileIdx}` and `/stream/…` over torrents that exist — an unknown hash is a `404` and `tr=` is ignored, where on loopback the same request would create the torrent with the caller's trackers — and the archive/NZB `/{fmt}/stream/…` routes over sessions loopback already created. `/proxy`, `/ftp`, every `/create` and the `/local-addon` stub are deliberately absent — see below |
 | **What it does not** | The control router is **not mounted on it at all**, not even behind the bearer middleware. A control path there is an unknown path: `404`, never the `401` that would confirm the route exists and only a token is missing. There is no token on that listener to guess, leak or brute-force. `/proxy` and `/ftp` are likewise unmounted and answer `404` |
 | **Where it binds** | `ServerConfig::lan_media_addr: Option<SocketAddr>` — `None` by default for **both** `embedded()` and `binary_default()`, so nothing changes unless an embedder asks for it. `Some(0.0.0.0:0)` lets the OS pick the port |
 | **When it runs** | `ServerHandle::set_lan_media(true)` starts it, `set_lan_media(false)` stops it — meant to bracket a cast session, so the LAN surface exists only while something is casting. Nothing is bound at startup, whatever the configuration: a port already in use fails the cast that asked for the listener, never the server |
@@ -546,10 +546,17 @@ out of the piece cache. That is why it is off by default, why it is meant to
 be held open only for the length of a cast session, and why `lanMediaEnabled`
 exists as an operator veto that no embedder call can override.
 
-**`/proxy` and `/ftp` do not travel with it.** Both fetch an arbitrary
-caller-supplied remote URL rather than media bytes from this server — `/proxy`
-over HTTP(S), `/ftp` over HTTP(S) or a spawned `curl` for FTP/FTPS — which
-makes either an open proxy for whoever can reach it.
+**Nothing a stranger could make this device *do* travels with it.** The test
+of a route belonging on the LAN is that it serves bytes the loopback side has
+already arranged and cannot be made to arrange anything. `/proxy` and `/ftp`
+fail it outright: both fetch an arbitrary caller-supplied remote URL rather
+than media bytes from this server — `/proxy` over HTTP(S), `/ftp` over
+HTTP(S) or a spawned `curl` for FTP/FTPS — which makes either an open proxy
+for whoever can reach it. So do the archive and NZB `/create` routes, which
+download an archive from a caller-named URL or open TCP connections to
+caller-named news servers, and the loopback stream route's first request for
+an info hash, which starts a torrent with the caller's trackers on this
+device's disk and connection; the LAN's stream route only looks a hash up.
 That is fine on the loopback listener, where only this host's own
 stremio-core can reach it, but not on a listener the whole LAN can reach, so
 neither is on the LAN allow-list. The consequence is deliberate, not an

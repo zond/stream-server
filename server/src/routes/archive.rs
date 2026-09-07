@@ -40,7 +40,18 @@ struct ArchiveCreateRequest {
     file_must_include: Vec<String>,
 }
 
+/// The whole archive API under one format prefix: [`session_router`] and
+/// [`stream_router`] together, which is what the loopback listener mounts.
 pub fn router() -> Router<AppState> {
+    stream_router().merge(session_router())
+}
+
+/// The session-creating half: `/create` takes an archive by URL (fetched
+/// whole, from wherever the caller names) or by torrent file, opens it and
+/// remembers the choice under a key. Loopback only -- see
+/// `crate::lan_media_routes` for why the LAN listener never mounts this
+/// half.
+pub fn session_router() -> Router<AppState> {
     Router::new()
         .route(
             "/create",
@@ -50,6 +61,13 @@ pub fn router() -> Router<AppState> {
             "/create/{key}",
             get(create_session_with_key).post(create_session_with_key),
         )
+}
+
+/// The byte-serving half: a member read out of a session [`session_router`]
+/// already created. Nothing here fetches, opens or names anything -- an
+/// unknown key is a `404` -- which is what lets the LAN listener mount it.
+pub fn stream_router() -> Router<AppState> {
+    Router::new()
         .route("/stream", get(stream_content_query))
         .route("/stream/{key}", get(stream_redirection))
         .route("/stream/{key}/{*file}", get(stream_content_path))

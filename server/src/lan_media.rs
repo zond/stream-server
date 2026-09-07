@@ -8,12 +8,15 @@
 //! downloads, engine stats and the torrent session.
 //!
 //! So this is a whole second listener rather than a wider bind on the first
-//! one. It serves [`crate::media_router`] alone -- the control routes are not
-//! mounted on it at all, not even behind the bearer middleware, so an
-//! unknown-path `404` is the strongest answer the LAN can get out of them and
-//! there is no token to guess, leak or brute-force. Both listeners share one
-//! [`AppState`], so a stream the LAN pulls uses the same engines, piece cache
-//! and settings as one the loopback listener serves.
+//! one. It serves `crate::lan_media_routes` alone: the byte-serving routes,
+//! over torrents and archive sessions the loopback side has already created,
+//! and nothing that a stranger on the network could make this device *do* --
+//! no route that fetches a caller-named URL, none that starts a torrent, and
+//! no control route at any level, not even behind the bearer middleware, so
+//! an unknown-path `404` is the strongest answer the LAN can get out of them
+//! and there is no token to guess, leak or brute-force. Both listeners share
+//! one [`AppState`], so a stream the LAN pulls uses the same engines, piece
+//! cache and settings as one the loopback listener serves.
 //!
 //! It is off unless an embedder configures [`ServerConfig::lan_media_addr`],
 //! and [`ServerHandle::set_lan_media`] starts and stops it at runtime so it

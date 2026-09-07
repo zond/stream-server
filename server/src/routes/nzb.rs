@@ -47,7 +47,17 @@ struct NzbLzPayload {
     servers: Vec<String>,
 }
 
+/// The whole NZB API: [`session_router`] and [`stream_router`] together,
+/// which is what the loopback listener mounts.
 pub fn router() -> Router<AppState> {
+    stream_router().merge(session_router())
+}
+
+/// The session-creating half: `/create` fetches the NZB the caller names
+/// and opens a pool of TCP connections to the news servers the caller
+/// names. Loopback only -- see `crate::lan_media_routes` for why the LAN
+/// listener never mounts this half.
+pub fn session_router() -> Router<AppState> {
     Router::new()
         .route(
             "/create",
@@ -57,6 +67,14 @@ pub fn router() -> Router<AppState> {
             "/create/{key}",
             get(create_session_with_key).post(create_session_with_key),
         )
+}
+
+/// The byte-serving half: a file read out of a session [`session_router`]
+/// already created, over connections that session already holds. An
+/// unknown key is a `404`; nothing here reaches out anywhere new, which is
+/// what lets the LAN listener mount it.
+pub fn stream_router() -> Router<AppState> {
+    Router::new()
         .route("/stream", get(stream_nzb_query))
         .route("/stream/{key}/{*file}", get(stream_nzb_file))
 }

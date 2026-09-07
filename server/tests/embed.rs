@@ -2148,13 +2148,16 @@ fn stats_json_reports_the_piece_the_open_reader_waits_for() -> anyhow::Result<()
 /// serving both, and range and HEAD requests -- what a receiver actually
 /// issues -- work through the LAN listener too.
 ///
-/// It must also NOT expose `/proxy` (and, for the same reason, `/ftp`):
-/// both fetch an arbitrary caller-supplied remote URL rather than media
-/// bytes from this server, so mounting them on the LAN would turn the
-/// listener into an open proxy for the whole network. They 404 on the LAN
-/// listener and keep working on loopback. The archive (rar/zip/7zip/tar/
-/// tgz), NZB and `/local-addon` routes are real media routes and work
-/// identically on both.
+/// It must also NOT expose anything a stranger on the network could make
+/// this device *do*: `/proxy` and `/ftp` fetch an arbitrary caller-supplied
+/// remote URL; the archive and NZB `/create` routes download an archive from
+/// a caller-named URL or open TCP connections to caller-named news servers;
+/// and the loopback stream route's first request for a hash starts a torrent
+/// with the caller's trackers. All of that is loopback only. The LAN gets the
+/// byte-serving halves alone -- a torrent that exists, a member of an
+/// archive or NZB session loopback already created -- and an unknown torrent
+/// there is a `404` that starts nothing. The `/local-addon` stub is not on
+/// the LAN either: no receiver calls it.
 #[test]
 fn lan_media_listener_serves_media_but_no_control_route() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -2289,36 +2292,126 @@ fn lan_media_listener_serves_media_but_no_control_route() -> anyhow::Result<()> 
         );
     }
 
-    // The archive and NZB session-create routes are on the LAN allow-list
-    // and answer identically -- here, both refuse the same missing payload
-    // -- on both listeners.
-    for path in [
-        "/rar/create",
-        "/zip/create",
-        "/7zip/create",
-        "/tar/create",
-        "/tgz/create",
-        "/nzb/create",
-    ] {
+    // The archive and NZB session-create routes fetch a caller-named URL
+    // (an archive to download whole, an NZB plus the news servers to open
+    // connections to), so they are loopback only: a real route there (a
+    // `400` for the missing payload) and absent from the LAN. `GET` on the
+    // LAN is the two-segment collision answered by the LAN stream handler
+    // looking `"rar"` up as an info hash and finding nothing; the keyed
+    // form has three segments and reaches the fallback; `POST` is a method
+    // the stream route does not take.
+    for prefix in ["/rar", "/zip", "/7zip", "/tar", "/tgz", "/nzb"] {
+        let create = format!("{prefix}/create");
+        assert_eq!(
+            anonymous.get(format!("{base}{create}")).send()?.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "{create} is a real route on the loopback listener"
+        );
+        assert_eq!(
+            anonymous.get(format!("{lan}{create}")).send()?.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "{create} must not exist on the LAN listener"
+        );
+        assert_eq!(
+            anonymous
+                .get(format!("{lan}{create}/some-key"))
+                .send()?
+                .status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "{create}/some-key must not exist on the LAN listener"
+        );
+        assert_eq!(
+            anonymous
+                .post(format!("{lan}{create}"))
+                .json(&serde_json::json!({ "urls": ["http://127.0.0.1:9/x.zip"] }))
+                .send()?
+                .status(),
+            reqwest::StatusCode::METHOD_NOT_ALLOWED,
+            "POST {create} must not reach a handler on the LAN listener"
+        );
+        // The byte-serving half of the same prefix *is* on the LAN: a
+        // request with no session key is refused by the route itself, on
+        // both listeners alike, and a key nobody created is a `404` that
+        // opened nothing.
+        let stream = format!("{prefix}/stream");
         for origin in [&lan, &base] {
-            let response = anonymous.get(format!("{origin}{path}")).send()?;
             assert_eq!(
-                response.status(),
+                anonymous.get(format!("{origin}{stream}")).send()?.status(),
                 reqwest::StatusCode::BAD_REQUEST,
-                "{origin}{path}"
+                "{origin}{stream} is a real route on both listeners"
+            );
+            assert_eq!(
+                anonymous
+                    .get(format!("{origin}{stream}/no-such-session/movie.mkv"))
+                    .send()?
+                    .status(),
+                reqwest::StatusCode::NOT_FOUND,
+                "{origin}{stream}/no-such-session/movie.mkv"
             );
         }
     }
-    // Likewise the `/local-addon` stub: also on the allow-list, also
-    // identical on both.
-    for origin in [&lan, &base] {
-        let manifest: serde_json::Value = anonymous
-            .get(format!("{origin}/local-addon/manifest.json"))
+    // The `/local-addon` stub is loopback only too -- not a hazard, just
+    // nothing a receiver asks for, and the allow-list is what a receiver
+    // needs rather than what is harmless.
+    let manifest: serde_json::Value = anonymous
+        .get(format!("{base}/local-addon/manifest.json"))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    assert_eq!(manifest["id"], "org.stremio.local");
+    assert_eq!(
+        anonymous
+            .get(format!("{lan}/local-addon/manifest.json"))
             .send()?
-            .error_for_status()?
-            .json()?;
-        assert_eq!(manifest["id"], "org.stremio.local", "{origin}");
+            .status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+
+    // A torrent this server does not have is a `404` on the LAN, at once,
+    // and nothing is started: on loopback the same request would create the
+    // torrent with the caller's `tr=` trackers and wait up to the metadata
+    // timeout for a swarm that does not exist. The stats poll afterwards
+    // starts its own registry add for the hash -- that is what a stats poll
+    // does -- so what it proves is that the LAN request left no add of its
+    // own behind: the attacker's tracker is in no source list.
+    let unknown = "00112233445566778899aabbccddeeff00112233";
+    let attacker_tracker = "udp://attacker.invalid:6969/announce";
+    let prompt = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    for method in [reqwest::Method::GET, reqwest::Method::HEAD] {
+        let response = prompt
+            .request(
+                method.clone(),
+                format!(
+                    "{lan}/{unknown}/0?tr={}",
+                    urlencoding::encode(attacker_tracker)
+                ),
+            )
+            .send()?;
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "{method} for an unknown torrent on the LAN listener"
+        );
     }
+    let response = prompt
+        .get(format!(
+            "{lan}/stream/{unknown}/0?tr={}",
+            urlencoding::encode(attacker_tracker)
+        ))
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    let stats: serde_json::Value = with_token
+        .get(format!("{base}/{unknown}/stats.json"))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    let sources = stats["sources"].to_string();
+    assert!(
+        !sources.contains("attacker.invalid"),
+        "the LAN request started an add carrying its own tracker: {stats}"
+    );
 
     // Media bytes, on both listeners, from the same engine.
     for origin in [&lan, &base] {
