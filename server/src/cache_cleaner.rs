@@ -432,6 +432,12 @@ async fn recover_out_of_space_torrents(state: &AppState, recovery: &mut DiskFull
 struct CacheRoots {
     download_dirs: Vec<std::path::PathBuf>,
     protected_paths: HashSet<std::path::PathBuf>,
+    /// Directories the cleaner was handed and may therefore never delete,
+    /// however empty eviction leaves them -- see [`remove_empty_parents`].
+    /// Every root *before* [`outermost`] collapsed them, which is the point:
+    /// a `downloadsDir` inside a cache root is no longer a walked root, and
+    /// the walked root is no longer a sufficient stop condition for it.
+    keep_dirs: HashSet<std::path::PathBuf>,
     limit: CacheLimit,
 }
 
@@ -467,6 +473,11 @@ async fn cache_roots(state: &AppState) -> CacheRoots {
     );
     download_dirs.sort();
     download_dirs.dedup();
+    // Every directory the cleaner was *given*, kept before the collapse below
+    // throws the inner ones away: these are configuration -- the engines'
+    // cache roots and the resolved `downloadsDir` -- and eviction emptying one
+    // must not take the directory with it.
+    let keep_dirs: HashSet<_> = download_dirs.iter().cloned().collect();
     // A root inside another root would have its files walked, counted and
     // aged twice -- `WalkDir` does not know the two overlap. Keeping only the
     // outermost is what makes a downloads dir *under* a cache root (or a
@@ -493,6 +504,7 @@ async fn cache_roots(state: &AppState) -> CacheRoots {
     CacheRoots {
         download_dirs,
         protected_paths,
+        keep_dirs,
         limit: CacheLimit {
             configured: limit,
             available,
@@ -518,7 +530,13 @@ pub(crate) async fn clean_cache(state: &AppState) -> anyhow::Result<EvictionRepo
         });
     }
 
-    evict(&roots.download_dirs, &roots.protected_paths, roots.limit).await
+    evict(
+        &roots.download_dirs,
+        &roots.protected_paths,
+        &roots.keep_dirs,
+        roots.limit,
+    )
+    .await
 }
 
 /// What the cache currently occupies against its configured limit
@@ -730,6 +748,7 @@ impl EvictionReport {
 async fn evict(
     download_dirs: &[std::path::PathBuf],
     protected_paths: &HashSet<std::path::PathBuf>,
+    keep_dirs: &HashSet<std::path::PathBuf>,
     limit: CacheLimit,
 ) -> anyhow::Result<EvictionReport> {
     // 2. Scan and Evict immediately based on age (30 days)
@@ -795,7 +814,7 @@ async fn evict(
                                         aged_out_files += 1;
                                         // Try to clean empty parent dir
                                         if let Some(parent) = path.parent() {
-                                            remove_empty_parents(parent, download_dir).await;
+                                            remove_empty_parents(parent, keep_dirs).await;
                                         }
                                     }
                                 } else {
@@ -888,10 +907,8 @@ async fn evict(
                 freed_space += size;
                 deleted_count += 1;
 
-                if let Some(parent) = path.parent()
-                    && let Some(root) = download_dirs.iter().find(|root| path.starts_with(root))
-                {
-                    remove_empty_parents(parent, root).await;
+                if let Some(parent) = path.parent() {
+                    remove_empty_parents(parent, keep_dirs).await;
                 }
             }
         }
@@ -986,8 +1003,21 @@ fn is_path_protected(path: &std::path::Path, protected: &HashSet<std::path::Path
     protected.contains(path) || protected.iter().any(|p| path.starts_with(p))
 }
 
-async fn remove_empty_parents(mut dir: &std::path::Path, root: &std::path::Path) {
-    while dir != root {
+/// Prune the directories a deletion left empty, upwards, stopping at the first
+/// one that is not empty -- and never at all on a directory in `keep`.
+///
+/// `keep` is every directory the cleaner was handed: the engines' cache roots
+/// and the resolved `downloadsDir`. The walked root alone used to be the stop
+/// condition, and that was right only while every configured directory was a
+/// walked root. It stopped being right when [`outermost`] began collapsing a
+/// `downloadsDir` under a cache root into that cache root: the walked root is
+/// then the cache root, and the loop walks through the downloads dir on its way
+/// up to it, deleting it the moment eviction has emptied it. That directory is
+/// settings -- `routes::system::prepare_downloads_dir` resolved and validated
+/// it and the engines were told about it -- and the cleaner is not the thing
+/// that gets to remove it.
+async fn remove_empty_parents(mut dir: &std::path::Path, keep: &HashSet<std::path::PathBuf>) {
+    while !keep.contains(dir) {
         if tokio::fs::remove_dir(dir).await.is_err() {
             break;
         }
@@ -1051,6 +1081,24 @@ mod tests {
         }
     }
 
+    /// `evict` where every walked root is also a directory to keep: the
+    /// ordinary shape, with nothing collapsed into anything. The tests about
+    /// the collapse build their own keep-set and call `evict` directly.
+    async fn evict_roots(
+        download_dirs: &[PathBuf],
+        protected_paths: &HashSet<PathBuf>,
+        limit: CacheLimit,
+    ) -> anyhow::Result<EvictionReport> {
+        let keep = download_dirs.iter().cloned().collect();
+        evict(download_dirs, protected_paths, &keep, limit).await
+    }
+
+    /// The keep-set of a plain root: what `cache_roots` builds when no
+    /// root sits inside another.
+    fn keep_only(dirs: &[&Path]) -> HashSet<PathBuf> {
+        dirs.iter().map(|dir| dir.to_path_buf()).collect()
+    }
+
     fn write_aged(path: &Path, bytes: &[u8], age: Duration) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, bytes).unwrap();
@@ -1099,7 +1147,7 @@ mod tests {
         let recent = root.join("recent.mkv");
         write_aged(&recent, &[0u8; 4096], Duration::from_secs(60));
 
-        evict(
+        evict_roots(
             std::slice::from_ref(&root),
             &HashSet::new(),
             CacheLimit::configured(0),
@@ -1121,7 +1169,7 @@ mod tests {
         let newer = root.join("newer.mkv");
         write_aged(&newer, &[0u8; 4096], Duration::from_secs(1));
         let limit = limit_between(&newer, &recent);
-        evict(
+        evict_roots(
             std::slice::from_ref(&root),
             &HashSet::new(),
             CacheLimit::configured(limit),
@@ -1147,7 +1195,7 @@ mod tests {
         let c = b.join("c");
         std::fs::create_dir_all(&c).unwrap();
 
-        remove_empty_parents(&c, root.path()).await;
+        remove_empty_parents(&c, &keep_only(&[root.path()])).await;
 
         assert!(!c.exists(), "empty leaf removed");
         assert!(!b.exists(), "empty parent removed");
@@ -1164,7 +1212,7 @@ mod tests {
         let keep = b.join("keep.txt");
         std::fs::write(&keep, b"x").unwrap();
 
-        remove_empty_parents(&c, root.path()).await;
+        remove_empty_parents(&c, &keep_only(&[root.path()])).await;
 
         assert!(!c.exists(), "empty leaf removed");
         assert!(b.exists(), "non-empty sibling dir kept");
@@ -1178,7 +1226,7 @@ mod tests {
         std::fs::create_dir_all(&a).unwrap();
 
         // Climbing from `a` empties the root, but the loop must stop at it.
-        remove_empty_parents(&a, root.path()).await;
+        remove_empty_parents(&a, &keep_only(&[root.path()])).await;
 
         assert!(!a.exists());
         assert!(root.path().exists(), "root preserved even when empty");
@@ -1226,7 +1274,7 @@ mod tests {
         let protected: HashSet<PathBuf> = HashSet::from([pinned_folder.clone()]);
         let roots = [root.clone(), offline.clone()];
 
-        let report = evict(&roots, &protected, CacheLimit::configured(0))
+        let report = evict_roots(&roots, &protected, CacheLimit::configured(0))
             .await
             .unwrap();
         assert!(
@@ -1241,7 +1289,7 @@ mod tests {
         // download the age rule was not old enough to take.
         let recent = offline.join(HASH).join("recent.mkv");
         write_aged(&recent, &[0u8; 8192], Duration::from_secs(3600));
-        let report = evict(
+        let report = evict_roots(
             &roots,
             &protected,
             CacheLimit::configured(occupancy(&pinned)),
@@ -1250,6 +1298,47 @@ mod tests {
         .unwrap();
         assert!(!recent.exists(), "{report:?}");
         assert!(pinned.is_file(), "never an LRU casualty");
+    }
+
+    /// The configured `downloadsDir` is settings, not cache: eviction may
+    /// empty it, never remove it.
+    ///
+    /// `remove_empty_parents` prunes the directories a deletion left behind,
+    /// upwards, and it used to stop only at the walked root. That was enough
+    /// while the downloads dir was a root of its own; it stopped being enough
+    /// when `outermost` started collapsing a downloads dir under a cache root
+    /// into the cache root, because the root is then the cache root and the
+    /// loop walks straight through the downloads dir on its way there. The
+    /// server resolved and validated that path (`prepare_downloads_dir`) and
+    /// handed it to the engines, so deleting it is the cleaner overruling a
+    /// setting.
+    #[tokio::test]
+    async fn evict_never_prunes_the_configured_downloads_dir_away() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("rqbit-downloads");
+        let offline = root.join("offline");
+        let stale = offline.join(HASH).join("movie.mkv");
+        write_aged(&stale, &[0u8; 8192], Duration::from_secs(40 * 24 * 60 * 60));
+
+        // Exactly what `cache_roots` hands `evict`: one walked root, because
+        // the downloads dir collapsed into it, and both directories to keep.
+        let keep = HashSet::from([root.clone(), offline.clone()]);
+        evict(
+            std::slice::from_ref(&root),
+            &HashSet::new(),
+            &keep,
+            CacheLimit::configured(0),
+        )
+        .await
+        .unwrap();
+
+        assert!(!stale.exists(), "the stale download still goes");
+        assert!(
+            !offline.join(HASH).exists(),
+            "and so does the torrent folder it emptied"
+        );
+        assert!(offline.is_dir(), "but the downloads dir itself stays");
+        assert!(root.is_dir());
     }
 
     /// A downloads dir inside a cache root (or a cache root inside the
@@ -1332,7 +1421,7 @@ mod tests {
         write_aged(&stale, &[0u8; 4096], forty_days);
         let protected: HashSet<PathBuf> = HashSet::from([pinned.clone()]);
 
-        evict(
+        evict_roots(
             std::slice::from_ref(&root),
             &protected,
             CacheLimit::configured(0),
@@ -1342,7 +1431,7 @@ mod tests {
         assert!(pinned.is_file(), "the pinned file survives the age rule");
         assert!(!stale.exists(), "its unpinned neighbour does not");
 
-        evict(
+        evict_roots(
             std::slice::from_ref(&root),
             &protected,
             CacheLimit::configured(1024),
@@ -1400,7 +1489,7 @@ mod tests {
         // the single-file-larger-than-the-limit rule, so the eviction fell
         // on the only other candidate and freed nothing that mattered.
         let limit = 1u64 << 30;
-        let report = evict(
+        let report = evict_roots(
             std::slice::from_ref(&root),
             &HashSet::new(),
             CacheLimit::configured(limit),
@@ -1535,7 +1624,7 @@ mod tests {
         let cold_bytes = occupancy(&cold);
         let limit = protected_bytes + limit_between(&warm, &cold);
 
-        let report = evict(
+        let report = evict_roots(
             std::slice::from_ref(&root),
             &protected,
             CacheLimit::configured(limit),
@@ -1573,7 +1662,7 @@ mod tests {
         let protected_bytes = occupancy(&pinned) + occupancy(&live);
         let limit = protected_bytes / 2;
 
-        let report = evict(
+        let report = evict_roots(
             std::slice::from_ref(&root),
             &protected,
             CacheLimit::configured(limit),
@@ -1855,7 +1944,7 @@ mod tests {
 
         // Unlimited by setting, and the walk found nothing to age out.
         let unlimited = CacheLimit::configured(u64::MAX);
-        let report = evict(std::slice::from_ref(&root), &HashSet::new(), unlimited)
+        let report = evict_roots(std::slice::from_ref(&root), &HashSet::new(), unlimited)
             .await
             .unwrap();
         assert_eq!(
@@ -1872,7 +1961,7 @@ mod tests {
             configured: u64::MAX,
             available: Some(CACHE_FREE_SPACE_FLOOR - stale_occupancy / 2),
         };
-        let report = evict(std::slice::from_ref(&root), &HashSet::new(), squeezed)
+        let report = evict_roots(std::slice::from_ref(&root), &HashSet::new(), squeezed)
             .await
             .unwrap();
         assert!(
@@ -1890,7 +1979,7 @@ mod tests {
         // says: a full disk may not delete what is being written, and the run
         // reports what protection held rather than a clean that did nothing.
         let protected: HashSet<_> = [recent.clone()].into_iter().collect();
-        let report = evict(
+        let report = evict_roots(
             std::slice::from_ref(&root),
             &protected,
             CacheLimit {
@@ -1939,7 +2028,7 @@ mod tests {
         );
 
         let protected: HashSet<_> = [live.clone()].into_iter().collect();
-        let report = evict(std::slice::from_ref(&root), &protected, squeezed)
+        let report = evict_roots(std::slice::from_ref(&root), &protected, squeezed)
             .await
             .unwrap();
 
@@ -1978,7 +2067,7 @@ mod tests {
 
         // No cap of any kind: the size rule cannot run, so whatever this
         // pass reports having freed came from the age rule alone.
-        let report = evict(
+        let report = evict_roots(
             std::slice::from_ref(&root),
             &HashSet::new(),
             CacheLimit::configured(0),
