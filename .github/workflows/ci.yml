@@ -5,6 +5,10 @@ on:
     branches: [ "master", "main" ]
   pull_request:
     branches: [ "master", "main" ]
+  # Pushes to master have never started this workflow on the zond fork -- its
+  # only run to date was a pull request, while master was pushed to dozens of
+  # times. Until that is understood, a way to start it by hand.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
