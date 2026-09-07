@@ -29,7 +29,8 @@
 //!   A URL response has no hashes to check against. So completeness is built
 //!   rather than inherited: a chunk is buffered whole in memory, written to a
 //!   temporary name and renamed into place, and a chunk file whose length is
-//!   not the length its entity says it should be is read as absent.
+//!   not the length its entity says it should be is refused at the read and
+//!   deleted, never served (see [`Cached::body`]).
 //! * It is also not wired into a session yet, for two reasons that are about
 //!   torrent have-sets. This must not wait on that, and must not be a second
 //!   `TorrentStorage`.
@@ -110,7 +111,7 @@ use bytes::Bytes;
 use futures_util::Stream;
 use reqwest::Method;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -326,8 +327,22 @@ impl Entry {
     /// What is on disk for the range this request asked for, or `None` when
     /// there is nothing here the request can be answered from.
     ///
-    /// Blocking: it stats one file per chunk of the range, which for a fully
-    /// cached film is thousands. Call it on the blocking pool.
+    /// Blocking: it reads one directory per thousand chunks of the range,
+    /// from the chunk the range starts in to the first one missing. Call it
+    /// on the blocking pool -- it is a handful of `getdents` for a cached
+    /// film, but a handful on a phone's flash is still not nothing.
+    ///
+    /// It used to stat every chunk file instead, from the range's first
+    /// chunk to its last: `Range: bytes=0-` on a fully cached 2 GB film was
+    /// eight thousand `statx`, on every rewatch, all of it before the first
+    /// byte. The names in a bucket directory say which chunks are there; what
+    /// the stat added was each file's length, and that check has moved to
+    /// the one place the file is opened anyway ([`Cached::body`]). **What
+    /// this reads as held is therefore a chunk at its final name**, which is
+    /// the claim the store is built to make good: a chunk gets that name by
+    /// being renamed into it whole. A file of some other length under that
+    /// name is an accident's, and the read refuses it -- see `body` for why
+    /// that is now the better place to.
     ///
     /// `range` is the request's `Range` header as it arrived. **A request
     /// with no `Range` is answered only from a complete entry**: it asks for
@@ -344,18 +359,25 @@ impl Entry {
 
         let mut held_to: Option<u64> = None;
         let mut index = first / CHUNK_BYTES;
+        // The bucket directory being read from, listed once and consulted
+        // for every chunk in it; the walk moves to the next listing when the
+        // run of held chunks crosses into the next bucket.
+        let mut bucket: Option<(u64, HashSet<u64>)> = None;
         loop {
-            let want = chunk_len(index, total);
-            match std::fs::metadata(chunk_path(&dir, index)) {
-                // Presence is not enough: a chunk is written under a
-                // temporary name and renamed, so a file at the final name is
-                // complete -- but a length that disagrees with the entity is
-                // a file some other accident left, and reading it as a chunk
-                // would serve a hole as content.
-                Ok(metadata) if metadata.is_file() && metadata.len() == want => {}
-                _ => break,
+            let in_bucket = index / CHUNKS_PER_DIRECTORY;
+            if bucket
+                .as_ref()
+                .is_none_or(|(listed, _)| *listed != in_bucket)
+            {
+                bucket = Some((in_bucket, committed_chunks(&dir, in_bucket)));
             }
-            let end = index * CHUNK_BYTES + want - 1;
+            if !bucket
+                .as_ref()
+                .is_some_and(|(_, present)| present.contains(&index))
+            {
+                break;
+            }
+            let end = index * CHUNK_BYTES + chunk_len(index, total) - 1;
             held_to = Some(end);
             if end >= last {
                 break;
@@ -509,6 +531,41 @@ fn remove_other_entities(key_dir: &Path, keep: &Path) {
     }
 }
 
+/// The chunks committed in bucket `bucket` of the entity at `dir`: every
+/// entry whose name is a chunk index spelled the way [`chunk_path`] spells
+/// one, and that is a file. One `read_dir`, which is what makes the lookup a
+/// listing per thousand chunks rather than a stat per chunk.
+///
+/// The name is matched by re-spelling, not by parsing alone: `007` and `+7`
+/// parse as 7 but no chunk was ever written under either, and a name that
+/// parses to an index outside this bucket was not put here by a fill. A
+/// temporary carries a `.` and parses as nothing, which is how a chunk still
+/// being written stays invisible to a read.
+fn committed_chunks(dir: &Path, bucket: u64) -> HashSet<u64> {
+    let mut present = HashSet::new();
+    let Ok(entries) = std::fs::read_dir(dir.join(bucket.to_string())) else {
+        return present;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(index) = name
+            .to_str()
+            .and_then(|name| name.parse::<u64>().ok())
+            .filter(|index| index.to_string().as_str() == name)
+        else {
+            continue;
+        };
+        if index / CHUNKS_PER_DIRECTORY != bucket {
+            continue;
+        }
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        present.insert(index);
+    }
+    present
+}
+
 /// `<entity dir>/<bucket>/<chunk>`.
 fn chunk_path(dir: &Path, index: u64) -> PathBuf {
     let mut path = dir.join((index / CHUNKS_PER_DIRECTORY).to_string());
@@ -567,6 +624,20 @@ impl Cached {
     /// here, which is an ordinary race and not a fault -- ends the stream with
     /// an error rather than a short body, so the player sees a broken source
     /// instead of a file that ended early.
+    ///
+    /// **This is where a chunk's length is checked, and the only place.** A
+    /// chunk file is never written at any length but its entity's, so one
+    /// found at another length is an accident's -- a power loss that
+    /// committed the rename and not the data is the realistic one -- and it
+    /// is not served: the read ends in an error, as above. It is also
+    /// *deleted*, which is what makes checking here rather than in the
+    /// lookup the better arrangement and not merely the cheaper one. The
+    /// lookup used to measure every chunk and read a wrong one as absent,
+    /// and the fill skips a chunk whose name is taken, so such a file was
+    /// skipped by every lookup and every fill for as long as the cleaner
+    /// left it, and the origin was asked for those bytes at every play.
+    /// Taken here, it costs the player one broken read, the next lookup
+    /// finds the gap, and the next fill writes the chunk again.
     pub fn body(&self) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static {
         let dir = self.dir.clone();
         let total = self.total;
@@ -580,9 +651,11 @@ impl Cached {
                 let index = offset / CHUNK_BYTES;
                 let start = index * CHUNK_BYTES;
                 let want = chunk_len(index, total);
-                let bytes = match tokio::fs::read(chunk_path(&dir, index)).await {
+                let path = chunk_path(&dir, index);
+                let bytes = match tokio::fs::read(&path).await {
                     Ok(bytes) if bytes.len() as u64 == want => bytes,
                     Ok(_) => {
+                        let _ = tokio::fs::remove_file(&path).await;
                         return Some((
                             Err(io::Error::other("a cached chunk is not the length it was")),
                             last + 1,
@@ -1014,11 +1087,18 @@ mod tests {
         );
     }
 
-    /// A chunk written whole and renamed into place is readable; a chunk
-    /// whose length disagrees with the entity is read as absent, because
-    /// serving it would serve a hole as content.
+    /// A chunk written whole and renamed into place is readable. A file at a
+    /// chunk's name whose length disagrees with the entity is never served
+    /// -- that would serve a hole as content -- but the place it is caught is
+    /// the read, not the lookup: the lookup goes by names, the read refuses
+    /// the file and removes it, and from then on the lookup sees the gap it
+    /// leaves and a fill can write the chunk again. (The lookup used to
+    /// measure every chunk and read a wrong one as absent, which left it in
+    /// place for ever: skipped by every lookup, skipped by every fill.)
     #[tokio::test]
-    async fn a_chunk_is_read_back_only_when_it_is_the_length_it_should_be() {
+    async fn a_chunk_of_the_wrong_length_is_refused_at_the_read_and_removed() {
+        use futures_util::StreamExt as _;
+
         let (_root, cache) = cache();
         let entry = entry_of(&cache, "https://host/film.mkv");
         let total = CHUNK_BYTES + 10;
@@ -1034,11 +1114,32 @@ mod tests {
         assert_eq!(cached.total, total);
         assert_eq!(cached.content_type, "video/mp4");
 
-        // The final chunk of this entity is ten bytes; a full-length one at
-        // its name is not that chunk.
+        // The final chunk of this entity is ten bytes; a full-length file at
+        // its name is not that chunk. The lookup takes the name at its word
+        // -- nothing but a completed fill puts a file there --
         write_chunk(&dir, 1, &vec![7u8; CHUNK_BYTES as usize]);
         let cached = entry.look_up(Some("bytes=0-")).expect("chunk 0 is here");
-        assert!(!cached.complete(), "the second chunk is the wrong length");
+        assert!(
+            cached.complete(),
+            "the lookup goes by the names in the bucket"
+        );
+        // ...and the read is what finds it out: chunk 0 is served, the
+        // impostor ends the body in an error and is gone.
+        let served: Vec<Result<Bytes, io::Error>> = cached.body().collect().await;
+        assert_eq!(served.len(), 2, "one chunk, then the refusal");
+        assert_eq!(
+            served[0].as_ref().map(|bytes| bytes.len()).ok(),
+            Some(CHUNK_BYTES as usize)
+        );
+        assert!(served[1].is_err(), "a hole is never served as content");
+        assert!(
+            !chunk_path(&dir, 1).exists(),
+            "and the file is removed rather than left for the next read to trip on"
+        );
+
+        // So the next lookup sees the gap and names what a fill must write.
+        let cached = entry.look_up(Some("bytes=0-")).expect("chunk 0 is here");
+        assert!(!cached.complete());
         assert_eq!(cached.held_to, CHUNK_BYTES - 1);
         assert_eq!(
             cached.remaining_range(),
@@ -1052,6 +1153,75 @@ mod tests {
             "and the right length is the whole entity"
         );
         assert_eq!(cached.held_to, total - 1);
+        let served: Vec<Result<Bytes, io::Error>> = cached.body().collect().await;
+        assert_eq!(
+            served
+                .iter()
+                .map(|chunk| chunk.as_ref().unwrap().len())
+                .sum::<usize>(),
+            total as usize
+        );
+    }
+
+    /// The lookup reads bucket directories, not chunk files, so what is in a
+    /// bucket that is not a chunk must not be mistaken for one, and a run of
+    /// held chunks must be followed from one bucket's listing into the next.
+    #[test]
+    fn the_lookup_reads_names_and_follows_a_run_into_the_next_bucket() {
+        let (_root, cache) = cache();
+        let entry = entry_of(&cache, "https://host/film.mkv");
+        // The entity's last chunk is the first of bucket 1, so two files are
+        // enough to hold the boundary: 999 whole, 1000 the ten-byte tail.
+        let total = CHUNKS_PER_DIRECTORY * CHUNK_BYTES + 10;
+        let dir = entry
+            .dir
+            .join(entity_dir_name(total, "video/mp4", VALIDATOR));
+        write_chunk(&dir, 0, &vec![0u8; CHUNK_BYTES as usize]);
+        write_chunk(&dir, 999, &vec![9u8; CHUNK_BYTES as usize]);
+        write_chunk(&dir, 1000, &[1u8; 10]);
+        // What else a bucket can hold: a chunk still being written, a
+        // directory with a chunk's name, and names that parse as a chunk
+        // index without being one.
+        let bucket = chunk_path(&dir, 0).parent().unwrap().to_path_buf();
+        std::fs::write(bucket.join("1.4242-7.part"), [1u8; 64]).unwrap();
+        std::fs::create_dir(bucket.join("2")).unwrap();
+        std::fs::write(bucket.join("003"), vec![3u8; CHUNK_BYTES as usize]).unwrap();
+        std::fs::write(bucket.join("+4"), vec![4u8; CHUNK_BYTES as usize]).unwrap();
+        std::fs::write(bucket.join("1005"), vec![5u8; CHUNK_BYTES as usize]).unwrap();
+
+        assert_eq!(
+            committed_chunks(&dir, 0),
+            HashSet::from([0, 999]),
+            "chunks are the files spelled the way a fill spells them"
+        );
+        assert_eq!(committed_chunks(&dir, 1), HashSet::from([1000]));
+        assert!(
+            committed_chunks(&dir, 2).is_empty(),
+            "a bucket that was never written"
+        );
+
+        let head = entry.look_up(Some("bytes=0-")).expect("chunk 0 is here");
+        assert_eq!(
+            head.held_to,
+            CHUNK_BYTES - 1,
+            "the run ends at the first gap"
+        );
+
+        let tail = entry
+            .look_up(Some(&format!("bytes={}-", 999 * CHUNK_BYTES)))
+            .expect("chunk 999 is here");
+        assert!(
+            tail.complete(),
+            "the run crosses from bucket 0 into bucket 1"
+        );
+        assert_eq!(tail.held_to, total - 1);
+
+        assert!(
+            entry
+                .look_up(Some(&format!("bytes={}-", 998 * CHUNK_BYTES)))
+                .is_none(),
+            "a seek into a hole is not a hit"
+        );
     }
 
     /// The lookup answers a *range*, not a response: a gap in the middle of

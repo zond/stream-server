@@ -1441,9 +1441,9 @@ async fn proxy(
     // not touch at all -- see [`crate::proxy_cache::ProxyCache::entry`] for
     // the whole of that list.
     //
-    // The lookup stats one file per chunk of the range, which for a cached
-    // film is thousands, so it goes to the blocking pool rather than onto
-    // the reactor.
+    // The lookup lists one directory per thousand chunks of the range -- a
+    // few `getdents` for a cached film, still filesystem reads -- so it goes
+    // to the blocking pool rather than onto the reactor.
     let ranged = headers.contains_key(header::RANGE);
     // Needed before the lookup, not after it: it is an input to the playlist
     // verdict, and every hit has to reach that verdict before it answers or
