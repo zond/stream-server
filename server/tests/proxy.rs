@@ -753,7 +753,7 @@ fn an_origin_that_ignores_if_range_is_still_not_spliced() -> anyhow::Result<()> 
     Ok(())
 }
 
-/// A cache hit and a cache miss are the same request answered the same way.
+/// A cache hit and a cache miss classify the same request the same way.
 ///
 /// `r=` is deliberately not in the cache key: it never reaches the origin,
 /// so it cannot vary the bytes stored. What it *can* vary is the verdict on

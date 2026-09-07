@@ -55,12 +55,15 @@
 //!   from the one before it in any of the three gets a new directory, and the
 //!   fill that discovers it removes the old one.
 //! * **The validator is the only one of the three that can tell two
-//!   generations of one resource apart**, and it is why chunks from two of
-//!   them can never end up in one directory or one body. Length and type say
+//!   generations of one resource apart**, and it is what keeps chunks of two
+//!   of them out of one directory and out of one body. Length and type say
 //!   nothing about a URL whose content was replaced by content of the same
 //!   size -- which is why a response the origin will identify by neither
 //!   `ETag` nor `Last-Modified` is not kept at all
-//!   (`routes::proxy::cacheable_entity`).
+//!   (`routes::proxy::cacheable_entity`). What the origin says is the whole
+//!   of the evidence, and it is the whole of what is claimed here: an origin
+//!   that serves new bytes under an old validator is being untruthful, and
+//!   nothing in this module can catch that.
 //! * `<bucket>` is `<chunk> / 1000`, for the same reason the piece store
 //!   buckets: exFAT and FAT32 scan a directory linearly, and that is exactly
 //!   where a phone's cache lives.
@@ -76,21 +79,32 @@
 //!
 //! # What is not here, and no comment may imply otherwise
 //!
-//! * **No revalidation of any kind.** No `ETag`, no `If-None-Match`, no
-//!   `Last-Modified`, no `If-Modified-Since`, no freshness lifetime, no
-//!   `Age`. An entry is served until the cleaner evicts it. If the origin
-//!   changes the entity under the same URL and the change is visible in
-//!   neither its length nor its content type, this serves the old one. That
-//!   is the single largest thing it does not do.
+//! * **Nothing here is revalidated.** No `If-None-Match`, no
+//!   `If-Modified-Since`, no freshness lifetime, no `Age`. An entry is served
+//!   until the cleaner evicts it. The origin's validator *is* kept -- it is a
+//!   third of the entity's directory name -- but it is only ever compared
+//!   when the origin is being asked for something anyway, and a read this
+//!   store answers in full asks the origin nothing. So a resource that
+//!   changed under the URL is served as it was until this key next misses,
+//!   and the fill that misses is what discovers the change and drops what was
+//!   held of the old entity. That is the single largest thing this does not
+//!   do.
+//!
+//!   The one conditional the cache itself adds to a request is the
+//!   `If-Range` that goes with a narrowed range, and that is not revalidation
+//!   either: it asks the origin to answer the tail *only* while the head
+//!   being narrowed against is still part of the entity, and it rides on a
+//!   fetch the player had asked for regardless.
 //! * **No `Vary`.** The key is fixed (below); the header is not read.
 //! * **No credentialed responses at all.** Not "keyed carefully" -- refused,
 //!   in [`ProxyCache::entry`].
 //! * **No coalescing.** Two players filling the same missing chunk both fetch
 //!   it.
-//! * **Nothing is stored for a fetch that starts mid-chunk.** Only whole
-//!   chunks are written, and the bytes before the first chunk boundary in a
-//!   body are dropped rather than provoking a wider fetch than the player
-//!   asked for.
+//! * **Nothing is kept of the chunk a fetch starts inside.** Only whole
+//!   chunks are written and there is no completing a chunk whose front the
+//!   response does not carry, so the bytes before a body's first chunk
+//!   boundary are dropped rather than provoking a wider fetch than the player
+//!   asked for. Every whole chunk after that boundary is written as usual.
 
 use bytes::Bytes;
 use futures_util::Stream;
@@ -185,10 +199,17 @@ impl ProxyCache {
     /// * **`r=`.** It never travels to the origin. It overrides headers on
     ///   the way back and it can flip the playlist verdict -- so it varies
     ///   *the response the player is handed*, and not one byte of what the
-    ///   origin sends. What is stored here is origin bytes, replayed through
-    ///   the same classification and header code, so `r=` stays out. (The
-    ///   note is here because the design this was built from asserted the
-    ///   opposite. A cache of assembled *responses* would have to key on it.)
+    ///   origin sends. What is stored here is origin bytes, and both things
+    ///   `r=` does to them are done to a hit exactly as to a fetch: the
+    ///   playlist verdict is `routes::proxy::is_a_playlist`, asked by the
+    ///   hit before it answers, and the overrides are
+    ///   `apply_custom_response_headers`, applied by both. That is what the
+    ///   omission rests on, and it is load-bearing: while a hit answered
+    ///   before the classification, an `r=` that turned the verdict over got
+    ///   the rewrite on a miss and the origin's own body on a hit, which is
+    ///   this key promising something it did not do. (The note is here
+    ///   because the design this was built from asserted the opposite. A
+    ///   cache of assembled *responses* would have to key on it.)
     /// * **`p=`.** The client's name for its player, never sent to the
     ///   origin. Keyed on, two players reading the same stream would share
     ///   nothing, since each mints its own token -- which is the case this
@@ -410,12 +431,12 @@ impl Entry {
 
 /// `<length>_<content type>_<validator>`, the last two percent-encoded.
 ///
-/// `_` is escaped along with everything else a percent-encoding escapes, so
-/// the name splits into exactly three fields however an origin spells a type
-/// or a tag. It is in the unreserved set that `urlencoding::encode` leaves
-/// alone, and a content type may hold one (`application/x-foo_bar`), so
-/// leaving it would make the separator ambiguous the first time an origin
-/// used it.
+/// `_` is escaped too, which a percent-encoding on its own would not do: it
+/// is in the unreserved set `urlencoding::encode` leaves alone, and a content
+/// type may hold one (`application/x-foo_bar`), so leaving it would make the
+/// separator ambiguous the first time an origin used one. Escaped, the name
+/// splits into exactly three fields however an origin spells a type or a
+/// tag.
 fn entity_dir_name(total: u64, content_type: &str, validator: &str) -> String {
     format!(
         "{total}_{}_{}",
@@ -1213,9 +1234,9 @@ mod tests {
         }
     }
 
-    /// The three fields go into one directory name, and the rule about that
-    /// name is the only reason a response the origin describes perfectly well
-    /// might still not be kept.
+    /// The three fields go into one directory name, and a name past what a
+    /// filesystem holds is the one refusal that is about none of the things
+    /// the origin said -- only about how long they are.
     ///
     /// This is where it is pinned rather than in the route's tests, because
     /// from outside the two answers are the same: a name past what a

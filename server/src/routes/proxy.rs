@@ -718,11 +718,16 @@ fn finalize_response(builder: Builder, body: axum::body::Body) -> Response {
     }
 }
 
-/// The CORS headers every proxied response carries, on the relay and on a
-/// cache hit alike. One function because a hit is the same response the
-/// relay would have made, with the bytes coming off disk instead of a
-/// socket, and a header set that differed between the two would be a header
-/// set a player could tell them apart by.
+/// The CORS headers every proxied response carries -- the relay, the
+/// rewritten playlist and the cache hit alike.
+///
+/// One function because these three headers are the same on all of them and
+/// must stay so: a browser-hosted client that could read a relayed body and
+/// not a cached one would be watching the cache decide what it may fetch.
+/// That is a claim about *these* headers only. The rest of a hit's are not
+/// the relay's -- `Server` and `Date` describe the hop that is not being
+/// made, and the framing is written from what the store holds; see
+/// [`cache_hit_response`].
 fn with_cors(builder: Builder) -> Builder {
     builder
         .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
@@ -790,8 +795,8 @@ fn origin_forbids_caching(res_headers: &HeaderMap) -> bool {
 struct EntityValidator {
     /// `etag` or `last-modified` -- the header it was read from.
     header: HeaderName,
-    /// Its value, exactly as the origin wrote it, which is what goes back
-    /// out as `If-Range`.
+    /// Its value as the origin wrote it, trimmed of surrounding space, which
+    /// is what goes back out as `If-Range`.
     value: String,
 }
 
@@ -851,8 +856,9 @@ impl EntityValidator {
 ///   anything else would let a later hit answer a range the origin never
 ///   said it supports, which is claiming seekability for a stream that has
 ///   none the moment the cache misses;
-/// * **an entity whose length the origin will not state.** There is nothing
-///   to file the chunks under and no `Content-Range` a hit could write;
+/// * **an entity whose length the origin will not state, or states as
+///   zero.** There is nothing to file the chunks under, no `Content-Range` a
+///   hit could write, and no chunk in an entity of no bytes;
 /// * **an entity the origin will not identify.** No `ETag` and no
 ///   `Last-Modified` (see [`EntityValidator`]) and there is nothing that
 ///   could ever tell a second generation of this resource from the one being
@@ -929,9 +935,9 @@ struct CacheableEntity {
 /// The response a cache hit is: framing written from what the store holds,
 /// over bytes that came off disk instead of a socket.
 ///
-/// Every field in it describes the entity rather than the fetch that is not
-/// happening, and each is the origin's own claim remembered rather than one
-/// invented here:
+/// Every field in it describes the entity, or the span of it being served,
+/// and never the fetch that is not happening. Three of them are the origin's
+/// own claims remembered rather than anything invented here:
 ///
 /// * `Accept-Ranges: bytes`, because an entity only exists in the store at
 ///   all if the origin proved it answers ranges -- a `206`, or a `200` that
@@ -1429,9 +1435,9 @@ async fn proxy(
     // rewrite failing exactly for the second player of a stream. Asking
     // [`is_a_playlist`] here, with the same inputs the fetch would give it,
     // is what makes the key's promise true: the store keeps origin bytes, and
-    // what is done with them is one question with one answer. A hit that
-    // would be a playlist steps aside and the origin is fetched and
-    // rewritten.
+    // what is done with them is one question with one answer. A hit whose
+    // answer is "playlist" steps aside, and the origin is fetched and its
+    // response classified the way any fetched one is.
     let cached = match cached {
         Some(cached)
             if cached.complete()
@@ -1476,7 +1482,7 @@ async fn proxy(
     // question that says so, and an origin that honours it answers the whole
     // of the new entity when the head has gone stale -- which is a correct
     // answer to the player rather than a tail it did not ask for. It is not
-    // the guard (an origin may ignore it, and many do); the guard is the
+    // the guard -- an origin is free to ignore it; the guard is the
     // comparison below, on what actually came back.
     let narrowed = cached.as_ref().map(|cached| {
         (
@@ -1841,9 +1847,10 @@ async fn proxy(
     //   splicing across that change produces a body half of one generation
     //   and half of another with nothing anywhere able to notice -- not the
     //   player, which was told a coherent `Content-Range`, and not this
-    //   store, which has no hash to check its own bytes against. It is the
-    //   only failure here that is silent, so it is the one the guard is
-    //   built around;
+    //   store, which has no hash to check its own bytes against. Every other
+    //   way this join can go wrong ends in a read that visibly breaks; this
+    //   one ends in a file that plays and is wrong, which is why it is the
+    //   question the guard is built around;
     // * its `Content-Range` begins exactly where the cache left off, in an
     //   entity of the same length;
     // * it is a `206`, under no content coding, and not a playlist.
@@ -1988,11 +1995,10 @@ async fn proxy(
             // not framing: relayed from here they are the *fetched*
             // response's, and half the body they would be labelling came off
             // disk. That is the same defect as the splice above, one step
-            // later -- the guard is what makes it a lie rather than what
-            // makes it true, since a stitch that happens has proved the two
-            // halves share a validator. What it has not proved is anything
-            // about the origin's *other* validator, so only the one that was
-            // compared goes back out.
+            // later. What makes any of them truthful is the guard: a stitch
+            // that happened has proved the two halves share one validator.
+            // What it has not proved is anything about the origin's *other*
+            // validator, so only the one that was compared goes back out.
             if stitched.is_some()
                 && matches!(
                     name,
