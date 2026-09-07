@@ -169,10 +169,16 @@ impl CacheLimit {
 /// `statvfs` probe against a real directory, which agreed with glibc and with
 /// `df` to the block.
 ///
-/// Failure -- a root that does not exist yet, a filesystem that refuses the
-/// call -- is `None`, never 0: an unreadable volume must not be read as "no
-/// room" and evict a healthy cache. The configured `cacheSize` then stands
-/// alone, exactly as it did before any of this existed.
+/// Failure -- a filesystem that refuses the call, a path on no volume the OS
+/// can name -- is `None`, never 0: an unreadable volume must not be read as
+/// "no room" and evict a healthy cache. The configured `cacheSize` then
+/// stands alone, exactly as it did before any of this existed. Which paths
+/// fail is the platform's business, not this function's: `statvfs` wants
+/// the path to exist, so on Unix a root not yet created is unreadable, while
+/// Windows resolves the volume from the drive letter (`GetVolumePathNameW`)
+/// and answers for a directory nothing has made yet. The tests therefore
+/// exercise the `None` through the probe seam of [`budgets_by_volume`], not
+/// by finding a path the OS will refuse.
 fn available_space(path: &std::path::Path) -> Option<u64> {
     match fs4::available_space(path) {
         Ok(available) => Some(available),
@@ -2411,6 +2417,16 @@ mod tests {
     /// An unreadable volume leaves the configured limit exactly as it was --
     /// never 0 free space, which would evict a healthy cache on the strength
     /// of a failed syscall.
+    ///
+    /// The refusal is injected through the probe parameter of
+    /// `budgets_by_volume` rather than staged with a path the OS will not
+    /// answer for, because there is no such path on every platform: `statvfs`
+    /// fails on a directory not yet created, but Windows names the volume from
+    /// the drive letter and answers for it with the drive's real free space.
+    /// (That is exactly how this test used to fail there, with the real
+    /// number where `None` was expected -- the property held; the fixture did
+    /// not.) What the cleaner does with a probe that answers `None` is the
+    /// property, and it is the same on both.
     #[test]
     fn an_unreadable_volume_leaves_the_configured_limit_alone() {
         assert_eq!(CacheLimit::configured(1024).effective(4096), Some(1024));
@@ -2421,10 +2437,23 @@ mod tests {
         assert_eq!(CacheLimit::configured(0).effective(4096), None);
         assert!(!CacheLimit::configured(0).disk_bound(4096));
 
-        // And that is what the probe reports for a path there is no volume
-        // to ask about, while a real directory answers with a real number.
+        // The seam the real probe is wired through: a volume whose free space
+        // cannot be read gets a budget with no filesystem reading behind it,
+        // so the configured cap -- or no cap -- is what it enforces.
+        let roots = [PathBuf::from("/c/rqbit-downloads")];
+        let volume_of = |_: &Path| Some(1);
+        let unreadable = |_: &Path| None;
+        for (configured, expected) in [(1024, Some(1024)), (u64::MAX, Some(u64::MAX)), (0, None)] {
+            let budgets = budgets_by_volume(&roots, configured, volume_of, unreadable);
+            assert_eq!(budgets.len(), 1);
+            assert_eq!(budgets[0].limit, CacheLimit::configured(configured));
+            assert_eq!(budgets[0].limit.effective(4096), expected);
+            assert!(!budgets[0].limit.disk_bound(4096));
+        }
+
+        // Whereas a real directory answers with a real number -- on every
+        // platform, which is all that can be said of the real probe here.
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(available_space(&tmp.path().join("not-created-yet")), None);
         assert!(available_space(tmp.path()).unwrap() > 0);
     }
 
