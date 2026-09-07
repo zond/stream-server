@@ -638,10 +638,45 @@ pub(crate) async fn clean_cache(state: &AppState) -> anyhow::Result<EvictionRepo
             .await?,
         );
     }
-    Ok(reports
+    let report = reports
         .into_iter()
         .reduce(EvictionReport::combined_with)
-        .unwrap_or_default())
+        .unwrap_or_default();
+    state.last_eviction.record(&report);
+    Ok(report)
+}
+
+/// The report of the last pass, kept for a reader that wants to know what
+/// the cache occupies without walking it (see [`LastEviction::get`]).
+///
+/// The memory sampler is that reader. It used to walk the whole download
+/// dir itself, synchronously, on the runtime, every thirty seconds -- twice
+/// the cleaner's debounce, and a hundred and twenty times its hourly
+/// fallback on an idle device -- for two numbers it then logged once a
+/// minute at most. The cleaner has just counted the same tree: while
+/// something is writing, a minute ago; while nothing is, whenever the tree
+/// last changed, which is when the figure last could have. So the sampler
+/// reads this, with its age, and walks nothing.
+#[derive(Default)]
+pub struct LastEviction(std::sync::Mutex<Option<(std::time::Instant, EvictionReport)>>);
+
+impl LastEviction {
+    pub(crate) fn record(&self, report: &EvictionReport) {
+        if let Ok(mut last) = self.0.lock() {
+            *last = Some((std::time::Instant::now(), report.clone()));
+        }
+    }
+
+    /// The last pass's report and how long ago that pass finished, or
+    /// `None` before the first pass has run (the first fallback tick fires at
+    /// startup, so that is a few seconds at most).
+    pub fn get(&self) -> Option<(Duration, EvictionReport)> {
+        self.0
+            .lock()
+            .ok()?
+            .as_ref()
+            .map(|(at, report)| (at.elapsed(), report.clone()))
+    }
 }
 
 /// What the cache currently occupies against its configured limit
@@ -1342,9 +1377,9 @@ async fn remove_empty_parents(mut dir: &std::path::Path, keep: &HashSet<std::pat
 mod tests {
     use super::{
         CACHE_FREE_SPACE_FLOOR, CacheLimit, CacheUsage, CleanSchedule, DiskFullRecovery,
-        EvictionReport, WALKED_ON_THIS_THREAD, available_space, budgets_by_volume, evict,
-        is_path_protected, is_session_artifact, occupied_bytes, outermost, remove_empty_parents,
-        scan_usage,
+        EvictionReport, LastEviction, WALKED_ON_THIS_THREAD, available_space, budgets_by_volume,
+        evict, is_path_protected, is_session_artifact, occupied_bytes, outermost,
+        remove_empty_parents, scan_usage,
     };
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
@@ -2760,5 +2795,36 @@ mod tests {
         };
         assert!(freed_something.made_room());
         assert!(freed_something.shortfall_message().is_none());
+    }
+
+    /// What the memory sampler reads instead of walking: nothing before the
+    /// first pass, and after it the pass's own report with its age.
+    #[test]
+    fn the_last_report_is_kept_with_its_age() {
+        let last = LastEviction::default();
+        assert!(last.get().is_none(), "no pass has run");
+
+        let report = EvictionReport {
+            total: 4096,
+            protected: 1024,
+            protected_files: 1,
+            limit: Some(1 << 30),
+            ..EvictionReport::default()
+        };
+        last.record(&report);
+        let (age, kept) = last.get().expect("a pass has run");
+        assert_eq!(kept, report);
+        assert!(age < Duration::from_secs(60), "recorded just now");
+
+        let next = EvictionReport {
+            total: 2048,
+            ..report.clone()
+        };
+        last.record(&next);
+        assert_eq!(
+            last.get().map(|(_, kept)| kept.total),
+            Some(2048),
+            "the latest pass wins"
+        );
     }
 }
