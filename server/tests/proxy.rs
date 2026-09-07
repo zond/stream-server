@@ -93,12 +93,18 @@ impl Origin {
     /// `Range` support, which is how a test tells "the proxy relayed the
     /// range" from "the proxy fetched the whole file and sliced it".
     fn start() -> anyhow::Result<Self> {
-        Self::start_with(|request: &Request, socket: &mut TcpStream| {
+        Self::start_sized(ORIGIN_LENGTH)
+    }
+
+    /// The default origin at another length, for a test whose ranges have
+    /// to be bigger than [`ORIGIN_LENGTH`] allows.
+    fn start_sized(length: usize) -> anyhow::Result<Self> {
+        Self::start_with(move |request: &Request, socket: &mut TcpStream| {
             let served = request.range().and_then(|value| {
                 let (first, last) = value.trim_start_matches("bytes=").split_once('-')?;
                 let first: usize = first.parse().ok()?;
                 let last: usize = if last.is_empty() {
-                    ORIGIN_LENGTH - 1
+                    length - 1
                 } else {
                     last.parse().ok()?
                 };
@@ -111,7 +117,7 @@ impl Origin {
                         format!(
                             "HTTP/1.1 206 Partial Content\r\nAccept-Ranges: bytes\r\n\
                              Content-Type: video/mp4\r\nETag: {ORIGIN_ETAG}\r\n\
-                             Content-Range: bytes {first}-{last}/{ORIGIN_LENGTH}\r\n\
+                             Content-Range: bytes {first}-{last}/{length}\r\n\
                              Content-Length: {}\r\nConnection: close\r\n\r\n",
                             body.len()
                         ),
@@ -119,12 +125,12 @@ impl Origin {
                     )
                 }
                 None => {
-                    let body: Vec<u8> = (0..ORIGIN_LENGTH).map(byte_at).collect();
+                    let body: Vec<u8> = (0..length).map(byte_at).collect();
                     (
                         format!(
                             "HTTP/1.1 200 OK\r\nAccept-Ranges: bytes\r\n\
                              Content-Type: video/mp4\r\nETag: {ORIGIN_ETAG}\r\n\
-                             Content-Length: {ORIGIN_LENGTH}\r\nConnection: close\r\n\r\n"
+                             Content-Length: {length}\r\nConnection: close\r\n\r\n"
                         ),
                         body,
                     )
@@ -4923,6 +4929,98 @@ fn closing_during_the_origin_s_time_to_first_byte_ends_that_stream() -> anyhow::
         "the stream its client already ended is not served to it"
     );
     assert_ne!(relayed, PAYLOAD, "and the origin's body is not relayed");
+
+    drop(fixture.handle);
+    Ok(())
+}
+
+/// A stitched response -- the cached head off disk, the origin's tail behind
+/// it -- is one body under one registration, so a close during the head
+/// breaks the read there. It used to register only the tail and chain the
+/// head in front of that: `Chain` never polls its second stream until the
+/// first has ended, so the close was answered `{"closed":1}`, `live()` fell
+/// to zero, and every remaining chunk of the head kept coming off disk to a
+/// player whose client had finished with it; the read broke only when the
+/// tail was first polled.
+#[test]
+fn closing_during_the_cached_head_of_a_stitched_response_breaks_the_read() -> anyhow::Result<()> {
+    use std::io::Read as _;
+
+    // A head longer than anything between hyper and this socket can buffer,
+    // so what the client can still read after the close is bounded by that
+    // buffering and not by the head's length: 64 chunks, 16 MiB. (Linux
+    // autotunes a loopback socket's send and receive buffers to a few MiB
+    // each at most; hyper's own write buffer is smaller than that.)
+    const HEAD_CHUNKS: u64 = 64;
+    let head_len = HEAD_CHUNKS * CHUNK;
+    let fixture = fixture_with(Origin::start_sized((head_len + 4 * CHUNK) as usize)?)?;
+    let origin = format!("http://{}", fixture.origin.addr);
+    let client = reqwest::blocking::Client::new();
+
+    // The head goes into the cache first, from a read that carries no token.
+    let warm = client
+        .get(format!(
+            "{}/proxy/?d={}",
+            fixture.base,
+            encode(&format!("{origin}/film.mkv"))
+        ))
+        .header(reqwest::header::RANGE, format!("bytes=0-{}", head_len - 1))
+        .send()?;
+    assert_eq!(warm.bytes()?.len() as u64, head_len);
+    fixture.origin.next_request();
+    wait_for_chunks(&fixture, HEAD_CHUNKS as usize);
+
+    // The stitched read: the whole head off disk, one chunk more from the
+    // origin, under the player's token.
+    let mut response = client
+        .get(format!(
+            "{}/proxy/?d={}&p=player-stitched",
+            fixture.base,
+            encode(&format!("{origin}/film.mkv"))
+        ))
+        .header(
+            reqwest::header::RANGE,
+            format!("bytes=0-{}", head_len + CHUNK - 1),
+        )
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        fixture.origin.next_request().range(),
+        Some(format!("bytes={head_len}-{}", head_len + CHUNK - 1)).as_deref(),
+        "only the tail is asked for; the head is the cache's"
+    );
+    let mut first = vec![0u8; CHUNK as usize];
+    response.read_exact(&mut first)?;
+    assert_eq!(first[0], byte_at(0), "the player is inside the cached head");
+    assert_eq!(fixture.handle.proxy_streams_live(), 1);
+
+    assert_eq!(fixture.handle.close_proxy_streams("player-stitched"), 1);
+
+    // What can still be read is what was already buffered on the way to this
+    // socket; then the read breaks -- inside the head, well short of the
+    // tail the registration used to cover alone.
+    let mut read_after_close = 0u64;
+    let mut buffer = vec![0u8; 64 * 1024];
+    let outcome = loop {
+        match response.read(&mut buffer) {
+            Ok(0) => break Ok(()),
+            Ok(n) => read_after_close += n as u64,
+            Err(error) => break Err(error),
+        }
+    };
+    assert!(
+        outcome.is_err(),
+        "the closed stream must break, not end tidily"
+    );
+    // Half the head is far more than any buffering accounts for (measured:
+    // one chunk), and far less than the old route served -- all of the head
+    // but the chunk hyper had in hand when the tail's first poll broke it.
+    assert!(
+        read_after_close < head_len / 2,
+        "the read broke inside the head: {read_after_close} more bytes after the close, \
+         of a {head_len}-byte head"
+    );
+    assert_eq!(fixture.handle.proxy_streams_live(), 0);
 
     drop(fixture.handle);
     Ok(())

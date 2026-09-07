@@ -110,13 +110,30 @@ impl ProxyStreams {
         S: Stream<Item = Result<Bytes, E>> + Send + 'static,
         E: std::error::Error + Send + Sync + 'static,
     {
-        let inner = Box::pin(inner.map(|chunk| chunk.map_err(std::io::Error::other)));
+        Some(self.register(token)?.wrap(inner))
+    }
+
+    /// The decision half of [`ProxyStreams::attach`] on its own: register a
+    /// stream under `token` -- or refuse, `None`, exactly as `attach` would
+    /// -- and hand back the [`Handle`] that wraps the body later.
+    ///
+    /// For a body that is not simply the origin's stream. `/proxy` builds a
+    /// stitched response as the cached head chained in front of the origin's
+    /// tail, with the cache writer over the tail, and two rules pull that
+    /// body in two directions. The writer may not be built until the
+    /// registration is decided, since a refusal serves no bytes and a writer
+    /// started before it would commit chunks off a stream nobody reads. And
+    /// the registry's stream must go around the *whole* body: `Chain` never
+    /// polls its second stream until the first has ended, so a close during
+    /// the head of a body that registered only the tail was answered
+    /// `{"closed":1}` while every remaining chunk of the head kept coming off
+    /// disk -- the close was polled, but only by the half that was not being
+    /// read. Deciding first and wrapping last is how both hold.
+    pub fn register(self: &Arc<Self>, token: Option<String>) -> Option<Handle> {
         let Some(token) = token else {
-            return Some(ClosableStream {
-                inner,
+            return Some(Handle {
                 close: None,
                 registration: None,
-                ended: false,
             });
         };
         let (close, closed) = oneshot::channel();
@@ -137,14 +154,12 @@ impl ProxyStreams {
             }
             self.live.insert(id, LiveStream { token, close });
         }
-        Some(ClosableStream {
-            inner,
+        Some(Handle {
             close: Some(closed),
             registration: Some(Registration {
                 streams: self.clone(),
                 id,
             }),
-            ended: false,
         })
     }
 
@@ -222,6 +237,33 @@ impl ProxyStreams {
         closed.push_back(token.to_string());
         while closed.len() > CLOSED_TOKENS_REMEMBERED {
             closed.pop_front();
+        }
+    }
+}
+
+/// A stream's place in the registry, decided but not yet wrapped around a
+/// body (see [`ProxyStreams::register`]). Dropped unwrapped, it takes the
+/// stream out of the registry again, as an ended body would.
+pub struct Handle {
+    close: Option<oneshot::Receiver<()>>,
+    registration: Option<Registration>,
+}
+
+impl Handle {
+    /// The body this registration is for, endable from outside. Everything
+    /// the player will read goes inside -- the close is polled only by polls
+    /// of what is wrapped, so a part of the body left outside is a part a
+    /// close cannot reach.
+    pub fn wrap<S, E>(self, inner: S) -> ClosableStream
+    where
+        S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        ClosableStream {
+            inner: Box::pin(inner.map(|chunk| chunk.map_err(std::io::Error::other))),
+            close: self.close,
+            registration: self.registration,
+            ended: false,
         }
     }
 }

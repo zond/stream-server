@@ -2154,10 +2154,7 @@ async fn proxy(
     // refused, if the close landed while the origin was still thinking. Same
     // `410` and for the same reason as the check above: the stream was asked
     // for, and its client ended it before a byte of it arrived.
-    let Some(stream) = state
-        .proxy_streams
-        .attach(player_token.clone(), response.bytes_stream())
-    else {
+    let Some(registration) = state.proxy_streams.register(player_token.clone()) else {
         tracing::debug!(
             token = player_token.as_deref().unwrap_or_default(),
             "a player token was closed while its origin was being fetched"
@@ -2170,21 +2167,38 @@ async fn proxy(
     };
 
     // The body, in the order it is built: the origin's bytes, the cache
-    // writer over them, and the cached head in front.
+    // writer over them, the cached head in front, and the registry's stream
+    // around the whole of it.
     //
-    // **The writer goes on after `attach`, never before.** `attach` can
-    // refuse -- the token was retired while the origin was thinking -- and
-    // that refusal serves no bytes at all; a writer started before it would
-    // have been committing chunks off a stream nobody ever read. It goes
-    // *under* the registry's stream and not over it for the other half of
-    // the same rule: what the writer sees is what the player is being
-    // served, so a close or a client that vanished ends the fill at the same
-    // byte it ends the read (see [`crate::proxy_cache::Filling`], and
-    // `proxy_streams::Registration`'s `Drop` for how a vanished client gets
-    // here at all).
+    // **The writer goes on after the registration is decided, never
+    // before.** `register` can refuse -- the token was retired while the
+    // origin was thinking -- and that refusal serves no bytes at all; a
+    // writer started before it would have been committing chunks off a
+    // stream nobody ever read. It goes *under* the registry's stream and not
+    // over it for the other half of the same rule: what the writer sees is
+    // what the player is being served, so a close or a client that vanished
+    // ends the fill at the same byte it ends the read (see
+    // [`crate::proxy_cache::Filling`], and `proxy_streams::Registration`'s
+    // `Drop` for how a vanished client gets here at all). And it goes over
+    // the origin's bytes only, never over the head: what is on disk is not
+    // written again.
+    //
+    // **The registry's stream goes around the whole body, head included.**
+    // It used to wrap the origin's stream alone, with the head chained in
+    // front of that, and `Chain` never polls its second stream until the
+    // first has ended -- so a close during the head was answered
+    // `{"closed":1}`, `live()` fell to zero, and every remaining chunk of the
+    // head kept coming off disk to a player whose client had finished with
+    // it; the read broke only when the tail was first polled. Wrapped last,
+    // the close is polled on every poll of the body, head reads included
+    // (`ClosableStream::poll_next`).
     let mut body: std::pin::Pin<
         Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>,
-    > = Box::pin(stream);
+    > = Box::pin(
+        response
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(std::io::Error::other)),
+    );
     if let Some(entity) = cacheable
         && let Some(entry) = cache_entry
     {
@@ -2201,7 +2215,10 @@ async fn proxy(
     if let Some(cached) = stitched {
         body = Box::pin(cached.body().chain(body));
     }
-    finalize_response(res_builder, axum::body::Body::from_stream(body))
+    finalize_response(
+        res_builder,
+        axum::body::Body::from_stream(registration.wrap(body)),
+    )
 }
 
 /// `POST /proxy-streams/{token}/close`: end every proxied stream the client
