@@ -3,7 +3,7 @@ pub mod parser;
 pub mod session;
 pub mod stream;
 
-use crate::archives::{ArchiveEntry, ArchiveReader, AsyncSeekableReader};
+use crate::archives::{ArchiveEntry, ArchiveReader, OpenedMember};
 use anyhow::{Result, anyhow};
 use std::path::PathBuf;
 
@@ -47,7 +47,7 @@ impl ArchiveReader for NzbHandler {
         Ok(entries)
     }
 
-    async fn open_file(&self, _path: &str) -> Result<Box<dyn AsyncSeekableReader>> {
+    async fn open_file(&self, _path: &str) -> Result<OpenedMember> {
         Err(anyhow!(
             "Direct NZB file streaming from disk not fully implemented (requires NNTP connection details)"
         ))

@@ -1,5 +1,6 @@
 use super::{
-    ArchiveEntry, ArchiveReader, AsyncSeekableReader, CacheConfig, cache::ProgressiveCache,
+    ArchiveEntry, ArchiveReader, AsyncSeekableReader, CacheConfig, OpenedMember,
+    cache::ProgressiveCache,
 };
 use anyhow::{Result, anyhow};
 use async_zip::tokio::read::seek::ZipFileReader;
@@ -95,7 +96,7 @@ impl ArchiveReader for ZipHandler {
         }
     }
 
-    async fn open_file(&self, path: &str) -> Result<Box<dyn AsyncSeekableReader>> {
+    async fn open_file(&self, path: &str) -> Result<OpenedMember> {
         let mut reader_guard = self.reader.lock().await;
 
         let reader_box: Box<dyn AsyncSeekableReader> = if let Some(p) = &self.path {
@@ -140,6 +141,6 @@ impl ArchiveReader for ZipHandler {
             }
         });
 
-        Ok(Box::new(cache.reader().await?))
+        Ok(OpenedMember::Extracted(cache))
     }
 }

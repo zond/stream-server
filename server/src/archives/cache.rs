@@ -2,7 +2,9 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{self, AsyncRead, AsyncSeek, AsyncWrite, AsyncWriteExt};
@@ -15,15 +17,78 @@ struct StateSnapshot {
     error: Option<String>,
 }
 
+/// How long an extraction goes on writing with nobody reading before it
+/// gives up (see [`Readers`]).
+///
+/// Long enough to bridge a seek -- the player drops one connection and
+/// opens the next a moment later, and an extraction that stopped in
+/// between would have to start over from the archive -- and long enough
+/// for a player that pauses with its connection closed to come back from a
+/// short pause. Short enough that a player that has gone for good costs
+/// half a minute of decoding and no more, rather than a whole member's
+/// worth.
+pub const ABANDONED_AFTER: Duration = Duration::from_secs(30);
+
+/// How many [`ProgressiveReader`]s are open on a cache right now. The
+/// writers watch it: an extraction nobody is reading is an extraction
+/// nobody wants, and once it has been that way for [`ABANDONED_AFTER`] the
+/// next write fails and the extraction unwinds. Before this a member was
+/// decoded to its end however early the player left -- the whole of a
+/// 4 GB member, on a slow SoC, for a request that lasted a second.
+#[derive(Default)]
+struct Readers(AtomicUsize);
+
+impl Readers {
+    fn any(&self) -> bool {
+        self.0.load(Ordering::SeqCst) > 0
+    }
+}
+
+/// The writer's side of the readers count: when it last saw a reader, and
+/// how long it waits for one.
+struct Abandonment {
+    readers: Arc<Readers>,
+    unread_since: Option<Instant>,
+    after: Duration,
+}
+
+impl Abandonment {
+    fn new(readers: Arc<Readers>, after: Duration) -> Self {
+        Self {
+            readers,
+            unread_since: None,
+            after,
+        }
+    }
+
+    /// `Err` once nobody has been reading for `after`.
+    fn check(&mut self) -> io::Result<()> {
+        if self.readers.any() {
+            self.unread_since = None;
+            return Ok(());
+        }
+        let since = *self.unread_since.get_or_insert_with(Instant::now);
+        if since.elapsed() >= self.after {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "extraction abandoned: nothing has read it for a while",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// The core cache controller
 ///
 /// The backing file is a [`NamedTempFile`] that is deleted when its last
 /// owner drops. Ownership is shared between the cache and its [`CacheWriter`]
 /// (see the `temp_file` fields), so the file outlives whichever of the two
-/// goes first. Callers routinely drop the cache as soon as they have a
-/// reader (`open_file` in the archive handlers returns only the reader), while
-/// the writer is moved into a background extraction task that may not start
-/// until later.
+/// goes first. The archive handlers hand the cache to the caller, who keeps
+/// it for as long as the member should stay extracted (`ArchiveSource`
+/// keeps one per member for the life of the session) and takes readers from
+/// it; the writer is moved into a background extraction task that may not
+/// start until later.
 #[derive(Clone)]
 pub struct ProgressiveCache {
     state_rx: watch::Receiver<StateSnapshot>,
@@ -32,6 +97,7 @@ pub struct ProgressiveCache {
     _temp_file_handle: Arc<NamedTempFile>,
     total_size: Option<u64>,
     notify: Arc<Notify>,
+    readers: Arc<Readers>,
 }
 
 impl ProgressiveCache {
@@ -69,6 +135,7 @@ impl ProgressiveCache {
 
         let (tx, rx) = watch::channel(initial_state);
         let notify = Arc::new(Notify::new());
+        let readers = Arc::new(Readers::default());
 
         // Open async file for writer
         let writer_file = OpenOptions::new()
@@ -83,6 +150,7 @@ impl ProgressiveCache {
             _video_file_size: total_size,
             notify: notify.clone(),
             temp_file: handle.clone(),
+            abandonment: Abandonment::new(readers.clone(), ABANDONED_AFTER),
         };
 
         Ok((
@@ -92,13 +160,17 @@ impl ProgressiveCache {
                 _temp_file_handle: handle,
                 total_size,
                 notify,
+                readers,
             },
             writer,
         ))
     }
 
+    /// A reader from the start of the member. Counted: while it lives the
+    /// extraction is wanted (see [`Readers`]).
     pub async fn reader(&self) -> io::Result<ProgressiveReader> {
         let file = File::open(&self.temp_path).await?;
+        self.readers.0.fetch_add(1, Ordering::SeqCst);
         Ok(ProgressiveReader {
             state_rx: self.state_rx.clone(),
             file,
@@ -106,7 +178,15 @@ impl ProgressiveCache {
             total_size: self.total_size,
             notify: self.notify.clone(),
             wait: None,
+            readers: self.readers.clone(),
         })
+    }
+
+    /// Whether the extraction ended in an error -- decoding failed, or it
+    /// was abandoned -- so a reader taken now would only be told so. A
+    /// holder keeping caches around replaces one that has.
+    pub fn is_failed(&self) -> bool {
+        self.state_rx.borrow().error.is_some()
     }
 }
 
@@ -121,6 +201,7 @@ pub struct CacheWriter {
     /// file already deleted. Also the source of handle dups for
     /// [`Self::try_clone_sync`].
     temp_file: Arc<NamedTempFile>,
+    abandonment: Abandonment,
 }
 
 impl AsyncWrite for CacheWriter {
@@ -129,6 +210,10 @@ impl AsyncWrite for CacheWriter {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if let Err(abandoned) = self.abandonment.check() {
+            self.set_error(abandoned.to_string());
+            return Poll::Ready(Err(abandoned));
+        }
         let poll = Pin::new(&mut self.file).poll_write(cx, buf);
         if let Poll::Ready(Ok(n)) = poll
             && n > 0
@@ -204,7 +289,16 @@ impl CacheWriter {
             state_tx: self.state_tx.clone(),
             file,
             notify: self.notify.clone(),
+            abandonment: Abandonment::new(self.abandonment.readers.clone(), self.abandonment.after),
         })
+    }
+
+    /// How long this writer (and sync clones taken after this) keeps writing
+    /// with no reader before giving up; [`ABANDONED_AFTER`] unless a test
+    /// says otherwise.
+    #[cfg(test)]
+    pub fn abandon_after(&mut self, after: Duration) {
+        self.abandonment.after = after;
     }
 }
 
@@ -213,6 +307,7 @@ pub struct SyncCacheWriter {
     state_tx: watch::Sender<StateSnapshot>,
     file: std::fs::File,
     notify: Arc<Notify>,
+    abandonment: Abandonment,
 }
 
 impl SyncCacheWriter {
@@ -234,6 +329,10 @@ impl SyncCacheWriter {
 
 impl std::io::Write for SyncCacheWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Err(abandoned) = self.abandonment.check() {
+            self.set_error(abandoned.to_string());
+            return Err(abandoned);
+        }
         let n = self.file.write(buf)?;
         if n > 0 {
             self.state_tx.send_modify(|state| {
@@ -261,6 +360,14 @@ pub struct ProgressiveReader {
     /// a locally created-and-dropped future would miss every
     /// `notify_waiters()` from the writer and the reader would hang forever.
     wait: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+    /// Counted in by `ProgressiveCache::reader`, out on drop.
+    readers: Arc<Readers>,
+}
+
+impl Drop for ProgressiveReader {
+    fn drop(&mut self) {
+        self.readers.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl AsyncRead for ProgressiveReader {
@@ -603,5 +710,85 @@ mod tests {
 
         let err = reader.seek(SeekFrom::Current(-5)).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// A short grace for the abandonment tests: real time, since the sync
+    /// writer runs off the runtime and cannot see a paused clock. The loops
+    /// below are bounded, not timed -- a regression fails, never hangs.
+    const GRACE: std::time::Duration = std::time::Duration::from_millis(50);
+    const BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// An extraction whose last reader has gone stops: once the grace has
+    /// passed the next write fails, through both the async writer and a
+    /// sync clone of it, and the cache reports the failure so a holder
+    /// replaces it rather than handing out readers onto a dead extraction.
+    #[tokio::test]
+    async fn a_writer_nobody_reads_from_gives_up_after_the_grace() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cache, mut writer) = ProgressiveCache::new_in_dir(dir.path(), None)
+            .await
+            .unwrap();
+        writer.abandon_after(GRACE);
+        let reader = cache.reader().await.unwrap();
+        writer.write_all(b"read").await.expect("a reader is there");
+        drop(reader);
+        assert!(!cache.is_failed());
+
+        let deadline = std::time::Instant::now() + BOUND;
+        let err = loop {
+            match writer.write_all(b"unread").await {
+                Ok(()) => assert!(
+                    std::time::Instant::now() < deadline,
+                    "the writer never gave up"
+                ),
+                Err(err) => break err,
+            }
+            tokio::time::sleep(GRACE / 5).await;
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(cache.is_failed(), "the failure is recorded on the cache");
+
+        // A sync clone watches the same readers with a clock of its own: its
+        // first write starts the grace, and with nobody reading it gives up
+        // the same way.
+        let mut sync = writer.try_clone_sync().unwrap();
+        let deadline = std::time::Instant::now() + BOUND;
+        let err = loop {
+            match std::io::Write::write_all(&mut sync, b"still unread") {
+                Ok(()) => assert!(
+                    std::time::Instant::now() < deadline,
+                    "the sync writer never gave up"
+                ),
+                Err(err) => break err,
+            }
+            std::thread::sleep(GRACE / 5);
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    /// While a reader is open the writer keeps going however slowly the
+    /// reader reads, and a reader that arrives before the grace is up
+    /// resets it -- a seek, which is one connection closing and another
+    /// opening, does not cost the extraction.
+    #[tokio::test]
+    async fn a_reader_keeps_the_writer_going() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cache, mut writer) = ProgressiveCache::new_in_dir(dir.path(), None)
+            .await
+            .unwrap();
+        writer.abandon_after(GRACE);
+        let reader = cache.reader().await.unwrap();
+        for _ in 0..4 {
+            tokio::time::sleep(GRACE).await;
+            writer.write_all(b"x").await.expect("a reader is open");
+        }
+
+        // Gone, then back before the grace is up.
+        drop(reader);
+        tokio::time::sleep(GRACE / 2).await;
+        let _next = cache.reader().await.unwrap();
+        tokio::time::sleep(GRACE).await;
+        writer.write_all(b"y").await.expect("the new reader counts");
+        assert!(!cache.is_failed());
     }
 }

@@ -544,8 +544,8 @@ async fn stream_file(
     // torrent-backed form, which has no session.
     let mut session_in_use = None;
 
-    // 1. Determine Input Source
-    let archive_reader: Box<dyn crate::archives::ArchiveReader> = if key.starts_with("torrent:") {
+    // 1. Determine Input Source, and open the member in it
+    let mut reader: Box<dyn crate::archives::AsyncSeekableReader> = if key.starts_with("torrent:") {
         // Format: torrent:<info_hash>/path/to/archive
         let parts: Vec<&str> = key.splitn(3, '/').collect();
         if parts.len() < 2 {
@@ -633,7 +633,7 @@ async fn stream_file(
                     .rsplit_once('.')
                     .map(|(_, extension)| extension)
                     .unwrap_or("");
-                crate::archives::get_archive_reader_from_stream(
+                let archive_reader = crate::archives::get_archive_reader_from_stream(
                     wrapped_reader,
                     extension,
                     cache_config,
@@ -641,7 +641,16 @@ async fn stream_file(
                 .map_err(|e| {
                     tracing::error!("Failed to create stream reader: {}", e);
                     StatusCode::INTERNAL_SERVER_ERROR
-                })?
+                })?;
+                // No session to keep the extraction in: this form pays for
+                // one per request.
+                archive_reader
+                    .open_file(file_path_in_archive)
+                    .await
+                    .map_err(|_| StatusCode::NOT_FOUND)?
+                    .into_reader()
+                    .await
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
             } else {
                 return Err(StatusCode::NOT_FOUND);
             }
@@ -657,23 +666,24 @@ async fn stream_file(
             return Ok(rar_disabled_response());
         }
 
-        let reader = session.source.reader().await.map_err(|e| {
-            tracing::error!(
-                "Failed to create reader for {:?}: {}",
-                session.source.path(),
-                e
-            );
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        // One extraction per member per archive, whatever the number of
+        // requests on it (see `ArchiveSource::open_member`).
+        let reader = session
+            .source
+            .open_member(file_path_in_archive)
+            .await
+            .map_err(|e| {
+                tracing::warn!(
+                    archive = %session.source.path().display(),
+                    member = file_path_in_archive,
+                    error = %e,
+                    "archive member could not be opened"
+                );
+                StatusCode::NOT_FOUND
+            })?;
         session_in_use = Some(session);
         reader
     };
-
-    // 2. Open Entry
-    let mut reader = archive_reader
-        .open_file(file_path_in_archive)
-        .await
-        .map_err(|_| StatusCode::NOT_FOUND)?;
 
     // 3. Determine Content Length
     let file_size = reader

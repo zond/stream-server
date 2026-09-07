@@ -1,5 +1,5 @@
 use super::{
-    ArchiveEntry, ArchiveReader, AsyncSeekableReader, CacheConfig,
+    ArchiveEntry, ArchiveReader, AsyncSeekableReader, CacheConfig, OpenedMember,
     cache::{ProgressiveCache, SyncCacheWriter},
 };
 use anyhow::{Result, anyhow};
@@ -129,7 +129,7 @@ impl ArchiveReader for SevenZHandler {
         .await?
     }
 
-    async fn open_file(&self, path: &str) -> Result<Box<dyn AsyncSeekableReader>> {
+    async fn open_file(&self, path: &str) -> Result<OpenedMember> {
         let Some(archive_path) = self.path.clone() else {
             // Stream-based access not yet supported (see list_files).
             return Err(anyhow!("Streaming 7z from remote source not supported yet"));
@@ -179,8 +179,7 @@ impl ArchiveReader for SevenZHandler {
             }
         });
 
-        let reader = cache.reader().await?;
-        Ok(Box::new(reader))
+        Ok(OpenedMember::Extracted(cache))
     }
 }
 
@@ -287,14 +286,23 @@ mod tests {
         let mut reader = handler
             .open_file("videos/second.bin")
             .await
-            .expect("open entry");
+            .expect("open entry")
+            .into_reader()
+            .await
+            .expect("open reader");
         let mut data = Vec::new();
         reader.read_to_end(&mut data).await.expect("read entry");
 
         assert_eq!(data, second_content());
 
         // The smaller entry decodes correctly too.
-        let mut reader = handler.open_file("first.txt").await.expect("open entry");
+        let mut reader = handler
+            .open_file("first.txt")
+            .await
+            .expect("open entry")
+            .into_reader()
+            .await
+            .expect("open reader");
         let mut data = Vec::new();
         reader.read_to_end(&mut data).await.expect("read entry");
         assert_eq!(data, FIRST_CONTENT);
@@ -310,7 +318,10 @@ mod tests {
         let mut reader = handler
             .open_file("videos/second.bin")
             .await
-            .expect("open entry");
+            .expect("open entry")
+            .into_reader()
+            .await
+            .expect("open reader");
 
         // Seek into the middle of the entry and read a bounded range, the way
         // an HTTP Range request is served.
@@ -346,13 +357,22 @@ mod tests {
         let mut reader = handler
             .open_file("videos/second.bin")
             .await
-            .expect("open entry");
+            .expect("open entry")
+            .into_reader()
+            .await
+            .expect("open reader");
         let mut data = Vec::new();
         reader.read_to_end(&mut data).await.expect("read entry");
         assert_eq!(data, second_content());
 
         // The first entry of the block still extracts correctly.
-        let mut reader = handler.open_file("first.txt").await.expect("open entry");
+        let mut reader = handler
+            .open_file("first.txt")
+            .await
+            .expect("open entry")
+            .into_reader()
+            .await
+            .expect("open reader");
         let mut data = Vec::new();
         reader.read_to_end(&mut data).await.expect("read entry");
         assert_eq!(data, FIRST_CONTENT);
@@ -384,11 +404,20 @@ mod tests {
                     let mut reader = handler
                         .open_file("videos/second.bin")
                         .await
-                        .expect("open second entry");
+                        .expect("open second entry")
+                        .into_reader()
+                        .await
+                        .expect("open reader");
                     let mut second = Vec::new();
                     reader.read_to_end(&mut second).await.expect("read second");
 
-                    let mut reader = handler.open_file("first.txt").await.expect("open first");
+                    let mut reader = handler
+                        .open_file("first.txt")
+                        .await
+                        .expect("open first")
+                        .into_reader()
+                        .await
+                        .expect("open reader");
                     let mut first = Vec::new();
                     reader.read_to_end(&mut first).await.expect("read first");
                     (first, second)

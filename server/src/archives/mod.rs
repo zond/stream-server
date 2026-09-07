@@ -135,14 +135,40 @@ pub fn scratch_file(
 pub trait AsyncSeekableReader: AsyncRead + AsyncSeek + Unpin + Send {}
 impl<T: AsyncRead + AsyncSeek + Unpin + Send> AsyncSeekableReader for T {}
 
+/// A member opened by [`ArchiveReader::open_file`].
+///
+/// Most formats have to decode the member, and do so into a
+/// [`cache::ProgressiveCache`] that any number of readers can be taken from
+/// while the decoding runs. The cache is what `open_file` returns, not a
+/// reader from it, so the caller can keep it and serve every later request
+/// for the same member -- a player's range requests, one per seek -- from
+/// the one extraction rather than starting another (see
+/// `ArchiveSource::open_member`). A format that needs no decoding (a stored
+/// TAR member is a slice of the archive) returns a reader over the archive
+/// itself; there is nothing to keep.
+pub enum OpenedMember {
+    Extracted(cache::ProgressiveCache),
+    Direct(Box<dyn AsyncSeekableReader>),
+}
+
+impl OpenedMember {
+    /// One reader, for a caller with nothing to keep the cache in.
+    pub async fn into_reader(self) -> Result<Box<dyn AsyncSeekableReader>> {
+        match self {
+            Self::Extracted(cache) => Ok(Box::new(cache.reader().await?)),
+            Self::Direct(reader) => Ok(reader),
+        }
+    }
+}
+
 /// Trait for Archive implementations
 #[async_trait]
 pub trait ArchiveReader: Send + Sync {
     /// List all files in the archive
     async fn list_files(&self) -> Result<Vec<ArchiveEntry>>;
 
-    /// Open a stream for a specific file inside the archive
-    async fn open_file(&self, path: &str) -> Result<Box<dyn AsyncSeekableReader>>;
+    /// Open a specific file inside the archive -- see [`OpenedMember`].
+    async fn open_file(&self, path: &str) -> Result<OpenedMember>;
 }
 
 /// Create an archive reader with custom cache configuration

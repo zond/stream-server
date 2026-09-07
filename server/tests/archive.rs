@@ -251,10 +251,26 @@ fn an_archive_by_url_is_kept_under_the_cache_root_and_fetched_once() -> anyhow::
     );
     assert_eq!(ranged.bytes()?.as_ref(), &expected[40000..41000]);
 
-    // The redirect form stremio-core uses: GET create lands on the chosen
-    // member of a session sharing the same download.
-    let redirected = client.get(&member).send()?;
-    assert_eq!(redirected.status(), reqwest::StatusCode::OK);
+    let again = client.get(&member).send()?;
+    assert_eq!(again.status(), reqwest::StatusCode::OK);
+
+    // Three requests on the member -- the shape of a player's head, tail
+    // and seek -- were one extraction, kept beside the download for the
+    // next request, not one per request.
+    let files = fixture.scratch_files();
+    assert_eq!(
+        files
+            .iter()
+            .filter(|name| name.starts_with("archive_extract_"))
+            .count(),
+        1,
+        "one extraction for three requests: {files:?}"
+    );
+    assert_eq!(
+        files.iter().filter(|name| name.ends_with(".7z")).count(),
+        1,
+        "{files:?}"
+    );
 
     let second_key = fixture.create_key(&url)?;
     assert_ne!(second_key, key, "a session per create");
@@ -263,7 +279,15 @@ fn an_archive_by_url_is_kept_under_the_cache_root_and_fetched_once() -> anyhow::
         1,
         "the second create reused the first's download"
     );
-    assert_eq!(fixture.scratch_files().len(), 1);
+    assert_eq!(
+        fixture
+            .scratch_files()
+            .iter()
+            .filter(|name| name.ends_with(".7z"))
+            .count(),
+        1,
+        "and downloaded nothing"
+    );
 
     fixture.finish()
 }

@@ -1,5 +1,5 @@
 use super::{
-    ArchiveEntry, ArchiveReader, AsyncSeekableReader, CacheConfig,
+    ArchiveEntry, ArchiveReader, CacheConfig, OpenedMember,
     cache::{ProgressiveCache, SyncCacheWriter},
 };
 use anyhow::{Result, anyhow};
@@ -119,7 +119,7 @@ impl ArchiveReader for RarHandler {
         .await?
     }
 
-    async fn open_file(&self, path: &str) -> Result<Box<dyn AsyncSeekableReader>> {
+    async fn open_file(&self, path: &str) -> Result<OpenedMember> {
         let archive_path = self.path.clone();
         let target = path.to_string();
 
@@ -159,8 +159,7 @@ impl ArchiveReader for RarHandler {
             }
         });
 
-        let reader = cache.reader().await?;
-        Ok(Box::new(reader))
+        Ok(OpenedMember::Extracted(cache))
     }
 }
 
@@ -343,13 +342,22 @@ mod tests {
         let mut reader = handler
             .open_file("videos/second.bin")
             .await
-            .expect("open entry");
+            .expect("open entry")
+            .into_reader()
+            .await
+            .expect("open reader");
         let mut data = Vec::new();
         reader.read_to_end(&mut data).await.expect("read entry");
         assert_eq!(data, second_content());
 
         // The smaller entry decodes correctly too.
-        let mut reader = handler.open_file("first.txt").await.expect("open entry");
+        let mut reader = handler
+            .open_file("first.txt")
+            .await
+            .expect("open entry")
+            .into_reader()
+            .await
+            .expect("open reader");
         let mut data = Vec::new();
         reader.read_to_end(&mut data).await.expect("read entry");
         assert_eq!(data, FIRST_CONTENT);
@@ -365,7 +373,10 @@ mod tests {
         let mut reader = handler
             .open_file("videos/second.bin")
             .await
-            .expect("open entry");
+            .expect("open entry")
+            .into_reader()
+            .await
+            .expect("open reader");
 
         // Seek into the middle of the entry and read a bounded range, the way
         // an HTTP Range request is served.

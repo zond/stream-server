@@ -1,4 +1,4 @@
-use super::{ArchiveEntry, ArchiveReader, AsyncSeekableReader};
+use super::{ArchiveEntry, ArchiveReader, OpenedMember};
 use anyhow::{Result, anyhow};
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -38,7 +38,7 @@ impl ArchiveReader for TarHandler {
         .await?
     }
 
-    async fn open_file(&self, path: &str) -> Result<Box<dyn AsyncSeekableReader>> {
+    async fn open_file(&self, path: &str) -> Result<OpenedMember> {
         // For TAR, we need to find the offset and size.
         // We can't jump directly without index.
         // Linear scan is needed (unfortunately, typical for TAR).
@@ -62,7 +62,7 @@ impl ArchiveReader for TarHandler {
         .await??;
 
         let slice = AsyncRawFileSlice::new(self.path.clone(), offset, size).await?;
-        Ok(Box::new(slice))
+        Ok(OpenedMember::Direct(Box::new(slice)))
     }
 }
 

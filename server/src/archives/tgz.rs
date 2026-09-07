@@ -1,6 +1,4 @@
-use super::{
-    ArchiveEntry, ArchiveReader, AsyncSeekableReader, CacheConfig, cache::ProgressiveCache,
-};
+use super::{ArchiveEntry, ArchiveReader, CacheConfig, OpenedMember, cache::ProgressiveCache};
 use anyhow::{Result, anyhow};
 use std::path::PathBuf;
 
@@ -40,7 +38,7 @@ impl ArchiveReader for TgzHandler {
         .await?
     }
 
-    async fn open_file(&self, path: &str) -> Result<Box<dyn AsyncSeekableReader>> {
+    async fn open_file(&self, path: &str) -> Result<OpenedMember> {
         // TGZ requires decompression. Random access is impossible without decompressing up to that point.
         // We use ProgressiveCache + spawn_blocking to decompress directly to cache.
         // This supports seeking on result.
@@ -113,6 +111,6 @@ impl ArchiveReader for TgzHandler {
             }
         });
 
-        Ok(Box::new(cache.reader().await?))
+        Ok(OpenedMember::Extracted(cache))
     }
 }
