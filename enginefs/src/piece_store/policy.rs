@@ -71,13 +71,45 @@
 //!
 //! "Leaves the window" is therefore a transition and not a position, and
 //! deciding it needs one pass of memory: the window the previous
-//! [`RetentionPolicy::advance`] chose. A held piece is a commit candidate
-//! exactly when that window covered it and this one does not. A held piece the
-//! window has never covered is a reclaim candidate and nothing else, whichever
-//! side of the playhead it is on. Waiting until the window releases a piece is
-//! also what makes "a piece we might reclaim is never announced" decidable in
-//! one place: the decision to advertise and the decision never to reclaim are
-//! the same decision, taken once.
+//! [`RetentionPolicy::advance`] chose. But "that window covered it and this
+//! one does not" is *not* the transition -- it is only the window stopping
+//! covering the piece, which is a thing seeks do wholesale and in both
+//! directions. **A release is a piece the playhead has moved past**, which is
+//! three conditions and not one: the previous window covered it, it is behind
+//! the playhead now, and the playhead got where it is by walking rather than
+//! jumping -- every piece between where it was and where it is now was covered
+//! by that window. The window is the whole of what we fetch, so a playhead
+//! beyond the last piece it covered crossed pieces we never held and cannot
+//! have played them. A held piece the window has never covered is a reclaim
+//! candidate and nothing else, whichever side of the playhead it is on.
+//! Waiting until the window releases a piece is also what makes "a piece we
+//! might reclaim is never announced" decidable in one place: the decision to
+//! advertise and the decision never to reclaim are the same decision, taken
+//! once.
+//!
+//! **A large forward seek therefore commits nothing, exactly like a backward
+//! one.** The pieces it jumps over were covered and are behind the playhead
+//! now, and calling them released is the tempting reading -- but playback
+//! never reached them either. They are the read-ahead of a position the player
+//! walked away from, and settling the permanent, never-reclaimed,
+//! always-advertised set out of them is the thing this section rules out, in
+//! whichever direction it is done. So they are reclaimed like any other cache
+//! the playhead has not reached. That is the rule the owner set -- we keep
+//! pieces we have *seen*, and we never settle the shared set from read-ahead
+//! -- rather than the shorter predicate: the cost of it is that a seeky
+//! session shares less, on a volume too small to share much anyway, and the
+//! cost of the other choice is that the rule stops being true. Being about
+//! walking rather than about the sign of the movement is also why both seeks
+//! land in the same place, and why neither needs a case of its own.
+//!
+//! One ambiguity is left, and it is bounded rather than hidden: inside the
+//! reach of the previous window a seek and playing on are the same
+//! observation -- a playhead that has moved forward over pieces we held -- so
+//! a seek shorter than a window commits what it skipped. Those are pieces we
+//! had already fetched for imminent playback, within a window of where the
+//! playhead really was, and there are at most a window's worth of them; that
+//! is a different thing from a warm cache or a jumped-over region, both of
+//! which are unbounded and neither of which is next to the playhead at all.
 //!
 //! **The first pieces offered win, and the set then never changes.** The
 //! design says to choose by whatever is cheapest and explicitly not by rarity:
@@ -186,6 +218,14 @@ pub struct RetentionPolicy {
     /// playback has passed over. Empty until the first pass, so a stream that
     /// starts on a warm cache commits none of it -- those pieces are reclaim
     /// candidates like any other piece no window has covered.
+    ///
+    /// It answers two questions and both are needed. *Was this piece covered?*
+    /// -- and *did the playhead walk out of here, or jump?*, which is
+    /// [`Range::end`] against the playhead: a playhead past the last piece
+    /// this window covered crossed pieces no window ever held for it. Without
+    /// the second question a seek commits the window it left, forward over the
+    /// read-ahead it never reached and backward over the same, which is the
+    /// mistake this field exists to prevent wearing one sign or the other.
     ///
     /// One pass is all the memory the rule needs, and the cost of it being
     /// only one is stated rather than hidden: a piece we did not hold at the
@@ -328,11 +368,14 @@ impl RetentionPolicy {
     /// this as two outcomes and reclaims whatever is outside the window
     /// deletes the pieces it is advertising, which is the advertise-then-
     /// refuse the whole policy exists to avoid. Any *other* held piece outside
-    /// the window is **committed** if the previous pass's window covered it --
-    /// that is what makes it a piece the window released rather than one it
-    /// has never reached (see [`Self::covered`]) -- and **reclaimed** if not.
-    /// So the first pass of a stream commits nothing: no window has covered
-    /// anything yet.
+    /// the window is **committed** if the window *released* it -- the previous
+    /// pass covered it, it is behind `playhead` now, and `playhead` is no
+    /// further on than the last piece that window covered, so playback walked
+    /// past this piece rather than jumping over it (see [`Self::covered`]) --
+    /// and **reclaimed** if not. So the first pass of a stream commits
+    /// nothing, no window having covered anything yet, and so does either
+    /// direction of a seek: what a seek leaves behind is read-ahead it never
+    /// reached.
     ///
     /// Idempotent for a fixed playhead and a fixed `held`: the second call
     /// commits nothing new and reclaims the same pieces, because a reclaim is
@@ -364,6 +407,18 @@ impl RetentionPolicy {
             Shape::Whole => usize::MAX,
             Shape::Split { committed, .. } => committed as usize,
         };
+        // Did the playhead walk here or jump here? It walked if every piece
+        // between where it was and where it is now was covered by the previous
+        // window, and that window is the whole of what we fetch, so a playhead
+        // past the last piece it covered crossed pieces we never held and
+        // cannot have played them. `covered.end` is the boundary and it is
+        // reachable, not excluded: it is the first piece that window did not
+        // hold, and a playhead sitting on it has played up *to* that piece
+        // rather than through it. Clamped the way `window_at` clamps, so a
+        // playhead off the end of the file decides what the window decides.
+        let playhead = playhead.clamp(self.pieces.start, self.pieces.end - 1);
+        let walked = playhead <= self.covered.end;
+
         // Ascending, so "the first pieces offered win" is a stable rule and
         // not a function of iteration order.
         for &piece in held {
@@ -371,10 +426,13 @@ impl RetentionPolicy {
                 continue;
             }
             // Outside the window is what makes a piece reclaimable. Having
-            // been inside the *previous* one is what makes it committable:
-            // together they are the window letting go of it.
+            // been inside the *previous* one, being behind the playhead now,
+            // and the playhead having walked here rather than jumped are what
+            // make it committable: together they are playback moving past it,
+            // where "outside the previous window" alone is only the window
+            // stopping covering it, which a seek does in either direction.
             let outside = !window.contains(&piece);
-            let released = outside && self.covered.contains(&piece);
+            let released = outside && piece < playhead && walked && self.covered.contains(&piece);
             // Under `Whole` there is no window to be released from: the file
             // fits, so every piece of it is shared as soon as it arrives.
             if (released || self.shape == Shape::Whole) && self.committed.len() < capacity {
@@ -408,6 +466,28 @@ mod tests {
             u64::from(count) * PIECE,
         )
         .expect("a consistent file")
+    }
+
+    /// Play the stream through `playheads`, as a caller would: honour every
+    /// reclaim, and fill in whatever the window covers, because covering a
+    /// piece is what fetches it.
+    ///
+    /// Stepping matters, and several tests below need it rather than a single
+    /// leap: a playhead that arrives beyond the last piece the previous window
+    /// covered has jumped over pieces we never held, and this policy commits
+    /// nothing for a jump.
+    fn play(
+        p: &mut RetentionPolicy,
+        disk: &mut BTreeSet<u32>,
+        playheads: impl IntoIterator<Item = u32>,
+    ) {
+        for playhead in playheads {
+            let d = p.advance(playhead, disk);
+            for piece in &d.reclaim {
+                disk.remove(piece);
+            }
+            disk.extend(d.window.clone());
+        }
     }
 
     #[test]
@@ -625,23 +705,30 @@ mod tests {
         }
         assert_eq!(disk, held(29..39));
 
-        // Playing on. The window slides off what it covered, and those ten --
-        // which we hold, because covering them is what fetched them -- fill
-        // the shared half.
-        disk.extend(39..49);
-        let d = p.advance(40, &disk);
-        assert_eq!(d.window, 39..49);
+        // Playing on, a piece at a time. The window slides off the pieces
+        // behind the playhead one by one, and those -- which we hold, because
+        // covering them is what fetched them -- fill the shared half.
+        let d = p.advance(31, &disk);
+        assert_eq!(d.window, 30..40);
         assert_eq!(
             d.committed,
-            (29..39).collect::<Vec<_>>(),
-            "the first ten the window let go of fill the shared half"
+            vec![29],
+            "the one piece the window has walked off"
         );
         assert!(d.reclaim.is_empty(), "and nothing else is held");
-        assert_eq!(*p.advertised(), held(29..39));
+        disk.extend(d.window.clone());
+
+        play(&mut p, &mut disk, 32..41);
+        assert_eq!(
+            *p.advertised(),
+            held(29..39),
+            "ten pieces of playback, and the shared half is full"
+        );
 
         // A scan back of a few seconds is served from the window itself, and
         // what the window leaves behind now has nowhere to go: the shared half
         // is full.
+        assert_eq!(p.window_at(40), 39..49);
         let d = p.advance(39, &disk);
         assert_eq!(d.window, 38..48);
         assert!(d.committed.is_empty(), "the shared half is full");
@@ -674,21 +761,107 @@ mod tests {
         );
     }
 
+    /// A seek back commits nothing. The previous window stops covering all ten
+    /// of its pieces at once, but the playhead did not move *past* them: it
+    /// moved back over the one it was on and away from nine it had never
+    /// reached.
+    ///
+    /// Reading "released" as "the previous window covered it and this one does
+    /// not" made a scrub back -- or a player reading a trailing `moov` atom and
+    /// returning to 0 -- settle the permanent, never-reclaimed,
+    /// always-advertised set out of read-ahead, which is the same mistake as
+    /// committing a warm cache wearing the opposite sign.
+    #[test]
+    fn a_seek_back_commits_none_of_the_window_it_left() {
+        let mut p = policy(20, 200);
+        let disk = held(29..39);
+        let d = p.advance(30, &disk);
+        assert_eq!(d.window, 29..39);
+        assert!(d.committed.is_empty() && d.reclaim.is_empty());
+
+        // Back to the start, having played one piece.
+        let d = p.advance(0, &disk);
+        assert_eq!(d.window, 0..10);
+        assert!(
+            d.committed.is_empty() && p.advertised().is_empty(),
+            "committed {:?} for a playhead that has only ever been on piece 30",
+            d.committed
+        );
+        assert_eq!(
+            d.reclaim,
+            (29..39).collect::<Vec<_>>(),
+            "read-ahead the playhead left behind is cache to give back"
+        );
+    }
+
+    /// And a seek *forward* is the same, which is the point: the pieces it
+    /// jumps over were covered and are behind the playhead now, and playback
+    /// passed over none of them either. What decides is whether the window slid
+    /// or jumped, not the sign of the movement.
+    #[test]
+    fn a_seek_on_commits_none_of_the_window_it_jumped_out_of() {
+        let mut p = policy(20, 200);
+        let mut disk = held(29..39);
+        p.advance(30, &disk);
+
+        let d = p.advance(120, &disk);
+        assert_eq!(d.window, 119..129);
+        assert!(
+            d.committed.is_empty() && p.advertised().is_empty(),
+            "committed {:?} the playhead skipped over",
+            d.committed
+        );
+        assert_eq!(d.reclaim, (29..39).collect::<Vec<_>>());
+
+        // Playing on from where it landed commits from there, once the window
+        // has walked off something -- the seek cost us the shared half's
+        // filling, not its filling ever again.
+        disk = held(119..129);
+        play(&mut p, &mut disk, 121..123);
+        assert_eq!(*p.advertised(), held(119..121));
+    }
+
+    /// Walking and jumping part at the far edge of the previous window: the
+    /// playhead may arrive at the first piece that window did not cover, having
+    /// played up *to* it, and one piece further it must have played *through*
+    /// a piece no window ever held for it, which is a seek.
+    #[test]
+    fn the_playhead_may_walk_to_the_edge_of_the_last_window_but_not_over_it() {
+        let start = {
+            let mut p = policy(20, 200);
+            p.advance(30, &held(29..39)); // covers 29..39, holding all of it
+            p
+        };
+
+        let mut walked = start.clone();
+        let d = walked.advance(39, &held(29..39));
+        assert_eq!(d.window, 38..48);
+        assert_eq!(
+            d.committed,
+            (29..38).collect::<Vec<_>>(),
+            "every piece it played through, and not the one it stopped on"
+        );
+
+        let mut jumped = start;
+        let d = jumped.advance(40, &held(29..39));
+        assert_eq!(d.window, 39..49);
+        assert!(
+            d.committed.is_empty(),
+            "reaching 40 means playing piece 39, which no window ever held"
+        );
+        assert_eq!(d.reclaim, (29..39).collect::<Vec<_>>());
+    }
+
     /// Once the committed half is full it does not move again, however the
     /// playhead does. That is the whole reason to choose by "first offered"
     /// rather than by any ranking: a set that re-ranks re-downloads.
     #[test]
     fn the_committed_set_does_not_churn_when_the_playhead_moves() {
         let mut p = policy(20, 400);
-        let mut disk: BTreeSet<u32> = (0..40).collect();
-        for playhead in [30u32, 60, 200, 5, 399, 100] {
-            let d = p.advance(playhead, &disk);
-            for piece in &d.reclaim {
-                disk.remove(piece);
-            }
-            // Playing on: the window fills with what it now covers.
-            disk.extend(d.window.clone());
-        }
+        let mut disk: BTreeSet<u32> = BTreeSet::new();
+        // Filled the only way it can be: by playing, which is what walks the
+        // window off a piece. The seeks come after.
+        play(&mut p, &mut disk, 0..30);
         let settled = p.advertised().clone();
         assert_eq!(settled.len(), 10, "the shared half, full");
 
@@ -750,12 +923,10 @@ mod tests {
     #[test]
     fn a_committed_piece_we_have_lost_stops_being_advertised() {
         let mut p = policy(20, 200);
-        // Fill the shared half the only way it can be filled: hold a window's
-        // worth, then move the playhead past it.
-        let mut disk: BTreeSet<u32> = (0..10).collect();
-        p.advance(0, &disk);
-        disk.extend(10..20);
-        p.advance(11, &disk);
+        // Fill the shared half the only way it can be filled: play, and let
+        // the window walk off what is behind the playhead.
+        let mut disk: BTreeSet<u32> = BTreeSet::new();
+        play(&mut p, &mut disk, 0..12);
         assert_eq!(*p.advertised(), held(0..10));
 
         disk.remove(&4);
@@ -776,9 +947,8 @@ mod tests {
 
         // The slot it freed goes to the next piece the window lets go of.
         disk.remove(&4);
-        disk.extend(20..30);
-        let d = p.advance(21, &disk);
-        assert_eq!(d.window, 20..30);
+        let d = p.advance(12, &disk);
+        assert_eq!(d.window, 11..21);
         assert_eq!(d.committed, vec![10], "one slot, one release");
         assert_eq!(p.advertised().len(), 10);
     }
@@ -808,10 +978,11 @@ mod tests {
             "only pieces this file owns are considered at all"
         );
 
-        // And the same once there is something to commit: the window has let
-        // go of 150, and the other files' pieces are still not ours to touch.
-        let d = p.advance(160, &held([0, 5, 99, 150, 160, 200, 4000]));
-        assert_eq!(d.window, 160..165);
+        // And the same once there is something to commit: playback has walked
+        // to the far edge of that window and it has let go of 150, while the
+        // other files' pieces are still not ours to touch.
+        let d = p.advance(155, &held([0, 5, 99, 150, 155, 200, 4000]));
+        assert_eq!(d.window, 155..160);
         assert_eq!(d.committed, vec![150]);
         assert!(d.reclaim.is_empty());
         assert!(!p.is_advertised(99) && !p.is_advertised(200));
@@ -828,11 +999,11 @@ mod tests {
         let mut disk: BTreeSet<u32> = (0..10).collect();
         p.advance(0, &disk);
         disk.extend(10..40);
-        let first = p.advance(30, &disk);
-        let second = p.advance(30, &disk);
+        let first = p.advance(10, &disk);
+        let second = p.advance(10, &disk);
         assert_eq!(first.window, second.window);
         assert_eq!(first.reclaim, second.reclaim);
-        assert_eq!(first.committed, (0..10).collect::<Vec<_>>());
+        assert_eq!(first.committed, (0..9).collect::<Vec<_>>());
         assert!(
             second.committed.is_empty(),
             "already committed, and this window has let go of nothing since"
