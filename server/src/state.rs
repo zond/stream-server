@@ -43,10 +43,14 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// EngineFS that owns stream/HLS torrents: the disk-backed download engine when
-    /// available, otherwise the memory-only engine. Mirrors the selection in
-    /// `routes::stream` so HLS playback and the `/stream` loopback share one torrent
-    /// instead of spinning up a redundant memory-only copy that never evicts pieces.
+    /// The `EngineFS` every torrent-creating route uses -- the stream route,
+    /// `/create`, the stats polls -- so they all share one torrent per hash.
+    ///
+    /// In production this is the one engine there is: `run()` builds a single
+    /// `EngineFS` and puts the same `Arc` in `engine` and `download_engine`
+    /// (there is no memory-only engine to prefer it over; see `run`). The
+    /// choice below only means anything for an `AppState` a test built with
+    /// two distinct engines, and then it says which one streams.
     pub fn stream_engine(&self) -> Arc<EngineFS> {
         if self.download_engine_disk_backed {
             self.download_engine.clone()

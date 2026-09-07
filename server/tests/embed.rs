@@ -2069,6 +2069,65 @@ fn start_lan_media(handle: &ServerHandle) -> anyhow::Result<std::net::SocketAddr
         .ok_or_else(|| anyhow::anyhow!("set_lan_media(true) answered with no address"))
 }
 
+/// A stream request below the free-space floor is refused with a `507`
+/// once a cleaner pass has had its chance -- not "degraded to memory-only",
+/// which re-selected the same disk-backed engine and streamed to the disk
+/// the check had just refused.
+///
+/// A volume cannot be filled on demand, so the reading is declared through
+/// `pretend_available_space`, keyed by this test's own cache root so no
+/// other server in the run sees it.
+#[test]
+fn a_stream_below_the_free_space_floor_is_refused_not_degraded() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    let (handle, base, info_hash, idx, payload) =
+        lan_media_server(config_dir.path(), cache_dir.path(), src.path(), None)?;
+    let cache_root = cache_dir.path().join("cache");
+    let anonymous = reqwest::blocking::Client::new();
+    let url = format!("{base}/{info_hash}/{idx}");
+
+    // Nothing free: refused, whatever the range, with a fixed body -- the
+    // check's own message names the cache root, and no response may.
+    stream_server::pretend_available_space(&cache_root, 0);
+    for range in [None, Some("bytes=0-1023")] {
+        let mut request = anonymous.get(&url);
+        if let Some(range) = range {
+            request = request.header(reqwest::header::RANGE, range);
+        }
+        let response = request.send()?;
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::INSUFFICIENT_STORAGE,
+            "range {range:?}"
+        );
+        assert_eq!(
+            response.text()?,
+            "Insufficient disk space for this stream; free some space and retry",
+            "range {range:?}"
+        );
+    }
+    // A HEAD probe writes nothing and is not refused: the player learns the
+    // length and the range support, and the GET that follows is what the
+    // floor is judged on.
+    let response = anonymous.head(&url).send()?.error_for_status()?;
+    assert_eq!(
+        header_value(&response, "content-length"),
+        payload.len().to_string()
+    );
+
+    // Room again: the same request streams the same bytes, from the same
+    // engine -- there was never another.
+    stream_server::pretend_available_space(&cache_root, u64::MAX);
+    let response = anonymous.get(&url).send()?.error_for_status()?;
+    assert_eq!(response.bytes()?.as_ref(), payload.as_slice());
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
 /// `stats.json` reports the piece the open reader is waiting on, in bytes.
 ///
 /// Whole verified pieces are all the have-bitfield can show, and a piece on

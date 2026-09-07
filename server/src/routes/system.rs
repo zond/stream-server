@@ -17,21 +17,27 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-/// One per-torrent reading over both engines, keyed by info hash.
+/// One per-torrent reading over the engine fields, keyed by info hash.
 ///
-/// The server holds two `EngineFS` instances -- `engine` and
-/// `download_engine`, one and the same `Arc` when no disk-backed engine
-/// came up -- and anything that reports "every torrent" has to ask both, or
-/// a background download is invisible to it. Direct playback and download
-/// requests use `download_engine` when disk-backed mode is available, so
-/// its entry wins a duplicate hash: that is where the active transfer is.
-/// The one merge, shared by `/stats.json` and the activity light, so the
-/// two cannot disagree about which torrents exist.
+/// `AppState` has two engine fields, `engine` and `download_engine`, and in
+/// production they hold the same `Arc`: `run()` builds one `EngineFS` and
+/// puts it in both (there is no memory-only engine and never was one). The
+/// merge exists because the type allows two -- a test may build an
+/// `AppState` that way -- and anything that reports "every torrent" over
+/// such a state has to ask both or one engine's torrents are invisible to
+/// it; where the two are one instance it reads that instance once. When
+/// they differ, the download engine's entry wins a duplicate hash, since
+/// `stream_engine` sends playback and downloads there. The one merge, shared
+/// by `/stats.json` and the activity light, so the two cannot disagree
+/// about which torrents exist.
 async fn combined_per_torrent<T>(
     state: &AppState,
     per_engine: impl AsyncFn(&EngineFS) -> HashMap<String, T>,
 ) -> HashMap<String, T> {
     let engines = per_engine(&state.engine).await;
+    if std::sync::Arc::ptr_eq(&state.engine, &state.download_engine) {
+        return engines;
+    }
     let download_engines = per_engine(&state.download_engine).await;
     prefer_download_engine(engines, download_engines)
 }
@@ -58,19 +64,21 @@ async fn combined_engine_stats(state: &AppState) -> HashMap<String, EngineStats>
 /// shows. Shared with [`crate::ServerHandle::background_traffic`]; there is
 /// no route, since the consumer is the embedding client.
 ///
-/// The conjunction is taken here, over both engines, and handed over as one
-/// value on purpose: an embedder reading traffic and playback separately
-/// would sample them a moment apart across FFI and get a light that
-/// flickers whenever they disagree. *Traffic* is the sum of every existing
-/// torrent's own peer counters ([`enginefs::backend::TransferTotals`],
-/// through the same merge `/stats.json` uses) compared against the last
-/// reading; *nothing playing* is [`EngineFS::playback_is_live`] of either
-/// engine, held over the window and not just now (see
-/// [`enginefs::traffic::TrafficWindow::sample`]).
+/// The conjunction is taken here, over the engine fields, and handed over
+/// as one value on purpose: an embedder reading traffic and playback
+/// separately would sample them a moment apart across FFI and get a light
+/// that flickers whenever they disagree. *Traffic* is the sum of every
+/// existing torrent's own peer counters
+/// ([`enginefs::backend::TransferTotals`], through the same merge
+/// `/stats.json` uses) compared against the last reading; *nothing playing*
+/// is [`EngineFS::playback_is_live`] of either engine field, held over the
+/// window and not just now (see [`enginefs::traffic::TrafficWindow::sample`]).
 ///
 /// Cheap and a peek, so it can be polled every second or two for the life
-/// of the process: two atomics per torrent that exists and the three live
-/// playback fields, no snapshot built, no idle clock touched (a reading
+/// of the process: per torrent that exists, one read of librqbit's live
+/// stats snapshot under the torrent's state lock (a handful of counters,
+/// nothing built -- see `LibrqbitHandle::transfer_totals`), plus the three
+/// live playback fields; no `stats()`, no idle clock touched (a reading
 /// that counted as a poll would hold every torrent out of the idle sweep,
 /// and the light would be lit by the seeding it caused). It creates
 /// nothing -- no engine, no magnet add -- so it never goes near
@@ -1207,7 +1215,7 @@ pub async fn get_https(
 }
 
 /// What a `stats.json` route reports on: an existing engine from either
-/// EngineFS (the stream route may have fallen back to the memory-only engine),
+/// engine field (one instance in production, see [`combined_per_torrent`]),
 /// else the in-flight magnet add for the hash -- started here, in the stream
 /// engine, exactly as `routes::stream` would start it, honouring the request's
 /// `tr=` trackers. Clients commonly poll stats before their first stream
@@ -1415,8 +1423,10 @@ mod tests {
                 ("d".to_string(), 30)
             ])
         );
-        // The same `Arc` on both sides -- the server with no disk-backed
-        // engine -- is one set of torrents, not a doubled one.
+        // The same readings on both sides -- what the production server,
+        // with one engine in both fields, would produce if the merge did
+        // not skip the second read -- is one set of torrents, not a
+        // doubled one.
         let same = HashMap::from([("a".to_string(), 7)]);
         assert_eq!(prefer_download_engine(same.clone(), same.clone()), same);
     }

@@ -424,7 +424,49 @@ type DiskSpaceCache =
 static DISK_SPACE_CACHE: std::sync::OnceLock<DiskSpaceCache> = std::sync::OnceLock::new();
 const DISK_SPACE_CACHE_TTL: Duration = Duration::from_secs(3);
 
+/// Free space a test has declared for a root and everything under it,
+/// standing in for the volume probe -- see [`pretend_available_space`].
+type DiskSpaceOverrides = std::sync::Mutex<Vec<(std::path::PathBuf, u64)>>;
+static DISK_SPACE_OVERRIDES: std::sync::OnceLock<DiskSpaceOverrides> = std::sync::OnceLock::new();
+
+/// Declare how much free space the volume under `root` has, for every
+/// readiness check on a path below it from now on.
+///
+/// A test seam and nothing else: a volume cannot be filled on demand, so
+/// without this the low-disk refusal and the cleaner pass in front of it
+/// (`ensure_disk_ready_or_refuse`) could not be exercised end to end. Keyed
+/// by root so parallel tests, each with its own temp cache root, never see
+/// each other's declaration.
+#[doc(hidden)]
+pub fn pretend_available_space(root: impl Into<std::path::PathBuf>, bytes: u64) {
+    let root = root.into();
+    if let Ok(mut overrides) = DISK_SPACE_OVERRIDES
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+    {
+        overrides.retain(|(declared, _)| *declared != root);
+        overrides.push((root, bytes));
+    }
+}
+
+/// Drop the cached free-space reading for `path`, so the next check probes
+/// the volume again -- for the check that follows a cache-cleaner pass, which
+/// must not be judged by the reading taken before it.
+fn forget_available_space(path: &FsPath) {
+    if let Some(cache) = DISK_SPACE_CACHE.get()
+        && let Ok(mut map) = cache.lock()
+    {
+        map.remove(path);
+    }
+}
+
 fn available_space_for_path(path: &FsPath) -> Option<u64> {
+    if let Some(overrides) = DISK_SPACE_OVERRIDES.get()
+        && let Ok(overrides) = overrides.lock()
+        && let Some((_, bytes)) = overrides.iter().find(|(root, _)| path.starts_with(root))
+    {
+        return Some(*bytes);
+    }
     let cache =
         DISK_SPACE_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     if let Ok(map) = cache.lock()
@@ -522,6 +564,112 @@ fn ensure_download_disk_ready(
 
 fn disk_space_check_treats_as_partial(is_download: bool, is_partial: bool) -> bool {
     !is_download || is_partial
+}
+
+/// The readiness check the stream route runs before it streams to disk, and
+/// what happens when the disk is not ready: one cache-cleaner pass, the check
+/// again, and a `507` if the disk is still short. `Err` is the status and
+/// body to answer.
+///
+/// This used to "degrade the request to memory-only" by re-selecting
+/// `state.engine` -- which is the same `Arc<EngineFS>` as
+/// `state.download_engine`: `run()` builds one engine and puts it in both
+/// fields, librqbit sessions always persist to disk, and there is no
+/// memory-only storage anywhere in this server. So the fallback re-fetched
+/// the same torrent from the same engine, labelled the log
+/// `memoryOnlyLowDiskFallback`, and streamed to the disk the check had just
+/// refused; the floor degraded nothing and the torrent ran on until
+/// librqbit's ENOSPC fatal error, exactly as if the check did not exist.
+///
+/// Refusing at once is not right either, on the device the floor is about.
+/// The cleaner is what keeps the floor free, by evicting stale cache, but it
+/// runs debounced after filesystem events and hourly otherwise, and a
+/// refused request writes nothing to arm it with -- a phone with 300 MiB
+/// free and gigabytes of old cache would sit refused until the hourly pass.
+/// So a failed check runs the cleaner now (`cache_cleaner::clean_cache`, the
+/// same pass `POST /cache/clean` takes, with the same protections) and asks
+/// again with a fresh free-space reading; only a disk still short after that
+/// is answered `507 Insufficient Storage` -- the status the pin route already
+/// uses for a full disk -- with a fixed body, because the check's own message
+/// names the cache root and no response may carry a path.
+#[allow(clippy::too_many_arguments)]
+async fn ensure_disk_ready_or_refuse(
+    state: &AppState,
+    engine_fs: &EngineFS,
+    stream_id: u64,
+    info_hash: &str,
+    file_idx: usize,
+    file_name: &str,
+    file_size: u64,
+    requested_len: u64,
+    treat_as_partial: bool,
+) -> Result<(), (StatusCode, &'static str)> {
+    // The check performs blocking std::fs syscalls (create_dir_all, a write
+    // probe, and a metadata stat) that are re-run on every request and every
+    // seek. Run them on the blocking pool so they never stall an async worker
+    // thread inline -- which would also block any other stream/API task
+    // scheduled on that same worker -- e.g. when the cache lives on a
+    // spun-down HDD or a slow network/SMB mount.
+    let check = || {
+        let download_dir = engine_fs.download_dir.clone();
+        let file_name = file_name.to_string();
+        async move {
+            tokio::task::spawn_blocking(move || {
+                ensure_download_disk_ready(
+                    &download_dir,
+                    &file_name,
+                    file_size,
+                    requested_len,
+                    treat_as_partial,
+                )
+            })
+            .await
+            .unwrap_or_else(|join_err| Err(format!("disk readiness check task failed: {join_err}")))
+        }
+    };
+    let Err(first) = check().await else {
+        return Ok(());
+    };
+    tracing::warn!(
+        stream_id,
+        info_hash = %info_hash,
+        file_idx,
+        error = %first,
+        "disk not ready for this stream; running a cache-cleaner pass before giving up on it"
+    );
+    match crate::cache_cleaner::clean_cache(state).await {
+        Ok(report) => tracing::info!(
+            stream_id,
+            freed = report.freed,
+            deleted = report.deleted,
+            "cache-cleaner pass on behalf of a stream request"
+        ),
+        Err(error) => tracing::warn!(
+            stream_id,
+            error = %format!("{error:#}"),
+            "cache-cleaner pass on behalf of a stream request failed"
+        ),
+    }
+    // The free-space reading is cached for a few seconds against a player's
+    // burst of probes; a pass that just freed space must not be judged by
+    // the reading taken before it.
+    forget_available_space(&engine_fs.download_dir);
+    match check().await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            tracing::warn!(
+                stream_id,
+                info_hash = %info_hash,
+                file_idx,
+                error = %error,
+                "disk still not ready after a cache-cleaner pass; refusing the stream"
+            );
+            Err((
+                StatusCode::INSUFFICIENT_STORAGE,
+                "Insufficient disk space for this stream; free some space and retry",
+            ))
+        }
+    }
 }
 
 /// How a stream request may come by its torrent -- the one thing that
@@ -624,12 +772,7 @@ async fn head_stream_video_with(
     let info_hash = info_hash.to_lowercase();
     let query = PlaybackQuery::parse(query_str.as_deref());
     let is_download = query.download;
-    let prefer_disk_stream = state.download_engine_disk_backed;
-    let engine_fs = if prefer_disk_stream {
-        state.download_engine.clone()
-    } else {
-        state.engine.clone()
-    };
+    let engine_fs = state.stream_engine();
 
     let engine = match engine_for_request(
         &engine_fs,
@@ -774,17 +917,7 @@ async fn stream_video_with(
     let stream_id = NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed);
     let query = PlaybackQuery::parse(query_str.as_deref());
     let is_download = query.download;
-    let prefer_disk_stream = state.download_engine_disk_backed;
-    let mut engine_fs = if prefer_disk_stream {
-        state.download_engine.clone()
-    } else {
-        state.engine.clone()
-    };
-    let mut download_storage_mode = if prefer_disk_stream {
-        "diskBacked"
-    } else {
-        "memoryOnly"
-    };
+    let engine_fs = state.stream_engine();
 
     tracing::debug!(
         stream_id,
@@ -795,7 +928,7 @@ async fn stream_video_with(
 
     // Existing engine, or -- on loopback -- one created from the info hash
     // with the request's trackers.
-    let mut engine = match engine_for_request(
+    let engine = match engine_for_request(
         &engine_fs,
         access,
         &info_hash,
@@ -811,8 +944,8 @@ async fn stream_video_with(
         Err(refusal) => return refusal.into_response(),
     };
 
-    let mut _metadata_resolution = MetadataResolutionGuard::acquire(&engine).await;
-    let mut files = engine.handle.get_files().await;
+    let _metadata_resolution = MetadataResolutionGuard::acquire(&engine).await;
+    let files = engine.handle.get_files().await;
     let candidates = files
         .iter()
         .enumerate()
@@ -822,7 +955,7 @@ async fn stream_video_with(
             length: file.length,
         })
         .collect::<Vec<_>>();
-    let mut idx = match compat::resolve_file_idx(&requested_idx, &candidates, &query.filters) {
+    let idx = match compat::resolve_file_idx(&requested_idx, &candidates, &query.filters) {
         Ok(idx) => idx,
         Err(err) => {
             tracing::warn!(
@@ -844,14 +977,14 @@ async fn stream_video_with(
         );
         return (StatusCode::NOT_FOUND, "File not found").into_response();
     };
-    let mut size = file_info.length;
-    let mut name = file_info.name.clone();
+    let size = file_info.length;
+    let name = file_info.name.clone();
 
     let range_header = headers
         .get(header::RANGE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let (mut start, mut end, mut is_partial) = if let Some(range) = &range_header {
+    let (start, end, is_partial) = if let Some(range) = &range_header {
         if let Some((start, end)) = parse_range(range, size) {
             (start, end, true)
         } else {
@@ -867,121 +1000,25 @@ async fn stream_video_with(
     } else {
         (0, size.saturating_sub(1), false)
     };
-    let mut requested_content_length = if size == 0 {
+    let requested_content_length = if size == 0 {
         0
     } else {
         end.saturating_sub(start) + 1
     };
-    // The readiness check performs blocking std::fs syscalls (create_dir_all, a
-    // write probe, and a metadata stat) that are re-run on every request and every
-    // seek. Run them on the blocking pool so they never stall an async worker
-    // thread inline — which would also block any other stream/API task scheduled on
-    // that same worker — e.g. when the cache lives on a spun-down HDD or a slow
-    // network/SMB mount.
-    let disk_ready = if prefer_disk_stream {
-        let download_dir = engine_fs.download_dir.clone();
-        let file_name = name.clone();
-        let treat_as_partial = disk_space_check_treats_as_partial(is_download, is_partial);
-        tokio::task::spawn_blocking(move || {
-            ensure_download_disk_ready(
-                &download_dir,
-                &file_name,
-                size,
-                requested_content_length,
-                treat_as_partial,
-            )
-        })
-        .await
-        .unwrap_or_else(|join_err| Err(format!("disk readiness check task failed: {join_err}")))
-    } else {
-        Ok(())
-    };
-    if prefer_disk_stream && let Err(err) = disk_ready {
-        tracing::warn!(
-            stream_id,
-            info_hash = %info_hash,
-            file_idx = idx,
-            error = %err,
-            "disk-backed stream unavailable; switching this request to memory-only mode"
-        );
-        engine_fs = state.engine.clone();
-        download_storage_mode = "memoryOnlyLowDiskFallback";
-
-        engine = match compat::get_or_create_engine(&engine_fs, &info_hash, query_str.as_deref())
-            .await
-        {
-            Ok(e) => {
-                tracing::debug!(stream_id, "stream_video fallback memory engine ready");
-                e
-            }
-            Err(e) => {
-                tracing::error!(
-                    stream_id,
-                    error = %e,
-                    "stream_video failed to create fallback memory engine"
-                );
-                return compat::engine_creation_failure(&e).into_response();
-            }
-        };
-
-        _metadata_resolution = MetadataResolutionGuard::acquire(&engine).await;
-        files = engine.handle.get_files().await;
-        let candidates = files
-            .iter()
-            .enumerate()
-            .map(|(index, file)| compat::FileCandidate {
-                index,
-                name: file.name.clone(),
-                length: file.length,
-            })
-            .collect::<Vec<_>>();
-        idx = match compat::resolve_file_idx(&requested_idx, &candidates, &query.filters) {
-            Ok(idx) => idx,
-            Err(err) => {
-                tracing::warn!(
-                    stream_id,
-                    info_hash = %info_hash,
-                    requested_idx = %requested_idx,
-                    error = %err,
-                    "stream_video fallback memory engine could not resolve file index"
-                );
-                return (StatusCode::NOT_FOUND, err).into_response();
-            }
-        };
-        let Some(file_info) = files.get(idx) else {
-            tracing::warn!(
-                stream_id,
-                info_hash = %info_hash,
-                file_idx = idx,
-                "stream_video fallback memory file index not found before stream start"
-            );
-            return (StatusCode::NOT_FOUND, "File not found").into_response();
-        };
-        size = file_info.length;
-        name = file_info.name.clone();
-
-        (start, end, is_partial) = if let Some(range) = &range_header {
-            if let Some((start, end)) = parse_range(range, size) {
-                (start, end, true)
-            } else {
-                tracing::warn!(
-                    stream_id,
-                    info_hash = %info_hash,
-                    file_idx = idx,
-                    range = %range,
-                    "stream_video fallback memory invalid range header"
-                );
-                return (StatusCode::RANGE_NOT_SATISFIABLE, "Range Not Satisfiable")
-                    .into_response();
-            }
-        } else {
-            (0, size.saturating_sub(1), false)
-        };
-        requested_content_length = if size == 0 {
-            0
-        } else {
-            end.saturating_sub(start) + 1
-        };
+    if let Err(refusal) = ensure_disk_ready_or_refuse(
+        &state,
+        &engine_fs,
+        stream_id,
+        &info_hash,
+        idx,
+        &name,
+        size,
+        requested_content_length,
+        disk_space_check_treats_as_partial(is_download, is_partial),
+    )
+    .await
+    {
+        return refusal.into_response();
     }
     let start_offset_hint = start;
     // Parse priority from enginefs-prio header
@@ -1181,7 +1218,6 @@ async fn stream_video_with(
             range_start = start,
             range_end = end,
             partial = is_partial,
-            download_storage_mode,
             stage = "http_response_ready",
             "startup: direct stream response ready"
         );
@@ -1194,7 +1230,6 @@ async fn stream_video_with(
             range_start = start,
             range_end = end,
             partial = is_partial,
-            download_storage_mode,
             stage = "http_response_ready",
             "startup: direct stream response ready"
         );

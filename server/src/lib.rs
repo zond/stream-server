@@ -12,6 +12,7 @@ pub use enginefs::{PIN_FREE_SPACE_MARGIN, PinDownloadError, UnpinOutcome};
 pub use routes::downloads::DownloadInfo;
 #[doc(hidden)]
 pub use routes::proxy::unverified_origins;
+pub use routes::stream::pretend_available_space;
 pub use routes::system::{FileNotFound, ServerSettings, resolved_path};
 pub use state::AppState;
 use std::{
@@ -850,28 +851,20 @@ pub async fn run(
         },
     };
 
-    let (download_engine, download_engine_disk_backed) = match EngineFS::new_disk_backed(
-        cache_dir.clone(),
-        backend_config.clone(),
-        Some(tracker_storage.clone()),
-    )
-    .await
-    {
-        Ok(download_engine_fs) => (Arc::new(download_engine_fs), true),
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                "Disk-backed download engine unavailable at startup; download=1 will use memory-only mode"
-            );
-            let engine_fs = EngineFS::new_with_storage(
-                cache_dir.clone(),
-                backend_config,
-                Some(tracker_storage),
-            )
-            .await?;
-            (Arc::new(engine_fs), false)
-        }
-    };
+    // One engine. `AppState` carries two fields, `engine` and
+    // `download_engine`, from a design that meant to pair a memory-only
+    // stream engine with a disk-backed download engine; librqbit sessions
+    // always persist to disk and no memory-only storage was ever built, so
+    // `EngineFS::new_disk_backed` is `new_with_storage` under another name
+    // and the same `Arc` goes in both fields. (There used to be a retry
+    // through `new_with_storage` when `new_disk_backed` failed, described as
+    // falling back to memory-only mode -- the same constructor, failing the
+    // same way, so a failure here is a failure.) Whatever reads the two
+    // fields reads one instance twice, which `Arc::ptr_eq` lets it skip.
+    let download_engine = Arc::new(
+        EngineFS::new_disk_backed(cache_dir.clone(), backend_config, Some(tracker_storage)).await?,
+    );
+    let download_engine_disk_backed = true;
     let engine = download_engine.clone();
 
     let mut state = AppState::new_with_shared_settings_log_dir_and_download_engine(
