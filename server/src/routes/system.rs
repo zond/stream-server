@@ -369,13 +369,12 @@ pub fn cache_roots(state: &AppState) -> [std::path::PathBuf; 2] {
 ///
 /// Checked before it is created, so a refused setting leaves no directory
 /// behind; and resolved before it is returned, because the stored value is
-/// compared as a plain path prefix from then on: `cache_cleaner::evict`
-/// prunes it from the walk with `starts_with` against the roots it walks,
-/// and the engines place torrents under exactly this path, so the cleaner
-/// matches their files by name. A spelling that reaches the same directory
-/// through a symlinked prefix passes validation (a directory *below* a
-/// cache root is allowed) and then matches neither -- an offline download
-/// inside a cache root would be walked as cache and aged out.
+/// compared as a plain path prefix from then on: the cleaner walks this
+/// directory as one of its roots and protects what is in it by
+/// `starts_with` against the paths the engines report, and the engines
+/// place torrents under exactly this path. A spelling that reaches the same
+/// directory through a symlinked prefix would match neither, leaving a
+/// dormant pin's folder unprotected in a directory that is now walked.
 pub async fn prepare_downloads_dir(
     raw: &str,
     cache_roots: &[std::path::PathBuf],
@@ -388,12 +387,16 @@ pub async fn prepare_downloads_dir(
     if !path.is_absolute() {
         anyhow::bail!("downloadsDir must be an absolute path, got {raw:?}");
     }
-    // A downloads dir that is a cache root, or above one, cannot be told
-    // apart from the cache in it: the cleaner walks those roots and would
-    // have to prune the walk at its own root to spare the downloads,
-    // which switches both eviction rules off for it (see
-    // `cache_cleaner::evict`). Compared through the deepest existing
-    // ancestor so a symlink to a root is caught too.
+    // A downloads dir at or above a cache root is still refused, but for a
+    // different reason than it once was. The cleaner used to prune it from
+    // the walk, and pruning a walk at its own root switched both eviction
+    // rules off for it; the cleaner walks the downloads dir now, and
+    // overlapping roots collapse to the outermost, so that failure is gone.
+    // What is left is worse: the roots the cleaner walks are the roots it
+    // *evicts from*, and a downloadsDir above one would hand it a tree the
+    // engines do not own -- on Android, the whole of shared storage. Keep it
+    // pointed at a directory of its own. Compared through the deepest
+    // existing ancestor so a symlink to a root is caught too.
     let resolved = canonical_prefix(&path);
     for root in cache_roots {
         if canonical_prefix(root).starts_with(&resolved) {
@@ -1395,12 +1398,11 @@ mod tests {
     }
 
     /// The stored `downloadsDir` is the resolved path, and a refused one
-    /// leaves nothing on disk. Both matter to the cleaner: it prunes the
-    /// downloads dir from its walk, and protects a live engine's files, by
-    /// plain path prefix against the roots it walks -- a spelling that
-    /// reaches the same directory through a symlinked prefix is accepted
-    /// (below a cache root is allowed) and then matches neither, so an
-    /// offline download inside a cache root would age out as cache.
+    /// leaves nothing on disk. Both matter to the cleaner: it walks this
+    /// directory and decides what may not go there by plain path prefix
+    /// against what the engines report -- a spelling that reaches the same
+    /// directory through a symlinked prefix would match neither, leaving a
+    /// dormant pin's download evictable.
     #[cfg(unix)]
     #[tokio::test]
     async fn prepare_downloads_dir_stores_the_resolved_path() {
@@ -1436,9 +1438,9 @@ mod tests {
     }
 
     /// A `downloadsDir` that is a torrent cache root, or above one, is
-    /// refused: the cache cleaner walks those roots, and a downloads dir
-    /// covering one cannot be pruned from the walk without switching every
-    /// eviction rule off for it. Below it and beside it are both fine.
+    /// refused: the roots the cleaner walks are the roots it evicts from,
+    /// and one above a cache root would hand it a tree the engines do not
+    /// own. Below it and beside it are both fine.
     #[tokio::test]
     async fn prepare_downloads_dir_refuses_a_path_covering_a_cache_root() {
         use super::prepare_downloads_dir;

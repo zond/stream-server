@@ -1368,14 +1368,25 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
     }
 
-    /// Where the registry's engines write, for the cache cleaner: every
-    /// file at the path the backend reports (`TorrentHandle::file_path`, or
-    /// the output folder joined with the file's name when the backend knows
-    /// the folder but not the path), `<download_dir>/<name>` for a backend
-    /// that knows neither. A torrent without a file list yet protects its
-    /// output folder (or `<download_dir>/<name>`). Paths outside the
-    /// download dir (a torrent placed under the downloads dir) are harmless
-    /// to the cleaner, which never walks there.
+    /// What the cache cleaner may not evict.
+    ///
+    /// Every registry engine's files, at the path the backend reports
+    /// (`TorrentHandle::file_path`, or the output folder joined with the
+    /// file's name when the backend knows the folder but not the path),
+    /// `<download_dir>/<name>` for a backend that knows neither. A torrent
+    /// without a file list yet protects its output folder (or
+    /// `<download_dir>/<name>`).
+    ///
+    /// Plus the placement folder of every *dormant* pin. Those have no engine
+    /// -- that is what dormant means -- so nothing above would name them, and
+    /// the cleaner walks the downloads dir now: without this entry a pin whose
+    /// torrent the backend did not restore would be aged out from under the
+    /// user, which is a worse bug than the orphaned-and-immortal one that made
+    /// the cleaner walk there in the first place. It can only name
+    /// `<downloads dir>/<info hash>`, the placement this layer chooses itself;
+    /// a dormant pin whose data predates a downloads dir lives in the cache
+    /// root under a folder named by metadata a dormant pin does not have, and
+    /// is protected by nothing.
     pub async fn protected_paths(&self) -> Vec<std::path::PathBuf> {
         let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
         let mut paths = Vec::new();
@@ -1398,6 +1409,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                         .join(&file.path),
                 };
                 paths.push(path);
+            }
+        }
+        for pin in self.dormant_pinned_downloads() {
+            if let Some(folder) = self.download_folder(&pin.info_hash) {
+                paths.push(folder);
             }
         }
         paths
@@ -2004,8 +2020,9 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// last pin, only this file while other pins hold. A dormant pin has no
     /// torrent to delete anything of beyond its placement folder under the
     /// downloads dir, which this layer named itself and removes
-    /// ([`Self::delete_dormant_download_data`]) -- nothing else would ever
-    /// reclaim it, since the cache cleaner does not walk there. What was
+    /// ([`Self::delete_dormant_download_data`]) -- while the pin stands
+    /// [`Self::protected_paths`] keeps the cleaner off it, so this is what
+    /// takes it now rather than in thirty days. What was
     /// really deleted is reported, not what was asked for
     /// ([`UnpinOutcome`]). A `file_idx` the torrent does not
     /// have is then refused with [`PinDownloadError::FileNotFound`], as
@@ -2140,10 +2157,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// Nothing goes while another file of the same hash is still pinned --
     /// the folder holds that file too -- and nothing can go without a
     /// downloads dir: the torrent then lived in the cache root under a
-    /// folder named by metadata a dormant pin does not have. Those bytes
-    /// are not orphaned, though: the cache cleaner walks the cache root and
-    /// ages them out, which is exactly what it must never do under the
-    /// downloads dir -- hence this call.
+    /// folder named by metadata a dormant pin does not have. Either way the
+    /// bytes are reachable by the cleaner, which walks the downloads dir as
+    /// well now; this call is what makes an explicit `deleteFiles` unpin
+    /// take effect at once instead of waiting on the age rule, and what
+    /// takes the folder out of [`Self::protected_paths`] with the pin.
     async fn delete_dormant_download_data(
         &self,
         info_hash: &str,
@@ -5365,6 +5383,41 @@ mod tests {
         assert_eq!(counters.restart_after_error.load(Ordering::SeqCst), 1);
     }
 
+    /// A dormant pin has no engine, so nothing in the engine walk names it --
+    /// and the cleaner walks the downloads dir now. Without its folder in the
+    /// protected set, an offline download whose torrent the backend did not
+    /// restore would be aged out from under the user.
+    #[tokio::test]
+    async fn protected_paths_cover_a_dormant_pins_download_folder() {
+        let (enginefs, _counters) = test_enginefs_with_file_count(1);
+        let downloads = enginefs.download_dir.join("offline");
+        enginefs.set_downloads_dir(Some(downloads.clone()));
+        std::fs::create_dir_all(&downloads).unwrap();
+        std::fs::write(
+            enginefs.pinned_downloads_path(),
+            serde_json::to_vec(&serde_json::json!({ OTHER_HASH: [0] })).unwrap(),
+        )
+        .unwrap();
+        enginefs.restore_pinned_downloads().await;
+
+        let folder = downloads.join(OTHER_HASH);
+        assert!(
+            enginefs.protected_paths().await.contains(&folder),
+            "the dormant pin's folder is protected"
+        );
+
+        // And it stops being protected the moment the pin does, so the bytes
+        // an unpin leaves behind become ordinary cache.
+        assert!(
+            enginefs
+                .unpin_download(OTHER_HASH, 0, false)
+                .await
+                .unwrap()
+                .unpinned
+        );
+        assert!(!enginefs.protected_paths().await.contains(&folder));
+    }
+
     /// The cleaner's protected paths are where the files really are: the
     /// backend's `file_path` (its output folder -- `<root>/<torrent name>`
     /// for a multi-file torrent in the cache root, `<downloadsDir>/<hash>`
@@ -6839,10 +6892,11 @@ mod tests {
 
     /// A dormant pin asked to take its data with it: the placement folder
     /// `<downloadsDir>/<info hash>` is one this layer named itself, so it
-    /// goes. Nothing else ever would -- the cache cleaner does not walk the
-    /// downloads dir -- and the entry leaves `downloads.json` with the pin,
-    /// so no client could ask again either. The folder stays while another
-    /// file of the same torrent is still pinned: it holds that file too.
+    /// goes at once rather than waiting on the cleaner's age rule, which
+    /// `protected_paths` holds off for as long as the pin stands -- and the
+    /// entry leaves `downloads.json` with the pin, so no client could ask
+    /// again either. The folder stays while another file of the same torrent
+    /// is still pinned: it holds that file too.
     #[tokio::test]
     async fn unpin_download_of_a_dormant_pin_deletes_its_download_folder() {
         let root = tempfile::tempdir().unwrap();
