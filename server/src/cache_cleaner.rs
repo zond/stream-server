@@ -652,19 +652,31 @@ pub(crate) async fn clean_cache(state: &AppState) -> anyhow::Result<EvictionRepo
 /// (`ServerHandle::cache_usage` and `GET /cache.json`).
 pub(crate) async fn usage(state: &AppState) -> CacheUsage {
     let roots = cache_roots(state).await;
-    roots
-        .budgets
-        .iter()
-        .map(|budget| {
-            scan_usage(
-                &budget.roots,
-                &roots.protected_paths,
-                &roots.boundaries,
-                budget.limit,
-            )
-        })
-        .reduce(CacheUsage::combined_with)
-        .unwrap_or_default()
+    // The walk is synchronous filesystem work -- see [`evict`] for why it is
+    // off the runtime -- and a `GET /cache.json` is a request a worker is
+    // serving.
+    tokio::task::spawn_blocking(move || {
+        roots
+            .budgets
+            .iter()
+            .map(|budget| {
+                scan_usage(
+                    &budget.roots,
+                    &roots.protected_paths,
+                    &roots.boundaries,
+                    budget.limit,
+                )
+            })
+            .reduce(CacheUsage::combined_with)
+            .unwrap_or_default()
+    })
+    .await
+    .unwrap_or_else(|error| {
+        // A panic in the walk, in a debug build; the release profile aborts
+        // the process instead. Nothing to report but that nothing was read.
+        error!("the cache usage scan did not finish: {error}");
+        CacheUsage::default()
+    })
 }
 
 /// What a cache root costs on disk, as the cleaner must count it.
@@ -760,6 +772,8 @@ fn scan_usage(
     boundaries: &HashSet<std::path::PathBuf>,
     limit: CacheLimit,
 ) -> CacheUsage {
+    #[cfg(test)]
+    WALKED_ON_THIS_THREAD.set(true);
     let mut total = 0u64;
     let mut protected = 0u64;
     let mut protected_files = 0usize;
@@ -955,89 +969,51 @@ async fn evict(
     boundaries: &HashSet<std::path::PathBuf>,
     limit: CacheLimit,
 ) -> anyhow::Result<EvictionReport> {
-    // 2. Scan and Evict immediately based on age (30 days)
-    let thirty_days = Duration::from_secs(30 * 24 * 60 * 60);
-    let now = std::time::SystemTime::now();
+    // 1. Walk. On the blocking pool, not on the worker this future is
+    // running on: `walkdir` plus a `statx` per file is synchronous I/O over
+    // the whole tree -- sixteen thousand files for 4 GB of proxy cache, on
+    // eMMC, with a dentry cache that memory pressure keeps evicting -- and
+    // the pass runs once a minute for as long as a torrent is writing. A
+    // worker held for the length of that walk is a worker not serving range
+    // requests; on a four-core television work-stealing hides one, on a
+    // smaller runtime nothing does. The inputs are cloned for the closure
+    // because the sets are borrowed from `CacheRoots` and the walk outlives
+    // the borrow's poll.
+    let walk = WalkInputs {
+        download_dirs: download_dirs.to_vec(),
+        protected_paths: protected_paths.clone(),
+        boundaries: boundaries.clone(),
+        max_age: Duration::from_secs(30 * 24 * 60 * 60),
+        now: std::time::SystemTime::now(),
+    };
+    let Walked {
+        files,
+        aged_out,
+        mut total_size,
+        protected_size,
+        protected_files,
+    } = tokio::task::spawn_blocking(move || walk.run())
+        .await
+        .map_err(|error| anyhow::anyhow!("the cache walk did not finish: {error}"))?;
 
-    let mut files = Vec::new();
-    let mut total_size = 0u64;
-    let mut protected_size = 0u64;
-    let mut protected_files = 0usize;
-    // What the age rule reclaims counts towards what the run freed, exactly
-    // as the size rule's does: `EvictionReport::made_room` is what decides
-    // whether a torrent ENOSPC stopped goes back to work, and a pass that
-    // took a gigabyte off the disk has made room whichever rule took it.
+    // 2. Evict what the age rule found (30 days). What it reclaims counts
+    // towards what the run freed, exactly as the size rule's does:
+    // `EvictionReport::made_room` is what decides whether a torrent ENOSPC
+    // stopped goes back to work, and a pass that took a gigabyte off the
+    // disk has made room whichever rule took it.
     let mut aged_out_bytes = 0u64;
     let mut aged_out_files = 0usize;
-
-    for download_dir in download_dirs {
-        if !download_dir.exists() {
-            continue;
-        }
-
-        let mut entries = walk_within(download_dir, boundaries);
-
-        loop {
-            match entries.next() {
-                Some(Ok(entry)) => {
-                    if entry.file_type().is_file() {
-                        let path = entry.path().to_path_buf();
-                        if is_session_artifact(&path, download_dir) {
-                            continue;
-                        }
-                        // Is protected?
-                        let is_protected = is_path_protected(&path, protected_paths);
-
-                        if let Ok(metadata) = entry.metadata() {
-                            // Occupancy, not apparent length: librqbit
-                            // pre-allocates wanted files at full size.
-                            let size = occupied_bytes(&metadata);
-
-                            if is_protected {
-                                total_size += size;
-                                protected_size += size;
-                                protected_files += 1;
-                                continue;
-                            }
-
-                            if let Ok(modified) = metadata.modified() {
-                                // Check AGE
-                                let age = now
-                                    .duration_since(modified)
-                                    .unwrap_or(Duration::from_secs(0));
-                                if age > thirty_days {
-                                    info!("File older than 30 days, deleting: {:?}", path);
-                                    if let Err(e) = tokio::fs::remove_file(&path).await {
-                                        error!("Failed to delete file {:?}: {}", path, e);
-                                        // Count it in total size since we failed to delete?
-                                        // Or ignore? Let's count it to be safe for cache limit.
-                                        total_size += size;
-                                    } else {
-                                        // Successfully deleted, do not add to total_size
-                                        aged_out_bytes += size;
-                                        aged_out_files += 1;
-                                        // Try to clean empty parent dir
-                                        if let Some(parent) = path.parent() {
-                                            remove_empty_parents(parent, keep_dirs).await;
-                                        }
-                                    }
-                                } else {
-                                    // Keep for potentially size-based eviction
-                                    total_size += size;
-                                    files.push((path, size, modified));
-                                }
-                            } else {
-                                // Could not read time, keep it but count size
-                                total_size += size;
-                                files.push((path, size, std::time::SystemTime::UNIX_EPOCH));
-                            }
-                        }
-                    }
-                }
-                Some(Err(e)) => {
-                    debug!("Error walking directory: {}", e);
-                }
-                None => break,
+    for (path, size) in aged_out {
+        info!("File older than 30 days, deleting: {:?}", path);
+        if let Err(e) = tokio::fs::remove_file(&path).await {
+            error!("Failed to delete file {:?}: {}", path, e);
+            // Still on the disk, so still counted against the limit.
+            total_size += size;
+        } else {
+            aged_out_bytes += size;
+            aged_out_files += 1;
+            if let Some(parent) = path.parent() {
+                remove_empty_parents(parent, keep_dirs).await;
             }
         }
     }
@@ -1071,9 +1047,7 @@ async fn evict(
             total_size, limit
         );
 
-        // Sort by modification time (oldest first)
-        files.sort_by_key(|a| a.2);
-
+        // Oldest first: the walk sorted them.
         for (path, size, _) in files {
             if total_size <= limit {
                 break;
@@ -1137,6 +1111,113 @@ async fn evict(
     }
 
     Ok(report)
+}
+
+/// What [`evict`] hands the blocking pool: the roots to walk and the rules to
+/// sort what it finds by. Owned, because the walk runs on another thread.
+struct WalkInputs {
+    download_dirs: Vec<std::path::PathBuf>,
+    protected_paths: HashSet<std::path::PathBuf>,
+    boundaries: HashSet<std::path::PathBuf>,
+    /// The age rule: a file last modified longer ago than this goes.
+    max_age: Duration,
+    now: std::time::SystemTime,
+}
+
+/// What the walk found, sorted into what [`evict`] does with it. Sizes are
+/// occupancy ([`occupied_bytes`]).
+struct Walked {
+    /// Evictable by the size rule, oldest modification first, with the
+    /// occupancy and modification time of each. A file whose time could not
+    /// be read sorts oldest -- it is counted, and the first to go.
+    files: Vec<(std::path::PathBuf, u64, std::time::SystemTime)>,
+    /// Past the age rule, to be deleted whatever the size rule says.
+    aged_out: Vec<(std::path::PathBuf, u64)>,
+    /// Occupancy of everything that stays unless the size rule takes it:
+    /// `files` plus the protected. The aged-out are *not* in it -- they are
+    /// as good as gone -- and `evict` adds one back if its deletion fails.
+    total_size: u64,
+    protected_size: u64,
+    protected_files: usize,
+}
+
+impl WalkInputs {
+    /// The walk itself: synchronous, the whole of the filesystem reading a
+    /// pass does, and nothing else -- no deletion happens here, so the
+    /// blocking thread holds no decision the async half has to wait on.
+    /// Mirrors [`scan_usage`]'s exclusion and protection rules exactly.
+    fn run(self) -> Walked {
+        #[cfg(test)]
+        WALKED_ON_THIS_THREAD.set(true);
+        let mut walked = Walked {
+            files: Vec::new(),
+            aged_out: Vec::new(),
+            total_size: 0,
+            protected_size: 0,
+            protected_files: 0,
+        };
+        for download_dir in &self.download_dirs {
+            if !download_dir.exists() {
+                continue;
+            }
+            for entry in walk_within(download_dir, &self.boundaries) {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        debug!("Error walking directory: {}", e);
+                        continue;
+                    }
+                };
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let path = entry.path().to_path_buf();
+                if is_session_artifact(&path, download_dir) {
+                    continue;
+                }
+                let Ok(metadata) = entry.metadata() else {
+                    continue;
+                };
+                // Occupancy, not apparent length: librqbit pre-allocates
+                // wanted files at full size.
+                let size = occupied_bytes(&metadata);
+                if is_path_protected(&path, &self.protected_paths) {
+                    walked.total_size += size;
+                    walked.protected_size += size;
+                    walked.protected_files += 1;
+                    continue;
+                }
+                let modified = metadata.modified().ok();
+                let age = modified.map(|modified| {
+                    self.now
+                        .duration_since(modified)
+                        .unwrap_or(Duration::from_secs(0))
+                });
+                if age.is_some_and(|age| age > self.max_age) {
+                    walked.aged_out.push((path, size));
+                } else {
+                    walked.total_size += size;
+                    walked.files.push((
+                        path,
+                        size,
+                        modified.unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                    ));
+                }
+            }
+        }
+        // Oldest first, for the size rule.
+        walked.files.sort_by_key(|(_, _, modified)| *modified);
+        walked
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Whether the cache walk ran on the thread that reads this. Set by the
+    /// walk, on whichever thread it runs on; read by a test on its own
+    /// thread, where a current-thread runtime would have run an inline walk.
+    /// A thread-local so parallel tests cannot see each other's walks.
+    static WALKED_ON_THIS_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Whether `path` (under the session root `root`) is state the torrent
@@ -1261,8 +1342,9 @@ async fn remove_empty_parents(mut dir: &std::path::Path, keep: &HashSet<std::pat
 mod tests {
     use super::{
         CACHE_FREE_SPACE_FLOOR, CacheLimit, CacheUsage, CleanSchedule, DiskFullRecovery,
-        EvictionReport, available_space, budgets_by_volume, evict, is_path_protected,
-        is_session_artifact, occupied_bytes, outermost, remove_empty_parents, scan_usage,
+        EvictionReport, WALKED_ON_THIS_THREAD, available_space, budgets_by_volume, evict,
+        is_path_protected, is_session_artifact, occupied_bytes, outermost, remove_empty_parents,
+        scan_usage,
     };
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
@@ -1363,6 +1445,37 @@ mod tests {
     /// the size rule has to take exactly the evictable file.
     fn limit_between(keep: &Path, evictable: &Path) -> u64 {
         occupancy(keep) + occupancy(evictable) / 2
+    }
+
+    /// The walk is the whole of a pass's filesystem reading, and it does
+    /// not run on the runtime's thread. `#[tokio::test]` is a current-thread
+    /// runtime, which runs this future on the test's own thread: an inline
+    /// walk would set the marker *here*, one on the blocking pool sets it on
+    /// a pool thread this thread never sees.
+    #[tokio::test]
+    async fn the_walk_runs_off_the_runtime_thread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("rqbit-downloads");
+        let film = root.join(HASH).join("film.mkv");
+        write_aged(&film, &[0u8; 4096], Duration::ZERO);
+
+        WALKED_ON_THIS_THREAD.set(false);
+        let report = evict_roots(
+            &[root.clone()],
+            &HashSet::new(),
+            CacheLimit::configured(u64::MAX),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            report.total,
+            occupancy(&film),
+            "the walk did run, and found the file"
+        );
+        assert!(
+            !WALKED_ON_THIS_THREAD.get(),
+            "the cache walk ran on the runtime's own thread"
+        );
     }
 
     /// The session's own records live in the walked root but are not cache:
