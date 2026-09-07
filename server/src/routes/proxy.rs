@@ -780,8 +780,10 @@ impl ProxyParams {
 /// origin, which is what [`CredentialChain`] holds, both halves come out
 /// right.
 ///
-/// **A chain that is not all `https` arms that one origin and no other, at
-/// any depth, whatever a line's scheme.** A line to A is fetched as
+/// **A chain that is not all `https` arms the origin the caller named in the
+/// clear and no other, at any depth, whatever a line's scheme** -- and a
+/// chain that began at `https` and stepped down arms nothing at all, having
+/// named nothing in the clear to spend on. A line to A is fetched as
 /// `d=http://A`, so the origin *it* may arm is A again, and nothing else in
 /// its playlist -- an `https` line included -- is written with a credential
 /// for anything further on to inherit. That bound is that chain's alone: an
