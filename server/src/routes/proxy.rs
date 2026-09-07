@@ -295,12 +295,15 @@ fn cannot_be_a_playlist(content_type: &str) -> bool {
 ///
 /// **One function because there are two places the question is asked**, and
 /// they used to answer it differently. A fetch asks it about what just
-/// arrived; a full cache hit asks it about what is on disk, before a byte of
-/// that is served -- and a hit that skipped the question served the very body
+/// arrived; a cache hit asks it about what is on disk -- **every hit, whole
+/// or partial**, before a byte of it is served and before a fetch is
+/// narrowed against it. A hit that skipped the question served the very body
 /// the rewrite exists to replace, so one URL played through the proxy on a
-/// miss and bypassed it on a hit. That split is also what made keeping `r=`
-/// out of the cache key wrong, since `r=` is the input that can turn the
-/// verdict over: see [`crate::proxy_cache::ProxyCache::entry`].
+/// miss and bypassed it on a hit; a partial one that skipped it narrowed the
+/// player's range down to a tail and relayed that raw, which is the same
+/// failure reached by a longer road. That split is also what made keeping
+/// `r=` out of the cache key wrong, since `r=` is the input that can turn
+/// the verdict over: see [`crate::proxy_cache::ProxyCache::entry`].
 ///
 /// Both URLs are asked, because either one alone has a blind spot. The
 /// URL the *caller* named is the one an HLS player knows it asked for,
@@ -1390,7 +1393,8 @@ async fn proxy(
     // the reactor.
     let ranged = headers.contains_key(header::RANGE);
     // Needed before the lookup, not after it: it is an input to the playlist
-    // verdict, and a full hit has to reach that verdict before it answers.
+    // verdict, and every hit has to reach that verdict before it answers or
+    // narrows anything.
     let forced_content_type = forced_content_type(&params.response_headers);
     let cache_entry = state.proxy_cache.entry(
         &method,
@@ -1421,10 +1425,10 @@ async fn proxy(
         None => (None, None),
     };
 
-    // The whole of what was asked for is here. Nothing is fetched, and the
-    // origin never learns this read happened -- **unless this request is one
-    // whose body we would replace**, which is the one question that has to be
-    // settled before a hit may answer.
+    // **Is this a request whose body we would replace?** Asked of everything
+    // the cache found, before any of it is used for anything, because the
+    // answer decides both of the things a hit can do: answer outright, and
+    // narrow the fetch.
     //
     // The store never holds a playlist ([`cacheable_entity`] refuses one),
     // but whether a stored body *is* one is not decided by the stored bytes
@@ -1435,19 +1439,37 @@ async fn proxy(
     // rewrite failing exactly for the second player of a stream. Asking
     // [`is_a_playlist`] here, with the same inputs the fetch would give it,
     // is what makes the key's promise true: the store keeps origin bytes, and
-    // what is done with them is one question with one answer. A hit whose
-    // answer is "playlist" steps aside, and the origin is fetched and its
-    // response classified the way any fetched one is.
+    // what is done with them is one question with one answer.
+    //
+    // A hit whose answer is "playlist" steps aside **whole**: the entry is
+    // dropped, the player's own `Range` goes to the origin unnarrowed, and
+    // the response is classified and rewritten the way any fetched one is.
+    // Stepping aside only when the hit was complete was the same bug one
+    // step further along. A partial hit went on to narrow the fetch to the
+    // bytes it did not hold, the tail came back a playlist, the stitch guard
+    // below dropped the head it could not join to one -- and what reached the
+    // player was the origin's `206`: raw unrewritten bytes, under a
+    // `Content-Range` naming a range it never asked for, with every segment
+    // line pointing straight at the origin. One request had three answers,
+    // chosen by how much of it happened to be on disk.
     let cached = match cached {
         Some(cached)
-            if cached.complete()
-                && !is_a_playlist(
-                    &url,
-                    None,
-                    &cached.content_type.to_ascii_lowercase(),
-                    forced_content_type.as_deref(),
-                ) =>
+            if is_a_playlist(
+                &url,
+                None,
+                &cached.content_type.to_ascii_lowercase(),
+                forced_content_type.as_deref(),
+            ) =>
         {
+            tracing::debug!(
+                url = %url,
+                "this request would rewrite the body the cache holds; fetching it instead"
+            );
+            None
+        }
+        // The whole of what was asked for is here, and it is ours to send.
+        // Nothing is fetched, and the origin never learns this read happened.
+        Some(cached) if cached.complete() => {
             tracing::debug!(
                 url = %url,
                 first = cached.first,
@@ -1461,13 +1483,6 @@ async fn proxy(
                 ranged,
                 cached,
             );
-        }
-        Some(cached) if cached.complete() => {
-            tracing::debug!(
-                url = %url,
-                "this request would rewrite the body the cache holds; fetching it instead"
-            );
-            None
         }
         held => held,
     };

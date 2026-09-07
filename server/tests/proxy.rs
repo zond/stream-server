@@ -619,6 +619,19 @@ fn warm_the_head(fixture: &Fixture) -> anyhow::Result<String> {
     Ok(url)
 }
 
+/// A playlist long enough to fill `chunks` whole cache chunks: ordinary
+/// `#EXTINF`/segment pairs, cut to the byte so every chunk of it is a whole
+/// one and the store keeps them all.
+fn playlist_of(chunks: u64) -> Vec<u8> {
+    let mut playlist = "#EXTM3U\n#EXT-X-VERSION:3\n".to_string();
+    while (playlist.len() as u64) < CHUNK * chunks {
+        let line = playlist.len();
+        playlist.push_str(&format!("#EXTINF:4.0,\nsegment-{line}.ts\n"));
+    }
+    playlist.truncate((CHUNK * chunks) as usize);
+    playlist.into_bytes()
+}
+
 /// A cached head is joined to a fresh `206` only when the origin says the
 /// two are parts of one entity, and the joined response is labelled with the
 /// validator that said so.
@@ -769,12 +782,7 @@ fn a_cache_hit_is_classified_the_way_a_miss_is() -> anyhow::Result<()> {
     // A playlist the origin labels `video/mp4`, four whole chunks of it, so
     // the store keeps it and a request with no `Range` can be answered from
     // the store entire.
-    let mut playlist = "#EXTM3U\n#EXT-X-VERSION:3\n".to_string();
-    for line in 0..40_000 {
-        playlist.push_str(&format!("#EXTINF:4.0,\nsegment-{line}.ts\n"));
-    }
-    playlist.truncate((CHUNK * 4) as usize);
-    let body = playlist.clone().into_bytes();
+    let body = playlist_of(4);
     let origin = Origin::start_with(move |request: &Request, socket: &mut TcpStream| {
         let _ = socket.write_all(
             format!(
@@ -840,6 +848,162 @@ fn a_cache_hit_is_classified_the_way_a_miss_is() -> anyhow::Result<()> {
         hit_body.replace("/warm.mp4", "/cold.mp4"),
         missed_body,
         "and the same answer"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
+/// The same request, answered from an empty cache, from a half-filled one
+/// and from a full one, must come back the same three times.
+///
+/// This is the previous test's question asked of the *partial* hit, and it
+/// is the one the full hit's fix left open: a hit that held only the head of
+/// the range skipped the classification entirely, narrowed the player's
+/// `Range` down to what it did not hold, and -- the fetched tail being a
+/// playlist -- had the cached head dropped by the stitch guard and the
+/// origin's `206` relayed raw. Measured against the code before this test:
+/// `200` and a rewritten playlist cold and fully cached, `206` and 512 KiB
+/// of unrewritten origin bytes half cached, under a `Content-Range` naming a
+/// range the player never asked for and with every segment line pointing
+/// straight at the origin -- no `h=`, no `p=`. One request, three answers,
+/// chosen by how much happened to be on disk.
+#[test]
+fn a_partly_held_range_is_classified_the_way_a_hit_and_a_miss_are() -> anyhow::Result<()> {
+    // A playlist the origin labels `video/mp4` at a URL that names no
+    // extension: nothing but `r=` says this is a playlist, which is the
+    // whole point -- and four whole chunks of it, so the cache can hold
+    // half.
+    let body = playlist_of(4);
+    let total = body.len();
+    let origin = Origin::start_with(move |request: &Request, socket: &mut TcpStream| {
+        let served = request.range().and_then(|value| {
+            let (first, last) = value.trim_start_matches("bytes=").split_once('-')?;
+            let first: usize = first.parse().ok()?;
+            let last: usize = if last.is_empty() {
+                total - 1
+            } else {
+                last.parse().ok()?
+            };
+            Some((first, last))
+        });
+        let (head, part) = match served {
+            Some((first, last)) => (
+                format!(
+                    "HTTP/1.1 206 Partial Content\r\nAccept-Ranges: bytes\r\n\
+                     Content-Type: video/mp4\r\nETag: \"the-list\"\r\n\
+                     Content-Range: bytes {first}-{last}/{total}\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    last - first + 1
+                ),
+                &body[first..=last],
+            ),
+            None => (
+                format!(
+                    "HTTP/1.1 200 OK\r\nAccept-Ranges: bytes\r\nContent-Type: video/mp4\r\n\
+                     ETag: \"the-list\"\r\nContent-Length: {total}\r\n\
+                     Connection: close\r\n\r\n"
+                ),
+                &body[..],
+            ),
+        };
+        let _ = socket.write_all(head.as_bytes());
+        let _ = socket.write_all(part);
+        let _ = socket.flush();
+    })?;
+    let fixture = fixture_with(origin)?;
+    let origin = format!("http://{}", fixture.origin.addr);
+    let client = reqwest::blocking::Client::new();
+    let forced = encode("Content-Type:application/x-mpegURL");
+    let proxied = |force: bool| {
+        if force {
+            format!(
+                "{}/proxy/d={}&r={forced}/stream",
+                fixture.base,
+                encode(&origin)
+            )
+        } else {
+            format!("{}/proxy/d={}/stream", fixture.base, encode(&origin))
+        }
+    };
+    // What a player opens a stream with, and the one shape that reaches the
+    // cache holding part of the range: an unranged request is answered only
+    // from a complete entry.
+    let whole = "bytes=0-";
+    let answer = |force: bool| -> anyhow::Result<(String, Option<String>, String)> {
+        let response = client
+            .get(proxied(force))
+            .header(reqwest::header::RANGE, whole)
+            .send()?;
+        let status = response.status().to_string();
+        let ranges = header(response.headers(), "accept-ranges").map(str::to_string);
+        Ok((status, ranges, response.text()?))
+    };
+
+    // Cold: nothing on disk, so the fetch classifies the body and the
+    // rewrite is what the player gets.
+    let cold = answer(true)?;
+    assert_eq!(
+        fixture.origin.next_request().range(),
+        Some(whole),
+        "and the player's own range went to the origin"
+    );
+    assert_eq!(cold.0, "200 OK", "a rewritten playlist is the whole body");
+    assert_eq!(cold.1.as_deref(), Some("none"));
+    assert!(
+        cold.2.contains("/proxy/d="),
+        "every segment line comes back through this server"
+    );
+    assert!(
+        cached_chunks(&fixture).is_empty(),
+        "and a playlist is not a body the cache keeps"
+    );
+
+    // Half of it on disk, filled by a request that did not force the type --
+    // which is the second player of a stream, or the same one before the
+    // addon's `r=` was in play.
+    let warm = client
+        .get(proxied(false))
+        .header(reqwest::header::RANGE, format!("bytes=0-{}", CHUNK * 2 - 1))
+        .send()?;
+    assert_eq!(warm.bytes()?.len() as u64, CHUNK * 2);
+    fixture.origin.next_request();
+    wait_for_chunks(&fixture, 2);
+
+    let half_cached = answer(true)?;
+    assert_eq!(
+        fixture.origin.next_request().range(),
+        Some(whole),
+        "a request whose body we would replace is not narrowed against a head \
+         we are not going to send"
+    );
+    assert_eq!(
+        half_cached, cold,
+        "a partial hit answers what an empty cache answered"
+    );
+
+    // The rest of it on disk, and the same request once more.
+    let rest = client
+        .get(proxied(false))
+        .header(reqwest::header::RANGE, whole)
+        .send()?;
+    assert_eq!(rest.bytes()?.len() as u64, CHUNK * 4);
+    assert_eq!(
+        fixture.origin.next_request().range(),
+        Some(format!("bytes={}-{}", CHUNK * 2, CHUNK * 4 - 1)).as_deref(),
+        "that fill is an ordinary narrowed fetch; nothing here changes it"
+    );
+    wait_for_chunks(&fixture, 4);
+
+    let fully_cached = answer(true)?;
+    assert_eq!(
+        fixture.origin.next_request().range(),
+        Some(whole),
+        "the full hit steps aside the same way"
+    );
+    assert_eq!(
+        fully_cached, cold,
+        "and a full hit answers what an empty cache answered"
     );
 
     drop(fixture.handle);
