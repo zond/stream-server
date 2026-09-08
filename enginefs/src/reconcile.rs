@@ -176,8 +176,7 @@ pub fn verdict(conditions: &Conditions, trigger: Trigger) -> Verdict {
         return arm(Decision::Run);
     }
     if volume_is_short(
-        trigger,
-        conditions.run_state,
+        line(trigger, conditions.run_state),
         conditions.has_metadata,
         conditions.finished,
         conditions.available,
@@ -209,13 +208,13 @@ pub fn verdict(conditions: &Conditions, trigger: Trigger) -> Verdict {
 }
 
 /// The free-space arm of [`desired`] on its own: whether the volume this
-/// torrent writes to is too short for it to be running.
+/// torrent writes to is too short, against `line`, for it to be running.
 ///
 /// `wants_to_write` is the first half -- only a torrent that still has data
 /// to fetch can take a volume down, so a magnet that has not resolved its
 /// info dictionary (no files, no length) and a torrent that has everything
 /// it wants are both outside this arm however little room is left. The
-/// second half is the reading against [`floor`].
+/// second half is the reading against `line`.
 ///
 /// It is a function of its own, and not a line inside the ladder, because
 /// the ladder is not the only caller: `Engine::is_stopped_for_space` asks
@@ -224,20 +223,28 @@ pub fn verdict(conditions: &Conditions, trigger: Trigger) -> Verdict {
 /// A second copy of the test in either place is a policy in two halves that
 /// drift, which is how the free-space watch came to skip the very torrents
 /// the stream route was answering `507` for.
+///
+/// **The line is the caller's, and the two callers do not want the same
+/// one.** The ladder asks "should I start this torrent?" and takes its line
+/// from [`line`], which is the hysteresis; everything that asks "is this
+/// device short?" -- the statistics a client reads, the cleaner's eviction
+/// classes -- asks at [`CACHE_FREE_SPACE_FLOOR`], the same number
+/// `ensure_download_disk_ready` answers `507` under and the cleaner keeps
+/// free. Handing the hysteresis to those callers reports a volume the rest
+/// of the server is happy with as out of disk, and takes the files of every
+/// torrent that happens to be paused inside the band out of the protected
+/// class.
 pub fn volume_is_short(
-    trigger: Trigger,
-    run_state: RunState,
+    line: u64,
     has_metadata: bool,
     finished: bool,
     available: Option<u64>,
 ) -> bool {
-    has_metadata
-        && !finished
-        && available.is_some_and(|available| available < floor(trigger, run_state))
+    has_metadata && !finished && available.is_some_and(|available| available < line)
 }
 
-/// The free-space line this decision is measured against, and the whole of
-/// the hysteresis.
+/// The free-space line the *ladder's* decision is measured against, and the
+/// whole of the hysteresis.
 ///
 /// One line would flap: a torrent stopped at the floor is started again the
 /// moment the volume reads a byte over it, writes for two seconds, crosses
@@ -257,7 +264,11 @@ pub fn volume_is_short(
 /// torrent is doing: the margin is there to stop a *timer* restarting
 /// something into a nearly-full volume for no one, and a user pressing play
 /// on a volume that has room above the floor is owed their stream.
-fn floor(trigger: Trigger, observed: RunState) -> u64 {
+///
+/// It is the ladder's alone. A reader that is not deciding whether to make
+/// a start/stop call wants [`CACHE_FREE_SPACE_FLOOR`] -- see
+/// [`volume_is_short`].
+pub(crate) fn line(trigger: Trigger, observed: RunState) -> u64 {
     match (trigger, observed) {
         (Trigger::PlaybackStart, _) | (_, RunState::Live) => CACHE_FREE_SPACE_FLOOR,
         _ => resume_line(),

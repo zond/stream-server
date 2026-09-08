@@ -71,9 +71,9 @@ pub const FREE_SPACE_WATCH_INTERVAL: Duration = Duration::from_secs(2);
 /// *over* the floor. Without the hysteresis a torrent started at the floor
 /// writes a few MB, is stopped again, and flaps: each stop drops its peers
 /// and each start re-announces. The band's memory is the torrent's own run
-/// state and nothing else -- see [`reconcile::floor`].
+/// state and nothing else -- see [`reconcile::line`].
 ///
-/// [`reconcile::floor`]: reconcile
+/// [`reconcile::line`]: reconcile
 pub const FREE_SPACE_RESUME_MARGIN: u64 = 64 * 1024 * 1024;
 /// How long the volume a stopped torrent writes to may stay short with that
 /// torrent's readers parked before they are failed
@@ -7920,14 +7920,20 @@ mod tests {
         );
         assert!(!engine.reads_refused(), "its readers wait for the cleaner");
 
-        // Back over the floor but inside the margin: still stopped.
+        // Back over the floor but inside the margin: still stopped -- the
+        // margin is what it has to see cleared before anything starts it
+        // again. The *device* is no longer short, though, so nothing tells
+        // a client it is out of disk and nothing offers this torrent's
+        // files to the cleaner: the hysteresis is the ladder's line and
+        // nobody else's.
         available.store(
             CACHE_FREE_SPACE_FLOOR + FREE_SPACE_RESUME_MARGIN - 1,
             Ordering::SeqCst,
         );
         enginefs.reconcile_tick().await;
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
-        assert!(engine.is_stopped_for_space().await);
+        assert!(!engine.is_stopped_for_space().await);
+        assert!(enginefs.out_of_space_torrents().await.is_empty());
 
         // The margin over: started again, and off the cleaner's list.
         available.store(
@@ -8604,6 +8610,53 @@ mod tests {
     async fn idle_pause(engine: &Arc<Engine<FakeHandle>>) {
         engine.idle_paused.store(true, Ordering::Relaxed);
         engine.handle.pause_torrent().await.unwrap();
+    }
+
+    /// A torrent that is paused for a reason of its own, on a volume the
+    /// rest of the server is happy with, is not out of disk -- and its
+    /// files keep the cleaner's protection.
+    ///
+    /// The band between the floor and the resume margin is the *ladder's*
+    /// hysteresis: it decides when a stopped torrent may be started again.
+    /// Judging "is this torrent stopped for want of space?" there instead
+    /// of at the floor answers for every paused torrent on a volume with
+    /// 513 MiB free -- which `ensure_download_disk_ready` serves from
+    /// without complaint and the cleaner's own cap treats as fine -- and
+    /// two things follow that are both wrong: the client is shown a torrent
+    /// error, and the files leave `EvictionClasses::protected` for
+    /// `stopped_for_space`, which the cache cleaner does not protect. Those
+    /// go to the ordinary oldest-first eviction and are unlinked piecemeal
+    /// under a torrent that still holds them open with a piece map that
+    /// says it has them.
+    #[tokio::test(start_paused = true)]
+    async fn a_paused_torrent_over_the_floor_is_not_out_of_disk() {
+        let (mut enginefs, _counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(CACHE_FREE_SPACE_FLOOR + 1));
+        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        idle_pause(&engine).await;
+        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE).await;
+
+        // The pass takes the volume's reading; the volume never went under
+        // the floor at all.
+        enginefs.reconcile_tick().await;
+        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
+
+        let stats = engine.get_statistics().await;
+        assert_ne!(
+            stats.phase,
+            StartupPhase::Error,
+            "the volume is above the floor, so nothing is out of space"
+        );
+        assert_eq!(stats.error, None);
+        let classes = enginefs.eviction_classes().await;
+        assert!(
+            classes.stopped_for_space.is_empty(),
+            "and its files keep their protection"
+        );
+        assert!(!classes.protected.is_empty());
+        assert!(!engine.is_stopped_for_space().await);
+        assert!(enginefs.out_of_space_torrents().await.is_empty());
     }
 
     /// Re-enabling seeding resumes the torrents the idle policy paused, and

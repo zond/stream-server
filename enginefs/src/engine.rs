@@ -329,10 +329,24 @@ impl<H: TorrentHandle> Engine<H> {
     /// things that are both readable now: the backend's state machine says
     /// the torrent is stopped ([`crate::backend::TorrentHandle::run_state`],
     /// never its persisted `paused` flag, which across an initial check is
-    /// wrong in both directions), and the free-space arm of the reconciler's
-    /// ladder says the volume is short for it
-    /// ([`crate::reconcile::volume_is_short`] -- the same function the
-    /// ladder itself calls, so the two cannot disagree).
+    /// wrong in both directions), and the volume it writes to is short for
+    /// it ([`crate::reconcile::volume_is_short`], the same predicate the
+    /// reconciler's free-space arm applies).
+    ///
+    /// **At [`crate::CACHE_FREE_SPACE_FLOOR`], not at the reconciler's
+    /// hysteresis line.** The two readers of this are a client's statistics
+    /// (`phase: error`, [`STOPPED_FOR_SPACE_MESSAGE`]) and the cache
+    /// cleaner's eviction classes, and both are asking about the *device*,
+    /// which the rest of this server judges at the floor: it is what
+    /// `ensure_download_disk_ready` answers `507` under and what the
+    /// cleaner's cap keeps free. Judging it at floor + resume margin
+    /// instead -- the line the *ladder* holds a stopped torrent at, so that
+    /// it has room to run into before it is started again -- tells a client
+    /// that a volume the stream route is serving from happily is out of
+    /// disk, and moves every torrent that merely happens to be paused
+    /// inside the band out of `EvictionClasses::protected` and into
+    /// `stopped_for_space`, whose files the cleaner will unlink piecemeal
+    /// under a torrent that still holds them open.
     ///
     /// It used to be a bit set when the free-space watch stopped a torrent
     /// and cleared when something started it again, and that bit was wrong
@@ -354,8 +368,7 @@ impl<H: TorrentHandle> Engine<H> {
         let run_state = self.handle.run_state();
         matches!(run_state, crate::backend::RunState::Paused)
             && crate::reconcile::volume_is_short(
-                crate::reconcile::Trigger::Timer,
-                run_state,
+                crate::CACHE_FREE_SPACE_FLOOR,
                 self.handle.has_metadata().await,
                 self.handle.is_finished().await,
                 self.volumes
