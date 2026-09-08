@@ -2903,13 +2903,12 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
 
         engine.touch();
-        // The selection is registered above, so the ladder reads `playing`
-        // and starts the torrent if something had stopped it. Awaited, and
-        // before the want-set is applied below: an unpause is what
-        // un-wedges a torrent that came back stopped, and the reader that
-        // follows this call opens on it.
-        self.reconcile_hash(info_hash, crate::reconcile::Trigger::PlaybackStart)
-            .await;
+        // No reconcile here. Both callers of this reach it through
+        // `activate_file` and both ask the reconciler for themselves once
+        // they have finished registering their activity
+        // (`on_stream_start`, `refresh_existing_hls_playback`), so a call
+        // here would be a second decision about the same torrent in the
+        // same request -- and one taken from a half-registered reading.
 
         Self::reconcile_multifile_engine(engine, Some(file_idx), hot_file, generation, source)
             .await;
@@ -4327,9 +4326,13 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     }
                 } else {
                     self.activate_file(&info_hash, file_idx, true, source).await;
-                    // The lease was refreshed above, so `playing` reads
-                    // true here; a torrent the idle arm stopped while the
-                    // player was between segments starts again.
+                    // The lease was refreshed above, so the ladder reads
+                    // `playing`. An HLS player between segments issues no
+                    // new stream, so this is the only moment its torrent
+                    // can be started again -- and it must be measured at
+                    // the floor rather than at the resume line, or a
+                    // torrent stopped inside the hysteresis band would sit
+                    // there while the player waits for a segment.
                     self.reconcile_hash(&info_hash, crate::reconcile::Trigger::PlaybackStart)
                         .await;
                 }
@@ -7513,6 +7516,52 @@ mod tests {
             1,
             "a torrent that is already stopped is not asked to stop again"
         );
+    }
+
+    /// An HLS player between segments issues no new `/stream`, so the
+    /// lease refresh is the only moment its torrent can be started again --
+    /// and it is measured at the floor, like every other decision somebody
+    /// is waiting on.
+    ///
+    /// The band between the floor and the resume margin is where this
+    /// matters. A torrent stopped for want of space is not started again by
+    /// the timer until the volume has cleared the margin; a player that is
+    /// mid-playlist, on a volume that has cleared the floor, would
+    /// otherwise sit there fetching nothing until it gave up.
+    #[tokio::test(start_paused = true)]
+    async fn refreshing_an_hls_lease_starts_a_torrent_stopped_inside_the_band() {
+        let (mut enginefs, _counters) = test_enginefs_for_reconciler(1);
+        let available = Arc::new(AtomicU64::new(CACHE_FREE_SPACE_FLOOR - 1));
+        let probe = available.clone();
+        enginefs.set_free_space_probe(move |_| Ok(probe.load(Ordering::SeqCst)));
+        insert_active_lease(&enginefs, 0).await;
+
+        // The volume goes under the floor and the arm stops the torrent,
+        // lease or no lease -- which is the point of that arm's position.
+        enginefs.reconcile_tick().await;
+        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
+
+        // Room above the floor, but inside the resume margin: the timer
+        // leaves it where it is.
+        available.store(
+            CACHE_FREE_SPACE_FLOOR + FREE_SPACE_RESUME_MARGIN - 1,
+            Ordering::SeqCst,
+        );
+        enginefs.reconcile_tick().await;
+        assert_eq!(
+            run_state_of(&enginefs, TEST_HASH).await,
+            RunState::Paused,
+            "a timer does not restart a torrent into a nearly-full volume for nobody"
+        );
+
+        // The player asks for its next segment.
+        assert!(
+            enginefs
+                .refresh_existing_hls_playback(TEST_HASH, 0, "test")
+                .await,
+            "the lease is live, so the refresh lands"
+        );
+        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
     }
 
     /// The anti-flap dwell, and both halves of its asymmetry.
