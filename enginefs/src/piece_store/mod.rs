@@ -184,7 +184,7 @@ pub mod sweep;
 
 pub use crate::chunk_store::StoredChunk as StoredPiece;
 pub use layout::{FileSpec, PieceLayout, Segment};
-pub use policy::{Decision, RetentionPolicy, Shape};
+pub use policy::{Decision, RetentionPolicy, Shape, Share};
 pub use store::{
     MissingPiece, PieceStore, PieceStoreFactory, StoreContents, StoreRoot, StoredTorrent, layout_of,
 };

@@ -43,7 +43,7 @@ use std::collections::BTreeSet;
 use std::ops::Range;
 
 use crate::backend::{AfterRelease, FilePieceSpan, TorrentHandle};
-use crate::piece_store::{RetentionPolicy, Shape, StoreRoot};
+use crate::piece_store::{RetentionPolicy, Shape, Share, StoreRoot};
 
 /// What the cache cleaner says the torrent-data volume may hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -163,7 +163,17 @@ pub(crate) async fn policy_for<H: TorrentHandle>(
     };
     let span = handle.file_pieces(file_idx).await?;
     let piece_length = handle.piece_length().filter(|length| *length > 0)?;
-    let policy = match RetentionPolicy::new(budget, piece_length, span.pieces.clone(), span.bytes) {
+    // A torrent's half of the budget is committed for sharing: its pieces are
+    // what a peer asks us for. That is the whole of what differs from the
+    // proxy cache's policy (`server::proxy_retention`), and it is this
+    // argument rather than a second policy.
+    let policy = match RetentionPolicy::new(
+        budget,
+        piece_length,
+        span.pieces.clone(),
+        span.bytes,
+        Share::Half,
+    ) {
         Ok(policy) => policy,
         Err(error) => {
             tracing::warn!(

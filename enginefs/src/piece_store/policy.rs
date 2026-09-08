@@ -137,13 +137,47 @@ use std::ops::Range;
 /// whatever we do. Ahead is what keeps playback fed, so it gets the rest.
 const BEHIND_PERCENT: u64 = 10;
 
+/// How much of the budget is committed for sharing rather than spent on the
+/// window.
+///
+/// **This is the only thing that differs between the two kinds of stream this
+/// policy governs, and it is a number rather than a branch.** The budget is
+/// split between what playback needs and what a peer may be offered; a
+/// proxied URL response is not seeded, so nobody can be offered any of it and
+/// the whole budget is window. Everything else -- the 90/10 window, the
+/// release rule, the reclaim -- is the same arithmetic on both, which is what
+/// "one retention policy over both stores" means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Share {
+    /// Half of it: a torrent's pieces, which a peer may ask us for.
+    Half,
+    /// None of it. **Not "share nothing yet"** -- there is no swarm for a
+    /// URL response and there never will be, so a committed set for one
+    /// would be a permanently unreclaimable half of the cache held for a
+    /// reader that does not exist.
+    Nothing,
+}
+
+impl Share {
+    /// How many of `budget` pieces this leaves for the committed set.
+    ///
+    /// The odd piece goes to the window: it is what keeps playback fed, and
+    /// the committed half is generosity.
+    fn committed_of(self, budget: u32) -> u32 {
+        match self {
+            Self::Half => budget / 2,
+            Self::Nothing => 0,
+        }
+    }
+}
+
 /// How a budget relates to the file it has to hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shape {
     /// The budget covers the file. Keep all of it, share all of it, drop
     /// nothing.
     Whole,
-    /// It does not, so it is halved.
+    /// It does not, so it is split: see [`Share`] for what decides where.
     Split {
         /// Pieces the rolling window may cover.
         window: u32,
@@ -234,8 +268,14 @@ pub struct RetentionPolicy {
 }
 
 impl RetentionPolicy {
-    /// The policy for a file occupying `pieces` of the torrent and `bytes` of
-    /// the disk, under a budget of `budget_bytes`.
+    /// The policy for a stream occupying `pieces` of a chunk store and
+    /// `bytes` of the disk, under a budget of `budget_bytes`, `share` of
+    /// which may be committed for a peer.
+    ///
+    /// "Pieces" here are a torrent's when the caller is the piece store's
+    /// adapter and 256 KiB chunks when it is `/proxy`'s: the arithmetic is
+    /// the store's own -- an index space and a length -- and neither
+    /// adapter's names for them reach in here.
     ///
     /// All four numbers have to describe the same file, and three of them
     /// overdetermine the fourth, so the disagreement is checked for rather
@@ -249,6 +289,7 @@ impl RetentionPolicy {
         piece_length: u64,
         pieces: Range<u32>,
         bytes: u64,
+        share: Share,
     ) -> anyhow::Result<Self> {
         if piece_length == 0 {
             anyhow::bail!("a piece length of zero");
@@ -270,32 +311,35 @@ impl RetentionPolicy {
         let covered = pieces.start..pieces.start;
         Ok(Self {
             pieces,
-            shape: Self::shape_for(budget_bytes, piece_length, bytes),
+            shape: Self::shape_for(budget_bytes, piece_length, bytes, share),
             committed: BTreeSet::new(),
             covered,
         })
     }
 
-    /// Halve the budget, or don't.
+    /// Split the budget, or don't.
     ///
     /// The comparison that decides is in bytes and not in pieces, because the
     /// last piece of a file is usually short and "the budget covers the file"
     /// has to mean the file and not a rounded-up multiple of it. Everything
     /// after it is in pieces, and the conversion floors: a budget that is two
     /// and a half pieces buys two.
-    fn shape_for(budget_bytes: u64, piece_length: u64, bytes: u64) -> Shape {
+    ///
+    /// Where the split falls is [`Share`]'s and there is no branch on the
+    /// kind of stream here: a torrent gives half of it to the committed set,
+    /// a proxied response gives none, and what is left over is the window in
+    /// both cases.
+    fn shape_for(budget_bytes: u64, piece_length: u64, bytes: u64, share: Share) -> Shape {
         if budget_bytes >= bytes {
             return Shape::Whole;
         }
         // `budget_bytes < bytes`, so this cannot exceed the file's own piece
         // count and cannot need more than the u32 piece indices already are.
         let budget = (budget_bytes / piece_length) as u32;
-        // The odd piece goes to the window: it is what keeps playback fed,
-        // and the committed half is generosity.
-        let window = budget.div_ceil(2);
+        let committed = share.committed_of(budget);
         Shape::Split {
-            window,
-            committed: budget - window,
+            window: budget - committed,
+            committed,
         }
     }
 
@@ -463,6 +507,19 @@ mod tests {
             PIECE,
             0..count,
             u64::from(count) * PIECE,
+            Share::Half,
+        )
+        .expect("a consistent file")
+    }
+
+    /// The same file under a stream nothing can be shared from: `/proxy`'s.
+    fn unshared(budget_pieces: u64, count: u32) -> RetentionPolicy {
+        RetentionPolicy::new(
+            budget_pieces * PIECE,
+            PIECE,
+            0..count,
+            u64::from(count) * PIECE,
+            Share::Nothing,
         )
         .expect("a consistent file")
     }
@@ -509,14 +566,76 @@ mod tests {
         assert_eq!(p.advertised().len(), 20);
     }
 
+    /// **A stream with no swarm spends the whole budget on the window, and
+    /// that is a number and not a case.**
+    ///
+    /// A proxied URL response is not seeded: nothing will ever ask us for a
+    /// chunk of it. A committed half for one would be half the cache held
+    /// permanently -- never reclaimed, by the committed set's own rule --
+    /// for a reader that does not exist, and the window playback actually
+    /// needs would be half what the disk could give it. So the split is
+    /// [`Share::Nothing`] and everything else about the policy is the same
+    /// arithmetic the torrent gets.
+    #[test]
+    fn a_stream_nothing_can_be_shared_from_spends_the_whole_budget_on_the_window() {
+        let shared = policy(10, 40);
+        let alone = unshared(10, 40);
+        assert_eq!(
+            shared.shape(),
+            Shape::Split {
+                window: 5,
+                committed: 5
+            }
+        );
+        assert_eq!(
+            alone.shape(),
+            Shape::Split {
+                window: 10,
+                committed: 0
+            },
+            "twice the window, because none of it is being kept for a peer"
+        );
+        assert_eq!(
+            shared.shape().piece_budget(),
+            alone.shape().piece_budget(),
+            "and the same budget: the split moved, the total did not"
+        );
+    }
+
+    /// And it commits nothing, ever -- so nothing of it is exempt from the
+    /// reclaim, whatever the playhead does. Played straight through, the
+    /// disk holds a window and no more.
+    #[test]
+    fn an_unshared_stream_commits_nothing_and_holds_only_its_window() {
+        let mut p = unshared(10, 40);
+        let mut disk = BTreeSet::new();
+        play(&mut p, &mut disk, 0..40);
+        assert!(
+            p.advertised().is_empty(),
+            "there is no peer to have been told about any of it"
+        );
+        assert!(
+            disk.len() <= 10,
+            "{} pieces on disk, and the budget is 10",
+            disk.len()
+        );
+
+        // The same walk on the sharing policy settles a permanent set, which
+        // is exactly what a proxied stream must not do.
+        let mut shared = policy(10, 40);
+        let mut shared_disk = BTreeSet::new();
+        play(&mut shared, &mut shared_disk, 0..40);
+        assert!(!shared.advertised().is_empty());
+    }
+
     /// The boundary is in bytes, because the last piece of a file is usually
     /// short: a budget one byte under the file's real size is still a split.
     #[test]
     fn the_whole_file_test_is_the_files_own_length_not_a_rounded_one() {
         let bytes = 19 * PIECE + 1;
-        let exact = RetentionPolicy::new(bytes, PIECE, 0..20, bytes).unwrap();
+        let exact = RetentionPolicy::new(bytes, PIECE, 0..20, bytes, Share::Half).unwrap();
         assert_eq!(exact.shape(), Shape::Whole);
-        let short = RetentionPolicy::new(bytes - 1, PIECE, 0..20, bytes).unwrap();
+        let short = RetentionPolicy::new(bytes - 1, PIECE, 0..20, bytes, Share::Half).unwrap();
         assert_ne!(short.shape(), Shape::Whole, "one byte short is not covered");
         // 19 pieces and a byte of budget buys 19 pieces: 10 window, 9 shared.
         assert_eq!(
@@ -558,7 +677,7 @@ mod tests {
 
         // And a budget of less than one whole piece is the same thing: the
         // conversion to pieces floors.
-        let sub = RetentionPolicy::new(PIECE - 1, PIECE, 0..20, 20 * PIECE).unwrap();
+        let sub = RetentionPolicy::new(PIECE - 1, PIECE, 0..20, 20 * PIECE, Share::Half).unwrap();
         assert_eq!(
             sub.shape(),
             Shape::Split {
@@ -627,7 +746,7 @@ mod tests {
     #[test]
     fn a_file_of_one_piece_is_the_whole_window_and_nothing_else() {
         // Not covered by the budget, so it splits, and the split is degenerate.
-        let mut p = RetentionPolicy::new(PIECE / 2, PIECE, 7..8, PIECE).unwrap();
+        let mut p = RetentionPolicy::new(PIECE / 2, PIECE, 7..8, PIECE, Share::Half).unwrap();
         assert_eq!(
             p.shape(),
             Shape::Split {
@@ -642,7 +761,7 @@ mod tests {
         assert!(d.reclaim.is_empty() && d.committed.is_empty());
 
         // Covered by it, and the one piece is shared.
-        let mut p = RetentionPolicy::new(PIECE, PIECE, 7..8, PIECE).unwrap();
+        let mut p = RetentionPolicy::new(PIECE, PIECE, 7..8, PIECE, Share::Half).unwrap();
         assert_eq!(p.shape(), Shape::Whole);
         let d = p.advance(7, &held([7]));
         assert_eq!(d.committed, vec![7]);
@@ -956,8 +1075,8 @@ mod tests {
     /// somebody else's decision and must not be reclaimed by this one.
     #[test]
     fn pieces_outside_this_files_range_are_left_alone() {
-        let mut p =
-            RetentionPolicy::new(10 * PIECE, PIECE, 100..200, 100 * PIECE).expect("consistent");
+        let mut p = RetentionPolicy::new(10 * PIECE, PIECE, 100..200, 100 * PIECE, Share::Half)
+            .expect("consistent");
         assert_eq!(
             p.shape(),
             Shape::Split {
@@ -1013,19 +1132,19 @@ mod tests {
     #[test]
     fn a_file_whose_numbers_do_not_agree_is_refused() {
         // 20 pieces of 1000 hold between 19001 and 20000 bytes.
-        assert!(RetentionPolicy::new(0, PIECE, 0..20, 20_000).is_ok());
-        assert!(RetentionPolicy::new(0, PIECE, 0..20, 19_001).is_ok());
-        let err = RetentionPolicy::new(0, PIECE, 0..20, 19_000)
+        assert!(RetentionPolicy::new(0, PIECE, 0..20, 20_000, Share::Half).is_ok());
+        assert!(RetentionPolicy::new(0, PIECE, 0..20, 19_001, Share::Half).is_ok());
+        let err = RetentionPolicy::new(0, PIECE, 0..20, 19_000, Share::Half)
             .unwrap_err()
             .to_string();
         assert!(err.contains("between 19001 and 20000"), "{err}");
-        assert!(RetentionPolicy::new(0, PIECE, 0..20, 20_001).is_err());
+        assert!(RetentionPolicy::new(0, PIECE, 0..20, 20_001, Share::Half).is_err());
         assert!(
-            RetentionPolicy::new(0, 0, 0..20, 20_000).is_err(),
+            RetentionPolicy::new(0, 0, 0..20, 20_000, Share::Half).is_err(),
             "zero piece length"
         );
         assert!(
-            RetentionPolicy::new(0, PIECE, 5..5, 0).is_err(),
+            RetentionPolicy::new(0, PIECE, 5..5, 0, Share::Half).is_err(),
             "no pieces"
         );
     }
@@ -1038,7 +1157,8 @@ mod tests {
         let count = 64u32;
         let bytes = u64::from(count) * PIECE;
         for budget_bytes in (0..=bytes + 2 * PIECE).step_by(PIECE as usize / 8) {
-            let mut p = RetentionPolicy::new(budget_bytes, PIECE, 0..count, bytes).unwrap();
+            let mut p =
+                RetentionPolicy::new(budget_bytes, PIECE, 0..count, bytes, Share::Half).unwrap();
             match p.shape() {
                 Shape::Whole => assert!(budget_bytes >= bytes),
                 Shape::Split { window, committed } => {
