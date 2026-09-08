@@ -2583,12 +2583,19 @@ fn a_restart_leaves_a_torrent_stopped_and_a_stream_request_starts_it() -> anyhow
         Ok(stats["swarmPaused"] == serde_json::json!(true))
     };
     // The initial check has to finish before the state machine can say
-    // anything settled about the torrent at all.
+    // anything settled about the torrent at all -- and `phase` leaving
+    // `checking` is not that moment, so this is a bounded poll on the
+    // reading the rest of the test depends on rather than one assertion
+    // taken the instant `phase` moves.
     stats_after_check(&client, &base, &info_hash)?;
-    assert!(
-        swarm_paused(&client)?,
-        "the torrent came back stopped, exactly as the last process left it"
-    );
+    let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
+    while !swarm_paused(&client)? {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the torrent did not come back stopped, as the last process left it"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     // And it stays that way while nobody asks: several reconciler ticks
     // (its interval is two seconds) go by.
     std::thread::sleep(enginefs::reconcile::RECONCILE_INTERVAL * 3);
