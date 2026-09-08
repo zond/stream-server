@@ -1060,12 +1060,12 @@ async fn stream_video_with(
     // the cache again.
     //
     // This used to be here because the two gates measured two devices: a
-    // pinned download lived under `downloadsDir` -- a setting whose entire
-    // purpose is a second card -- while `ensure_disk_ready_or_refuse`
-    // probes `engine_fs.download_dir` and nothing else. That gap is closed:
-    // the piece store is the session's default storage and its root is
-    // inside `download_dir`, so every payload byte of every torrent, pinned
-    // or streamed, lands on the volume the gate below probes.
+    // pinned download was placed under `downloadsDir`, while
+    // `ensure_disk_ready_or_refuse` probes `engine_fs.download_dir` and
+    // nothing else. That gap is closed twice over: the piece store is the
+    // session's default storage and its root is inside `download_dir`, so
+    // every payload byte of every torrent lands on the volume the gate
+    // below probes -- and nothing places a torrent anywhere any more.
     //
     // What is left is a short circuit, and it is worth keeping as one. The
     // gate below answers a refusal by running a whole cache-cleaner pass

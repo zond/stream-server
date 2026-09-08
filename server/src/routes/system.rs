@@ -350,13 +350,21 @@ pub struct ServerSettings {
     #[serde(rename = "seedingEnabled", default = "default_seeding_enabled")]
     pub seeding_enabled: bool,
 
-    /// Where offline downloads are placed: `<downloadsDir>/<infoHash>/` per
-    /// pinned torrent. `None` (the default) keeps them in the cache root
-    /// (`<cacheRoot>/rqbit-downloads`). Set through `POST /settings` with
-    /// an absolute path (created if missing, must be writable, and not at
-    /// or above a cache root -- see [`prepare_downloads_dir`]) or `null`;
-    /// pins issued from then on go there, and a torrent already managed in
-    /// the cache root is relocated by its next pin.
+    /// A directory the cache cleaner walks in addition to the cache roots,
+    /// and **nothing else decides anything by** (see
+    /// [`prepare_downloads_dir`]). Set through `POST /settings` with an
+    /// absolute path (created if missing, must be writable, and not at or
+    /// above a cache root) or `null`.
+    ///
+    /// It used to be where offline downloads were placed,
+    /// `<downloadsDir>/<infoHash>/` per pinned torrent, with a torrent
+    /// already managed elsewhere relocated into it by its next pin. Torrent
+    /// data is one file per piece under the store's single root now
+    /// (`<cacheRoot>/.pieces`), for the streaming cache and offline
+    /// downloads alike, and pinning is a retention property rather than a
+    /// location -- so nothing is written here by this version at all. What
+    /// is here is what earlier versions wrote, which is neither converted
+    /// nor read, and walking it is how those bytes are ever reclaimed.
     #[serde(rename = "downloadsDir", default)]
     pub downloads_dir: Option<String>,
 
@@ -425,17 +433,20 @@ pub fn cache_roots(state: &AppState) -> [std::path::PathBuf; 2] {
 /// Validate and prepare a `downloadsDir` value: trimmed, absolute, not at
 /// or above any of `cache_roots` ([`cache_roots`]), created if missing and
 /// writable (a probe file is created and removed). The returned path --
-/// **resolved**, see below -- is what the setting stores and the engines
-/// use.
+/// **resolved**, see below -- is what the setting stores.
+///
+/// Nothing places anything here (see the field): what the value decides is
+/// which directory the cache cleaner walks *besides* the cache roots, so
+/// that the whole-file downloads earlier versions wrote there can be
+/// counted and reclaimed.
 ///
 /// Checked before it is created, so a refused setting leaves no directory
 /// behind; and resolved before it is returned, because the stored value is
 /// compared as a plain path prefix from then on: the cleaner walks this
-/// directory as one of its roots and protects what is in it by
-/// `starts_with` against the paths the engines report, and the engines
-/// place torrents under exactly this path. A spelling that reaches the same
-/// directory through a symlinked prefix would match neither, leaving a
-/// dormant pin's folder unprotected in a directory that is now walked.
+/// directory as one of its roots, collapses roots into each other by
+/// `starts_with`, and prunes empty directories up to exactly it. A spelling
+/// that reaches the same directory through a symlinked prefix would match
+/// none of that.
 pub async fn prepare_downloads_dir(
     raw: &str,
     cache_roots: &[std::path::PathBuf],
@@ -1041,10 +1052,6 @@ pub async fn update_settings(
 
     let seeding_enabled = settings.seeding_enabled;
     let lan_media_enabled = settings.lan_media_enabled;
-    let downloads_dir = settings
-        .downloads_dir
-        .as_ref()
-        .map(std::path::PathBuf::from);
 
     // Build new speed profile from updated settings
     let new_profile = enginefs::backend::TorrentSpeedProfile {
@@ -1106,8 +1113,12 @@ pub async fn update_settings(
         .download_engine
         .set_seeding_enabled(seeding_enabled)
         .await;
-    state.engine.set_downloads_dir(downloads_dir.clone());
-    state.download_engine.set_downloads_dir(downloads_dir);
+    // `downloadsDir` is not pushed to the engines: nothing places a
+    // torrent any more (a pin is a retention property, see
+    // `enginefs::BackendEngineFS::pin_download`), so the resolved path is
+    // read straight from the settings by the one thing left that uses it --
+    // the cache cleaner, which walks it for what earlier versions wrote
+    // there.
 
     // Save to disk
     state.save_settings().await?;

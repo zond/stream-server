@@ -401,10 +401,11 @@ impl ServerHandle {
     /// Pin `file_idx` of `info_hash` as an offline download (see
     /// `routes::downloads::pin_download`, which the download control route
     /// shares): created through the magnet registry with `trackers` (as in
-    /// [`Self::engine_stats`]) when new, placed under `settings.downloadsDir`
-    /// when set, kept wanted and exempt from eviction, persisted across
-    /// restarts. Fails with [`PinDownloadError`] -- `InsufficientSpace`
-    /// below [`PIN_FREE_SPACE_MARGIN`], `FileNotFound` for a bad index.
+    /// [`Self::engine_stats`]) when new, kept wanted and exempt from
+    /// eviction, persisted across restarts. The torrent does not move --
+    /// pinning is retention, not a location. Fails with
+    /// [`PinDownloadError`] -- `InsufficientSpace` below
+    /// [`PIN_FREE_SPACE_MARGIN`], `FileNotFound` for a bad index.
     pub fn pin_download(
         &self,
         info_hash: &str,
@@ -428,8 +429,8 @@ impl ServerHandle {
     /// [`UnpinOutcome::deleted_files`] whether data actually went, which is
     /// not simply `delete_files` echoed back. With `delete_files` the data
     /// goes too: the whole torrent when this was its last pin, only that
-    /// file while other pins hold, the `<downloadsDir>/<infoHash>` folder
-    /// for a pin whose torrent the backend does not have, and a `file_idx`
+    /// file while other pins hold, the piece-store directory for a pin whose
+    /// torrent the backend does not have, and a `file_idx`
     /// the torrent does not have is refused with
     /// [`PinDownloadError::FileNotFound`] rather than taken for the whole
     /// torrent. Without it only the pin goes and the engine becomes an
@@ -455,16 +456,16 @@ impl ServerHandle {
         self.block_on_server(async move { routes::downloads::downloads(&state).await })
     }
 
-    /// Where `file_idx` of `info_hash` is *placed* (the `path` of its
-    /// [`Self::downloads`] entry). `None` when the torrent is not managed
-    /// right now or the backend does not know the path yet; never creates an
-    /// engine.
+    /// What the torrent backend calls `file_idx` of `info_hash` (the `path`
+    /// of its [`Self::downloads`] entry). `None` when the torrent is not
+    /// managed right now or the backend does not know the path yet; never
+    /// creates an engine.
     ///
     /// A name, not a file: torrent data is stored one file per piece
     /// (`enginefs::piece_store`), so nothing is written at this path and
     /// handing it to a local player would hand it a path that does not
     /// exist. A finished download plays through the media routes like any
-    /// other.
+    /// other. Nothing above the backend chooses the folder in it either.
     pub fn download_path(
         &self,
         info_hash: &str,
@@ -1043,29 +1044,26 @@ pub async fn run(
         let mut settings = settings_arc.write().await;
         seeding_enabled = settings.seeding_enabled;
         // A persisted downloadsDir that cannot be used any more (unmounted
-        // drive, permissions) is cleared rather than kept as a setting the
-        // engines silently ignore: pins fall back to the cache root,
-        // `GET /settings` says so, and so does the settings file (below,
-        // once the lock is released) -- an embedder reading it sees the
-        // same value, and the next boot does not warn again.
-        if let Some(raw) = settings.downloads_dir.clone() {
-            match routes::system::prepare_downloads_dir(&raw, &routes::system::cache_roots(&state))
-                .await
-            {
-                Ok(path) => {
-                    state.engine.set_downloads_dir(Some(path.clone()));
-                    state.download_engine.set_downloads_dir(Some(path));
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        downloads_dir = %raw,
-                        error = %format!("{error:#}"),
-                        "downloadsDir is unusable; clearing it (downloads go to the cache root)"
-                    );
-                    settings.downloads_dir = None;
-                    cleared_downloads_dir = true;
-                }
-            }
+        // drive, permissions) is cleared rather than kept as a setting
+        // nothing can act on: `GET /settings` says so, and so does the
+        // settings file (below, once the lock is released) -- an embedder
+        // reading it sees the same value, and the next boot does not warn
+        // again. What the value still does is give the cache cleaner a root
+        // to walk (`cache_cleaner::cache_roots`, which reads it from the
+        // settings); no torrent is written there.
+        if let Some(raw) = settings.downloads_dir.clone()
+            && let Err(error) =
+                routes::system::prepare_downloads_dir(&raw, &routes::system::cache_roots(&state))
+                    .await
+        {
+            tracing::warn!(
+                downloads_dir = %raw,
+                error = %format!("{error:#}"),
+                "downloadsDir is unusable; clearing it (nothing is written there, but the \
+                 cache cleaner would have walked it)"
+            );
+            settings.downloads_dir = None;
+            cleared_downloads_dir = true;
         }
     }
     // Outside the settings lock, and after it: applying the setting now

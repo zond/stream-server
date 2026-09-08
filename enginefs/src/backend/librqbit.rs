@@ -1785,50 +1785,6 @@ pub fn magnet_with_trackers(url: &str, trackers: &[String]) -> String {
     parsed.to_string()
 }
 
-/// Move a file, falling back to copy + remove when `rename` cannot cross
-/// the device boundary (`EXDEV`; `ERROR_NOT_SAME_DEVICE` on Windows -- both
-/// `ErrorKind::CrossesDevices`). A failed copy removes its partial target.
-pub(crate) async fn move_file(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-    match tokio::fs::rename(src, dst).await {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
-            copy_then_remove(src, dst).await
-        }
-        Err(e) => Err(e),
-    }
-}
-
-/// Whether a file of a torrent being relocated is worth moving: it has
-/// verified bytes per the chunk tracker (`have`, known once the torrent
-/// has initialized), or -- `have` unknown, the torrent still Initializing
-/// -- it has blocks allocated on disk, which a pre-sized sparse placeholder
-/// has not (on platforms without block counts every existing file moves).
-fn has_data_to_move(have: Option<u64>, metadata: &std::fs::Metadata) -> bool {
-    match have {
-        Some(have) => have > 0,
-        None => has_allocated_blocks(metadata),
-    }
-}
-
-#[cfg(unix)]
-fn has_allocated_blocks(metadata: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    metadata.blocks() > 0
-}
-
-#[cfg(not(unix))]
-fn has_allocated_blocks(_metadata: &std::fs::Metadata) -> bool {
-    true
-}
-
-async fn copy_then_remove(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-    if let Err(e) = tokio::fs::copy(src, dst).await {
-        let _ = tokio::fs::remove_file(dst).await;
-        return Err(e);
-    }
-    tokio::fs::remove_file(src).await
-}
-
 /// Put `footprint` on one torrent: prune the peer table first when going
 /// lean (see `LibrqbitBackend::set_footprint` for why the order matters),
 /// then the cap. A torrent that is not live has nothing to prune and takes
@@ -1887,6 +1843,10 @@ impl LibrqbitBackend {
         torrents.len()
     }
 
+    /// Wrap a librqbit handle as this backend's own. Only the tests build
+    /// one this way now: every production path gets its handle from the add
+    /// or from `get_torrent`.
+    #[cfg(test)]
     fn wrap(&self, handle: Arc<ManagedTorrent>) -> LibrqbitHandle {
         let info_hash = handle.info_hash().as_string();
         LibrqbitHandle {
@@ -1996,12 +1956,11 @@ impl TorrentBackend for LibrqbitBackend {
             .await
     }
 
-    /// `placement.output_folder` becomes librqbit's per-torrent
-    /// `output_folder` (persisted with the torrent, so a restart restores
-    /// the place) and `placement.only_files` its initial want-set; librqbit
-    /// rejects an out-of-range index at add time. `overwrite: true` always:
-    /// resuming on top of existing files is the normal case here (a restart,
-    /// a relocated torrent).
+    /// `placement.only_files` is the torrent's initial want-set; librqbit
+    /// rejects an out-of-range index at add time. No output folder is ever
+    /// named -- librqbit picks its own, and the payload goes to the piece
+    /// store either way. `overwrite: true` always: resuming on top of
+    /// existing files is the normal case here (a restart).
     async fn add_torrent_placed(
         &self,
         source: TorrentSource,
@@ -2025,9 +1984,6 @@ impl TorrentBackend for LibrqbitBackend {
                 Some(librqbit::AddTorrentOptions {
                     overwrite: true,
                     trackers: Some(trackers),
-                    output_folder: placement
-                        .output_folder
-                        .map(|folder| folder.to_string_lossy().into_owned()),
                     only_files: placement.only_files,
                     // What makes `ManagedTorrent::drop_pieces` -- and so
                     // `LibrqbitHandle::drop_file_pieces` -- available on
@@ -2075,147 +2031,6 @@ impl TorrentBackend for LibrqbitBackend {
             stream_positions: self.stream_positions.clone(),
             swarm_scraper: self.swarm_scraper.clone(),
         })
-    }
-
-    /// librqbit has no relocate call, so: drop the torrent from the session
-    /// keeping its files (`Session::delete(_, false)` also drops its
-    /// persisted record and `.bitv` bitfield), move every file that holds
-    /// verified data from the old output folder into the new one (rename,
-    /// copy + remove across devices), then re-add it from its own metainfo
-    /// bytes with the placement and `overwrite: true` -- librqbit
-    /// hash-checks the moved data (`checking` phase), so nothing verified is
-    /// lost. Files without any verified bytes are not moved but deleted
-    /// with the old folder: librqbit pre-sizes every wanted file when a
-    /// torrent goes live (all of them for a plain magnet add), so a streamed
-    /// season pack has a full-length sparse placeholder per episode, and a
-    /// cross-device copy would write every one of them out as zeros. The
-    /// re-added torrent pre-sizes what it wants in the new folder itself.
-    /// If the move or the re-add fails the torrent is re-added where it was
-    /// (best effort) and the error returned. The deferred-selection slot
-    /// belonged to the old torrent and is dropped; the pin set stays.
-    async fn relocate_torrent(
-        &self,
-        info_hash: &str,
-        placement: TorrentPlacement,
-        trackers: Vec<String>,
-    ) -> Result<Self::Handle> {
-        let id = librqbit::api::TorrentIdOrHash::parse(info_hash)
-            .with_context(|| format!("invalid info hash {info_hash}"))?;
-        let handle = self
-            .session
-            .get(id)
-            .with_context(|| format!("torrent {info_hash} is not managed"))?;
-        let metadata = handle
-            .metadata
-            .load_full()
-            .with_context(|| format!("torrent {info_hash} has no metadata yet"))?;
-        let target = placement
-            .output_folder
-            .clone()
-            .context("relocation needs an output folder")?;
-        let old_folder = handle.output_folder().to_path_buf();
-        let old_only_files = handle.only_files();
-        if old_folder == target {
-            return Ok(self.wrap(handle));
-        }
-        // Per-file verified bytes, snapshotted while the torrent still has a
-        // chunk tracker (empty while it is Initializing -- then the file's
-        // own allocation decides, see `has_data_to_move`).
-        let file_progress = handle.stats().file_progress;
-        self.session
-            .delete(id, false)
-            .await
-            .with_context(|| format!("failed to drop torrent {info_hash} before relocating"))?;
-        self.deferred_selections.lock().remove(info_hash);
-
-        let relocated = async {
-            tokio::fs::create_dir_all(&target)
-                .await
-                .with_context(|| format!("creating {}", target.display()))?;
-            for (idx, file) in metadata.file_infos.iter().enumerate() {
-                let src = old_folder.join(&file.relative_filename);
-                let Ok(src_metadata) = tokio::fs::metadata(&src).await else {
-                    continue;
-                };
-                if !has_data_to_move(file_progress.get(idx).copied(), &src_metadata) {
-                    debug!(
-                        src = %src.display(),
-                        "no verified data; dropping the placeholder instead of moving it"
-                    );
-                    tokio::fs::remove_file(&src)
-                        .await
-                        .with_context(|| format!("removing {}", src.display()))?;
-                    continue;
-                }
-                let dst = target.join(&file.relative_filename);
-                if tokio::fs::try_exists(&dst).await.unwrap_or(false) {
-                    // Data already in the destination (downloaded there
-                    // before) wins over the source: librqbit pre-sizes
-                    // every wanted file in the old folder, so the source
-                    // is often a sparse placeholder that would wipe
-                    // verified bytes. The re-check sorts out what the
-                    // destination actually has.
-                    debug!(
-                        src = %src.display(),
-                        dst = %dst.display(),
-                        "destination file exists; keeping it and dropping the source"
-                    );
-                    tokio::fs::remove_file(&src)
-                        .await
-                        .with_context(|| format!("removing {}", src.display()))?;
-                    continue;
-                }
-                if let Some(parent) = dst.parent() {
-                    tokio::fs::create_dir_all(parent).await?;
-                }
-                move_file(&src, &dst)
-                    .await
-                    .with_context(|| format!("moving {} to {}", src.display(), dst.display()))?;
-            }
-            // The old folder is a per-torrent one only for multi-file
-            // torrents (single-file ones write into the session root, which
-            // stays); drop it once empty, like `remove_torrent` does.
-            if old_folder != self.download_dir
-                && let Err(e) = tokio::fs::remove_dir(&old_folder).await
-                && !matches!(
-                    e.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
-                )
-            {
-                debug!(error = %e, path = ?old_folder, "Left the old output folder in place");
-            }
-            self.add_torrent_placed(
-                TorrentSource::Bytes(metadata.torrent_bytes.to_vec()),
-                trackers.clone(),
-                placement,
-            )
-            .await
-        }
-        .await;
-        match relocated {
-            Ok(handle) => Ok(handle),
-            Err(error) => {
-                warn!(
-                    info_hash,
-                    error = %format!("{error:#}"),
-                    "relocation failed; re-adding the torrent where it was"
-                );
-                if let Err(e) = self
-                    .add_torrent_placed(
-                        TorrentSource::Bytes(metadata.torrent_bytes.to_vec()),
-                        trackers,
-                        TorrentPlacement {
-                            output_folder: Some(old_folder),
-                            only_files: old_only_files,
-                        },
-                    )
-                    .await
-                {
-                    warn!(info_hash, error = %format!("{e:#}"), "re-adding the torrent failed too");
-                }
-                Err(error)
-            }
-        }
     }
 
     async fn get_torrent(&self, info_hash: &str) -> Option<Self::Handle> {
@@ -2837,22 +2652,20 @@ impl TorrentHandle for LibrqbitHandle {
 
     /// The torrent's resolved output folder (`ManagedTorrent::output_folder`,
     /// public since librqbit 9) joined with the file's relative name from
-    /// the metadata's `file_infos` -- exactly where librqbit's storage
-    /// writes it. `None` while a magnet is still resolving or for a bad
-    /// index. This is for handing a *complete* file to a local player;
-    /// reads of an in-progress file keep going through the FileStream,
-    /// which blocks on missing pieces where a sparse file would not.
+    /// the metadata's `file_infos`. **The name librqbit gives the file, not
+    /// a file**: the session's storage is the piece store, so no byte is
+    /// written there -- see the trait's doc. `None` while a magnet is still
+    /// resolving or for a bad index.
+    ///
+    /// The folder is librqbit's own (the session root for a single-file
+    /// torrent, `<root>/<torrent name>` for a multi-file one, or whatever a
+    /// torrent added by an earlier version of this server persisted). This
+    /// layer never chooses it: `output_folder` is librqbit's concept and
+    /// stays there.
     async fn file_path(&self, file_idx: usize) -> Option<PathBuf> {
         let metadata = self.handle.metadata.load_full()?;
         let file = metadata.file_infos.get(file_idx)?;
         Some(self.handle.output_folder().join(&file.relative_filename))
-    }
-
-    /// librqbit's resolved `output_folder` for the torrent: the placement's
-    /// folder when one was given, else the session root (single-file
-    /// torrents) or `<root>/<torrent name>` (multi-file).
-    fn output_folder(&self) -> Option<PathBuf> {
-        Some(self.handle.output_folder().to_path_buf())
     }
 
     fn piece_length(&self) -> Option<u64> {
@@ -8042,12 +7855,11 @@ mod tests {
         assert_eq!(multi.file_path(2).await, None);
     }
 
-    /// `add_torrent_placed` hands librqbit the placement: the torrent's
-    /// files live in exactly `output_folder` (no name sub-folder), only the
-    /// listed files are wanted, `output_folder()` reports the folder, and
-    /// data already present there is picked up by the hash check
-    /// (`overwrite: true`). An out-of-range `only_files` index is refused
-    /// at add time.
+    /// `add_torrent_placed` hands librqbit the want-set and nothing else:
+    /// only the listed files are wanted, the torrent lands in librqbit's own
+    /// folder (this layer names none), and data already there is picked up
+    /// by the hash check (`overwrite: true`). An out-of-range `only_files`
+    /// index is refused at add time.
     /// Storage that opens without complaint and then fails the initial
     /// check -- how librqbit actually reaches its Error state, since a
     /// storage that cannot be opened at all fails the add itself instead.
@@ -8198,7 +8010,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_torrent_placed_uses_the_folder_and_want_set() {
+    async fn add_torrent_placed_uses_the_want_set_and_names_no_folder() {
         use crate::backend::TorrentHandle;
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("src");
@@ -8217,9 +8029,10 @@ mod tests {
         let backend = LibrqbitBackend::new_for_tests(dl.clone())
             .await
             .expect("hermetic session");
-        let folder = tmp.path().join("offline").join(&hash);
+        // librqbit's own folder for a multi-file torrent, which this layer
+        // does not choose and cannot change; pre-seed the wanted file there.
+        let folder = dl.join("src");
         tokio::fs::create_dir_all(&folder).await.unwrap();
-        // Pre-seed the wanted file where the placement points.
         tokio::fs::copy(src.join("b.bin"), folder.join("b.bin"))
             .await
             .unwrap();
@@ -8229,13 +8042,11 @@ mod tests {
                 TorrentSource::Bytes(bytes.clone()),
                 vec![],
                 TorrentPlacement {
-                    output_folder: Some(folder.clone()),
                     only_files: Some(vec![b]),
                 },
             )
             .await
             .expect("add with placement");
-        assert_eq!(handle.output_folder(), Some(folder.clone()));
         assert_eq!(handle.handle.only_files(), Some(vec![b]));
         assert_eq!(
             handle.file_path(b).await.as_deref(),
@@ -8248,10 +8059,6 @@ mod tests {
             "pre-seeded file verified: {stats:?}"
         );
         assert!(!stats.files[a].complete);
-        assert!(
-            !dl.join("src").exists(),
-            "nothing lands in the session root"
-        );
 
         backend.remove_torrent(&hash).await.unwrap();
         let err = match backend
@@ -8259,7 +8066,6 @@ mod tests {
                 TorrentSource::Bytes(bytes),
                 vec![],
                 TorrentPlacement {
-                    output_folder: Some(folder),
                     only_files: Some(vec![2]),
                 },
             )
@@ -8271,361 +8077,48 @@ mod tests {
         assert!(format!("{err:#}").contains("out of range"), "{err:#}");
     }
 
-    /// `relocate_torrent` moves a torrent's files -- multi-file: out of its
-    /// `<root>/<name>` folder (which goes once empty); single-file: out of
-    /// the root itself -- into the placement's folder, re-adds it there
-    /// wanting the placement's files, and librqbit's re-check finds the
-    /// moved data complete. Already in place: same handle, nothing moved.
+    /// `remove_torrent_and_files` takes the torrent's files and its (then
+    /// empty) folder with it; `remove_torrent` keeps them. The folder is
+    /// librqbit's own -- `<root>/<torrent name>` for a multi-file torrent --
+    /// since nothing here places a torrent any more.
     #[tokio::test]
-    async fn relocate_torrent_moves_the_data_and_rechecks_it_in_place() {
-        use crate::backend::TorrentHandle;
-        let tmp = tempfile::tempdir().unwrap();
-        let dl = tmp.path().join("dl");
-        // Seed both torrents in the session root as if streamed there.
-        let multi_src = dl.join("show");
-        tokio::fs::create_dir_all(&multi_src).await.unwrap();
-        write_payload(&multi_src.join("e1.bin"), 40 * 1024).await;
-        write_payload(&multi_src.join("e2.bin"), 24 * 1024).await;
-        let (multi_bytes, multi_hash) = make_torrent(&multi_src).await;
-        // The torrent's file order is the filesystem's readdir order, not
-        // the order the fixture wrote the files in: look every index up.
-        let e1 = torrent_file_index(&multi_bytes, "e1.bin");
-        let e2 = torrent_file_index(&multi_bytes, "e2.bin");
-        let single_src = dl.join("movie.bin");
-        write_payload(&single_src, 20 * 1024).await;
-        let (single_bytes, single_hash) = make_torrent(&single_src).await;
-
-        let backend = LibrqbitBackend::new_for_tests(dl.clone())
-            .await
-            .expect("hermetic session");
-        let multi = backend
-            .add_torrent(TorrentSource::Bytes(multi_bytes), vec![])
-            .await
-            .unwrap();
-        multi.handle.wait_until_initialized().await.unwrap();
-        assert_eq!(multi.output_folder(), Some(multi_src.clone()));
-        let single = backend
-            .add_torrent(TorrentSource::Bytes(single_bytes), vec![])
-            .await
-            .unwrap();
-        single.handle.wait_until_initialized().await.unwrap();
-        assert!(multi.stats().await.files.iter().all(|f| f.complete));
-
-        let offline = tmp.path().join("offline");
-        let multi_target = offline.join(&multi_hash);
-        let moved = backend
-            .relocate_torrent(
-                &multi_hash,
-                TorrentPlacement {
-                    output_folder: Some(multi_target.clone()),
-                    only_files: Some(vec![e2]),
-                },
-                vec![],
-            )
-            .await
-            .expect("relocate multi-file torrent");
-        assert_eq!(moved.output_folder(), Some(multi_target.clone()));
-        assert_eq!(moved.handle.only_files(), Some(vec![e2]));
-        assert!(multi_target.join("e1.bin").is_file());
-        assert!(multi_target.join("e2.bin").is_file());
-        assert!(!multi_src.exists(), "emptied source folder is removed");
-        moved.handle.wait_until_initialized().await.unwrap();
-        let stats = moved.stats().await;
-        assert!(
-            stats.files.iter().all(|f| f.complete),
-            "moved data verified by the re-check: {stats:?}"
-        );
-        assert_eq!(
-            moved.file_path(e2).await.as_deref(),
-            Some(multi_target.join("e2.bin").as_path())
-        );
-        assert_eq!(backend.list_torrents().await.len(), 2);
-
-        // Already there: same torrent, no re-add.
-        let again = backend
-            .relocate_torrent(
-                &multi_hash,
-                TorrentPlacement {
-                    output_folder: Some(multi_target.clone()),
-                    only_files: Some(vec![e1]),
-                },
-                vec![],
-            )
-            .await
-            .unwrap();
-        assert!(Arc::ptr_eq(&again.handle, &moved.handle));
-
-        let single_target = offline.join(&single_hash);
-        let moved = backend
-            .relocate_torrent(
-                &single_hash,
-                TorrentPlacement {
-                    output_folder: Some(single_target.clone()),
-                    only_files: None,
-                },
-                vec![],
-            )
-            .await
-            .expect("relocate single-file torrent");
-        assert!(single_target.join("movie.bin").is_file());
-        assert!(!single_src.exists());
-        assert!(dl.is_dir(), "the session root stays");
-        moved.handle.wait_until_initialized().await.unwrap();
-        assert!(moved.stats().await.files[0].complete);
-        assert_eq!(
-            moved.file_path(0).await.as_deref(),
-            Some(single_target.join("movie.bin").as_path())
-        );
-    }
-
-    /// librqbit pre-sizes every wanted file when a torrent goes live, so a
-    /// torrent added in the root without data still has full-length
-    /// placeholders there. Relocating it onto a folder that already holds
-    /// the real bytes must keep those: the placeholder is dropped, the
-    /// destination file stays and verifies complete.
-    #[tokio::test]
-    async fn relocate_torrent_keeps_a_file_already_at_the_destination() {
-        use crate::backend::TorrentHandle;
-        let tmp = tempfile::tempdir().unwrap();
-        let src = tmp.path().join("show");
-        tokio::fs::create_dir_all(&src).await.unwrap();
-        // Whole pieces per file, whichever order the torrent lists them
-        // in: no boundary piece is shared with e1, whose data is absent.
-        write_payload(&src.join("e1.bin"), 32 * 1024).await;
-        write_payload(&src.join("e2.bin"), 16 * 1024).await;
-        let (bytes, hash) = make_torrent(&src).await;
-        // Readdir order decides the file indices -- look them up.
-        let e1 = torrent_file_index(&bytes, "e1.bin");
-        let e2 = torrent_file_index(&bytes, "e2.bin");
-
-        let dl = tmp.path().join("dl");
-        let backend = LibrqbitBackend::new_for_tests(dl.clone())
-            .await
-            .expect("hermetic session");
-        // Added without data: the root folder gets empty placeholders.
-        let handle = backend
-            .add_torrent(TorrentSource::Bytes(bytes), vec![])
-            .await
-            .unwrap();
-        handle.handle.wait_until_initialized().await.unwrap();
-        let root_folder = dl.join("show");
-        let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
-        while !root_folder.join("e2.bin").exists() && std::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(
-            root_folder.join("e2.bin").is_file(),
-            "librqbit pre-sizes the files"
-        );
-        assert!(!handle.stats().await.files[e2].complete);
-
-        // The destination already holds the real e2.bin.
-        let target = tmp.path().join("offline").join(&hash);
-        tokio::fs::create_dir_all(&target).await.unwrap();
-        tokio::fs::copy(src.join("e2.bin"), target.join("e2.bin"))
-            .await
-            .unwrap();
-
-        let moved = backend
-            .relocate_torrent(
-                &hash,
-                TorrentPlacement {
-                    output_folder: Some(target.clone()),
-                    only_files: Some(vec![e2]),
-                },
-                vec![],
-            )
-            .await
-            .expect("relocate");
-        moved.handle.wait_until_initialized().await.unwrap();
-        let stats = moved.stats().await;
-        assert!(stats.files[e2].complete, "destination data kept: {stats:?}");
-        assert!(!stats.files[e1].complete);
-        assert!(!root_folder.exists(), "placeholders dropped, folder gone");
-        let bytes = tokio::fs::read(target.join("e2.bin")).await.unwrap();
-        assert!(bytes.iter().enumerate().all(|(i, b)| *b == (i % 251) as u8));
-    }
-
-    /// A file of the relocated torrent without a single verified byte is a
-    /// pre-sized sparse placeholder (librqbit sizes every wanted file at
-    /// init, and a plain add wants everything): it is dropped with the old
-    /// folder, never moved -- a cross-device copy would write its whole
-    /// nominal length as zeros into the destination. The file with data
-    /// moves and verifies.
-    #[tokio::test]
-    async fn relocate_torrent_drops_empty_placeholders_instead_of_moving_them() {
-        use crate::backend::TorrentHandle;
-        let tmp = tempfile::tempdir().unwrap();
-        let src = tmp.path().join("show");
-        tokio::fs::create_dir_all(&src).await.unwrap();
-        // Whole pieces per file, whichever order the torrent lists them
-        // in: e1's verified pieces never spill into e2.
-        write_payload(&src.join("e1.bin"), 32 * 1024).await;
-        write_payload(&src.join("e2.bin"), 16 * 1024).await;
-        let (bytes, hash) = make_torrent(&src).await;
-        // Readdir order decides the file indices -- look them up.
-        let e1 = torrent_file_index(&bytes, "e1.bin");
-        let e2 = torrent_file_index(&bytes, "e2.bin");
-        // Only e1's data is in the session root.
-        tokio::fs::remove_file(src.join("e2.bin")).await.unwrap();
-
-        let dl = tmp.path().join("dl");
-        let root_folder = dl.join("show");
-        tokio::fs::create_dir_all(&root_folder).await.unwrap();
-        tokio::fs::rename(src.join("e1.bin"), root_folder.join("e1.bin"))
-            .await
-            .unwrap();
-        let backend = LibrqbitBackend::new_for_tests(dl.clone())
-            .await
-            .expect("hermetic session");
-        let handle = backend
-            .add_torrent(TorrentSource::Bytes(bytes), vec![])
-            .await
-            .unwrap();
-        handle.handle.wait_until_initialized().await.unwrap();
-        let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
-        while !root_folder.join("e2.bin").exists() && std::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(
-            root_folder.join("e2.bin").is_file(),
-            "librqbit pre-sizes the unwanted-so-far file"
-        );
-        let stats = handle.stats().await;
-        assert!(
-            stats.files[e1].complete && !stats.files[e2].complete,
-            "{stats:?}"
-        );
-
-        let target = tmp.path().join("offline").join(&hash);
-        let moved = backend
-            .relocate_torrent(
-                &hash,
-                TorrentPlacement {
-                    output_folder: Some(target.clone()),
-                    only_files: Some(vec![e1]),
-                },
-                vec![],
-            )
-            .await
-            .expect("relocate");
-        assert!(target.join("e1.bin").is_file(), "the data moved");
-        // librqbit's storage opens (creates, empty) every file of the
-        // re-added torrent, so the test is the length, not the existence.
-        let e2_len = tokio::fs::metadata(target.join("e2.bin"))
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
-        assert_eq!(
-            e2_len, 0,
-            "the placeholder was not carried into the destination"
-        );
-        assert!(
-            !root_folder.exists(),
-            "placeholder dropped, old folder gone"
-        );
-        moved.handle.wait_until_initialized().await.unwrap();
-        let stats = moved.stats().await;
-        assert!(stats.files[e1].complete, "moved data verified: {stats:?}");
-        assert!(!stats.files[e2].complete);
-    }
-
-    /// While a torrent is still Initializing there is no chunk tracker to
-    /// ask, so a file's own allocation decides: a sparse placeholder has no
-    /// blocks, a file with bytes written has.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn has_data_to_move_falls_back_to_allocated_blocks() {
-        let tmp = tempfile::tempdir().unwrap();
-        let sparse = tmp.path().join("sparse.bin");
-        std::fs::File::create(&sparse)
-            .unwrap()
-            .set_len(8 * 1024 * 1024)
-            .unwrap();
-        let written = tmp.path().join("written.bin");
-        write_payload(&written, 64 * 1024).await;
-        let sparse_meta = std::fs::metadata(&sparse).unwrap();
-        let written_meta = std::fs::metadata(&written).unwrap();
-
-        assert!(!has_data_to_move(None, &sparse_meta), "no blocks, no data");
-        assert!(has_data_to_move(None, &written_meta));
-        // Known have-bytes win over the allocation either way.
-        assert!(has_data_to_move(Some(1), &sparse_meta));
-        assert!(!has_data_to_move(Some(0), &written_meta));
-    }
-
-    /// `remove_torrent_and_files` on a torrent placed in its own folder
-    /// takes the pre-sized files and the folder with it; `remove_torrent`
-    /// keeps them.
-    #[tokio::test]
-    async fn remove_torrent_and_files_takes_the_placed_folder_with_it() {
+    async fn remove_torrent_and_files_takes_the_torrents_folder_with_it() {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("src");
         tokio::fs::create_dir_all(&src).await.unwrap();
+        // Two files, so librqbit gives the torrent a folder of its own
+        // (`<root>/<name>`); a one-file torrent writes into the root, which
+        // is never removed.
         write_payload(&src.join("movie.bin"), 20 * 1024).await;
-        let (bytes, hash) = make_torrent(&src.join("movie.bin")).await;
+        write_payload(&src.join("extra.bin"), 16 * 1024).await;
+        let (bytes, hash) = make_torrent(&src).await;
         let dl = tmp.path().join("dl");
         let backend = LibrqbitBackend::new_for_tests(dl.clone())
             .await
             .expect("hermetic session");
-        let place = |folder: &std::path::Path| TorrentPlacement {
-            output_folder: Some(folder.to_path_buf()),
-            only_files: Some(vec![0]),
-        };
+        let folder = dl.join("src");
 
-        let kept = tmp.path().join("offline").join("kept");
         let handle = backend
-            .add_torrent_placed(TorrentSource::Bytes(bytes.clone()), vec![], place(&kept))
+            .add_torrent(TorrentSource::Bytes(bytes.clone()), vec![])
             .await
             .unwrap();
         handle.handle.wait_until_initialized().await.unwrap();
-        assert!(kept.join("movie.bin").is_file(), "pre-sized placeholder");
+        assert!(folder.join("movie.bin").is_file(), "pre-sized placeholder");
         backend.remove_torrent(&hash).await.unwrap();
         assert!(
-            kept.join("movie.bin").is_file(),
+            folder.join("movie.bin").is_file(),
             "remove_torrent keeps files"
         );
 
-        let gone = tmp.path().join("offline").join("gone");
         let handle = backend
-            .add_torrent_placed(TorrentSource::Bytes(bytes), vec![], place(&gone))
+            .add_torrent(TorrentSource::Bytes(bytes), vec![])
             .await
             .unwrap();
         handle.handle.wait_until_initialized().await.unwrap();
-        assert!(gone.join("movie.bin").is_file());
         backend.remove_torrent_and_files(&hash).await.unwrap();
-        assert!(!gone.exists(), "files and folder removed: {gone:?}");
+        assert!(!folder.exists(), "files and folder removed: {folder:?}");
         assert!(backend.list_torrents().await.is_empty());
         assert!(dl.is_dir(), "session root untouched");
-    }
-
-    /// The cross-device fallback of `move_file` copies then removes the
-    /// source, and leaves no partial target behind when the copy fails.
-    #[tokio::test]
-    async fn copy_then_remove_moves_the_bytes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let src = tmp.path().join("src.bin");
-        let dst = tmp.path().join("nested").join("dst.bin");
-        write_payload(&src, 8 * 1024).await;
-        tokio::fs::create_dir_all(dst.parent().unwrap())
-            .await
-            .unwrap();
-        super::copy_then_remove(&src, &dst).await.unwrap();
-        assert!(!src.exists());
-        let bytes = tokio::fs::read(&dst).await.unwrap();
-        assert_eq!(bytes.len(), 8 * 1024);
-        assert!(bytes.iter().enumerate().all(|(i, b)| *b == (i % 251) as u8));
-
-        let missing = tmp.path().join("missing.bin");
-        let target = tmp.path().join("partial.bin");
-        assert!(super::copy_then_remove(&missing, &target).await.is_err());
-        assert!(!target.exists());
-        assert!(
-            super::move_file(&dst, &tmp.path().join("back.bin"))
-                .await
-                .is_ok()
-        );
-        assert!(!dst.exists());
     }
 
     #[tokio::test]

@@ -458,15 +458,6 @@ impl<H: TorrentHandle> Engine<H> {
         }
     }
 
-    /// The shared per-volume readings this engine was made with, for an
-    /// engine that replaces it on the same [`BackendEngineFS`]
-    /// (`replace_engine`, after a relocation).
-    ///
-    /// [`BackendEngineFS`]: crate::BackendEngineFS
-    pub(crate) fn volumes(&self) -> Arc<crate::reconcile::Volumes> {
-        self.volumes.clone()
-    }
-
     /// Whether this process has re-applied its want-set to this torrent
     /// (see the field).
     pub(crate) fn is_settled(&self) -> bool {

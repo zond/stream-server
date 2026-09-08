@@ -19,15 +19,17 @@ pub enum TorrentSource {
     Bytes(Vec<u8>),
 }
 
-/// Where a backend puts a torrent's data and what it wants at first. The
-/// default is the backend's own placement (its session root, everything
-/// wanted); an offline download (`BackendEngineFS::pin_download`) names a
-/// per-torrent folder and the pinned file.
+/// What a torrent wants when it is added. The default is everything.
+///
+/// It named a directory too, until pinning stopped being a place: an
+/// offline download was written to `<downloadsDir>/<info hash>` and a
+/// torrent already managed elsewhere was moved there. Nothing chooses a
+/// directory any more -- the piece store is the session's default storage
+/// and takes one root of its own, so where a backend says a torrent's
+/// files are decides nothing about where its bytes go, and a pin is a
+/// retention flag rather than a location.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TorrentPlacement {
-    /// Directory the torrent's files are written to (the torrent's own
-    /// folder, not a parent of it); `None` = the backend's default.
-    pub output_folder: Option<std::path::PathBuf>,
     /// Initial want-set; `None` = everything.
     pub only_files: Option<Vec<usize>>,
 }
@@ -57,10 +59,9 @@ pub trait TorrentBackend: Send + Sync {
     }
 
     /// [`Self::add_torrent`] with an explicit [`TorrentPlacement`]. The
-    /// default ignores the placement -- the only possible answer for a
-    /// backend with one root and no per-file selection -- so callers that
-    /// care check [`TorrentHandle::output_folder`] afterwards instead of
-    /// assuming.
+    /// default ignores it -- the only possible answer for a backend with no
+    /// per-file selection -- so a caller learns what it got from the
+    /// handle's own file list rather than by assuming.
     async fn add_torrent_placed(
         &self,
         source: TorrentSource,
@@ -68,22 +69,6 @@ pub trait TorrentBackend: Send + Sync {
         _placement: TorrentPlacement,
     ) -> Result<Self::Handle> {
         self.add_torrent(source, trackers).await
-    }
-
-    /// Move a managed torrent to `placement` (whose `output_folder` is
-    /// required): its files end up under the new folder and the backend
-    /// manages it from there, wanting `placement.only_files`, re-checking
-    /// whatever data was moved. Returns the handle for the torrent in its
-    /// new place; the old handle is dead afterwards. The pin set survives
-    /// (it is why the torrent moves). Backends without per-torrent
-    /// placement refuse.
-    async fn relocate_torrent(
-        &self,
-        info_hash: &str,
-        _placement: TorrentPlacement,
-        _trackers: Vec<String>,
-    ) -> Result<Self::Handle> {
-        anyhow::bail!("backend cannot relocate torrent {info_hash}")
     }
 
     async fn get_torrent(&self, info_hash: &str) -> Option<Self::Handle>;
@@ -476,18 +461,18 @@ pub trait TorrentHandle: Send + Sync + Clone {
     async fn drop_file_pieces(&self, _file_idx: usize) -> Result<Option<DroppedFilePieces>> {
         Ok(None)
     }
-    /// The file's on-disk path (the torrent's output folder joined with the
-    /// file's relative name), for handing a completed download to a local
-    /// player. `None` when the backend does not know (no metadata yet, bad
-    /// index, or a backend without a per-file path). Reads still go through
-    /// `get_file_reader`, which blocks on pieces a sparse file would not.
+    /// The file's on-disk path, as the backend names it (librqbit: the
+    /// torrent's own output folder joined with the file's relative name).
+    ///
+    /// **A name, not a file.** Nothing writes a whole file any more -- the
+    /// bytes are piece files in the store -- so this is what the backend
+    /// *calls* the file, reported to a client and used to sweep up a
+    /// whole-file copy an earlier version of this server left there.
+    /// Nothing may decide anything about placement, protection or
+    /// accounting from it. `None` when the backend does not know (no
+    /// metadata yet, bad index, or a backend with no per-file path). Reads
+    /// go through `get_file_reader`.
     async fn file_path(&self, _file_idx: usize) -> Option<std::path::PathBuf> {
-        None
-    }
-    /// The directory the torrent's files are written to (what
-    /// [`TorrentPlacement::output_folder`] resolved to, or the backend's
-    /// default). `None` when the backend does not know.
-    fn output_folder(&self) -> Option<std::path::PathBuf> {
         None
     }
     /// The torrent's piece length -- the unit a read blocks on, so the one

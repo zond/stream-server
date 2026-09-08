@@ -21,20 +21,22 @@ use std::collections::BTreeMap;
 pub struct DownloadInfo {
     pub info_hash: String,
     pub file_idx: usize,
-    /// Where the torrent's placement puts this file, when the engine knows.
+    /// What the torrent backend calls this file, when it knows.
     ///
     /// **A name, not a file.** Torrent data is stored one file per piece
     /// (`enginefs::piece_store`), so no whole file is ever produced at this
     /// path and nothing should try to open it; the bytes come out of the
-    /// media routes. It is still what identifies a download's placement --
-    /// `<downloadsDir>/<info hash>/<name in the torrent>` for a pin -- and
-    /// it is what `download_path` and the listing agree on.
+    /// media routes. The folder in it is librqbit's own -- nothing above the
+    /// backend chooses one, for a pinned download no more than for a
+    /// streamed torrent -- and it is what `download_path` and the listing
+    /// agree on.
     pub path: Option<String>,
     pub name: String,
     pub length: u64,
     pub downloaded: u64,
     pub complete: bool,
-    /// The torrent's startup phase (`checking` right after a relocation).
+    /// The torrent's startup phase (`checking` while librqbit verifies what
+    /// is already on disk).
     pub phase: StartupPhase,
     /// Why the download is not progressing, when anything knows: the
     /// engine's error for a failed magnet add or a torrent the backend put
@@ -48,17 +50,21 @@ pub struct DownloadInfo {
 /// What a pin whose torrent the backend did not restore reports as its
 /// `error` (`enginefs::BackendEngineFS::dormant_pinned_downloads`): the pin
 /// is kept, nothing is downloading, and there is nothing for the client to
-/// fix beyond making the folder available again.
-pub const DORMANT_DOWNLOAD_ERROR: &str = "the torrent is not managed right now (its download folder may be unavailable); \
+/// do about it. It used to blame a folder that might be unavailable, from
+/// when a pinned download lived in one of its own; a dormant pin is a
+/// torrent the session did not bring back, and where its bytes are is not
+/// the question.
+pub const DORMANT_DOWNLOAD_ERROR: &str = "the torrent is not managed right now; \
      the pin is kept and applies when it comes back";
 
 /// Pin `file_idx` of `info_hash` as an offline download, exactly what
 /// `POST /{infoHash}/{fileIdx}/download` will answer: the engine is created
 /// through the magnet registry with `trackers` (normalised like the stats
-/// routes' `tr=` values) when the hash is new, placed under
-/// `settings.downloadsDir` when one is set -- relocating a torrent already
-/// managed in the cache root -- and kept wanted and exempt from eviction
-/// (see `enginefs::BackendEngineFS::pin_download`). Refused with
+/// routes' `tr=` values) when the hash is new, and the file is kept wanted
+/// and exempt from eviction (see
+/// `enginefs::BackendEngineFS::pin_download`). **Nothing moves**: a pin is
+/// a retention property, and a torrent that was streamed first is pinned
+/// where it already is. Refused with
 /// [`PinDownloadError::InsufficientSpace`] below the free-space margin.
 pub async fn pin_download(
     state: &AppState,
@@ -100,7 +106,7 @@ pub async fn pin_download(
 /// response reports, not the request's own flag.
 /// `delete_files` also deletes the data -- the whole torrent when this was
 /// its last pin, only that file while other pins hold, and, for a pin whose
-/// torrent the backend does not have, its `<downloadsDir>/<infoHash>` folder
+/// torrent the backend does not have, its directory in the piece store
 /// (see `enginefs::BackendEngineFS::unpin_download`); a `file_idx` the
 /// torrent does not have is refused with [`PinDownloadError::FileNotFound`]
 /// (404), like [`pin_download`]. Without it the bytes stay where they are
@@ -182,10 +188,11 @@ fn live_download(
     }
 }
 
-/// Where `file_idx` of `info_hash` is on disk, for handing a finished
-/// download to a local player. `None` when the torrent is not managed right
-/// now or the backend does not know the path yet (no metadata). Never
-/// creates an engine -- unlike [`pin_download`], this only reports.
+/// What the backend calls `file_idx` of `info_hash` -- [`DownloadInfo::path`]
+/// on its own, a name and not a file that exists. `None` when the torrent is
+/// not managed right now or the backend does not know the path yet (no
+/// metadata). Never creates an engine -- unlike [`pin_download`], this only
+/// reports.
 pub async fn download_path(state: &AppState, info_hash: &str, file_idx: usize) -> Option<String> {
     let engine = state
         .stream_engine()

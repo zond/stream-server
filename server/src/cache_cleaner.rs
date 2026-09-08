@@ -583,33 +583,34 @@ fn budgets_by_volume(
 async fn cache_roots(state: &AppState) -> CacheRoots {
     let settings = state.settings.read().await;
     let limit = crate::routes::system::cache_size_bytes(settings.cache_size);
+    let configured_downloads_dir = settings
+        .downloads_dir
+        .as_ref()
+        .map(std::path::PathBuf::from);
     drop(settings); // Release lock
 
     // Every root the cleaner walks: the two engines' cache roots and the
-    // downloads dir, which is now one of them.
+    // configured `downloadsDir`, which is now one of them -- and is read
+    // from the settings, because it is the only thing left that reads it.
+    // The engines were told about it while a pin was a placement; a pin is
+    // a retention property now and nothing is written there at all.
     //
-    // It was not always. The downloads dir used to be pruned out of the walk
-    // on the grounds that what is there is an offline download the user asked
-    // for, not cache. That was right while a download was a whole file the
-    // client could play from disk. It is not right any more: downloads are
-    // stored as pieces like everything else, an old plain-file download under
-    // the downloads dir is neither migrated nor read, and left unwalked it
-    // would be orphaned *and* immortal -- bytes nothing can play and nothing
-    // can reclaim, on the device where space runs out. Protection, not
-    // exclusion, is what keeps a live or pinned download safe now, and
-    // `protected_paths` covers dormant pins for exactly that reason.
+    // Walking it was not always right. The downloads dir used to be pruned
+    // out of the walk on the grounds that what is there is an offline
+    // download the user asked for, not cache. That was right while a
+    // download was a whole file the client could play from disk. It is not
+    // right any more: downloads are stored as pieces like everything else,
+    // an old plain-file download under the downloads dir is neither
+    // migrated nor read, and left unwalked it would be orphaned *and*
+    // immortal -- bytes nothing can play and nothing can reclaim, on the
+    // device where space runs out. Protection, not exclusion, is what keeps
+    // a live or pinned download safe now, and `protected_paths` covers
+    // dormant pins for exactly that reason.
     let mut download_dirs = vec![
         state.engine.download_dir.clone(),
         state.download_engine.download_dir.clone(),
     ];
-    download_dirs.extend(
-        [
-            state.engine.downloads_dir(),
-            state.download_engine.downloads_dir(),
-        ]
-        .into_iter()
-        .flatten(),
-    );
+    download_dirs.extend(configured_downloads_dir);
     download_dirs.sort();
     download_dirs.dedup();
     // Every directory the cleaner was *given*, kept before the collapse below
