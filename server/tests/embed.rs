@@ -2370,6 +2370,16 @@ fn start_lan_media(handle: &ServerHandle) -> anyhow::Result<std::net::SocketAddr
 /// which re-selected the same disk-backed engine and streamed to the disk
 /// the check had just refused.
 ///
+/// The refusal is keyed on what the engine's reconciler keys its free-space
+/// arm on, and on nothing else: **a torrent that still wants bytes**, on a
+/// volume under the floor. So the two halves are tested apart. A torrent
+/// that has everything it wants writes nothing, and is served from the disk
+/// it has already filled -- refusing it would take a finished film off a
+/// device at exactly the moment its owner wanted to watch something without
+/// downloading anything, and the engine would not have stopped that torrent
+/// either. A torrent that still has data to fetch is the one the floor is
+/// about, and it is refused.
+///
 /// A volume cannot be filled on demand, so the reading is declared through
 /// `pretend_available_space`, keyed by this test's own cache root so no
 /// other server in the run sees it.
@@ -2381,14 +2391,31 @@ fn a_stream_below_the_free_space_floor_is_refused_not_degraded() -> anyhow::Resu
     let (handle, base, info_hash, idx, payload) =
         lan_media_server(config_dir.path(), cache_dir.path(), src.path(), None)?;
     let cache_root = cache_dir.path().join("cache");
+    let client = bearer_client(&handle)?;
     let anonymous = reqwest::blocking::Client::new();
     let url = format!("{base}/{info_hash}/{idx}");
+
+    // A second torrent, whose data is deliberately *not* seeded into the
+    // cache: it still wants every byte it has, which is what the floor is
+    // about.
+    let wanting = src.path().join("Wanted");
+    std::fs::create_dir_all(&wanting)?;
+    write_payload(&wanting.join("wanted.bin"), 64 * 1024);
+    let (wanting_torrent, wanting_hash) = real_torrent(&wanting);
+    client
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": hex::encode(&wanting_torrent) }))
+        .send()?
+        .error_for_status()?;
+    let wanting_stats = stats_after_check(&client, &base, &wanting_hash)?;
+    let wanting_idx = file_index(&wanting_stats, "wanted.bin");
+    let wanting_url = format!("{base}/{wanting_hash}/{wanting_idx}");
 
     // Nothing free: refused, whatever the range, with a fixed body -- the
     // check's own message names the cache root, and no response may.
     stream_server::pretend_available_space(&cache_root, 0);
     for range in [None, Some("bytes=0-1023")] {
-        let mut request = anonymous.get(&url);
+        let mut request = anonymous.get(&wanting_url);
         if let Some(range) = range {
             request = request.header(reqwest::header::RANGE, range);
         }
@@ -2404,20 +2431,41 @@ fn a_stream_below_the_free_space_floor_is_refused_not_degraded() -> anyhow::Resu
             "range {range:?}"
         );
     }
-    // A HEAD probe writes nothing and is not refused: the player learns the
-    // length and the range support, and the GET that follows is what the
-    // floor is judged on.
-    let response = anonymous.head(&url).send()?.error_for_status()?;
-    assert_eq!(
-        header_value(&response, "content-length"),
-        payload.len().to_string()
-    );
 
-    // Room again: the same request streams the same bytes, from the same
-    // engine -- there was never another.
-    stream_server::pretend_available_space(&cache_root, u64::MAX);
+    // The torrent that has everything it wants is served from the same full
+    // volume: it writes nothing, so there is nothing for the floor to
+    // protect against.
     let response = anonymous.get(&url).send()?.error_for_status()?;
     assert_eq!(response.bytes()?.as_ref(), payload.as_slice());
+
+    // A HEAD probe writes nothing and is not refused either: the player
+    // learns the length and the range support, and the GET that follows is
+    // what the floor is judged on.
+    let response = anonymous.head(&wanting_url).send()?.error_for_status()?;
+    assert_eq!(
+        header_value(&response, "content-length"),
+        (64 * 1024).to_string()
+    );
+
+    // Room again: the same request is no longer refused, and it is the
+    // same engine it always was -- there was never another.
+    stream_server::pretend_available_space(&cache_root, u64::MAX);
+    let refused_again = anonymous
+        .get(&wanting_url)
+        .header(reqwest::header::RANGE, "bytes=0-1023")
+        .timeout(std::time::Duration::from_secs(2))
+        .send();
+    match refused_again {
+        Ok(response) => assert_ne!(
+            response.status(),
+            reqwest::StatusCode::INSUFFICIENT_STORAGE,
+            "with room on the volume the floor refuses nothing"
+        ),
+        // No peer will ever bring these bytes, so a request that got past
+        // the floor waits for them until this client gives up -- which is
+        // itself the proof that it was not refused.
+        Err(error) => assert!(error.is_timeout(), "{error}"),
+    }
 
     handle.shutdown()?;
     handle.join()?;

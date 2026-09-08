@@ -509,13 +509,29 @@ fn available_space_for_path_uncached(path: &FsPath) -> Option<u64> {
     best_available
 }
 
-fn ensure_download_disk_ready(
-    root: &FsPath,
-    file_name: &str,
-    file_size: u64,
-    requested_len: u64,
-    is_partial: bool,
-) -> Result<(), String> {
+/// Whether the cache root can be written to at all, and whether the volume
+/// under it has the floor free.
+///
+/// **One line, and it is the reconciler's.** `available <
+/// CACHE_FREE_SPACE_FLOOR` is the free-space arm of
+/// `enginefs::reconcile::desired` written out, so the route refuses exactly
+/// the request whose torrent the reconciler would stop -- and, just as
+/// importantly, refuses nothing else. It used to be two lines with one
+/// name: a partial request needed `min(requested, floor)` free and a whole
+/// download needed `remaining + floor`, so the check could pass a request
+/// the engine layer was about to stop, and fail one it would have been
+/// happy to run. A `?download=1` of a film larger than the volume is no
+/// longer refused up front by this; it starts, fills to the floor, and is
+/// stopped there like anything else, which is the same answer arrived at by
+/// the one policy instead of by a second one that only this route knew
+/// about. (The offline-download path keeps a whole-file check of its own,
+/// where it can refuse *before* anything is downloaded --
+/// `enginefs::free_space_allows` in `pin_download`.)
+///
+/// A volume that cannot be probed is an error here rather than a pass,
+/// unlike in the reconciler: this runs before a byte is written, and the
+/// caller retries with a cleaner pass in between.
+fn ensure_download_disk_ready(root: &FsPath) -> Result<(), String> {
     std::fs::create_dir_all(root).map_err(|e| {
         format!(
             "download cache path is not writable: {} ({})",
@@ -534,22 +550,9 @@ fn ensure_download_disk_ready(
     })?;
     let _ = std::fs::remove_file(&probe_path);
 
-    let existing_len = root
-        .join(file_name)
-        .metadata()
-        .map(|metadata| metadata.len().min(file_size))
-        .unwrap_or(0);
-    let remaining = file_size.saturating_sub(existing_len);
-    // The same floor the cache cleaner keeps free (`CacheLimit::effective`):
-    // below it this check gives up on the disk, so it is the line the cleaner
-    // must keep the cache out of.
-    let safety_margin = crate::cache_cleaner::CACHE_FREE_SPACE_FLOOR;
-    let required = if is_partial {
-        requested_len.min(safety_margin)
-    } else {
-        remaining.saturating_add(safety_margin)
-    };
-
+    // The same floor the cache cleaner keeps free (`CacheLimit::effective`)
+    // and the same one the engine's reconciler stops a torrent at.
+    let required = crate::cache_cleaner::CACHE_FREE_SPACE_FLOOR;
     let available = available_space_for_path(root).ok_or_else(|| {
         format!(
             "could not determine available disk space for download cache: {}",
@@ -567,10 +570,6 @@ fn ensure_download_disk_ready(
     }
 
     Ok(())
-}
-
-fn disk_space_check_treats_as_partial(is_download: bool, is_partial: bool) -> bool {
-    !is_download || is_partial
 }
 
 /// The readiness check the stream route runs before it streams to disk, and
@@ -599,18 +598,25 @@ fn disk_space_check_treats_as_partial(is_download: bool, is_partial: bool) -> bo
 /// is answered `507 Insufficient Storage` -- the status the pin route already
 /// uses for a full disk -- with a fixed body, because the check's own message
 /// names the cache root and no response may carry a path.
-#[allow(clippy::too_many_arguments)]
 async fn ensure_disk_ready_or_refuse(
     state: &AppState,
     engine_fs: &EngineFS,
     stream_id: u64,
     info_hash: &str,
     file_idx: usize,
-    file_name: &str,
-    file_size: u64,
-    requested_len: u64,
-    treat_as_partial: bool,
+    wants_to_write: bool,
 ) -> Result<(), (StatusCode, &'static str)> {
+    // A torrent that has everything it wants writes nothing, so a volume
+    // with no room on it is not about this request: refusing to serve bytes
+    // that are already on the disk because the disk is full would take a
+    // finished film off a device at exactly the moment its owner most wants
+    // to watch something without downloading anything. The other half of
+    // the reconciler's free-space arm, and the reason this is one gate
+    // rather than two: the arm's `wants_to_write &&
+    // available < floor` is answered here in the same order.
+    if !wants_to_write {
+        return Ok(());
+    }
     // The check performs blocking std::fs syscalls (create_dir_all, a write
     // probe, and a metadata stat) that are re-run on every request and every
     // seek. Run them on the blocking pool so they never stall an async worker
@@ -619,19 +625,12 @@ async fn ensure_disk_ready_or_refuse(
     // spun-down HDD or a slow network/SMB mount.
     let check = || {
         let download_dir = engine_fs.download_dir.clone();
-        let file_name = file_name.to_string();
         async move {
-            tokio::task::spawn_blocking(move || {
-                ensure_download_disk_ready(
-                    &download_dir,
-                    &file_name,
-                    file_size,
-                    requested_len,
-                    treat_as_partial,
-                )
-            })
-            .await
-            .unwrap_or_else(|join_err| Err(format!("disk readiness check task failed: {join_err}")))
+            tokio::task::spawn_blocking(move || ensure_download_disk_ready(&download_dir))
+                .await
+                .unwrap_or_else(|join_err| {
+                    Err(format!("disk readiness check task failed: {join_err}"))
+                })
         }
     };
     let Err(first) = check().await else {
@@ -951,27 +950,6 @@ async fn stream_video_with(
         Err(refusal) => return refusal.into_response(),
     };
 
-    // A torrent the free-space watch has stopped is not downloading, so a
-    // reader opened on it would park on its first missing piece for as long
-    // as it stays stopped -- a player buffering with no end. The engine has
-    // already said what is wrong with the disk; say it to the client, with
-    // the body the free-space check uses for the same condition. The cache
-    // cleaner either restarts the torrent (and the next request streams) or
-    // evicts it (and the next request meets `MagnetAddError::EvictedForSpace`,
-    // the same `507`, until the cooling-off period ends).
-    if engine.is_stopped_for_space().await {
-        tracing::warn!(
-            stream_id,
-            info_hash = %info_hash,
-            "stream_video: the torrent is stopped for want of disk space; refusing the stream"
-        );
-        return (
-            StatusCode::INSUFFICIENT_STORAGE,
-            INSUFFICIENT_DISK_SPACE_BODY,
-        )
-            .into_response();
-    }
-
     let _metadata_resolution = MetadataResolutionGuard::acquire(&engine).await;
     let files = engine.handle.get_files().await;
     let candidates = files
@@ -1039,10 +1017,7 @@ async fn stream_video_with(
         stream_id,
         &info_hash,
         idx,
-        &name,
-        size,
-        requested_content_length,
-        disk_space_check_treats_as_partial(is_download, is_partial),
+        !engine.handle.is_finished().await,
     )
     .await
     {
@@ -1378,10 +1353,10 @@ mod tests {
     }
 
     #[test]
-    fn accepts_small_partial_download_when_cache_root_is_writable() {
+    fn accepts_a_writable_cache_root_with_room_on_it() {
         let temp = tempfile::tempdir().expect("temp dir");
-        ensure_download_disk_ready(temp.path(), "movie.mkv", 10 * 1024 * 1024, 1, true)
-            .expect("writable temp dir should pass partial request safety check");
+        ensure_download_disk_ready(temp.path())
+            .expect("a writable temp dir with room on it should pass");
     }
 
     #[tokio::test]
@@ -1392,21 +1367,10 @@ mod tests {
         // result it would when called directly.
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().to_path_buf();
-        let name = "movie.mkv".to_string();
-        let readiness = tokio::task::spawn_blocking(move || {
-            ensure_download_disk_ready(&root, &name, 10 * 1024 * 1024, 1, true)
-        })
-        .await
-        .expect("spawn_blocking join should succeed");
-        readiness.expect("writable temp dir should pass partial request safety check");
-    }
-
-    #[test]
-    fn normal_playback_uses_partial_disk_space_policy() {
-        assert!(disk_space_check_treats_as_partial(false, false));
-        assert!(disk_space_check_treats_as_partial(false, true));
-        assert!(disk_space_check_treats_as_partial(true, true));
-        assert!(!disk_space_check_treats_as_partial(true, false));
+        let readiness = tokio::task::spawn_blocking(move || ensure_download_disk_ready(&root))
+            .await
+            .expect("spawn_blocking join should succeed");
+        readiness.expect("a writable temp dir with room on it should pass");
     }
 
     #[test]
