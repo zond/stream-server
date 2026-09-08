@@ -1301,7 +1301,9 @@ impl LibrqbitBackend {
 #[derive(Default)]
 pub struct TestSessionOptions {
     /// The session's default storage factory. `None` is librqbit's
-    /// filesystem storage, as in production.
+    /// filesystem storage -- **not** what production uses, which is the
+    /// piece store (`session_storage_factory`); a test that means to
+    /// exercise the shipped storage has to name it.
     pub default_storage: Option<librqbit::storage::BoxStorageFactory>,
     /// Persist the session (`session.json`, the `.bitv` bitfields) under
     /// the download dir, so a second backend opened over the same dir
@@ -1515,7 +1517,8 @@ fn gated_storage() -> (librqbit::storage::BoxStorageFactory, HeldInitCheck) {
 /// piece, which is what these tests check. Reclaiming the *bytes* one piece
 /// at a time is the real piece store's job and is tested against it in
 /// `piece_store`; over a whole-file filesystem storage a drop frees nothing,
-/// which is exactly why the shipped session runs with reclaim off. It also
+/// which is why the session ran with reclaim off for as long as it ran on
+/// one. It also
 /// forwards `ensure_persistable` (the filesystem storage keeps that
 /// promise), so a persistent session accepts it -- what the restart test
 /// needs.
@@ -2971,17 +2974,27 @@ impl TorrentHandle for LibrqbitHandle {
     ///
     /// Two states refuse. A torrent that is still hash-checking (or stopped
     /// with an error) has no have-set to edit. And a torrent added without
-    /// `piece_reclaim` -- which is every torrent on the shipped session,
-    /// whose filesystem storage cannot release a single piece, so
-    /// `add_torrent_placed` never sets the option (see
-    /// [`LibrqbitBackend`]'s `piece_reclaim` field) -- has librqbit answer
-    /// `PieceReclaimDisabled` however long it has been running. Both are
-    /// reported, not hidden: the caller deletes the bytes regardless, and
-    /// until the next restart librqbit believes it has them. The restart
-    /// heals it -- the fastresume validation hash-checks at least one
-    /// claimed piece of every file, the deleted file reads back empty, and
-    /// the whole torrent is re-checked from disk -- and the pieces stay out
-    /// of the want-set because `only_files` is persisted without the file.
+    /// `piece_reclaim` has librqbit answer `PieceReclaimDisabled` however
+    /// long it has been running. `add_torrent_placed` sets the option on
+    /// every add it makes, since the session's default storage is the piece
+    /// store and it can release one (see [`LibrqbitBackend`]'s
+    /// `piece_reclaim` field), so the second refusal is left over from the
+    /// whole-file session this ran on before -- with **one** live exception,
+    /// named here because nothing else names it: the legacy
+    /// `<downloadDir>/.cache/<hash>.torrent` restore in
+    /// [`LibrqbitBackend::new_with_settings`] hands librqbit no options at
+    /// all, so a torrent resurrected from a pre-fork server's cache is added
+    /// without reclaim and refuses here.
+    ///
+    /// Both refusals are reported, not hidden: the caller deletes what bytes
+    /// it can, and until the next restart librqbit believes it has the
+    /// pieces. The restart heals it -- the fastresume validation hash-checks
+    /// at least one claimed piece of every file, the deleted file reads back
+    /// empty, and the whole torrent is re-checked from disk -- and the pieces
+    /// stay out of the want-set because `only_files` is persisted without the
+    /// file. What it does *not* heal is the disk: with no claim there are no
+    /// piece indices, and `delete_download_data` will not take pieces the
+    /// backend still believes it has.
     async fn drop_file_pieces(&self, file_idx: usize) -> Result<Option<DroppedFilePieces>> {
         let range = self
             .handle
@@ -6718,8 +6731,8 @@ mod tests {
         write_payload(&content_dir.join("b.bin"), 56 * 1024).await;
         let (torrent_bytes, _hash) = make_torrent(&content_dir).await;
         // Reclaim is what makes drop_file_pieces available, and it is set
-        // only on a storage that can release a piece -- so this test needs
-        // one, where the plain filesystem session (reclaim off) would refuse
+        // only on a storage that can release a piece -- so this test names
+        // one, where a plain filesystem session (reclaim off) would refuse
         // the drop (see `dropping_pieces_without_reclaim_is_refused_by_name`).
         let (_backend, handle) = reclaiming_backend_with_torrent(&dir, &torrent_bytes).await;
         handle.handle.wait_until_initialized().await.unwrap();
@@ -7700,12 +7713,17 @@ mod tests {
         drop(seeders);
     }
 
-    /// A torrent added without `piece_reclaim` -- which is every torrent on
-    /// the shipped session, whose filesystem storage cannot release a piece
-    /// so the option is never set -- cannot forget a piece, and the refusal
-    /// says why rather than reading as a generic backend error. The delete
-    /// path logs it and goes on deleting; the next restart re-checks the
-    /// torrent from disk.
+    /// A torrent added without `piece_reclaim` cannot forget a piece, and
+    /// the refusal says why rather than reading as a generic backend error.
+    /// The delete path logs it and deletes what it can; the next restart
+    /// re-checks the torrent from disk.
+    ///
+    /// The shipped session sets the option on every add it makes -- its
+    /// default storage is the piece store, which can release one -- so what
+    /// this pins is the *other* side of the fork's contract, over a session
+    /// whose storage cannot: a backend that cannot drop is named, not
+    /// hidden. The one production add that still lands here is the legacy
+    /// `.cache/<hash>.torrent` restore, which hands librqbit no options.
     #[tokio::test(flavor = "multi_thread")]
     async fn dropping_pieces_without_reclaim_is_refused_by_name() {
         use crate::backend::TorrentHandle;
