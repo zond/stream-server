@@ -8,6 +8,8 @@ use axum::{
 pub use cache_cleaner::{CacheUsage, EvictionReport};
 use enginefs::EngineFS;
 pub use enginefs::backend::{EngineStats, TorrentListenPort};
+#[doc(hidden)]
+pub use enginefs::pretend_volume_space;
 pub use enginefs::{PIN_FREE_SPACE_MARGIN, PinDownloadError, UnpinOutcome};
 pub use routes::downloads::DownloadInfo;
 #[doc(hidden)]

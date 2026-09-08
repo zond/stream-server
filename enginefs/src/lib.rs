@@ -334,6 +334,41 @@ pub fn free_space_allows(available: u64, remaining: u64, margin: u64) -> bool {
 /// (the torrent's folder may not exist yet) -- how the free-space and
 /// volume-id probes are asked about a folder. `Err` only when no ancestor
 /// can be probed.
+/// Free space a test has declared for a root and everything under it,
+/// standing in for the volume probe -- see [`pretend_volume_space`].
+type DeclaredVolumeSpace = parking_lot::Mutex<Vec<(std::path::PathBuf, u64)>>;
+static DECLARED_VOLUME_SPACE: std::sync::OnceLock<DeclaredVolumeSpace> = std::sync::OnceLock::new();
+
+/// Declare how much free space the volume under `root` has, for every probe
+/// this crate's **default** free-space probe takes of a path below it from
+/// now on.
+///
+/// A test seam and nothing else, and the same one `stream_server`'s
+/// `pretend_available_space` is for the stream route's own probe: a volume
+/// cannot be filled on demand, so without this the free-space arm of a
+/// reconciler running inside a real server -- rather than one a unit test
+/// drives by hand with `set_free_space_probe` -- could not be exercised at
+/// all. Keyed by root so parallel tests, each with its own temp cache root,
+/// never see each other's declaration.
+#[doc(hidden)]
+pub fn pretend_volume_space(root: impl Into<std::path::PathBuf>, bytes: u64) {
+    let root = root.into();
+    let mut declared = DECLARED_VOLUME_SPACE
+        .get_or_init(|| parking_lot::Mutex::new(Vec::new()))
+        .lock();
+    declared.retain(|(declared, _)| *declared != root);
+    declared.push((root, bytes));
+}
+
+/// What [`pretend_volume_space`] declared for `path`, if anything.
+fn declared_volume_space(path: &std::path::Path) -> Option<u64> {
+    let declared = DECLARED_VOLUME_SPACE.get()?.lock();
+    declared
+        .iter()
+        .find(|(root, _)| path.starts_with(root))
+        .map(|(_, bytes)| *bytes)
+}
+
 fn probe_at_existing_ancestor(
     probe: &(dyn Fn(&std::path::Path) -> std::io::Result<u64> + Send + Sync),
     path: &std::path::Path,
@@ -895,7 +930,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             pin_locks: parking_lot::Mutex::new(HashMap::new()),
             relocations: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             dormant_pins: parking_lot::Mutex::new(BTreeMap::new()),
-            free_space_probe: Arc::new(|path| fs4::available_space(path)),
+            free_space_probe: Arc::new(|path| match declared_volume_space(path) {
+                Some(bytes) => Ok(bytes),
+                None => fs4::available_space(path),
+            }),
             volume_id_probe: Arc::new(volume_id),
             clock,
             sweep_task: parking_lot::Mutex::new(None),

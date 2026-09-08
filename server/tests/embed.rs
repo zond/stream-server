@@ -2365,6 +2365,123 @@ fn start_lan_media(handle: &ServerHandle) -> anyhow::Result<std::net::SocketAddr
         .ok_or_else(|| anyhow::anyhow!("set_lan_media(true) answered with no address"))
 }
 
+/// The whole free-space loop, inside a real server: the reconciler `run()`
+/// starts stops a torrent that is writing when its volume falls under the
+/// floor, the statistics say so, and it runs again when the space comes
+/// back.
+///
+/// Every unit test of the arm drives `reconcile_tick` by hand, so none of
+/// them would notice the two lines in `run()` that start the loop going
+/// away -- which is the whole of what makes the floor hold on a real
+/// device. A volume cannot be filled on demand, so the engine's own probe
+/// is declared through `pretend_volume_space`, keyed by this test's cache
+/// root so no other server in the run sees it.
+///
+/// The last part is the window the hysteresis opens. Between the floor and
+/// the resume margin a timer leaves a stopped torrent alone -- but the
+/// stream route no longer has a refusal of its own keyed on "this torrent
+/// is stopped", so a request landing there must be what starts it, or the
+/// reader would park on a torrent nothing is fetching for.
+#[test]
+fn the_servers_own_reconciler_stops_a_torrent_under_the_floor_and_starts_it_again()
+-> anyhow::Result<()> {
+    const FLOOR: u64 = enginefs::CACHE_FREE_SPACE_FLOOR;
+    const MARGIN: u64 = enginefs::FREE_SPACE_RESUME_MARGIN;
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    let cache_root = cache_dir.path().join("cache");
+    // Declared before the server starts, so its reconciler never reads the
+    // machine's real disk for this root.
+    stream_server::pretend_volume_space(&cache_root, u64::MAX);
+
+    let content = src.path().join("Wanted");
+    std::fs::create_dir_all(&content)?;
+    write_payload(&content.join("wanted.bin"), 64 * 1024);
+    let (torrent, info_hash) = real_torrent(&content);
+
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_root.clone()),
+        ..offline_config()
+    })?;
+    let base = format!("http://{}", handle.http_addr());
+    let client = bearer_client(&handle)?;
+    client
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
+        .send()?
+        .error_for_status()?;
+    let stats = stats_after_check(&client, &base, &info_hash)?;
+    let idx = file_index(&stats, "wanted.bin");
+
+    // Nothing of the file is on disk, so it wants every byte it has.
+    let stopped_message =
+        "the torrent is stopped for want of disk space; free some space and it will resume";
+    let error_of = |client: &reqwest::blocking::Client| -> anyhow::Result<Option<String>> {
+        let stats: serde_json::Value = client
+            .get(format!("{base}/{info_hash}/stats.json"))
+            .send()?
+            .error_for_status()?
+            .json()?;
+        Ok(stats["error"].as_str().map(str::to_owned))
+    };
+    assert_eq!(error_of(&client)?, None, "nothing is wrong with it yet");
+
+    // The volume fills. Bounded poll on what the client can see, never a
+    // sleep: the loop runs on its own two-second interval.
+    stream_server::pretend_volume_space(&cache_root, 0);
+    let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
+    loop {
+        if error_of(&client)?.as_deref() == Some(stopped_message) {
+            break;
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the server's reconciler never stopped the torrent"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // Room above the floor, but inside the resume margin: the timer leaves
+    // it stopped, and a stream request is what starts it. The route's own
+    // probe reads the same number, so its floor check passes.
+    stream_server::pretend_volume_space(&cache_root, FLOOR + MARGIN - 1);
+    stream_server::pretend_available_space(&cache_root, FLOOR + MARGIN - 1);
+    let anonymous = reqwest::blocking::Client::new();
+    let served = anonymous
+        .get(format!("{base}/{info_hash}/{idx}"))
+        .header(reqwest::header::RANGE, "bytes=0-1023")
+        .timeout(std::time::Duration::from_secs(3))
+        .send();
+    match served {
+        Ok(response) => assert_ne!(
+            response.status(),
+            reqwest::StatusCode::INSUFFICIENT_STORAGE,
+            "with room above the floor the request is not refused"
+        ),
+        // No peer will ever bring these bytes, so the request waits until
+        // this client gives up -- which is the proof it was not refused.
+        Err(error) => assert!(error.is_timeout(), "{error}"),
+    }
+    let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
+    loop {
+        if error_of(&client)? != Some(stopped_message.to_string()) {
+            break;
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the playback start never started the torrent again"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
 /// A stream request below the free-space floor is refused with a `507`
 /// once a cleaner pass has had its chance -- not "degraded to memory-only",
 /// which re-selected the same disk-backed engine and streamed to the disk
