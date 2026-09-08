@@ -1323,9 +1323,21 @@ fn real_torrent(dir: &std::path::Path) -> (Vec<u8>, String) {
 }
 
 /// Pre-seed a whole torrent's data where the server actually reads it: the
-/// piece store. See [`seed_piece_store_files`] for the rules.
+/// piece store. See [`seed_piece_store_pieces`] for the rules.
 fn seed_piece_store(cache_root: &std::path::Path, torrent_bytes: &[u8], content: &std::path::Path) {
     seed_piece_store_files(cache_root, torrent_bytes, content, None);
+}
+
+/// Pre-seed the named files of a torrent, whole pieces only. See
+/// [`seed_piece_store_pieces`] for the rules; this is that function with no
+/// hole in it.
+fn seed_piece_store_files(
+    cache_root: &std::path::Path,
+    torrent_bytes: &[u8],
+    content: &std::path::Path,
+    only: Option<&[&str]>,
+) {
+    seed_piece_store_pieces(cache_root, torrent_bytes, content, only, None);
 }
 
 /// Pre-seed a torrent's data one file per piece under
@@ -1354,16 +1366,25 @@ fn seed_piece_store(cache_root: &std::path::Path, torrent_bytes: &[u8], content:
 /// cannot check -- and the assertion below says how many pieces were seeded,
 /// so a fixture that meant to seed something and seeded nothing fails here.
 ///
+/// `hole` is the other way to leave something out: a byte range of that same
+/// flat layout, every piece overlapping which is skipped. `only` picks whole
+/// files; this picks bytes, which is what a fixture needs when the gap has to
+/// be *inside* one file -- an archive whose ends are present, so its
+/// directory can be read, and whose middle never arrives, so a read of a
+/// member parks there for ever. Nothing seeds these fixtures, so a piece left
+/// out either way is a piece that never comes.
+///
 /// **Call this after the server has started**, never before. The launch-time
 /// sweep (`BackendEngineFS::sweep_unadopted_pieces`) deletes every piece
 /// directory the session has no record of, and a directory seeded before the
 /// process comes up is exactly that: the server would start, delete it, and
 /// the torrent would then check as empty. Which is the sweep working.
-fn seed_piece_store_files(
+fn seed_piece_store_pieces(
     cache_root: &std::path::Path,
     torrent_bytes: &[u8],
     content: &std::path::Path,
     only: Option<&[&str]>,
+    hole: Option<std::ops::Range<u64>>,
 ) {
     let meta = librqbit::torrent_from_bytes(torrent_bytes).expect("parse the torrent back");
     let info_hash = meta.info_hash.as_string();
@@ -1410,6 +1431,12 @@ fn seed_piece_store_files(
         let start = index as u64 * piece_length;
         let end = start + piece.len() as u64;
         if !seeded.iter().any(|(from, to)| *from <= start && end <= *to) {
+            continue;
+        }
+        if hole
+            .as_ref()
+            .is_some_and(|hole| start < hole.end && hole.start < end)
+        {
             continue;
         }
         let index = index as u32;
@@ -2929,6 +2956,277 @@ fn an_archive_member_request_starts_the_torrent_it_reads_from() -> anyhow::Resul
         !swarm_paused(&client)?,
         "the archive request started the torrent it was about to read from"
     );
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
+/// The bytes of the member `stored_zip` puts in its archive: deterministic,
+/// and mildly incompressible so nothing along the way can shorten it.
+fn member_payload(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i.wrapping_mul(31) % 251) as u8).collect()
+}
+
+/// A zip holding one member, **stored** rather than deflated.
+///
+/// Stored because a fixture that leaves a hole in the middle of the archive
+/// needs to know where the member's bytes are: uncompressed, they run from a
+/// local header at the front to the central directory at the back, so a hole
+/// anywhere in the middle of the file is a hole in the member's data and
+/// nowhere else.
+fn stored_zip(member: &str, len: usize) -> Vec<u8> {
+    let data = member_payload(len);
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let mut writer = async_zip::base::write::ZipFileWriter::with_tokio(Vec::new());
+        writer
+            .write_entry_whole(
+                async_zip::ZipEntryBuilder::new(member.into(), async_zip::Compression::Stored)
+                    .build(),
+                &data,
+            )
+            .await
+            .expect("write the member");
+        writer.close().await.expect("close the zip").into_inner()
+    })
+}
+
+/// A server holding one torrent whose only file is `fixture.zip`, a zip with
+/// one stored member -- the shape `/zip/stream/torrent:<hash>/<archive>/<member>`
+/// reads.
+///
+/// `hole` is a byte range of that file the piece store is *not* seeded with.
+/// Nothing seeds these fixtures and no peer will ever bring the missing
+/// pieces, so a read that reaches the hole parks there for as long as the
+/// test wants, which is how a response body is held open.
+///
+/// The volume is declared roomy: every arm of the reconciler's ladder above
+/// the idle one is about the disk, and a test about the idle one wants none
+/// of them.
+fn archive_member_server(
+    config_dir: &std::path::Path,
+    cache_dir: &std::path::Path,
+    src: &std::path::Path,
+    member: &str,
+    member_len: usize,
+    hole: Option<std::ops::Range<u64>>,
+) -> anyhow::Result<(ServerHandle, String, String)> {
+    let content = src.join("Wanted");
+    std::fs::create_dir_all(&content)?;
+    std::fs::write(content.join("fixture.zip"), stored_zip(member, member_len))?;
+    let (torrent, info_hash) = real_torrent(&content);
+
+    let cache_root = cache_dir.join("cache");
+    stream_server::pretend_volume_space(&cache_root, u64::MAX);
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.join("config")),
+        cache_dir: Some(cache_root.clone()),
+        ..offline_config()
+    })?;
+    // After the start, never before (see `seed_piece_store_pieces`).
+    seed_piece_store_pieces(&cache_root, &torrent, &content, None, hole);
+    let base = format!("http://{}", handle.http_addr());
+    let client = bearer_client(&handle)?;
+    client
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
+        .send()?
+        .error_for_status()?;
+    stats_after_check(&client, &base, &info_hash)?;
+    Ok((handle, base, info_hash))
+}
+
+/// `torrent:<info hash>/<path in the torrent>` is one path segment of the
+/// archive URL, so the separator inside it is encoded; the member after it is
+/// the wildcard.
+fn archive_member_url(base: &str, info_hash: &str, member: &str) -> String {
+    format!("{base}/zip/stream/torrent:{info_hash}%2Ffixture.zip/{member}")
+}
+
+/// Whether the reconciler has this torrent stopped, as the server reports it:
+/// `swarmPaused` is `run_state() == Paused` read off librqbit, not anything
+/// the route under test writes.
+fn swarm_paused(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    info_hash: &str,
+) -> anyhow::Result<bool> {
+    let stats: serde_json::Value = client
+        .get(format!("{base}/{info_hash}/stats.json"))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    Ok(stats["swarmPaused"] == serde_json::json!(true))
+}
+
+/// The stream an archive member read registers lasts as long as the
+/// **response body**, so the reconciler leaves that torrent running while a
+/// player is still reading out of it.
+///
+/// `routes::archive::stream_file` puts the registration guard inside the
+/// body's closure for exactly this reason. Held in the handler's own frame
+/// instead, it would be dropped the moment the response is built -- while
+/// every byte the player has yet to read is still to come -- and the idle arm
+/// of `enginefs::reconcile::desired` (seeding off, nothing playing, quiet for
+/// `INACTIVE_TORRENT_PAUSE_GRACE`) would then stop the torrent mid-body,
+/// dropping its peers under a reader being served out of it.
+///
+/// Two torrents, because "it is still running" only means something if the
+/// arm was firing at all in that window: the second one is read by nobody,
+/// and the test waits for the reconciler to stop *it* before asking about the
+/// first. That is the observable proof the policy was armed and running --
+/// no counter the route writes is read anywhere here.
+///
+/// The body is held open by the fixture rather than by the client's reading
+/// pace: the middle of the archive is missing from the piece store and no
+/// peer will bring it, so the extraction parks there and the response stays
+/// open however slowly or quickly the client reads.
+#[test]
+fn an_archive_body_keeps_its_torrent_running_while_it_is_open() -> anyhow::Result<()> {
+    const MEMBER: &str = "member.bin";
+    const MEMBER_LEN: usize = 512 * 1024;
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+
+    // The hole sits well inside the member's own bytes: the local header at
+    // the front and the central directory at the back are both seeded, so the
+    // zip opens and the extraction gets going before it stalls.
+    let (handle, base, info_hash) = archive_member_server(
+        config_dir.path(),
+        cache_dir.path(),
+        src.path(),
+        MEMBER,
+        MEMBER_LEN,
+        Some(128 * 1024..192 * 1024),
+    )?;
+    let client = bearer_client(&handle)?;
+
+    // The control: a torrent of the same server that nobody reads.
+    let idle_content = src.path().join("Idle");
+    std::fs::create_dir_all(&idle_content)?;
+    write_payload(&idle_content.join("idle.bin"), 16 * 1024);
+    let (idle_torrent, idle_hash) = real_torrent(&idle_content);
+    client
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": hex::encode(&idle_torrent) }))
+        .send()?
+        .error_for_status()?;
+    stats_after_check(&client, &base, &idle_hash)?;
+
+    // The read. The response arrives -- there are bytes to send before the
+    // hole -- and the body is then left open, unread, for the rest of the
+    // test.
+    let anonymous = reqwest::blocking::Client::new();
+    let response = anonymous
+        .get(archive_member_url(&base, &info_hash, MEMBER))
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let opened = std::time::Instant::now();
+
+    // Now arm the idle arm. Deliberately after the request, so the torrent
+    // this body reads from is one the reconciler was leaving alone anyway
+    // when the read began, and the only thing that can save it from here on
+    // is the registration.
+    handle.update_settings(serde_json::json!({ "seedingEnabled": false }))?;
+
+    // Wait until both are true: the control torrent has been stopped, and
+    // enough time has passed that a registration ended with the *response*
+    // would have let the grace run out on this one too.
+    let would_have_stopped =
+        opened + enginefs::INACTIVE_TORRENT_PAUSE_GRACE + 3 * enginefs::FREE_SPACE_WATCH_INTERVAL;
+    let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
+    loop {
+        if swarm_paused(&client, &base, &idle_hash)?
+            && std::time::Instant::now() >= would_have_stopped
+        {
+            break;
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the reconciler never stopped the torrent nobody was reading"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        !swarm_paused(&client, &base, &info_hash)?,
+        "the torrent an archive body is still reading from was stopped under it"
+    );
+
+    drop(response);
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
+/// And when the body ends, the registration ends with it: the reconciler is
+/// free to stop the torrent again.
+///
+/// The other half of `routes::archive::stream_file`'s registration, and the
+/// half that is easy to leave out, because leaving it out breaks nothing a
+/// player can see: `TorrentMemberStream::drop` has to spawn the
+/// `on_stream_end` the registers are waiting for -- a `Drop` cannot await the
+/// async locks itself. Without it every archive member ever read leaves a
+/// stream registered for the life of the process, and the torrent behind it
+/// is one the idle policy can never stop again: with seeding turned off it
+/// goes on fetching a film nobody is watching, which is the whole thing that
+/// policy exists to prevent.
+///
+/// So this read is a whole one -- the member comes back complete, out of a
+/// torrent seeded with every piece -- and the assertions are the pair either
+/// side of the body: running while it was open (with seeding still on, so
+/// nothing else could have stopped it), and stopped by the reconciler after
+/// the grace once the read is over.
+#[test]
+fn an_archive_member_read_lets_the_torrent_be_stopped_again_when_it_is_done() -> anyhow::Result<()>
+{
+    const MEMBER: &str = "member.bin";
+    const MEMBER_LEN: usize = 64 * 1024;
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+
+    let (handle, base, info_hash) = archive_member_server(
+        config_dir.path(),
+        cache_dir.path(),
+        src.path(),
+        MEMBER,
+        MEMBER_LEN,
+        None,
+    )?;
+    let client = bearer_client(&handle)?;
+
+    // The member, read to its end out of the torrent.
+    let anonymous = reqwest::blocking::Client::new();
+    let response = anonymous
+        .get(archive_member_url(&base, &info_hash, MEMBER))
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.bytes()?.as_ref(),
+        member_payload(MEMBER_LEN).as_slice(),
+        "the member served out of the torrent"
+    );
+    assert!(
+        !swarm_paused(&client, &base, &info_hash)?,
+        "the read left the torrent running"
+    );
+
+    // Seeding off: from here the idle arm stops any torrent nothing is
+    // reading, once it has been quiet for the grace. The read is over, so
+    // this one qualifies -- unless its registration outlived it.
+    handle.update_settings(serde_json::json!({ "seedingEnabled": false }))?;
+    let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
+    while !swarm_paused(&client, &base, &info_hash)? {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the finished archive read left a stream registered: \
+             the reconciler never stopped the torrent again"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 
     handle.shutdown()?;
     handle.join()?;

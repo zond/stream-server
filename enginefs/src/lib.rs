@@ -146,7 +146,12 @@ const _: () = assert!(
 );
 /// How long a torrent must be quiet before the idle arm of
 /// [`crate::reconcile::desired`] stops it (with seeding off).
-pub(crate) const INACTIVE_TORRENT_PAUSE_GRACE: Duration = Duration::from_secs(15);
+///
+/// Public because it is the wait an end-to-end test of that arm has to sit
+/// out: `server`'s embed suite drives the whole loop through a running
+/// server and cannot ask the ladder anything, so it measures its own waits
+/// from here rather than from a copy of the number.
+pub const INACTIVE_TORRENT_PAUSE_GRACE: Duration = Duration::from_secs(15);
 
 /// How long after the reconciler last moved a torrent its *timer* will
 /// leave it stopped -- the anti-flap dwell, applied in
