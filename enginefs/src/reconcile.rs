@@ -25,6 +25,7 @@
 
 use crate::backend::RunState;
 use crate::{CACHE_FREE_SPACE_FLOOR, FREE_SPACE_RESUME_MARGIN, FREE_SPACE_WATCH_INTERVAL};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// How often the reconciler recomputes every torrent's decision.
@@ -205,10 +206,153 @@ fn floor(trigger: Trigger, observed: RunState) -> u64 {
     }
 }
 
+/// One lock per info hash, so that reconciling one torrent never queues
+/// behind reconciling another.
+///
+/// The obvious shape -- one `tokio::Mutex` around the whole policy -- is
+/// what this replaces, and it was not merely inelegant: the pause call it
+/// guarded is `Session::pause`, which flushes the session's persistence
+/// file before it returns, so every torrent's decision waited on every
+/// other torrent's disk write. A playback starting on one hash could sit
+/// behind the idle sweep's slow pause of an unrelated one.
+///
+/// Entries live only while a caller holds or waits for one, exactly as
+/// `BackendEngineFS::pin_locks` does, so an engine that reconciles a
+/// thousand torrents over a session keeps no thousand mutexes.
+#[derive(Default)]
+pub(crate) struct HashLocks {
+    locks: parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl HashLocks {
+    /// Take this hash's lock, waiting for whoever holds it. The guard
+    /// releases it -- and forgets the entry if nobody else wants it -- when
+    /// it is dropped.
+    pub(crate) async fn lock(&self, info_hash: &str) -> HashLockGuard<'_> {
+        let lock = self
+            .locks
+            .lock()
+            .entry(info_hash.to_string())
+            .or_default()
+            .clone();
+        let guard = Some(Arc::clone(&lock).lock_owned().await);
+        HashLockGuard {
+            locks: self,
+            info_hash: info_hash.to_string(),
+            lock,
+            guard,
+        }
+    }
+
+    /// How many hashes currently have a lock in the map.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.locks.lock().len()
+    }
+}
+
+/// A held [`HashLocks`] entry.
+pub(crate) struct HashLockGuard<'a> {
+    locks: &'a HashLocks,
+    info_hash: String,
+    lock: Arc<tokio::sync::Mutex<()>>,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for HashLockGuard<'_> {
+    fn drop(&mut self) {
+        // The mutex first, the map second, and never the other way round: a
+        // caller that arrived after the entry was dropped but before the
+        // mutex was released would build itself a *second* mutex for the
+        // same hash and hold it at the same time as us. Dropping the entry
+        // is safe only for an entry nobody can still reach, and the
+        // `strong_count` below is read under the map lock, which is the
+        // same lock a new caller needs to clone the `Arc` -- so the count
+        // cannot change while it is being read. Two is ours plus the map's:
+        // a waiter, or a second guard, holds a third.
+        self.guard.take();
+        let mut locks = self.locks.locks.lock();
+        if Arc::strong_count(&self.lock) == 2 {
+            locks.remove(&self.info_hash);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::INACTIVE_TORRENT_PAUSE_GRACE;
+
+    const TEST_HASH: &str = "0123456789abcdef0123456789abcdef01234567";
+    const OTHER_HASH: &str = "fedcba9876543210fedcba9876543210fedcba98";
+
+    /// Two reconciles of the same torrent are one at a time: the second
+    /// waits for the first, and gets in the moment it lets go.
+    #[tokio::test(start_paused = true)]
+    async fn one_hash_is_taken_by_one_caller_at_a_time() {
+        let locks = Arc::new(HashLocks::default());
+        let held = locks.lock(TEST_HASH).await;
+
+        let waiter = tokio::spawn({
+            let locks = locks.clone();
+            async move {
+                let _second = locks.lock(TEST_HASH).await;
+            }
+        });
+        // A whole (virtual) second of scheduler time in which the waiter
+        // is polled and gets nowhere.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            !waiter.is_finished(),
+            "the second caller got in while the first was holding the lock"
+        );
+
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the second caller waited for the lock, not for ever")
+            .expect("no panic");
+    }
+
+    /// The property the whole shape exists for. One torrent's reconcile can
+    /// be arbitrarily slow -- the pause it makes flushes librqbit's session
+    /// file to disk -- and it must hold up no other torrent's. A single
+    /// global mutex would fail this.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_reconcile_holds_up_only_its_own_torrent() {
+        let locks = HashLocks::default();
+        let _slow = locks.lock(TEST_HASH).await;
+
+        tokio::time::timeout(Duration::from_secs(5), locks.lock(OTHER_HASH))
+            .await
+            .expect("another torrent's reconcile is not behind this one");
+    }
+
+    /// Entries are per call, like the pin locks': one is kept while anybody
+    /// holds or waits for it, and nothing is left behind afterwards.
+    #[tokio::test(start_paused = true)]
+    async fn a_lock_nobody_wants_is_not_kept() {
+        let locks = Arc::new(HashLocks::default());
+        {
+            let _held = locks.lock(TEST_HASH).await;
+            assert_eq!(locks.len(), 1);
+
+            let waiter = tokio::spawn({
+                let locks = locks.clone();
+                async move {
+                    let _second = locks.lock(TEST_HASH).await;
+                }
+            });
+            tokio::task::yield_now().await;
+            assert_eq!(locks.len(), 1, "the waiter's entry must survive");
+            drop(_held);
+            tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .expect("the waiter got the lock")
+                .expect("no panic");
+        }
+        assert_eq!(locks.len(), 0, "nothing is left behind");
+    }
 
     /// A torrent with nothing wrong with it: running, alive, watched by
     /// nobody, on a roomy volume, with seeding on. Every test below changes
