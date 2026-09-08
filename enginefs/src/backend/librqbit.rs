@@ -2622,6 +2622,14 @@ impl TorrentHandle for LibrqbitHandle {
         self.handle.stats().finished
     }
 
+    /// One `ArcSwap` load of the slot librqbit fills when a torrent's info
+    /// dictionary arrives (`ManagedTorrent::metadata`), which is the same
+    /// thing `stats()` reports as `has_metadata` -- and, unlike `stats()`,
+    /// it neither walks the files nor copies the piece bitfield.
+    async fn has_metadata(&self) -> bool {
+        self.handle.metadata.load().is_some()
+    }
+
     /// Per-file completion from chunk-tracker have-bytes. `file_progress` is
     /// empty while the torrent is still Initializing, in which case the file
     /// is reported incomplete.
@@ -4345,6 +4353,31 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// `has_metadata` reads librqbit's metadata slot, so this pins that it
+    /// is reading the right slot the right way round: a torrent added from
+    /// a `.torrent` has its info dictionary from the moment it is added,
+    /// and says so. (The reconciler asks this of every torrent every two
+    /// seconds, and answers `Run` when it is false, so an inverted reading
+    /// would keep every torrent on this server running for ever.)
+    #[tokio::test]
+    async fn a_torrent_added_from_a_file_knows_its_metadata() {
+        use crate::backend::TorrentHandle;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("dl");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let payload = dir.join("payload.bin");
+        write_payload(&payload, 16 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+        let (_backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
+
+        assert!(handle.has_metadata().await);
+        assert_eq!(
+            handle.has_metadata().await,
+            handle.stats().await.has_metadata,
+            "the cheap answer and the statistics' answer are the same answer"
+        );
     }
 
     /// The swallowed unpause, against the shipped librqbit: after it, the

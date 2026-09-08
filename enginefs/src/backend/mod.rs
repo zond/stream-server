@@ -269,6 +269,22 @@ pub trait TorrentHandle: Send + Sync + Clone {
     async fn is_finished(&self) -> bool {
         false
     }
+    /// Whether the torrent's info dictionary is known -- for a magnet, that
+    /// the metadata fetch has finished. A torrent without it has no files,
+    /// no length and nothing to write to disk; what it is doing is fetching
+    /// the dictionary from the swarm, which is why the reconciler
+    /// ([`crate::reconcile::desired`]) keeps such a torrent running whatever
+    /// else is true of it.
+    ///
+    /// Cheap, like [`Self::is_finished`] and [`Self::run_state`] beside it:
+    /// polled for every torrent on the reconciler's tick, so it must read
+    /// the slot the backend already holds. The default answers from
+    /// `stats()` -- correct for any backend, but `stats()` is a per-file
+    /// walk plus a copy of the piece bitfield, so a backend that can answer
+    /// from one load should override it.
+    async fn has_metadata(&self) -> bool {
+        self.stats().await.has_metadata
+    }
     /// Whether this handle owns file selection, resume, and idle-pause
     /// lifecycle internally.
     fn manages_playback_lifecycle(&self) -> bool {
