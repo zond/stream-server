@@ -4268,9 +4268,12 @@ mod tests {
         efs.reconcile_tick().await;
         assert_eq!(handle.run_state(), RunState::Paused);
 
-        // And room brings it back.
+        // And room brings it back, once the dwell that follows the
+        // reconciler's own stop is out. The reading is handed in rather
+        // than waited for: this session runs on the real clock.
         available.store(u64::MAX, Ordering::SeqCst);
-        efs.reconcile_tick().await;
+        efs.reconcile_tick_at(2 * crate::RECONCILE_MIN_DWELL.as_secs())
+            .await;
         assert_eq!(handle.run_state(), RunState::Live);
     }
 

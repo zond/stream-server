@@ -252,6 +252,25 @@ impl GetFileError {
 /// arm needs no absence-of-a-reading case and gets no sentinel to misread.
 const EPOCH: u64 = 0;
 
+/// [`Engine::last_transition_at`] for a torrent the reconciler has never
+/// started or stopped.
+///
+/// A sentinel, and it cannot be `0` the way [`EPOCH`] can. `0` is a real
+/// reading here -- [`crate::Clock::now_secs`] is `epoch.elapsed().as_secs()`,
+/// so it answers `0` for the whole first second of the process -- and the
+/// two claims it would then carry disagree: "this reconciler has never
+/// moved this torrent", which exempts it from the dwell, and "this
+/// reconciler moved it just now", which is the strongest reason to apply
+/// one. The first second is not a corner. Two things reconcile inside it
+/// on an ordinary boot: `server::run` applies the persisted seeding
+/// setting before the reconciler's timer starts, and that call reconciles
+/// every engine there is synchronously -- on a volume under the floor it
+/// stops every torrent that wants to write, at reading zero -- and a
+/// client that asks for a stream as the server comes up reconciles its
+/// torrent again with `PlaybackStart`, which starts it, at reading zero.
+/// Either transition is one the next timer pass has to wait out.
+const NEVER_MOVED: u64 = u64::MAX;
+
 /// What `stats.error` says for a torrent the reconciler's free-space arm
 /// has stopped (`Engine::is_stopped_for_space`): a fixed, path-free
 /// sentence, like `librqbit::TORRENT_ERROR_MESSAGE` for the backend's own
@@ -316,8 +335,8 @@ pub struct Engine<H: TorrentHandle> {
     /// [`BackendEngineFS::restore_pinned_downloads`]: crate::BackendEngineFS::restore_pinned_downloads
     settled: AtomicBool,
     /// The clock reading at the last start or stop the reconciler made on
-    /// this torrent, or 0 for a torrent it has never moved: the dwell in
-    /// [`crate::BackendEngineFS::start_if_stopped`].
+    /// this torrent, or [`NEVER_MOVED`] for a torrent it has never moved:
+    /// the dwell in [`crate::BackendEngineFS::start_if_stopped`].
     ///
     /// [`crate::BackendEngineFS::start_if_stopped`]: crate::BackendEngineFS
     last_transition_at: AtomicU64,
@@ -359,8 +378,7 @@ pub struct Engine<H: TorrentHandle> {
     /// `0` -- something used this torrent inside the first second -- means
     /// "quiet since the epoch", which is exactly what the seed means, so
     /// the collision is between two facts that agree. Compare
-    /// [`Self::last_transition_at`], where `0` is not the epoch but a
-    /// sentinel for "never", and so does collide.
+    /// [`NEVER_MOVED`], where the two claims `0` would carry disagree.
     ///
     /// [`Self::settled`]: Engine::settled
     last_active_at: AtomicU64,
@@ -406,7 +424,7 @@ impl<H: TorrentHandle> Engine<H> {
                 .max_capacity(64 * 1024 * 1024) // 64MB cache per engine
                 .build(),
             settled: AtomicBool::new(true),
-            last_transition_at: AtomicU64::new(0),
+            last_transition_at: AtomicU64::new(NEVER_MOVED),
             last_active_at: AtomicU64::new(EPOCH),
             pinned_files: parking_lot::RwLock::new(BTreeSet::new()),
             volumes,
@@ -443,9 +461,13 @@ impl<H: TorrentHandle> Engine<H> {
     }
 
     /// The clock reading at the reconciler's last start or stop of this
-    /// torrent, or 0 if it has never moved it.
-    pub(crate) fn last_transition_at(&self) -> u64 {
-        self.last_transition_at.load(Ordering::Relaxed)
+    /// torrent, or `None` if it has never moved it -- which is not the same
+    /// as "moved at reading zero": see [`NEVER_MOVED`].
+    pub(crate) fn last_transition_at(&self) -> Option<u64> {
+        match self.last_transition_at.load(Ordering::Relaxed) {
+            NEVER_MOVED => None,
+            at => Some(at),
+        }
     }
 
     /// Record that the reconciler has just started or stopped this torrent.

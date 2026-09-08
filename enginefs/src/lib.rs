@@ -1653,6 +1653,12 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     ///
     /// What is left is the timer's own start, which nobody is waiting for
     /// and which will come round again in [`RECONCILE_INTERVAL`].
+    ///
+    /// A torrent this reconciler has never moved is exempt as well, and
+    /// that question is asked of [`Engine::last_transition_at`] as a
+    /// `None` rather than as a reading of zero: the clock answers zero for
+    /// the whole first second of the process, and a stop made in it is a
+    /// stop like any other -- see [`crate::engine::NEVER_MOVED`].
     async fn start_if_stopped(
         &self,
         engine: &Arc<Engine<B::Handle>>,
@@ -1663,17 +1669,18 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         if conditions.run_state != RunState::Paused {
             return;
         }
-        let since_transition = Duration::from_secs(now.saturating_sub(engine.last_transition_at()));
-        if trigger == crate::reconcile::Trigger::Timer
-            && engine.last_transition_at() != 0
-            && since_transition < RECONCILE_MIN_DWELL
+        if let Some(moved_at) = engine.last_transition_at()
+            && trigger == crate::reconcile::Trigger::Timer
         {
-            debug!(
-                info_hash = %engine.info_hash,
-                since_secs = since_transition.as_secs(),
-                "not starting a torrent this soon after the last time it was moved"
-            );
-            return;
+            let since_transition = Duration::from_secs(now.saturating_sub(moved_at));
+            if since_transition < RECONCILE_MIN_DWELL {
+                debug!(
+                    info_hash = %engine.info_hash,
+                    since_secs = since_transition.as_secs(),
+                    "not starting a torrent this soon after the last time it was moved"
+                );
+                return;
+            }
         }
         match engine.handle.start_torrent().await {
             Ok(()) => {
@@ -7704,6 +7711,61 @@ mod tests {
         assert_eq!(counters.start_torrent.load(Ordering::SeqCst), 1);
     }
 
+    /// A move made inside the process's first second is a move, and the
+    /// dwell that follows it is the same dwell.
+    ///
+    /// [`Clock::now_secs`] is `epoch.elapsed().as_secs()`, so it answers 0
+    /// for a whole second, and the field the dwell reads used to start at 0
+    /// as its "never moved" -- which the timer treats as exempt. A real
+    /// transition recorded in that first second was therefore read as "this
+    /// reconciler has never moved it" and the dwell was skipped for it. The
+    /// startup path reaches it on any quick boot: `server::run` applies the
+    /// persisted seeding setting before the reconciler's timer starts, and
+    /// that call reconciles every engine there is -- on a volume under the
+    /// floor, stopping every torrent that wants to write.
+    ///
+    /// The stop here is the free-space arm's, because the idle arm cannot
+    /// fire this early now that its grace runs from the process's own
+    /// start -- which is the point: the collision is about the *clock*, not
+    /// about which arm moved the torrent.
+    #[tokio::test(start_paused = true)]
+    async fn a_move_in_the_processs_first_second_still_holds_the_dwell() {
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(CACHE_FREE_SPACE_FLOOR - 1));
+        assert_eq!(
+            enginefs.clock.now_secs(),
+            0,
+            "the whole point: the process is still inside its first second"
+        );
+
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), Decision::Stop)]
+        );
+        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
+
+        // The volume clears at once, well over the resume margin.
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), Decision::Run)],
+            "the ladder wants it running again"
+        );
+        assert_eq!(
+            run_state_of(&enginefs, TEST_HASH).await,
+            RunState::Paused,
+            "and the timer leaves it alone this soon after moving it"
+        );
+        assert_eq!(counters.start_torrent.load(Ordering::SeqCst), 0);
+
+        // A delay and not a refusal, the same as for a move made later.
+        tokio::time::advance(RECONCILE_MIN_DWELL).await;
+        enginefs.reconcile_tick().await;
+        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
+        assert_eq!(counters.start_torrent.load(Ordering::SeqCst), 1);
+    }
+
     /// The activity inputs, both ways round: a torrent with a stream open
     /// on it runs however long it has been since anything asked it for a
     /// byte, and the same torrent with the stream gone is stopped.
@@ -7869,7 +7931,10 @@ mod tests {
 
         // The same torrent with everything it wants writes nothing, so the
         // volume under it is not about it: keeping it stopped would cost
-        // its seeding for no bytes saved.
+        // its seeding for no bytes saved. The dwell is sat out first, since
+        // the reconciler stopped this torrent itself and a start of it is
+        // the timer's own.
+        tokio::time::advance(RECONCILE_MIN_DWELL).await;
         counters.seeded.store(true, Ordering::SeqCst);
         assert_eq!(
             enginefs.reconcile_tick().await,
@@ -8137,11 +8202,14 @@ mod tests {
         assert!(!engine.is_stopped_for_space().await);
         assert!(enginefs.out_of_space_torrents().await.is_empty());
 
-        // The margin over: started again, and off the cleaner's list.
+        // The margin over: started again, and off the cleaner's list. Past
+        // the dwell as well, which every timer start of a torrent this
+        // reconciler stopped has to be.
         available.store(
             CACHE_FREE_SPACE_FLOOR + FREE_SPACE_RESUME_MARGIN,
             Ordering::SeqCst,
         );
+        tokio::time::advance(RECONCILE_MIN_DWELL).await;
         enginefs.reconcile_tick().await;
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
         assert_eq!(counters.start_torrent.load(Ordering::SeqCst), 1);
@@ -8331,9 +8399,13 @@ mod tests {
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
 
         // Room again -- but the torrent is inside a check that will park it
-        // back in `Paused` whatever the unpause said.
+        // back in `Paused` whatever the unpause said. Each timer start
+        // waits out a dwell from the last call the reconciler made on this
+        // torrent, the swallowed one included: what it does not do is
+        // believe that call happened.
         enginefs.set_free_space_probe(|_| Ok(u64::MAX));
         counters.swallow_start.store(true, Ordering::SeqCst);
+        tokio::time::advance(RECONCILE_MIN_DWELL).await;
         assert_eq!(
             enginefs.reconcile_tick().await,
             vec![(TEST_HASH.to_string(), Decision::Run)]
@@ -8346,6 +8418,7 @@ mod tests {
 
         // The check has ended. One tick, and the torrent is running.
         counters.swallow_start.store(false, Ordering::SeqCst);
+        tokio::time::advance(RECONCILE_MIN_DWELL).await;
         enginefs.reconcile_tick().await;
         assert_eq!(
             run_state_of(&enginefs, TEST_HASH).await,
@@ -8387,8 +8460,10 @@ mod tests {
         assert_eq!(counters.restart_from_error.load(Ordering::SeqCst), 0);
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
 
-        // The cleaner made room. The next pass is what starts it.
+        // The cleaner made room. The next pass past the dwell is what
+        // starts it.
         available.store(u64::MAX, Ordering::SeqCst);
+        tokio::time::advance(RECONCILE_MIN_DWELL).await;
         enginefs.reconcile_tick().await;
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
         assert!(!engine.is_stopped_for_space().await);
