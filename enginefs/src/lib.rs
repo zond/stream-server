@@ -4270,6 +4270,9 @@ mod tests {
         /// pieces up -- a torrent added without piece reclaim, or one whose
         /// state has no chunk tracker to edit.
         refuses_drop: AtomicBool,
+        /// Every `set_pieces_advertised` call, in order: which range, and
+        /// whether it was put into what we announce or held back out of it.
+        advertised: Mutex<Vec<(std::ops::Range<u32>, bool)>>,
         /// The fake handle's own pin set (what the real backend keeps in its
         /// `PinnedFiles` map), reported through `stats()`.
         pinned: Mutex<std::collections::BTreeSet<usize>>,
@@ -4667,6 +4670,26 @@ mod tests {
                 offset: file_idx as u64 * len,
                 bytes: len,
             })
+        }
+
+        async fn set_pieces_advertised(
+            &self,
+            pieces: std::ops::Range<u32>,
+            advertised: bool,
+        ) -> Result<usize> {
+            let count = (pieces.end - pieces.start) as usize;
+            self.counters
+                .advertised
+                .lock()
+                .unwrap()
+                .push((pieces, advertised));
+            Ok(count)
+        }
+
+        /// One piece per file, matching `file_pieces` above, so a policy
+        /// can be sized without a layout.
+        fn piece_length(&self) -> Option<u64> {
+            Some(self.files.first()?.length)
         }
 
         async fn drop_pieces(
@@ -9775,6 +9798,48 @@ mod tests {
         counters.refuses_drop.store(true, Ordering::SeqCst);
         assert_eq!(enginefs.release_pieces(TEST_HASH, &[5]).await, 0);
         assert!(bucket.join("5").is_file());
+    }
+
+    /// A stream that moves to another file of the same torrent puts the
+    /// first file's range back into what we announce before it holds the
+    /// second one's back.
+    ///
+    /// One policy per torrent, so opening a reader on another file replaces
+    /// it -- and the range it was holding back would otherwise stay
+    /// announced to nobody for the life of the engine, while the cache
+    /// cleaner's gate, which reads "no policy for this piece" as "we
+    /// announce it", went on calling those same pieces protected. Held back
+    /// and protected at once is the one combination that is never right:
+    /// bytes we will not share and will not reclaim either.
+    #[tokio::test]
+    async fn a_reader_moving_to_another_file_gives_the_first_one_back_to_the_swarm() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        // Smaller than either file, so both get a real policy rather than
+        // `Shape::Whole` -- which installs nothing and holds nothing back.
+        enginefs.set_cache_budget(Some(40));
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+
+        let hash = TEST_HASH.to_lowercase();
+        engine.begin_retention(0).await;
+        let gate = enginefs.reclaim_verdicts().await.gate;
+        assert!(
+            gate.releases(&hash, 0),
+            "file 0's piece is inside the window and uncommitted, so it may go"
+        );
+
+        engine.begin_retention(1).await;
+        assert_eq!(
+            *counters.advertised.lock().unwrap(),
+            vec![(0..1, false), (0..1, true), (1..2, false)],
+            "file 0 held back, then given back, and only then file 1 held back"
+        );
+
+        // And the gate says the same thing from the other side: the piece
+        // we announce again is one nothing may take, and the piece we are
+        // now holding back is one a pass may.
+        let gate = enginefs.reclaim_verdicts().await.gate;
+        assert!(!gate.releases(&hash, 0), "announced again, so protected");
+        assert!(gate.releases(&hash, 1), "held back, so reclaimable");
     }
 
     /// A hash the session runs no torrent for has no have-set for a

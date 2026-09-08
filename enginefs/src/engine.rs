@@ -736,9 +736,17 @@ impl<H: TorrentHandle> Engine<H> {
         {
             return;
         }
-        let Some(retention) = crate::retention::policy_for(&self.handle, budget, file_idx).await
-        else {
-            self.clear_retention().await;
+        let policy = crate::retention::policy_for(&self.handle, budget, file_idx).await;
+        // Whatever was held back for the file before this one goes back
+        // into what we announce first, whether or not a new policy is going
+        // in. Otherwise a torrent whose reader moved to another file would
+        // leave the first file's range announced to nobody for the life of
+        // the engine, while the cleaner's gate -- which reads "no policy
+        // covers this piece" as "we announce it" -- called those same pieces
+        // protected. Held back and protected at once is the one combination
+        // that is never right.
+        self.clear_retention().await;
+        let Some(retention) = policy else {
             return;
         };
         let pieces = retention.pieces();
@@ -807,9 +815,16 @@ impl<H: TorrentHandle> Engine<H> {
         let (file_idx, offset) = (*self.playhead.lock())?;
         let mut retention = self.retention.lock().take()?;
         if retention.file_idx != file_idx {
-            // The reader moved to another file of the same torrent. This
-            // policy's file is not being played, so it governs nothing:
-            // `begin_retention` installs the new one.
+            // The playhead names a different file: a reader that has just
+            // been opened on another one and has not read yet, or the last
+            // read of the file this policy replaced. Either way this pass
+            // has no playhead for the policy it is holding, so it leaves it
+            // exactly as it is -- `begin_retention` is what replaces a
+            // policy, and it puts the old range back when it does.
+            let mut slot = self.retention.lock();
+            if slot.is_none() {
+                *slot = Some(retention);
+            }
             return None;
         }
         let pass =
