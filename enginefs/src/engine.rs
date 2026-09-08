@@ -265,6 +265,40 @@ pub struct Engine<H: TorrentHandle> {
     pub handle: H,
     /// Epoch of `last_accessed`, shared with the owning `BackendEngineFS`.
     clock: crate::Clock,
+    /// The clock reading at the last time anything **looked this engine
+    /// up**, written by [`Self::touch`].
+    ///
+    /// It counts lookups, not playback, and it has exactly one reader left:
+    /// the engine eviction in the housekeeping sweep the `BackendEngineFS`
+    /// constructor spawns (`crate::BackendEngineFS::take_sweep_task`'s
+    /// task), which drops an engine nothing has asked about for
+    /// `INACTIVE_TORRENT_REMOVE_TIMEOUT`. That reader
+    /// is the legitimate one, and it is legitimate *because* the field
+    /// counts lookups: what eviction protects against is forgetting a
+    /// torrent some caller still holds a name for, so "somebody asked about
+    /// this" is the right question there -- and the sweep asks the five
+    /// activity registers separately before it removes anything, so a
+    /// playing torrent is never dropped on this field's word alone.
+    ///
+    /// **Nothing that decides whether a torrent is idle may read it.** Its
+    /// writers are every lookup (`get_engine`/`lookup_engine`,
+    /// `register_engine`) and every `Engine::get_statistics`, so a client
+    /// polling `GET /{infoHash}/stats.json` -- which reaches its engine
+    /// through `get_engine` and then calls `get_statistics` -- resets it
+    /// every few seconds. The reconciler's idle arm used to measure its
+    /// grace from here, which made "somebody is asking about this torrent"
+    /// mean "somebody is watching it" and kept a torrent nobody was
+    /// watching downloading all night with seeding off. The idle arm has
+    /// [`Self::last_active_at`] instead, which moves only where activity is
+    /// actually observed.
+    ///
+    /// It is also initialised to the clock rather than left unset, which
+    /// for an engine made for a torrent the *previous* process left behind
+    /// is a claim about a past this process never saw. That is harmless for
+    /// eviction -- it only buys a restored engine one inactivity window
+    /// before the sweep may drop it, which is the right way round -- and
+    /// would not be harmless for a policy that pauses, which is the other
+    /// half of why the idle arm does not read it.
     pub last_accessed: AtomicU64,
     pub active_streams: Arc<AtomicUsize>,
     pub data_cache: DataCache,
