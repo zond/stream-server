@@ -455,10 +455,16 @@ impl ServerHandle {
         self.block_on_server(async move { routes::downloads::downloads(&state).await })
     }
 
-    /// Where `file_idx` of `info_hash` is on disk (the `path` of its
-    /// [`Self::downloads`] entry), for handing a finished download to a
-    /// local player. `None` when the torrent is not managed right now or
-    /// the backend does not know the path yet; never creates an engine.
+    /// Where `file_idx` of `info_hash` is *placed* (the `path` of its
+    /// [`Self::downloads`] entry). `None` when the torrent is not managed
+    /// right now or the backend does not know the path yet; never creates an
+    /// engine.
+    ///
+    /// A name, not a file: torrent data is stored one file per piece
+    /// (`enginefs::piece_store`), so nothing is written at this path and
+    /// handing it to a local player would hand it a path that does not
+    /// exist. A finished download plays through the media routes like any
+    /// other.
     pub fn download_path(
         &self,
         info_hash: &str,
