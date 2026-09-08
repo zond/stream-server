@@ -371,7 +371,7 @@ impl RetentionPolicy {
     /// the window is **committed** if the window *released* it -- the previous
     /// pass covered it, it is behind `playhead` now, and `playhead` is no
     /// further on than the last piece that window covered, so playback walked
-    /// past this piece rather than jumping over it (see [`Self::covered`]) --
+    /// past this piece rather than jumping over it (see `Self::covered`) --
     /// and **reclaimed** if not. So the first pass of a stream commits
     /// nothing, no window having covered anything yet, and so does either
     /// direction of a seek: what a seek leaves behind is read-ahead it never

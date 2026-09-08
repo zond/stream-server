@@ -18,7 +18,7 @@
 ///
 /// The compiled-in roots come from `webpki-root-certs`, which
 /// `rustls-platform-verifier` already pulls into the graph, so they compile
-/// nothing new; the platform's own anchors are read by [`platform_roots`],
+/// nothing new; the platform's own anchors are read by `platform_roots`,
 /// once, at the first HTTPS request rather than at every handshake.
 ///
 /// # Why not the platform verifier
@@ -47,7 +47,7 @@
 ///
 /// **The cost was never the anchors, it was doing the verification in Java
 /// per handshake.** So the anchors come back and the Java call does not:
-/// [`platform_roots`] reads the same store the verifier would have consulted,
+/// `platform_roots` reads the same store the verifier would have consulted,
 /// once, and rustls checks chains against it in Rust. That is why this is a
 /// union rather than a replacement, and why the trade below is small.
 ///

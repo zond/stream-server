@@ -522,7 +522,7 @@ impl TorrentStorage for PieceStore {
     /// Nothing to open and nothing to pre-allocate -- just the torrent's own
     /// directory, so the first write does not have to race to create it, and
     /// the one piece of reconciliation the store owes a fresh process
-    /// ([`Self::discard_shadowing_staged`]). The bucket directories are made on
+    /// (`Self::discard_shadowing_staged`). The bucket directories are made on
     /// demand.
     fn init(
         &mut self,

@@ -1290,7 +1290,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     }
 
     /// Start the reconciler: [`Self::reconcile_tick`] every
-    /// [`RECONCILE_INTERVAL`] for as long as this engine exists. The caller
+    /// [`crate::reconcile::RECONCILE_INTERVAL`] for as long as this engine
+    /// exists. The caller
     /// owns the task -- `server::run` puts it with the other forever loops
     /// it aborts on shutdown -- and the task holds the engine weakly, so an
     /// embedder that drops the engine without aborting it ends it too. Not
@@ -1637,7 +1638,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     ///   in the one case where a human can tell.
     ///
     /// What is left is the timer's own start, which nobody is waiting for
-    /// and which will come round again in [`RECONCILE_INTERVAL`].
+    /// and which will come round again in
+    /// [`crate::reconcile::RECONCILE_INTERVAL`].
     ///
     /// A torrent this reconciler has never moved is exempt as well, and
     /// that question is asked of [`Engine::last_transition_at`] as a
@@ -2301,7 +2303,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// notice it.
     ///
     /// Plus both ends of every relocation in flight
-    /// ([`Self::begin_relocation`]). A relocation is the one window where a
+    /// (`Self::begin_relocation`). A relocation is the one window where a
     /// torrent's data has no engine at all speaking for it -- the engine
     /// leaves the registry before the backend is asked to move a byte, and a
     /// cross-device copy takes minutes -- so without those entries the
@@ -2729,7 +2731,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// Several torrent files may be active at once; cleanup is per file stream.
     ///
     /// **Cancel-safe**: dropped before it returns, it leaves nothing
-    /// registered. See [`StreamStartRollback`] for what that is worth --
+    /// registered. See `StreamStartRollback` for what that is worth --
     /// the registers this writes have no expiry, so one that outlives the
     /// request that wrote it is read as `playing` for the life of the
     /// process. Once this *has* returned the caller owns the registration
@@ -2987,7 +2989,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// downloaded (`checking` phase) and replaces the registry's engine;
     /// readers still open on the old one end, and for the length of the
     /// move the hash is looked up as an in-flight add (see
-    /// [`Self::relocate_engine`]), so requests wait for the new engine
+    /// `Self::relocate_engine`), so requests wait for the new engine
     /// rather than reaching the dropped torrent. Without a downloads dir
     /// everything stays in the backend's root.
     ///
@@ -3009,7 +3011,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// already in place.
     ///
     /// The guard is owned, and for the length of a relocation it belongs to
-    /// the move rather than to this call ([`Self::relocate_engine`]). What
+    /// the move rather than to this call (`Self::relocate_engine`). What
     /// it guards is the window in which the hash has no engine, and the move
     /// outlives the request that asked for it, so the lock has to outlive it
     /// too: a caller that goes away leaves the guard with the move, which
@@ -3216,11 +3218,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// With `delete_files` the data goes too, whether or not the file was
     /// pinned (the caller wants the download gone; a pin lost to a crash
     /// must not leave the bytes behind), see
-    /// [`Self::delete_download_data`]: the whole torrent when this was its
+    /// `Self::delete_download_data`: the whole torrent when this was its
     /// last pin, only this file while other pins hold. A dormant pin has no
     /// torrent to delete anything of beyond its placement folder under the
     /// downloads dir, which this layer named itself and removes
-    /// ([`Self::delete_dormant_download_data`]) -- while the pin stands
+    /// (`Self::delete_dormant_download_data`) -- while the pin stands
     /// [`Self::protected_paths`] keeps the cleaner off it, so this is what
     /// takes it now rather than in thirty days. What was
     /// really deleted is reported, not what was asked for

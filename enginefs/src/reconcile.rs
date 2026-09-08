@@ -188,13 +188,13 @@ pub struct Conditions {
 ///    stream that is playing is exactly the torrent that will run the
 ///    volume to zero. A finished torrent writes nothing and so is never
 ///    stopped by this arm. Which line, and what an unreadable probe means,
-///    is [`floor`].
+///    is `line` and [`volume_is_short`].
 /// 6. **Playing or pinned -> [`Decision::Run`].** Someone is watching it,
 ///    or someone asked for it offline.
 /// 7. **Seeding off and idle -> [`Decision::Stop`].** The idle policy: with
 ///    seeding disabled and nothing playing, what a running torrent is doing
 ///    is fetching a film nobody is watching while we have promised to
-///    upload nothing. [`crate::INACTIVE_TORRENT_PAUSE_GRACE`] of quiet
+///    upload nothing. `crate::INACTIVE_TORRENT_PAUSE_GRACE` of quiet
 ///    first, so a player that stops one segment and starts the next does
 ///    not stop and start the torrent with it -- and a torrent nothing has
 ///    been seen using at all ([`Conditions::idle_for`] `None`, a restored
@@ -361,8 +361,8 @@ pub(crate) fn line(trigger: Trigger, observed: RunState) -> u64 {
 ///
 /// Keyed by output folder rather than by torrent, because that is what a
 /// volume is: two torrents writing to one folder share one reading and one
-/// [`Reading::short_since`], and a bound counted per torrent would start
-/// the clock again for each of them (see [`Self::short_for`]).
+/// `Reading::short_since`, and a bound counted per torrent would start
+/// the clock again for each of them (see `Self::short_for`).
 pub struct Volumes {
     /// Where a torrent that names no output folder of its own writes --
     /// the engine's download directory.

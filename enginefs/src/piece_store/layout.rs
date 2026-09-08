@@ -161,7 +161,7 @@ impl PieceLayout {
     }
 
     /// Whether this file has payload bytes of its own -- see
-    /// [`FileExtent::owns_bytes`]. `false` for an out-of-range id.
+    /// `FileExtent::owns_bytes`. `false` for an out-of-range id.
     pub fn owns_bytes(&self, file_id: usize) -> bool {
         self.files.get(file_id).is_some_and(|f| f.owns_bytes)
     }

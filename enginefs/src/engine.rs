@@ -328,7 +328,7 @@ pub struct Engine<H: TorrentHandle> {
     /// grace from here, which made "somebody is asking about this torrent"
     /// mean "somebody is watching it" and kept a torrent nobody was
     /// watching downloading all night with seeding off. The idle arm has
-    /// [`Self::last_active_at`] instead, which moves only where activity is
+    /// `Self::last_active_at` instead, which moves only where activity is
     /// actually observed.
     ///
     /// It is also initialised to the clock rather than left unset, which
@@ -542,7 +542,7 @@ impl<H: TorrentHandle> Engine<H> {
     /// lines and the gap between them swallowed torrents whole.
     ///
     /// The ladder measures a `Paused` torrent on a timer at
-    /// [`crate::reconcile::line`], which is the floor plus
+    /// `crate::reconcile::line`, which is the floor plus
     /// `FREE_SPACE_RESUME_MARGIN`; the stall clock that fails its reads is
     /// started at the same line. `is_stopped_for_space` measures at the
     /// floor alone, deliberately, because eviction and the 507 gate are
@@ -641,7 +641,7 @@ impl<H: TorrentHandle> Engine<H> {
         self.reads_refused.load(Ordering::SeqCst)
     }
 
-    /// Fail every read on this engine, now and until [`Self::allow_reads`]:
+    /// Fail every read on this engine, now and until `Self::allow_reads`:
     /// the parked ones are woken to find `reads_refused` set and return
     /// `StorageFull`, and a new one returns it on its first poll.
     ///
