@@ -1750,9 +1750,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
 
     /// Whether anything is using this torrent right now: a response body
     /// open on it, a file stream, an unexpired HLS playback lease, a
-    /// multi-file selection, or a reader parked inside the engine. The same
-    /// five questions the idle sweep and the grace-period task each ask for
-    /// themselves today.
+    /// multi-file selection, or a reader parked inside the engine. These
+    /// were five questions asked in three places -- the housekeeping
+    /// sweep's idle pause, the per-stream grace-period task and this -- and
+    /// the first two are gone: the ladder is the only thing that asks.
     async fn torrent_is_active(
         &self,
         info_hash: &str,
@@ -2792,10 +2793,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         // clears the floor *plus* `FREE_SPACE_RESUME_MARGIN`, and in
         // between a request would otherwise open a reader on a torrent
         // nothing is fetching for -- the player's spinner, with no end and
-        // no error. A user pressing play is owed the floor itself, which is
-        // what this trigger is measured against, and `resume_torrent` above
-        // cannot do it: the reconciler's stop is deliberately not a pause
-        // that call can lift.
+        // no error. A user pressing play is owed the floor itself, which
+        // is what this trigger is measured against, and nothing else in
+        // the request can do it: starting a stopped torrent is the
+        // reconciler's and only the reconciler's.
         self.reconcile_hash(&info_hash, crate::reconcile::Trigger::PlaybackStart)
             .await;
     }
@@ -8077,9 +8078,9 @@ mod tests {
     /// until the volume has cleared the floor *plus* the resume margin --
     /// the margin exists so a timer does not restart something into a
     /// nearly-full volume for nobody. A user pressing play is not nobody,
-    /// and inside that band nothing else would start the torrent for them:
-    /// `resume_torrent`, which every playback start calls, cannot lift the
-    /// reconciler's stop by design. The reader would open on a torrent
+    /// and inside that band nothing else would start the torrent for them,
+    /// because starting a stopped torrent is the reconciler's alone. The
+    /// reader would open on a torrent
     /// nothing is fetching for and park -- a spinner with no end and no
     /// error, which is the failure the stall bound exists to convert into
     /// an error twenty seconds later.
@@ -8667,15 +8668,15 @@ mod tests {
     ///
     /// The refusal used to be lifted only by the reconciler's own
     /// `start_torrent`, and this is the sequence that leaves no such start
-    /// to hang it on. It is all ordinary: seeding off (the idle policy's
-    /// own precondition), so the sweep pauses the torrent; the volume then
-    /// falls under the floor and stays there past the stall bound, so the
-    /// free-space arm -- which sits above the idle arm and does not care
-    /// which pause the torrent is under -- fails its readers; the cleaner
-    /// empties the volume; and the user presses play. `activate_file`
-    /// resumes the idle pause first, so by the time the playback's own
-    /// reconcile answers `Run` the torrent is `Live` and there is nothing
-    /// to start. Every read on that engine then failed with `StorageFull`,
+    /// to hang it on. It is all ordinary: the torrent is stopped (seeding
+    /// off and nothing playing is one way, a previous process is another);
+    /// the volume then falls under the floor and stays there past the stall
+    /// bound, so the free-space arm -- which sits above the idle arm and
+    /// does not care why the torrent is stopped -- fails its readers; the
+    /// cleaner empties the volume; and the user presses play. The playback
+    /// start's own reconcile is what starts it, and on the *next* pass the
+    /// torrent is already `Live`, so there is no start left to hang the
+    /// lift on. Every read on that engine then failed with `StorageFull`,
     /// for good, on a volume with room to spare.
     #[tokio::test(start_paused = true)]
     async fn a_playback_that_finds_its_torrent_running_still_lifts_the_read_refusal() {
@@ -8704,7 +8705,7 @@ mod tests {
         assert_eq!(
             run_state_of(&enginefs, TEST_HASH).await,
             RunState::Live,
-            "the resume in `activate_file` lifted the idle pause"
+            "the playback start's reconcile started it"
         );
         assert!(
             poll_a_read(&engine).await.is_none(),

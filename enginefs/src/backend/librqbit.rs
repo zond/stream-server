@@ -1987,8 +1987,10 @@ impl TorrentBackend for LibrqbitBackend {
                     // librqbit refuses the option otherwise, and would
                     // refuse the whole add with it. Persisted with the
                     // torrent, and a restored torrent that has it comes
-                    // back paused whatever it was doing at shutdown -- see
-                    // `BackendEngineFS::resume_restored_torrents`.
+                    // back paused whatever it was doing at shutdown --
+                    // see `reconcile::Conditions::settled`, which is what
+                    // keeps the engine layer from starting one before it
+                    // has put the want-set back.
                     piece_reclaim: self.piece_reclaim,
                     ..Default::default()
                 }),
@@ -4945,9 +4947,10 @@ mod tests {
     /// seeding is off, the stream stops, the idle grace passes -- and the
     /// torrent must not be downloading any more.
     ///
-    /// The policy half of this (when `pause_torrent` is called) is pinned by
-    /// the fake-backend tests in `lib.rs`; what those could not see is that
-    /// the call did nothing. Measured before the fix, with the engine marked
+    /// The policy half of this (when the idle arm decides `Stop`) is
+    /// pinned by the fake-backend tests in `lib.rs`; what those could not
+    /// see is that the call did nothing. Measured before the fix, with the
+    /// engine marked
     /// `idle_paused` and the free-space probe pinned at zero bytes free: the
     /// torrent went 3 MiB -> 12 MiB over the next three seconds, because the
     /// free-space watch skips an engine that claims to be paused and nothing

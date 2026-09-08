@@ -439,7 +439,7 @@ fn resume_line() -> u64 {
 /// guarded is `Session::pause`, which flushes the session's persistence
 /// file before it returns, so every torrent's decision waited on every
 /// other torrent's disk write. A playback starting on one hash could sit
-/// behind the idle sweep's slow pause of an unrelated one.
+/// behind the idle arm's slow stop of an unrelated one.
 ///
 /// Entries live only while a caller holds or waits for one, exactly as
 /// `BackendEngineFS::pin_locks` does, so an engine that reconciles a
