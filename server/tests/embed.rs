@@ -2648,6 +2648,127 @@ fn a_restart_leaves_a_torrent_stopped_and_a_stream_request_starts_it() -> anyhow
     Ok(())
 }
 
+/// An archive member served out of a live torrent is a playback too, and
+/// the route that serves it says so.
+///
+/// `routes::archive::stream_file`'s `torrent:` form opens a file reader on
+/// a torrent exactly the way the stream route does, and registered nothing
+/// at all: no `on_stream_start`, no reconcile. Two failures follow, and
+/// this test drives the one that can be observed from outside without
+/// racing a timer -- an archive request landing on a torrent the last
+/// reconciler pass already stopped, which is left parked on pieces nobody
+/// is fetching, with no end and no error, because nothing asked the
+/// reconciler to start it. (The other is the mirror image: with seeding
+/// off and the grace elapsed, the timer pauses the torrent an archive
+/// response body is streaming from, mid-body.)
+///
+/// The volume is held **inside the hysteresis band** for the archive
+/// request, exactly as `a_restart_leaves_a_torrent_stopped_and_a_stream_request_starts_it`
+/// holds it: room above the floor, but under the resume margin, is the one
+/// window in which nothing *but* a request will start the torrent.
+/// Without it the timer would start it a couple of seconds later and the
+/// test would pass whatever the route did.
+///
+/// Nothing seeds this fixture, so the member is never read and the client
+/// gives up -- which is the point. What the request has to leave behind is
+/// a torrent that is running.
+#[test]
+fn an_archive_member_request_starts_the_torrent_it_reads_from() -> anyhow::Result<()> {
+    const FLOOR: u64 = enginefs::CACHE_FREE_SPACE_FLOOR;
+    const MARGIN: u64 = enginefs::FREE_SPACE_RESUME_MARGIN;
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    let cache_root = cache_dir.path().join("cache");
+    stream_server::pretend_volume_space(&cache_root, u64::MAX);
+
+    // A torrent whose one file is an archive. Its bytes are never read --
+    // no peer will bring them -- so what is in it does not matter, but the
+    // suffix does: it is what picks the reader, and only the two formats
+    // `archives::get_archive_reader_from_stream` can drive from a stream
+    // get as far as reading the torrent at all.
+    let content = src.path().join("Wanted");
+    std::fs::create_dir_all(&content)?;
+    write_payload(&content.join("fixture.zip"), 64 * 1024);
+    let (torrent, info_hash) = real_torrent(&content);
+
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_root.clone()),
+        ..offline_config()
+    })?;
+    let base = format!("http://{}", handle.http_addr());
+    let client = bearer_client(&handle)?;
+    client
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
+        .send()?
+        .error_for_status()?;
+    stats_after_check(&client, &base, &info_hash)?;
+
+    let swarm_paused = |client: &reqwest::blocking::Client| -> anyhow::Result<bool> {
+        let stats: serde_json::Value = client
+            .get(format!("{base}/{info_hash}/stats.json"))
+            .send()?
+            .error_for_status()?
+            .json()?;
+        Ok(stats["swarmPaused"] == serde_json::json!(true))
+    };
+
+    // The volume fills and the server's own reconciler stops the torrent.
+    stream_server::pretend_volume_space(&cache_root, 0);
+    let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
+    while !swarm_paused(&client)? {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the reconciler never stopped the torrent"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // Room above the floor, inside the resume margin: several ticks go by
+    // and the timer leaves it stopped.
+    stream_server::pretend_volume_space(&cache_root, FLOOR + MARGIN - 1);
+    stream_server::pretend_available_space(&cache_root, FLOOR + MARGIN - 1);
+    std::thread::sleep(enginefs::reconcile::RECONCILE_INTERVAL * 3);
+    assert!(
+        swarm_paused(&client)?,
+        "the timer must not start a torrent into a volume inside the resume margin"
+    );
+
+    // `torrent:<info hash>/<path in the torrent>` is one path segment, so
+    // the separator inside it is encoded; the member after it is the
+    // wildcard. The zip reader goes looking for the central directory and
+    // parks there for ever, so the client giving up is the expected end --
+    // and the timeout is generous rather than tight because what is being
+    // waited for is the *server* reaching its registration, on a loaded
+    // machine running the whole suite in parallel.
+    let anonymous = reqwest::blocking::Client::new();
+    match anonymous
+        .get(format!(
+            "{base}/zip/stream/torrent:{info_hash}%2Ffixture.zip/first.txt"
+        ))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+    {
+        Ok(response) => assert_ne!(
+            response.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "the route found neither the torrent nor the archive member"
+        ),
+        Err(error) => assert!(error.is_timeout(), "{error}"),
+    }
+    assert!(
+        !swarm_paused(&client)?,
+        "the archive request started the torrent it was about to read from"
+    );
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
 /// A stream request below the free-space floor is refused with a `507`
 /// once a cleaner pass has had its chance -- not "degraded to memory-only",
 /// which re-selected the same disk-backed engine and streamed to the disk

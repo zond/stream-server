@@ -535,6 +535,66 @@ fn encode_path_segments(path: &str) -> String {
         .join("/")
 }
 
+/// Registers a stream on a torrent for as long as the archive response
+/// body reading from it lives.
+///
+/// The `torrent:` form of [`stream_file`] opens a file reader on a live
+/// torrent, and until this existed it registered nothing at all: no
+/// `on_stream_start`, no reconcile, no entry in any activity register.
+/// Two things follow from that, and both are the failure the
+/// `PlaybackStart` reconcile in `EngineFS::on_stream_start` was written to
+/// prevent.
+///
+/// * The reconciler's own tick reads `playing` from those registers, so
+///   with seeding off and the grace elapsed it pauses the torrent this
+///   response body is streaming from -- mid-body, dropping its peers,
+///   while a reader is still being served out of it.
+/// * A request arriving on a torrent an earlier pass already stopped asks
+///   the reconciler nothing, and `LibrqbitBackend::get_file_reader` accepts
+///   a paused torrent and hands back a reader: the read then parks on
+///   pieces nobody is fetching, with no end and no error.
+///
+/// This is the sibling of the stream route's call site, and it registers
+/// the same way for the same reasons -- including the handover:
+/// `on_stream_start` and the guard that ends it are one call with no await
+/// between them, because a cancel can only land at an await and a
+/// registration nobody holds is never ended (see
+/// `crate::routes::stream::StreamLifecycleGuard::start`).
+struct TorrentMemberStream {
+    engine: Arc<enginefs::EngineFS>,
+    info_hash: String,
+    file_idx: usize,
+}
+
+impl TorrentMemberStream {
+    async fn start(engine: Arc<enginefs::EngineFS>, info_hash: String, file_idx: usize) -> Self {
+        engine.on_stream_start(&info_hash, file_idx).await;
+        Self {
+            engine,
+            info_hash,
+            file_idx,
+        }
+    }
+}
+
+impl Drop for TorrentMemberStream {
+    fn drop(&mut self) {
+        let engine = self.engine.clone();
+        let info_hash = std::mem::take(&mut self.info_hash);
+        let file_idx = self.file_idx;
+        // Spawned because the registers are behind async locks and a
+        // `Drop` cannot await one.
+        tokio::spawn(async move {
+            engine.on_stream_end(&info_hash, file_idx).await;
+            tracing::debug!(
+                info_hash = %info_hash,
+                file_idx,
+                "archive member stream ended"
+            );
+        });
+    }
+}
+
 // New implementation of stream_file
 async fn stream_file(
     state: &AppState,
@@ -547,6 +607,11 @@ async fn stream_file(
     // response body lives (see `archives::sessions`); `None` for the
     // torrent-backed form, which has no session.
     let mut session_in_use = None;
+    // And the other half of the same idea for the torrent-backed form,
+    // which has a torrent instead of a session: the stream registration
+    // that keeps the reconciler from pausing the torrent this body reads
+    // from. `None` for the session form, which reads from a file.
+    let mut torrent_stream_in_use = None;
 
     // 1. Determine Input Source, and open the member in it
     let mut reader: Box<dyn crate::archives::AsyncSeekableReader> = if key.starts_with("torrent:") {
@@ -575,6 +640,14 @@ async fn stream_file(
 
             // Find index
             if let Some(idx) = files.iter().position(|f| f.name == archive_internal_path) {
+                // Before the reader, not after it: what the reconciler is
+                // being told is that a read is about to start, and the
+                // reconcile it makes is what starts a torrent an earlier
+                // pass left stopped. See `TorrentMemberStream`.
+                torrent_stream_in_use = Some(
+                    TorrentMemberStream::start(state.engine.clone(), hash_part.to_lowercase(), idx)
+                        .await,
+                );
                 // get_file_reader(idx, offset, priority)
                 let reader = handle
                     .get_file_reader(
@@ -727,6 +800,10 @@ async fn stream_file(
     // starts when the body is dropped.
     let body = Body::from_stream(media_body(limited_reader).map(move |chunk| {
         let _in_use = &session_in_use;
+        // The same for the torrent-backed form: the stream stays
+        // registered until the body is dropped, so nothing pauses the
+        // torrent underneath a player that is still reading.
+        let _streaming = &torrent_stream_in_use;
         chunk
     }));
 
