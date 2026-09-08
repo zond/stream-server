@@ -264,27 +264,38 @@ struct MetadataResolutionGuard {
 }
 
 impl MetadataResolutionGuard {
-    async fn acquire<H: TorrentHandle>(engine: &Arc<enginefs::engine::Engine<H>>) -> Self {
+    /// Count the request as active, and ask the engine's reconciler whether
+    /// this torrent should now be running.
+    ///
+    /// **The counter first, the reconcile after, and awaited.** The count
+    /// is one of the conditions the ladder reads as `playing`
+    /// (`BackendEngineFS::torrent_is_active` asks the engine's own reader
+    /// count), so a reconcile taken before the increment is a decision
+    /// about a torrent nobody is watching. And it is awaited rather than
+    /// spawned because the unpause it may issue is what un-wedges a torrent
+    /// that came back stopped from the last process: the reader this guard
+    /// exists for opens on the next line.
+    ///
+    /// It used to read `if engine.idle_paused.load()` and resume only then
+    /// -- and that flag is `false` in a fresh process while the pause it
+    /// describes was persisted and is not, so after every restart this was
+    /// dead code in exactly the case it existed for.
+    async fn acquire<B: enginefs::backend::TorrentBackend + 'static>(
+        engine_fs: &enginefs::BackendEngineFS<B>,
+        engine: &Arc<enginefs::engine::Engine<B::Handle>>,
+    ) -> Self {
         let active_readers = engine.active_streams.clone();
         active_readers.fetch_add(1, Ordering::SeqCst);
         let guard = Self { active_readers };
 
         engine.touch();
-        if !engine.handle.manages_playback_lifecycle() && engine.idle_paused.load(Ordering::SeqCst)
-        {
-            if let Err(error) = engine.handle.resume_torrent().await {
-                tracing::warn!(
-                    info_hash = %engine.info_hash,
-                    %error,
-                    "Failed to resume torrent while resolving stream metadata"
-                );
-            } else {
-                engine.idle_paused.store(false, Ordering::SeqCst);
-                tracing::info!(
-                    info_hash = %engine.info_hash,
-                    "torrent_resumed_for_metadata_resolution"
-                );
-            }
+        if !engine.handle.manages_playback_lifecycle() {
+            engine_fs
+                .reconcile_hash(
+                    &engine.info_hash,
+                    enginefs::reconcile::Trigger::PlaybackStart,
+                )
+                .await;
         }
 
         guard
@@ -793,7 +804,7 @@ async fn head_stream_video_with(
         Err(refusal) => return refusal.into_response(),
     };
 
-    let _metadata_resolution = MetadataResolutionGuard::acquire(&engine).await;
+    let _metadata_resolution = MetadataResolutionGuard::acquire(&engine_fs, &engine).await;
     let files = engine.handle.get_files().await;
     let candidates = files
         .iter()
@@ -950,7 +961,7 @@ async fn stream_video_with(
         Err(refusal) => return refusal.into_response(),
     };
 
-    let _metadata_resolution = MetadataResolutionGuard::acquire(&engine).await;
+    let _metadata_resolution = MetadataResolutionGuard::acquire(&engine_fs, &engine).await;
     let files = engine.handle.get_files().await;
     let candidates = files
         .iter()

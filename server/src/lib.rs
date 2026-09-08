@@ -1032,12 +1032,10 @@ pub async fn run(
     }
 
     let mut cleared_downloads_dir = false;
+    let seeding_enabled;
     {
         let mut settings = settings_arc.write().await;
-        state.engine.set_seeding_enabled(settings.seeding_enabled);
-        state
-            .download_engine
-            .set_seeding_enabled(settings.seeding_enabled);
+        seeding_enabled = settings.seeding_enabled;
         // A persisted downloadsDir that cannot be used any more (unmounted
         // drive, permissions) is cleared rather than kept as a setting the
         // engines silently ignore: pins fall back to the cache root,
@@ -1064,6 +1062,15 @@ pub async fn run(
             }
         }
     }
+    // Outside the settings lock, and after it: applying the setting now
+    // awaits a reconcile of every restored torrent, which reaches
+    // librqbit's persistence file. Holding the settings write guard across
+    // that would park every route that reads a setting behind a disk write.
+    state.engine.set_seeding_enabled(seeding_enabled).await;
+    state
+        .download_engine
+        .set_seeding_enabled(seeding_enabled)
+        .await;
     if cleared_downloads_dir && let Err(error) = state.save_settings().await {
         tracing::warn!(
             error = %format!("{error:#}"),

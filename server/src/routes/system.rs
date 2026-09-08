@@ -1101,8 +1101,11 @@ pub async fn update_settings(
         state.lan_media.stop().await;
     }
 
-    state.engine.set_seeding_enabled(seeding_enabled);
-    state.download_engine.set_seeding_enabled(seeding_enabled);
+    state.engine.set_seeding_enabled(seeding_enabled).await;
+    state
+        .download_engine
+        .set_seeding_enabled(seeding_enabled)
+        .await;
     state.engine.set_downloads_dir(downloads_dir.clone());
     state.download_engine.set_downloads_dir(downloads_dir);
 

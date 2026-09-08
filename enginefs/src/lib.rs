@@ -143,11 +143,29 @@ const _: () = assert!(
     METADATA_RESOLVE_TIMEOUT.as_secs() < INACTIVE_TORRENT_REMOVE_TIMEOUT.as_secs(),
     "a waiting magnet add must time out before it can be swept as idle"
 );
-/// How long a torrent must be quiet before the idle policy stops it (with
-/// seeding off). Read by the grace-period task and by
-/// [`crate::reconcile::desired`], which is one number so the two cannot
-/// disagree about when a torrent has gone quiet.
+/// How long a torrent must be quiet before the idle arm of
+/// [`crate::reconcile::desired`] stops it (with seeding off).
 pub(crate) const INACTIVE_TORRENT_PAUSE_GRACE: Duration = Duration::from_secs(15);
+
+/// How long after the reconciler last moved a torrent its *timer* will
+/// leave it stopped -- the anti-flap dwell, applied in
+/// [`BackendEngineFS::start_if_stopped`] and nowhere else.
+///
+/// The ladder's own lines already carry most of the hysteresis: the
+/// free-space arm measures a stopped torrent against a higher line than a
+/// running one, and the idle arm wants [`INACTIVE_TORRENT_PAUSE_GRACE`] of
+/// quiet. What is left over is an input that moves for reasons of its own
+/// around one of those lines -- a lease that expires and is renewed, a
+/// metadata slot that is briefly unreadable -- and each crossing of it
+/// costs a swarm: a stop drops every peer and a start re-announces to
+/// trackers that enforce a minimum announce interval.
+///
+/// A whole [`INACTIVE_TORRENT_PAUSE_GRACE`], reusing that number rather
+/// than inventing a second one, because it is the same judgement: how long
+/// this server waits before believing that a torrent's activity has really
+/// changed. Neither a stop nor a playback start goes through it -- see
+/// [`BackendEngineFS::start_if_stopped`] for why each is exempt.
+pub(crate) const RECONCILE_MIN_DWELL: Duration = INACTIVE_TORRENT_PAUSE_GRACE;
 const HLS_PLAYBACK_LEASE_TTL: Duration = Duration::from_secs(300);
 const NATIVE_LIFECYCLE_HLS_PLAYBACK_LEASE_TTL: Duration = Duration::from_secs(15);
 
@@ -790,7 +808,18 @@ pub struct StreamActivitySnapshot {
     pub active_file: Option<ActiveFileSnapshot>,
     pub active_playback_leases: Vec<ActivePlaybackLeaseSnapshot>,
     pub active_multifile_selections: Vec<MultiFileActiveSelectionSnapshot>,
-    pub idle_paused_torrents: Vec<String>,
+    /// The torrents the backend's state machine reports stopped, right now
+    /// -- an observation, taken when the snapshot is built.
+    ///
+    /// It used to be the engines carrying an `idle_paused` flag this
+    /// process had written, which reported nothing at all about a pause
+    /// that survived a restart, and reported a pause for a torrent whose
+    /// resume had failed. Neither is possible of a reading taken from the
+    /// state machine. It no longer says *why* each is stopped, because
+    /// nothing in this server remembers that any more: the reason is
+    /// recomputed from live conditions on every reconciler pass
+    /// ([`crate::reconcile::desired`]).
+    pub paused_torrents: Vec<String>,
 }
 
 impl StreamActivitySnapshot {
@@ -890,17 +919,22 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     ) -> Self {
         let clock = Clock::start();
         let volumes = Arc::new(crate::reconcile::Volumes::new(download_dir.clone()));
+        // A backend that sets piece reclaim restores every torrent paused
+        // and wanting every hole in its storage, because the piece-level
+        // want-set is not in the record. Until this process has put the
+        // want-set back -- `restore_pinned_downloads`, below -- the
+        // reconciler must not start one, and the honest way to say so is
+        // that it has not been settled yet
+        // (`reconcile::Conditions::settled`). Every other engine is made by
+        // an add, which carries its want-set with it.
+        let restored_unsettled = backend.sets_piece_reclaim();
         let mut engines_map = HashMap::new();
         for (hash, handle) in restored_handles {
-            engines_map.insert(
-                hash.clone(),
-                Arc::new(Engine::new_with_handle(
-                    handle,
-                    &hash,
-                    clock,
-                    volumes.clone(),
-                )),
-            );
+            let engine = Engine::new_with_handle(handle, &hash, clock, volumes.clone());
+            if restored_unsettled {
+                engine.mark_unsettled();
+            }
+            engines_map.insert(hash.clone(), Arc::new(engine));
         }
 
         let engines = Arc::new(RwLock::new(engines_map));
@@ -949,15 +983,14 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let active_file_clone = efs.active_file.clone();
         let active_playback_leases_clone = efs.active_playback_leases.clone();
         let active_multifile_files_clone = efs.active_multifile_files.clone();
-        let seeding_flag = efs.seeding_enabled.clone();
         let magnet_adds_clone = efs.magnet_adds.clone();
         let clock = efs.clock;
         let sweep = tokio::spawn(async move {
             loop {
-                // Run fairly frequently so seeding stops promptly after the
-                // user disables it; torrent removal is still gated by the much
-                // longer inactivity timeout below, so this only changes how
-                // quickly the seeding-disabled pause reacts.
+                // Lease expiry and magnet-registry pruning; torrent removal
+                // is gated by the much longer inactivity timeout below.
+                // Pausing is not here any more -- that is the reconciler's,
+                // on its own two-second tick.
                 tokio::time::sleep(Duration::from_secs(15)).await;
                 let mut to_remove = Vec::new();
                 let now = clock.now_secs();
@@ -1236,98 +1269,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                         }
                     }
                 }
-
-                // Stop all torrent activity when seeding is disabled and no
-                // playback is active. A later playback request resumes the
-                // torrent before making its requested file wanted.
-                if !seeding_flag.load(Ordering::Relaxed) {
-                    // Snapshotted, and the guard dropped, before the loop:
-                    // `engines` is a write-preferring `RwLock`, and the loop
-                    // awaits the backend twice per engine (the metadata and
-                    // finished questions) and then `Session::pause`, which
-                    // flushes librqbit's persistence file. Held across those,
-                    // one torrent's disk write parks every route waiting to
-                    // look an engine up.
-                    let engines: Vec<_> = engines_clone
-                        .read()
-                        .await
-                        .iter()
-                        .map(|(hash, engine)| (hash.clone(), engine.clone()))
-                        .collect();
-                    for (hash, engine) in &engines {
-                        if engine.handle.manages_playback_lifecycle() {
-                            continue;
-                        }
-                        // A pinned download must keep downloading; seeding
-                        // is stopped for it the moment it completes and is
-                        // unpinned, like any other torrent.
-                        if engine.is_pinned() {
-                            continue;
-                        }
-                        let hash_active = {
-                            let streams = active_streams_clone.read().await;
-                            streams.get(hash).copied().unwrap_or(0) > 0
-                        };
-                        let file_active = {
-                            let streams = active_file_streams_clone.read().await;
-                            streams
-                                .iter()
-                                .any(|((stream_hash, _), count)| stream_hash == hash && *count > 0)
-                        };
-                        let playback_active = {
-                            let leases = active_playback_leases_clone.read().await;
-                            leases.iter().any(|((stream_hash, _), lease)| {
-                                stream_hash == hash && playback_lease_is_active(lease, now)
-                            })
-                        };
-                        let multifile_active = {
-                            let selections = active_multifile_files_clone.read().await;
-                            selections.contains_key(hash)
-                        };
-                        let reader_active = engine.active_streams.load(Ordering::SeqCst) > 0;
-                        if hash_active
-                            || file_active
-                            || playback_active
-                            || multifile_active
-                            || reader_active
-                        {
-                            continue;
-                        }
-
-                        // A magnet that is still fetching its info dictionary
-                        // must remain connected to the swarm. Inactive engines
-                        // are removed by the separate cleanup policy.
-                        if !engine.handle.stats().await.has_metadata {
-                            continue;
-                        }
-
-                        // Already stopped, and by an owner with a better
-                        // claim: the reconciler starts it again when the
-                        // volume recovers, and the backend refuses to pause
-                        // a torrent twice, so pausing here would only log a
-                        // failure every sweep.
-                        if engine.is_stopped_for_space().await {
-                            continue;
-                        }
-
-                        if engine.idle_paused.swap(true, Ordering::Relaxed) {
-                            continue;
-                        }
-
-                        tracing::info!(
-                            info_hash = %hash,
-                            "torrent_paused_idle"
-                        );
-                        if let Err(e) = engine.handle.pause_torrent().await {
-                            tracing::warn!(
-                                info_hash = %hash,
-                                error = %e,
-                                "Failed to pause idle torrent"
-                            );
-                            engine.idle_paused.store(false, Ordering::Relaxed);
-                        }
-                    }
-                }
             }
         });
         *efs.sweep_task.lock() = Some(sweep);
@@ -1407,12 +1348,23 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// wakes walks every root anyway, so a second ring would only make it
     /// walk them twice.
     pub async fn reconcile_tick(&self) -> Vec<(String, crate::reconcile::Decision)> {
+        self.reconcile_tick_at(self.clock.now_secs()).await
+    }
+
+    /// [`Self::reconcile_tick`] with the clock reading handed in.
+    ///
+    /// The clock is an input to the pass like the volume probe is, and it
+    /// is separated for the same reason: a test that drives a **real**
+    /// librqbit session cannot run under `tokio`'s paused clock (its
+    /// sockets and its check threads need time to actually pass), so
+    /// without this the only way to reach the idle arm from one would be to
+    /// sit out [`INACTIVE_TORRENT_PAUSE_GRACE`] of wall time per test.
+    async fn reconcile_tick_at(&self, now: u64) -> Vec<(String, crate::reconcile::Decision)> {
         // Cloned out and the guard dropped before the first `.await`: this
         // is a write-preferring `RwLock`, so a read guard held across an
         // await parks every later reader behind any writer that queues
         // meanwhile.
         let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
-        let now = self.clock.now_secs();
         let mut probed: HashSet<std::path::PathBuf> = HashSet::new();
         let mut decisions = Vec::with_capacity(engines.len());
         let mut stopped_any = false;
@@ -1477,18 +1429,19 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// here would be a second owner of the same state -- which is the whole
     /// class of bug this reconciler exists to end.
     ///
-    /// **What it acts on, and what it still leaves to somebody else.** The
-    /// free-space arm is this reconciler's: it makes every stop and every
-    /// start that arm implies. The idle arm is not yet -- the housekeeping
-    /// sweep and the grace-period task own their pauses, recorded in
-    /// `Engine::idle_paused`, and two owners of one pause is precisely the
-    /// bug being closed, so a `Stop` that is not the free-space arm's is
-    /// left alone here and a `Run` is not acted on for a torrent that flag
-    /// claims. That guard is scaffolding for one stage: it errs in the safe
-    /// direction (after a restart the flag is false and the pause is not,
-    /// so the pause a fresh process cannot explain is one this *will* lift
-    /// once there is room, which is the whole point), and it goes with the
-    /// flag when the idle arm moves here too.
+    /// **Every pause and every unpause in the process is made here.** Both
+    /// arms of the ladder are this reconciler's -- the free-space one and
+    /// the idle one -- and there is nowhere else left that calls the
+    /// backend's pause or unpause at all. That is the point of the whole
+    /// design: eight call sites each hand-rolling "set the flag, call
+    /// resume" in three different orders is what produced four consecutive
+    /// defects, and what is left instead is one ladder, one actuator and
+    /// no record of who stopped what.
+    ///
+    /// Only [`Verdict::for_space`] separates the two stops afterwards, and
+    /// only for things that are statements about the *device*: the cache
+    /// cleaner's wake-up and the read refusal. The stop call itself is the
+    /// same call.
     async fn reconcile_engine(
         &self,
         engine: &Arc<Engine<B::Handle>>,
@@ -1507,6 +1460,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
         let conditions = crate::reconcile::Conditions {
             run_state: engine.handle.run_state(),
+            settled: engine.is_settled(),
             playing: self.torrent_is_active(&engine.info_hash, engine, now).await,
             pinned: engine.is_pinned(),
             seeding_enabled: self.seeding_enabled.load(Ordering::Relaxed),
@@ -1533,25 +1487,40 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             finished = conditions.finished,
             available = ?conditions.available,
             idle_secs = conditions.idle_for.as_secs(),
+            settled = conditions.settled,
             "torrent_reconciled"
         );
 
         match verdict.decision {
-            crate::reconcile::Decision::Stop if verdict.for_space => {
-                self.stop_for_space(engine, &conditions, &folder, now, stopped_any)
-                    .await;
+            crate::reconcile::Decision::Stop => {
+                // One call for both arms. It is guarded on `Live` and not
+                // on the arm, because what makes a stop safe is the state
+                // it is made from: pausing an *initializing* torrent wedges
+                // its check for good (`file_ops.rs:113` bails it,
+                // `mod.rs:590-593` returns `Ok` without changing the state,
+                // and `wait_until_initialized` then polls a torrent with no
+                // check running for ever), and the ladder's first arm
+                // answers `Stop` for exactly that reading.
+                let stopped_here = self.stop_if_running(engine, &conditions, now).await;
+                if verdict.for_space {
+                    self.after_stopping_for_space(
+                        engine,
+                        &conditions,
+                        &folder,
+                        now,
+                        stopped_here,
+                        stopped_any,
+                    );
+                } else {
+                    // Not a statement about the device, so it lifts one.
+                    self.let_reads_park_again(engine);
+                }
             }
             crate::reconcile::Decision::Run => {
-                self.start_if_stopped(engine, &conditions).await;
+                self.start_if_stopped(engine, &conditions, trigger, now)
+                    .await;
                 self.let_reads_park_again(engine);
             }
-            // The idle arm's stop and an unsettled reading's stop: neither
-            // has an owner here, so no call is made -- and an unsettled
-            // reading in particular must never become a pause call, because
-            // pausing an initializing torrent wedges its check for good
-            // (see `TorrentHandle::run_state`). The read refusal still goes,
-            // because it is the free-space arm's and this is not it.
-            crate::reconcile::Decision::Stop => self.let_reads_park_again(engine),
             // `Error`, and a probe that failed on a timer pass. Both are
             // "no opinion", and lifting a refusal is an opinion: a torrent
             // the backend killed has its refusal lifted by
@@ -1565,47 +1534,89 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         Some(verdict.decision)
     }
 
-    /// Act on the free-space arm's `Stop` for one engine.
+    /// The ladder's `Stop`, for both of its arms: stop the torrent if it is
+    /// running.
     ///
-    /// A torrent that is running is stopped, once -- the next pass sees it
-    /// `Paused` and comes here again, which is where the readers get their
-    /// answer. A torrent that is already stopped and whose volume has been
+    /// Once, not once per pass -- the next pass sees it `Paused` and makes
+    /// no call. Guarded on [`RunState::Live`] rather than on "not paused",
+    /// because the third state a stop must never be made from is
+    /// `Initializing`: see the caller.
+    ///
+    /// Whether the stop succeeded is not recorded anywhere; what the next
+    /// pass reads is the state machine, which is the only thing that knows.
+    /// A refusal is logged at debug and nothing else, because the ordinary
+    /// cause of one is a race with a check that settled between the reading
+    /// and the call.
+    async fn stop_if_running(
+        &self,
+        engine: &Arc<Engine<B::Handle>>,
+        conditions: &crate::reconcile::Conditions,
+        now: u64,
+    ) -> bool {
+        if conditions.run_state != RunState::Live {
+            return false;
+        }
+        match engine.handle.stop_torrent().await {
+            Ok(()) => {
+                engine.record_transition(now);
+                tracing::info!(
+                    info_hash = %engine.info_hash,
+                    available = ?conditions.available,
+                    playing = conditions.playing,
+                    pinned = conditions.pinned,
+                    seeding_enabled = conditions.seeding_enabled,
+                    idle_secs = conditions.idle_for.as_secs(),
+                    "torrent_stopped_by_reconciler"
+                );
+                true
+            }
+            Err(error) => {
+                debug!(
+                    info_hash = %engine.info_hash,
+                    error = %format!("{error:#}"),
+                    "the backend would not stop the torrent"
+                );
+                false
+            }
+        }
+    }
+
+    /// What the free-space arm's `Stop` does on top of the stop call, and
+    /// what only it does: it is the one arm that is a statement about the
+    /// *device*.
+    ///
+    /// The cache cleaner is woken (through `stopped_any`, once per pass
+    /// however many torrents it stopped -- the cleaner walks every root
+    /// anyway). And a torrent that is stopped on a volume that has been
     /// short for [`STOPPED_READ_STALL_BOUND`] has its reads failed
     /// ([`Engine::refuse_reads_for_space`]): a read parked on a piece that
     /// is not being fetched is a player buffering with no end, and the
     /// bound is how long the cache cleaner gets to settle it first.
-    async fn stop_for_space(
+    ///
+    /// The bound is read on the same pass as the stop, not only on a later
+    /// one: what decides whether a parked read has anything coming is how
+    /// long the *volume* has had no room, not how long this torrent has
+    /// been stopped on it. A torrent stopped now, onto a volume that filled
+    /// ten minutes ago, has readers as doomed as one stopped then.
+    fn after_stopping_for_space(
         &self,
         engine: &Arc<Engine<B::Handle>>,
         conditions: &crate::reconcile::Conditions,
         folder: &std::path::Path,
         now: u64,
+        stopped_here: bool,
         stopped_any: &mut bool,
     ) {
-        if conditions.run_state == RunState::Live {
-            match engine.handle.stop_torrent().await {
-                Ok(()) => {
-                    *stopped_any = true;
-                    tracing::warn!(
-                        info_hash = %engine.info_hash,
-                        available = ?conditions.available,
-                        floor = CACHE_FREE_SPACE_FLOOR,
-                        pinned = conditions.pinned,
-                        "torrent_stopped_for_space"
-                    );
-                }
-                Err(error) => debug!(
-                    info_hash = %engine.info_hash,
-                    error = %format!("{error:#}"),
-                    "the backend would not stop the torrent for space"
-                ),
-            }
+        if stopped_here {
+            *stopped_any = true;
+            tracing::warn!(
+                info_hash = %engine.info_hash,
+                available = ?conditions.available,
+                floor = CACHE_FREE_SPACE_FLOOR,
+                pinned = conditions.pinned,
+                "torrent_stopped_for_space"
+            );
         }
-        // On the same pass as the stop, and not only on a later one: what
-        // decides whether a parked read has anything coming is how long the
-        // volume has had no room, not how long this torrent has been
-        // stopped on it. A torrent stopped now, onto a volume that filled
-        // ten minutes ago, has readers as doomed as one stopped then.
         let short_for = self.volumes.short_for(folder, now).unwrap_or_default();
         if !engine.reads_refused() && short_for >= STOPPED_READ_STALL_BOUND {
             tracing::warn!(
@@ -1619,27 +1630,63 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
     }
 
-    /// Act on a `Run` for one engine: start it if it is stopped.
+    /// Act on a `Run` for one engine: start it if it is stopped, whoever
+    /// stopped it and whenever -- the previous process included, which is
+    /// the pause nothing on master could lift.
     ///
-    /// A torrent that is already `Live` is left alone, and so is one the
-    /// idle policy holds -- the `idle_paused` guard is the stage's
-    /// scaffolding, explained on [`Self::reconcile_engine`]. Lifting the
-    /// read refusal is *not* done here, precisely because of those two
-    /// cases: see [`Self::let_reads_park_again`].
+    /// A torrent that is already `Live` is left alone. Lifting the read
+    /// refusal is *not* done here, precisely because of that case: see
+    /// [`Self::let_reads_park_again`].
+    ///
+    /// **The dwell.** A [`crate::reconcile::Trigger::Timer`] will not start
+    /// a torrent within [`RECONCILE_MIN_DWELL`] of the reconciler's last
+    /// start or stop of it. Every stop drops the swarm and every start
+    /// re-announces to trackers that enforce a minimum announce interval,
+    /// so a condition that oscillates around one of the ladder's lines
+    /// costs peers rather than merely CPU. It is deliberately asymmetric,
+    /// and both halves of the asymmetry matter:
+    ///
+    /// * A **stop** is never delayed by it. The free-space arm's stop is
+    ///   what keeps a volume from filling, and a disk fills in seconds.
+    /// * A **[`crate::reconcile::Trigger::PlaybackStart`]** is never
+    ///   delayed by it. Somebody is waiting for the stream, and making them
+    ///   wait out a dwell to protect an announce budget is the wrong trade
+    ///   in the one case where a human can tell.
+    ///
+    /// What is left is the timer's own start, which nobody is waiting for
+    /// and which will come round again in [`RECONCILE_INTERVAL`].
     async fn start_if_stopped(
         &self,
         engine: &Arc<Engine<B::Handle>>,
         conditions: &crate::reconcile::Conditions,
+        trigger: crate::reconcile::Trigger,
+        now: u64,
     ) {
-        if conditions.run_state != RunState::Paused || engine.idle_paused.load(Ordering::Relaxed) {
+        if conditions.run_state != RunState::Paused {
+            return;
+        }
+        let since_transition = Duration::from_secs(now.saturating_sub(engine.last_transition_at()));
+        if trigger == crate::reconcile::Trigger::Timer
+            && engine.last_transition_at() != 0
+            && since_transition < RECONCILE_MIN_DWELL
+        {
+            debug!(
+                info_hash = %engine.info_hash,
+                since_secs = since_transition.as_secs(),
+                "not starting a torrent this soon after the last time it was moved"
+            );
             return;
         }
         match engine.handle.start_torrent().await {
-            Ok(()) => tracing::info!(
-                info_hash = %engine.info_hash,
-                available = ?conditions.available,
-                "torrent_started_by_reconciler"
-            ),
+            Ok(()) => {
+                engine.record_transition(now);
+                tracing::info!(
+                    info_hash = %engine.info_hash,
+                    available = ?conditions.available,
+                    ?trigger,
+                    "torrent_started_by_reconciler"
+                );
+            }
             Err(error) => tracing::warn!(
                 info_hash = %engine.info_hash,
                 error = %format!("{error:#}"),
@@ -2368,49 +2415,39 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     }
 
     /// Turn seeding on or off session-wide, and put back to work the
-    /// torrents the idle policy paused for want of it.
+    /// torrents the idle arm had stopped for want of it.
     ///
-    /// Generic rather than `librqbit`-only because nothing in it is: the
-    /// flag is this layer's, the backend call has a no-op default on the
-    /// trait, and the resume pass talks to `TorrentHandle`. On the concrete
-    /// impl no fake backend could reach it, so what it does under the
-    /// engine registry's lock could not be tested at all.
-    pub fn set_seeding_enabled(&self, enabled: bool) {
+    /// `seeding_enabled` is one of the ladder's conditions
+    /// ([`crate::reconcile::Conditions`]), so flipping it changes what
+    /// every torrent should be doing -- and the reconciler is asked at
+    /// once rather than at its next tick, because the user has just moved a
+    /// switch and is looking at the result.
+    ///
+    /// **Awaited, and the registry dropped first.** The engines are
+    /// snapshotted out of `self.engines` and the read guard dropped before
+    /// the first `.await`: it is a write-preferring `RwLock`, so a read
+    /// guard held across an await parks every later reader behind any
+    /// writer that queues meanwhile -- and the await here reaches
+    /// `Session::unpause`, which flushes librqbit's persistence file. One
+    /// torrent's disk write would otherwise stall every route that wants to
+    /// look an engine up.
+    ///
+    /// It used to spawn instead, over `if idle_paused.swap(false) &&
+    /// resume()`, which is `false && ...` in a fresh process: dead code
+    /// after every restart, and a restart is exactly when torrents come up
+    /// stopped with nothing in this process able to say why.
+    pub async fn set_seeding_enabled(&self, enabled: bool) {
         self.seeding_enabled.store(enabled, Ordering::Relaxed);
         self.backend.set_seeding_enabled(enabled);
         tracing::info!(seeding_enabled = enabled, "Seeding policy updated");
 
-        // When seeding is turned back on, resume torrents the seeding-disabled
-        // policy had paused so they can seed again. Turning seeding off is
-        // handled lazily by the periodic loop / schedule_torrent_pause.
-        if enabled {
-            let engines = self.engines.clone();
-            tokio::spawn(async move {
-                // Snapshotted, and the guard dropped, before the first
-                // `.await` on a backend call. `engines` is a
-                // write-preferring `RwLock`, so a read guard held across an
-                // await parks every later reader behind any writer that
-                // queues meanwhile -- and the await here is
-                // `Session::unpause`, which flushes librqbit's persistence
-                // file: one torrent's disk write would stall every route
-                // that wants to look an engine up.
-                let engines: Vec<_> = engines.read().await.values().cloned().collect();
-                for engine in engines {
-                    if engine.handle.manages_playback_lifecycle() {
-                        continue;
-                    }
-                    if engine.idle_paused.swap(false, Ordering::Relaxed)
-                        && let Err(err) = engine.handle.resume_torrent().await
-                    {
-                        tracing::warn!(
-                            info_hash = %engine.info_hash,
-                            error = %err,
-                            "Failed to resume torrent after re-enabling seeding"
-                        );
-                        engine.idle_paused.store(true, Ordering::Relaxed);
-                    }
-                }
-            });
+        let hashes: Vec<String> = {
+            let engines = self.engines.read().await;
+            engines.keys().cloned().collect()
+        };
+        for hash in hashes {
+            self.reconcile_hash(&hash, crate::reconcile::Trigger::PlaybackStart)
+                .await;
         }
     }
 
@@ -2575,9 +2612,9 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     .load(std::sync::atomic::Ordering::SeqCst)
             })
             .sum();
-        let idle_paused_torrents = engines
+        let paused_torrents = engines
             .iter()
-            .filter(|(_, engine)| engine.idle_paused.load(Ordering::Relaxed))
+            .filter(|(_, engine)| engine.handle.run_state() == RunState::Paused)
             .map(|(hash, _)| hash.clone())
             .collect();
         drop(engines);
@@ -2643,7 +2680,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             active_file,
             active_playback_leases,
             active_multifile_selections,
-            idle_paused_torrents,
+            paused_torrents,
         }
     }
 
@@ -2769,24 +2806,12 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             }
             is_multifile = engine.handle.file_count().await > 1;
 
-            // Any new playback activity must resume a torrent that was paused
-            // by the idle seeding-disabled policy.
-            if let Err(err) = engine.handle.resume_torrent().await {
-                tracing::warn!(
-                    info_hash = %info_hash,
-                    file_idx,
-                    error = %err,
-                    source,
-                    "Failed to resume torrent for active stream"
-                );
-            } else if engine.idle_paused.swap(false, Ordering::Relaxed) {
-                tracing::info!(
-                    info_hash = %info_hash,
-                    file_idx,
-                    source,
-                    "torrent_resumed_for_stream"
-                );
-            }
+            // No resume here any more. Starting a torrent that is stopped
+            // is the reconciler's, and it has to be asked *after* the
+            // activity this call is part of is registered, or it reads a
+            // torrent nobody is watching: both callers therefore ask it
+            // themselves once they have finished registering
+            // (`on_stream_start`, `refresh_existing_hls_playback`).
 
             if keep_file_downloading
                 && !is_multifile
@@ -2878,18 +2903,13 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
 
         engine.touch();
-        if let Err(err) = engine.handle.resume_torrent().await {
-            tracing::warn!(
-                info_hash = %info_hash,
-                file_idx,
-                generation,
-                error = %err,
-                source,
-                "Failed to resume torrent for multi-file active file"
-            );
-        } else {
-            engine.idle_paused.store(false, Ordering::Relaxed);
-        }
+        // The selection is registered above, so the ladder reads `playing`
+        // and starts the torrent if something had stopped it. Awaited, and
+        // before the want-set is applied below: an unpause is what
+        // un-wedges a torrent that came back stopped, and the reader that
+        // follows this call opens on it.
+        self.reconcile_hash(info_hash, crate::reconcile::Trigger::PlaybackStart)
+            .await;
 
         Self::reconcile_multifile_engine(engine, Some(file_idx), hot_file, generation, source)
             .await;
@@ -3154,17 +3174,13 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             }
         }
         engine.touch();
-        if engine.idle_paused.swap(false, Ordering::Relaxed)
-            && let Err(err) = engine.handle.resume_torrent().await
-        {
-            tracing::warn!(
-                info_hash = %engine.info_hash,
-                file_idx,
-                error = %err,
-                "Failed to resume idle-paused torrent for pinned download"
-            );
-            engine.idle_paused.store(true, Ordering::Relaxed);
-        }
+        // The pin is registered above, so the ladder reads `pinned` and
+        // wants this torrent running whatever the idle arm would have said
+        // -- and it is the reconciler that starts it, because a pause that
+        // survived a restart is one no record in this process can explain.
+        // Awaited: the pin is an instruction to download now.
+        self.reconcile_hash(&engine.info_hash, crate::reconcile::Trigger::PlaybackStart)
+            .await;
         self.reconcile_with_active_selection(engine.clone(), "pin_download")
             .await;
         self.persist_pinned_downloads().await;
@@ -3554,18 +3570,22 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// restored. Called once at startup, after the engines are registered.
     pub async fn restore_pinned_downloads(&self) -> usize {
         let path = self.pinned_downloads_path();
+        // Every path through the file yields a pin map, empty where it used
+        // to return early. The tail of this function is what tells the
+        // reconciler that the want-set is back on every restored torrent
+        // (`reconcile::Conditions::settled`), and a boot with no pin file at
+        // all -- which is most boots -- must reach it: skipping it would
+        // leave every restored torrent stopped for good.
         let pins = match tokio::fs::read(&path).await {
-            Ok(bytes) => match serde_json::from_slice::<BTreeMap<String, Vec<usize>>>(&bytes) {
-                Ok(pins) => pins,
-                Err(error) => {
+            Ok(bytes) => serde_json::from_slice::<BTreeMap<String, Vec<usize>>>(&bytes)
+                .unwrap_or_else(|error| {
                     tracing::warn!(path = %path.display(), %error, "ignoring unreadable pinned downloads file");
-                    return 0;
-                }
-            },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return 0,
+                    BTreeMap::new()
+                }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
             Err(error) => {
                 tracing::warn!(path = %path.display(), %error, "could not read pinned downloads file");
-                return 0;
+                BTreeMap::new()
             }
         };
         let mut restored = 0;
@@ -3597,61 +3617,19 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         if restored > 0 || dormant_count > 0 {
             self.persist_pinned_downloads().await;
         }
+        // The want-set is back, so the reconciler may start what should be
+        // running (`reconcile::Conditions::settled`). Over *every* engine
+        // and not only the pinned ones: what this call re-applies for a
+        // torrent with no pins is the empty pin set, and that is as
+        // re-applied as it will ever get. A torrent librqbit restored
+        // paused for want of a want-set is otherwise never started by
+        // anything, which is a restart that comes up downloading and
+        // seeding nothing.
+        for engine in self.engines.read().await.values() {
+            engine.mark_settled();
+        }
         tracing::info!(restored, "pinned_downloads_restored");
         restored
-    }
-
-    /// Unpause the torrents the backend restored at startup, once their pins
-    /// are back.
-    ///
-    /// A backend that sets piece reclaim
-    /// ([`crate::backend::TorrentBackend::sets_piece_reclaim`]) restores
-    /// every torrent paused, whatever it was doing when the process died:
-    /// the per-session piece-level want-set did not survive the record, so
-    /// librqbit forces a restored reclaim torrent paused and wanting every
-    /// hole in the storage until the caller re-applies the want-set, or a
-    /// seeder reaching it would refill a hole the caller was about to drop.
-    /// The want-set this layer re-applies is the pins
-    /// ([`Self::restore_pinned_downloads`], run just before this) and the
-    /// `only_files` selection librqbit persists with the torrent; there is
-    /// no piece-level want-set to re-apply here, because the retention
-    /// policy that would compute one is not wired into the session yet (see
-    /// [`crate::piece_store`]). So once the pins are back, the torrents are
-    /// unpaused -- otherwise a restart would come up with every torrent
-    /// stopped, downloading and seeding nothing. The seeding-disabled and
-    /// idle policies pause again from here whatever should not be running.
-    ///
-    /// A no-op unless the backend sets piece reclaim: the shipped session's
-    /// filesystem storage cannot reclaim, so its restored torrents were
-    /// never force-paused and keep whatever paused state they had.
-    ///
-    /// Called once at startup, after [`Self::restore_pinned_downloads`] and
-    /// before any route can add anything -- the engines here are exactly the
-    /// restored torrents.
-    pub async fn resume_restored_torrents(&self) {
-        if !self.backend.sets_piece_reclaim() {
-            return;
-        }
-        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
-        let mut resumed = 0usize;
-        for engine in engines {
-            match engine.handle.unpause_restored().await {
-                Ok(()) => {
-                    engine.idle_paused.store(false, Ordering::Relaxed);
-                    resumed += 1;
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        info_hash = %engine.info_hash,
-                        error = %format!("{error:#}"),
-                        "could not resume a restored torrent; it stays paused"
-                    );
-                }
-            }
-        }
-        if resumed > 0 {
-            tracing::info!(resumed, "restored_torrents_resumed");
-        }
     }
 
     /// Reconcile the piece store against what this session actually holds:
@@ -4349,6 +4327,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     }
                 } else {
                     self.activate_file(&info_hash, file_idx, true, source).await;
+                    // The lease was refreshed above, so `playing` reads
+                    // true here; a torrent the idle arm stopped while the
+                    // player was between segments starts again.
+                    self.reconcile_hash(&info_hash, crate::reconcile::Trigger::PlaybackStart)
+                        .await;
                 }
             }
             tracing::debug!(
@@ -4366,20 +4349,17 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     pub async fn on_stream_end(&self, info_hash: &str, file_idx: usize) {
         let info_hash = info_hash.to_lowercase();
 
-        let hash_streams_remaining = {
+        // Decremented and dropped at zero, not read: what the last stream
+        // ending changes is a condition the reconciler reads for itself.
+        {
             let mut streams = self.active_streams.write().await;
             if let Some(count) = streams.get_mut(&info_hash) {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
                     streams.remove(&info_hash);
-                    0
-                } else {
-                    *count
                 }
-            } else {
-                0
             }
-        };
+        }
 
         let file_streams_remaining = {
             let mut streams = self.active_file_streams.write().await;
@@ -4406,9 +4386,12 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             false
         };
 
-        if !native_lifecycle && hash_streams_remaining == 0 && file_streams_remaining == 0 {
-            self.schedule_torrent_pause(info_hash.clone());
-        }
+        // Nothing schedules a pause here any more. The last stream ending
+        // is not a decision, it is a change of condition: the reconciler
+        // reads `idle_for` from the engine's own `last_accessed`, which
+        // `touch()` above has just set, and stops the torrent on the first
+        // tick after `INACTIVE_TORRENT_PAUSE_GRACE` of quiet -- from one
+        // ladder, with no task per stream deciding a second time.
 
         if !native_lifecycle && file_streams_remaining == 0 {
             self.schedule_file_cleanup(info_hash.clone(), file_idx)
@@ -4423,125 +4406,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             remaining,
             file_streams_remaining
         );
-    }
-
-    /// Promptly pause an idle torrent shortly after the last stream on it ends
-    /// when seeding is disabled. A later playback request resumes it before
-    /// selecting the requested file.
-    fn schedule_torrent_pause(&self, info_hash: String) {
-        // Dropping a Tokio JoinHandle detaches the task instead of cancelling it.
-        drop(self.schedule_torrent_pause_after(info_hash, INACTIVE_TORRENT_PAUSE_GRACE));
-    }
-
-    fn schedule_torrent_pause_after(
-        &self,
-        info_hash: String,
-        delay: Duration,
-    ) -> tokio::task::JoinHandle<()> {
-        let engines = self.engines.clone();
-        let active_streams = self.active_streams.clone();
-        let active_file_streams = self.active_file_streams.clone();
-        let active_playback_leases = self.active_playback_leases.clone();
-        let active_multifile_files = self.active_multifile_files.clone();
-        let seeding_enabled = self.seeding_enabled.clone();
-        let clock = self.clock;
-
-        tokio::spawn(async move {
-            tokio::time::sleep(delay).await;
-
-            if seeding_enabled.load(Ordering::Relaxed) {
-                return;
-            }
-
-            let hash_active = {
-                let streams = active_streams.read().await;
-                streams.get(&info_hash).copied().unwrap_or(0) > 0
-            };
-            let file_active = {
-                let streams = active_file_streams.read().await;
-                streams
-                    .iter()
-                    .any(|((hash, _), count)| hash == &info_hash && *count > 0)
-            };
-            let playback_active = {
-                let now = clock.now_secs();
-                let leases = active_playback_leases.read().await;
-                leases.iter().any(|((hash, _), lease)| {
-                    hash == &info_hash && playback_lease_is_active(lease, now)
-                })
-            };
-            let multifile_active = {
-                let selections = active_multifile_files.read().await;
-                selections.contains_key(&info_hash)
-            };
-            if hash_active || file_active || playback_active || multifile_active {
-                tracing::debug!(
-                    info_hash = %info_hash,
-                    hash_active,
-                    file_active,
-                    playback_active,
-                    multifile_active,
-                    "Skipping idle pause because stream activity resumed"
-                );
-                return;
-            }
-
-            let engine = {
-                let engines = engines.read().await;
-                engines.get(&info_hash).cloned()
-            };
-            if let Some(engine) = engine {
-                let reader_active = engine.active_streams.load(Ordering::SeqCst) > 0;
-                if reader_active {
-                    tracing::debug!(
-                        info_hash = %info_hash,
-                        reader_active,
-                        "Skipping idle pause because a file or metadata reader is active"
-                    );
-                    return;
-                }
-                if engine.is_pinned() {
-                    tracing::debug!(
-                        info_hash = %info_hash,
-                        "Skipping idle pause because the torrent has a pinned download"
-                    );
-                    return;
-                }
-                if !engine.handle.stats().await.has_metadata {
-                    tracing::debug!(
-                        info_hash = %info_hash,
-                        "Skipping idle pause while torrent metadata is unresolved"
-                    );
-                    return;
-                }
-                // The reconciler already stopped it, and starts it again
-                // when the volume recovers; the backend refuses a second
-                // pause anyway (see `TorrentHandle::stop_torrent`).
-                if engine.is_stopped_for_space().await {
-                    tracing::debug!(
-                        info_hash = %info_hash,
-                        "Skipping idle pause: this torrent is already stopped for want of disk space"
-                    );
-                    return;
-                }
-                engine.touch();
-                if engine.idle_paused.swap(true, Ordering::Relaxed) {
-                    return;
-                }
-                tracing::info!(
-                    info_hash = %info_hash,
-                    "torrent_paused_idle"
-                );
-                if let Err(err) = engine.handle.pause_torrent().await {
-                    tracing::warn!(
-                        info_hash = %info_hash,
-                        error = %err,
-                        "Failed to pause inactive torrent after grace period"
-                    );
-                    engine.idle_paused.store(false, Ordering::Relaxed);
-                }
-            }
-        })
     }
 
     async fn schedule_file_cleanup(&self, info_hash: String, file_idx: usize) {
@@ -4726,7 +4590,6 @@ impl BackendEngineFS<LibrqbitBackend> {
         .await?;
         let efs = Self::new_with_backend(backend, restored, root_dir.join("cache"), download_dir);
         efs.restore_pinned_downloads().await;
-        efs.resume_restored_torrents().await;
         efs.sweep_unadopted_pieces().await;
         Ok(efs)
     }
@@ -4764,7 +4627,6 @@ impl BackendEngineFS<LibrqbitBackend> {
             tracker_storage,
         );
         efs.restore_pinned_downloads().await;
-        efs.resume_restored_torrents().await;
         efs.sweep_unadopted_pieces().await;
         Ok(efs)
     }
@@ -4815,24 +4677,25 @@ impl BackendEngineFS<LibrqbitBackend> {
         self.backend.footprint()
     }
 
-    /// Mark the torrent as active. librqbit has no session-wide streaming mode,
-    /// so this is a best-effort resume of a torrent the idle policy had paused.
+    /// Mark the torrent as active: librqbit has no session-wide streaming
+    /// mode, so what this can do is touch the engine and ask the reconciler
+    /// whether the torrent should now be running.
+    ///
+    /// It used to read `if engine.idle_paused.swap(false) && resume()`,
+    /// which on a fresh process is `false && ...` -- dead code after every
+    /// restart, and a restart is exactly when a torrent comes up stopped
+    /// with nothing in this process able to say why.
     pub async fn focus_torrent(&self, target_info_hash: &str) {
-        if let Some(engine) = self.get_engine(&target_info_hash.to_lowercase()).await {
-            if engine.handle.manages_playback_lifecycle() {
-                return;
-            }
-            if engine.idle_paused.swap(false, Ordering::Relaxed)
-                && let Err(err) = engine.handle.resume_torrent().await
-            {
-                tracing::warn!(
-                    info_hash = %engine.info_hash,
-                    error = %err,
-                    "Failed to resume torrent on focus"
-                );
-                engine.idle_paused.store(true, Ordering::Relaxed);
-            }
+        let info_hash = target_info_hash.to_lowercase();
+        let Some(engine) = self.get_engine(&info_hash).await else {
+            return;
+        };
+        if engine.handle.manages_playback_lifecycle() {
+            return;
         }
+        engine.touch();
+        self.reconcile_hash(&info_hash, crate::reconcile::Trigger::PlaybackStart)
+            .await;
     }
 }
 
@@ -4855,8 +4718,6 @@ mod tests {
     struct FakeCounters {
         keep_file_downloading: AtomicUsize,
         clear_file_streaming: AtomicUsize,
-        resume_torrent: AtomicUsize,
-        pause_torrent: AtomicUsize,
         reconcile_file_priorities: AtomicUsize,
         prepare_file_for_streaming: AtomicUsize,
         get_file_reader: AtomicUsize,
@@ -4901,13 +4762,6 @@ mod tests {
         /// fake torrent is always running, and anything that reconciles a
         /// run state would be tested against a torrent that never obeys.
         paused: AtomicBool,
-        /// Whether the pause it is under is the *idle* one, which is the
-        /// only pause `resume_torrent` may lift -- `LibrqbitBackend` keeps
-        /// the same distinction in its `IdlePauses` set. A fake whose
-        /// `resume_torrent` lifted any pause would quietly answer for the
-        /// reconciler in every test where a playback starts on a stopped
-        /// torrent.
-        idle_pause: AtomicBool,
         /// How many times `has_metadata` was asked -- the reconciler's tick
         /// asks every torrent once per pass, so this is how a test sees the
         /// loop actually running.
@@ -4923,19 +4777,19 @@ mod tests {
         /// `Paused` from the `start_paused` it captured before the unpause
         /// arrived.
         swallow_start: AtomicBool,
-        /// Test knobs: hold `pause_torrent` / `resume_torrent` open at the
+        /// Test knobs: hold `stop_torrent` / `start_torrent` open at the
         /// matching gate until the test releases it, so a test can see what
         /// the caller is still holding while it awaits the backend.
         ///
-        /// A slow pause is the ordinary case, not a contrived one:
+        /// A slow stop is the ordinary case, not a contrived one:
         /// `Session::pause` and `Session::unpause` both flush librqbit's
         /// persistence file before they return. A caller that holds the
         /// engine registry across one is invisible against a fake that
         /// answers in the same poll.
-        hold_pause: AtomicBool,
-        pause_gate: tokio::sync::Notify,
-        hold_resume: AtomicBool,
-        resume_gate: tokio::sync::Notify,
+        hold_stop: AtomicBool,
+        stop_gate: tokio::sync::Notify,
+        hold_start: AtomicBool,
+        start_gate: tokio::sync::Notify,
     }
 
     /// Simulates librqbit's `Initializing` state for the fake torrent: the
@@ -5370,18 +5224,6 @@ mod tests {
             !self.files.is_empty()
         }
 
-        /// Lifts the idle pause and no other, as the real backend's does.
-        async fn resume_torrent(&self) -> Result<()> {
-            self.counters.resume_torrent.fetch_add(1, Ordering::SeqCst);
-            if self.counters.hold_resume.load(Ordering::SeqCst) {
-                self.counters.resume_gate.notified().await;
-            }
-            if self.counters.idle_pause.swap(false, Ordering::SeqCst) {
-                self.counters.paused.store(false, Ordering::SeqCst);
-            }
-            Ok(())
-        }
-
         async fn is_out_of_space(&self) -> bool {
             self.counters.out_of_space.load(Ordering::SeqCst)
         }
@@ -5402,11 +5244,14 @@ mod tests {
         /// tell it from a caller that asks once.
         async fn stop_torrent(&self) -> Result<()> {
             self.counters.stop_torrent.fetch_add(1, Ordering::SeqCst);
+            if self.counters.hold_stop.load(Ordering::SeqCst) {
+                self.counters.stop_gate.notified().await;
+            }
             if self.counters.paused.swap(true, Ordering::SeqCst) {
                 anyhow::bail!("already paused");
             }
             Ok(())
-            // Recorded nowhere, so `resume_torrent` cannot lift it.
+            // Recorded nowhere: nothing in this design remembers why.
         }
 
         /// Refuses a torrent that is not stopped, as `Session::unpause`
@@ -5418,9 +5263,11 @@ mod tests {
                 anyhow::bail!("not paused");
             }
             self.counters.start_torrent.fetch_add(1, Ordering::SeqCst);
+            if self.counters.hold_start.load(Ordering::SeqCst) {
+                self.counters.start_gate.notified().await;
+            }
             if !self.counters.swallow_start.load(Ordering::SeqCst) {
                 self.counters.paused.store(false, Ordering::SeqCst);
-                self.counters.idle_pause.store(false, Ordering::SeqCst);
             }
             Ok(())
         }
@@ -5436,17 +5283,6 @@ mod tests {
                 .fetch_add(1, Ordering::SeqCst);
             self.counters.out_of_space.store(false, Ordering::SeqCst);
             self.counters.paused.store(false, Ordering::SeqCst);
-            self.counters.idle_pause.store(false, Ordering::SeqCst);
-            Ok(())
-        }
-
-        async fn pause_torrent(&self) -> Result<()> {
-            self.counters.pause_torrent.fetch_add(1, Ordering::SeqCst);
-            if self.counters.hold_pause.load(Ordering::SeqCst) {
-                self.counters.pause_gate.notified().await;
-            }
-            self.counters.paused.store(true, Ordering::SeqCst);
-            self.counters.idle_pause.store(true, Ordering::SeqCst);
             Ok(())
         }
 
@@ -6543,68 +6379,88 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn paused_torrent_resumes_for_requested_multifile_file() {
-        let (enginefs, counters) = test_enginefs_with_file_count(3);
-        {
-            let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
-            engine.idle_paused.store(true, Ordering::Relaxed);
-        }
+    /// A stream request on a torrent that is stopped -- for any reason,
+    /// including one from a previous process -- starts it, and selects the
+    /// file that was asked for.
+    ///
+    /// Asserted on the run state, not on a resume counter: the counter said
+    /// a call was made, which is a different claim from "the torrent is
+    /// running", and it is the claim that let four consecutive defects
+    /// through. The torrent here is stopped the way librqbit stops one, so
+    /// nothing in the process holds any note about it.
+    #[tokio::test(start_paused = true)]
+    async fn a_stopped_torrent_is_started_by_a_request_for_one_of_its_files() {
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(3);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        stop_torrent(&enginefs, TEST_HASH).await;
+        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
 
         enginefs.on_stream_start(TEST_HASH, 2).await;
 
+        assert_eq!(
+            run_state_of(&enginefs, TEST_HASH).await,
+            RunState::Live,
+            "the request started the torrent it is going to read from"
+        );
         let snapshot = enginefs.stream_activity_snapshot().await;
         assert_eq!(snapshot.active_multifile_selections.len(), 1);
         assert_eq!(snapshot.active_multifile_selections[0].file_idx, 2);
         assert_eq!(*counters.last_active_file.lock().unwrap(), Some(2));
         assert!(
-            counters.resume_torrent.load(Ordering::SeqCst) > 0,
-            "request should resume an idle-paused torrent"
+            snapshot.paused_torrents.is_empty(),
+            "and the snapshot reports what the torrent is doing"
         );
     }
 
-    #[tokio::test]
-    async fn idle_pause_skips_active_multifile_selection() {
-        let (enginefs, counters) = test_enginefs_with_file_count(3);
+    /// The idle arm does not stop a torrent whose multi-file selection is
+    /// still live, however long ago the HTTP stream that made it ended.
+    ///
+    /// This used to be a test of the grace-period task, which read the same
+    /// five activity registers the sweep read and the reconciler now reads.
+    /// Three readers of one question is what the reconciler replaced; the
+    /// question itself is unchanged.
+    #[tokio::test(start_paused = true)]
+    async fn the_idle_arm_leaves_a_live_multifile_selection_alone() {
+        let (mut enginefs, _counters) = test_enginefs_for_reconciler(3);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
         enginefs.seeding_enabled.store(false, Ordering::Relaxed);
 
         enginefs.on_stream_start(TEST_HASH, 1).await;
-        {
-            enginefs.active_streams.write().await.clear();
-            enginefs.active_file_streams.write().await.clear();
-        }
-        enginefs
-            .schedule_torrent_pause_after(TEST_HASH.to_string(), Duration::from_millis(10))
-            .await
-            .unwrap();
+        // The HTTP stream goes; the selection it made stays.
+        enginefs.active_streams.write().await.clear();
+        enginefs.active_file_streams.write().await.clear();
+        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE * 2).await;
 
-        assert_eq!(counters.pause_torrent.load(Ordering::SeqCst), 0);
+        enginefs.reconcile_tick().await;
+        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
     }
 
-    #[tokio::test]
-    async fn idle_pause_runs_when_no_activity_remains() {
-        let (enginefs, counters) = test_enginefs_with_file_count(3);
+    /// Seeding off, nothing active, quiet for the grace: stopped. The
+    /// positive case the two above are the exceptions to.
+    #[tokio::test(start_paused = true)]
+    async fn the_idle_arm_stops_a_torrent_with_nothing_left_on_it() {
+        let (mut enginefs, _counters) = test_enginefs_for_reconciler(3);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
         enginefs.seeding_enabled.store(false, Ordering::Relaxed);
+        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE).await;
 
-        enginefs
-            .schedule_torrent_pause_after(TEST_HASH.to_string(), Duration::from_millis(10))
-            .await
-            .unwrap();
-
-        assert_eq!(counters.pause_torrent.load(Ordering::SeqCst), 1);
+        enginefs.reconcile_tick().await;
+        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
     }
 
-    #[tokio::test]
-    async fn idle_pause_skips_torrent_awaiting_metadata() {
-        let (enginefs, counters) = test_enginefs_with_file_count(0);
+    /// A magnet that has not resolved its info dictionary keeps running
+    /// whatever the idle arm would say: what it is fetching is the
+    /// dictionary, it writes no file data while it does, and stopping it is
+    /// how a magnet comes never to resolve.
+    #[tokio::test(start_paused = true)]
+    async fn the_idle_arm_leaves_a_torrent_still_fetching_its_metadata_alone() {
+        let (mut enginefs, _counters) = test_enginefs_for_reconciler(0);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
         enginefs.seeding_enabled.store(false, Ordering::Relaxed);
+        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE).await;
 
-        enginefs
-            .schedule_torrent_pause_after(TEST_HASH.to_string(), Duration::from_millis(10))
-            .await
-            .unwrap();
-
-        assert_eq!(counters.pause_torrent.load(Ordering::SeqCst), 0);
+        enginefs.reconcile_tick().await;
+        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
     }
 
     #[tokio::test]
@@ -7589,11 +7445,11 @@ mod tests {
         }
     }
 
-    /// A fixture whose housekeeping sweep is not running. The sweep pauses
-    /// idle torrents itself when seeding is off, so left running it would
-    /// move the very torrent these tests watch the reconciler decide about,
-    /// and "nothing moved" would be a statement about which of the two got
-    /// there first.
+    /// A fixture whose housekeeping sweep is not running. The sweep no
+    /// longer pauses anything, but it still removes engines it finds idle,
+    /// and these tests advance the clock past every timeout there is: left
+    /// running it would take the very torrent they watch the reconciler
+    /// decide about out of the registry underneath them.
     fn test_enginefs_for_reconciler(
         file_count: usize,
     ) -> (BackendEngineFS<FakeBackend>, Arc<FakeCounters>) {
@@ -7606,8 +7462,6 @@ mod tests {
 
     /// Every call the reconciler could make and does not, in one place.
     fn assert_nothing_moved(counters: &FakeCounters) {
-        assert_eq!(counters.pause_torrent.load(Ordering::SeqCst), 0);
-        assert_eq!(counters.resume_torrent.load(Ordering::SeqCst), 0);
         assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), 0);
         assert_eq!(counters.start_torrent.load(Ordering::SeqCst), 0);
         assert_eq!(counters.restart_from_error.load(Ordering::SeqCst), 0);
@@ -7625,13 +7479,17 @@ mod tests {
             .run_state()
     }
 
-    /// This stage takes the free-space arm and no other. The decision here
-    /// is the idle arm's `Stop` -- seeding off, nothing playing, quiet for
-    /// the whole grace, and a volume with room to spare -- and the
-    /// housekeeping sweep and the grace-period task still own it, so the
-    /// torrent must be running afterwards and no call must have been made.
+    /// The idle arm, acted on: seeding off, nothing playing, quiet for the
+    /// whole grace, and a volume with room to spare -- so the torrent is
+    /// stopped, by the reconciler, on the pass that decided it.
+    ///
+    /// Stopped **once**, not once per pass. The backend refuses a second
+    /// pause, so a reconciler that asked every tick would log a failure
+    /// every two seconds for every stopped torrent there is; the counter
+    /// counts the asking rather than the succeeding, which is what makes
+    /// that visible.
     #[tokio::test(start_paused = true)]
-    async fn the_idle_arm_is_decided_and_left_to_its_owner() {
+    async fn the_idle_arm_stops_the_torrent_and_asks_only_once() {
         let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
         enginefs.set_free_space_probe(|_| Ok(u64::MAX));
         enginefs.seeding_enabled.store(false, Ordering::Relaxed);
@@ -7641,11 +7499,19 @@ mod tests {
             enginefs.reconcile_tick().await,
             vec![(TEST_HASH.to_string(), Decision::Stop)]
         );
-        assert_nothing_moved(&counters);
         assert_eq!(
             run_state_of(&enginefs, TEST_HASH).await,
-            RunState::Live,
-            "the idle arm decided Stop and the torrent kept running"
+            RunState::Paused,
+            "the idle arm decided Stop and the reconciler made it so"
+        );
+        assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), 1);
+
+        enginefs.reconcile_tick().await;
+        enginefs.reconcile_tick().await;
+        assert_eq!(
+            counters.stop_torrent.load(Ordering::SeqCst),
+            1,
+            "a torrent that is already stopped is not asked to stop again"
         );
     }
 
@@ -8039,19 +7905,20 @@ mod tests {
     /// so the next playback was let through and put the torrent straight
     /// back onto the full disk.
     ///
-    /// Nothing here is keyed on who stopped it: the question is asked of the
-    /// torrent's state and the volume's, so the answer is the same whichever
-    /// policy took the pause, and the reconciler will not start it while the
-    /// volume is short whatever else is true of it.
+    /// Nothing here is keyed on who stopped it, because there is nothing
+    /// left that could be: the question is asked of the torrent's state and
+    /// the volume's, so the answer is the same whichever policy took the
+    /// pause, and the reconciler will not start it while the volume is
+    /// short whatever else is true of it.
     #[tokio::test(start_paused = true)]
-    async fn an_idle_paused_torrent_on_a_full_volume_is_stopped_for_space_too() {
+    async fn a_torrent_already_stopped_on_a_full_volume_is_stopped_for_space_too() {
         let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
         enginefs.set_free_space_probe(|_| Ok(0));
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
 
-        // The idle policy's pause, taken by the owner it still has.
-        engine.handle.pause_torrent().await.unwrap();
-        engine.idle_paused.store(true, Ordering::Relaxed);
+        // Stopped before the volume was ever looked at -- an idle stop this
+        // process took, or one it inherited from the last one.
+        stop_torrent(&enginefs, TEST_HASH).await;
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
 
         enginefs.reconcile_tick().await;
@@ -8065,12 +7932,11 @@ mod tests {
             "so the cleaner is told there is something to make room for"
         );
 
-        // A playback starting on it lifts the idle pause -- that is what
-        // `resume_torrent` is for, and it cannot tell one pause from
-        // another. The reconcile `on_stream_start` takes is what refuses to
-        // leave it running: measured against the floor, which is what the
-        // volume is under, and consulting no record of who stopped it
-        // first.
+        // A playback starting on it asks the reconciler, and the reconcile
+        // refuses to start it: measured against the floor, which is what
+        // the volume is under, and consulting no record of who stopped it
+        // first. On master this is where a resume that could not tell one
+        // pause from another put the torrent back onto the full disk.
         enginefs.on_stream_start(TEST_HASH, 0).await;
         assert_eq!(
             run_state_of(&enginefs, TEST_HASH).await,
@@ -8128,44 +7994,26 @@ mod tests {
         assert_eq!(counters.start_torrent.load(Ordering::SeqCst), 1);
     }
 
-    /// The idle pause has an owner, and it is not this reconciler yet.
+    /// The pause a fresh process cannot explain is the one it must be able
+    /// to lift, and this is that case: seeding is on, the volume is roomy,
+    /// the ladder wants the torrent running, and it is stopped by something
+    /// that left no note -- which is every pause that survived a restart.
     ///
-    /// Seeding is on and the volume is roomy, so the ladder wants this
-    /// torrent running -- and it is stopped, by the housekeeping sweep,
-    /// which still keeps its own record of that in `Engine::idle_paused`.
-    /// Starting it from here would make two owners of one librqbit pause,
-    /// which is the entire class of bug being closed; the reconciler takes
-    /// the free-space arm in this stage and hands everything else back.
-    ///
-    /// The guard errs in the safe direction, and the second half of the
-    /// test is that direction: the moment nothing claims the pause -- which
-    /// is every pause in a fresh process, since the flag does not survive a
-    /// restart and the pause does -- the reconciler starts it.
+    /// On master the three call sites that could have started it all read
+    /// `if idle_paused.swap(false) && resume()`, which is `false && ...` in
+    /// a fresh process. Nothing started it, ever.
     #[tokio::test(start_paused = true)]
-    async fn a_pause_the_idle_policy_still_claims_is_left_to_the_idle_policy() {
+    async fn a_stop_nobody_can_explain_is_lifted_by_the_reconciler() {
         let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
         enginefs.set_free_space_probe(|_| Ok(u64::MAX));
         assert!(enginefs.seeding_enabled.load(Ordering::Relaxed));
-        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
-
-        engine.handle.pause_torrent().await.unwrap();
-        engine.idle_paused.store(true, Ordering::Relaxed);
+        stop_torrent(&enginefs, TEST_HASH).await;
 
         assert_eq!(
             enginefs.reconcile_tick().await,
             vec![(TEST_HASH.to_string(), Decision::Run)],
             "the ladder wants it running"
         );
-        assert_eq!(
-            run_state_of(&enginefs, TEST_HASH).await,
-            RunState::Paused,
-            "and leaves it to the owner that took this pause"
-        );
-        assert_eq!(counters.start_torrent.load(Ordering::SeqCst), 0);
-
-        // Nobody claims it any more -- which is what a restart looks like.
-        engine.idle_paused.store(false, Ordering::Relaxed);
-        enginefs.reconcile_tick().await;
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
         assert_eq!(counters.start_torrent.load(Ordering::SeqCst), 1);
     }
@@ -8678,13 +8526,19 @@ mod tests {
         .await
     }
 
-    /// Put the torrent where the housekeeping sweep leaves an idle one when
-    /// seeding is off: paused, with the engine's record that the pause is
-    /// the idle policy's. The reconciler fixtures abort that sweep, so its
-    /// two calls are made here.
-    async fn idle_pause(engine: &Arc<Engine<FakeHandle>>) {
-        engine.idle_paused.store(true, Ordering::Relaxed);
-        engine.handle.pause_torrent().await.unwrap();
+    /// Stop the torrent the way anything stops one -- the reconciler, a
+    /// previous process, librqbit's own restore -- and leave no note behind
+    /// saying who did: there is nowhere left to put one. A test that wants
+    /// a stopped torrent asks for a stopped torrent.
+    async fn stop_torrent(enginefs: &BackendEngineFS<FakeBackend>, hash: &str) {
+        enginefs
+            .peek_engine(hash)
+            .await
+            .expect("the engine is registered")
+            .handle
+            .stop_torrent()
+            .await
+            .expect("a live torrent stops");
     }
 
     /// The read refusal is the free-space arm's, and it goes when that arm
@@ -8711,7 +8565,7 @@ mod tests {
         enginefs.set_free_space_probe(move |_| Ok(probe_available.load(Ordering::SeqCst)));
         enginefs.seeding_enabled.store(false, Ordering::Relaxed);
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
-        idle_pause(&engine).await;
+        stop_torrent(&enginefs, TEST_HASH).await;
 
         enginefs.reconcile_tick().await;
         tokio::time::advance(STOPPED_READ_STALL_BOUND).await;
@@ -8752,7 +8606,7 @@ mod tests {
         enginefs.set_free_space_probe(move |_| Ok(probe_available.load(Ordering::SeqCst)));
         enginefs.seeding_enabled.store(false, Ordering::Relaxed);
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
-        idle_pause(&engine).await;
+        stop_torrent(&enginefs, TEST_HASH).await;
 
         enginefs.reconcile_tick().await;
         tokio::time::advance(STOPPED_READ_STALL_BOUND).await;
@@ -8805,7 +8659,7 @@ mod tests {
         enginefs.set_free_space_probe(|_| Ok(CACHE_FREE_SPACE_FLOOR + 1));
         enginefs.seeding_enabled.store(false, Ordering::Relaxed);
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
-        idle_pause(&engine).await;
+        stop_torrent(&enginefs, TEST_HASH).await;
         tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE).await;
 
         // The pass takes the volume's reading; the volume never went under
@@ -8830,9 +8684,9 @@ mod tests {
         assert!(enginefs.out_of_space_torrents().await.is_empty());
     }
 
-    /// Re-enabling seeding resumes the torrents the idle policy paused, and
-    /// it does not hold the engine registry while it waits for the backend
-    /// to do it.
+    /// Re-enabling seeding starts the torrents the idle arm stopped, and it
+    /// does not hold the engine registry while it waits for the backend to
+    /// do it.
     ///
     /// `engines` is a write-preferring `RwLock`: a read guard held across
     /// an await parks every later reader behind any writer that queues
@@ -8840,20 +8694,25 @@ mod tests {
     /// librqbit's persistence file. One torrent's disk write would stall
     /// every route that wants to look an engine up.
     #[tokio::test]
-    async fn re_enabling_seeding_resumes_without_holding_the_engine_registry() {
-        let (enginefs, counters) = test_enginefs_for_reconciler(1);
-        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
-        idle_pause(&engine).await;
+    async fn re_enabling_seeding_starts_without_holding_the_engine_registry() {
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        let enginefs = Arc::new(enginefs);
+        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
+        stop_torrent(&enginefs, TEST_HASH).await;
 
-        counters.hold_resume.store(true, Ordering::SeqCst);
-        enginefs.set_seeding_enabled(true);
+        counters.hold_start.store(true, Ordering::SeqCst);
+        let switch = tokio::spawn({
+            let enginefs = enginefs.clone();
+            async move { enginefs.set_seeding_enabled(true).await }
+        });
         assert!(
             wait_until(TEST_WAIT_BOUND, || counters
-                .resume_torrent
+                .start_torrent
                 .load(Ordering::SeqCst)
                 == 1)
             .await,
-            "the resume reached the backend and is waiting there"
+            "the start reached the backend and is waiting there"
         );
 
         let engines = enginefs.engines.clone();
@@ -8863,31 +8722,32 @@ mod tests {
             "a writer on the engine registry is not parked behind that call"
         );
 
-        counters.resume_gate.notify_one();
-        assert!(
-            wait_until(TEST_WAIT_BOUND, || !counters.paused.load(Ordering::SeqCst)).await,
-            "and the resume it was waiting on still lands"
-        );
+        counters.start_gate.notify_one();
+        switch.await.expect("the switch finished");
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
     }
 
-    /// The same of the housekeeping sweep, which pauses an idle torrent
-    /// when seeding is off. Its await is `Session::pause`, the other half
-    /// of the same persistence flush, and this stage widened the window by
-    /// asking the backend twice more under the guard (whether the torrent
-    /// has metadata and whether it is finished).
-    #[tokio::test(start_paused = true)]
-    async fn the_idle_sweep_pauses_without_holding_the_engine_registry() {
-        let (enginefs, counters) = test_enginefs_with_file_count(1);
-        enginefs.set_seeding_enabled(false);
-        counters.hold_pause.store(true, Ordering::SeqCst);
+    /// The same of the reconciler's own tick, whose await is
+    /// `Session::pause` -- the other half of the same persistence flush --
+    /// and which reaches every torrent there is rather than one.
+    #[tokio::test]
+    async fn the_reconcilers_tick_stops_without_holding_the_engine_registry() {
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(CACHE_FREE_SPACE_FLOOR - 1));
+        let enginefs = Arc::new(enginefs);
+
+        counters.hold_stop.store(true, Ordering::SeqCst);
+        let tick = tokio::spawn({
+            let enginefs = enginefs.clone();
+            async move { enginefs.reconcile_tick().await }
+        });
         assert!(
             wait_until(TEST_WAIT_BOUND, || counters
-                .pause_torrent
+                .stop_torrent
                 .load(Ordering::SeqCst)
                 == 1)
             .await,
-            "the sweep's pause reached the backend and is waiting there"
+            "the stop reached the backend and is waiting there"
         );
 
         let engines = enginefs.engines.clone();
@@ -8897,11 +8757,8 @@ mod tests {
             "a writer on the engine registry is not parked behind that call"
         );
 
-        counters.pause_gate.notify_one();
-        assert!(
-            wait_until(TEST_WAIT_BOUND, || counters.paused.load(Ordering::SeqCst)).await,
-            "and the pause it was waiting on still lands"
-        );
+        counters.stop_gate.notify_one();
+        tick.await.expect("the tick finished");
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
     }
 
@@ -10751,17 +10608,26 @@ mod tests {
         assert!(!enginefs.get_engine(TEST_HASH).await.unwrap().is_pinned());
     }
 
-    /// A torrent the seeding-disabled policy had paused must download again
-    /// once one of its files is pinned.
-    #[tokio::test]
-    async fn pin_download_resumes_idle_paused_torrent() {
-        let (enginefs, counters) = test_enginefs_with_file_count(2);
-        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
-        engine.idle_paused.store(true, Ordering::Relaxed);
+    /// A stopped torrent must download again once one of its files is
+    /// pinned -- whoever stopped it, including the process before this one.
+    ///
+    /// Asserted on the run state, never on a resume counter: on master this
+    /// read `if idle_paused.swap(false) && resume()`, so with a stopped
+    /// torrent and an empty flag -- every torrent after a restart -- the
+    /// pin recorded an offline download that downloaded nothing, and a
+    /// counter-based test could not have told the difference.
+    #[tokio::test(start_paused = true)]
+    async fn pin_download_starts_a_stopped_torrent() {
+        let (mut enginefs, _counters) = test_enginefs_for_reconciler(2);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        stop_torrent(&enginefs, TEST_HASH).await;
 
         enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
-        assert!(counters.resume_torrent.load(Ordering::SeqCst) > 0);
-        assert!(!engine.idle_paused.load(Ordering::Relaxed));
+        assert_eq!(
+            run_state_of(&enginefs, TEST_HASH).await,
+            RunState::Live,
+            "a pinned download that is not running is not a download"
+        );
     }
 
     /// Single-file torrents are always fully wanted: the pin is recorded
@@ -10823,44 +10689,37 @@ mod tests {
         );
     }
 
-    /// With seeding disabled the periodic loop pauses idle torrents; a
-    /// pinned one must keep downloading.
+    /// With seeding off the idle arm stops what nobody is watching -- and a
+    /// pinned torrent is not that: somebody asked for it offline, and it
+    /// keeps downloading.
+    ///
+    /// Two engines under one tick, so the assertion is a difference rather
+    /// than a claim about a machine that had not got round to it: the
+    /// unpinned one is stopped on the same pass that leaves the pinned one
+    /// running.
     #[tokio::test(start_paused = true)]
-    async fn seeding_disabled_loop_skips_pinned_engine() {
-        let TwoEngines {
-            enginefs,
-            counters: [pinned, unpinned],
-            ..
-        } = test_enginefs_with_two_engines();
+    async fn the_idle_arm_stops_the_unpinned_torrent_and_leaves_the_pinned_one() {
+        let TwoEngines { mut enginefs, .. } = test_enginefs_with_two_engines();
+        if let Some(sweep) = enginefs.take_sweep_task() {
+            sweep.abort();
+        }
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
         enginefs.seeding_enabled.store(false, Ordering::Relaxed);
         enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
+        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE * 2).await;
 
-        tokio::time::sleep(Duration::from_secs(20)).await;
-        assert_eq!(unpinned.pause_torrent.load(Ordering::SeqCst), 1);
-        assert_eq!(pinned.pause_torrent.load(Ordering::SeqCst), 0);
-        assert!(
-            !enginefs
-                .get_engine(TEST_HASH)
-                .await
-                .unwrap()
-                .idle_paused
-                .load(Ordering::Relaxed)
+        enginefs.reconcile_tick().await;
+
+        assert_eq!(
+            run_state_of(&enginefs, TEST_HASH).await,
+            RunState::Live,
+            "the pinned torrent keeps downloading"
         );
-    }
-
-    /// The post-stream grace-period pause skips a pinned torrent too.
-    #[tokio::test]
-    async fn idle_pause_after_stream_skips_pinned_torrent() {
-        let (enginefs, counters) = test_enginefs_with_file_count(3);
-        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
-        enginefs.pin_download(TEST_HASH, 2, None).await.unwrap();
-
-        enginefs
-            .schedule_torrent_pause_after(TEST_HASH.to_string(), Duration::from_millis(10))
-            .await
-            .unwrap();
-
-        assert_eq!(counters.pause_torrent.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            run_state_of(&enginefs, OTHER_HASH).await,
+            RunState::Paused,
+            "and the one nobody asked for is stopped on the same pass"
+        );
     }
 
     // --- season-pack episode guessing (server.js guessFileIdx parity) ---

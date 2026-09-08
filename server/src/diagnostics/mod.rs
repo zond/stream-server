@@ -200,11 +200,11 @@ pub fn start_memory_sampler(state: AppState) -> tokio::task::JoinHandle<()> {
                     active_file_streams = snapshot.engine.streams.active_file_streams.len(),
                     active_multifile_selections =
                         snapshot.engine.streams.active_multifile_selections.len(),
-                    idle_paused_torrents = snapshot.engine.streams.idle_paused_torrents.len(),
+                    paused_torrents = snapshot.engine.streams.paused_torrents.len(),
                     download_active_multifile_selections =
                         snapshot.download_engine.streams.active_multifile_selections.len(),
-                    download_idle_paused_torrents =
-                        snapshot.download_engine.streams.idle_paused_torrents.len(),
+                    download_paused_torrents =
+                        snapshot.download_engine.streams.paused_torrents.len(),
                     rust_piece_cache_entries = snapshot.engine.memory.rust_piece_cache_entries,
                     rust_piece_cache_bytes = snapshot.engine.memory.rust_piece_cache_bytes,
                     native_storage_bytes = snapshot.engine.memory.native_storage_bytes,

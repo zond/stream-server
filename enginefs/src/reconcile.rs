@@ -51,16 +51,27 @@ pub enum Decision {
     Leave,
 }
 
-/// What made a decision be taken now. It changes one thing only -- which
-/// free-space line the volume is measured against ([`floor`]) -- and it
-/// exists because a decision taken *because a stream is starting* is
-/// answering a user who is waiting, while a decision taken by the timer is
-/// answering nobody.
+/// What made a decision be taken now. It changes two things -- which
+/// free-space line the volume is measured against ([`line`]), and whether
+/// the anti-flap dwell applies -- and both differences are the same
+/// difference: a decision taken because *somebody is waiting for it* is
+/// answering a person, while a decision taken by the timer is answering
+/// nobody.
+///
+/// [`line`]: line
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trigger {
     /// The reconciler's own tick, over every torrent.
     Timer,
-    /// A playback is starting on this torrent, right now.
+    /// Somebody is waiting on this decision right now.
+    ///
+    /// Named for its main case, which is a playback starting on this
+    /// torrent -- and it is also the pin of an offline download, the focus
+    /// of a stream and the seeding switch being turned back on. All four
+    /// are a person having just asked for something and looking at the
+    /// result, which is what the trigger is for: a torrent they are owed is
+    /// measured against the floor rather than the resume line, and is not
+    /// made to wait out a dwell that exists to protect an announce budget.
     PlaybackStart,
 }
 
@@ -72,6 +83,23 @@ pub struct Conditions {
     /// [`crate::backend::TorrentHandle::run_state`], never its `paused`
     /// flag, which across an initial check is wrong in both directions.
     pub run_state: RunState,
+    /// This process has re-applied its want-set to this torrent.
+    ///
+    /// The one record in the whole design that is a claim about something
+    /// *this process did*, and it is here because starting false is the
+    /// correct answer rather than a hole. A backend that sets piece reclaim
+    /// ([`crate::backend::TorrentBackend::sets_piece_reclaim`]) restores
+    /// every torrent paused and wanting every hole in its storage, because
+    /// the piece-level want-set did not survive the record; until the
+    /// caller has put the want-set back, starting one would have a seeder
+    /// refill holes it is about to drop. A fresh process has re-applied
+    /// nothing, so `false` at start is exactly true -- which is what every
+    /// record this design deleted could not say.
+    ///
+    /// Not to be confused with a *settled reading* of
+    /// [`Self::run_state`], which is about the backend's state machine and
+    /// nothing to do with this process: see [`desired`]'s first two arms.
+    pub settled: bool,
     /// A stream, a file read, an HLS lease or a multi-file selection is
     /// live on this torrent.
     pub playing: bool,
@@ -95,7 +123,7 @@ pub struct Conditions {
 ///
 /// The ladder, in order, and why each arm is where it is:
 ///
-/// 1. **Not settled -> [`Decision::Stop`].** An `Initializing` reading is
+/// 1. **Not a settled reading -> [`Decision::Stop`].** An `Initializing` reading is
 ///    not a state anything may conclude from: where the torrent ends up
 ///    when its check finishes is decided by a `start_paused` captured when
 ///    the check began, which is not observable from out here (see
@@ -111,32 +139,41 @@ pub struct Conditions {
 ///    torrent that has no check running for ever). An actuator acts on
 ///    settled readings; this arm exists so the arms below cannot read
 ///    `playing` or `available` off an unsettled one and conclude `Run`.
-/// 2. **`Error` -> [`Decision::Leave`].** A torrent the backend stopped
+/// 2. **Want-set not re-applied -> [`Decision::Stop`].**
+///    [`Conditions::settled`]: a torrent this process has not put its
+///    want-set back on must not be started, because under piece reclaim it
+///    would come up wanting every hole in its storage. Above the `Error`
+///    arm, and it costs that arm nothing: the actuator's `Stop` calls
+///    nothing on a torrent that is not running, so for an errored torrent
+///    the two answers differ only in that this one also lets a read refusal
+///    lapse -- which is right, since a torrent nobody has settled is not a
+///    statement about a disk.
+/// 3. **`Error` -> [`Decision::Leave`].** A torrent the backend stopped
 ///    with an error is the cache cleaner's business
 ///    (`recover_out_of_space_torrents` reclaims space and restarts it) or
 ///    nobody's. Pausing it is meaningless and starting it would race the
 ///    cleaner.
-/// 3. **No metadata -> [`Decision::Run`].** A resolving magnet must stay
+/// 4. **No metadata -> [`Decision::Run`].** A resolving magnet must stay
 ///    connected to the swarm: the thing it is fetching is the info
 ///    dictionary, it writes no file data while it does, and stopping it is
 ///    how you make a magnet that never resolves. Above the free-space arm
 ///    for that reason -- it cannot fill a disk.
-/// 4. **Writing, and the volume is under the line -> [`Decision::Stop`].**
+/// 5. **Writing, and the volume is under the line -> [`Decision::Stop`].**
 ///    Above `playing`, which is the point: librqbit writes the file it
 ///    wants straight to `ENOSPC` and calls that a fatal torrent error, so a
 ///    stream that is playing is exactly the torrent that will run the
 ///    volume to zero. A finished torrent writes nothing and so is never
 ///    stopped by this arm. Which line, and what an unreadable probe means,
 ///    is [`floor`].
-/// 5. **Playing or pinned -> [`Decision::Run`].** Someone is watching it,
+/// 6. **Playing or pinned -> [`Decision::Run`].** Someone is watching it,
 ///    or someone asked for it offline.
-/// 6. **Seeding off and idle -> [`Decision::Stop`].** The idle policy: with
+/// 7. **Seeding off and idle -> [`Decision::Stop`].** The idle policy: with
 ///    seeding disabled and nothing playing, what a running torrent is doing
 ///    is fetching a film nobody is watching while we have promised to
 ///    upload nothing. [`crate::INACTIVE_TORRENT_PAUSE_GRACE`] of quiet
 ///    first, so a player that stops one segment and starts the next does
 ///    not stop and start the torrent with it.
-/// 7. Otherwise **[`Decision::Run`]**.
+/// 8. Otherwise **[`Decision::Run`]**.
 pub fn desired(conditions: &Conditions, trigger: Trigger) -> Decision {
     verdict(conditions, trigger).decision
 }
@@ -169,8 +206,11 @@ pub fn verdict(conditions: &Conditions, trigger: Trigger) -> Verdict {
     };
     match conditions.run_state {
         RunState::Initializing { .. } | RunState::Gone => return arm(Decision::Stop),
-        RunState::Error => return arm(Decision::Leave),
-        RunState::Live | RunState::Paused => {}
+        RunState::Error if conditions.settled => return arm(Decision::Leave),
+        RunState::Error | RunState::Live | RunState::Paused => {}
+    }
+    if !conditions.settled {
+        return arm(Decision::Stop);
     }
     if !conditions.has_metadata {
         return arm(Decision::Run);
@@ -619,6 +659,7 @@ mod tests {
     fn healthy() -> Conditions {
         Conditions {
             run_state: RunState::Live,
+            settled: true,
             playing: false,
             pinned: false,
             seeding_enabled: true,

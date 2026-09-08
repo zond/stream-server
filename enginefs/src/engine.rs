@@ -260,9 +260,26 @@ pub struct Engine<H: TorrentHandle> {
     pub last_accessed: AtomicU64,
     pub active_streams: Arc<AtomicUsize>,
     pub data_cache: DataCache,
-    /// Whether this torrent was paused by the idle seeding-disabled policy.
-    /// A new playback request resumes it before making a file wanted.
-    pub idle_paused: AtomicBool,
+    /// Whether this process has re-applied its want-set to this torrent
+    /// ([`crate::reconcile::Conditions::settled`]).
+    ///
+    /// `true` for every engine made here, because an engine is made by an
+    /// add and an add carries the want-set with it. A *restored* engine on
+    /// a backend that sets piece reclaim is marked unsettled by
+    /// [`BackendEngineFS::new_with_backend_and_storage`] and settled again
+    /// by [`BackendEngineFS::restore_pinned_downloads`], which is the call
+    /// that puts the want-set back.
+    ///
+    /// [`BackendEngineFS`]: crate::BackendEngineFS
+    /// [`BackendEngineFS::new_with_backend_and_storage`]: crate::BackendEngineFS::new_with_backend_and_storage
+    /// [`BackendEngineFS::restore_pinned_downloads`]: crate::BackendEngineFS::restore_pinned_downloads
+    settled: AtomicBool,
+    /// The clock reading at the last start or stop the reconciler made on
+    /// this torrent, or 0 for a torrent it has never moved: the dwell in
+    /// [`crate::BackendEngineFS::start_if_stopped`].
+    ///
+    /// [`crate::BackendEngineFS::start_if_stopped`]: crate::BackendEngineFS
+    last_transition_at: AtomicU64,
     /// Files pinned as offline downloads (`BackendEngineFS::pin_download`).
     /// While non-empty the engine is exempt from idle removal and the
     /// seeding-disabled pause; the handle keeps its own copy for the
@@ -304,7 +321,8 @@ impl<H: TorrentHandle> Engine<H> {
                 .weigher(|_key, value: &Arc<Vec<u8>>| value.len() as u32)
                 .max_capacity(64 * 1024 * 1024) // 64MB cache per engine
                 .build(),
-            idle_paused: AtomicBool::new(false),
+            settled: AtomicBool::new(true),
+            last_transition_at: AtomicU64::new(0),
             pinned_files: parking_lot::RwLock::new(BTreeSet::new()),
             volumes,
             reads_refused: AtomicBool::new(false),
@@ -320,6 +338,34 @@ impl<H: TorrentHandle> Engine<H> {
     /// [`BackendEngineFS`]: crate::BackendEngineFS
     pub(crate) fn volumes(&self) -> Arc<crate::reconcile::Volumes> {
         self.volumes.clone()
+    }
+
+    /// Whether this process has re-applied its want-set to this torrent
+    /// (see the field).
+    pub(crate) fn is_settled(&self) -> bool {
+        self.settled.load(Ordering::Relaxed)
+    }
+
+    /// Mark the want-set as not yet re-applied -- a restored torrent on a
+    /// backend that sets piece reclaim, before the pins come back.
+    pub(crate) fn mark_unsettled(&self) {
+        self.settled.store(false, Ordering::Relaxed);
+    }
+
+    /// The want-set is back on this torrent; the reconciler may start it.
+    pub(crate) fn mark_settled(&self) {
+        self.settled.store(true, Ordering::Relaxed);
+    }
+
+    /// The clock reading at the reconciler's last start or stop of this
+    /// torrent, or 0 if it has never moved it.
+    pub(crate) fn last_transition_at(&self) -> u64 {
+        self.last_transition_at.load(Ordering::Relaxed)
+    }
+
+    /// Record that the reconciler has just started or stopped this torrent.
+    pub(crate) fn record_transition(&self, now: u64) {
+        self.last_transition_at.store(now, Ordering::Relaxed);
     }
 
     /// Whether this torrent is stopped, and stopped because the volume it

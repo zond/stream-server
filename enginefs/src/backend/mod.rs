@@ -122,8 +122,10 @@ pub trait TorrentBackend: Send + Sync {
     /// the backend *restores* at startup comes back paused whatever it was
     /// doing at shutdown -- its per-session want-set did not survive, so
     /// librqbit forces it paused until the caller re-applies the want-set --
-    /// and the engine layer unpauses it once the pins are back (see
-    /// [`BackendEngineFS::resume_restored_torrents`]). The default is `false`
+    /// and the engine layer starts it again once the want-set is back
+    /// (`BackendEngineFS::restore_pinned_downloads`, which is what marks
+    /// each restored engine settled -- see
+    /// [`crate::reconcile::Conditions::settled`]). The default is `false`
     /// (a backend whose storage keeps whole files cannot reclaim, and its
     /// restored torrents keep whatever paused state they had), which is also
     /// how the shipped session runs today.
@@ -358,27 +360,6 @@ pub trait TorrentHandle: Send + Sync + Clone {
     /// so it is a couple of lock reads and no I/O, never a `stats()` walk.
     fn run_state(&self) -> RunState;
 
-    /// Lift an idle pause ([`Self::pause_torrent`]) -- and only an idle
-    /// pause. Called on every playback start, so for a torrent this never
-    /// paused it must be a silent no-op rather than an error, and it must
-    /// never lift the reconciler's stop ([`Self::stop_torrent`]) -- that
-    /// torrent may have nowhere to write, and the reconciler is the one
-    /// thing that decides when it runs again. A backend that can pause
-    /// therefore has to record which pauses are its idle ones.
-    async fn resume_torrent(&self) -> Result<()> {
-        Ok(())
-    }
-    /// Un-stop a torrent the backend restored *paused* (see
-    /// [`TorrentBackend::sets_piece_reclaim`]) once the caller has re-applied
-    /// its want-set. Distinct from [`Self::resume_torrent`], which lifts an
-    /// idle/seeding throttle and does not restart a stopped torrent: this
-    /// starts a paused torrent going again. Called only on a torrent the
-    /// backend restored, and only by a backend that restores paused, so the
-    /// default -- for a backend that does neither -- errs rather than
-    /// pretend it un-paused something.
-    async fn unpause_restored(&self) -> Result<()> {
-        anyhow::bail!("this backend does not restore torrents paused")
-    }
     /// Whether the backend stopped this torrent because the volume it writes
     /// to ran out of space -- the one torrent error that is a statement about
     /// the device rather than about the torrent, and the one worth reclaiming
@@ -440,29 +421,15 @@ pub trait TorrentHandle: Send + Sync + Clone {
     /// the previous process included.
     ///
     /// The counterpart of [`Self::stop_torrent`] and the other half of the
-    /// reconciler's control. Unconditional is the whole point:
-    /// [`Self::resume_torrent`] lifts only the pauses the backend itself
-    /// recorded as idle ones, so it is silent for a pause that survived a
-    /// restart -- which is exactly the pause somebody has to be able to
-    /// lift. Errs for a torrent that is not stopped, so a caller cannot
-    /// mistake "already running" for a start it made.
+    /// reconciler's control. **Unconditional is the whole point.** This
+    /// used to sit beside a `resume_torrent` that lifted only the pauses
+    /// the backend itself had recorded as idle ones, and was therefore
+    /// silent for a pause that survived a restart -- which is exactly the
+    /// pause somebody has to be able to lift. Errs for a torrent that is
+    /// not stopped, so a caller cannot mistake "already running" for a
+    /// start it made.
     async fn start_torrent(&self) -> Result<()> {
         anyhow::bail!("this backend cannot start a stopped torrent")
-    }
-    /// Pause torrent activity when no stream is using it and the user has
-    /// turned seeding off. Reached only through that conjunction, so what it
-    /// stops is a torrent still fetching a film nobody is watching while we
-    /// have promised to upload nothing -- which on a small device is a
-    /// volume filling for no one. A backend that really pauses must record
-    /// the pause as its own, so that [`Self::resume_torrent`] lifts it and
-    /// the reconciler's [`Self::stop_torrent`] is never mistaken for it.
-    ///
-    /// The default is a no-op, for a backend that would rather throttle than
-    /// lose its peers ([`Self::set_upload_throttled`]); a backend that takes
-    /// it must accept that pausing drops the swarm and the next playback
-    /// re-acquires it.
-    async fn pause_torrent(&self) -> Result<()> {
-        Ok(())
     }
     /// Throttle (or restore) the torrent's upload rate to control seeding
     /// WITHOUT disconnecting peers. Pausing a torrent disconnects every peer,
