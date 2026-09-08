@@ -1541,13 +1541,26 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 self.stop_for_space(engine, &conditions, &folder, now, stopped_any)
                     .await;
             }
-            crate::reconcile::Decision::Run => self.start_if_stopped(engine, &conditions).await,
-            // The idle arm's stop, an unsettled reading's stop, and the
-            // error state, all of which have an owner that is not this one.
-            // An unsettled reading in particular must never become a pause
-            // call: pausing an initializing torrent wedges its check for
-            // good (see `TorrentHandle::run_state`).
-            crate::reconcile::Decision::Stop | crate::reconcile::Decision::Leave => {}
+            crate::reconcile::Decision::Run => {
+                self.start_if_stopped(engine, &conditions).await;
+                self.let_reads_park_again(engine);
+            }
+            // The idle arm's stop and an unsettled reading's stop: neither
+            // has an owner here, so no call is made -- and an unsettled
+            // reading in particular must never become a pause call, because
+            // pausing an initializing torrent wedges its check for good
+            // (see `TorrentHandle::run_state`). The read refusal still goes,
+            // because it is the free-space arm's and this is not it.
+            crate::reconcile::Decision::Stop => self.let_reads_park_again(engine),
+            // `Error`, and a probe that failed on a timer pass. Both are
+            // "no opinion", and lifting a refusal is an opinion: a torrent
+            // the backend killed has its refusal lifted by
+            // `restart_from_error` when the cleaner puts it back to work,
+            // and a `statvfs` that stopped answering is evidence neither
+            // that the volume filled nor that it cleared -- the same reason
+            // `reconcile::Volumes::record` leaves the stall clock alone for
+            // one.
+            crate::reconcile::Decision::Leave => {}
         }
         Some(verdict.decision)
     }
@@ -1606,11 +1619,13 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
     }
 
-    /// Act on a `Run` for one engine: start it if it is stopped, and let
-    /// its reads park again rather than fail.
+    /// Act on a `Run` for one engine: start it if it is stopped.
     ///
-    /// The `idle_paused` guard is the stage's scaffolding, explained on
-    /// [`Self::reconcile_engine`].
+    /// A torrent that is already `Live` is left alone, and so is one the
+    /// idle policy holds -- the `idle_paused` guard is the stage's
+    /// scaffolding, explained on [`Self::reconcile_engine`]. Lifting the
+    /// read refusal is *not* done here, precisely because of those two
+    /// cases: see [`Self::let_reads_park_again`].
     async fn start_if_stopped(
         &self,
         engine: &Arc<Engine<B::Handle>>,
@@ -1620,23 +1635,51 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             return;
         }
         match engine.handle.start_torrent().await {
-            Ok(()) => {
-                // Only now: a reader let out before the torrent is running
-                // again would park on a piece nothing is fetching yet.
-                engine.allow_reads();
-                engine.wake_readers();
-                tracing::info!(
-                    info_hash = %engine.info_hash,
-                    available = ?conditions.available,
-                    "torrent_started_by_reconciler"
-                );
-            }
+            Ok(()) => tracing::info!(
+                info_hash = %engine.info_hash,
+                available = ?conditions.available,
+                "torrent_started_by_reconciler"
+            ),
             Err(error) => tracing::warn!(
                 info_hash = %engine.info_hash,
                 error = %format!("{error:#}"),
                 "the backend would not start a torrent the reconciler wants running"
             ),
         }
+    }
+
+    /// Let reads through this engine park again rather than fail with
+    /// `StorageFull` ([`Engine::allow_reads`]).
+    ///
+    /// The refusal is recomputed like everything else here: it stands while
+    /// the free-space arm is stopping this torrent and the volume has been
+    /// short for [`STOPPED_READ_STALL_BOUND`], and it is lifted on the
+    /// first pass that arm is not the one deciding. It is a claim about the
+    /// *device*, and no other arm of the ladder makes one.
+    ///
+    /// Tying it to the start call instead is how a refusal that nothing
+    /// could ever clear shipped. The two ways out of a refusal that are not
+    /// a start are both ordinary: the torrent is idle-paused when the
+    /// cleaner frees the volume, so the reconcile that follows answers the
+    /// idle arm's `Stop` and starts nothing; and the user then presses play,
+    /// which resumes it through `activate_file` before
+    /// [`Self::reconcile_hash`] is asked, so by the time the answer is `Run`
+    /// the torrent is already `Live` and there is no start to hang the lift
+    /// on. Every read on that engine then failed with `StorageFull`, for
+    /// good, on a volume with room to spare.
+    fn let_reads_park_again(&self, engine: &Arc<Engine<B::Handle>>) {
+        if !engine.reads_refused() {
+            return;
+        }
+        tracing::info!(
+            info_hash = %engine.info_hash,
+            "the volume this torrent writes to has room again; its reads wait rather than fail"
+        );
+        engine.allow_reads();
+        // Nothing should be parked (a refusal wakes every reader and they
+        // return `StorageFull`), but a read that arrived between the lift
+        // and this line is one nobody would wake otherwise.
+        engine.wake_readers();
     }
 
     /// Probe `folder`'s volume and record the reading for this pass and for
@@ -8603,6 +8646,38 @@ mod tests {
         );
     }
 
+    /// One poll of a fresh reader on this engine: `None` when the read
+    /// parks -- what a read on a piece that is still coming does -- and the
+    /// error when it is refused outright.
+    ///
+    /// Asserted on instead of `Engine::reads_refused`, which is the flag
+    /// the code under test writes. What a player actually gets is this.
+    async fn poll_a_read(engine: &Arc<Engine<FakeHandle>>) -> Option<std::io::Error> {
+        use tokio::io::AsyncRead;
+        let mut reader = crate::files::FileHandle::new(
+            100,
+            "video-0.mkv".to_string(),
+            Box::new(ParkedStream),
+            engine.clone(),
+            0,
+            0,
+        );
+        // Balanced by `FileHandle::drop`, which subtracts one.
+        engine.active_streams.fetch_add(1, Ordering::SeqCst);
+        let mut buf = [0u8; 16];
+        std::future::poll_fn(|cx| {
+            let polled = std::pin::Pin::new(&mut reader)
+                .poll_read(cx, &mut tokio::io::ReadBuf::new(&mut buf));
+            std::task::Poll::Ready(match polled {
+                std::task::Poll::Pending => None,
+                std::task::Poll::Ready(result) => {
+                    Some(result.expect_err("ParkedStream never completes a read"))
+                }
+            })
+        })
+        .await
+    }
+
     /// Put the torrent where the housekeeping sweep leaves an idle one when
     /// seeding is off: paused, with the engine's record that the pause is
     /// the idle policy's. The reconciler fixtures abort that sweep, so its
@@ -8610,6 +8685,102 @@ mod tests {
     async fn idle_pause(engine: &Arc<Engine<FakeHandle>>) {
         engine.idle_paused.store(true, Ordering::Relaxed);
         engine.handle.pause_torrent().await.unwrap();
+    }
+
+    /// The read refusal is the free-space arm's, and it goes when that arm
+    /// is not the one deciding -- here on the pass that finds the torrent
+    /// already running.
+    ///
+    /// The refusal used to be lifted only by the reconciler's own
+    /// `start_torrent`, and this is the sequence that leaves no such start
+    /// to hang it on. It is all ordinary: seeding off (the idle policy's
+    /// own precondition), so the sweep pauses the torrent; the volume then
+    /// falls under the floor and stays there past the stall bound, so the
+    /// free-space arm -- which sits above the idle arm and does not care
+    /// which pause the torrent is under -- fails its readers; the cleaner
+    /// empties the volume; and the user presses play. `activate_file`
+    /// resumes the idle pause first, so by the time the playback's own
+    /// reconcile answers `Run` the torrent is `Live` and there is nothing
+    /// to start. Every read on that engine then failed with `StorageFull`,
+    /// for good, on a volume with room to spare.
+    #[tokio::test(start_paused = true)]
+    async fn a_playback_that_finds_its_torrent_running_still_lifts_the_read_refusal() {
+        let (mut enginefs, _counters) = test_enginefs_for_reconciler(1);
+        let available = Arc::new(AtomicU64::new(0));
+        let probe_available = available.clone();
+        enginefs.set_free_space_probe(move |_| Ok(probe_available.load(Ordering::SeqCst)));
+        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        idle_pause(&engine).await;
+
+        enginefs.reconcile_tick().await;
+        tokio::time::advance(STOPPED_READ_STALL_BOUND).await;
+        enginefs.reconcile_tick().await;
+        assert_eq!(
+            poll_a_read(&engine)
+                .await
+                .expect("nothing is fetching for this read")
+                .kind(),
+            std::io::ErrorKind::StorageFull
+        );
+
+        // The cleaner empties the volume; the user presses play.
+        available.store(u64::MAX, Ordering::SeqCst);
+        enginefs.on_stream_start(TEST_HASH, 0).await;
+        assert_eq!(
+            run_state_of(&enginefs, TEST_HASH).await,
+            RunState::Live,
+            "the resume in `activate_file` lifted the idle pause"
+        );
+        assert!(
+            poll_a_read(&engine).await.is_none(),
+            "and its reads work again on a volume with room to spare"
+        );
+    }
+
+    /// The same refusal, lifted by the arm that starts nothing at all.
+    ///
+    /// The cleaner makes room while the torrent is still the idle policy's,
+    /// so the pass that follows answers the idle arm's `Stop`: no start, no
+    /// call of any kind. The refusal still has to go -- it says the device
+    /// has no room, and the device has room.
+    #[tokio::test(start_paused = true)]
+    async fn a_volume_with_room_lifts_the_refusal_of_a_torrent_the_idle_policy_holds() {
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
+        let available = Arc::new(AtomicU64::new(0));
+        let probe_available = available.clone();
+        enginefs.set_free_space_probe(move |_| Ok(probe_available.load(Ordering::SeqCst)));
+        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        idle_pause(&engine).await;
+
+        enginefs.reconcile_tick().await;
+        tokio::time::advance(STOPPED_READ_STALL_BOUND).await;
+        enginefs.reconcile_tick().await;
+        assert_eq!(
+            poll_a_read(&engine)
+                .await
+                .expect("nothing is fetching for this read")
+                .kind(),
+            std::io::ErrorKind::StorageFull
+        );
+
+        available.store(u64::MAX, Ordering::SeqCst);
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), Decision::Stop)],
+            "nothing is playing, so this pass is the idle arm's"
+        );
+        assert_eq!(
+            run_state_of(&enginefs, TEST_HASH).await,
+            RunState::Paused,
+            "which starts nothing"
+        );
+        assert_eq!(counters.start_torrent.load(Ordering::SeqCst), 0);
+        assert!(
+            poll_a_read(&engine).await.is_none(),
+            "and its reads still stop failing for a disk that is no longer full"
+        );
     }
 
     /// A torrent that is paused for a reason of its own, on a volume the
