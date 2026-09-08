@@ -157,6 +157,39 @@ struct StreamLifecycleGuard {
 }
 
 impl StreamLifecycleGuard {
+    /// Register the stream and take ownership of ending it, with no await
+    /// in between.
+    ///
+    /// These were two statements in the handler with two more awaits
+    /// between them, and the gap was a leak with no floor under it. A
+    /// registered stream is ended by exactly one thing -- this guard's
+    /// `on_stream_end` -- and until the guard exists there is nothing to
+    /// end it; drop the handler's future in the gap, which is how every
+    /// one of these handlers ends when a player closes the connection, and
+    /// `active_streams` and `active_file_streams` stay up for the life of
+    /// the process. `torrent_activity_registers` then reads `playing` true
+    /// for that torrent for ever, so the idle arm can never fire, the
+    /// sweep never removes the engine, and with seeding off it downloads a
+    /// film nobody is watching until the server is restarted.
+    ///
+    /// The handover is what this function is: `on_stream_start` undoes its
+    /// own registration if it is dropped before it returns (see
+    /// `BackendEngineFS::on_stream_start`), and from the instant it does
+    /// return the guard owns it. Putting the two in one function with no
+    /// `.await` between them is what leaves no third state -- a cancel can
+    /// only land at an await, so there is no point at which a registration
+    /// exists that neither side is holding. Written out in the handler it
+    /// was a comment asking the next reader not to reorder them.
+    async fn start(
+        engine: Arc<enginefs::EngineFS>,
+        info_hash: String,
+        file_idx: usize,
+        stream_id: u64,
+    ) -> Self {
+        engine.on_stream_start(&info_hash, file_idx).await;
+        Self::new(engine.clone(), info_hash, file_idx, stream_id)
+    }
+
     fn new(
         engine: Arc<enginefs::EngineFS>,
         info_hash: String,
@@ -1097,7 +1130,11 @@ async fn stream_video_with(
     }
 
     // --- Stream Lifecycle: Notify start only after validation has succeeded. ---
-    engine_fs.on_stream_start(&info_hash, idx).await;
+    // Registration and the guard that ends it, with no await between them,
+    // so a cancelled request never leaves a stream registered that nothing
+    // is holding. See `StreamLifecycleGuard::start`.
+    let lifecycle =
+        StreamLifecycleGuard::start(engine_fs.clone(), info_hash.clone(), idx, stream_id).await;
     if !native_lifecycle {
         engine_fs
             .activate_multifile_file_for_playback(
@@ -1113,9 +1150,6 @@ async fn stream_video_with(
                 "stream-read",
             )
             .await;
-    }
-    let lifecycle = StreamLifecycleGuard::new(engine_fs.clone(), info_hash.clone(), idx, stream_id);
-    if !native_lifecycle {
         engine_fs.focus_torrent(&info_hash).await;
     }
 

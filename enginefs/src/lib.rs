@@ -900,6 +900,145 @@ pub struct StoppedTorrent {
 
 pub type EngineFS = BackendEngineFS<LibrqbitBackend>;
 
+/// Undoes what [`BackendEngineFS::on_stream_start`] registered, if that call
+/// is dropped before it returns.
+///
+/// The registers a stream start writes -- the two stream counters, and for
+/// a multi-file torrent the active selection -- have **no expiry**. Nothing
+/// ages them out and nothing recomputes them; they are ended by the caller
+/// calling [`BackendEngineFS::on_stream_end`], and by nothing else. So a
+/// registration that outlives the call which wrote it is not a stale
+/// reading that corrects itself, it is a permanent one:
+/// `torrent_activity_registers` reads `playing` true for that torrent for
+/// the life of the process, the idle arm can therefore never fire, the
+/// housekeeping sweep never removes the engine, and with seeding off the
+/// torrent downloads a film nobody is watching until the server restarts.
+///
+/// The window is not small. `on_stream_start` increments both counters and
+/// then **awaits** the reconcile, which is inside the backend for as long
+/// as starting a torrent takes; before that it awaits `activate_file`,
+/// which for a multi-file torrent awaits the backend again. Dropping that
+/// future is not an edge case either -- it is how every one of these
+/// handlers ends when a player closes the connection.
+///
+/// It undoes only what it saw land, so it is correct under concurrency: it
+/// decrements the counters it incremented rather than removing the entries
+/// (another stream on the same file keeps its own count), and it drops the
+/// multi-file selection only when the file it names has no stream left at
+/// all.
+///
+/// **Exactly one of this and the caller's guard ever fires**: returning
+/// from `on_stream_start` is what disarms this, and the caller has no
+/// registration to end until `on_stream_start` has returned. Two owners
+/// decrementing for one increment would end somebody else's stream, which
+/// is the failure this is not allowed to trade for.
+struct StreamStartRollback {
+    active_streams: Arc<RwLock<HashMap<String, usize>>>,
+    active_file_streams: Arc<RwLock<HashMap<(String, usize), usize>>>,
+    active_multifile_files: Arc<RwLock<HashMap<String, MultiFileActiveSelection>>>,
+    active_file: Arc<RwLock<Option<(String, usize)>>>,
+    key: (String, usize),
+    counted_stream: bool,
+    counted_file_stream: bool,
+    armed: bool,
+}
+
+impl StreamStartRollback {
+    fn armed<B: TorrentBackend + 'static>(
+        efs: &BackendEngineFS<B>,
+        info_hash: String,
+        file_idx: usize,
+    ) -> Self {
+        Self {
+            active_streams: efs.active_streams.clone(),
+            active_file_streams: efs.active_file_streams.clone(),
+            active_multifile_files: efs.active_multifile_files.clone(),
+            active_file: efs.active_file.clone(),
+            key: (info_hash, file_idx),
+            counted_stream: false,
+            counted_file_stream: false,
+            armed: true,
+        }
+    }
+
+    /// The torrent-wide counter has been incremented.
+    fn counted_stream(&mut self) {
+        self.counted_stream = true;
+    }
+
+    /// The per-file counter has been incremented.
+    fn counted_file_stream(&mut self) {
+        self.counted_file_stream = true;
+    }
+
+    /// `on_stream_start` returned; the caller owns the registration now.
+    fn handed_over(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StreamStartRollback {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let active_streams = self.active_streams.clone();
+        let active_file_streams = self.active_file_streams.clone();
+        let active_multifile_files = self.active_multifile_files.clone();
+        let active_file = self.active_file.clone();
+        let key = std::mem::take(&mut self.key);
+        let counted_stream = self.counted_stream;
+        let counted_file_stream = self.counted_file_stream;
+        // Spawned because the maps are async locks and a `Drop` cannot
+        // await one. The task is the whole of the undo, so nothing is left
+        // half-undone if the runtime stops it: every step of it is
+        // idempotent and conditional on what is still there.
+        tokio::spawn(async move {
+            if counted_stream {
+                let mut streams = active_streams.write().await;
+                if let Some(count) = streams.get_mut(&key.0) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        streams.remove(&key.0);
+                    }
+                }
+            }
+            let file_streams_remain = {
+                let mut streams = active_file_streams.write().await;
+                if counted_file_stream && let Some(count) = streams.get_mut(&key) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        streams.remove(&key);
+                    }
+                }
+                streams.contains_key(&key)
+            };
+            // A stream that is still reading this file owns the selection;
+            // only a file nothing is left reading gives it up.
+            if !file_streams_remain {
+                {
+                    let mut selections = active_multifile_files.write().await;
+                    if selections
+                        .get(&key.0)
+                        .is_some_and(|selection| selection.file_idx == key.1)
+                    {
+                        selections.remove(&key.0);
+                    }
+                }
+                let mut active = active_file.write().await;
+                if active.as_ref() == Some(&key) {
+                    *active = None;
+                }
+            }
+            tracing::debug!(
+                info_hash = %key.0,
+                file_idx = key.1,
+                "stream start rolled back: its caller walked away before it returned"
+            );
+        });
+    }
+}
+
 impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     pub fn new_with_backend(
         backend: B,
@@ -2785,8 +2924,17 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
 
     /// Called when a stream starts for a torrent file.
     /// Several torrent files may be active at once; cleanup is per file stream.
+    ///
+    /// **Cancel-safe**: dropped before it returns, it leaves nothing
+    /// registered. See [`StreamStartRollback`] for what that is worth --
+    /// the registers this writes have no expiry, so one that outlives the
+    /// request that wrote it is read as `playing` for the life of the
+    /// process. Once this *has* returned the caller owns the registration
+    /// and must end it with [`Self::on_stream_end`]; the two never both
+    /// fire, because returning is what disarms the rollback.
     pub async fn on_stream_start(&self, info_hash: &str, file_idx: usize) {
         let info_hash = info_hash.to_lowercase();
+        let mut rollback = StreamStartRollback::armed(self, info_hash.clone(), file_idx);
         let native_lifecycle = self
             .get_engine(&info_hash)
             .await
@@ -2807,11 +2955,13 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             let count = streams.entry(info_hash.clone()).or_insert(0);
             *count += 1;
         }
+        rollback.counted_stream();
         {
             let mut streams = self.active_file_streams.write().await;
             let count = streams.entry((info_hash.clone(), file_idx)).or_insert(0);
             *count += 1;
         }
+        rollback.counted_file_stream();
 
         tracing::debug!(
             "Stream started for {} file_idx={} (shared mode)",
@@ -2835,6 +2985,9 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         // reconciler's and only the reconciler's.
         self.reconcile_hash(&info_hash, crate::reconcile::Trigger::PlaybackStart)
             .await;
+
+        // Handed over: from here the caller's guard owns the registration.
+        rollback.handed_over();
     }
 
     /// Mark the torrent as active: librqbit has no session-wide streaming
@@ -9380,6 +9533,62 @@ mod tests {
         // property that makes an abandoned reconcile harmless.
         enginefs.reconcile_tick().await;
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
+    }
+
+    /// The same request, walking away at the same moment, leaves no stream
+    /// registered either.
+    ///
+    /// `on_stream_start` increments both stream counters and *then* awaits
+    /// the reconcile, which is inside the backend for as long as starting a
+    /// torrent takes. The registers it writes have no expiry: nothing ages
+    /// them out, and the only thing that ends one is the `on_stream_end`
+    /// the caller's guard makes -- which does not exist yet, because
+    /// `on_stream_start` has not returned. So a count left behind here is
+    /// left behind for good, and the server answers "something is playing"
+    /// about this torrent for the rest of the process: the idle arm can
+    /// never fire and the sweep never removes the engine.
+    ///
+    /// Asserted through `playback_is_live`, which is what a client polls
+    /// for its activity light, rather than through the counters themselves.
+    #[tokio::test]
+    async fn a_stream_start_whose_caller_walked_away_registers_no_stream() {
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        let enginefs = Arc::new(enginefs);
+        stop_torrent(&enginefs, TEST_HASH).await;
+        assert!(
+            !enginefs.playback_is_live().await,
+            "nothing is playing before the request arrives"
+        );
+
+        counters.hold_start.store(true, Ordering::SeqCst);
+        let request = tokio::spawn({
+            let enginefs = enginefs.clone();
+            async move { enginefs.on_stream_start(TEST_HASH, 0).await }
+        });
+        assert!(
+            wait_until(TEST_WAIT_BOUND, || counters
+                .start_torrent
+                .load(Ordering::SeqCst)
+                == 1)
+            .await,
+            "the stream is registered and the reconcile it triggered is inside the backend"
+        );
+
+        // The player closed the connection before there was a body to read.
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        counters.hold_start.store(false, Ordering::SeqCst);
+        counters.start_gate.notify_one();
+
+        let deadline = tokio::time::Instant::now() + TEST_WAIT_BOUND;
+        while enginefs.playback_is_live().await {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the stream the abandoned request registered is still registered"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// A torrent asked to be focused runs, with nothing else registered
