@@ -4336,12 +4336,33 @@ mod tests {
             "a paused torrent is not paused twice"
         );
         handle.resume_torrent().await.expect("and this lifts it");
-        assert!(!handle.handle.is_paused());
+        assert_eq!(handle.run_state(), RunState::Live);
         handle
             .resume_torrent()
             .await
             .expect("a second resume is a no-op again");
-        assert!(!handle.handle.is_paused());
+        assert_eq!(handle.run_state(), RunState::Live);
+
+        // The idle policy's pause, lifted by the reconciler rather than by
+        // the policy that took it -- which is what happens the moment the
+        // volume clears under an idle-paused torrent. The record of that
+        // pause has to go with it: left behind, the next playback start's
+        // `resume_torrent` would find the hash listed, call
+        // `Session::unpause` on a torrent that is already live, and log
+        // librqbit's complaint on an ordinary playback of an ordinary
+        // torrent.
+        handle.pause_torrent().await.expect("the idle pause pauses");
+        assert_eq!(wait_until_settled(&handle).await, RunState::Paused);
+        handle
+            .start_torrent()
+            .await
+            .expect("the reconciler starts it");
+        assert_eq!(handle.run_state(), RunState::Live);
+        handle
+            .resume_torrent()
+            .await
+            .expect("and the playback start that follows finds nothing to lift");
+        assert_eq!(handle.run_state(), RunState::Live);
     }
 
     /// How far a torrent's initial check has got, or `None` once it is past
