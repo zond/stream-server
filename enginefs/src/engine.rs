@@ -250,12 +250,13 @@ impl GetFileError {
 /// **Not a time, and deliberately not `0`.** [`crate::Clock::now_secs`] is
 /// `epoch.elapsed().as_secs()` from an instant taken when *this process*
 /// started, so `0` on that clock does not mean "long ago", it means "now, at
-/// boot". Seeding the idle clock with it says a torrent the previous process
-/// left behind was active a moment ago, which hands every restored torrent a
-/// fresh grace period on every restart -- so an app that restarts often never
-/// idle-pauses anything. That was the third time this design stored a value
-/// the process invented at startup and then read it back as an observation;
-/// the first two were `idle_paused` and `last_accessed`.
+/// boot" -- and it is a reading a torrent really can have, for the whole of
+/// the first second. Giving a restored torrent any reading at all says it
+/// was active a moment ago, which hands it a fresh grace period on every
+/// restart -- so an app that restarts often never idle-pauses anything. That
+/// was the third time this design stored a value the process invented at
+/// startup and then read it back as an observation; the first two were
+/// `idle_paused` and `last_accessed`.
 ///
 /// "Nothing has used this since I started" and "the last use was at my start"
 /// are not the same statement: the first is about this process's knowledge,
@@ -275,8 +276,8 @@ const NEVER_ACTIVE: u64 = u64::MAX;
 /// [`Engine::last_transition_at`] for a torrent the reconciler has never
 /// started or stopped.
 ///
-/// A sentinel, and it cannot be `0` the way [`EPOCH`] can. `0` is a real
-/// reading here -- [`crate::Clock::now_secs`] is `epoch.elapsed().as_secs()`,
+/// A sentinel, and it cannot be `0`. `0` is a real reading here --
+/// [`crate::Clock::now_secs`] is `epoch.elapsed().as_secs()`,
 /// so it answers `0` for the whole first second of the process -- and the
 /// two claims it would then carry disagree: "this reconciler has never
 /// moved this torrent", which exempts it from the dwell, and "this
@@ -378,26 +379,30 @@ pub struct Engine<H: TorrentHandle> {
     /// `BackendEngineFS::torrent_is_active` actually reads true, so looking
     /// is not using.
     ///
-    /// **It starts at the clock's epoch -- `0`, the instant this process
-    /// built its [`crate::Clock`] -- and not at `clock.now_secs()`.** The
-    /// distinction is the whole of the defect this field replaced. Seeded
-    /// per engine at `now` it claims "something used this torrent just now",
-    /// which for an engine made for a torrent the *previous* process left
-    /// behind is a claim about a past this process never saw, and for one
-    /// made an hour into the run is a claim about a use that never
-    /// happened; either way the idle arm cannot fire for a whole grace
-    /// after the engine appears, which with seeding off is a torrent
-    /// nobody asked for announcing, finding peers and downloading. Seeded
-    /// at the epoch it says something true and checkable instead --
-    /// *nothing has used this since this process started* -- so the grace
-    /// is measured from the only instant this process can vouch for, and a
-    /// torrent restored into a fresh process becomes eligible for the idle
-    /// pause once that grace has actually run out.
+    /// **There are two seeds, because the two kinds of engine can vouch for
+    /// different things**, and the whole of the defect this field replaced
+    /// was one value being wrong for half its callers.
     ///
-    /// `0` needs no sentinel here, and must not have one. A real reading of
-    /// [`NEVER_ACTIVE`] until something is actually seen using it, which is
-    /// an absence and not a time; `0` is a real reading here (something used
-    /// the torrent inside the first second) and cannot double as the seed.
+    /// * An engine this process *made* is seeded with the creation instant
+    ///   (`clock.now_secs()`), and that is a real observation: nothing can
+    ///   have used a torrent in an interval that did not exist. Seeding it
+    ///   with an absence instead paused a freshly added torrent on its
+    ///   first tick with seeding off, dropping the swarm it had just
+    ///   dialled and paying a re-announce at the start of playback.
+    /// * An engine built over a torrent a *previous* process left behind is
+    ///   given [`NEVER_ACTIVE`] by [`Self::forget_last_active`], because
+    ///   this process has no reading at all. Stamping `now` there would be
+    ///   the claim this design keeps having to delete -- "used at boot" for
+    ///   something nobody has touched in a week -- which hands every
+    ///   restored torrent a fresh grace period on every restart, so an app
+    ///   that restarts often idle-pauses nothing.
+    ///
+    /// So the absence is carried as an absence: [`Self::quiet_for`] answers
+    /// `Option`, `None` where there is no reading, and the idle arm reads
+    /// `None` as quiet -- a torrent nobody is watching is eligible to be
+    /// paused whether or not we can say for how long. `0` is not the seed
+    /// and is not a sentinel: it is an ordinary reading meaning something
+    /// used the torrent inside this process's first second.
     ///
     /// [`Self::settled`]: Engine::settled
     last_active_at: AtomicU64,

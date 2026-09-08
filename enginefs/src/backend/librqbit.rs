@@ -6918,9 +6918,8 @@ mod tests {
 
     /// The other side of that restart, and the one nothing on this branch
     /// covered: with seeding turned off, a torrent the last process left
-    /// stopped is stopped again once the idle grace has run out -- and the
-    /// grace is measured from the instant *this* process started, so it
-    /// really does have to run out.
+    /// stopped is stopped again -- at once, because there is no reading of
+    /// when it was last used to measure a grace from.
     ///
     /// The reconciler starts anything the ladder says should run, the
     /// previous process's pause included -- that is the point of it -- so

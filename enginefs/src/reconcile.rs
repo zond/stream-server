@@ -123,22 +123,23 @@ pub struct Conditions {
     /// How long since anything was **using** this torrent -- a stream, a
     /// file read, a multi-file selection.
     ///
-    /// For a torrent nothing has used yet it is the time since **this
-    /// process started**, which is the honest reading of a use that has not
-    /// happened: this process can vouch for its own uptime and for nothing
-    /// before it. It is never "idle for no time at all", which is what a
-    /// per-engine `now` would make it -- a fresh timestamp standing in for
-    /// a past the process did not see, the same claim every record this
-    /// design deleted was making.
+    /// `None` for a torrent nothing has been seen using at all -- a
+    /// restored one, most often, since a torrent a previous process left
+    /// behind comes back with no reading this process can vouch for
+    /// (`Engine::forget_last_active`). That is an absence, not a zero and
+    /// not a fresh `now`: filling it in would claim the torrent was active
+    /// at boot and hand it a whole grace period on every restart, which is
+    /// the same claim every record this design deleted was making. A
+    /// torrent *this* process added is stamped with its creation instant,
+    /// which is a real observation -- nothing can have used it in an
+    /// interval that did not exist.
     ///
     /// It is **not** the registry's idle-eviction clock, which counts
     /// lookups: see `Engine::last_active_at`.
     ///
-    /// `None` where nothing has been seen using the torrent at all -- a
-    /// restored one, most often. That is an absence, not a zero: the clock
-    /// this is measured on starts at the process, so filling it in would
-    /// claim the torrent was active at boot and hand it a fresh grace period
-    /// on every restart. The idle arm reads `None` as quiet.
+    /// The idle arm reads `None` as quiet: a torrent nobody is watching may
+    /// be paused whether or not we can say for how long, and after a restart
+    /// there is no recent stream for the grace to protect.
     pub idle_for: Option<Duration>,
 }
 
@@ -195,10 +196,10 @@ pub struct Conditions {
 ///    is fetching a film nobody is watching while we have promised to
 ///    upload nothing. [`crate::INACTIVE_TORRENT_PAUSE_GRACE`] of quiet
 ///    first, so a player that stops one segment and starts the next does
-///    not stop and start the torrent with it -- and for a torrent nothing
-///    has used in this process at all, the grace runs from the instant the
-///    process started ([`Conditions::idle_for`]), so a restart's own
-///    torrents become eligible when it has really run out and not before.
+///    not stop and start the torrent with it -- and a torrent nothing has
+///    been seen using at all ([`Conditions::idle_for`] `None`, a restored
+///    one) counts as quiet, because there is no recent stream for the grace
+///    to protect.
 /// 8. Otherwise **[`Decision::Run`]**.
 pub fn desired(conditions: &Conditions, trigger: Trigger) -> Decision {
     verdict(conditions, trigger).decision
