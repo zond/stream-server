@@ -61,11 +61,12 @@ const INACTIVE_TORRENT_REMOVE_TIMEOUT: Duration = Duration::from_secs(300); // 5
 /// can therefore settle the volume under this line by design, and the
 /// reconciler stops it there like anything else.
 pub const CACHE_FREE_SPACE_FLOOR: u64 = 512 * 1024 * 1024;
-/// How often the reconciler reads the volume. One `statvfs` per distinct
-/// output folder per tick -- microseconds -- so it can afford to be short,
-/// and it has to be: a torrent at 20 MB/s writes 40 MB per tick past the
-/// floor before anything sees it. [`reconcile::RECONCILE_INTERVAL`] is an
-/// alias of this, so the pass and the reading cannot drift apart.
+/// How often the reconciler reads the volume. One `statvfs` per tick, since
+/// there is one volume -- the piece store's -- microseconds, so it can
+/// afford to be short, and it has to be: a torrent at 20 MB/s writes 40 MB
+/// per tick past the floor before anything sees it.
+/// [`reconcile::RECONCILE_INTERVAL`] is an alias of this, so the pass and
+/// the reading cannot drift apart.
 pub const FREE_SPACE_WATCH_INTERVAL: Duration = Duration::from_secs(2);
 /// A stopped torrent is started again only once the volume has this much
 /// *over* the floor. Without the hysteresis a torrent started at the floor
@@ -307,8 +308,8 @@ pub enum PinDownloadError {
     /// The torrent has no such file.
     #[error("file index {file_idx} out of range ({file_count} files)")]
     FileNotFound { file_idx: usize, file_count: usize },
-    /// The download volume has less than the file's missing bytes plus
-    /// [`PIN_FREE_SPACE_MARGIN`] available.
+    /// The volume the pieces land on has less than the file's missing bytes
+    /// plus [`PIN_FREE_SPACE_MARGIN`] available.
     #[error(
         "not enough free space for the download: {required} bytes needed (including a {margin} byte margin), {available} available"
     )]
@@ -403,26 +404,9 @@ fn probe_at_existing_ancestor(
     Err(last_error.unwrap_or_else(|| std::io::Error::other("empty path")))
 }
 
-/// Bytes a file has allocated on disk (`st_blocks` * 512 on Unix): a
-/// pre-sized sparse placeholder has none, a file with data written about
-/// its length. 0 where std exposes no block count, or the file cannot be
-/// read.
-#[cfg(unix)]
-fn allocated_bytes(path: &std::path::Path) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(path)
-        .map(|metadata| metadata.blocks().saturating_mul(512))
-        .unwrap_or(0)
-}
-
-#[cfg(not(unix))]
-fn allocated_bytes(_path: &std::path::Path) -> u64 {
-    0
-}
-
 /// `Fn(path) -> u64` probe of the volume holding a path: available bytes
-/// (`fs4::available_space`) or an identity (`volume_id`) telling two
-/// paths on the same volume apart from two on different ones.
+/// (`fs4::available_space`), or an identity (`volume_id`) telling two paths
+/// on the same volume apart from two on different ones.
 type VolumeProbe = Arc<dyn Fn(&std::path::Path) -> std::io::Result<u64> + Send + Sync>;
 
 /// An identity of the volume holding `path`, equal for two paths on the
@@ -699,13 +683,10 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     /// and applied by the next `pin_download` of the torrent, or dropped by
     /// `unpin_download`. Never held across an `.await`.
     dormant_pins: parking_lot::Mutex<BTreeMap<String, std::collections::BTreeSet<usize>>>,
-    /// Available-bytes probe for the free-space check in `pin_download`
-    /// (`fs4::available_space`; tests substitute one).
+    /// Available-bytes probe for the free-space check in `pin_download` and
+    /// for the reconciler's arm (`fs4::available_space`; tests substitute
+    /// one). Both ask it about one folder: the piece store's root.
     free_space_probe: VolumeProbe,
-    /// Volume-identity probe telling whether a relocation stays on one
-    /// volume (a rename, free) or crosses to another (a copy, which the
-    /// free-space check has to size; `volume_id`, tests substitute one).
-    volume_id_probe: VolumeProbe,
     /// Epoch of every `*_secs` timestamp this instance and its engines keep.
     clock: Clock,
     /// The housekeeping sweep started by the constructor, kept so its owner
@@ -1079,7 +1060,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 Some(bytes) => Ok(bytes),
                 None => fs4::available_space(path),
             }),
-            volume_id_probe: Arc::new(volume_id),
             clock,
             sweep_task: parking_lot::Mutex::new(None),
             out_of_space_notify: Arc::new(tokio::sync::Notify::new()),
@@ -3085,9 +3065,12 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         // Asked before the add, which creates the folder: one that already
         // exists may hold the data of an earlier session whose backend
         // records are gone (a purged cache dir with the downloads dir
-        // intact) -- data a refused pin must not delete, and that the
-        // free-space check must not count as missing while the backend is
-        // still checking it (`downloaded` reads 0 until then).
+        // intact) -- data a refused pin must not delete.
+        //
+        // It says nothing about what *this* session can read, and so
+        // nothing to the free-space check: the torrent's data lives in the
+        // piece store now, and whole files an earlier version wrote are
+        // neither converted nor read (see `check_pin_preconditions`).
         let folder_existed = match &folder {
             Some(folder) => tokio::fs::try_exists(folder).await.unwrap_or(false),
             None => false,
@@ -3100,12 +3083,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             .add_magnet_placed(info_hash, extra_trackers.clone(), placement)
             .await?;
         let checked = self
-            .check_pin_preconditions(
-                &engine,
-                file_idx,
-                folder.as_deref(),
-                was_managed || folder_existed,
-            )
+            .check_pin_preconditions(&engine, file_idx, was_managed)
             .await;
         if let Err(error) = checked {
             // Torn down only when demonstrably this pin's and nobody
@@ -3804,33 +3782,47 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             .collect()
     }
 
-    /// The file exists, and the volume it is (or will be) written to has
-    /// room for what the pin will write there plus [`PIN_FREE_SPACE_MARGIN`]:
-    /// the file's missing bytes -- or, when the pin relocates the torrent
-    /// onto another volume, the full length of every file the move copies
-    /// (the pinned file, and any other file with verified data; see
-    /// `TorrentBackend::relocate_torrent`), since a copy writes sparse
-    /// files out in full and the pinned file's rest is downloaded there.
-    /// A relocation within one volume is a rename and costs nothing beyond
-    /// the missing bytes. A volume that cannot be probed is not held against
-    /// the pin (logged); volumes whose identity cannot be told apart are
-    /// assumed different (the strict side).
+    /// The file exists, and the volume the pin's bytes land on has room for
+    /// what it will write plus [`PIN_FREE_SPACE_MARGIN`]: the pinned file's
+    /// missing bytes.
     ///
-    /// A torrent that stays where it is and is still `checking` data that
-    /// may already be there (`may_have_data_in_place`: it was managed
-    /// before this call -- a restart, a relocation -- or the pin added it
-    /// into a folder that already existed) is not measured at all:
+    /// **That volume is the piece store's root, for every torrent**
+    /// ([`crate::piece_store::root_in`] of the engine's download dir) --
+    /// not the folder the placement names. A pin places the torrent at
+    /// `<downloadsDir>/<infoHash>`, a setting whose entire purpose is a
+    /// second card, and no payload byte is written there: the store is the
+    /// session's default storage and takes one root of its own (see
+    /// `backend::librqbit::session_storage_factory`). Probing the placement
+    /// therefore passed a pin onto a full store and refused one with all
+    /// the room it needed.
+    ///
+    /// **The missing bytes and nothing else.** This used to size a pin that
+    /// relocates the torrent onto another volume as a *copy* of every file
+    /// with data in it, because the move rewrote each of them at the
+    /// destination. A relocation moves a name now -- the output folder
+    /// librqbit records and reports paths under -- and the pieces do not
+    /// move at all, so there is nothing for it to copy and nowhere else for
+    /// the download to land. (`TorrentBackend::relocate_torrent` still
+    /// moves whatever plain files an older version of this server left in
+    /// the old folder; by the same decision that leaves them there,
+    /// unconverted, nothing sizes that -- they are cache for the cleaner.)
+    ///
+    /// A volume that cannot be probed is not held against the pin (logged).
+    ///
+    /// A torrent that is still `checking` data that may already be there
+    /// (`may_have_data_in_place`: it was managed before this call -- a
+    /// restart, a relocation, a stream) is not measured at all:
     /// `downloaded` reads 0 until the check ends, so a complete file would
     /// be refused as if it had everything left to write -- and refusing
-    /// changes nothing about a download librqbit already wants. A torrent
-    /// measured while checking -- one the pin relocates, or added into a
-    /// fresh folder -- counts what its files have allocated on disk
-    /// instead of `downloaded` (see `allocated_bytes`).
+    /// changes nothing about a download librqbit already wants. Where the
+    /// pin puts the torrent makes no difference to that any more, since it
+    /// makes none to where the data is. A torrent this pin *added* is
+    /// measured even while it checks: nothing of it is on disk, and the 0
+    /// its files report is the truth about it.
     async fn check_pin_preconditions(
         &self,
         engine: &Arc<Engine<B::Handle>>,
         file_idx: usize,
-        folder: Option<&std::path::Path>,
         may_have_data_in_place: bool,
     ) -> Result<(), PinDownloadError> {
         let file_count = engine.handle.file_count().await;
@@ -3841,61 +3833,18 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             });
         }
         let stats = engine.handle.stats().await;
-        let current = engine.handle.output_folder();
-        let relocating_to = match (folder, current.as_deref()) {
-            (Some(folder), Some(current)) if folder != current => Some(folder),
-            _ => None,
-        };
-        if may_have_data_in_place
-            && relocating_to.is_none()
-            && stats.phase == crate::backend::StartupPhase::Checking
-        {
+        if may_have_data_in_place && stats.phase == crate::backend::StartupPhase::Checking {
             return Ok(());
         }
-        let crosses_volumes = match (relocating_to, current.as_deref()) {
-            (Some(to), Some(from)) => !self.same_volume(from, to),
-            _ => false,
-        };
-        // While the torrent is checking, `downloaded` reads 0 for every
-        // file. Measured anyway (about to be moved -- a pin during a
-        // restart's check -- or freshly added), each file counts what it
-        // has allocated on disk, the fallback the backend's relocation
-        // uses to decide what moves. Nothing allocated, no path, or no
-        // block counts on this platform is the strict side: all missing.
-        let checking = stats.phase == crate::backend::StartupPhase::Checking;
-        let mut have = Vec::with_capacity(stats.files.len());
-        for (idx, file) in stats.files.iter().enumerate() {
-            have.push(if checking {
-                match engine.handle.file_path(idx).await {
-                    Some(path) => allocated_bytes(&path).min(file.length),
-                    None => 0,
-                }
-            } else {
-                file.downloaded
-            });
-        }
-        let required = if crosses_volumes {
-            stats
-                .files
-                .iter()
-                .enumerate()
-                .filter(|(idx, _)| *idx == file_idx || have[*idx] > 0)
-                .map(|(_, file)| file.length)
-                .fold(0u64, u64::saturating_add)
-        } else {
-            stats
-                .files
-                .get(file_idx)
-                .map(|file| file.length.saturating_sub(have[file_idx]))
-                .unwrap_or(0)
-        };
+        let required = stats
+            .files
+            .get(file_idx)
+            .map(|file| file.length.saturating_sub(file.downloaded))
+            .unwrap_or(0);
         if required == 0 {
             return Ok(());
         }
-        let volume = folder
-            .map(std::path::Path::to_path_buf)
-            .or(current)
-            .unwrap_or_else(|| self.download_dir.clone());
+        let volume = crate::piece_store::root_in(&self.download_dir);
         match probe_at_existing_ancestor(&*self.free_space_probe, &volume) {
             Ok(available) if free_space_allows(available, required, PIN_FREE_SPACE_MARGIN) => {
                 Ok(())
@@ -3917,43 +3866,12 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
     }
 
-    /// Whether `from` and `to` (or their nearest existing ancestors) are on
-    /// the same volume. Unknown counts as different: the free-space check
-    /// then sizes a copy rather than a rename.
-    fn same_volume(&self, from: &std::path::Path, to: &std::path::Path) -> bool {
-        let probe = &*self.volume_id_probe;
-        match (
-            probe_at_existing_ancestor(probe, from),
-            probe_at_existing_ancestor(probe, to),
-        ) {
-            (Ok(a), Ok(b)) => a == b,
-            (from_id, to_id) => {
-                debug!(
-                    from = %from.display(),
-                    to = %to.display(),
-                    ?from_id,
-                    ?to_id,
-                    "volume identity unknown; sizing the relocation as a copy"
-                );
-                false
-            }
-        }
-    }
-
     #[cfg(test)]
     fn set_free_space_probe(
         &mut self,
         probe: impl Fn(&std::path::Path) -> std::io::Result<u64> + Send + Sync + 'static,
     ) {
         self.free_space_probe = Arc::new(probe);
-    }
-
-    #[cfg(test)]
-    fn set_volume_id_probe(
-        &mut self,
-        probe: impl Fn(&std::path::Path) -> std::io::Result<u64> + Send + Sync + 'static,
-    ) {
-        self.volume_id_probe = Arc::new(probe);
     }
 
     /// Where pinned downloads go: `<dir>/<info hash>` per torrent, or the
@@ -9535,81 +9453,68 @@ mod tests {
         enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
     }
 
-    /// A pin that relocates the torrent onto another volume has to fit what
-    /// the move copies -- the pinned file in full plus every other file with
-    /// verified data (placeholders stay behind) -- not just the pinned
-    /// file's missing bytes; on one volume the move is a rename and only the
-    /// missing bytes count. Volumes that cannot be told apart are sized as
-    /// a copy.
+    /// A pin is measured against the volume its bytes land on, which is the
+    /// piece store's root and not the folder the placement names. Those are
+    /// two cards whenever `downloadsDir` is set, which is the whole purpose
+    /// of the setting -- so probing the placement passed a pin onto a full
+    /// store, and refused one that had all the room it needed.
     #[tokio::test]
-    async fn relocation_across_volumes_needs_room_for_what_it_copies() {
-        // Three 100-byte files, half downloaded each: every file has data,
-        // so a cross-volume move copies all 300 bytes.
-        let cross_volume = |enginefs: &mut BackendEngineFS<FakeBackend>| {
-            enginefs
-                .set_volume_id_probe(|path| Ok(if path.starts_with("/offline") { 2 } else { 1 }));
-        };
-        let (mut enginefs, counters) = test_enginefs_with_file_count(3);
-        *counters.output_folder.lock().unwrap() = Some("/cache/rqbit-downloads/show".into());
+    async fn a_pin_is_measured_against_the_volume_the_pieces_land_on() {
+        // Fake files are 100 bytes, half downloaded: 50 remain to write.
+        let (mut enginefs, _counters) = test_enginefs_with_file_count(2);
         enginefs.set_downloads_dir(Some("/offline".into()));
-        cross_volume(&mut enginefs);
-        let available = Arc::new(AtomicU64::new(PIN_FREE_SPACE_MARGIN + 299));
-        let probe_available = available.clone();
-        enginefs.set_free_space_probe(move |_| Ok(probe_available.load(Ordering::SeqCst)));
-
+        let pieces = crate::piece_store::root_in(&enginefs.download_dir);
+        enginefs.set_free_space_probe(move |path| {
+            Ok(if path.starts_with(&pieces) {
+                PIN_FREE_SPACE_MARGIN + 49
+            } else {
+                u64::MAX
+            })
+        });
         match enginefs.pin_download(TEST_HASH, 0, None).await {
-            Err(PinDownloadError::InsufficientSpace { required, .. }) => {
-                assert_eq!(required, PIN_FREE_SPACE_MARGIN + 300);
+            Err(PinDownloadError::InsufficientSpace {
+                required,
+                available,
+                ..
+            }) => {
+                assert_eq!(required, PIN_FREE_SPACE_MARGIN + 50);
+                assert_eq!(
+                    available,
+                    PIN_FREE_SPACE_MARGIN + 49,
+                    "the store's volume is what was short, and what is reported"
+                );
             }
+            Ok(_) => panic!("must refuse: the volume the pieces land on is short"),
             Err(other) => panic!("unexpected error: {other}"),
-            Ok(_) => panic!("must refuse"),
         }
-        assert!(enginefs.backend.relocations.lock().unwrap().is_empty());
-        assert!(
-            enginefs.get_engine(TEST_HASH).await.is_some(),
-            "the streamed torrent stays"
-        );
-        available.store(PIN_FREE_SPACE_MARGIN + 300, Ordering::SeqCst);
-        enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
-        assert_eq!(enginefs.backend.relocations.lock().unwrap().len(), 1);
 
-        // Same volume: a rename, only the pinned file's 50 missing bytes.
-        let (mut enginefs, counters) = test_enginefs_with_file_count(3);
-        *counters.output_folder.lock().unwrap() = Some("/cache/rqbit-downloads/show".into());
+        // The other direction: the card the placement names is full, and
+        // the pin writes nothing to it.
+        let (mut enginefs, _counters) = test_enginefs_with_file_count(2);
         enginefs.set_downloads_dir(Some("/offline".into()));
-        enginefs.set_volume_id_probe(|_| Ok(7));
-        enginefs.set_free_space_probe(|_| Ok(PIN_FREE_SPACE_MARGIN + 50));
+        let pieces = crate::piece_store::root_in(&enginefs.download_dir);
+        enginefs.set_free_space_probe(move |path| {
+            Ok(if path.starts_with(&pieces) {
+                u64::MAX
+            } else {
+                0
+            })
+        });
         enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
-        assert_eq!(enginefs.backend.relocations.lock().unwrap().len(), 1);
-
-        // Unknown volumes: sized as a copy.
-        let (mut enginefs, counters) = test_enginefs_with_file_count(3);
-        *counters.output_folder.lock().unwrap() = Some("/cache/rqbit-downloads/show".into());
-        enginefs.set_downloads_dir(Some("/offline".into()));
-        enginefs.set_volume_id_probe(|_| Err(std::io::Error::other("no stat")));
-        enginefs.set_free_space_probe(|_| Ok(PIN_FREE_SPACE_MARGIN + 299));
-        assert!(matches!(
-            enginefs.pin_download(TEST_HASH, 0, None).await,
-            Err(PinDownloadError::InsufficientSpace { .. })
-        ));
-
-        // Not relocating (no downloads dir): missing bytes only, whatever
-        // the volumes.
-        let (mut enginefs, counters) = test_enginefs_with_file_count(3);
-        *counters.output_folder.lock().unwrap() = Some("/cache/rqbit-downloads/show".into());
-        cross_volume(&mut enginefs);
-        enginefs.set_free_space_probe(|_| Ok(PIN_FREE_SPACE_MARGIN + 50));
-        enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
+        assert_eq!(enginefs.pinned_downloads().await.len(), 1);
     }
 
-    /// Re-pinning a file of a torrent that is still checking its data in
-    /// place (a restart, a relocation) is not refused for space: its
-    /// `downloaded` reads 0 until the check ends, and the download is
-    /// already librqbit's to continue. A torrent added by the pin itself is
-    /// measured even while initializing (nothing of it is on disk yet), and
-    /// so is a checking torrent the pin would relocate.
+    /// Re-pinning a file of a torrent that is still checking (a restart, a
+    /// stream the pin joined) is not refused for space: its `downloaded`
+    /// reads 0 until the check ends, and the download is already
+    /// librqbit's to continue. Where the pin would *place* it makes no
+    /// difference to that -- the check is about data the store already
+    /// holds, and a placement moves no data -- so a relocating pin skips it
+    /// too. A torrent added by the pin itself is measured even while
+    /// initializing: nothing of it is on disk, and the 0 its files report
+    /// is the truth about it.
     #[tokio::test]
-    async fn re_pin_of_a_checking_torrent_in_place_skips_the_space_check() {
+    async fn re_pin_of_a_checking_torrent_skips_the_space_check() {
         let (mut enginefs, _counters, _init) =
             test_enginefs_initializing(2, Duration::from_secs(60));
         enginefs.set_free_space_probe(|_| Ok(0));
@@ -9625,16 +9530,17 @@ mod tests {
         );
         enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
 
-        // Would relocate: measured (and refused -- everything would move).
+        // Would relocate: skipped just the same, on a disk reporting no
+        // room at all. The move is of the folder librqbit names the
+        // torrent's files under; the pieces it is checking stay where they
+        // are, so measuring it would refuse a download whose bytes are
+        // already on the disk.
         let (mut enginefs, counters, _init) =
             test_enginefs_initializing(2, Duration::from_secs(60));
         *counters.output_folder.lock().unwrap() = Some("/cache/rqbit-downloads/show".into());
         enginefs.set_downloads_dir(Some("/offline".into()));
         enginefs.set_free_space_probe(|_| Ok(0));
-        assert!(matches!(
-            enginefs.pin_download(TEST_HASH, 1, None).await,
-            Err(PinDownloadError::InsufficientSpace { .. })
-        ));
+        enginefs.pin_download(TEST_HASH, 1, None).await.unwrap();
 
         // Freshly added for the pin: measured.
         let counters = Arc::new(FakeCounters::default());
@@ -9659,70 +9565,6 @@ mod tests {
             enginefs.pin_download(TEST_HASH, 0, None).await,
             Err(PinDownloadError::InsufficientSpace { .. })
         ));
-    }
-
-    /// A relocation issued while the torrent is still checking (a pin right
-    /// after a restart) cannot read `downloaded`, which is 0 for every file
-    /// until the check ends; it is sized from what the files have allocated
-    /// on disk instead: a complete file moved within one volume needs
-    /// nothing, an absent one its length, and a cross-volume copy counts
-    /// every file with data plus the pinned one in full.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn relocation_during_a_check_is_sized_from_the_allocated_bytes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let show = tmp.path().join("show");
-        std::fs::create_dir_all(&show).unwrap();
-        std::fs::write(show.join("video-0.mkv"), [1u8; 100]).unwrap();
-        let offline = tmp.path().join("offline");
-        let checking_in = |folder: &std::path::Path| {
-            let (enginefs, counters, _init) =
-                test_enginefs_initializing(2, Duration::from_secs(60));
-            *counters.output_folder.lock().unwrap() = Some(folder.to_path_buf());
-            enginefs.set_downloads_dir(Some(offline.clone()));
-            enginefs
-        };
-
-        // Same volume, file 0 all there: nothing to write.
-        let mut enginefs = checking_in(&show);
-        enginefs.set_volume_id_probe(|_| Ok(7));
-        enginefs.set_free_space_probe(|_| Ok(0));
-        enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
-        assert_eq!(enginefs.backend.relocations.lock().unwrap().len(), 1);
-
-        // Same volume, file 1 absent: its whole length.
-        let mut enginefs = checking_in(&show);
-        enginefs.set_volume_id_probe(|_| Ok(7));
-        enginefs.set_free_space_probe(|_| Ok(PIN_FREE_SPACE_MARGIN + 99));
-        match enginefs.pin_download(TEST_HASH, 1, None).await {
-            Err(PinDownloadError::InsufficientSpace { required, .. }) => {
-                assert_eq!(required, PIN_FREE_SPACE_MARGIN + 100);
-            }
-            Err(other) => panic!("unexpected error: {other}"),
-            Ok(_) => panic!("must refuse"),
-        }
-
-        // Across volumes: file 0 (data) is copied, file 1 (pinned) written.
-        let cross_volume = |enginefs: &mut BackendEngineFS<FakeBackend>| {
-            let offline = offline.clone();
-            enginefs.set_volume_id_probe(move |path| {
-                Ok(if path.starts_with(&offline) { 2 } else { 1 })
-            });
-        };
-        let mut enginefs = checking_in(&show);
-        cross_volume(&mut enginefs);
-        enginefs.set_free_space_probe(|_| Ok(PIN_FREE_SPACE_MARGIN + 199));
-        match enginefs.pin_download(TEST_HASH, 1, None).await {
-            Err(PinDownloadError::InsufficientSpace { required, .. }) => {
-                assert_eq!(required, PIN_FREE_SPACE_MARGIN + 200);
-            }
-            Err(other) => panic!("unexpected error: {other}"),
-            Ok(_) => panic!("must refuse"),
-        }
-        let mut enginefs = checking_in(&show);
-        cross_volume(&mut enginefs);
-        enginefs.set_free_space_probe(|_| Ok(PIN_FREE_SPACE_MARGIN + 200));
-        enginefs.pin_download(TEST_HASH, 1, None).await.unwrap();
     }
 
     /// Engine over an unmanaged fake torrent that is still checking (as a
@@ -9751,12 +9593,18 @@ mod tests {
         (enginefs, counters)
     }
 
-    /// A fresh pin into a `<dir>/<hash>` folder that already exists (the
-    /// data of an earlier session whose backend records are gone) is not
-    /// measured while the torrent is still checking that data -- its
-    /// `downloaded` reads 0 -- and, refused, drops the torrent but never
-    /// the folder's files. Only a folder the pin itself created goes with
-    /// a refused pin.
+    /// A refused pin drops the torrent it added but never the files of a
+    /// `<dir>/<hash>` folder that was already there -- the whole-file data
+    /// of an earlier version of this server, which this session neither
+    /// converts nor reads. Only a folder the pin itself created goes with a
+    /// refused pin.
+    ///
+    /// That folder is no longer a reason to *skip* the free-space check
+    /// either: what it holds is not data this torrent can find. Its bytes
+    /// live in the piece store now, and a fresh pin has none there, so the
+    /// pin is measured for the whole file and refused on a disk with no
+    /// room -- while the old copy stays exactly where it is, for the cache
+    /// cleaner and for nobody else.
     #[tokio::test]
     async fn fresh_pin_into_an_existing_folder_keeps_its_data() {
         let tmp = tempfile::tempdir().unwrap();
@@ -9765,11 +9613,20 @@ mod tests {
         let data = folder.join("video-0.mkv");
         std::fs::write(&data, [7u8; 100]).unwrap();
 
-        // Still checking, disk reports no room: accepted, unmeasured.
+        // Still checking, disk reports no room: measured and refused, and
+        // the torrent is dropped *keeping* the folder's files.
         let (mut enginefs, _counters) = test_enginefs_unmanaged_checking();
         enginefs.set_downloads_dir(Some(tmp.path().to_path_buf()));
         enginefs.set_free_space_probe(|_| Ok(0));
-        enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
+        assert!(matches!(
+            enginefs.pin_download(TEST_HASH, 0, None).await,
+            Err(PinDownloadError::InsufficientSpace { .. })
+        ));
+        assert_eq!(
+            enginefs.backend.removed.lock().unwrap().as_slice(),
+            &[TEST_HASH.to_string()],
+            "dropped keeping its files"
+        );
         assert!(
             enginefs
                 .backend
