@@ -1232,6 +1232,17 @@ pub struct EngineStats {
     pub stream_name: String,
     pub stream_progress: f64,
     pub swarm_connections: u64,
+    /// Whether the torrent is stopped -- `swarmPaused` on the wire, and the
+    /// one field of this server.js-compatible shape that says whether the
+    /// torrent is running at all.
+    ///
+    /// The backend answers it from its state machine
+    /// ([`TorrentHandle::run_state`]), never from a persisted `paused`
+    /// flag and never from a note about who stopped it: this server keeps
+    /// no such note, because whether a torrent should be running is
+    /// recomputed from live conditions on every reconciler pass (see
+    /// [`crate::reconcile::desired`]). `false` for a backend with no state
+    /// to read.
     pub swarm_paused: bool,
     /// NOT a swarm-size estimate, despite the name: it is currently just an
     /// alias of `peers` (connected peers), kept because it is part of the

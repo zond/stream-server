@@ -66,12 +66,17 @@ pub enum Trigger {
     /// Somebody is waiting on this decision right now.
     ///
     /// Named for its main case, which is a playback starting on this
-    /// torrent -- and it is also the pin of an offline download, the focus
-    /// of a stream and the seeding switch being turned back on. All four
-    /// are a person having just asked for something and looking at the
-    /// result, which is what the trigger is for: a torrent they are owed is
-    /// measured against the floor rather than the resume line, and is not
-    /// made to wait out a dwell that exists to protect an announce budget.
+    /// torrent -- and it is also the pin of an offline download and the
+    /// focus of a stream. All three are somebody about to read from this
+    /// torrent, which is what the trigger is for: a torrent they are owed
+    /// is measured against the floor rather than the resume line, and is
+    /// not made to wait out a dwell that exists to protect an announce
+    /// budget.
+    ///
+    /// The test is *waiting*, not *asked*. A user moving the seeding switch
+    /// asked for something too, and that is still a [`Self::Timer`]
+    /// decision: nothing is about to open a reader, so there is no reason
+    /// to spend either concession on it.
     PlaybackStart,
 }
 

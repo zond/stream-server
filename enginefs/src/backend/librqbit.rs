@@ -2555,7 +2555,16 @@ impl TorrentHandle for LibrqbitHandle {
                 0.0
             },
             swarm_connections: peers,
-            swarm_paused: false,
+            // The state machine's answer, not a constant. This is the one
+            // field of the server.js-compatible shape that says whether the
+            // torrent is running, and it read `false` for every torrent
+            // there has ever been -- including a torrent stopped for want
+            // of disk space, and including one this process restored
+            // stopped and has not started yet. A client polling stats had
+            // no way to tell a torrent that is fetching from one that is
+            // not. Read from `run_state` like every other question about
+            // what a torrent is doing, never from `is_paused()`.
+            swarm_paused: self.run_state() == RunState::Paused,
             swarm_size: peers,
             connected_seeders,
             swarm_seeders: swarm.seeders,

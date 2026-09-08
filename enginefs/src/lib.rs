@@ -2419,9 +2419,19 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     ///
     /// `seeding_enabled` is one of the ladder's conditions
     /// ([`crate::reconcile::Conditions`]), so flipping it changes what
-    /// every torrent should be doing -- and the reconciler is asked at
-    /// once rather than at its next tick, because the user has just moved a
-    /// switch and is looking at the result.
+    /// every torrent should be doing -- and the reconciler is asked at once
+    /// rather than at its next tick, so that the switch takes effect when
+    /// it is moved.
+    ///
+    /// [`crate::reconcile::Trigger::Timer`], not `PlaybackStart`, even
+    /// though a person did move the switch: nobody is *waiting* on the
+    /// answer, no reader is about to open, and the two things that trigger
+    /// changes are both concessions made to someone who is. A torrent
+    /// stopped for want of space keeps its resume margin here, which is
+    /// what stops this call restarting torrents into a nearly-full volume
+    /// -- and `server::run` applies the persisted setting at startup, over
+    /// every torrent the last process left stopped, where "a user is
+    /// waiting" would be simply false.
     ///
     /// **Awaited, and the registry dropped first.** The engines are
     /// snapshotted out of `self.engines` and the read guard dropped before
@@ -2446,7 +2456,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             engines.keys().cloned().collect()
         };
         for hash in hashes {
-            self.reconcile_hash(&hash, crate::reconcile::Trigger::PlaybackStart)
+            self.reconcile_hash(&hash, crate::reconcile::Trigger::Timer)
                 .await;
         }
     }

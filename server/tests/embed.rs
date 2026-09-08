@@ -2482,6 +2482,148 @@ fn the_servers_own_reconciler_stops_a_torrent_under_the_floor_and_starts_it_agai
     Ok(())
 }
 
+/// A restart, over the real persisted librqbit session the server keeps,
+/// with a torrent the previous process had stopped -- and the stream
+/// request that starts it again.
+///
+/// This is the whole of the design, from outside. The pause is in
+/// `session.json` and survived the process; nothing in the new one knows
+/// it exists, let alone why. On master three of the four sites that could
+/// have lifted it read `if idle_paused.swap(false) && resume()`, which is
+/// `false && ...` in a fresh process, and the fourth -- the stream route's
+/// own metadata-resolution guard, which this test drives -- was gated on
+/// the same flag.
+///
+/// Observed through `swarmPaused`, which the backend answers from its state
+/// machine: it is the one field of the stats shape that says whether the
+/// torrent is running.
+///
+/// The volume is held **inside the hysteresis band** -- room above the
+/// free-space floor, but under the resume margin -- for the middle of the
+/// test, because that is the window in which nothing *but* a request will
+/// start the torrent: the reconciler's timer deliberately leaves a stopped
+/// torrent alone until the volume has cleared the margin. Without that the
+/// timer would start it a couple of seconds later and the test would pass
+/// whatever the route did. The route's own floor check reads a separate
+/// declaration (`pretend_available_space`), so the request is not refused.
+#[test]
+fn a_restart_leaves_a_torrent_stopped_and_a_stream_request_starts_it() -> anyhow::Result<()> {
+    const FLOOR: u64 = enginefs::CACHE_FREE_SPACE_FLOOR;
+    const MARGIN: u64 = enginefs::FREE_SPACE_RESUME_MARGIN;
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    let cache_root = cache_dir.path().join("cache");
+
+    let content = src.path().join("Wanted");
+    std::fs::create_dir_all(&content)?;
+    write_payload(&content.join("wanted.bin"), 64 * 1024);
+    let (torrent, info_hash) = real_torrent(&content);
+
+    let start = || {
+        stream_server::start(stream_server::ServerConfig {
+            http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            config_dir: Some(config_dir.path().join("config")),
+            cache_dir: Some(cache_root.clone()),
+            ..offline_config()
+        })
+    };
+    let stopped_message =
+        "the torrent is stopped for want of disk space; free some space and it will resume";
+
+    // The process before this one: it adds the torrent, its volume fills,
+    // and its reconciler stops it. librqbit persists that.
+    stream_server::pretend_volume_space(&cache_root, u64::MAX);
+    let handle = start()?;
+    {
+        let base = format!("http://{}", handle.http_addr());
+        let client = bearer_client(&handle)?;
+        client
+            .post(format!("{base}/create"))
+            .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
+            .send()?
+            .error_for_status()?;
+        stats_after_check(&client, &base, &info_hash)?;
+
+        stream_server::pretend_volume_space(&cache_root, 0);
+        let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
+        loop {
+            let stats: serde_json::Value = client
+                .get(format!("{base}/{info_hash}/stats.json"))
+                .send()?
+                .error_for_status()?
+                .json()?;
+            if stats["error"].as_str() == Some(stopped_message) {
+                assert_eq!(stats["swarmPaused"], serde_json::json!(true));
+                break;
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "the first process never stopped the torrent: {stats}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    handle.shutdown()?;
+    handle.join()?;
+
+    // This one. Room above the floor, inside the resume margin: nothing on
+    // a timer will start the torrent here.
+    stream_server::pretend_volume_space(&cache_root, FLOOR + MARGIN - 1);
+    stream_server::pretend_available_space(&cache_root, FLOOR + MARGIN - 1);
+    let handle = start()?;
+    let base = format!("http://{}", handle.http_addr());
+    let client = bearer_client(&handle)?;
+    let swarm_paused = |client: &reqwest::blocking::Client| -> anyhow::Result<bool> {
+        let stats: serde_json::Value = client
+            .get(format!("{base}/{info_hash}/stats.json"))
+            .send()?
+            .error_for_status()?
+            .json()?;
+        Ok(stats["swarmPaused"] == serde_json::json!(true))
+    };
+    // The initial check has to finish before the state machine can say
+    // anything settled about the torrent at all.
+    stats_after_check(&client, &base, &info_hash)?;
+    assert!(
+        swarm_paused(&client)?,
+        "the torrent came back stopped, exactly as the last process left it"
+    );
+    // And it stays that way while nobody asks: several reconciler ticks
+    // (its interval is two seconds) go by.
+    std::thread::sleep(enginefs::reconcile::RECONCILE_INTERVAL * 3);
+    assert!(
+        swarm_paused(&client)?,
+        "the timer must not start a torrent into a volume inside the resume margin"
+    );
+
+    // The request. It goes to the same route a player uses, whose
+    // metadata-resolution guard is what asks the reconciler; no peer will
+    // ever bring these bytes, so the client giving up is the expected end.
+    let anonymous = reqwest::blocking::Client::new();
+    match anonymous
+        .get(format!("{base}/{info_hash}/0"))
+        .header(reqwest::header::RANGE, "bytes=0-1023")
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+    {
+        Ok(response) => assert_ne!(
+            response.status(),
+            reqwest::StatusCode::INSUFFICIENT_STORAGE,
+            "with room above the floor the request is not refused"
+        ),
+        Err(error) => assert!(error.is_timeout(), "{error}"),
+    }
+    assert!(
+        !swarm_paused(&client)?,
+        "the stream request started the torrent it was about to read from"
+    );
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
 /// A stream request below the free-space floor is refused with a `507`
 /// once a cleaner pass has had its chance -- not "degraded to memory-only",
 /// which re-selected the same disk-backed engine and streamed to the disk
