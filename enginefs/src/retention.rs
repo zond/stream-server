@@ -383,8 +383,14 @@ pub struct ReclaimGate {
 }
 
 /// One torrent's answer, in the three shapes it comes in.
+///
+/// Asked in two places and computed in one ([`crate::engine::Engine::gate_verdict`]):
+/// the cleaner's walk collects these into a [`ReclaimGate`], and the delete
+/// the cleaner then asks for re-asks the same question of the same engine
+/// before it unlinks anything. The walk's copy is a reading taken minutes
+/// ago; the second asking is the one that decides.
 #[derive(Debug, Clone)]
-enum TorrentGate {
+pub enum TorrentGate {
     /// Everything it holds is announced, so nothing may be taken. A torrent
     /// with no retention policy, and every pinned one -- a pin is a
     /// retention property, and the user asked for those bytes.
@@ -403,16 +409,39 @@ enum TorrentGate {
     },
 }
 
+impl TorrentGate {
+    /// Whether this torrent will give the piece up.
+    pub fn releases(&self, piece: u32) -> bool {
+        match self {
+            Self::Nothing { .. } => true,
+            Self::Announced => false,
+            Self::Policy { pieces, committed } => {
+                pieces.contains(&piece) && !committed.contains(&piece)
+            }
+        }
+    }
+
+    /// Whether this torrent's pieces sort to the front of the size rule:
+    /// bytes nothing will ever read or resume into.
+    pub fn goes_first(&self) -> bool {
+        matches!(self, Self::Nothing { first: true })
+    }
+}
+
 impl ReclaimGate {
+    /// Record one torrent's answer.
+    pub fn insert(&mut self, info_hash: String, gate: TorrentGate) {
+        self.torrents.insert(info_hash, gate);
+    }
+
     /// This torrent announces everything it holds: nothing of it may go.
     pub fn insert_announced(&mut self, info_hash: String) {
-        self.torrents.insert(info_hash, TorrentGate::Announced);
+        self.insert(info_hash, TorrentGate::Announced);
     }
 
     /// This torrent announces nothing at all, and its bytes go first.
     pub fn insert_dead(&mut self, info_hash: String) {
-        self.torrents
-            .insert(info_hash, TorrentGate::Nothing { first: true });
+        self.insert(info_hash, TorrentGate::Nothing { first: true });
     }
 
     /// A policy governs `pieces` of this torrent and has committed
@@ -424,8 +453,7 @@ impl ReclaimGate {
         pieces: Range<u32>,
         committed: BTreeSet<u32>,
     ) {
-        self.torrents
-            .insert(info_hash, TorrentGate::Policy { pieces, committed });
+        self.insert(info_hash, TorrentGate::Policy { pieces, committed });
     }
 
     /// Whether the policy will give this piece up.
@@ -434,22 +462,17 @@ impl ReclaimGate {
     /// a previous install's, or one the idle sweep has already taken out of
     /// the session -- and it goes.
     pub fn releases(&self, info_hash: &str, piece: u32) -> bool {
-        match self.torrents.get(info_hash) {
-            None | Some(TorrentGate::Nothing { .. }) => true,
-            Some(TorrentGate::Announced) => false,
-            Some(TorrentGate::Policy { pieces, committed }) => {
-                pieces.contains(&piece) && !committed.contains(&piece)
-            }
-        }
+        self.torrents
+            .get(info_hash)
+            .is_none_or(|gate| gate.releases(piece))
     }
 
     /// Whether this torrent's pieces sort to the front of the size rule:
     /// bytes nothing will ever read or resume into.
     pub fn goes_first(&self, info_hash: &str) -> bool {
-        matches!(
-            self.torrents.get(info_hash),
-            Some(TorrentGate::Nothing { first: true })
-        )
+        self.torrents
+            .get(info_hash)
+            .is_some_and(TorrentGate::goes_first)
     }
 }
 

@@ -442,6 +442,27 @@ pub struct Engine<H: TorrentHandle> {
     /// nothing of it may be reclaimed, which is exactly what this server
     /// did before the policy was wired.
     retention: parking_lot::Mutex<Option<crate::retention::FileRetention>>,
+    /// Serialises everything that changes what this torrent announces, and
+    /// the deletes taken under it.
+    ///
+    /// **The reason the cleaner's reclaim goes through this engine at all.**
+    /// Four operations touch the same pair of facts -- what we announce and
+    /// what is on the disk: installing a policy ([`Self::begin_retention`],
+    /// which holds a range back), dropping one ([`Self::clear_retention_locked`],
+    /// which puts a range back), a retention pass ([`Self::retain`], which
+    /// commits pieces *into* what we announce and reclaims the rest), and
+    /// the cache cleaner's delete ([`Self::release_reclaimable`]). A piece
+    /// that becomes announced between "the policy would release this" and
+    /// the unlink is a piece we have told a peer about and then thrown
+    /// away, which is the one thing this whole design exists to prevent --
+    /// and both of the other two do exactly that on the happy path, every
+    /// two seconds and on every file change. Holding this across the whole
+    /// of each is what makes "what we announce is what nothing will
+    /// reclaim" an invariant rather than a likelihood.
+    ///
+    /// A `tokio` mutex and not a `parking_lot` one because every holder
+    /// awaits the backend while it holds it.
+    announce: tokio::sync::Mutex<()>,
     /// Where a reader last got to: which file, and how far into it.
     ///
     /// **An absence at process start, and it has to be**: a playhead is an
@@ -481,6 +502,7 @@ impl<H: TorrentHandle> Engine<H> {
             next_reader_id: AtomicU64::new(1),
             budget,
             retention: parking_lot::Mutex::new(None),
+            announce: tokio::sync::Mutex::new(()),
             playhead: parking_lot::Mutex::new(None),
         }
     }
@@ -723,9 +745,15 @@ impl<H: TorrentHandle> Engine<H> {
     /// user asked for those bytes, and they are shared like any other bytes
     /// we are keeping.
     pub(crate) async fn begin_retention(&self, file_idx: usize) {
+        let _announce = self.announce.lock().await;
+        self.begin_retention_locked(file_idx).await
+    }
+
+    /// [`Self::begin_retention`] with [`Self::announce`] already held.
+    async fn begin_retention_locked(&self, file_idx: usize) {
         let budget = self.budget.get();
         if self.is_pinned() {
-            self.clear_retention().await;
+            self.clear_retention_locked().await;
             return;
         }
         if self
@@ -745,7 +773,7 @@ impl<H: TorrentHandle> Engine<H> {
         // covers this piece" as "we announce it" -- called those same pieces
         // protected. Held back and protected at once is the one combination
         // that is never right.
-        self.clear_retention().await;
+        self.clear_retention_locked().await;
         let Some(retention) = policy else {
             return;
         };
@@ -783,7 +811,7 @@ impl<H: TorrentHandle> Engine<H> {
     /// The pieces stop being reclaimable at the same moment they start
     /// being announced again, which is the only order that keeps the rule:
     /// what we announce is what nothing will reclaim.
-    async fn clear_retention(&self) {
+    async fn clear_retention_locked(&self) {
         let Some(retention) = self.retention.lock().take() else {
             return;
         };
@@ -812,6 +840,18 @@ impl<H: TorrentHandle> Engine<H> {
         &self,
         store: &crate::piece_store::StoreRoot,
     ) -> Option<crate::retention::RetentionPass> {
+        let _announce = self.announce.lock().await;
+        // A pin taken while this file was already playing leaves the policy
+        // installed: `begin_retention` is the only other place that asks,
+        // and it ran before the pin existed. Without this a pinned file is
+        // reclaimed under its own reader -- measured, half a 32 MiB file
+        // deleted with `is_pinned()` true throughout -- and, because the
+        // policy also holds its range back, the file the user asked to keep
+        // is announced to nobody while librqbit re-fetches it in a loop.
+        if self.is_pinned() {
+            self.clear_retention_locked().await;
+            return None;
+        }
         let (file_idx, offset) = (*self.playhead.lock())?;
         let mut retention = self.retention.lock().take()?;
         if retention.file_idx != file_idx {
@@ -837,16 +877,87 @@ impl<H: TorrentHandle> Engine<H> {
         Some(pass)
     }
 
+    /// What this engine will give up, right now.
+    ///
+    /// Computed in one place and asked in two: the cleaner's walk collects
+    /// these into a [`crate::retention::ReclaimGate`], and the delete the
+    /// walk goes on to ask for re-asks it here before unlinking anything.
+    /// The walk's copy is a reading taken before a blocking directory walk
+    /// and every delete before this one; this asking is the one that
+    /// decides.
+    pub(crate) fn gate_verdict(&self) -> crate::retention::TorrentGate {
+        match self.retention.lock().as_ref() {
+            Some(retention) => crate::retention::TorrentGate::Policy {
+                pieces: retention.pieces(),
+                committed: retention.committed().clone(),
+            },
+            None => crate::retention::TorrentGate::Announced,
+        }
+    }
+
     /// What this engine tells the cache cleaner it may take, for
     /// [`crate::retention::ReclaimGate`].
     pub(crate) fn gate_entry(&self, gate: &mut crate::retention::ReclaimGate) {
         let info_hash = self.info_hash.to_lowercase();
-        match self.retention.lock().as_ref() {
-            Some(retention) => {
-                gate.insert_policy(info_hash, retention.pieces(), retention.committed().clone())
+        match self.gate_verdict() {
+            crate::retention::TorrentGate::Policy { pieces, committed } => {
+                gate.insert_policy(info_hash, pieces, committed)
             }
-            None => gate.insert_announced(info_hash),
+            _ => gate.insert_announced(info_hash),
         }
+    }
+
+    /// Delete the pieces of this torrent that are *still* reclaimable, and
+    /// answer how many bytes went.
+    ///
+    /// **The second asking, and the reason the cleaner's delete comes
+    /// through the engine at all.** The gate the cleaner carries was taken
+    /// before its walk; between that reading and this unlink a piece can
+    /// have become announced, and two paths do it on the happy path --
+    /// [`Self::retain`] commits and advertises pieces on every pass, and
+    /// [`Self::begin_retention`] puts a whole range back when the reader
+    /// moves to another file. Deleting a piece we have told a peer about is
+    /// the one thing this design exists to prevent, so the question is
+    /// asked again here, under the lock those two also take, and the answer
+    /// taken from the live policy rather than from a copy of it.
+    pub(crate) async fn release_reclaimable(
+        &self,
+        store: &crate::piece_store::StoreRoot,
+        pieces: &[u32],
+    ) -> usize {
+        let _announce = self.announce.lock().await;
+        // Only a *policy* narrows the cleaner's request. Where there is
+        // none this engine has no opinion the cleaner does not already
+        // have: it decided by its own rule -- a dead torrent's bytes go
+        // first, a live one's are protected -- and second-guessing that
+        // here would quietly make a live torrent with no reader
+        // unevictable, which is a policy change and not this fix.
+        //
+        // The case this exists for still lands inside that: the reader
+        // moving to another file installs a policy for *that* file, and
+        // piece 0 of the file it left is outside the new range, so the
+        // verdict refuses it. So does a piece the pass has committed since.
+        let still: Vec<u32> = match self.gate_verdict() {
+            verdict @ crate::retention::TorrentGate::Policy { .. } => pieces
+                .iter()
+                .copied()
+                .filter(|piece| verdict.releases(*piece))
+                .collect(),
+            _ => pieces.to_vec(),
+        };
+        if still.len() != pieces.len() {
+            tracing::debug!(
+                info_hash = %self.info_hash,
+                asked = pieces.len(),
+                taking = still.len(),
+                "pieces became announced between the cleaner's reading and its delete"
+            );
+        }
+        let mut freed = 0;
+        for run in crate::retention::runs(&still) {
+            freed += crate::retention::release(&self.handle, store, &self.info_hash, run).await;
+        }
+        freed
     }
 
     pub fn is_pinned(&self) -> bool {

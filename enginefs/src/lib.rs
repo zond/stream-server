@@ -2238,7 +2238,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 crate::backend::RunState::Error | crate::backend::RunState::Gone
             )
         });
-        let Some(handle) = live else {
+        let Some(_handle) = live else {
             return store
                 .delete_pieces(info_hash, pieces.iter().copied())
                 .unwrap_or_else(|error| {
@@ -2250,11 +2250,19 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     0
                 });
         };
-        let mut freed = 0;
-        for run in crate::retention::runs(pieces) {
-            freed += crate::retention::release(&handle, &store, info_hash, run).await;
-        }
-        freed
+        // Through the engine, so the question the cleaner asked before its
+        // walk is asked again against the live policy -- see
+        // `Engine::release_reclaimable`. An engine-less torrent the session
+        // still runs announces everything it holds by the gate's own rule,
+        // so there is nothing here to take.
+        let Some(engine) = self.peek_engine(info_hash).await else {
+            tracing::debug!(
+                info_hash = %info_hash,
+                "the session runs this torrent but nothing here holds it; leaving its pieces alone"
+            );
+            return 0;
+        };
+        engine.release_reclaimable(&store, pieces).await
     }
 
     /// What the cache cleaner says the torrent-data volume may hold, as of
@@ -9798,6 +9806,104 @@ mod tests {
         counters.refuses_drop.store(true, Ordering::SeqCst);
         assert_eq!(enginefs.release_pieces(TEST_HASH, &[5]).await, 0);
         assert!(bucket.join("5").is_file());
+    }
+
+    /// A piece that becomes announced between the cleaner's reading and its
+    /// unlink is not taken.
+    ///
+    /// The cleaner's gate is collected before a blocking directory walk and
+    /// before every delete ahead of this one, so by the time a delete
+    /// happens the reading can be minutes old. Two things make a piece
+    /// announced on the happy path, both of them ordinary: a retention pass
+    /// commits and advertises pieces every couple of seconds, and a reader
+    /// moving to another file puts the first file's whole range back. So
+    /// the question is asked a second time, against the live policy, inside
+    /// the same lock those two take -- `Engine::release_reclaimable`.
+    ///
+    /// Without that, the invariant the whole design rests on is a
+    /// likelihood rather than a rule: we would delete a piece we had told a
+    /// peer about.
+    #[tokio::test]
+    async fn a_piece_announced_since_the_cleaner_looked_is_left_alone() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("0"), [7u8; 4096]).unwrap();
+        *counters.drops_pieces.lock().unwrap() = vec![0];
+        // A policy is installed only where the budget does not cover the
+        // file, so the fixture needs one that does not.
+        enginefs.set_cache_budget(Some(1));
+
+        // A policy over file 0 that would give piece 0 up: this is the
+        // reading the cleaner takes.
+        engine.note_playhead(0, 0);
+        engine.begin_retention(0).await;
+        let mut gate = crate::retention::ReclaimGate::default();
+        engine.gate_entry(&mut gate);
+        assert!(
+            gate.releases(TEST_HASH, 0),
+            "the cleaner's reading says this piece may go"
+        );
+
+        // Then the reader moves to the other file, which puts file 0's
+        // range back into what we announce -- exactly what happens when a
+        // viewer skips to the next episode while a clean pass is walking.
+        engine.note_playhead(1, 0);
+        engine.begin_retention(1).await;
+
+        assert_eq!(
+            enginefs.release_pieces(TEST_HASH, &[0]).await,
+            0,
+            "the piece is announced now, whatever the cleaner's reading said"
+        );
+        assert!(
+            bucket.join("0").is_file(),
+            "and it is still on the disk: we told a peer we had it"
+        );
+    }
+
+    /// A pin taken while the file is already playing keeps its bytes.
+    ///
+    /// The pin exemption used to live only in `begin_retention`, which runs
+    /// when a reader opens. Pin a file that is already playing and the
+    /// policy installed before the pin existed stays installed, and the
+    /// retention pass reclaims under it: measured on a real session, half a
+    /// 32 MiB file deleted with `is_pinned()` true the whole time. Worse
+    /// than the deletion, the policy also holds the range back, so the file
+    /// the user asked to keep is announced to nobody while librqbit
+    /// re-fetches what was just thrown away.
+    ///
+    /// A pin is a retention property, so the pass has to ask, not just the
+    /// opener.
+    #[tokio::test]
+    async fn a_pin_taken_mid_playback_stops_the_reclaim_and_puts_the_range_back() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        *counters.drops_pieces.lock().unwrap() = vec![0, 1, 2, 3];
+        // A policy is installed only where the budget does not cover the
+        // file, so the fixture needs one that does not.
+        enginefs.set_cache_budget(Some(1));
+
+        engine.note_playhead(0, 0);
+        engine.begin_retention(0).await;
+        assert!(
+            engine.gate_verdict().releases(0),
+            "before the pin, the policy would give this piece up"
+        );
+
+        // The user pins the file they are watching.
+        engine.pinned_files.write().insert(0);
+
+        let store = enginefs.piece_store();
+        assert!(
+            engine.retain(&store).await.is_none(),
+            "a pinned torrent has no retention pass to make"
+        );
+        assert!(
+            !engine.gate_verdict().releases(0),
+            "and nothing of it may be reclaimed any more"
+        );
     }
 
     /// A stream that moves to another file of the same torrent puts the
