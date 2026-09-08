@@ -74,29 +74,29 @@ impl CleanSchedule {
 /// cache out of -- `enginefs`'s constant, re-exported, because it is one
 /// line read three ways and the three may not drift apart.
 ///
-/// `routes::stream::ensure_download_disk_ready` refuses to stream to disk
-/// unless this much is free on top of what the request needs -- a failed
-/// check runs one pass of this cleaner and, if the disk is still short,
-/// answers the stream `507 Insufficient Storage`. Below this line the server
-/// has therefore already decided the disk is unusable, so it is exactly the
-/// line the cleaner must keep the cache out of. (One constant, two readings:
-/// the cleaner asks `fs4::available_space`, which is `statvfs` on the path,
+/// `routes::stream::ensure_download_disk_ready` refuses to stream a torrent
+/// that still wants bytes unless this much is free -- a failed check runs
+/// one pass of this cleaner and, if the disk is still short, answers the
+/// stream `507 Insufficient Storage`. Below this line the server has
+/// therefore already decided the disk is unusable, so it is exactly the line
+/// the cleaner must keep the cache out of. (One constant, two readings: the
+/// cleaner asks `fs4::available_space`, which is `statvfs` on the path,
 /// while `ensure_download_disk_ready` matches the path against `sysinfo`'s
 /// mount list behind a 3-second cache. Same question, different syscall.)
 ///
-/// The third reader is the engine's free-space watch
-/// (`EngineFS::free_space_watch_tick`), and it is what turns the target into
+/// The third reader is the engine's reconciler, whose free-space arm this
+/// is (`enginefs::reconcile::desired`), and it is what turns the target into
 /// something close to a guarantee. The cleaner only deletes; it cannot
 /// throttle a writer, and librqbit writes the file it wants straight through
 /// this line to ENOSPC between passes -- on the device that prompted all
 /// this, Available went to nothing in 40 s rather than stopping at 512 MiB.
-/// The watch stops a writing torrent when the volume falls under the floor
-/// and rings [`recover_out_of_space_torrents`], so what this cleaner is
-/// handed is a torrent paused a few MB under the line, not one dead at
+/// The reconciler stops a writing torrent when the volume falls under the
+/// floor and rings [`recover_out_of_space_torrents`], so what this cleaner
+/// is handed is a torrent paused a few MB under the line, not one dead at
 /// zero. Offline downloads keep a margin of their own
 /// (`enginefs::PIN_FREE_SPACE_MARGIN`, 500 MiB, checked once when a pin is
 /// accepted), so a pin can settle the volume below this line by design; the
-/// watch stops it there like any other writer.
+/// reconciler stops it there like any other writer.
 pub(crate) use enginefs::CACHE_FREE_SPACE_FLOOR;
 
 /// What caps the cache on one run: what the operator configured and what the
@@ -296,7 +296,7 @@ pub fn start(state: Arc<AppState>) -> JoinHandle<()> {
                 }
 
                 // 3. A torrent the backend stopped for want of disk space,
-                //    found by the poll -- or, 3a, one the free-space watch
+                //    found by the poll -- or, 3a, one the reconciler
                 //    just stopped, which rings this the moment it does: the
                 //    torrent's readers are parked until the pass restarts it,
                 //    and a poll interval of parking is a player buffering.
@@ -393,8 +393,9 @@ fn engines_of(state: &AppState) -> Vec<Arc<enginefs::EngineFS>> {
     }
 }
 
-/// Completes when any of `engines` has had a torrent stopped for space
-/// since the last time this completed (`EngineFS::out_of_space_signal`).
+/// Completes when any of `engines` has had a torrent stopped for want of
+/// space since the last time this completed
+/// (`EngineFS::out_of_space_signal`).
 async fn out_of_space_signal(engines: &[Arc<enginefs::EngineFS>]) {
     let signals: Vec<BoxFuture<'_, ()>> = engines
         .iter()
@@ -453,11 +454,18 @@ async fn recover_out_of_space_torrents(state: &AppState, recovery: &mut DiskFull
             Ok(true) => info!(
                 info_hash = %info_hash,
                 freed = report.freed,
-                "restarted a torrent a full disk had stopped"
+                "restarted a torrent a full disk had killed"
             ),
+            // Two ordinary outcomes share this arm and neither is a
+            // failure: the torrent was gone by the time space had been
+            // reclaimed (evicted whole, or swept), or it is merely stopped
+            // rather than dead -- and a stopped one is the reconciler's to
+            // start again, from a reading of the volume it takes itself on
+            // its next pass, which is the whole reason there is only one
+            // caller of `Session::unpause` for that case.
             Ok(false) => debug!(
                 info_hash = %info_hash,
-                "the torrent was gone by the time space had been reclaimed (evicted whole, or swept)"
+                "the torrent was not in the backend's error state; nothing restarted from here"
             ),
             Err(e) => warn!(
                 info_hash = %info_hash,

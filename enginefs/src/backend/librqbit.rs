@@ -201,15 +201,20 @@ type DeferredSelections = Arc<Mutex<HashMap<String, Arc<DeferredSelection<Deferr
 /// ([`TorrentHandle::pause_torrent`]), shared by every handle clone like
 /// [`DeferredSelections`].
 ///
-/// **A single owner for "paused".** Three things here call librqbit's
-/// `Session::pause`/`unpause` for three different reasons -- the idle pause,
-/// the free-space watch's [`TorrentHandle::stop_for_space`], and the restore
-/// path's [`TorrentHandle::unpause_restored`] -- and librqbit records only
-/// *that* a torrent is paused, never why. Without this set, a stream
-/// starting on a torrent the free-space watch had stopped would unpause it
-/// straight back onto a full volume, and `resume_torrent`, which the engine
-/// layer calls on every playback start, would error on the great majority of
-/// torrents, which are not paused at all.
+/// **A single owner for "paused".** Several things here call librqbit's
+/// `Session::pause`/`unpause` for different reasons -- the idle pause, the
+/// reconciler's [`TorrentHandle::stop_torrent`] and
+/// [`TorrentHandle::start_torrent`], and the restore path's
+/// [`TorrentHandle::unpause_restored`] -- and librqbit records only *that* a
+/// torrent is paused, never why. Without this set, a stream starting on a
+/// torrent the reconciler had stopped would unpause it straight back onto a
+/// full volume, and `resume_torrent`, which the engine layer calls on every
+/// playback start, would error on the great majority of torrents, which are
+/// not paused at all.
+///
+/// It is the idle policy's own bookkeeping and it goes when that policy
+/// does: the reconciler keeps no such note, because what it does not know
+/// after a restart it recomputes.
 ///
 /// So [`TorrentHandle::resume_torrent`] lifts exactly the pauses recorded
 /// here and is a no-op for everything else. A `tokio::sync::Mutex` rather
@@ -2725,16 +2730,39 @@ impl TorrentHandle for LibrqbitHandle {
     /// `Session::pause` -> `ManagedTorrent::pause`: a live torrent's state
     /// becomes `Paused`, which drops its peers and its pending writes and
     /// keeps its files and piece map -- and which `Session::unpause` (our
-    /// `restart_from_error`) takes straight back to live, no re-check, so
-    /// nothing may touch those files while it is paused. A torrent still
-    /// in its initial check is asked to pause once the check ends. Errs on
-    /// a torrent already paused or in the error state, in librqbit's words.
-    async fn stop_for_space(&self) -> Result<()> {
+    /// [`Self::start_torrent`]) takes straight back to live, no re-check,
+    /// so nothing may touch those files while it is paused. Errs on a
+    /// torrent already paused or in the error state, in librqbit's words.
+    ///
+    /// Nothing is recorded here, unlike [`Self::pause_torrent`]: this is
+    /// the reconciler's stop and the reconciler keeps no note of what it
+    /// stopped. The practical consequence is the one that matters --
+    /// `resume_torrent`, which every playback start calls, finds no record
+    /// and so cannot lift this pause; only [`Self::start_torrent`] can.
+    async fn stop_torrent(&self) -> Result<()> {
         self.session.pause(&self.handle).await
     }
 
+    /// `Session::unpause`, unconditionally: the `Paused(_)` arm builds the
+    /// live state and clears the persisted flag, with no re-check and no
+    /// progress lost. Errs on a torrent that is not paused.
+    ///
+    /// The hash is dropped from [`IdlePauses`] on the way, because after
+    /// this the torrent is running and a stale entry there would have the
+    /// next `resume_torrent` call `Session::unpause` on a live torrent and
+    /// log the error librqbit answers with. Dropping an entry is not
+    /// lifting an idle pause -- the pause is already gone by then -- and it
+    /// is the only direction that keeps the set honest while it still
+    /// exists.
+    async fn start_torrent(&self) -> Result<()> {
+        let mut idle_paused = self.idle_pauses.lock().await;
+        self.session.unpause(&self.handle).await?;
+        idle_paused.remove(&self.info_hash);
+        Ok(())
+    }
+
     /// The idle pause, and it is a real one: the same `Session::pause` the
-    /// free-space watch uses, recorded in [`IdlePauses`] so that
+    /// reconciler uses, recorded in [`IdlePauses`] so that
     /// [`Self::resume_torrent`] and nothing else lifts it.
     ///
     /// This used to be the trait's no-op, on the reasoning that pausing
@@ -2746,7 +2774,7 @@ impl TorrentHandle for LibrqbitHandle {
     /// measured failure was a torrent going 3 MiB -> 12 MiB in three seconds
     /// with the engine marked `idle_paused`, right through the free-space
     /// floor, because `pause_torrent` did nothing and the free-space watch
-    /// skips an engine that claims to be paused. Keeping peers we have
+    /// of the day skipped an engine that claimed to be paused. Keeping peers we have
     /// promised not to seed to, for a download the user has stopped
     /// watching, is not worth a volume.
     ///
@@ -2755,9 +2783,9 @@ impl TorrentHandle for LibrqbitHandle {
     /// trackers, the DHT and its initial peers, so the cost of the drop is a
     /// re-acquisition at the next playback, not a stall.
     ///
-    /// Errs, like `stop_for_space`, on a torrent already paused or in the
-    /// error state, and records nothing when it does: a pause somebody else
-    /// owns must not become one this can lift.
+    /// Errs, like [`Self::stop_torrent`], on a torrent already paused or in
+    /// the error state, and records nothing when it does: a pause somebody
+    /// else owns must not become one this can lift.
     async fn pause_torrent(&self) -> Result<()> {
         let mut idle_paused = self.idle_pauses.lock().await;
         self.session.pause(&self.handle).await?;
@@ -2769,10 +2797,9 @@ impl TorrentHandle for LibrqbitHandle {
     /// this on every playback start, so for the great majority of torrents,
     /// which this never paused, it must be a cheap and silent no-op: a bare
     /// `Session::unpause` would error on all of them, and would also lift
-    /// the free-space watch's stop and put a torrent straight back onto a
-    /// volume that has no room, which is the one pause a starting stream
-    /// must not undo (the stream route answers `507` for that torrent
-    /// instead).
+    /// the reconciler's stop and put a torrent straight back onto a volume
+    /// that has no room, which is the one pause a starting stream must not
+    /// undo (the stream route answers `507` for that torrent instead).
     ///
     /// The hash is forgotten only on a successful unpause, so a failure
     /// leaves the pause owned here and the next call tries again.
@@ -4216,13 +4243,13 @@ mod tests {
         assert!(!handle.is_in_error_state().await);
     }
 
-    /// Against the shipped librqbit: `stop_for_space` is `Session::pause`,
+    /// Against the shipped librqbit: `stop_torrent` is `Session::pause`,
     /// which takes a live torrent to `Paused` (no peers, no writes, files and
     /// piece map kept) and refuses a torrent already paused, and
-    /// `restart_from_error` is `Session::unpause`, which takes it straight
-    /// back to live.
+    /// `start_torrent` is `Session::unpause`, which takes it straight back to
+    /// live. Read off the state machine, never off the persisted flag.
     #[tokio::test]
-    async fn stop_for_space_pauses_a_live_torrent_and_restart_takes_it_back() {
+    async fn stop_torrent_pauses_a_live_torrent_and_start_takes_it_back() {
         use crate::backend::TorrentHandle;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
@@ -4232,17 +4259,10 @@ mod tests {
         let (_backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
         handle.await_initialized().await.expect("the check ends");
 
-        handle
-            .stop_for_space()
-            .await
-            .expect("a live torrent pauses");
-        let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
-        while !handle.handle.is_paused() && std::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(handle.handle.is_paused());
+        handle.stop_torrent().await.expect("a live torrent pauses");
+        assert_eq!(wait_until_settled(&handle).await, RunState::Paused);
         assert!(
-            handle.stop_for_space().await.is_err(),
+            handle.stop_torrent().await.is_err(),
             "a paused torrent is not paused twice"
         );
         assert!(
@@ -4251,15 +4271,13 @@ mod tests {
         );
 
         handle
-            .restart_from_error()
+            .start_torrent()
             .await
             .expect("unpause takes it back to live");
-        assert!(!handle.handle.is_paused());
+        assert_eq!(handle.run_state(), RunState::Live, "live again");
         assert!(
-            handle
-                .handle
-                .with_state(|s| matches!(s, ManagedTorrentState::Live(_))),
-            "live again"
+            handle.start_torrent().await.is_err(),
+            "a live torrent is not started twice"
         );
     }
 
@@ -4267,7 +4285,7 @@ mod tests {
     ///
     /// The engine layer calls it on every playback start, over torrents it
     /// has no reason to think are paused, and it must never be the thing
-    /// that puts a torrent the free-space watch stopped back onto a volume
+    /// that puts a torrent the reconciler stopped back onto a volume
     /// with no room. No swarm needed: this is about which pause each call
     /// owns, and `is_paused` is the whole answer.
     #[tokio::test]
@@ -4289,22 +4307,26 @@ mod tests {
             .expect("resuming a live torrent is a no-op");
         assert!(!handle.handle.is_paused(), "and it left it live");
 
-        // The free-space watch's stop is not ours to lift.
-        handle.stop_for_space().await.expect("stops for space");
-        wait_until_paused(&handle).await;
+        // The reconciler's stop is not ours to lift.
+        handle
+            .stop_torrent()
+            .await
+            .expect("the reconciler stops it");
+        assert_eq!(wait_until_settled(&handle).await, RunState::Paused);
         handle
             .resume_torrent()
             .await
             .expect("resuming is still not an error");
-        assert!(
-            handle.handle.is_paused(),
-            "a stream starting must not unpause a torrent stopped for want of disk"
+        assert_eq!(
+            handle.run_state(),
+            RunState::Paused,
+            "a stream starting must not unpause a torrent the reconciler stopped"
         );
         handle
-            .restart_from_error()
+            .start_torrent()
             .await
-            .expect("the watch lifts its own stop");
-        assert!(!handle.handle.is_paused());
+            .expect("the reconciler lifts its own stop");
+        assert_eq!(handle.run_state(), RunState::Live);
 
         // Ours, and only ours, comes back.
         handle.pause_torrent().await.expect("the idle pause pauses");
@@ -4568,9 +4590,9 @@ mod tests {
             "restored unpaused, and its fastresume check is inside the storage"
         );
 
-        // The free-space watch's stop, landing in that window.
+        // The reconciler's stop, landing in that window.
         handle
-            .stop_for_space()
+            .stop_torrent()
             .await
             .expect("librqbit accepts a pause on an initializing torrent");
         assert!(handle.handle.is_paused(), "the flag says paused");
@@ -4664,7 +4686,7 @@ mod tests {
         gate.wait_until_held(2).await;
 
         wedged
-            .stop_for_space()
+            .stop_torrent()
             .await
             .expect("librqbit accepts a pause on an initializing torrent");
         assert!(wedged.handle.is_paused(), "the flag says paused");

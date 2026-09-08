@@ -959,7 +959,7 @@ async fn stream_video_with(
     // cleaner either restarts the torrent (and the next request streams) or
     // evicts it (and the next request meets `MagnetAddError::EvictedForSpace`,
     // the same `507`, until the cooling-off period ends).
-    if engine.is_stopped_for_space() {
+    if engine.is_stopped_for_space().await {
         tracing::warn!(
             stream_id,
             info_hash = %info_hash,

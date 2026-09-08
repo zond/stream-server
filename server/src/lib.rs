@@ -1100,13 +1100,14 @@ pub async fn run(
     // timer when the driver goes down.
     background_tasks.extend(state.engine.take_sweep_task());
     background_tasks.extend(state.download_engine.take_sweep_task());
-    // And the free-space watch, which stops a torrent before it runs the
-    // volume out -- one per engine, and one for both where they are the
-    // same `Arc` (a second watch would only race the first for the same
-    // torrents).
-    background_tasks.push(state.engine.start_free_space_watch());
+    // And the reconciler, which recomputes what every torrent should be
+    // doing and makes it so -- stopping one before it runs the volume out,
+    // starting it again when there is room. One per engine, and one for
+    // both where they are the same `Arc` (a second reconciler would only
+    // race the first for the same torrents).
+    background_tasks.push(state.engine.start_reconciler());
     if !Arc::ptr_eq(&state.engine, &state.download_engine) {
-        background_tasks.push(state.download_engine.start_free_space_watch());
+        background_tasks.push(state.download_engine.start_reconciler());
     }
     if cfg.enable_cache_cleaner {
         background_tasks.push(cache_cleaner::start(Arc::new(state.clone())));

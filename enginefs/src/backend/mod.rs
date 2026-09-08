@@ -361,10 +361,10 @@ pub trait TorrentHandle: Send + Sync + Clone {
     /// Lift an idle pause ([`Self::pause_torrent`]) -- and only an idle
     /// pause. Called on every playback start, so for a torrent this never
     /// paused it must be a silent no-op rather than an error, and it must
-    /// never lift a stop the free-space watch owns ([`Self::stop_for_space`])
-    /// -- that torrent has nowhere to write and the stream route answers
-    /// `507` for it. A backend that can pause therefore has to record which
-    /// pauses are its idle ones.
+    /// never lift the reconciler's stop ([`Self::stop_torrent`]) -- that
+    /// torrent may have nowhere to write, and the reconciler is the one
+    /// thing that decides when it runs again. A backend that can pause
+    /// therefore has to record which pauses are its idle ones.
     async fn resume_torrent(&self) -> Result<()> {
         Ok(())
     }
@@ -399,35 +399,63 @@ pub trait TorrentHandle: Send + Sync + Clone {
     async fn is_in_error_state(&self) -> bool {
         false
     }
-    /// Put a torrent the backend stopped with an error back to work, after
-    /// whatever caused the error has been dealt with. Errs for a backend that
-    /// cannot restart one, so a caller never mistakes silence for recovery.
-    /// Also what puts a torrent stopped by [`Self::stop_for_space`] back to
-    /// work.
+    /// Put a torrent the backend stopped with an **error** back to work,
+    /// after whatever caused the error has been dealt with -- and only that
+    /// transition. Errs for a backend that cannot restart one, so a caller
+    /// never mistakes silence for recovery.
+    ///
+    /// It used to lift the free-space stop as well, and that is why it is
+    /// worth a paragraph: one method reached from two places that meant
+    /// different things ("the error was dealt with" and "the space came
+    /// back") could be made correct for neither, and the second of those
+    /// callers is now [`Self::start_torrent`]. A torrent in the error state
+    /// is the one thing the reconciler will not touch (its ladder answers
+    /// `Leave`), because restarting it means re-running a storage check
+    /// that would only fail again unless the cache cleaner has made room
+    /// first -- so this is the cleaner's call and nobody else's.
     async fn restart_from_error(&self) -> Result<()> {
         anyhow::bail!("this backend cannot restart a stopped torrent")
     }
-    /// Stop the torrent -- no more reads from peers, no more writes to disk
-    /// -- because the volume it writes to is about to run out. Distinct from
-    /// the idle pause ([`Self::pause_torrent`]) not in what it does to the
-    /// torrent (for librqbit both are `Session::pause`) but in who owns it:
-    /// this stop is lifted by [`Self::restart_from_error`] when the space
-    /// comes back, never by [`Self::resume_torrent`] on a starting stream.
-    /// It must actually stop the writes, since the alternative is the
-    /// filesystem stopping them with ENOSPC and the backend declaring the
-    /// torrent dead. Errs for a backend that cannot, and for a torrent
-    /// already stopped -- an idle-paused one included, which is why the
-    /// free-space watch skips those.
-    async fn stop_for_space(&self) -> Result<()> {
-        anyhow::bail!("this backend cannot stop a torrent for space")
+    /// Stop the torrent -- no more reads from peers, no more writes to
+    /// disk, files and piece map kept.
+    ///
+    /// The reconciler's stop, and it deliberately carries **no reason**:
+    /// whether a torrent should be running is recomputed from present
+    /// conditions on every pass (`crate::reconcile::desired`), so a backend
+    /// that recorded which policy asked for a pause would be keeping a note
+    /// that outlives the condition behind it -- and, in a fresh process
+    /// where the note is empty and the pause is not, reads as "nobody
+    /// paused this".
+    ///
+    /// It must actually stop the writes: the alternative is the filesystem
+    /// stopping them with ENOSPC and the backend declaring the torrent
+    /// dead. Errs for a backend that cannot, and for a torrent that is not
+    /// running -- the reconciler calls it only on a torrent its state
+    /// machine reports [`RunState::Live`], never on an initializing one,
+    /// which a pause wedges (see [`Self::run_state`]).
+    async fn stop_torrent(&self) -> Result<()> {
+        anyhow::bail!("this backend cannot stop a torrent")
+    }
+    /// Start a torrent that is stopped, whoever stopped it and whenever --
+    /// the previous process included.
+    ///
+    /// The counterpart of [`Self::stop_torrent`] and the other half of the
+    /// reconciler's control. Unconditional is the whole point:
+    /// [`Self::resume_torrent`] lifts only the pauses the backend itself
+    /// recorded as idle ones, so it is silent for a pause that survived a
+    /// restart -- which is exactly the pause somebody has to be able to
+    /// lift. Errs for a torrent that is not stopped, so a caller cannot
+    /// mistake "already running" for a start it made.
+    async fn start_torrent(&self) -> Result<()> {
+        anyhow::bail!("this backend cannot start a stopped torrent")
     }
     /// Pause torrent activity when no stream is using it and the user has
     /// turned seeding off. Reached only through that conjunction, so what it
     /// stops is a torrent still fetching a film nobody is watching while we
     /// have promised to upload nothing -- which on a small device is a
     /// volume filling for no one. A backend that really pauses must record
-    /// the pause as its own, so that [`Self::resume_torrent`] lifts it and a
-    /// [`Self::stop_for_space`] is never mistaken for it.
+    /// the pause as its own, so that [`Self::resume_torrent`] lifts it and
+    /// the reconciler's [`Self::stop_torrent`] is never mistaken for it.
     ///
     /// The default is a no-op, for a backend that would rather throttle than
     /// lose its peers ([`Self::set_upload_throttled`]); a backend that takes

@@ -138,44 +138,102 @@ pub struct Conditions {
 ///    not stop and start the torrent with it.
 /// 7. Otherwise **[`Decision::Run`]**.
 pub fn desired(conditions: &Conditions, trigger: Trigger) -> Decision {
+    verdict(conditions, trigger).decision
+}
+
+/// A [`desired`] decision together with the arm of the ladder that took it.
+///
+/// The arm is computed, never remembered -- it comes out of the same walk
+/// of the same ladder as the decision, and is gone by the time the call
+/// returns to anything that could store it. It is here because the two
+/// stops mean different things to different readers: only the free-space
+/// one is a statement about the device, which is what the statistics report
+/// to a client (`Engine::is_stopped_for_space`), what the cache cleaner
+/// evicts for, and -- while the idle policy still has an owner of its own
+/// -- the only stop this reconciler is allowed to make.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Verdict {
+    /// What should happen to the torrent.
+    pub decision: Decision,
+    /// The free-space arm is what decided. Only a [`Decision::Stop`] ever
+    /// carries it.
+    pub for_space: bool,
+}
+
+/// [`desired`] with the arm that took it, which is the whole ladder; the
+/// arms and the reasons for their order are documented on [`desired`].
+pub fn verdict(conditions: &Conditions, trigger: Trigger) -> Verdict {
+    let arm = |decision| Verdict {
+        decision,
+        for_space: false,
+    };
     match conditions.run_state {
-        RunState::Initializing { .. } | RunState::Gone => return Decision::Stop,
-        RunState::Error => return Decision::Leave,
+        RunState::Initializing { .. } | RunState::Gone => return arm(Decision::Stop),
+        RunState::Error => return arm(Decision::Leave),
         RunState::Live | RunState::Paused => {}
     }
     if !conditions.has_metadata {
-        return Decision::Run;
+        return arm(Decision::Run);
     }
-    // `wants_to_write`: only a torrent that still has data to fetch can
-    // take the volume down.
-    if !conditions.finished {
-        match conditions.available {
-            Some(available) if available < floor(trigger, conditions.run_state) => {
-                return Decision::Stop;
-            }
-            // An unreadable volume is not a full one. For the timer that
-            // means no opinion at all -- it will ask again in two seconds,
-            // and a probe that has started failing is a broken environment,
-            // not evidence about a disk. For a playback it means the user
-            // who is waiting gets their stream: refusing to start a torrent
-            // because `statvfs` failed would make an unreadable volume look
-            // like a server that plays nothing.
-            None => {
-                return match trigger {
-                    Trigger::Timer => Decision::Leave,
-                    Trigger::PlaybackStart => Decision::Run,
-                };
-            }
-            Some(_) => {}
-        }
+    if volume_is_short(
+        trigger,
+        conditions.run_state,
+        conditions.has_metadata,
+        conditions.finished,
+        conditions.available,
+    ) {
+        return Verdict {
+            decision: Decision::Stop,
+            for_space: true,
+        };
+    }
+    // An unreadable volume is not a full one. For the timer that means no
+    // opinion at all -- it will ask again in two seconds, and a probe that
+    // has started failing is a broken environment, not evidence about a
+    // disk. For a playback it means the user who is waiting gets their
+    // stream: refusing to start a torrent because `statvfs` failed would
+    // make an unreadable volume look like a server that plays nothing.
+    if !conditions.finished && conditions.available.is_none() {
+        return arm(match trigger {
+            Trigger::Timer => Decision::Leave,
+            Trigger::PlaybackStart => Decision::Run,
+        });
     }
     if conditions.playing || conditions.pinned {
-        return Decision::Run;
+        return arm(Decision::Run);
     }
     if !conditions.seeding_enabled && conditions.idle_for >= crate::INACTIVE_TORRENT_PAUSE_GRACE {
-        return Decision::Stop;
+        return arm(Decision::Stop);
     }
-    Decision::Run
+    arm(Decision::Run)
+}
+
+/// The free-space arm of [`desired`] on its own: whether the volume this
+/// torrent writes to is too short for it to be running.
+///
+/// `wants_to_write` is the first half -- only a torrent that still has data
+/// to fetch can take a volume down, so a magnet that has not resolved its
+/// info dictionary (no files, no length) and a torrent that has everything
+/// it wants are both outside this arm however little room is left. The
+/// second half is the reading against [`floor`].
+///
+/// It is a function of its own, and not a line inside the ladder, because
+/// the ladder is not the only caller: `Engine::is_stopped_for_space` asks
+/// the same question of a torrent that is already stopped, for the
+/// statistics a client polls and for the cache cleaner's eviction classes.
+/// A second copy of the test in either place is a policy in two halves that
+/// drift, which is how the free-space watch came to skip the very torrents
+/// the stream route was answering `507` for.
+pub fn volume_is_short(
+    trigger: Trigger,
+    run_state: RunState,
+    has_metadata: bool,
+    finished: bool,
+    available: Option<u64>,
+) -> bool {
+    has_metadata
+        && !finished
+        && available.is_some_and(|available| available < floor(trigger, run_state))
 }
 
 /// The free-space line this decision is measured against, and the whole of
@@ -202,8 +260,119 @@ pub fn desired(conditions: &Conditions, trigger: Trigger) -> Decision {
 fn floor(trigger: Trigger, observed: RunState) -> u64 {
     match (trigger, observed) {
         (Trigger::PlaybackStart, _) | (_, RunState::Live) => CACHE_FREE_SPACE_FLOOR,
-        _ => CACHE_FREE_SPACE_FLOOR.saturating_add(FREE_SPACE_RESUME_MARGIN),
+        _ => resume_line(),
     }
+}
+
+/// The last free-space reading of every volume the reconciler has looked
+/// at, and how long each has been too short to run a torrent on.
+///
+/// This is not a record of anything the process decided. It is the
+/// reconciler's most recent *observation* of a live input -- at most one
+/// [`RECONCILE_INTERVAL`] old -- kept because the question "is this torrent
+/// stopped because its volume is full?" is asked far more often than the
+/// volume can usefully be measured: every `stats.json` poll asks it, and so
+/// does every pass of the cache cleaner, over every engine. A `statvfs` per
+/// asker would be a syscall per torrent per poll for a number that changes
+/// on the scale of seconds.
+///
+/// Keyed by output folder rather than by torrent, because that is what a
+/// volume is: two torrents writing to one folder share one reading and one
+/// [`Reading::short_since`], and a bound counted per torrent would start
+/// the clock again for each of them (see [`Self::short_for`]).
+pub struct Volumes {
+    /// Where a torrent that names no output folder of its own writes --
+    /// the engine's download directory.
+    default_folder: std::path::PathBuf,
+    readings: parking_lot::Mutex<std::collections::HashMap<std::path::PathBuf, Reading>>,
+}
+
+#[derive(Clone, Copy)]
+struct Reading {
+    /// Free bytes at the last probe, or `None` when that probe failed.
+    /// `None` is "unknown" everywhere, never "full".
+    available: Option<u64>,
+    /// The clock reading when this volume was first seen with less than
+    /// [`CACHE_FREE_SPACE_FLOOR`] + [`FREE_SPACE_RESUME_MARGIN`] free.
+    ///
+    /// That line, and not the floor, because this is the number the stall
+    /// bound is judged on: a stopped torrent is not started again until the
+    /// volume clears the margin, so between the floor and the margin its
+    /// readers are still waiting for something that is not coming.
+    short_since: Option<u64>,
+}
+
+impl Volumes {
+    pub(crate) fn new(default_folder: std::path::PathBuf) -> Self {
+        Self {
+            default_folder,
+            readings: Default::default(),
+        }
+    }
+
+    /// The folder a torrent writes to: its own if the backend names one,
+    /// otherwise the engine's download directory.
+    pub(crate) fn folder_of(
+        &self,
+        output_folder: Option<std::path::PathBuf>,
+    ) -> std::path::PathBuf {
+        output_folder.unwrap_or_else(|| self.default_folder.clone())
+    }
+
+    /// Record a probe of `folder` taken at `now_secs`.
+    ///
+    /// A failed probe (`available` of `None`) leaves [`Reading::short_since`]
+    /// exactly as it was: it is evidence neither that the volume filled nor
+    /// that it cleared, and starting or clearing the stall clock on a
+    /// `statvfs` that stopped answering would fail a player's reads because
+    /// of a broken environment rather than because of a full disk.
+    pub(crate) fn record(&self, folder: &std::path::Path, available: Option<u64>, now_secs: u64) {
+        let mut readings = self.readings.lock();
+        let reading = readings.entry(folder.to_path_buf()).or_insert(Reading {
+            available: None,
+            short_since: None,
+        });
+        reading.available = available;
+        match available {
+            Some(available) if available < resume_line() => {
+                reading.short_since.get_or_insert(now_secs);
+            }
+            Some(_) => reading.short_since = None,
+            None => {}
+        }
+    }
+
+    /// The last reading of `folder`, or `None` for a volume nothing has
+    /// probed yet and for one whose probe failed. Both are "unknown", which
+    /// is what [`volume_is_short`] refuses to treat as full.
+    pub fn available(&self, folder: &std::path::Path) -> Option<u64> {
+        self.readings.lock().get(folder).and_then(|r| r.available)
+    }
+
+    /// How long `folder` has been under the line a stopped torrent has to
+    /// see cleared before anything starts it again; `None` when it is not.
+    ///
+    /// Per volume and not per torrent, which is the point of it. The bound
+    /// exists to fail reads that nothing is ever going to complete, and
+    /// what decides that is the state of the disk, not when this particular
+    /// torrent happened to be stopped: a second torrent stopped on the same
+    /// full volume a minute later has readers as doomed as the first one's,
+    /// and counting from its own stop would give them a fresh twenty
+    /// seconds of spinning for a disk that has been full the whole time.
+    pub(crate) fn short_for(&self, folder: &std::path::Path, now_secs: u64) -> Option<Duration> {
+        let since = self
+            .readings
+            .lock()
+            .get(folder)
+            .and_then(|r| r.short_since)?;
+        Some(Duration::from_secs(now_secs.saturating_sub(since)))
+    }
+}
+
+/// The line a volume has to clear before a stopped torrent is started
+/// again, which is [`floor`]'s upper arm.
+fn resume_line() -> u64 {
+    CACHE_FREE_SPACE_FLOOR.saturating_add(FREE_SPACE_RESUME_MARGIN)
 }
 
 /// One lock per info hash, so that reconciling one torrent never queues

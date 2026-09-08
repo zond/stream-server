@@ -7,7 +7,7 @@ use anyhow::Context;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::files::FileHandle;
 use regex::Regex;
@@ -245,9 +245,10 @@ impl GetFileError {
     }
 }
 
-/// What `stats.error` says for a torrent the free-space watch stopped
-/// (`BackendEngineFS::free_space_watch_tick`): a fixed, path-free sentence,
-/// like `librqbit::TORRENT_ERROR_MESSAGE` for the backend's own error state.
+/// What `stats.error` says for a torrent the reconciler's free-space arm
+/// has stopped (`Engine::is_stopped_for_space`): a fixed, path-free
+/// sentence, like `librqbit::TORRENT_ERROR_MESSAGE` for the backend's own
+/// error state.
 pub const STOPPED_FOR_SPACE_MESSAGE: &str =
     "the torrent is stopped for want of disk space; free some space and it will resume";
 
@@ -267,14 +268,13 @@ pub struct Engine<H: TorrentHandle> {
     /// seeding-disabled pause; the handle keeps its own copy for the
     /// want-set planner (`TorrentHandle::pin_file`).
     pub pinned_files: parking_lot::RwLock<BTreeSet<usize>>,
-    /// The free-space watch stopped this torrent because the volume it
-    /// writes to fell under the floor (`BackendEngineFS::free_space_watch_tick`).
-    /// Cleared by whatever puts it back to work -- the watch when space
-    /// recovers, or the cache cleaner's `restart_from_error` once it has
-    /// made room. Read on the stream route, which answers `507` for it.
-    stopped_for_space: AtomicBool,
-    /// `Clock::now_secs()` of the stop, for the stall bound on its readers.
-    stopped_for_space_at_secs: AtomicU64,
+    /// The last free-space reading of every volume, shared with the
+    /// `BackendEngineFS` that made this engine and written by its
+    /// reconciler. Whether this torrent is stopped for want of space is
+    /// recomputed from it and from the torrent's own state
+    /// ([`Self::is_stopped_for_space`]); nothing here remembers that it
+    /// was.
+    volumes: Arc<crate::reconcile::Volumes>,
     /// Reads through this engine fail with `StorageFull` instead of parking:
     /// see [`Self::refuse_reads_for_space`].
     reads_refused: AtomicBool,
@@ -288,7 +288,12 @@ pub struct Engine<H: TorrentHandle> {
 }
 
 impl<H: TorrentHandle> Engine<H> {
-    pub fn new_with_handle(handle: H, info_hash: &str, clock: crate::Clock) -> Self {
+    pub fn new_with_handle(
+        handle: H,
+        info_hash: &str,
+        clock: crate::Clock,
+        volumes: Arc<crate::reconcile::Volumes>,
+    ) -> Self {
         Self {
             info_hash: info_hash.to_string(),
             handle,
@@ -301,40 +306,69 @@ impl<H: TorrentHandle> Engine<H> {
                 .build(),
             idle_paused: AtomicBool::new(false),
             pinned_files: parking_lot::RwLock::new(BTreeSet::new()),
-            stopped_for_space: AtomicBool::new(false),
-            stopped_for_space_at_secs: AtomicU64::new(0),
+            volumes,
             reads_refused: AtomicBool::new(false),
             read_wakers: parking_lot::Mutex::new(HashMap::new()),
             next_reader_id: AtomicU64::new(1),
         }
     }
 
-    /// Whether the free-space watch has this torrent stopped.
-    pub fn is_stopped_for_space(&self) -> bool {
-        self.stopped_for_space.load(Ordering::SeqCst)
+    /// The shared per-volume readings this engine was made with, for an
+    /// engine that replaces it on the same [`BackendEngineFS`]
+    /// (`replace_engine`, after a relocation).
+    ///
+    /// [`BackendEngineFS`]: crate::BackendEngineFS
+    pub(crate) fn volumes(&self) -> Arc<crate::reconcile::Volumes> {
+        self.volumes.clone()
     }
 
-    /// The watch stopped the torrent at `now_secs` (the engine's clock).
-    pub(crate) fn mark_stopped_for_space(&self, now_secs: u64) {
-        self.stopped_for_space_at_secs
-            .store(now_secs, Ordering::SeqCst);
-        self.stopped_for_space.store(true, Ordering::SeqCst);
-    }
-
-    /// How long the torrent has been stopped for space at `now_secs`;
-    /// `None` when it is not.
-    pub(crate) fn stopped_for_space_for(&self, now_secs: u64) -> Option<Duration> {
-        self.is_stopped_for_space().then(|| {
-            Duration::from_secs(
-                now_secs.saturating_sub(self.stopped_for_space_at_secs.load(Ordering::SeqCst)),
+    /// Whether this torrent is stopped, and stopped because the volume it
+    /// writes to has no room for it.
+    ///
+    /// **Recomputed, never remembered.** It is the conjunction of two
+    /// things that are both readable now: the backend's state machine says
+    /// the torrent is stopped ([`crate::backend::TorrentHandle::run_state`],
+    /// never its persisted `paused` flag, which across an initial check is
+    /// wrong in both directions), and the free-space arm of the reconciler's
+    /// ladder says the volume is short for it
+    /// ([`crate::reconcile::volume_is_short`] -- the same function the
+    /// ladder itself calls, so the two cannot disagree).
+    ///
+    /// It used to be a bit set when the free-space watch stopped a torrent
+    /// and cleared when something started it again, and that bit was wrong
+    /// in two ways that both shipped. It said nothing about a pause that
+    /// had survived a restart, because the bit had not; and because the
+    /// watch skipped any torrent that claimed to be idle-paused, an
+    /// idle-paused torrent on a full volume never got the bit at all --
+    /// while the stream route's `507` was gated on the bit alone, so a
+    /// playback starting on that torrent was let through onto the full
+    /// volume. Neither is possible of a question that is asked of the
+    /// present.
+    ///
+    /// The reading is the reconciler's last probe of the volume rather than
+    /// a fresh one: this is asked on every `stats.json` poll and by every
+    /// cache-cleaner pass over every engine, and it is a number that moves
+    /// on the scale of seconds. `false` for a volume nothing has probed yet
+    /// -- unknown is not full.
+    pub async fn is_stopped_for_space(&self) -> bool {
+        let run_state = self.handle.run_state();
+        matches!(run_state, crate::backend::RunState::Paused)
+            && crate::reconcile::volume_is_short(
+                crate::reconcile::Trigger::Timer,
+                run_state,
+                self.handle.has_metadata().await,
+                self.handle.is_finished().await,
+                self.volumes
+                    .available(&self.volumes.folder_of(self.handle.output_folder())),
             )
-        })
     }
 
-    /// The torrent is back to work: neither stopped nor refusing reads.
-    /// Readers that were failed meanwhile are gone; new ones read normally.
-    pub(crate) fn clear_space_stop(&self) {
-        self.stopped_for_space.store(false, Ordering::SeqCst);
+    /// Reads through this engine park again, as they did before
+    /// [`Self::refuse_reads_for_space`] failed them. The reconciler calls it
+    /// when it starts a torrent: the pieces its readers were waiting for
+    /// are being fetched again, so there is once more something for a
+    /// parked read to wait for.
+    pub(crate) fn allow_reads(&self) {
         self.reads_refused.store(false, Ordering::SeqCst);
     }
 
@@ -343,7 +377,7 @@ impl<H: TorrentHandle> Engine<H> {
         self.reads_refused.load(Ordering::SeqCst)
     }
 
-    /// Fail every read on this engine, now and until [`Self::clear_space_stop`]:
+    /// Fail every read on this engine, now and until [`Self::allow_reads`]:
     /// the parked ones are woken to find `reads_refused` set and return
     /// `StorageFull`, and a new one returns it on its first poll.
     ///
@@ -451,11 +485,11 @@ impl<H: TorrentHandle> Engine<H> {
             );
         }
 
-        // A torrent the free-space watch stopped is `Paused` to the backend,
-        // which is `buffering` to a client -- a wheel that never ends. It
-        // is an error in the sense the `error` field has always had: a
-        // full disk, and the client can act on it.
-        if self.is_stopped_for_space() {
+        // A torrent the reconciler stopped for space is `Paused` to the
+        // backend, which is `buffering` to a client -- a wheel that never
+        // ends. It is an error in the sense the `error` field has always
+        // had: a full disk, and the client can act on it.
+        if self.is_stopped_for_space().await {
             stats.phase = crate::backend::StartupPhase::Error;
             stats
                 .error
