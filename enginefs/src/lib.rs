@@ -166,11 +166,9 @@ pub(crate) const INACTIVE_TORRENT_PAUSE_GRACE: Duration = Duration::from_secs(15
 /// changed. Neither a stop nor a playback start goes through it -- see
 /// [`BackendEngineFS::start_if_stopped`] for why each is exempt.
 pub(crate) const RECONCILE_MIN_DWELL: Duration = INACTIVE_TORRENT_PAUSE_GRACE;
-const HLS_PLAYBACK_LEASE_TTL: Duration = Duration::from_secs(300);
-const NATIVE_LIFECYCLE_HLS_PLAYBACK_LEASE_TTL: Duration = Duration::from_secs(15);
 
 /// Instance-relative clock for the idle bookkeeping (engine `last_accessed`,
-/// playback leases, magnet-add polls). Seconds since the owning
+/// magnet-add polls). Seconds since the owning
 /// [`BackendEngineFS`] was created, measured with a `tokio::time::Instant` so
 /// it follows paused/advanced time under `#[tokio::test(start_paused = true)]`
 /// (it is the std clock otherwise). One epoch per instance rather than a
@@ -642,14 +640,6 @@ impl<H: TorrentHandle> MagnetAddEntry<H> {
 
 type MagnetAddRegistry<H> = Arc<RwLock<HashMap<String, MagnetAddEntry<H>>>>;
 
-fn hls_playback_lease_ttl_secs() -> u64 {
-    HLS_PLAYBACK_LEASE_TTL.as_secs()
-}
-
-fn playback_lease_is_active(lease: &PlaybackLease, now: u64) -> bool {
-    lease.expires_at_secs > now
-}
-
 const DEFAULT_TRACKERS: &[&str] = &[
     "udp://tracker.opentrackr.org:1337/announce",
     "udp://9.rarbg.com:2810/announce",
@@ -676,9 +666,6 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     /// Tracks the most recently active streamed file for legacy diagnostics.
     /// Active scheduling is driven by active_file_streams so several torrents can stream at once.
     active_file: Arc<RwLock<Option<(String, usize)>>>,
-    /// HLS playback is made of short segment reads. A lease keeps the file wanted
-    /// while the player is buffered and no response body is currently open.
-    active_playback_leases: Arc<RwLock<HashMap<(String, usize), PlaybackLease>>>,
     /// For multi-file torrents, only the latest requested file is allowed to be
     /// wanted at a time. Single-file torrents bypass this selector.
     active_multifile_files: Arc<RwLock<HashMap<String, MultiFileActiveSelection>>>,
@@ -754,12 +741,6 @@ struct EngineParts {
 }
 
 #[derive(Debug, Clone)]
-struct PlaybackLease {
-    last_seen_secs: u64,
-    expires_at_secs: u64,
-}
-
-#[derive(Debug, Clone)]
 struct MultiFileActiveSelection {
     file_idx: usize,
     generation: u64,
@@ -781,14 +762,6 @@ pub struct ActiveFileSnapshot {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ActivePlaybackLeaseSnapshot {
-    pub info_hash: String,
-    pub file_idx: usize,
-    pub last_seen_secs: u64,
-    pub expires_in_secs: u64,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MultiFileActiveSelectionSnapshot {
     pub info_hash: String,
     pub file_idx: usize,
@@ -806,7 +779,6 @@ pub struct StreamActivitySnapshot {
     pub active_streams: HashMap<String, usize>,
     pub active_file_streams: Vec<ActiveFileStreamSnapshot>,
     pub active_file: Option<ActiveFileSnapshot>,
-    pub active_playback_leases: Vec<ActivePlaybackLeaseSnapshot>,
     pub active_multifile_selections: Vec<MultiFileActiveSelectionSnapshot>,
     /// The torrents the backend's state machine reports stopped, right now
     /// -- an observation, taken when the snapshot is built.
@@ -825,17 +797,13 @@ pub struct StreamActivitySnapshot {
 impl StreamActivitySnapshot {
     /// Whether a player is reading from this server right now.
     ///
-    /// Three of the fields here are live and the rest are sticky, and telling
+    /// Two of the fields here are live and the rest are sticky, and telling
     /// them apart is the whole of the answer:
     ///
     /// * `engine_active_streams` counts open file readers -- up when one is
     ///   handed out, down when the [`crate::files::FileHandle`] is dropped.
     /// * `active_streams` counts the stream responses on top of them
-    ///   (`on_stream_start`/`on_stream_end`), which is also what an HLS
-    ///   client's segment requests move.
-    /// * `active_playback_leases` is already filtered to unexpired leases:
-    ///   how a client that reads in short bursts says it is still there
-    ///   between them.
+    ///   (`on_stream_start`/`on_stream_end`).
     ///
     /// `active_file` and `active_multifile_selections` are the ones to leave
     /// out. They name the file most recently chosen, and they deliberately
@@ -843,9 +811,7 @@ impl StreamActivitySnapshot {
     /// light driven by either would come on with the first playback of the
     /// session and never go out again.
     pub fn playback_is_live(&self) -> bool {
-        self.engine_active_streams > 0
-            || self.active_streams.values().any(|count| *count > 0)
-            || !self.active_playback_leases.is_empty()
+        self.engine_active_streams > 0 || self.active_streams.values().any(|count| *count > 0)
     }
 }
 
@@ -1098,7 +1064,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             active_streams: Arc::new(RwLock::new(HashMap::new())),
             active_file_streams: Arc::new(RwLock::new(HashMap::new())),
             active_file: Arc::new(RwLock::new(None)),
-            active_playback_leases: Arc::new(RwLock::new(HashMap::new())),
             active_multifile_files: Arc::new(RwLock::new(HashMap::new())),
             priority_generation: Arc::new(AtomicU64::new(0)),
             disk_cache: None,
@@ -1125,32 +1090,18 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let active_streams_clone = efs.active_streams.clone();
         let active_file_streams_clone = efs.active_file_streams.clone();
         let active_file_clone = efs.active_file.clone();
-        let active_playback_leases_clone = efs.active_playback_leases.clone();
         let active_multifile_files_clone = efs.active_multifile_files.clone();
         let magnet_adds_clone = efs.magnet_adds.clone();
         let clock = efs.clock;
         let sweep = tokio::spawn(async move {
             loop {
-                // Lease expiry and magnet-registry pruning; torrent removal
-                // is gated by the much longer inactivity timeout below.
-                // Pausing is not here any more -- that is the reconciler's,
-                // on its own two-second tick.
+                // Magnet-registry pruning; torrent removal is gated by
+                // the much longer inactivity timeout below. Pausing is not
+                // here any more -- that is the reconciler's, on its own
+                // two-second tick.
                 tokio::time::sleep(Duration::from_secs(15)).await;
                 let mut to_remove = Vec::new();
                 let now = clock.now_secs();
-
-                let expired_leases = {
-                    let mut leases = active_playback_leases_clone.write().await;
-                    let expired = leases
-                        .iter()
-                        .filter(|(_, lease)| !playback_lease_is_active(lease, now))
-                        .map(|(key, _)| key.clone())
-                        .collect::<Vec<_>>();
-                    for key in &expired {
-                        leases.remove(key);
-                    }
-                    expired
-                };
 
                 // Magnet adds nobody has asked about for the inactivity window:
                 // a failure record that was never retried, or (should the add
@@ -1191,103 +1142,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     });
                 }
 
-                for (info_hash, file_idx) in expired_leases {
-                    tracing::info!(
-                        info_hash = %info_hash,
-                        file_idx,
-                        ttl_secs = hls_playback_lease_ttl_secs(),
-                        "HLS playback lease expired"
-                    );
-
-                    let still_active = {
-                        let streams = active_file_streams_clone.read().await;
-                        streams
-                            .get(&(info_hash.clone(), file_idx))
-                            .copied()
-                            .unwrap_or(0)
-                            > 0
-                    };
-                    if still_active {
-                        continue;
-                    }
-
-                    let active_selection = {
-                        let mut selections = active_multifile_files_clone.write().await;
-                        match selections.get(&info_hash).cloned() {
-                            Some(selection) if selection.file_idx == file_idx => {
-                                selections.remove(&info_hash);
-                                tracing::info!(
-                                    info_hash = %info_hash,
-                                    file_idx,
-                                    generation = selection.generation,
-                                    reason = "hls-lease-expired",
-                                    "multifile_active_file_cleared"
-                                );
-                                None
-                            }
-                            Some(selection) => Some(selection),
-                            None => None,
-                        }
-                    };
-
-                    {
-                        let mut active = active_file_clone.write().await;
-                        if let Some((ref h, idx)) = *active
-                            && h == &info_hash
-                            && idx == file_idx
-                        {
-                            *active = active_selection
-                                .as_ref()
-                                .map(|selection| (info_hash.clone(), selection.file_idx));
-                        }
-                    }
-
-                    let engine = {
-                        let engines = engines_clone.read().await;
-                        engines.get(&info_hash).cloned()
-                    };
-                    if let Some(engine) = engine {
-                        if engine.handle.manages_playback_lifecycle() {
-                            // A native-lifecycle backend expires its own
-                            // generation-scoped HLS lease and performs the
-                            // acknowledged pause. Shared delayed cleanup must
-                            // not race it.
-                            continue;
-                        }
-                        let reconciled = Self::reconcile_multifile_engine(
-                            engine.clone(),
-                            active_selection
-                                .as_ref()
-                                .map(|selection| selection.file_idx),
-                            None,
-                            active_selection
-                                .as_ref()
-                                .map(|selection| selection.generation)
-                                .unwrap_or(0),
-                            "hls-lease-expired",
-                        )
-                        .await;
-                        if reconciled {
-                            continue;
-                        }
-
-                        if let Err(err) = engine.handle.clear_file_streaming(file_idx).await {
-                            tracing::warn!(
-                                info_hash = %info_hash,
-                                file_idx,
-                                error = %err,
-                                "Failed to clear file priorities after HLS playback lease expired"
-                            );
-                        } else {
-                            tracing::info!(
-                                info_hash = %info_hash,
-                                file_idx,
-                                "Cleared file priorities after HLS playback lease expired"
-                            );
-                        }
-                    }
-                }
-
                 {
                     let read = engines_clone.read().await;
                     for (hash, engine) in read.iter() {
@@ -1314,15 +1168,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                                 .map(|(_, count)| *count)
                                 .sum::<usize>()
                         };
-                        let active_playback_lease_count = {
-                            let leases = active_playback_leases_clone.read().await;
-                            leases
-                                .iter()
-                                .filter(|((stream_hash, _), lease)| {
-                                    stream_hash == hash && playback_lease_is_active(lease, now)
-                                })
-                                .count()
-                        };
                         let active_file_matches = {
                             let active = active_file_clone.read().await;
                             active
@@ -1347,8 +1192,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                             Some("active_streams")
                         } else if active_file_stream_count > 0 {
                             Some("active_file_streams")
-                        } else if active_playback_lease_count > 0 {
-                            Some("active_playback_leases")
                         } else if active_file_matches {
                             Some("active_file")
                         } else if active_multifile_matches {
@@ -1364,7 +1207,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                                 engine_active_streams,
                                 active_stream_count,
                                 active_file_stream_count,
-                                active_playback_lease_count,
                                 active_multifile_matches,
                                 removed = false,
                                 skip_reason,
@@ -1377,7 +1219,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                                 engine_active_streams,
                                 active_stream_count,
                                 active_file_stream_count,
-                                active_playback_lease_count,
                                 active_multifile_matches,
                                 removed = true,
                                 "Scheduling inactive-engine cleanup"
@@ -1421,8 +1262,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     }
 
     /// Take the housekeeping sweep this constructor started -- the loop above
-    /// that expires playback leases, prunes the magnet registry and pauses or
-    /// removes idle torrents -- for the caller to abort when it shuts down.
+    /// that prunes the magnet registry and removes idle torrents -- for the
+    /// caller to abort when it shuts down.
     /// `server::run` puts it with the other long-lived tasks it cancels. It
     /// comes out once; a second call (the stream and download engines are
     /// often the same `Arc`) yields `None`.
@@ -1898,11 +1739,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     }
 
     /// Whether anything is using this torrent right now: a response body
-    /// open on it, a file stream, an unexpired HLS playback lease, a
-    /// multi-file selection, or a reader parked inside the engine. These
-    /// were five questions asked in three places -- the housekeeping
-    /// sweep's idle pause, the per-stream grace-period task and this -- and
-    /// the first two are gone: the ladder is the only thing that asks.
+    /// open on it, a file stream, a multi-file selection, or a reader
+    /// parked inside the engine. These were questions asked in three
+    /// places -- the housekeeping sweep's idle pause, the per-stream
+    /// grace-period task and this -- and the first two are gone: the
+    /// ladder is the only thing that asks.
     ///
     /// A `true` answer is stamped on the engine ([`Engine::mark_active`]),
     /// and that stamp is the whole of the idle arm's grace clock. It is
@@ -1918,22 +1759,19 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         engine: &Engine<B::Handle>,
         now: u64,
     ) -> bool {
-        let active = self
-            .torrent_activity_registers(info_hash, engine, now)
-            .await;
+        let active = self.torrent_activity_registers(info_hash, engine).await;
         if active {
             engine.mark_active(now);
         }
         active
     }
 
-    /// [`Self::torrent_is_active`] without the stamp: the five registers
+    /// [`Self::torrent_is_active`] without the stamp: the four registers
     /// and nothing else.
     async fn torrent_activity_registers(
         &self,
         info_hash: &str,
         engine: &Engine<B::Handle>,
-        now: u64,
     ) -> bool {
         if engine.active_streams.load(Ordering::SeqCst) > 0 {
             return true;
@@ -1955,15 +1793,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             .await
             .iter()
             .any(|((hash, _), count)| hash == info_hash && *count > 0)
-        {
-            return true;
-        }
-        if self
-            .active_playback_leases
-            .read()
-            .await
-            .iter()
-            .any(|((hash, _), lease)| hash == info_hash && playback_lease_is_active(lease, now))
         {
             return true;
         }
@@ -2827,21 +2656,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 file_idx: *file_idx,
             });
         let now = self.clock.now_secs();
-        let active_playback_leases = self
-            .active_playback_leases
-            .read()
-            .await
-            .iter()
-            .filter(|(_, lease)| playback_lease_is_active(lease, now))
-            .map(
-                |((info_hash, file_idx), lease)| ActivePlaybackLeaseSnapshot {
-                    info_hash: info_hash.clone(),
-                    file_idx: *file_idx,
-                    last_seen_secs: lease.last_seen_secs,
-                    expires_in_secs: lease.expires_at_secs.saturating_sub(now),
-                },
-            )
-            .collect();
         let active_multifile_selections = self
             .active_multifile_files
             .read()
@@ -2864,7 +2678,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             active_streams,
             active_file_streams,
             active_file,
-            active_playback_leases,
             active_multifile_selections,
             paused_torrents,
         }
@@ -2874,12 +2687,12 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     ///
     /// The snapshot is the definition -- which of the fields mean "somebody
     /// is watching" is decided there and tested there -- but building one
-    /// to read three of its fields costs six lock acquisitions and four
-    /// cloned collections. This is the same three questions asked directly:
-    /// the per-engine reader counts, the stream-response counts and the
-    /// unexpired leases, three read locks (the `engines` one included, so
-    /// this too queues behind an add or remove -- the saving is the other
-    /// three locks and the clones, not that wait) and nothing cloned.
+    /// to read two of its fields costs six lock acquisitions and four
+    /// cloned collections. This is the same two questions asked directly:
+    /// the per-engine reader counts and the stream-response counts, two
+    /// read locks (the `engines` one included, so this too queues behind an
+    /// add or remove -- the saving is the other locks and the clones, not
+    /// that wait) and nothing cloned.
     /// Short-circuits, so a server with a reader open answers from the
     /// first. A client polls this every second or two through the activity
     /// light, which is what makes the difference worth two definitions;
@@ -2894,21 +2707,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         if readers_open {
             return true;
         }
-        if self
-            .active_streams
+        self.active_streams
             .read()
             .await
             .values()
             .any(|count| *count > 0)
-        {
-            return true;
-        }
-        let now = self.clock.now_secs();
-        self.active_playback_leases
-            .read()
-            .await
-            .values()
-            .any(|lease| playback_lease_is_active(lease, now))
     }
 
     pub async fn diagnostics_snapshot(&self) -> EngineDiagnosticsSnapshot {
@@ -2945,8 +2748,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             }
             *self.active_file.write().await = Some((info_hash.clone(), file_idx));
         } else {
-            self.activate_file(&info_hash, file_idx, false, "stream")
-                .await;
+            self.activate_file(&info_hash, file_idx, "stream").await;
         }
 
         // Also update legacy active_streams counter
@@ -3023,13 +2825,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             .await;
     }
 
-    async fn activate_file(
-        &self,
-        info_hash: &str,
-        file_idx: usize,
-        keep_file_downloading: bool,
-        source: &'static str,
-    ) {
+    async fn activate_file(&self, info_hash: &str, file_idx: usize, source: &'static str) {
         let mut is_multifile = false;
         if let Some(engine) = self.get_engine(info_hash).await {
             engine.touch();
@@ -3042,22 +2838,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             // No resume here any more. Starting a torrent that is stopped
             // is the reconciler's, and it has to be asked *after* the
             // activity this call is part of is registered, or it reads a
-            // torrent nobody is watching: both callers therefore ask it
-            // themselves once they have finished registering
-            // (`on_stream_start`, `refresh_existing_hls_playback`).
-
-            if keep_file_downloading
-                && !is_multifile
-                && let Err(err) = engine.handle.keep_file_downloading(file_idx).await
-            {
-                tracing::warn!(
-                    info_hash = %info_hash,
-                    file_idx,
-                    error = %err,
-                    source,
-                    "Failed to keep HLS playback file downloading"
-                );
-            }
+            // torrent nobody is watching: the caller therefore asks it
+            // itself once it has finished registering (`on_stream_start`).
         }
 
         {
@@ -3123,10 +2905,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         };
 
         {
-            let mut leases = self.active_playback_leases.write().await;
-            leases.retain(|(hash, idx), _| hash.as_str() != info_hash || *idx == file_idx);
-        }
-        {
             let mut streams = self.active_file_streams.write().await;
             streams.retain(|(hash, idx), _| hash.as_str() != info_hash || *idx == file_idx);
         }
@@ -3136,12 +2914,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
 
         engine.touch();
-        // No reconcile here. Both callers of this reach it through
-        // `activate_file` and both ask the reconciler for themselves once
-        // they have finished registering their activity
-        // (`on_stream_start`, `refresh_existing_hls_playback`), so a call
-        // here would be a second decision about the same torrent in the
-        // same request -- and one taken from a half-registered reading.
+        // No reconcile here. Its caller reaches it through `activate_file`
+        // and asks the reconciler for itself once it has finished
+        // registering its activity (`on_stream_start`), so a call here
+        // would be a second decision about the same torrent in the same
+        // request -- and one taken from a half-registered reading.
 
         Self::reconcile_multifile_engine(engine, Some(file_idx), hot_file, generation, source)
             .await;
@@ -4472,7 +4249,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             }
         }
         let key = (info_hash.to_string(), file_idx);
-        self.active_playback_leases.write().await.remove(&key);
         self.active_file_streams.write().await.remove(&key);
         {
             let mut active = self.active_file.write().await;
@@ -4506,79 +4282,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             reason,
         )
         .await;
-    }
-
-    /// Refresh a lease only if playback is already known to be active. This is
-    /// used by stats.json so a progress poll cannot create a new download.
-    pub async fn refresh_existing_hls_playback(
-        &self,
-        info_hash: &str,
-        file_idx: usize,
-        source: &'static str,
-    ) -> bool {
-        let info_hash = info_hash.to_lowercase();
-        let now = self.clock.now_secs();
-        let engine = self.get_engine(&info_hash).await;
-        let native_lifecycle = engine
-            .as_ref()
-            .is_some_and(|engine| engine.handle.manages_playback_lifecycle());
-        let ttl = if native_lifecycle {
-            NATIVE_LIFECYCLE_HLS_PLAYBACK_LEASE_TTL
-        } else {
-            HLS_PLAYBACK_LEASE_TTL
-        };
-        let refreshed = {
-            let mut leases = self.active_playback_leases.write().await;
-            let key = (info_hash.clone(), file_idx);
-            match leases.get_mut(&key) {
-                Some(lease) if playback_lease_is_active(lease, now) => {
-                    lease.last_seen_secs = now;
-                    lease.expires_at_secs = now.saturating_add(ttl.as_secs());
-                    true
-                }
-                Some(_) => {
-                    leases.remove(&key);
-                    false
-                }
-                None => false,
-            }
-        };
-
-        if refreshed {
-            if let Some(engine) = engine {
-                if native_lifecycle {
-                    engine.touch();
-                    if let Err(error) = engine.handle.refresh_hls_activity(file_idx, source).await {
-                        tracing::warn!(
-                            info_hash = %info_hash,
-                            file_idx,
-                            source,
-                            %error,
-                            "Failed to refresh existing native-lifecycle HLS playback"
-                        );
-                    }
-                } else {
-                    self.activate_file(&info_hash, file_idx, true, source).await;
-                    // The lease was refreshed above, so the ladder reads
-                    // `playing`. An HLS player between segments issues no
-                    // new stream, so this is the only moment its torrent
-                    // can be started again -- and it must be measured at
-                    // the floor rather than at the resume line, or a
-                    // torrent stopped inside the hysteresis band would sit
-                    // there while the player waits for a segment.
-                    self.reconcile_hash(&info_hash, crate::reconcile::Trigger::PlaybackStart)
-                        .await;
-                }
-            }
-            tracing::debug!(
-                info_hash = %info_hash,
-                file_idx,
-                source,
-                "Existing HLS playback lease refreshed"
-            );
-        }
-
-        refreshed
     }
 
     /// Called when a stream ends for a torrent file
@@ -4669,9 +4372,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let engines = self.engines.clone();
         let active_file = self.active_file.clone();
         let active_file_streams = self.active_file_streams.clone();
-        let active_playback_leases = self.active_playback_leases.clone();
         let active_multifile_files = self.active_multifile_files.clone();
-        let clock = self.clock;
         let scheduled_generation = {
             let selections = self.active_multifile_files.read().await;
             selections
@@ -4693,22 +4394,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     "Skipping delayed cleanup for {} idx={} because a new stream started",
                     info_hash,
                     file_idx
-                );
-                return;
-            }
-            let playback_active = {
-                let now = clock.now_secs();
-                let leases = active_playback_leases.read().await;
-                leases
-                    .get(&key)
-                    .map(|lease| playback_lease_is_active(lease, now))
-                    .unwrap_or(false)
-            };
-            if playback_active {
-                tracing::info!(
-                    info_hash = %info_hash,
-                    file_idx,
-                    "Skipping delayed cleanup because HLS playback lease is active"
                 );
                 return;
             }
@@ -4933,7 +4618,6 @@ mod tests {
 
     #[derive(Default)]
     struct FakeCounters {
-        keep_file_downloading: AtomicUsize,
         clear_file_streaming: AtomicUsize,
         reconcile_file_priorities: AtomicUsize,
         prepare_file_for_streaming: AtomicUsize,
@@ -5500,13 +5184,6 @@ mod tests {
                 .fetch_add(1, Ordering::SeqCst);
             self.counters.out_of_space.store(false, Ordering::SeqCst);
             self.counters.paused.store(false, Ordering::SeqCst);
-            Ok(())
-        }
-
-        async fn keep_file_downloading(&self, _file_idx: usize) -> Result<()> {
-            self.counters
-                .keep_file_downloading
-                .fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
@@ -6088,39 +5765,6 @@ mod tests {
         assert_eq!(*counters.last_active_file.lock().unwrap(), Some(0));
     }
 
-    /// Insert an active playback lease directly. Production leases are created
-    /// elsewhere now; tests that exercise the generic lease/cleanup machinery
-    /// seed a lease this way.
-    async fn insert_active_lease(enginefs: &BackendEngineFS<FakeBackend>, file_idx: usize) {
-        let now = enginefs.clock.now_secs();
-        enginefs.active_playback_leases.write().await.insert(
-            (TEST_HASH.to_string(), file_idx),
-            PlaybackLease {
-                last_seen_secs: now,
-                expires_at_secs: now.saturating_add(300),
-            },
-        );
-    }
-
-    #[tokio::test]
-    async fn refresh_existing_hls_playback_does_not_create_lease() {
-        let (enginefs, counters) = test_enginefs();
-
-        let refreshed = enginefs
-            .refresh_existing_hls_playback(TEST_HASH, 0, "stats-json")
-            .await;
-
-        assert!(!refreshed);
-        assert_eq!(counters.keep_file_downloading.load(Ordering::SeqCst), 0);
-        assert!(
-            enginefs
-                .stream_activity_snapshot()
-                .await
-                .active_playback_leases
-                .is_empty()
-        );
-    }
-
     #[tokio::test]
     async fn multi_file_selects_only_requested_file() {
         let (enginefs, counters) = test_enginefs_with_file_count(3);
@@ -6131,7 +5775,6 @@ mod tests {
         assert_eq!(snapshot.active_multifile_selections.len(), 1);
         assert_eq!(snapshot.active_multifile_selections[0].file_idx, 1);
         assert_eq!(*counters.last_active_file.lock().unwrap(), Some(1));
-        assert_eq!(counters.keep_file_downloading.load(Ordering::SeqCst), 0);
         assert_eq!(counters.reconcile_file_priorities.load(Ordering::SeqCst), 1);
     }
 
@@ -6468,42 +6111,6 @@ mod tests {
         assert_eq!(resolving["pinnedFiles"], serde_json::json!([]));
     }
 
-    #[tokio::test]
-    async fn stats_cannot_switch_active_multifile_file() {
-        let (enginefs, _counters) = test_enginefs_with_file_count(3);
-
-        enginefs.on_stream_start(TEST_HASH, 1).await;
-        insert_active_lease(&enginefs, 1).await;
-        let refreshed = enginefs
-            .refresh_existing_hls_playback(TEST_HASH, 2, "stats-json")
-            .await;
-
-        let snapshot = enginefs.stream_activity_snapshot().await;
-        assert!(!refreshed);
-        assert_eq!(snapshot.active_multifile_selections.len(), 1);
-        assert_eq!(snapshot.active_multifile_selections[0].file_idx, 1);
-        assert_eq!(snapshot.active_playback_leases.len(), 1);
-        assert_eq!(snapshot.active_playback_leases[0].file_idx, 1);
-    }
-
-    #[tokio::test]
-    async fn stats_refreshes_current_multifile_file() {
-        let (enginefs, _counters) = test_enginefs_with_file_count(3);
-
-        enginefs.on_stream_start(TEST_HASH, 1).await;
-        insert_active_lease(&enginefs, 1).await;
-        let refreshed = enginefs
-            .refresh_existing_hls_playback(TEST_HASH, 1, "stats-json")
-            .await;
-
-        let snapshot = enginefs.stream_activity_snapshot().await;
-        assert!(refreshed);
-        assert_eq!(snapshot.active_multifile_selections.len(), 1);
-        assert_eq!(snapshot.active_multifile_selections[0].file_idx, 1);
-        assert_eq!(snapshot.active_playback_leases.len(), 1);
-        assert_eq!(snapshot.active_playback_leases[0].file_idx, 1);
-    }
-
     /// Paused time: the wait is for the 5 s delayed-cleanup task to fire,
     /// which the virtual clock does the instant the runtime is idle. Slept
     /// for real it would be six seconds of wall clock *and* a race -- a
@@ -6551,17 +6158,11 @@ mod tests {
             !after.playback_is_live(),
             "the stream is over: what is left names the last file chosen, not a reader"
         );
-
-        insert_active_lease(&enginefs, 1).await;
-        assert!(
-            enginefs.stream_activity_snapshot().await.playback_is_live(),
-            "a live playback lease is a client that is still there between reads"
-        );
     }
 
     /// `BackendEngineFS::playback_is_live` is the snapshot's answer without
     /// the snapshot, so it is checked against the snapshot at every state
-    /// the three live fields can put the server in -- each one on its own,
+    /// the live fields can put the server in -- each one on its own,
     /// since the query short-circuits and a field it never reached would
     /// pass by accident behind one it did.
     #[tokio::test]
@@ -6593,17 +6194,6 @@ mod tests {
             "the response ended, sticky fields notwithstanding",
         )
         .await;
-
-        // A lease that has not expired, then one that has.
-        insert_active_lease(&enginefs, 1).await;
-        both_agree(&enginefs, true, "an unexpired playback lease").await;
-        enginefs
-            .active_playback_leases
-            .write()
-            .await
-            .values_mut()
-            .for_each(|lease| lease.expires_at_secs = 0);
-        both_agree(&enginefs, false, "an expired lease is a client that left").await;
     }
 
     /// The light's reading of the connection is a peek over the engines that
@@ -6806,42 +6396,6 @@ mod tests {
         let snapshot = enginefs.stream_activity_snapshot().await;
         assert!(snapshot.active_multifile_selections.is_empty());
         assert_eq!(counters.reconcile_file_priorities.load(Ordering::SeqCst), 0);
-        assert_eq!(counters.keep_file_downloading.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn active_hls_lease_prevents_delayed_cleanup() {
-        let (enginefs, counters) = test_enginefs();
-
-        insert_active_lease(&enginefs, 0).await;
-        let cleanup = enginefs
-            .schedule_file_cleanup_after(TEST_HASH.to_string(), 0, Duration::from_millis(10))
-            .await
-            .expect("cleanup task");
-        cleanup.await.expect("cleanup task completed");
-
-        assert_eq!(counters.clear_file_streaming.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn expired_hls_lease_allows_delayed_cleanup() {
-        let (enginefs, counters) = test_enginefs();
-
-        insert_active_lease(&enginefs, 0).await;
-        {
-            let mut leases = enginefs.active_playback_leases.write().await;
-            leases
-                .get_mut(&(TEST_HASH.to_string(), 0))
-                .unwrap()
-                .expires_at_secs = enginefs.clock.now_secs();
-        }
-        let cleanup = enginefs
-            .schedule_file_cleanup_after(TEST_HASH.to_string(), 0, Duration::from_millis(10))
-            .await
-            .expect("cleanup task");
-        cleanup.await.expect("cleanup task completed");
-
-        assert_eq!(counters.clear_file_streaming.load(Ordering::SeqCst), 1);
     }
 
     // --- torrent placement through the magnet registry ---
@@ -7847,52 +7401,6 @@ mod tests {
             1,
             "a torrent that is already stopped is not asked to stop again"
         );
-    }
-
-    /// An HLS player between segments issues no new `/stream`, so the
-    /// lease refresh is the only moment its torrent can be started again --
-    /// and it is measured at the floor, like every other decision somebody
-    /// is waiting on.
-    ///
-    /// The band between the floor and the resume margin is where this
-    /// matters. A torrent stopped for want of space is not started again by
-    /// the timer until the volume has cleared the margin; a player that is
-    /// mid-playlist, on a volume that has cleared the floor, would
-    /// otherwise sit there fetching nothing until it gave up.
-    #[tokio::test(start_paused = true)]
-    async fn refreshing_an_hls_lease_starts_a_torrent_stopped_inside_the_band() {
-        let (mut enginefs, _counters) = test_enginefs_for_reconciler(1);
-        let available = Arc::new(AtomicU64::new(CACHE_FREE_SPACE_FLOOR - 1));
-        let probe = available.clone();
-        enginefs.set_free_space_probe(move |_| Ok(probe.load(Ordering::SeqCst)));
-        insert_active_lease(&enginefs, 0).await;
-
-        // The volume goes under the floor and the arm stops the torrent,
-        // lease or no lease -- which is the point of that arm's position.
-        enginefs.reconcile_tick().await;
-        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
-
-        // Room above the floor, but inside the resume margin: the timer
-        // leaves it where it is.
-        available.store(
-            CACHE_FREE_SPACE_FLOOR + FREE_SPACE_RESUME_MARGIN - 1,
-            Ordering::SeqCst,
-        );
-        enginefs.reconcile_tick().await;
-        assert_eq!(
-            run_state_of(&enginefs, TEST_HASH).await,
-            RunState::Paused,
-            "a timer does not restart a torrent into a nearly-full volume for nobody"
-        );
-
-        // The player asks for its next segment.
-        assert!(
-            enginefs
-                .refresh_existing_hls_playback(TEST_HASH, 0, "test")
-                .await,
-            "the lease is live, so the refresh lands"
-        );
-        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
     }
 
     /// The anti-flap dwell, and both halves of its asymmetry.
@@ -11134,7 +10642,6 @@ mod tests {
         enginefs
             .activate_multifile_file_for_playback(TEST_HASH, 0, None, "test-playing")
             .await;
-        insert_active_lease(&enginefs, 0).await;
         enginefs
             .active_file_streams
             .write()
@@ -11164,14 +10671,6 @@ mod tests {
             "and it is no longer the torrent's active selection"
         );
         let key = (TEST_HASH.to_string(), 0);
-        assert!(
-            !enginefs
-                .active_playback_leases
-                .read()
-                .await
-                .contains_key(&key),
-            "its playback lease goes with it"
-        );
         assert!(
             !enginefs.active_file_streams.read().await.contains_key(&key),
             "and its stream count"

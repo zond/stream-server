@@ -2840,16 +2840,9 @@ impl TorrentHandle for LibrqbitHandle {
         .await
     }
 
-    // keep_file_downloading stays the default-equivalent no-op: its only call
-    // site (lib.rs activate_file) is guarded by !is_multifile, where the whole
-    // torrent is a single file and therefore always wanted.
-    async fn keep_file_downloading(&self, _file_idx: usize) -> Result<()> {
-        Ok(())
-    }
-
     /// Deselect `file_idx`, keeping the rest of the current selection. Called
-    /// from delayed cleanup and HLS-lease expiry, possibly AFTER a newer file
-    /// was prepared -- the planner refuses to clear a file that is no longer
+    /// from delayed cleanup, possibly AFTER a newer file was prepared -- the
+    /// planner refuses to clear a file that is no longer
     /// selected and refuses to produce an empty want-set, so stale cleanups
     /// can never clobber the active selection.
     async fn clear_file_streaming(&self, file_idx: usize) -> Result<()> {

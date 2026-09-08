@@ -1409,11 +1409,6 @@ pub async fn file_stats(
         .collect::<Vec<_>>();
     let idx = compat::resolve_file_idx(requested_idx, &candidates, filters)
         .map_err(|err| FileNotFound(err.to_string()))?;
-    state
-        .stream_engine()
-        .refresh_existing_hls_playback(&info_hash, idx, "stats-json")
-        .await;
-
     let mut stats = engine.get_statistics().await;
     if idx >= stats.files.len() {
         return Err(FileNotFound("File index out of bounds".to_string()));

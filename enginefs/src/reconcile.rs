@@ -105,8 +105,8 @@ pub struct Conditions {
     /// [`Self::run_state`], which is about the backend's state machine and
     /// nothing to do with this process: see [`desired`]'s first two arms.
     pub settled: bool,
-    /// A stream, a file read, an HLS lease or a multi-file selection is
-    /// live on this torrent.
+    /// A stream, a file read or a multi-file selection is live on this
+    /// torrent.
     pub playing: bool,
     /// Some file of it is pinned as an offline download.
     pub pinned: bool,
@@ -121,7 +121,7 @@ pub struct Conditions {
     /// probe failed. `None` is "unknown", never "full".
     pub available: Option<u64>,
     /// How long since anything was **using** this torrent -- a stream, a
-    /// file read, an HLS lease, a multi-file selection.
+    /// file read, a multi-file selection.
     ///
     /// For a torrent nothing has used yet it is the time since **this
     /// process started**, which is the honest reading of a use that has not

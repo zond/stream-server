@@ -135,9 +135,6 @@ async fn memory_snapshot_for_state(
             active_disk_files.insert((stream.info_hash.clone(), stream.file_idx));
         }
     }
-    for lease in &download_engine.streams.active_playback_leases {
-        active_disk_files.insert((lease.info_hash.clone(), lease.file_idx));
-    }
     for selection in &download_engine.streams.active_multifile_selections {
         active_disk_files.insert((selection.info_hash.clone(), selection.file_idx));
     }

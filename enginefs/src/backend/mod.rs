@@ -292,16 +292,6 @@ pub trait TorrentHandle: Send + Sync + Clone {
     fn manages_playback_lifecycle(&self) -> bool {
         false
     }
-    /// Record HLS activity without forcing shared backends to implement their
-    /// own lease controller; a native-lifecycle backend overrides this.
-    async fn refresh_hls_activity(&self, _file_idx: usize, _source: &'static str) -> Result<()> {
-        Ok(())
-    }
-    /// End HLS activity immediately. A native-lifecycle backend overrides this
-    /// to cancel the selected generation and confirm a normal torrent pause.
-    async fn end_hls_activity(&self, _file_idx: usize, _reason: &'static str) -> Result<()> {
-        Ok(())
-    }
     /// Cheap per-file completion check used to avoid probing sparse local files.
     async fn is_file_complete(&self, _file_idx: usize) -> bool {
         false
@@ -440,11 +430,6 @@ pub trait TorrentHandle: Send + Sync + Clone {
     /// newly-requested file downloads immediately from the existing peers.
     /// `true` = clamp upload to a trickle; `false` = restore unlimited upload.
     async fn set_upload_throttled(&self, _throttled: bool) -> Result<()> {
-        Ok(())
-    }
-    /// Keep a file minimally wanted so it continues downloading in the
-    /// background while higher-priority playback windows serve the current read.
-    async fn keep_file_downloading(&self, _file_idx: usize) -> Result<()> {
         Ok(())
     }
     /// Reconcile wanted files for multi-file torrents. Backends that cannot
