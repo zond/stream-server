@@ -9110,6 +9110,84 @@ mod tests {
         }
     }
 
+    /// And it gives up the *file* it selected, which the test above cannot
+    /// see.
+    ///
+    /// Two independent reasons, both of which left the other half of the
+    /// rollback -- the per-file counter, the multi-file selection and the
+    /// active-file slot -- covered by nothing. `playback_is_live` is a
+    /// deliberately narrow oracle: it reads `engine_active_streams` and
+    /// `active_streams` and nothing else, because `active_file` and the
+    /// selections outlive the stream on purpose (the want-set is planned
+    /// from them). But `playing` -- what the ladder actually reads -- comes
+    /// from `torrent_activity_registers`, which reads four registers,
+    /// `active_file_streams` and a bare `active_multifile_files.contains_key`
+    /// among them. And the test above runs over a single-file torrent, so
+    /// `activate_file` never reaches `activate_multifile_file` and the
+    /// selection branch is not entered at all.
+    ///
+    /// So this one is multi-file, and asserts through the reconciler: with
+    /// seeding off and the grace elapsed, a torrent nothing is using is
+    /// stopped. A count or a selection left behind by the abandoned request
+    /// is left behind for the life of the process -- nothing ages either
+    /// out, and the `on_stream_end` that would clear them belongs to a
+    /// guard that was never built -- so `playing` reads true for ever, the
+    /// idle arm can never fire, and with seeding off the torrent downloads
+    /// a film nobody is watching until the server restarts.
+    #[tokio::test]
+    async fn a_stream_start_whose_caller_walked_away_gives_up_the_file_it_selected() {
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(2);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
+        let enginefs = Arc::new(enginefs);
+        stop_torrent(&enginefs, TEST_HASH).await;
+
+        counters.hold_start.store(true, Ordering::SeqCst);
+        let request = tokio::spawn({
+            let enginefs = enginefs.clone();
+            async move { enginefs.on_stream_start(TEST_HASH, 1).await }
+        });
+        assert!(
+            wait_until(TEST_WAIT_BOUND, || counters
+                .start_torrent
+                .load(Ordering::SeqCst)
+                == 1)
+            .await,
+            "the stream and its file selection are registered and the reconcile              they triggered is inside the backend"
+        );
+
+        // The player closed the connection before there was a body to read.
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        counters.hold_start.store(false, Ordering::SeqCst);
+        counters.start_gate.notify_one();
+
+        // The undo is a spawned task, so the ladder is asked until it
+        // answers rather than once: each pass advances past the grace and
+        // reads the registers for itself. Bounded, so a register left
+        // behind fails instead of hanging -- and it fails on every pass,
+        // since nothing ever clears one.
+        tokio::time::pause();
+        let idle_stop = vec![(TEST_HASH.to_string(), Decision::Stop)];
+        let mut decided = Vec::new();
+        for _ in 0..100 {
+            tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE + Duration::from_secs(1)).await;
+            decided = enginefs.reconcile_tick().await;
+            if decided == idle_stop {
+                break;
+            }
+        }
+        assert_eq!(
+            decided, idle_stop,
+            "the file the abandoned request selected still reads as playback"
+        );
+        assert_eq!(
+            run_state_of(&enginefs, TEST_HASH).await,
+            RunState::Paused,
+            "and the torrent it was starting is running for nobody"
+        );
+    }
+
     /// A torrent asked to be focused runs, with nothing else registered
     /// anywhere.
     ///
