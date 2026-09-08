@@ -22,7 +22,8 @@ pub enum TorrentSource {
 /// What a torrent wants when it is added. The default is everything.
 ///
 /// It named a directory too, until pinning stopped being a place: an
-/// offline download was written to `<downloadsDir>/<info hash>` and a
+/// offline download was written to `<downloadsDir>/<info hash>` -- a
+/// settings key since removed in favour of one torrent-data root -- and a
 /// torrent already managed elsewhere was moved there. Nothing chooses a
 /// directory any more -- the piece store is the session's default storage
 /// and takes one root of its own, so where a backend says a torrent's

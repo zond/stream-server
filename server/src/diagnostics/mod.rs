@@ -30,7 +30,6 @@ pub struct CacheFigures {
 pub struct MemorySnapshot {
     pub process: ProcessMemorySnapshot,
     pub engine: enginefs::EngineDiagnosticsSnapshot,
-    pub download_engine: enginefs::EngineDiagnosticsSnapshot,
     /// The cache's size as the cleaner last counted it (see
     /// `cache_cleaner::LastEviction`). The sampler used to walk the whole
     /// download dir for this itself, synchronously, on the runtime, every
@@ -126,27 +125,24 @@ async fn memory_snapshot_for_state(
     state: &AppState,
     process: ProcessMemorySnapshot,
 ) -> MemorySnapshot {
-    let stream_engine = state.stream_engine();
-    let stream_engine_snapshot = stream_engine.diagnostics_snapshot().await;
-    let download_engine = state.download_engine.diagnostics_snapshot().await;
+    let engine = state.engine.diagnostics_snapshot().await;
     let mut active_disk_files = HashSet::new();
-    for stream in &download_engine.streams.active_file_streams {
+    for stream in &engine.streams.active_file_streams {
         if stream.count > 0 {
             active_disk_files.insert((stream.info_hash.clone(), stream.file_idx));
         }
     }
-    for selection in &download_engine.streams.active_multifile_selections {
+    for selection in &engine.streams.active_multifile_selections {
         active_disk_files.insert((selection.info_hash.clone(), selection.file_idx));
     }
     let active_disk_downloads = active_disk_files.len() as u64;
 
     MemorySnapshot {
         process,
-        engine: stream_engine_snapshot,
-        download_engine,
+        engine,
         cache: cache_figures(&state.last_eviction),
         active_disk_downloads,
-        disk_download_root: state.download_engine.download_dir.display().to_string(),
+        disk_download_root: state.engine.download_dir.display().to_string(),
         archive_session_count: state.archive_cache.len(),
         nzb_session_count: state.nzb_sessions.len(),
         active_direct_streams: logging::active_direct_streams(),
@@ -198,10 +194,6 @@ pub fn start_memory_sampler(state: AppState) -> tokio::task::JoinHandle<()> {
                     active_multifile_selections =
                         snapshot.engine.streams.active_multifile_selections.len(),
                     paused_torrents = snapshot.engine.streams.paused_torrents.len(),
-                    download_active_multifile_selections =
-                        snapshot.download_engine.streams.active_multifile_selections.len(),
-                    download_paused_torrents =
-                        snapshot.download_engine.streams.paused_torrents.len(),
                     rust_piece_cache_entries = snapshot.engine.memory.rust_piece_cache_entries,
                     rust_piece_cache_bytes = snapshot.engine.memory.rust_piece_cache_bytes,
                     native_storage_bytes = snapshot.engine.memory.native_storage_bytes,

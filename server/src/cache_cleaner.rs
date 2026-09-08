@@ -189,8 +189,9 @@ impl CacheLimit {
 /// the path to exist, so on Unix a root not yet created is unreadable, while
 /// Windows resolves the volume from the drive letter (`GetVolumePathNameW`)
 /// and answers for a directory nothing has made yet. The tests therefore
-/// exercise the `None` through the probe seam of [`budgets_by_volume`], not
-/// by finding a path the OS will refuse.
+/// The test for what an unreadable volume does therefore writes the `None`
+/// straight into a [`CacheLimit`] rather than finding a path the OS will
+/// refuse.
 fn available_space(path: &std::path::Path) -> Option<u64> {
     match fs4::available_space(path) {
         Ok(available) => Some(available),
@@ -243,17 +244,10 @@ pub fn start(state: Arc<AppState>) -> JoinHandle<()> {
 
         // Initial watch
         // We might need to retry if directory doesn't exist yet
-        let mut download_dirs = vec![
-            state.engine.download_dir.clone(),
-            state.download_engine.download_dir.clone(),
-        ];
-        download_dirs.sort();
-        download_dirs.dedup();
-        for download_dir in &download_dirs {
-            if let Err(e) = watcher.watch(download_dir, RecursiveMode::Recursive) {
-                warn!("Failed to watch download dir {:?}: {}", download_dir, e);
-                // We will try to re-watch inside the loop if needed (omitted for brevity, relying on fallback poll)
-            }
+        let download_dir = state.engine.download_dir.clone();
+        if let Err(e) = watcher.watch(&download_dir, RecursiveMode::Recursive) {
+            warn!("Failed to watch download dir {:?}: {}", download_dir, e);
+            // We will try to re-watch inside the loop if needed (omitted for brevity, relying on fallback poll)
         }
 
         // Fallback poll for a cache nothing is writing to (the first tick
@@ -268,7 +262,6 @@ pub fn start(state: Arc<AppState>) -> JoinHandle<()> {
         let mut schedule = CleanSchedule::default();
         let mut disk_full_recovery = DiskFullRecovery::default();
         let mut active_cleaning_timer = Box::pin(tokio::time::sleep(Duration::MAX)); // Inactive initially
-        let engines = engines_of(&state);
 
         loop {
             tokio::select! {
@@ -279,10 +272,8 @@ pub fn start(state: Arc<AppState>) -> JoinHandle<()> {
                         error!("Cache cleaner error: {}", e);
                     }
                     // Re-ensure watch if needed
-                    for download_dir in [&state.engine.download_dir, &state.download_engine.download_dir] {
-                        if let Err(e) = watcher.watch(download_dir, RecursiveMode::Recursive) {
-                            debug!("Retry watch {:?}: {}", download_dir, e);
-                        }
+                    if let Err(e) = watcher.watch(&download_dir, RecursiveMode::Recursive) {
+                        debug!("Retry watch {:?}: {}", download_dir, e);
                     }
                 }
 
@@ -303,7 +294,7 @@ pub fn start(state: Arc<AppState>) -> JoinHandle<()> {
                 _ = disk_full_poll.tick() => {
                     recover_out_of_space_torrents(&state, &mut disk_full_recovery).await;
                 }
-                _ = out_of_space_signal(&engines) => {
+                _ = state.engine.out_of_space_signal() => {
                     recover_out_of_space_torrents(&state, &mut disk_full_recovery).await;
                 }
 
@@ -382,47 +373,15 @@ impl DiskFullRecovery {
     }
 }
 
-/// The distinct engines of `state`. The stream and download engines are
-/// often the same `Arc`; asking one twice would restart a torrent that is
-/// already live again and log the backend's complaint about it.
-fn engines_of(state: &AppState) -> Vec<Arc<enginefs::EngineFS>> {
-    if Arc::ptr_eq(&state.engine, &state.download_engine) {
-        vec![state.engine.clone()]
-    } else {
-        vec![state.engine.clone(), state.download_engine.clone()]
-    }
-}
-
-/// Completes when any of `engines` has had a torrent stopped for want of
-/// space since the last time this completed
-/// (`EngineFS::out_of_space_signal`).
-async fn out_of_space_signal(engines: &[Arc<enginefs::EngineFS>]) {
-    let signals: Vec<BoxFuture<'_, ()>> = engines
-        .iter()
-        .map(|engine| Box::pin(engine.out_of_space_signal()) as BoxFuture<'_, ()>)
-        .collect();
-    if signals.is_empty() {
-        std::future::pending::<()>().await;
-    }
-    futures_util::future::select_all(signals).await;
-}
-
 async fn recover_out_of_space_torrents(state: &AppState, recovery: &mut DiskFullRecovery) {
-    let engines = engines_of(state);
-
-    let mut stopped = Vec::new();
-    for engine in &engines {
-        for info_hash in engine.out_of_space_torrents().await {
-            stopped.push((engine.clone(), info_hash));
-        }
-    }
+    let stopped: Vec<String> = state.engine.out_of_space_torrents().await;
     if stopped.is_empty() {
         recovery.room_was_made();
         return;
     }
     // Every tick after a pass that could not help would walk the whole
     // cache and say the same two things again; see [`DiskFullRecovery`].
-    let hashes: HashSet<String> = stopped.iter().map(|(_, hash)| hash.clone()).collect();
+    let hashes: HashSet<String> = stopped.iter().cloned().collect();
     if !recovery.has_new_work(&hashes) {
         return;
     }
@@ -449,8 +408,8 @@ async fn recover_out_of_space_torrents(state: &AppState, recovery: &mut DiskFull
     }
     recovery.room_was_made();
 
-    for (engine, info_hash) in stopped {
-        match engine.restart_from_error(&info_hash).await {
+    for info_hash in stopped {
+        match state.engine.restart_from_error(&info_hash).await {
             Ok(true) => info!(
                 info_hash = %info_hash,
                 freed = report.freed,
@@ -476,199 +435,71 @@ async fn recover_out_of_space_torrents(state: &AppState, recovery: &mut DiskFull
     }
 }
 
-/// The budgets, protections and keep-set both [`clean_cache`] and [`usage`]
+/// The root, its cap and the protections both [`clean_cache`] and [`usage`]
 /// need, gathered once so the two read `AppState` the same way and can
 /// never disagree about what the cache *is*.
 struct CacheRoots {
-    /// One entry per volume the walked roots live on. Usually one.
-    budgets: Vec<CacheBudget>,
+    /// The one torrent-data root (`settings.cacheRoot`, as the engine
+    /// reports it -- never as the setting spells it). Everything a torrent
+    /// puts on disk is under it, so this is the whole of what the cleaner
+    /// walks, counts and evicts from.
+    root: std::path::PathBuf,
+    /// The cap for the volume that root is on: the operator's `cacheSize`
+    /// against what the filesystem can give (see [`CacheLimit::effective`]).
+    /// It used to be one cap per volume, because the removed `downloadsDir`
+    /// setting could put a second root on a second disk and a cap is a
+    /// statement about *one*
+    /// volume -- summing two disks' occupancy against the tightest free-space
+    /// reading of the two had the cleaner evicting a healthy system disk's
+    /// cache to answer a shortage on an external drive it could reclaim
+    /// nothing from. With one root there is one volume and one cap.
+    limit: CacheLimit,
     protected_paths: HashSet<std::path::PathBuf>,
     /// Files to evict before any other -- what a dead torrent left behind
     /// (`EvictionClasses::dead`). Ordinary cache in every other respect:
     /// walked, counted, aged; they only sort to the front of the size rule.
     evict_first: HashSet<std::path::PathBuf>,
     /// Torrents stopped for want of disk space, to be evicted whole through
-    /// their engine when nothing else can go -- see [`evict`].
+    /// the engine when nothing else can go -- see [`evict`].
     stopped: Vec<StoppedTorrent>,
-    /// Directories the cleaner was handed and may therefore never delete,
-    /// however empty eviction leaves them -- see [`remove_empty_parents`].
-    /// Every root *before* [`outermost`] collapsed them, which is the point:
-    /// a `downloadsDir` inside a cache root is no longer a walked root, and
-    /// the walked root is no longer a sufficient stop condition for it.
-    keep_dirs: HashSet<std::path::PathBuf>,
-    /// Every root any budget walks, so each walk can stop where another
-    /// one's root begins -- see [`evict`]. Only roots on *different* volumes
-    /// are ever both in here and nested, since [`budgets_by_volume`]
-    /// collapses the ones that share a volume into a single walk.
-    boundaries: HashSet<std::path::PathBuf>,
-}
-
-/// The walked roots on one volume, and the cap they share.
-///
-/// A cap is a statement about a *volume*: [`CacheLimit::effective`] reads that
-/// volume's free space and holds [`CACHE_FREE_SPACE_FLOOR`] of it back. So the
-/// roots on one volume can be weighed against one number and the roots on
-/// another cannot. What this replaced summed every root's occupancy into a
-/// single total and weighed it against the *tightest* free-space figure of all
-/// of them -- correct while there is one volume, which is the phone this was
-/// written for, and wrong on a desktop with `downloadsDir` on an external
-/// drive. There the min is the external drive's, the sum carries the system
-/// disk's cache, and every pass evicts a film nobody is short of space for to
-/// answer a shortage on a drive it can reclaim nothing from: what fills a
-/// download drive is pinned, and protection keeps it.
-///
-/// `settings.cacheSize` becomes a per-volume allowance by the same argument.
-/// It was never defined across volumes -- there has only ever been one budget
-/// -- and of the two readings available, this is the one that cannot have a
-/// full downloads volume evict a healthy cache root to nothing.
-struct CacheBudget {
-    roots: Vec<std::path::PathBuf>,
-    limit: CacheLimit,
-}
-
-/// Group `roots` by the volume they are on, and give each group a cap of its
-/// own: `configured` (the operator's `cacheSize`, per volume) against the
-/// tightest free-space reading among that group's roots -- which is a real
-/// minimum now, since roots that share a volume share its free space and only
-/// differ by which of them could be probed at all.
-///
-/// Roots whose volume cannot be identified -- one that does not exist yet, a
-/// filesystem that will not answer -- share a single group. That is what the
-/// cleaner did with every root before, so it is the conservative answer for
-/// the paths where the question has no answer, rather than a new behaviour.
-///
-/// [`outermost`] collapses each group *after* it is grouped, never before,
-/// and that order is the whole point. The collapse throws away a root that
-/// sits inside another, `prepare_downloads_dir` deliberately permits a
-/// `downloadsDir` below a cache root, and `WalkDir` crosses mount points --
-/// so a downloads dir that is an external drive mounted under the cache root
-/// used to disappear into it and be walked, counted and capped as part of a
-/// volume its bytes are not on. A cap that is a statement about one volume
-/// cannot be built out of roots that have already stopped being separable.
-/// Grouped first, roots that really do share a volume still collapse to one
-/// walk, and roots that do not stay two budgets -- which is why every walk
-/// has to stop where another budget's root begins (see [`evict`]).
-///
-/// `volume_of` and `available` are parameters so a test can describe two
-/// volumes without needing two.
-fn budgets_by_volume(
-    roots: &[std::path::PathBuf],
-    configured: u64,
-    volume_of: impl Fn(&std::path::Path) -> Option<u64>,
-    available: impl Fn(&std::path::Path) -> Option<u64>,
-) -> Vec<CacheBudget> {
-    let mut by_volume: std::collections::BTreeMap<Option<u64>, Vec<std::path::PathBuf>> =
-        std::collections::BTreeMap::new();
-    for root in roots {
-        by_volume
-            .entry(volume_of(root))
-            .or_default()
-            .push(root.clone());
-    }
-    by_volume
-        .into_values()
-        .map(|roots| {
-            let available = roots.iter().filter_map(|root| available(root)).min();
-            CacheBudget {
-                roots: outermost(&roots),
-                limit: CacheLimit {
-                    configured,
-                    available,
-                },
-            }
-        })
-        .collect()
 }
 
 async fn cache_roots(state: &AppState) -> CacheRoots {
-    let settings = state.settings.read().await;
-    let limit = crate::routes::system::cache_size_bytes(settings.cache_size);
-    let configured_downloads_dir = settings
-        .downloads_dir
-        .as_ref()
-        .map(std::path::PathBuf::from);
-    drop(settings); // Release lock
+    let configured = {
+        let settings = state.settings.read().await;
+        crate::routes::system::cache_size_bytes(settings.cache_size)
+    };
 
-    // Every root the cleaner walks: the two engines' cache roots and the
-    // configured `downloadsDir`, which is now one of them -- and is read
-    // from the settings, because it is the only thing left that reads it.
-    // The engines were told about it while a pin was a placement; a pin is
-    // a retention property now and nothing is written there at all.
-    //
-    // Walking it was not always right. The downloads dir used to be pruned
-    // out of the walk on the grounds that what is there is an offline
-    // download the user asked for, not cache. That was right while a
-    // download was a whole file the client could play from disk. It is not
-    // right any more: downloads are stored as pieces like everything else,
-    // an old plain-file download under the downloads dir is neither
-    // migrated nor read, and left unwalked it would be orphaned *and*
-    // immortal -- bytes nothing can play and nothing can reclaim, on the
-    // device where space runs out. Protection, not exclusion, is what keeps
-    // a live or pinned download safe now, and `protected_paths` covers
-    // dormant pins for exactly that reason.
-    let mut download_dirs = vec![
-        state.engine.download_dir.clone(),
-        state.download_engine.download_dir.clone(),
-    ];
-    download_dirs.extend(configured_downloads_dir);
-    download_dirs.sort();
-    download_dirs.dedup();
-    // Every directory the cleaner was *given*, kept before the collapse below
-    // throws the inner ones away: these are configuration -- the engines'
-    // cache roots and the resolved `downloadsDir` -- and eviction emptying one
-    // must not take the directory with it.
-    let keep_dirs: HashSet<_> = download_dirs.iter().cloned().collect();
+    // The one root, taken from the engine and not from `settings.cacheRoot`:
+    // the session was opened on a root and cannot be moved off it, so the
+    // setting is where the data will be after the next start and the engine
+    // is where it is now.
+    let root = state.engine.download_dir.clone();
 
     // Everything a live engine writes, at the paths the backend reports (a
     // pinned engine stays live, so its data is protected for as long as
-    // the pin holds) -- and, from the same walk of the engines, what a dead
-    // one left behind, which goes first.
-    let mut protected_paths = HashSet::new();
-    let mut evict_first = HashSet::new();
-    let mut stopped = Vec::new();
-    for engine in engines_of(state) {
-        let classes = engine.eviction_classes().await;
-        protected_paths.extend(classes.protected);
-        evict_first.extend(classes.dead);
-        stopped.extend(
-            classes
-                .stopped_for_space
-                .into_iter()
-                .map(|torrent| StoppedTorrent {
-                    engine: engine.clone(),
-                    info_hash: torrent.info_hash,
-                    paths: torrent.paths.into_iter().collect(),
-                }),
-        );
-    }
-
-    // One budget per volume, each collapsed to its outermost roots. The two
-    // engines normally share one directory and the downloads dir is under it,
-    // so this is normally a single budget over a single walked root and the
-    // whole of what follows is what it always was.
-    let budgets = budgets_by_volume(
-        &download_dirs,
-        limit,
-        |path| enginefs::volume_id(path).ok(),
-        available_space,
-    );
-    // Where it is not -- a downloads dir on a drive mounted under the cache
-    // root -- the two survive as separate roots, and neither walk may wander
-    // into the other: `WalkDir` would happily cross the mount and count the
-    // drive's bytes against the cache root's cap, which is the reading the
-    // per-volume budgets exist to stop.
-    let boundaries: HashSet<_> = budgets
-        .iter()
-        .flat_map(|budget| budget.roots.iter().cloned())
+    // the pin holds) -- and, from the same walk, what a dead one left
+    // behind, which goes first.
+    let classes = state.engine.eviction_classes().await;
+    let stopped = classes
+        .stopped_for_space
+        .into_iter()
+        .map(|torrent| StoppedTorrent {
+            engine: state.engine.clone(),
+            info_hash: torrent.info_hash,
+            paths: torrent.paths.into_iter().collect(),
+        })
         .collect();
 
     CacheRoots {
-        budgets,
-        protected_paths,
-        evict_first,
+        limit: CacheLimit {
+            configured,
+            available: available_space(&root),
+        },
+        root,
+        protected_paths: classes.protected.into_iter().collect(),
+        evict_first: classes.dead.into_iter().collect(),
         stopped,
-        keep_dirs,
-        boundaries,
     }
 }
 
@@ -703,54 +534,39 @@ pub(crate) async fn clean_cache(state: &AppState) -> anyhow::Result<EvictionRepo
     clean_cache_with_headroom(state, 0).await
 }
 
-/// [`clean_cache`], evicting to `headroom` bytes under each volume's cap
-/// rather than to the cap -- for the pass run on behalf of a stopped torrent
-/// (see [`RECOVERY_HEADROOM`]).
+/// [`clean_cache`], evicting to `headroom` bytes under the cap rather than
+/// to the cap -- for the pass run on behalf of a stopped torrent (see
+/// [`RECOVERY_HEADROOM`]).
 async fn clean_cache_with_headroom(
     state: &AppState,
     headroom: u64,
 ) -> anyhow::Result<EvictionReport> {
     let roots = cache_roots(state).await;
-    let mut reports = Vec::with_capacity(roots.budgets.len());
-    for budget in &roots.budgets {
-        // A volume whose roots do not exist yet has nothing to walk, but its
-        // cap is still part of what this run enforced.
-        if budget
-            .roots
-            .iter()
-            .all(|download_dir| !download_dir.exists())
-        {
-            reports.push(EvictionReport {
-                limit: budget.limit.effective(0),
-                ..EvictionReport::default()
-            });
-            continue;
+    // A root that does not exist yet has nothing to walk, but its cap is
+    // still what this run enforced.
+    let report = if !roots.root.exists() {
+        EvictionReport {
+            limit: roots.limit.effective(0),
+            ..EvictionReport::default()
         }
+    } else {
         let stopped: Vec<(String, HashSet<std::path::PathBuf>)> = roots
             .stopped
             .iter()
             .map(|torrent| (torrent.info_hash.clone(), torrent.paths.clone()))
             .collect();
         let evictors: Vec<_> = roots.stopped.iter().map(StoppedTorrent::evictor).collect();
-        reports.push(
-            evict(
-                &budget.roots,
-                &roots.protected_paths,
-                &roots.evict_first,
-                &stopped,
-                &evictors,
-                &roots.keep_dirs,
-                &roots.boundaries,
-                budget.limit,
-                headroom,
-            )
-            .await?,
-        );
-    }
-    let report = reports
-        .into_iter()
-        .reduce(EvictionReport::combined_with)
-        .unwrap_or_default();
+        evict(
+            &roots.root,
+            &roots.protected_paths,
+            &roots.evict_first,
+            &stopped,
+            &evictors,
+            roots.limit,
+            headroom,
+        )
+        .await?
+    };
     state.last_eviction.record(&report);
     Ok(report)
 }
@@ -800,19 +616,7 @@ pub(crate) async fn usage(state: &AppState) -> CacheUsage {
     // off the runtime -- and a `GET /cache.json` is a request a worker is
     // serving.
     tokio::task::spawn_blocking(move || {
-        roots
-            .budgets
-            .iter()
-            .map(|budget| {
-                scan_usage(
-                    &budget.roots,
-                    &roots.protected_paths,
-                    &roots.boundaries,
-                    budget.limit,
-                )
-            })
-            .reduce(CacheUsage::combined_with)
-            .unwrap_or_default()
+        scan_usage(&roots.root, &roots.protected_paths, roots.limit)
     })
     .await
     .unwrap_or_else(|error| {
@@ -869,7 +673,7 @@ pub(crate) fn occupied_bytes(metadata: &std::fs::Metadata) -> u64 {
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheUsage {
-    /// Occupancy of the walked cache roots right now.
+    /// Occupancy of the walked root right now.
     pub total_bytes: u64,
     /// The limit actually enforced, in the same accounting: the smaller of
     /// `settings.cacheSize` and what the volume can give while keeping
@@ -887,42 +691,14 @@ pub struct CacheUsage {
     pub protected_files: usize,
 }
 
-impl CacheUsage {
-    /// Fold another volume's scan into this one, for the single answer
-    /// `GET /cache.json` gives. See [`EvictionReport::combined_with`], which
-    /// folds the same way and for the same reasons -- `limit_bytes`
-    /// especially: an uncapped volume leaves the run as a whole uncapped,
-    /// because its occupancy is in `total_bytes` and nothing bounds it.
-    ///
-    /// Note what that costs, and why it costs nothing here: summed
-    /// `total_bytes` against summed `limit_bytes` cannot say whether a
-    /// *volume* is over, because a roomy one's slack pays off a full one's
-    /// shortfall. Usage asks no such question -- it reports numbers and
-    /// leaves the reading to the client. Anything added here that does ask it
-    /// needs a per-volume figure carried through the fold, the way
-    /// [`EvictionReport::over_limit`] is.
-    fn combined_with(self, other: Self) -> Self {
-        Self {
-            total_bytes: self.total_bytes.saturating_add(other.total_bytes),
-            limit_bytes: self
-                .limit_bytes
-                .zip(other.limit_bytes)
-                .map(|(a, b)| a.saturating_add(b)),
-            protected_bytes: self.protected_bytes.saturating_add(other.protected_bytes),
-            protected_files: self.protected_files + other.protected_files,
-        }
-    }
-}
-
 /// The read-only half of [`evict`]'s walk: every payload file's occupancy
 /// and protection status, with nothing aged out or deleted. Mirrors
 /// `evict`'s session-artifact exclusion and protection rule exactly, so
 /// `usage` and a `clean_cache` run right after it agree about what the
 /// cache contains.
 fn scan_usage(
-    download_dirs: &[std::path::PathBuf],
+    download_dir: &std::path::Path,
     protected_paths: &HashSet<std::path::PathBuf>,
-    boundaries: &HashSet<std::path::PathBuf>,
     limit: CacheLimit,
 ) -> CacheUsage {
     #[cfg(test)]
@@ -931,12 +707,8 @@ fn scan_usage(
     let mut protected = 0u64;
     let mut protected_files = 0usize;
 
-    for download_dir in download_dirs {
-        if !download_dir.exists() {
-            continue;
-        }
-
-        let mut entries = walk_within(download_dir, boundaries);
+    if download_dir.exists() {
+        let mut entries = walkdir::WalkDir::new(download_dir).into_iter();
 
         loop {
             match entries.next() {
@@ -980,7 +752,7 @@ fn scan_usage(
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EvictionReport {
-    /// Occupancy of the walked roots once eviction finished.
+    /// Occupancy of the walked root once eviction finished.
     pub total: u64,
     /// How much of `total` eviction may never touch: files a live engine
     /// reports (a pinned download's engine is never swept, so its files are
@@ -1011,64 +783,19 @@ pub struct EvictionReport {
     /// the sentinel it silenced [`Self::shortfall_message`] on the one
     /// device that needed it and told a client the cache was unlimited.
     pub limit: Option<u64>,
-    /// How far over its cap this run ended, and the only thing
-    /// [`Self::shortfall_message`] reads: `total - limit` for one volume's
-    /// run, and the *sum* of that across the volumes that are over once runs
-    /// are folded together.
-    ///
-    /// Kept rather than derived from `total` and `limit`, because after the
-    /// fold neither of those describes any volume any more. Their sums say
-    /// what the device holds and what it was allowed in total, which is what
-    /// a client shows; they cannot say whether some volume is stuck, and
-    /// deriving the answer from them let a system disk's slack pay off a
-    /// download drive that was full -- one report saying the pass had got
-    /// under the limit while the drive it could not write to was over its own
-    /// by exactly as much as before.
+    /// How far over its cap this run ended (`total - limit`), and the only
+    /// thing [`Self::shortfall_message`] reads. Reported rather than left to
+    /// the client to derive, so that "still stuck" is one field and not a
+    /// comparison every reader has to get right.
     pub over_limit: u64,
 }
 
 impl EvictionReport {
-    /// Fold another volume's run into this one, so a caller of
-    /// `POST /cache/clean` gets one report for the pass.
-    ///
-    /// Sizes add. The limits add only while every volume has one: an uncapped
-    /// volume's occupancy is in `total` with nothing bounding it, so an
-    /// aggregate cap would be a number the run never enforced.
-    ///
-    /// Shortfalls add too, and separately -- that is what `over_limit` is
-    /// for. Summed `total` against summed `limit` is not the question "is any
-    /// volume still stuck?": a system disk with room to spare subsidises a
-    /// download drive that is full, and the fold answers that the pass got
-    /// under the limit while the drive nothing can write to is over its own
-    /// cap by exactly as much as it was.
-    fn combined_with(self, other: Self) -> Self {
-        Self {
-            total: self.total.saturating_add(other.total),
-            protected: self.protected.saturating_add(other.protected),
-            protected_files: self.protected_files + other.protected_files,
-            freed: self.freed.saturating_add(other.freed),
-            deleted: self.deleted + other.deleted,
-            limit: self
-                .limit
-                .zip(other.limit)
-                .map(|(a, b)| a.saturating_add(b)),
-            over_limit: self.over_limit.saturating_add(other.over_limit),
-        }
-    }
-
     /// Whether this run reclaimed anything -- the condition
     /// [`recover_out_of_space_torrents`] restarts a stopped torrent on. A
     /// clean that freed nothing has not changed the device's mind, so
     /// restarting into it would only reproduce the error the torrent already
     /// has.
-    ///
-    /// Across volumes this is "some volume gained room", not "the volume the
-    /// stopped torrent writes to did": a pass is one report, and which volume
-    /// a stopped torrent's output folder is on is not something this layer is
-    /// told. A restart onto a volume that is still full reproduces the ENOSPC,
-    /// the torrent stops again, and `recover_out_of_space_torrents` reports it
-    /// once and leaves it -- the same net that already catches a restart that
-    /// was simply too early.
     pub fn made_room(&self) -> bool {
         self.freed > 0
     }
@@ -1077,15 +804,8 @@ impl EvictionReport {
     /// protection kept -- "cleaned up 0 files, freed 0 bytes" on a phone
     /// that is filling up says nothing about *why*, and the why is always
     /// that the rest of the cache belongs to a live or pinned torrent.
-    /// Since the downloads dir is walked too, that now includes an offline
-    /// download the user has not unpinned.
-    /// `None` when every volume the run covered got under its limit (or had
-    /// none).
-    ///
-    /// It reads [`Self::over_limit`] and not `total` against `limit`, so that
-    /// one volume being stuck survives being folded together with volumes
-    /// that are fine -- the numbers it reports are how far over the pass
-    /// ended and what it could not touch, both of which add up honestly.
+    /// That includes a pinned download the user has not unpinned. `None`
+    /// when the run got under its limit (or had none).
     pub fn shortfall_message(&self) -> Option<String> {
         if self.over_limit == 0 {
             return None;
@@ -1126,25 +846,19 @@ impl EvictionReport {
 /// `headroom` lowers the cap this run evicts to (see [`RECOVERY_HEADROOM`]).
 /// Sizes are occupancy, not apparent length (see [`occupied_bytes`]).
 ///
-/// Every root handed in is walked to the bottom, the downloads dir included
-/// (`cache_roots` puts it in the list) -- to the bottom of *this volume*: a
-/// walk stops where another budget's root begins ([`walk_within`]), which is
-/// the only place a root can be nested inside another one by the time
-/// [`budgets_by_volume`] is done. Nothing else is excluded by *where* it
-/// lives; what a run may not touch is decided by `protected_paths` alone, and
-/// that is the only thing between the cleaner and a download somebody is
-/// watching. Callers that add a root must therefore make sure whatever must
-/// survive is named there -- see `EngineFS::protected_paths`, which covers
+/// `download_dir` -- the one torrent-data root -- is walked to the bottom.
+/// Nothing is excluded by *where* it lives; what a run may not touch is
+/// decided by `protected_paths` alone, and that is the only thing between
+/// the cleaner and a download somebody is watching. Whatever must survive
+/// has to be named there -- see `EngineFS::protected_paths`, which covers
 /// live engines and the dormant pins that have no engine to speak for them.
 #[allow(clippy::too_many_arguments)]
 async fn evict<E>(
-    download_dirs: &[std::path::PathBuf],
+    download_dir: &std::path::Path,
     protected_paths: &HashSet<std::path::PathBuf>,
     evict_first: &HashSet<std::path::PathBuf>,
     stopped: &[(String, HashSet<std::path::PathBuf>)],
     evictors: &[E],
-    keep_dirs: &HashSet<std::path::PathBuf>,
-    boundaries: &HashSet<std::path::PathBuf>,
     limit: CacheLimit,
     headroom: u64,
 ) -> anyhow::Result<EvictionReport>
@@ -1163,11 +877,10 @@ where
     // because the sets are borrowed from `CacheRoots` and the walk outlives
     // the borrow's poll.
     let walk = WalkInputs {
-        download_dirs: download_dirs.to_vec(),
+        download_dir: download_dir.to_path_buf(),
         protected_paths: protected_paths.clone(),
         evict_first: evict_first.clone(),
         stopped: stopped.iter().map(|(_, paths)| paths.clone()).collect(),
-        boundaries: boundaries.clone(),
         max_age: Duration::from_secs(30 * 24 * 60 * 60),
         now: std::time::SystemTime::now(),
     };
@@ -1199,7 +912,7 @@ where
             aged_out_bytes += size;
             aged_out_files += 1;
             if let Some(parent) = path.parent() {
-                remove_empty_parents(parent, keep_dirs).await;
+                remove_empty_parents(parent, download_dir).await;
             }
         }
     }
@@ -1275,7 +988,7 @@ where
                 deleted_count += 1;
 
                 if let Some(parent) = path.parent() {
-                    remove_empty_parents(parent, keep_dirs).await;
+                    remove_empty_parents(parent, download_dir).await;
                 }
             }
         }
@@ -1341,10 +1054,10 @@ where
     Ok(report)
 }
 
-/// What [`evict`] hands the blocking pool: the roots to walk and the rules to
+/// What [`evict`] hands the blocking pool: the root to walk and the rules to
 /// sort what it finds by. Owned, because the walk runs on another thread.
 struct WalkInputs {
-    download_dirs: Vec<std::path::PathBuf>,
+    download_dir: std::path::PathBuf,
     protected_paths: HashSet<std::path::PathBuf>,
     /// Sorted to the front of the size rule, whatever their age -- see
     /// [`evict`].
@@ -1353,7 +1066,6 @@ struct WalkInputs {
     /// order. Counted into their own buckets ([`Walked::stopped`]), never
     /// into the evictable files -- the engine, not the walk, deletes those.
     stopped: Vec<HashSet<std::path::PathBuf>>,
-    boundaries: HashSet<std::path::PathBuf>,
     /// The age rule: a file last modified longer ago than this goes.
     max_age: Duration,
     now: std::time::SystemTime,
@@ -1404,11 +1116,8 @@ impl WalkInputs {
             protected_files: 0,
             stopped: vec![StoppedFound::default(); self.stopped.len()],
         };
-        for download_dir in &self.download_dirs {
-            if !download_dir.exists() {
-                continue;
-            }
-            for entry in walk_within(download_dir, &self.boundaries) {
+        if self.download_dir.exists() {
+            for entry in walkdir::WalkDir::new(&self.download_dir) {
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(e) => {
@@ -1420,7 +1129,7 @@ impl WalkInputs {
                     continue;
                 }
                 let path = entry.path().to_path_buf();
-                if is_session_artifact(&path, download_dir) {
+                if is_session_artifact(&path, &self.download_dir) {
                     continue;
                 }
                 let Ok(metadata) = entry.metadata() else {
@@ -1525,47 +1234,6 @@ fn is_session_artifact(path: &std::path::Path, root: &std::path::Path) -> bool {
     }
 }
 
-/// Walk `root` to the bottom, but never down into a directory that is one of
-/// `boundaries` -- the roots the other budgets walk.
-///
-/// `WalkDir` crosses mount points, and it has to: the cache root is one
-/// filesystem and everything the cleaner is responsible for in it must be
-/// reachable. But a root on another volume is another budget's, weighed
-/// against another volume's free space, and a walk that descended into it
-/// would count and evict its files against a cap that says nothing about the
-/// disk they are on -- exactly what [`budgets_by_volume`] splits the roots up
-/// to prevent. Within one volume there is nothing to stop at: those roots
-/// collapsed into this one before the walk began.
-///
-/// The root itself is at depth 0 and is therefore never its own boundary.
-fn walk_within<'a>(
-    root: &std::path::Path,
-    boundaries: &'a HashSet<std::path::PathBuf>,
-) -> walkdir::FilterEntry<walkdir::IntoIter, impl FnMut(&walkdir::DirEntry) -> bool + 'a> {
-    walkdir::WalkDir::new(root)
-        .into_iter()
-        .filter_entry(move |entry| {
-            entry.depth() == 0 || !entry.file_type().is_dir() || !boundaries.contains(entry.path())
-        })
-}
-
-/// The roots that are not inside another root, component-wise. `WalkDir` has
-/// no idea that two roots overlap, so walking a parent and its child would
-/// count, age and evict everything under the child twice; keeping only the
-/// outermost makes that one walk. Assumes `roots` is already deduplicated, so
-/// two spellings of the same path do not cancel each other out.
-fn outermost(roots: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
-    roots
-        .iter()
-        .filter(|dir| {
-            !roots
-                .iter()
-                .any(|other| other != *dir && dir.starts_with(other))
-        })
-        .cloned()
-        .collect()
-}
-
 /// A file is protected from eviction when its full path is in `protected` or
 /// when it lives under a protected directory. Uses `Path::starts_with`, which
 /// matches whole path components — so `/dl/Movie2/x.mkv` is NOT shielded by a
@@ -1575,20 +1243,12 @@ fn is_path_protected(path: &std::path::Path, protected: &HashSet<std::path::Path
 }
 
 /// Prune the directories a deletion left empty, upwards, stopping at the first
-/// one that is not empty -- and never at all on a directory in `keep`.
-///
-/// `keep` is every directory the cleaner was handed: the engines' cache roots
-/// and the resolved `downloadsDir`. The walked root alone used to be the stop
-/// condition, and that was right only while every configured directory was a
-/// walked root. It stopped being right when [`outermost`] began collapsing a
-/// `downloadsDir` under a cache root into that cache root: the walked root is
-/// then the cache root, and the loop walks through the downloads dir on its way
-/// up to it, deleting it the moment eviction has emptied it. That directory is
-/// settings -- `routes::system::prepare_downloads_dir` resolved and validated
-/// it and the engines were told about it -- and the cleaner is not the thing
-/// that gets to remove it.
-async fn remove_empty_parents(mut dir: &std::path::Path, keep: &HashSet<std::path::PathBuf>) {
-    while !keep.contains(dir) {
+/// one that is not empty -- and never at `keep`, the torrent-data root
+/// itself. That directory is configuration (`settings.cacheRoot`, prepared at
+/// startup and opened on by the session), and the cleaner is not the thing
+/// that gets to remove it, however empty eviction leaves it.
+async fn remove_empty_parents(mut dir: &std::path::Path, keep: &std::path::Path) {
+    while dir != keep {
         if tokio::fs::remove_dir(dir).await.is_err() {
             break;
         }
@@ -1602,10 +1262,9 @@ async fn remove_empty_parents(mut dir: &std::path::Path, keep: &HashSet<std::pat
 #[cfg(test)]
 mod tests {
     use super::{
-        CACHE_FREE_SPACE_FLOOR, CacheLimit, CacheUsage, CleanSchedule, DiskFullRecovery,
-        EvictionReport, LastEviction, WALKED_ON_THIS_THREAD, available_space, budgets_by_volume,
-        evict, is_path_protected, is_session_artifact, occupied_bytes, outermost,
-        remove_empty_parents, scan_usage,
+        CACHE_FREE_SPACE_FLOOR, CacheLimit, CleanSchedule, DiskFullRecovery, EvictionReport,
+        LastEviction, WALKED_ON_THIS_THREAD, available_space, evict, is_path_protected,
+        is_session_artifact, occupied_bytes, remove_empty_parents, scan_usage,
     };
     use futures_util::future::BoxFuture;
     use std::collections::HashSet;
@@ -1654,25 +1313,20 @@ mod tests {
         }
     }
 
-    /// `evict` where every walked root is also a directory to keep and the
-    /// only boundary: the ordinary shape, one budget with nothing collapsed
-    /// into anything and no second volume to stop at. The tests about the
-    /// collapse and about two volumes build their own sets and call `evict`
-    /// directly.
-    async fn evict_roots(
-        download_dirs: &[PathBuf],
+    /// `evict` over the one torrent-data root, with nothing stopped and
+    /// nothing to evict first: the shape a pass has whenever no torrent is
+    /// in the backend's error state.
+    async fn evict_root(
+        download_dir: &Path,
         protected_paths: &HashSet<PathBuf>,
         limit: CacheLimit,
     ) -> anyhow::Result<EvictionReport> {
-        let keep: HashSet<PathBuf> = download_dirs.iter().cloned().collect();
         evict(
-            download_dirs,
+            download_dir,
             protected_paths,
             &HashSet::new(),
             &[],
             &no_evictors(),
-            &keep,
-            &keep,
             limit,
             0,
         )
@@ -1685,22 +1339,6 @@ mod tests {
     /// The evictor list for a run with no stopped torrents.
     fn no_evictors() -> Vec<Evictor> {
         Vec::new()
-    }
-
-    /// [`scan_usage`] for one budget whose roots are the only ones walked.
-    fn scan_roots(
-        download_dirs: &[PathBuf],
-        protected_paths: &HashSet<PathBuf>,
-        limit: CacheLimit,
-    ) -> CacheUsage {
-        let boundaries = download_dirs.iter().cloned().collect();
-        scan_usage(download_dirs, protected_paths, &boundaries, limit)
-    }
-
-    /// The keep-set of a plain root: what `cache_roots` builds when no
-    /// root sits inside another.
-    fn keep_only(dirs: &[&Path]) -> HashSet<PathBuf> {
-        dirs.iter().map(|dir| dir.to_path_buf()).collect()
     }
 
     fn write_aged(path: &Path, bytes: &[u8], age: Duration) {
@@ -1741,13 +1379,9 @@ mod tests {
         write_aged(&film, &[0u8; 4096], Duration::ZERO);
 
         WALKED_ON_THIS_THREAD.set(false);
-        let report = evict_roots(
-            std::slice::from_ref(&root),
-            &HashSet::new(),
-            CacheLimit::configured(u64::MAX),
-        )
-        .await
-        .unwrap();
+        let report = evict_root(&root, &HashSet::new(), CacheLimit::configured(u64::MAX))
+            .await
+            .unwrap();
         assert_eq!(
             report.total,
             occupancy(&film),
@@ -1782,13 +1416,9 @@ mod tests {
         let recent = root.join("recent.mkv");
         write_aged(&recent, &[0u8; 4096], Duration::from_secs(60));
 
-        evict_roots(
-            std::slice::from_ref(&root),
-            &HashSet::new(),
-            CacheLimit::configured(0),
-        )
-        .await
-        .unwrap();
+        evict_root(&root, &HashSet::new(), CacheLimit::configured(0))
+            .await
+            .unwrap();
         for record in &records {
             assert!(
                 record.is_file(),
@@ -1804,13 +1434,9 @@ mod tests {
         let newer = root.join("newer.mkv");
         write_aged(&newer, &[0u8; 4096], Duration::from_secs(1));
         let limit = limit_between(&newer, &recent);
-        evict_roots(
-            std::slice::from_ref(&root),
-            &HashSet::new(),
-            CacheLimit::configured(limit),
-        )
-        .await
-        .unwrap();
+        evict_root(&root, &HashSet::new(), CacheLimit::configured(limit))
+            .await
+            .unwrap();
         for record in &records {
             assert!(
                 record.is_file(),
@@ -1830,7 +1456,7 @@ mod tests {
         let c = b.join("c");
         std::fs::create_dir_all(&c).unwrap();
 
-        remove_empty_parents(&c, &keep_only(&[root.path()])).await;
+        remove_empty_parents(&c, root.path()).await;
 
         assert!(!c.exists(), "empty leaf removed");
         assert!(!b.exists(), "empty parent removed");
@@ -1847,7 +1473,7 @@ mod tests {
         let keep = b.join("keep.txt");
         std::fs::write(&keep, b"x").unwrap();
 
-        remove_empty_parents(&c, &keep_only(&[root.path()])).await;
+        remove_empty_parents(&c, root.path()).await;
 
         assert!(!c.exists(), "empty leaf removed");
         assert!(b.exists(), "non-empty sibling dir kept");
@@ -1861,7 +1487,7 @@ mod tests {
         std::fs::create_dir_all(&a).unwrap();
 
         // Climbing from `a` empties the root, but the loop must stop at it.
-        remove_empty_parents(&a, &keep_only(&[root.path()])).await;
+        remove_empty_parents(&a, root.path()).await;
 
         assert!(!a.exists());
         assert!(root.path().exists(), "root preserved even when empty");
@@ -1883,33 +1509,30 @@ mod tests {
         assert!(!is_path_protected(Path::new("/dl/Other/x.mkv"), &set));
     }
 
-    /// Old plain-file downloads are evictable, because nothing else will
-    /// ever reclaim them.
+    /// A plain-file download an earlier version wrote is evictable, because
+    /// nothing else will ever reclaim it.
     ///
-    /// They are not migrated to the piece store and they are not read: a
-    /// download is played from pieces now. Left out of the walk, as the
-    /// downloads dir used to be, they would be orphaned *and* immortal on
-    /// the device where space runs out. So the downloads dir is a walked
-    /// root like any other (`cache_roots` puts it in the list), and what
-    /// survives there survives because it is protected, not because of where
-    /// it lives.
+    /// It is not migrated to the piece store and it is not read: a download
+    /// is played from pieces now. Under a root left out of the walk -- as
+    /// the separate `downloadsDir` used to be -- such a file would be
+    /// orphaned *and* immortal on the device where space runs out. There is
+    /// one root and all of it is walked, and what survives there survives
+    /// because it is protected, not because of where it lives.
     #[tokio::test]
-    async fn evict_reclaims_the_old_downloads_nothing_else_would() {
+    async fn evict_reclaims_a_plain_file_download_nothing_else_would() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("rqbit-downloads");
-        let offline = tmp.path().join("offline");
         let forty_days = Duration::from_secs(40 * 24 * 60 * 60);
-        let abandoned = offline.join(HASH).join("movie.mkv");
+        let abandoned = root.join(HASH).join("movie.mkv");
         write_aged(&abandoned, &[0u8; 8192], forty_days);
         // A dormant pin's folder: no engine speaks for it, so
         // `EngineFS::protected_paths` names the folder itself.
-        let pinned_folder = offline.join(OTHER_HASH);
+        let pinned_folder = root.join(OTHER_HASH);
         let pinned = pinned_folder.join("kept.mkv");
         write_aged(&pinned, &[0u8; 8192], forty_days);
         let protected: HashSet<PathBuf> = HashSet::from([pinned_folder.clone()]);
-        let roots = [root.clone(), offline.clone()];
 
-        let report = evict_roots(&roots, &protected, CacheLimit::configured(0))
+        let report = evict_root(&root, &protected, CacheLimit::configured(0))
             .await
             .unwrap();
         assert!(
@@ -1920,12 +1543,12 @@ mod tests {
         assert_eq!(report.protected_files, 1);
         assert!(report.freed >= 8192, "{report:?}");
 
-        // And it counts towards the limit now, so the size rule can reach a
+        // And it counts towards the limit, so the size rule can reach a
         // download the age rule was not old enough to take.
-        let recent = offline.join(HASH).join("recent.mkv");
+        let recent = root.join(HASH).join("recent.mkv");
         write_aged(&recent, &[0u8; 8192], Duration::from_secs(3600));
-        let report = evict_roots(
-            &roots,
+        let report = evict_root(
+            &root,
             &protected,
             CacheLimit::configured(occupancy(&pinned)),
         )
@@ -1935,336 +1558,29 @@ mod tests {
         assert!(pinned.is_file(), "never an LRU casualty");
     }
 
-    /// The configured `downloadsDir` is settings, not cache: eviction may
-    /// empty it, never remove it.
-    ///
-    /// `remove_empty_parents` prunes the directories a deletion left behind,
-    /// upwards, and it used to stop only at the walked root. That was enough
-    /// while the downloads dir was a root of its own; it stopped being enough
-    /// when `outermost` started collapsing a downloads dir under a cache root
-    /// into the cache root, because the root is then the cache root and the
-    /// loop walks straight through the downloads dir on its way there. The
-    /// server resolved and validated that path (`prepare_downloads_dir`) and
-    /// handed it to the engines, so deleting it is the cleaner overruling a
-    /// setting.
+    /// The torrent-data root is configuration, not cache: eviction may empty
+    /// it, never remove it. Every directory eviction leaves empty *under* it
+    /// goes, so an evicted torrent leaves no husk behind.
     #[tokio::test]
-    async fn evict_never_prunes_the_configured_downloads_dir_away() {
+    async fn evict_empties_the_root_without_removing_it() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("rqbit-downloads");
-        let offline = root.join("offline");
-        let stale = offline.join(HASH).join("movie.mkv");
+        let stale = root.join(HASH).join("movie.mkv");
         write_aged(&stale, &[0u8; 8192], Duration::from_secs(40 * 24 * 60 * 60));
 
-        // Exactly what `cache_roots` hands `evict`: one walked root, because
-        // the downloads dir collapsed into it, and both directories to keep.
-        let keep = HashSet::from([root.clone(), offline.clone()]);
-        evict(
-            std::slice::from_ref(&root),
-            &HashSet::new(),
-            &HashSet::new(),
-            &[],
-            &no_evictors(),
-            &keep,
-            &HashSet::from([root.clone()]),
-            CacheLimit::configured(0),
-            0,
-        )
-        .await
-        .unwrap();
+        evict_root(&root, &HashSet::new(), CacheLimit::configured(0))
+            .await
+            .unwrap();
 
-        assert!(!stale.exists(), "the stale download still goes");
+        assert!(!stale.exists(), "the stale download goes");
         assert!(
-            !offline.join(HASH).exists(),
+            !root.join(HASH).exists(),
             "and so does the torrent folder it emptied"
         );
-        assert!(offline.is_dir(), "but the downloads dir itself stays");
-        assert!(root.is_dir());
+        assert!(root.is_dir(), "but the root itself stays");
     }
 
-    /// Roots on two volumes are two budgets, never one.
-    ///
-    /// The occupancy of every walked root used to be summed into one number
-    /// and weighed against a single free-space figure -- the *tightest* of the
-    /// roots, since one volume running out is enough to stop a write. That is
-    /// right while every root is on one volume, which is the phone this was
-    /// written for and is not the desktop with `downloadsDir` on an external
-    /// drive. There the min is the external drive's, the sum includes the
-    /// system disk's cache, and the cleaner evicts a healthy volume's film to
-    /// answer a shortage on a volume it never touches -- and cannot fix, since
-    /// what fills the download drive is pinned and protected.
-    #[tokio::test]
-    async fn each_volume_gets_a_budget_of_its_own() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cache = tmp.path().join("cache");
-        let offline = tmp.path().join("offline");
-        let film = cache.join(HASH).join("film.mkv");
-        write_aged(&film, &[0u8; 8192], Duration::from_secs(60));
-        let stale = offline.join(OTHER_HASH).join("leftovers.bin");
-        write_aged(&stale, &[0u8; 8192], Duration::from_secs(60));
-        let stale_occupancy = occupancy(&stale);
-
-        // Two volumes: the cache root's has a terabyte, the downloads
-        // drive is right up against the floor.
-        let on_the_download_drive = |path: &Path| path.starts_with(&offline);
-        let budgets = budgets_by_volume(
-            &[cache.clone(), offline.clone()],
-            // No `cacheSize` set, so the disk is the only thing capping
-            // anything -- the case the tightest-of-all minimum made worst.
-            0,
-            |path| Some(if on_the_download_drive(path) { 2 } else { 1 }),
-            |path| {
-                Some(if on_the_download_drive(path) {
-                    0
-                } else {
-                    1 << 40
-                })
-            },
-        );
-        assert_eq!(budgets.len(), 2, "one budget per volume");
-
-        let mut reports = Vec::new();
-        for budget in &budgets {
-            reports.push(
-                evict_roots(&budget.roots, &HashSet::new(), budget.limit)
-                    .await
-                    .unwrap(),
-            );
-        }
-        let per_volume: Vec<u64> = reports
-            .iter()
-            .map(|report| report.limit.expect("every volume is capped here"))
-            .collect();
-        let report = reports
-            .into_iter()
-            .reduce(EvictionReport::combined_with)
-            .unwrap();
-        assert!(
-            film.is_file(),
-            "the roomy volume's cache is not what a full download drive costs"
-        );
-        assert!(!stale.exists(), "the full volume evicts its own");
-        assert_eq!(report.freed, stale_occupancy, "{report:?}");
-        assert_eq!(
-            report.limit,
-            Some(per_volume.iter().sum()),
-            "and the one report a client gets adds the volumes' caps up, {report:?}"
-        );
-    }
-
-    /// The grouping has to happen before the collapse, because the collapse
-    /// is what destroys the question.
-    ///
-    /// `outermost` throws away a root that sits inside another, and
-    /// `prepare_downloads_dir` deliberately permits a `downloadsDir` *below* a
-    /// cache root. On a desktop that dir is an external drive mounted there --
-    /// so collapsed first, the drive stopped being a root at all and was never
-    /// asked which volume it was on: its bytes were walked as part of the cache
-    /// root and capped by the cache root's free space, a cap about a volume they
-    /// are not on. That is the exact reading per-volume budgets exist to stop.
-    /// Grouped first, the mount is its own budget, while a plain subdirectory
-    /// that really does share the volume still collapses into one walk.
-    #[test]
-    fn roots_are_grouped_by_volume_before_they_are_collapsed() {
-        let cache = PathBuf::from("/c/rqbit-downloads");
-        let archive = cache.join("archive");
-        let offline = cache.join("offline");
-        let external = |path: &Path| path.starts_with(&offline);
-        let budgets = budgets_by_volume(
-            &[cache.clone(), archive.clone(), offline.clone()],
-            0,
-            |path| Some(if external(path) { 2 } else { 1 }),
-            |path| Some(if external(path) { 0 } else { 1 << 40 }),
-        );
-
-        assert_eq!(
-            budgets.len(),
-            2,
-            "the mount under the cache root is a volume of its own"
-        );
-        assert_eq!(
-            budgets[0].roots,
-            vec![cache.clone()],
-            "a subdirectory sharing the volume is still one walk, not two"
-        );
-        assert_eq!(
-            budgets[0].limit.available,
-            Some(1 << 40),
-            "and the cache root is not capped by the drive mounted inside it"
-        );
-        assert_eq!(budgets[1].roots, vec![offline.clone()]);
-        assert_eq!(budgets[1].limit.available, Some(0), "which has its own cap");
-    }
-
-    /// And the two budgets stay two walks: `WalkDir` crosses mount points, so
-    /// without a stop the cache root's walk would count and evict the download
-    /// drive's files all over again, against a cap that says nothing about the
-    /// disk they are on -- undoing the split the budgets just made.
-    #[tokio::test]
-    async fn a_walk_stops_where_another_volumes_root_begins() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cache = tmp.path().join("rqbit-downloads");
-        let offline = cache.join("offline");
-        // Both stale, so the age rule alone decides: a cap of 0 would spare
-        // either of them as a single file bigger than the whole cap.
-        let forty_days = Duration::from_secs(40 * 24 * 60 * 60);
-        let film = cache.join(HASH).join("film.mkv");
-        write_aged(&film, &[0u8; 4096], forty_days);
-        let download = offline.join(OTHER_HASH).join("movie.mkv");
-        write_aged(&download, &[0u8; 8192], forty_days);
-
-        let external = |path: &Path| path.starts_with(&offline);
-        let budgets = budgets_by_volume(
-            &[cache.clone(), offline.clone()],
-            0,
-            |path| Some(if external(path) { 2 } else { 1 }),
-            |_| Some(1 << 40),
-        );
-        let boundaries: HashSet<PathBuf> = budgets
-            .iter()
-            .flat_map(|budget| budget.roots.iter().cloned())
-            .collect();
-
-        let totals: Vec<u64> = budgets
-            .iter()
-            .map(|budget| {
-                scan_usage(
-                    &budget.roots,
-                    &HashSet::new(),
-                    &boundaries,
-                    CacheLimit::configured(u64::MAX),
-                )
-                .total_bytes
-            })
-            .collect();
-        assert_eq!(
-            totals,
-            vec![occupancy(&film), occupancy(&download)],
-            "each volume's occupancy is its own"
-        );
-
-        // And the destructive half: the cache root ages out its own film and
-        // cannot reach across the mount for the equally stale download.
-        let keep: HashSet<PathBuf> = HashSet::from([cache.clone(), offline.clone()]);
-        evict(
-            &budgets[0].roots,
-            &HashSet::new(),
-            &HashSet::new(),
-            &[],
-            &no_evictors(),
-            &keep,
-            &boundaries,
-            CacheLimit::configured(0),
-            0,
-        )
-        .await
-        .unwrap();
-        assert!(!film.exists(), "the cache root evicts its own");
-        assert!(
-            download.is_file(),
-            "the download drive is another budget's to answer for"
-        );
-    }
-
-    /// The shape every device this actually ships on has, and the guarantee
-    /// that grouping changed nothing for it: all the roots on one volume are
-    /// one budget with one cap, as they were when there was only ever one.
-    /// Roots whose volume cannot be identified at all -- one that does not
-    /// exist yet, a filesystem that will not answer -- also share a budget,
-    /// which is the same conservative answer the cleaner gave every root
-    /// before it asked the question.
-    #[test]
-    fn roots_that_cannot_be_told_apart_share_one_budget() {
-        let roots = [
-            PathBuf::from("/c/rqbit-downloads"),
-            PathBuf::from("/c/offline"),
-        ];
-        let tightest = |path: &Path| Some(if path.ends_with("offline") { 100 } else { 900 });
-
-        for volume_of in [
-            // One volume, identified.
-            (|_: &Path| Some(1)) as fn(&Path) -> Option<u64>,
-            // No volume identifiable for either.
-            |_: &Path| None,
-        ] {
-            let budgets = budgets_by_volume(&roots, 42, volume_of, tightest);
-            assert_eq!(budgets.len(), 1);
-            assert_eq!(budgets[0].roots, roots);
-            assert_eq!(budgets[0].limit.configured, 42);
-            assert_eq!(
-                budgets[0].limit.available,
-                Some(100),
-                "the tightest reading among roots that share a budget"
-            );
-        }
-    }
-
-    /// A downloads dir inside a cache root (or a cache root inside the
-    /// downloads dir) must be walked once, not twice: `WalkDir` does not know
-    /// the two overlap, and a doubled walk would count every file twice
-    /// against `cacheSize` and try to evict each one twice.
-    #[test]
-    fn overlapping_roots_collapse_to_the_outermost() {
-        let dirs = |paths: &[&str]| -> Vec<PathBuf> {
-            let mut v: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
-            v.sort();
-            v.dedup();
-            outermost(&v)
-        };
-        assert_eq!(
-            dirs(&["/c/rqbit-downloads", "/c/rqbit-downloads/offline"]),
-            vec![PathBuf::from("/c/rqbit-downloads")],
-            "the downloads dir under a cache root"
-        );
-        assert_eq!(
-            dirs(&["/c/rqbit-downloads", "/c"]),
-            vec![PathBuf::from("/c")],
-            "and a cache root under the downloads dir"
-        );
-        assert_eq!(
-            dirs(&["/c/rqbit-downloads", "/c/rqbit-downloads"]),
-            vec![PathBuf::from("/c/rqbit-downloads")],
-            "two spellings of one root do not cancel each other out"
-        );
-        assert_eq!(
-            dirs(&["/a/dl", "/b/downloads"]),
-            vec![PathBuf::from("/a/dl"), PathBuf::from("/b/downloads")],
-            "disjoint roots are both kept"
-        );
-        assert_eq!(
-            dirs(&["/c/dl", "/c/dl2"]),
-            vec![PathBuf::from("/c/dl"), PathBuf::from("/c/dl2")],
-            "component-wise: /c/dl2 is not under /c/dl"
-        );
-    }
-
-    /// The whole walk, over a downloads dir that really is inside a cache
-    /// root: one pass, each file counted once.
-    #[tokio::test]
-    async fn a_downloads_dir_inside_a_cache_root_is_walked_once() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("rqbit-downloads");
-        let offline = root.join("offline");
-        let download = offline.join(HASH).join("movie.mkv");
-        write_aged(&download, &[0u8; 8192], Duration::from_secs(60));
-        let cache = root.join("fresh.mkv");
-        write_aged(&cache, &[0u8; 4096], Duration::from_secs(60));
-
-        let mut roots = vec![root.clone(), offline.clone()];
-        roots.sort();
-        roots.dedup();
-        let roots = outermost(&roots);
-        assert_eq!(roots, vec![root.clone()]);
-
-        let usage = scan_roots(&roots, &HashSet::new(), CacheLimit::configured(u64::MAX));
-        assert_eq!(
-            usage.total_bytes,
-            occupancy(&download) + occupancy(&cache),
-            "the download counts, and counts once"
-        );
-    }
-
-    /// A pinned download in the cache root (no downloads dir configured)
-    /// keeps its engine -- the idle sweeper skips pinned torrents -- so its
+    /// A pinned download keeps its engine -- the idle sweeper skips pinned torrents -- so its
     /// files come through `protected_paths` and neither rule touches them,
     /// however old they are.
     #[tokio::test]
@@ -2278,23 +1594,15 @@ mod tests {
         write_aged(&stale, &[0u8; 4096], forty_days);
         let protected: HashSet<PathBuf> = HashSet::from([pinned.clone()]);
 
-        evict_roots(
-            std::slice::from_ref(&root),
-            &protected,
-            CacheLimit::configured(0),
-        )
-        .await
-        .unwrap();
+        evict_root(&root, &protected, CacheLimit::configured(0))
+            .await
+            .unwrap();
         assert!(pinned.is_file(), "the pinned file survives the age rule");
         assert!(!stale.exists(), "its unpinned neighbour does not");
 
-        evict_roots(
-            std::slice::from_ref(&root),
-            &protected,
-            CacheLimit::configured(1024),
-        )
-        .await
-        .unwrap();
+        evict_root(&root, &protected, CacheLimit::configured(1024))
+            .await
+            .unwrap();
         assert!(pinned.is_file(), "and the size rule");
     }
 
@@ -2318,18 +1626,15 @@ mod tests {
         write_aged(&dead, &[0u8; 8192], Duration::from_secs(60));
         let dead_occupancy = occupancy(&dead);
         let occupied = occupancy(&old_film) + dead_occupancy;
-        let keep: HashSet<PathBuf> = HashSet::from([root.clone()]);
 
         // Room for exactly one of the two: by age alone the old film would
         // go; the dead torrent's file goes instead.
         let report = evict(
-            std::slice::from_ref(&root),
+            &root,
             &HashSet::new(),
             &HashSet::from([dead.clone()]),
             &[],
             &no_evictors(),
-            &keep,
-            &keep,
             CacheLimit::configured(occupied - dead_occupancy / 2),
             0,
         )
@@ -2348,13 +1653,11 @@ mod tests {
         write_aged(&e1, &[0u8; 4096], Duration::from_secs(30));
         write_aged(&e2, &[0u8; 4096], Duration::from_secs(30));
         let report = evict(
-            std::slice::from_ref(&root),
+            &root,
             &HashSet::new(),
             &HashSet::from([dead_dir.clone()]),
             &[],
             &no_evictors(),
-            &keep,
-            &keep,
             CacheLimit::configured(occupancy(&old_film) + occupancy(&e1)),
             0,
         )
@@ -2411,20 +1714,17 @@ mod tests {
         write_aged(&partial, &[0u8; 8192], Duration::from_secs(10));
         let old_occupancy = occupancy(&old_film);
         let partial_occupancy = occupancy(&partial);
-        let keep: HashSet<PathBuf> = HashSet::from([root.clone()]);
         let stopped = vec![(HASH.to_string(), HashSet::from([stopped_dir.clone()]))];
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 
         // Over by half the old film: the old film goes, the stopped torrent
         // stays -- with room to resume into.
         let report = evict(
-            std::slice::from_ref(&root),
+            &root,
             &HashSet::new(),
             &HashSet::new(),
             &stopped,
             &[fake_evictor(&calls, &stopped_dir, true)],
-            &keep,
-            &keep,
             CacheLimit::configured(old_occupancy + partial_occupancy - old_occupancy / 2),
             0,
         )
@@ -2446,13 +1746,11 @@ mod tests {
         // Nothing else left and still over: the stopped torrent goes whole,
         // through the engine, and the run ends under.
         let report = evict(
-            std::slice::from_ref(&root),
+            &root,
             &HashSet::new(),
             &HashSet::new(),
             &stopped,
             &[fake_evictor(&calls, &stopped_dir, true)],
-            &keep,
-            &keep,
             CacheLimit::configured(partial_occupancy / 2),
             0,
         )
@@ -2471,13 +1769,11 @@ mod tests {
         write_aged(&partial, &[0u8; 8192], Duration::from_secs(10));
         calls.lock().unwrap().clear();
         let report = evict(
-            std::slice::from_ref(&root),
+            &root,
             &HashSet::new(),
             &HashSet::new(),
             &stopped,
             &[fake_evictor(&calls, &stopped_dir, false)],
-            &keep,
-            &keep,
             CacheLimit::configured(partial_occupancy / 2),
             0,
         )
@@ -2505,26 +1801,19 @@ mod tests {
         let occupied = occupancy(&older) + occupancy(&newer);
 
         // Exactly at the cap: an ordinary pass evicts nothing.
-        let report = evict_roots(
-            std::slice::from_ref(&root),
-            &HashSet::new(),
-            CacheLimit::configured(occupied),
-        )
-        .await
-        .unwrap();
+        let report = evict_root(&root, &HashSet::new(), CacheLimit::configured(occupied))
+            .await
+            .unwrap();
         assert_eq!(report.deleted, 0);
 
         // The same cap with headroom: the pass makes that much room, oldest
         // first, and reports the cap it actually evicted to.
-        let keep: HashSet<PathBuf> = HashSet::from([root.clone()]);
         let report = evict(
-            std::slice::from_ref(&root),
+            &root,
             &HashSet::new(),
             &HashSet::new(),
             &[],
             &no_evictors(),
-            &keep,
-            &keep,
             CacheLimit::configured(occupied),
             occupancy(&older) / 2,
         )
@@ -2584,13 +1873,9 @@ mod tests {
         // the single-file-larger-than-the-limit rule, so the eviction fell
         // on the only other candidate and freed nothing that mattered.
         let limit = 1u64 << 30;
-        let report = evict_roots(
-            std::slice::from_ref(&root),
-            &HashSet::new(),
-            CacheLimit::configured(limit),
-        )
-        .await
-        .unwrap();
+        let report = evict_root(&root, &HashSet::new(), CacheLimit::configured(limit))
+            .await
+            .unwrap();
 
         assert!(
             report.total < 1 << 20,
@@ -2635,11 +1920,7 @@ mod tests {
             return;
         }
 
-        let usage = scan_roots(
-            std::slice::from_ref(&root),
-            &HashSet::new(),
-            CacheLimit::configured(0),
-        );
+        let usage = scan_usage(&root, &HashSet::new(), CacheLimit::configured(0));
 
         assert_eq!(usage.total_bytes, allocated, "occupancy, not len()");
         assert!(
@@ -2672,11 +1953,7 @@ mod tests {
         // a distinct, explicit zero-size cap, per `ServerSettings.cache_size`
         // -- `Some(0.0)`, not `None` -- and `CacheUsage` must not blur the
         // two the way `EvictionReport::shortfall_message` does).
-        let usage = scan_roots(
-            std::slice::from_ref(&root),
-            &protected,
-            CacheLimit::configured(u64::MAX),
-        );
+        let usage = scan_usage(&root, &protected, CacheLimit::configured(u64::MAX));
 
         assert_eq!(usage.total_bytes, pinned_bytes + free_bytes);
         assert_eq!(usage.protected_bytes, pinned_bytes);
@@ -2696,11 +1973,11 @@ mod tests {
         assert_eq!(json["limitBytes"], serde_json::Value::Null);
     }
 
-    /// The field condition: no `downloadsDir` is configured, so downloads
-    /// land in the very root the engines stream into. Ordinary streamed
-    /// cache there is reclaimable; a pinned download and the file a live
-    /// engine is writing are not -- and protection is the only thing that
-    /// tells them apart, since every root is walked to the bottom.
+    /// The field condition: downloads land in the very root the engine
+    /// streams into, because there is only one. Ordinary streamed cache
+    /// there is reclaimable; a pinned download and the file a live engine is
+    /// writing are not -- and protection is the only thing that tells them
+    /// apart, since the root is walked to the bottom.
     #[tokio::test]
     async fn evict_reclaims_unpinned_cache_sharing_the_root_with_downloads() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2719,13 +1996,9 @@ mod tests {
         let cold_bytes = occupancy(&cold);
         let limit = protected_bytes + limit_between(&warm, &cold);
 
-        let report = evict_roots(
-            std::slice::from_ref(&root),
-            &protected,
-            CacheLimit::configured(limit),
-        )
-        .await
-        .unwrap();
+        let report = evict_root(&root, &protected, CacheLimit::configured(limit))
+            .await
+            .unwrap();
 
         assert!(
             !cold.exists(),
@@ -2757,13 +2030,9 @@ mod tests {
         let protected_bytes = occupancy(&pinned) + occupancy(&live);
         let limit = protected_bytes / 2;
 
-        let report = evict_roots(
-            std::slice::from_ref(&root),
-            &protected,
-            CacheLimit::configured(limit),
-        )
-        .await
-        .unwrap();
+        let report = evict_root(&root, &protected, CacheLimit::configured(limit))
+            .await
+            .unwrap();
 
         assert!(pinned.is_file());
         assert!(live.is_file());
@@ -2893,47 +2162,6 @@ mod tests {
         assert!(recovery.has_new_work(&only_b));
     }
 
-    /// A run is one report to the client, but a shortfall is one volume's.
-    ///
-    /// Folding summed `total` against summed `limit`, so a system disk with
-    /// room to spare could pay off a download drive that is full: the client
-    /// asked whether cleaning had got the device under its limit, was told
-    /// yes, and the drive it could not write to was over its own cap by
-    /// exactly as much as before.
-    #[test]
-    fn one_volumes_shortfall_survives_another_volumes_slack() {
-        let full = EvictionReport {
-            total: 100,
-            protected: 100,
-            protected_files: 1,
-            freed: 0,
-            deleted: 0,
-            limit: Some(50),
-            over_limit: 50,
-        };
-        let roomy = EvictionReport {
-            total: 10,
-            limit: Some(1000),
-            ..EvictionReport::default()
-        };
-        assert!(
-            full.shortfall_message().is_some(),
-            "the volume that is over says so on its own"
-        );
-        assert_eq!(roomy.shortfall_message(), None);
-
-        let combined = full.clone().combined_with(roomy.clone());
-        assert!(
-            combined.shortfall_message().is_some(),
-            "and the pass as a whole still says it: {combined:?}"
-        );
-        assert_eq!(
-            roomy.clone().combined_with(roomy).shortfall_message(),
-            None,
-            "two volumes with room are still a pass with nothing to report"
-        );
-    }
-
     /// The shape the two sentinels cross the wire in. `POST /cache/clean`,
     /// `ServerHandle::clean_cache_now` and the FFI call behind the app's
     /// storage screen all read this JSON, and the app distinguishes "no cap"
@@ -2954,8 +2182,7 @@ mod tests {
         assert_eq!(json(Some(1024)), serde_json::json!(1024));
 
         // And the shortfall beside it, camelCase like the rest: it is what a
-        // client has to read to know some volume is stuck, since after a fold
-        // `total` against `limit` cannot tell it.
+        // client reads to know the cache is still stuck.
         let over = serde_json::to_value(EvictionReport {
             over_limit: 4096,
             ..EvictionReport::default()
@@ -3061,15 +2288,15 @@ mod tests {
     /// never 0 free space, which would evict a healthy cache on the strength
     /// of a failed syscall.
     ///
-    /// The refusal is injected through the probe parameter of
-    /// `budgets_by_volume` rather than staged with a path the OS will not
-    /// answer for, because there is no such path on every platform: `statvfs`
-    /// fails on a directory not yet created, but Windows names the volume from
-    /// the drive letter and answers for it with the drive's real free space.
-    /// (That is exactly how this test used to fail there, with the real
-    /// number where `None` was expected -- the property held; the fixture did
-    /// not.) What the cleaner does with a probe that answers `None` is the
-    /// property, and it is the same on both.
+    /// The `None` is written straight into the [`CacheLimit`] rather than
+    /// staged with a path the OS will not answer for, because there is no
+    /// such path on every platform: `statvfs` fails on a directory not yet
+    /// created, but Windows names the volume from the drive letter and
+    /// answers for it with the drive's real free space. (That is exactly how
+    /// this test used to fail there, with the real number where `None` was
+    /// expected -- the property held; the fixture did not.) What the cleaner
+    /// does with a probe that answered `None` is the property, and it is the
+    /// same on both.
     #[test]
     fn an_unreadable_volume_leaves_the_configured_limit_alone() {
         assert_eq!(CacheLimit::configured(1024).effective(4096), Some(1024));
@@ -3080,18 +2307,17 @@ mod tests {
         assert_eq!(CacheLimit::configured(0).effective(4096), None);
         assert!(!CacheLimit::configured(0).disk_bound(4096));
 
-        // The seam the real probe is wired through: a volume whose free space
-        // cannot be read gets a budget with no filesystem reading behind it,
-        // so the configured cap -- or no cap -- is what it enforces.
-        let roots = [PathBuf::from("/c/rqbit-downloads")];
-        let volume_of = |_: &Path| Some(1);
-        let unreadable = |_: &Path| None;
+        // What `cache_roots` builds when the root's free space cannot be
+        // read: a cap with no filesystem reading behind it, so the
+        // configured cap -- or no cap -- is what it enforces.
         for (configured, expected) in [(1024, Some(1024)), (u64::MAX, Some(u64::MAX)), (0, None)] {
-            let budgets = budgets_by_volume(&roots, configured, volume_of, unreadable);
-            assert_eq!(budgets.len(), 1);
-            assert_eq!(budgets[0].limit, CacheLimit::configured(configured));
-            assert_eq!(budgets[0].limit.effective(4096), expected);
-            assert!(!budgets[0].limit.disk_bound(4096));
+            let limit = CacheLimit {
+                configured,
+                available: None,
+            };
+            assert_eq!(limit, CacheLimit::configured(configured));
+            assert_eq!(limit.effective(4096), expected);
+            assert!(!limit.disk_bound(4096));
         }
 
         // Whereas a real directory answers with a real number -- on every
@@ -3117,9 +2343,7 @@ mod tests {
 
         // Unlimited by setting, and the walk found nothing to age out.
         let unlimited = CacheLimit::configured(u64::MAX);
-        let report = evict_roots(std::slice::from_ref(&root), &HashSet::new(), unlimited)
-            .await
-            .unwrap();
+        let report = evict_root(&root, &HashSet::new(), unlimited).await.unwrap();
         assert_eq!(
             report.deleted, 0,
             "nothing caps it without a free-space reading"
@@ -3134,9 +2358,7 @@ mod tests {
             configured: u64::MAX,
             available: Some(CACHE_FREE_SPACE_FLOOR - stale_occupancy / 2),
         };
-        let report = evict_roots(std::slice::from_ref(&root), &HashSet::new(), squeezed)
-            .await
-            .unwrap();
+        let report = evict_root(&root, &HashSet::new(), squeezed).await.unwrap();
         assert!(
             !stale.exists(),
             "the least recently modified file goes first"
@@ -3152,8 +2374,8 @@ mod tests {
         // says: a full disk may not delete what is being written, and the run
         // reports what protection held rather than a clean that did nothing.
         let protected: HashSet<_> = [recent.clone()].into_iter().collect();
-        let report = evict_roots(
-            std::slice::from_ref(&root),
+        let report = evict_root(
+            &root,
             &protected,
             CacheLimit {
                 configured: u64::MAX,
@@ -3201,9 +2423,7 @@ mod tests {
         );
 
         let protected: HashSet<_> = [live.clone()].into_iter().collect();
-        let report = evict_roots(std::slice::from_ref(&root), &protected, squeezed)
-            .await
-            .unwrap();
+        let report = evict_root(&root, &protected, squeezed).await.unwrap();
 
         assert!(
             !stale.exists(),
@@ -3240,13 +2460,9 @@ mod tests {
 
         // No cap of any kind: the size rule cannot run, so whatever this
         // pass reports having freed came from the age rule alone.
-        let report = evict_roots(
-            std::slice::from_ref(&root),
-            &HashSet::new(),
-            CacheLimit::configured(0),
-        )
-        .await
-        .unwrap();
+        let report = evict_root(&root, &HashSet::new(), CacheLimit::configured(0))
+            .await
+            .unwrap();
 
         assert!(!ancient.exists());
         assert_eq!(report.freed, reclaimable);

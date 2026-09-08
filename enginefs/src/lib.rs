@@ -2193,7 +2193,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// which has no engine to speak for it (that is what dormant means).
     ///
     /// For both that is **one directory**: the torrent's directory in the
-    /// piece store, `<cacheRoot>/.pieces/<info hash>`. Since
+    /// piece store, `<cacheRoot>/rqbit-downloads/.pieces/<info hash>`. Since
     /// [`crate::piece_store::PieceStoreFactory`] became the session's
     /// default storage that is where all of a torrent's data is, the
     /// streaming cache and an offline download alike, and the store's root
@@ -2266,7 +2266,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     }
 
     /// Where `info_hash`'s bytes are: its directory in the piece store,
-    /// `<cacheRoot>/.pieces/<info hash>`. **The one location question this
+    /// `<cacheRoot>/rqbit-downloads/.pieces/<info hash>`. **The one location question this
     /// layer asks, and the store is what it asks.**
     ///
     /// It replaces `download_folder`, which answered `<downloadsDir>/<info
@@ -2983,8 +2983,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             // It used to take the torrent's placement as the evidence
             // instead ("it sits in the folder only pins place under"),
             // which meant a refused pin left the torrent behind whenever no
-            // downloads dir was configured -- which was every default
-            // install. The add being this call's own is the evidence, and
+            // separate downloads directory was configured -- which was
+            // every default install, and is now every install. The add being this call's own is the evidence, and
             // it is one this layer still has.
             // **The torrent goes; the bytes stay.** A refusal happens
             // before anything is downloaded, so an add's own writes are
@@ -3217,9 +3217,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// the data actually went.
     ///
     /// It used to be `<downloadsDir>/<info hash>` -- the folder a pin placed
-    /// a torrent in -- and without a downloads dir there was nothing this
-    /// layer could name at all, so an explicit `deleteFiles` unpin of a
-    /// dormant pin deleted nothing on a default install. Asking the store
+    /// a torrent in, under a settings key since removed -- and without such
+    /// a directory configured there was nothing this layer could name at
+    /// all, so an explicit `deleteFiles` unpin of a dormant pin deleted
+    /// nothing on a default install. Asking the store
     /// answers for every pin, because a pin is a retention flag and the
     /// store is the one place a torrent's bytes are.
     ///
@@ -9829,9 +9830,9 @@ mod tests {
         );
     }
 
-    /// A dormant pin (no torrent in the backend) with no downloads dir has
-    /// nothing on disk this layer can name -- the torrent lived in the
-    /// cache root under a folder named by metadata the pin does not have.
+    /// A dormant pin (no torrent in the backend) had nothing on disk the
+    /// old placement could name -- the torrent lived in the cache root
+    /// under a folder named by metadata the pin does not have.
     /// The pin is dropped, nothing is deleted, nothing fails, and the
     /// answer says the data did not go rather than echoing the request.
     #[tokio::test]
@@ -9961,8 +9962,8 @@ mod tests {
     /// of the same torrent is still pinned: it holds that file's pieces too.
     ///
     /// This used to delete `<downloadsDir>/<info hash>`, and so deleted
-    /// nothing at all on an install with no downloads dir configured -- which
-    /// is every default one.
+    /// nothing at all on an install with no separate downloads directory
+    /// configured -- which was every default one, and is now every one.
     #[tokio::test]
     async fn unpin_download_of_a_dormant_pin_deletes_its_pieces() {
         let root = tempfile::tempdir().unwrap();

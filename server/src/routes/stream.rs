@@ -622,10 +622,10 @@ fn ensure_download_disk_ready(root: &FsPath) -> Result<(), String> {
 /// body to answer.
 ///
 /// This used to "degrade the request to memory-only" by re-selecting
-/// `state.engine` -- which is the same `Arc<EngineFS>` as
-/// `state.download_engine`: `run()` builds one engine and puts it in both
-/// fields, librqbit sessions always persist to disk, and there is no
-/// memory-only storage anywhere in this server. So the fallback re-fetched
+/// `state.engine` -- which was the engine it already had: there was a
+/// second field holding the same `Arc`, librqbit sessions always persist to
+/// disk, and there is no memory-only storage anywhere in this server (the
+/// second field is gone; see `run()`). So the fallback re-fetched
 /// the same torrent from the same engine, labelled the log
 /// `memoryOnlyLowDiskFallback`, and streamed to the disk the check had just
 /// refused; the floor degraded nothing and the torrent ran on until
@@ -822,7 +822,7 @@ async fn head_stream_video_with(
     let info_hash = info_hash.to_lowercase();
     let query = PlaybackQuery::parse(query_str.as_deref());
     let is_download = query.download;
-    let engine_fs = state.stream_engine();
+    let engine_fs = state.engine.clone();
 
     let engine = match engine_for_request(
         &engine_fs,
@@ -967,7 +967,7 @@ async fn stream_video_with(
     let stream_id = NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed);
     let query = PlaybackQuery::parse(query_str.as_deref());
     let is_download = query.download;
-    let engine_fs = state.stream_engine();
+    let engine_fs = state.engine.clone();
 
     tracing::debug!(
         stream_id,
@@ -1060,19 +1060,19 @@ async fn stream_video_with(
     // the cache again.
     //
     // This used to be here because the two gates measured two devices: a
-    // pinned download was placed under `downloadsDir`, while
-    // `ensure_disk_ready_or_refuse` probes `engine_fs.download_dir` and
-    // nothing else. That gap is closed twice over: the piece store is the
-    // session's default storage and its root is inside `download_dir`, so
-    // every payload byte of every torrent lands on the volume the gate
-    // below probes -- and nothing places a torrent anywhere any more.
+    // pinned download was placed under the removed `downloadsDir` setting,
+    // while `ensure_disk_ready_or_refuse` probes `engine_fs.download_dir`
+    // and nothing else. That gap is closed three times over: the piece
+    // store is the session's default storage and its root is inside
+    // `download_dir`, nothing places a torrent anywhere any more, and there
+    // is one torrent-data root to place it under.
     //
     // What is left is a short circuit, and it is worth keeping as one. The
     // gate below answers a refusal by running a whole cache-cleaner pass
     // and asking again, which is right for a request that has just met a
     // full disk -- and wrong to repeat for a player retrying a torrent this
     // process already stopped for space and already rang the cleaner for
-    // (`out_of_space_signal`): that is a walk of every cache root per
+    // (`out_of_space_signal`): that is a walk of the whole cache root per
     // retry, several a second, for an answer nothing has changed. This
     // costs a lookup of the last reading instead. It can only be reached
     // while the ladder holds the stop, which it lifts within one

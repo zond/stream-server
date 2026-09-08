@@ -1475,7 +1475,7 @@ fn write_payload(path: &std::path::Path, len: usize) {
 
 /// A `TempDir`-derived path in the spelling the server answers with.
 ///
-/// `prepare_downloads_dir` stores and reports the *resolved* `downloadsDir`,
+/// `prepare_torrent_data_root` stores and reports the *resolved* `cacheRoot`,
 /// so an expectation built from a `TempDir` path has to be resolved the same
 /// way or it compares two spellings of the same directory: on Windows
 /// `TempDir` hands back the 8.3 short name (`C:\Users\RUNNER~1\...`) while
@@ -1677,15 +1677,29 @@ fn set_background_caps_the_torrent_and_still_streams() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A persisted `downloadsDir` that is unusable at startup (its path is a
-/// file now) is cleared in the settings file, not only in memory: an
-/// embedder reading the file sees what `settings()` says, and the next
-/// boot does not warn about it again.
+/// `cacheRoot` is the one torrent-data root, and the only thing that decides
+/// where a torrent's bytes go.
+///
+/// A librqbit session's storage is fixed when the session opens, so a
+/// `cacheRoot` set through `POST /settings` is where the data lives *from the
+/// next start*: the running server keeps writing where it opened. At that
+/// next start the setting is prepared before anything opens on it, and one
+/// that cannot be used any more (its path is a file now) falls back to the
+/// configured cache directory -- in the settings file too, so an embedder
+/// reading the file sees what `settings()` says and the next boot does not
+/// warn about it again.
 #[test]
-fn unusable_persisted_downloads_dir_is_cleared_on_disk() -> anyhow::Result<()> {
+fn the_cache_root_setting_decides_where_the_next_session_opens() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
-    let downloads_dir = tempfile::tempdir()?;
+    let elsewhere = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    let default_root = resolved(&cache_dir.path().join("cache"));
+
+    let content = src.path().join("Show");
+    std::fs::create_dir_all(&content)?;
+    write_payload(&content.join("e1.bin"), 32 * 1024);
+    let (torrent, info_hash) = real_torrent(&content);
     let config = || stream_server::ServerConfig {
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         config_dir: Some(config_dir.path().join("config")),
@@ -1698,26 +1712,103 @@ fn unusable_persisted_downloads_dir_is_cleared_on_disk() -> anyhow::Result<()> {
             &settings_file,
         )?)?)
     };
-    let downloads = resolved(&downloads_dir.path().join("offline"));
+    // Where a session keeps its own records for the torrents it holds, and
+    // so the mark that a session opened on a root and put a torrent there.
+    let opened_on = |root: &std::path::Path| root.join("rqbit-downloads").join("session.json");
+    // The torrent that makes it write them.
+    let add_a_torrent = |handle: &stream_server::ServerHandle| -> anyhow::Result<()> {
+        let base = format!("http://{}", handle.http_addr());
+        let created: serde_json::Value = bearer_client(handle)?
+            .post(format!("{base}/create"))
+            .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
+            .send()?
+            .error_for_status()?
+            .json()?;
+        assert_eq!(created["infoHash"], info_hash);
+        Ok(())
+    };
 
     let handle = stream_server::start(config())?;
-    handle.update_settings(serde_json::json!({ "downloadsDir": downloads.to_str().unwrap() }))?;
+    add_a_torrent(&handle)?;
     assert_eq!(
-        read_persisted()?["downloadsDir"],
-        downloads.to_str().unwrap()
+        handle.settings()?.cache_root,
+        default_root.to_str().unwrap(),
+        "with nothing configured the root is the cache directory the embedder gave"
     );
+    assert!(opened_on(&default_root).is_file());
+
+    // Validated like any path setting, and a refusal fails the whole update.
+    assert!(
+        handle
+            .update_settings(serde_json::json!({ "cacheRoot": "relative/path" }))
+            .is_err(),
+        "a relative cacheRoot is refused"
+    );
+    assert!(
+        handle
+            .update_settings(serde_json::json!({ "cacheRoot": 123 }))
+            .is_err(),
+        "a cacheRoot that is not a string is refused, not ignored"
+    );
+    assert_eq!(
+        handle.settings()?.cache_root,
+        default_root.to_str().unwrap(),
+        "and a refused update changes nothing"
+    );
+
+    let moved = resolved(&elsewhere.path().join("torrent-data"));
+    let updated = handle.update_settings(serde_json::json!({
+        "cacheRoot": moved.to_str().unwrap()
+    }))?;
+    assert_eq!(updated.cache_root, moved.to_str().unwrap());
+    assert!(moved.is_dir(), "created on the spot");
+    assert_eq!(read_persisted()?["cacheRoot"], moved.to_str().unwrap());
+    assert!(
+        !opened_on(&moved).exists(),
+        "the running session cannot be moved onto it"
+    );
+
+    // And the cleaner goes on walking the root the session opened on, not
+    // the one the setting now names: it takes the root from the engine.
+    // Read from the setting instead, this pass would walk an empty
+    // directory and report a cache of nothing while the disk fills up.
+    let stale = default_root
+        .join("rqbit-downloads")
+        .join("Stale")
+        .join("e1.bin");
+    std::fs::create_dir_all(stale.parent().unwrap())?;
+    write_payload(&stale, 16 * 1024);
+    std::fs::File::options()
+        .write(true)
+        .open(&stale)?
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86400))?;
+    let report = handle.clean_cache_now()?;
+    assert!(!stale.exists(), "the stale file under the live root goes");
+    assert!(report.freed >= 16 * 1024, "{report:?}");
     handle.shutdown()?;
     handle.join()?;
 
-    // The directory is a file now: unusable.
-    std::fs::remove_dir_all(&downloads)?;
-    std::fs::write(&downloads, b"in the way")?;
+    // The next start opens there instead.
     let handle = stream_server::start(config())?;
-    assert_eq!(handle.settings()?.downloads_dir, None);
+    assert_eq!(handle.settings()?.cache_root, moved.to_str().unwrap());
+    add_a_torrent(&handle)?;
+    assert!(opened_on(&moved).is_file(), "and this one did");
+    handle.shutdown()?;
+    handle.join()?;
+
+    // The directory is a file now: unusable, so the configured default is
+    // what the session opens on and what the setting says afterwards.
+    std::fs::remove_dir_all(&moved)?;
+    std::fs::write(&moved, b"in the way")?;
+    let handle = stream_server::start(config())?;
     assert_eq!(
-        read_persisted()?["downloadsDir"],
-        serde_json::Value::Null,
-        "cleared in the settings file too"
+        handle.settings()?.cache_root,
+        default_root.to_str().unwrap()
+    );
+    assert_eq!(
+        read_persisted()?["cacheRoot"],
+        default_root.to_str().unwrap(),
+        "corrected in the settings file too"
     );
     handle.shutdown()?;
     handle.join()?;
@@ -1727,16 +1818,12 @@ fn unusable_persisted_downloads_dir_is_cleared_on_disk() -> anyhow::Result<()> {
 /// **A pin moves nothing.** A torrent that was streamed first is pinned
 /// exactly where it is: `pin_download` reports the same path the backend
 /// reported before, every piece it had it still has, and no second copy
-/// appears anywhere -- least of all under `downloadsDir`, which used to be
-/// where a pin relocated a torrent to. The setting is still validated
-/// (`POST /settings` semantics) and persisted, since the cache cleaner
-/// walks it; and a restart on the same dirs restores the torrent with its
-/// pin.
+/// appears anywhere -- there is one root and a pin is not a location. A
+/// restart on the same dirs restores the torrent with its pin.
 #[test]
 fn a_pin_moves_nothing_and_survives_a_restart() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
-    let downloads_dir = tempfile::tempdir()?;
     let src = tempfile::tempdir()?;
 
     let content = src.path().join("Show Season 1");
@@ -1777,40 +1864,8 @@ fn a_pin_moves_nothing_and_survives_a_restart() -> anyhow::Result<()> {
     assert_eq!(stats["pinnedFiles"], serde_json::json!([]));
     let idx = file_index(&stats, "e2.bin");
 
-    // The setting: validated like the route, persisted, reported.
-    assert_eq!(handle.settings()?.downloads_dir, None);
-    assert!(
-        handle
-            .update_settings(serde_json::json!({ "downloadsDir": "relative/path" }))
-            .is_err(),
-        "a relative downloadsDir is refused"
-    );
-    assert!(
-        handle
-            .update_settings(serde_json::json!({ "downloadsDir": 123 }))
-            .is_err(),
-        "a downloadsDir that is neither a string nor null is refused, not ignored"
-    );
-    assert_eq!(handle.settings()?.downloads_dir, None);
-    let downloads = resolved(&downloads_dir.path().join("offline"));
-    let updated = handle.update_settings(serde_json::json!({
-        "downloadsDir": downloads.to_str().unwrap()
-    }))?;
-    assert_eq!(
-        updated.downloads_dir.as_deref(),
-        Some(downloads.to_str().unwrap())
-    );
-    assert!(downloads.is_dir(), "created on the spot");
-    let http: serde_json::Value = client
-        .get(format!("{base}/settings"))
-        .send()?
-        .error_for_status()?
-        .json()?;
-    assert_eq!(http["values"]["downloadsDir"], downloads.to_str().unwrap());
-
     // Pin: nothing moves, and the name the backend gives the file is the
     // one it gave it before.
-    let target = downloads.join(&info_hash);
     let before = handle.download_path(&info_hash, idx)?;
     assert_eq!(
         before.as_deref(),
@@ -1823,11 +1878,9 @@ fn a_pin_moves_nothing_and_survives_a_restart() -> anyhow::Result<()> {
     assert_eq!(info.name, "e2.bin");
     assert_eq!(info.length, 24 * 1024);
     assert_eq!(info.path, before, "the pin did not move the torrent");
-    // And nothing was written into the downloads dir, which is what a pin
-    // used to relocate a torrent into. A whole file is produced nowhere at
-    // all: the torrent's bytes are piece files under the store's one root.
-    assert!(!target.exists(), "nothing is placed under downloadsDir");
-    assert!(!root_folder.join("e2.bin").exists(), "no whole file either");
+    // A whole file is produced nowhere at all: the torrent's bytes are
+    // piece files under the store's one root.
+    assert!(!root_folder.join("e2.bin").exists(), "no whole file");
     assert_eq!(
         pieces_held(&pieces),
         seeded_pieces,
@@ -1863,15 +1916,11 @@ fn a_pin_moves_nothing_and_survives_a_restart() -> anyhow::Result<()> {
     handle.join()?;
 
     // Restart on the same dirs: librqbit restores the torrent where it
-    // always was (its persisted output folder / only_files), the pin comes
-    // back from the persisted pin set, the setting from settings.json.
+    // always was (its persisted output folder / only_files) and the pin
+    // comes back from the persisted pin set.
     let handle = stream_server::start(config())?;
     let base = format!("http://{}", handle.http_addr());
     let client = bearer_client(&handle)?;
-    assert_eq!(
-        handle.settings()?.downloads_dir.as_deref(),
-        Some(downloads.to_str().unwrap())
-    );
     let stats = handle.engine_stats(&info_hash, &[])?;
     assert_ne!(
         stats.phase,
@@ -1886,7 +1935,6 @@ fn a_pin_moves_nothing_and_survives_a_restart() -> anyhow::Result<()> {
     let info = handle.pin_download(&info_hash, idx, &[])?;
     assert_eq!(info.path, before, "still where it always was");
     assert!(info.complete);
-    assert!(!target.exists(), "and still nothing under downloadsDir");
     assert_eq!(
         pieces_held(&pieces),
         seeded_pieces,
@@ -1918,12 +1966,11 @@ fn bitv_files(session_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 /// restart brings both torrents back ready and complete with the bitfields
 /// still in place (the `.bitv` + `overwrite: true` combination librqbit
 /// needs to resume on top of existing files). One root, because a pin is
-/// not a place: `downloadsDir` is set here and holds nothing.
+/// not a place.
 #[test]
 fn fastresume_persists_piece_bitfields_for_a_pinned_torrent_too() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
-    let downloads_dir = tempfile::tempdir()?;
     let src = tempfile::tempdir()?;
 
     let streamed = src.path().join("Streamed");
@@ -1941,8 +1988,6 @@ fn fastresume_persists_piece_bitfields_for_a_pinned_torrent_too() -> anyhow::Res
 
     let cache_root = cache_dir.path().join("cache");
     let session_dir = cache_root.join("rqbit-downloads");
-    let downloads = resolved(&downloads_dir.path().join("offline"));
-    let pinned_folder = downloads.join(&pinned_hash);
 
     let config = || stream_server::ServerConfig {
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -1951,10 +1996,10 @@ fn fastresume_persists_piece_bitfields_for_a_pinned_torrent_too() -> anyhow::Res
         ..offline_config()
     };
     let handle = stream_server::start(config())?;
-    // Both roots' data is in the one piece store, seeded after the launch
+    // Both torrents' data is in the one piece store, seeded after the launch
     // sweep: the streamed torrent whole, the pinned one only where the pin
-    // will be. There is no second store under `downloadsDir` -- the store
-    // takes one root, and it is the cache root.
+    // will be. There is no second store anywhere -- the store takes one
+    // root, and it is the cache root.
     seed_piece_store(&cache_root, &streamed_torrent, &streamed);
     seed_piece_store_files(&cache_root, &pinned_torrent, &pinned, Some(&["p2.bin"]));
     let base = format!("http://{}", handle.http_addr());
@@ -1969,7 +2014,6 @@ fn fastresume_persists_piece_bitfields_for_a_pinned_torrent_too() -> anyhow::Res
     assert_eq!(stats["files"][0]["complete"], true, "{stats}");
     assert_eq!(stats["files"][1]["complete"], true, "{stats}");
 
-    handle.update_settings(serde_json::json!({ "downloadsDir": downloads.to_str().unwrap() }))?;
     // A pin by hash needs the metadata: /create supplies it. Nothing about
     // the pin is a location -- the torrent stays where librqbit has it and
     // its data stays where the store has it.
@@ -1986,7 +2030,6 @@ fn fastresume_persists_piece_bitfields_for_a_pinned_torrent_too() -> anyhow::Res
         Some(session_dir.join("Pinned").join("p2.bin").to_str().unwrap()),
         "librqbit's own folder for the torrent, pinned or not"
     );
-    assert!(!pinned_folder.exists(), "and nothing under downloadsDir");
     let stats = stats_after_check(&client, &base, &pinned_hash)?;
     assert_eq!(stats["files"][p2]["complete"], true, "{stats}");
     assert_eq!(stats["files"][1 - p2]["complete"], false, "{stats}");
@@ -2030,7 +2073,6 @@ fn fastresume_persists_piece_bitfields_for_a_pinned_torrent_too() -> anyhow::Res
     );
     // No whole file anywhere; both torrents' bytes are pieces in the one
     // store, and the restart read the bitfields against those.
-    assert!(!pinned_folder.exists());
     assert!(!session_dir.join("Pinned").join("p2.bin").exists());
     assert!(!session_dir.join("Streamed").exists());
     assert!(pieces_held(&piece_store_dir(&cache_root, &streamed_hash)) > 0);
@@ -2051,7 +2093,6 @@ fn fastresume_persists_piece_bitfields_for_a_pinned_torrent_too() -> anyhow::Res
 fn download_routes_match_the_library_api() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
-    let downloads_dir = tempfile::tempdir()?;
     let src = tempfile::tempdir()?;
 
     let content = src.path().join("Show Season 2");
@@ -2086,10 +2127,6 @@ fn download_routes_match_the_library_api() -> anyhow::Result<()> {
     let first = file_index(&stats, "e1.bin");
     let second = file_index(&stats, "e2.bin");
 
-    let downloads = resolved(&downloads_dir.path().join("offline"));
-    handle.update_settings(serde_json::json!({ "downloadsDir": downloads.to_str().unwrap() }))?;
-    // Where a pin used to put a torrent, and where nothing goes now.
-    let never = downloads.join(&info_hash);
     // Where librqbit says the torrent's files are, which the pin does not
     // change: `<cacheRoot>/rqbit-downloads/<torrent name>`.
     let named = cache_root.join("rqbit-downloads").join("Show Season 2");
@@ -2135,7 +2172,6 @@ fn download_routes_match_the_library_api() -> anyhow::Result<()> {
     // a pinned download is piece files like everything else, and the folder
     // in that name holds none of them.
     assert!(!named.join("e1.bin").exists(), "no whole file is produced");
-    assert!(!never.exists(), "and nothing at all under downloadsDir");
     assert_eq!(
         pieces_held(&pieces),
         seeded_pieces,
@@ -2290,7 +2326,6 @@ fn download_routes_match_the_library_api() -> anyhow::Result<()> {
     // the answer says nothing was deleted instead of echoing the query flag
     // back. ("Nothing there" is not "freed", and under this storage it is
     // the ordinary answer.)
-    handle.update_settings(serde_json::json!({ "downloadsDir": null }))?;
     let unmanaged = "b".repeat(40);
     let nothing: serde_json::Value = client
         .delete(format!("{base}/{unmanaged}/0/download?deleteFiles=1"))
@@ -2339,7 +2374,6 @@ fn download_routes_match_the_library_api() -> anyhow::Result<()> {
 fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
-    let downloads_dir = tempfile::tempdir()?;
     let src = tempfile::tempdir()?;
 
     let content = src.path().join("Movie");
@@ -2407,18 +2441,6 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
     handle.pin_download(&info_hash, idx, &[])?;
     stats_after_check(&client, &base, &info_hash)?;
 
-    // A configured `downloadsDir` is a root the cleaner walks, and that is
-    // now the only thing the setting does: nothing is written there, and
-    // what is there is a whole-file download an earlier version placed
-    // under it -- neither converted nor read, so ordinary cache. The value
-    // reaches the cleaner from the settings, no longer from the engines,
-    // and unwalked those bytes would be orphaned *and* immortal.
-    let downloads = resolved(&downloads_dir.path().join("offline"));
-    handle.update_settings(serde_json::json!({ "downloadsDir": downloads.to_str().unwrap() }))?;
-    let legacy_download = downloads.join(&info_hash).join("movie.mkv");
-    std::fs::create_dir_all(legacy_download.parent().unwrap())?;
-    std::fs::copy(content.join("movie.mkv"), &legacy_download)?;
-
     // Read usage() before touching the limit, to learn exactly how many
     // bytes the pinned torrent's two files occupy: `evict` never takes a
     // single file whose own size exceeds the limit (see
@@ -2446,7 +2468,6 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
     assert_eq!(serde_json::to_value(&api_usage)?, http_usage);
     assert!(idle.is_file(), "usage() must not touch the filesystem");
     assert!(root_folder.join("movie.mkv").is_file());
-    assert!(legacy_download.is_file());
     assert_eq!(http_usage["limitBytes"], limit, "{http_usage}");
     assert!(
         http_usage["totalBytes"].as_u64().unwrap() > limit,
@@ -2475,22 +2496,12 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
         "and so is the pinned torrent's own superseded whole-file copy, \
          which nothing reads and nothing else would ever reclaim: {report}"
     );
-    assert!(
-        !legacy_download.exists(),
-        "and so is a whole-file download an earlier version left under \
-         downloadsDir, which the cleaner reaches because the configured \
-         value is one of its walk roots: {report}"
-    );
-    assert!(
-        downloads.is_dir(),
-        "the configured directory itself is never pruned away: {report}"
-    );
     assert_eq!(
         pieces_held(&pieces),
         seeded_pieces,
         "while the pin's real bytes are untouched: {report}"
     );
-    assert_eq!(report["deleted"], 4, "{report}");
+    assert_eq!(report["deleted"], 3, "{report}");
     assert_eq!(report["total"], baseline.protected_bytes, "{report}");
     assert_eq!(
         report["freed"],

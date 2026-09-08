@@ -397,8 +397,10 @@ pub struct Volumes {
     /// records one and reports file paths under it, and no payload byte is
     /// written there (see `backend::librqbit::session_storage_factory`).
     /// Probing it answered about the wrong device in both directions --
-    /// loudest for a pinned download, placed under `downloadsDir`, a
-    /// setting whose entire purpose is to be a second card.
+    /// loudest while a pinned download was placed under a settings key of
+    /// its own. There is one torrent-data root now (`settings.cacheRoot`)
+    /// and a pin is a retention property, so there is no second device for
+    /// a probe to miss.
     data_folder: std::path::PathBuf,
     reading: parking_lot::Mutex<Reading>,
 }

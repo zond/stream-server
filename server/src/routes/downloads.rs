@@ -75,7 +75,7 @@ pub async fn pin_download(
     let info_hash = info_hash.to_lowercase();
     let trackers = compat::normalize_tracker_sources(trackers);
     let engine = state
-        .stream_engine()
+        .engine
         .pin_download(&info_hash, file_idx, Some(trackers))
         .await?;
     let stats = engine.get_statistics().await;
@@ -118,7 +118,7 @@ pub async fn unpin_download(
     delete_files: bool,
 ) -> Result<UnpinOutcome, PinDownloadError> {
     state
-        .stream_engine()
+        .engine
         .unpin_download(&info_hash.to_lowercase(), file_idx, delete_files)
         .await
 }
@@ -128,7 +128,7 @@ pub async fn unpin_download(
 /// dormant ones (torrent not restored, [`DORMANT_DOWNLOAD_ERROR`]) after
 /// them. One stats call per torrent, not per file.
 pub async fn downloads(state: &AppState) -> Vec<DownloadInfo> {
-    let engine_fs = state.stream_engine();
+    let engine_fs = state.engine.clone();
     let mut by_hash: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for pin in engine_fs.pinned_downloads().await {
         by_hash.entry(pin.info_hash).or_default().push(pin.file_idx);
@@ -194,10 +194,7 @@ fn live_download(
 /// metadata). Never creates an engine -- unlike [`pin_download`], this only
 /// reports.
 pub async fn download_path(state: &AppState, info_hash: &str, file_idx: usize) -> Option<String> {
-    let engine = state
-        .stream_engine()
-        .get_engine(&info_hash.to_lowercase())
-        .await?;
+    let engine = state.engine.get_engine(&info_hash.to_lowercase()).await?;
     engine.handle.get_file_path(file_idx).await
 }
 

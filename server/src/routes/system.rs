@@ -12,52 +12,9 @@ use enginefs::backend::{
     BtSettingsReport, EngineStats, TorrentEncryptionMode, TorrentHandle, TorrentPrivacyConfig,
     TorrentProxyType, TransferTotals,
 };
-use enginefs::{EngineFS, EngineLookup, FailedMagnetAdd, PendingMagnetAdd};
+use enginefs::{EngineLookup, FailedMagnetAdd, PendingMagnetAdd};
 use serde_json::{Value, json};
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
-
-/// One per-torrent reading over the engine fields, keyed by info hash.
-///
-/// `AppState` has two engine fields, `engine` and `download_engine`, and in
-/// production they hold the same `Arc`: `run()` builds one `EngineFS` and
-/// puts it in both (there is no memory-only engine and never was one). The
-/// merge exists because the type allows two -- a test may build an
-/// `AppState` that way -- and anything that reports "every torrent" over
-/// such a state has to ask both or one engine's torrents are invisible to
-/// it; where the two are one instance it reads that instance once. When
-/// they differ, the download engine's entry wins a duplicate hash, since
-/// `stream_engine` sends playback and downloads there. The one merge, shared
-/// by `/stats.json` and the activity light, so the two cannot disagree
-/// about which torrents exist.
-async fn combined_per_torrent<T>(
-    state: &AppState,
-    per_engine: impl AsyncFn(&EngineFS) -> HashMap<String, T>,
-) -> HashMap<String, T> {
-    let engines = per_engine(&state.engine).await;
-    if std::sync::Arc::ptr_eq(&state.engine, &state.download_engine) {
-        return engines;
-    }
-    let download_engines = per_engine(&state.download_engine).await;
-    prefer_download_engine(engines, download_engines)
-}
-
-/// The merge rule of [`combined_per_torrent`] on its own, so it can be
-/// tested without two engines: everything from both, the download engine's
-/// entry standing for a hash in both.
-fn prefer_download_engine<T>(
-    mut engines: HashMap<String, T>,
-    download_engines: HashMap<String, T>,
-) -> HashMap<String, T> {
-    for (hash, entry) in download_engines {
-        engines.insert(hash, entry);
-    }
-    engines
-}
-
-async fn combined_engine_stats(state: &AppState) -> HashMap<String, EngineStats> {
-    combined_per_torrent(state, async |engine| engine.get_all_statistics().await).await
-}
 
 /// Whether this server is using the connection while nothing is playing,
 /// in each direction -- what a client's "working in the background" light
@@ -69,10 +26,9 @@ async fn combined_engine_stats(state: &AppState) -> HashMap<String, EngineStats>
 /// separately would sample them a moment apart across FFI and get a light
 /// that flickers whenever they disagree. *Traffic* is the sum of every
 /// existing torrent's own peer counters
-/// ([`enginefs::backend::TransferTotals`], through the same merge
-/// `/stats.json` uses) compared against the last reading; *nothing playing*
-/// is [`EngineFS::playback_is_live`] of either engine field, held over the
-/// window and not just now (see [`enginefs::traffic::TrafficWindow::sample`]).
+/// ([`enginefs::backend::TransferTotals`]) compared against the last
+/// reading; *nothing playing* is [`enginefs::EngineFS::playback_is_live`], held over
+/// the window and not just now (see [`enginefs::traffic::TrafficWindow::sample`]).
 ///
 /// Cheap and a peek, so it can be polled every second or two for the life
 /// of the process: per torrent that exists, one read of librqbit's live
@@ -84,12 +40,13 @@ async fn combined_engine_stats(state: &AppState) -> HashMap<String, EngineStats>
 /// nothing -- no engine, no magnet add -- so it never goes near
 /// `stats_target`.
 pub async fn background_traffic(state: &AppState) -> enginefs::traffic::BackgroundTraffic {
-    let totals = combined_per_torrent(state, async |engine| engine.transfer_totals().await)
+    let totals = state
+        .engine
+        .transfer_totals()
         .await
         .into_values()
         .fold(TransferTotals::default(), TransferTotals::plus);
-    let playing =
-        state.engine.playback_is_live().await || state.download_engine.playback_is_live().await;
+    let playing = state.engine.playback_is_live().await;
     state.traffic_window.sample(totals, playing)
 }
 
@@ -149,14 +106,14 @@ fn sys_info_uncached() -> Value {
 /// Shared by `GET /stats.json`'s `dht` key and
 /// [`crate::ServerHandle::dht_status`], per the library-parity rule.
 pub fn dht_status(state: &AppState) -> enginefs::backend::DhtStatus {
-    state.stream_engine().dht_status()
+    state.engine.clone().dht_status()
 }
 
 pub async fn get_stats(
     State(state): State<AppState>,
     Query(params): Query<StatsParams>,
 ) -> impl IntoResponse {
-    let engines = combined_engine_stats(&state).await;
+    let engines = state.engine.get_all_statistics().await;
 
     // Convert engines HashMap to Value
     let mut root: serde_json::Map<String, Value> = serde_json::Map::new();
@@ -247,6 +204,37 @@ pub struct ServerSettings {
     pub app_path: String,
     #[serde(rename = "serverVersion")]
     pub server_version: String,
+    /// **The one torrent-data root.** Everything a torrent puts on disk
+    /// lives under it: the piece store
+    /// (`<cacheRoot>/rqbit-downloads/.pieces/<infoHash>`, one file per
+    /// piece, for the streaming cache and offline downloads alike), the
+    /// session's own records beside it, and what `/proxy` cached. It is
+    /// the only root the cache cleaner walks, and pinning is a retention
+    /// property rather than a location, so there is nowhere else for a
+    /// download to be.
+    ///
+    /// Set through `POST /settings` with an absolute path
+    /// ([`prepare_torrent_data_root`]: trimmed, created if missing, must be
+    /// writable). It is the one validated setting -- a path that cannot be
+    /// used, or a value that is not a string, fails the whole update rather
+    /// than being ignored. Unset in the settings file, it is
+    /// `ServerConfig::cache_dir`, the root the embedder configured.
+    ///
+    /// **At process start this is where the data actually is**: the value
+    /// is prepared before the session opens and the session is opened on
+    /// it, and one that cannot be prepared is replaced by the configured
+    /// default (and the correction persisted) before anything is built. It
+    /// is configuration all the same, not an observation: a change through
+    /// `POST /settings` names where torrent data will live from the next
+    /// start -- a running librqbit session cannot be moved -- so nothing
+    /// asks this string where the bytes are. The cleaner, the free-space
+    /// ladder and the diagnostics all read the live root from the engine
+    /// (`state.engine.download_dir`).
+    ///
+    /// It replaces `downloadsDir`, which was a second location for pinned
+    /// downloads. There is no second location: a pin does not move a
+    /// torrent, so a root that only pinned data went to had nothing to
+    /// hold.
     #[serde(rename = "cacheRoot")]
     pub cache_root: String,
     // Option<f64> matches stremio-core's Settings.cache_size
@@ -350,24 +338,6 @@ pub struct ServerSettings {
     #[serde(rename = "seedingEnabled", default = "default_seeding_enabled")]
     pub seeding_enabled: bool,
 
-    /// A directory the cache cleaner walks in addition to the cache roots,
-    /// and **nothing else decides anything by** (see
-    /// [`prepare_downloads_dir`]). Set through `POST /settings` with an
-    /// absolute path (created if missing, must be writable, and not at or
-    /// above a cache root) or `null`.
-    ///
-    /// It used to be where offline downloads were placed,
-    /// `<downloadsDir>/<infoHash>/` per pinned torrent, with a torrent
-    /// already managed elsewhere relocated into it by its next pin. Torrent
-    /// data is one file per piece under the store's single root now
-    /// (`<cacheRoot>/.pieces`), for the streaming cache and offline
-    /// downloads alike, and pinning is a retention property rather than a
-    /// location -- so nothing is written here by this version at all. What
-    /// is here is what earlier versions wrote, which is neither converted
-    /// nor read, and walking it is how those bytes are ever reclaimed.
-    #[serde(rename = "downloadsDir", default)]
-    pub downloads_dir: Option<String>,
-
     /// DHT bootstrap nodes (`host:port`) used to seed librqbit's routing
     /// table when it starts cold. `None` or an empty list (the default)
     /// uses `enginefs::backend::librqbit::DEFAULT_DHT_BOOTSTRAP_NODES`
@@ -421,78 +391,47 @@ pub struct ServerSettings {
     pub buffer_profile: BufferProfile,
 }
 
-/// The torrent cache roots the cache cleaner walks -- what a
-/// `downloadsDir` may not cover (see [`prepare_downloads_dir`]).
-pub fn cache_roots(state: &AppState) -> [std::path::PathBuf; 2] {
-    [
-        state.engine.download_dir.clone(),
-        state.download_engine.download_dir.clone(),
-    ]
-}
-
-/// Validate and prepare a `downloadsDir` value: trimmed, absolute, not at
-/// or above any of `cache_roots` ([`cache_roots`]), created if missing and
-/// writable (a probe file is created and removed). The returned path --
-/// **resolved**, see below -- is what the setting stores.
+/// Validate and prepare a torrent-data root (`settings.cacheRoot`):
+/// trimmed, absolute, created if missing and writable (a probe file is
+/// created and removed). The returned path -- **resolved**, see below -- is
+/// what the setting stores.
 ///
-/// Nothing places anything here (see the field): what the value decides is
-/// which directory the cache cleaner walks *besides* the cache roots, so
-/// that the whole-file downloads earlier versions wrote there can be
-/// counted and reclaimed.
+/// This is the only root there is: the piece store, the session's records
+/// and the proxy cache all live under it, and it is the only tree the cache
+/// cleaner walks. It used to have a companion, `downloadsDir`, which was
+/// refused at or above a cache root -- the roots the cleaner walks are the
+/// roots it evicts from, and a second root above the first would have handed
+/// it a tree the engine does not own. With one root there is nothing for it
+/// to be above.
 ///
 /// Checked before it is created, so a refused setting leaves no directory
 /// behind; and resolved before it is returned, because the stored value is
-/// compared as a plain path prefix from then on: the cleaner walks this
-/// directory as one of its roots, collapses roots into each other by
-/// `starts_with`, and prunes empty directories up to exactly it. A spelling
-/// that reaches the same directory through a symlinked prefix would match
-/// none of that.
-pub async fn prepare_downloads_dir(
-    raw: &str,
-    cache_roots: &[std::path::PathBuf],
-) -> anyhow::Result<std::path::PathBuf> {
+/// compared and joined onto as a plain path from then on. A spelling that
+/// reaches the same directory through a symlinked prefix would match none of
+/// that.
+pub async fn prepare_torrent_data_root(raw: &str) -> anyhow::Result<std::path::PathBuf> {
     let raw = raw.trim();
     if raw.is_empty() {
-        anyhow::bail!("downloadsDir must not be empty (use null to unset it)");
+        anyhow::bail!("cacheRoot must not be empty");
     }
     let path = std::path::PathBuf::from(raw);
     if !path.is_absolute() {
-        anyhow::bail!("downloadsDir must be an absolute path, got {raw:?}");
-    }
-    // A downloads dir at or above a cache root is still refused, but for a
-    // different reason than it once was. The cleaner used to prune it from
-    // the walk, and pruning a walk at its own root switched both eviction
-    // rules off for it; the cleaner walks the downloads dir now, and
-    // overlapping roots collapse to the outermost, so that failure is gone.
-    // What is left is worse: the roots the cleaner walks are the roots it
-    // *evicts from*, and a downloadsDir above one would hand it a tree the
-    // engines do not own -- on Android, the whole of shared storage. Keep it
-    // pointed at a directory of its own. Compared through the deepest
-    // existing ancestor so a symlink to a root is caught too.
-    let resolved = canonical_prefix(&path);
-    for root in cache_roots {
-        if canonical_prefix(root).starts_with(&resolved) {
-            anyhow::bail!(
-                "downloadsDir {raw:?} is at or above the torrent cache root {}; \
-                 pick a directory outside it (or unset it to download into the cache root)",
-                root.display()
-            );
-        }
+        anyhow::bail!("cacheRoot must be an absolute path, got {raw:?}");
     }
     tokio::fs::create_dir_all(&path)
         .await
-        .map_err(|e| anyhow::anyhow!("downloadsDir {raw:?} cannot be created: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("cacheRoot {raw:?} cannot be created: {e}"))?;
     let probe = path.join(format!(".stream-server-write-probe-{}", std::process::id()));
     tokio::fs::write(&probe, b"")
         .await
-        .map_err(|e| anyhow::anyhow!("downloadsDir {raw:?} is not writable: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("cacheRoot {raw:?} is not writable: {e}"))?;
     if let Err(error) = tokio::fs::remove_file(&probe).await {
         tracing::debug!(path = %probe.display(), %error, "could not remove the write probe");
     }
     Ok(resolved_path(&path))
 }
 
-/// The spelling [`prepare_downloads_dir`] resolves `path` to, without
+/// The spelling [`prepare_torrent_data_root`] resolves `path` to, without
 /// creating or validating anything.
 ///
 /// Exported for tests only. A test that builds an expectation from a
@@ -829,7 +768,6 @@ impl Default for ServerSettings {
             trackers_last_updated: 0,
             trackers_source_url: default_trackers_url(),
             seeding_enabled: default_seeding_enabled(),
-            downloads_dir: None,
             dht_bootstrap_nodes: None,
             lan_media_enabled: false,
             buffer_profile: BufferProfile::default(),
@@ -850,32 +788,29 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
 
 /// Merge `payload` (the `POST /settings` body: any subset of the camelCase
 /// settings keys; wrong-typed values leave that setting unchanged, except
-/// `downloadsDir`, which is validated and fails the update) into the live
-/// settings, push the torrent-related values into both engines and
+/// `cacheRoot`, which is validated and fails the update) into the live
+/// settings, push the torrent-related values into the engine and
 /// persist. Returns the settings as they are afterwards, paired with the
 /// [`BtSettingsReport`] the torrent session gave for the `bt*` values --
 /// what applied to the running session now, what waits for the next start,
 /// and what the backend never honours -- so the caller can tell the client
 /// which of its settings took effect rather than echoing them back as if
-/// they all had. Both engines are the same `Arc` in production and are
-/// handed the same values, so their reports match; the engine's is the one
-/// returned. Shared by the HTTP handler and `ServerHandle::update_settings`.
+/// they all had. Shared by the HTTP handler and
+/// `ServerHandle::update_settings`.
 pub async fn update_settings(
     state: &AppState,
     payload: &Value,
 ) -> anyhow::Result<(ServerSettings, BtSettingsReport)> {
     tracing::debug!("update_settings: received payload: {:?}", payload);
 
-    // `downloadsDir` is the one validated setting: an unusable directory
-    // -- or a value that is neither a path nor `null` -- fails the whole
-    // update (nothing is merged), before the lock is taken.
-    let downloads_dir_patch = match payload.get("downloadsDir") {
+    // `cacheRoot` is the one validated setting: an unusable directory -- or
+    // a value that is not a string -- fails the whole update (nothing is
+    // merged), before the lock is taken. There is no `null`: the server
+    // always has a root, and clearing it would mean nowhere to write.
+    let cache_root_patch = match payload.get("cacheRoot") {
         None => None,
-        Some(Value::Null) => Some(None),
-        Some(Value::String(raw)) => {
-            Some(Some(prepare_downloads_dir(raw, &cache_roots(state)).await?))
-        }
-        Some(other) => anyhow::bail!("downloadsDir must be a string or null, got {other}"),
+        Some(Value::String(raw)) => Some(prepare_torrent_data_root(raw).await?),
+        Some(other) => anyhow::bail!("cacheRoot must be a string, got {other}"),
     };
 
     // Merge with existing settings
@@ -888,10 +823,11 @@ pub async fn update_settings(
         {
             settings.cache_size = resolved;
         }
-        if let Some(v) = obj.get("cacheRoot")
-            && let Some(s) = v.as_str()
-        {
-            settings.cache_root = s.to_string();
+        if let Some(root) = cache_root_patch {
+            // The running session cannot be moved onto it: librqbit opened
+            // its storage at start. It is where torrent data lives from the
+            // next start, and until then the live root is the engine's.
+            settings.cache_root = root.to_string_lossy().into_owned();
         }
         if let Some(v) = obj.get("proxyStreamsEnabled")
             && let Some(b) = v.as_bool()
@@ -1031,9 +967,6 @@ pub async fn update_settings(
         {
             settings.buffer_profile = profile;
         }
-        if let Some(dir) = downloads_dir_patch {
-            settings.downloads_dir = dir.map(|path| path.to_string_lossy().into_owned());
-        }
         if let Some(v) = obj.get("dhtBootstrapNodes") {
             if v.is_null() {
                 settings.dht_bootstrap_nodes = None;
@@ -1097,10 +1030,6 @@ pub async fn update_settings(
         .engine
         .update_torrent_settings(&new_profile, &new_privacy)
         .await;
-    state
-        .download_engine
-        .update_torrent_settings(&new_profile, &new_privacy)
-        .await;
 
     // The operator's veto has to reach a listener that is already running,
     // or "forbid it" would only mean "forbid the next one".
@@ -1109,16 +1038,11 @@ pub async fn update_settings(
     }
 
     state.engine.set_seeding_enabled(seeding_enabled).await;
-    state
-        .download_engine
-        .set_seeding_enabled(seeding_enabled)
-        .await;
-    // `downloadsDir` is not pushed to the engines: nothing places a
-    // torrent any more (a pin is a retention property, see
-    // `enginefs::BackendEngineFS::pin_download`), so the resolved path is
-    // read straight from the settings by the one thing left that uses it --
-    // the cache cleaner, which walks it for what earlier versions wrote
-    // there.
+    // `cacheRoot` is not pushed to the engine: a librqbit session's storage
+    // root is fixed when the session opens, so a new one takes effect at the
+    // next start. Nothing reads this string for where the bytes are -- the
+    // cleaner, the free-space ladder and the diagnostics all take the live
+    // root from the engine.
 
     // Save to disk
     state.save_settings().await?;
@@ -1282,9 +1206,8 @@ pub async fn get_https(
     .into_response()
 }
 
-/// What a `stats.json` route reports on: an existing engine from either
-/// engine field (one instance in production, see [`combined_per_torrent`]),
-/// else the in-flight magnet add for the hash -- started here, in the stream
+/// What a `stats.json` route reports on: the engine for the hash if there
+/// is one, else the in-flight magnet add for it -- started here, in the same
 /// engine, exactly as `routes::stream` would start it, honouring the request's
 /// `tr=` trackers. Clients commonly poll stats before their first stream
 /// request, so this path must not differ from the stream route's or the
@@ -1298,13 +1221,11 @@ async fn stats_target(
     trackers: Vec<String>,
     context: &str,
 ) -> EngineLookup<LibrqbitHandle> {
-    let stream_engine = state.stream_engine();
-    for engine_fs in [&state.engine, &state.download_engine] {
-        if let Some(engine) = engine_fs.get_engine(info_hash).await {
-            return EngineLookup::Ready(engine);
-        }
+    if let Some(engine) = state.engine.get_engine(info_hash).await {
+        return EngineLookup::Ready(engine);
     }
-    let lookup = stream_engine
+    let lookup = state
+        .engine
         .get_or_begin_add_magnet(info_hash, Some(trackers))
         .await;
     match &lookup {
@@ -1468,64 +1389,42 @@ pub async fn get_file_stats(
 
 #[cfg(test)]
 mod tests {
-    /// Both engines' torrents are in the merged view, and a hash in both is
-    /// the download engine's -- the rule `/stats.json` and the activity
-    /// light share, so a background download can be invisible to neither.
-    #[test]
-    fn the_merge_keeps_both_engines_and_prefers_the_download_engine() {
-        use super::prefer_download_engine;
-        use std::collections::HashMap;
-        let engines = HashMap::from([("a".to_string(), 1), ("both".to_string(), 2)]);
-        let download_engines = HashMap::from([("both".to_string(), 20), ("d".to_string(), 30)]);
-        let merged = prefer_download_engine(engines, download_engines);
-        assert_eq!(
-            merged,
-            HashMap::from([
-                ("a".to_string(), 1),
-                ("both".to_string(), 20),
-                ("d".to_string(), 30)
-            ])
-        );
-        // The same readings on both sides -- what the production server,
-        // with one engine in both fields, would produce if the merge did
-        // not skip the second read -- is one set of torrents, not a
-        // doubled one.
-        let same = HashMap::from([("a".to_string(), 7)]);
-        assert_eq!(prefer_download_engine(same.clone(), same.clone()), same);
-    }
-
-    /// `downloadsDir` must be absolute and usable: relative, empty and
-    /// file-shadowed paths are refused, a missing directory is created,
+    /// The torrent-data root must be absolute and usable: relative, empty
+    /// and file-shadowed paths are refused, a missing directory is created,
     /// the probe leaves nothing behind, and what comes back is the plain
     /// spelling of the resolved path -- never the `\\?\` verbatim one
     /// `std::fs::canonicalize` answers with on Windows.
     #[tokio::test]
-    async fn prepare_downloads_dir_validates_and_creates() {
-        use super::prepare_downloads_dir;
+    async fn prepare_torrent_data_root_validates_and_creates() {
+        use super::prepare_torrent_data_root;
         let tmp = tempfile::tempdir().unwrap();
-        assert!(prepare_downloads_dir("", &[]).await.is_err());
-        assert!(prepare_downloads_dir("   ", &[]).await.is_err());
-        assert!(prepare_downloads_dir("relative/dir", &[]).await.is_err());
+        assert!(prepare_torrent_data_root("").await.is_err());
+        assert!(prepare_torrent_data_root("   ").await.is_err());
+        assert!(prepare_torrent_data_root("relative/dir").await.is_err());
+        assert!(
+            !std::path::Path::new("relative").exists(),
+            "a relative root is refused before anything is created, not made under the cwd"
+        );
         let file = tmp.path().join("a-file");
         std::fs::write(&file, b"x").unwrap();
         assert!(
-            prepare_downloads_dir(file.to_str().unwrap(), &[])
+            prepare_torrent_data_root(file.to_str().unwrap())
                 .await
                 .is_err(),
             "a file is not a directory"
         );
 
-        let nested = tmp.path().join("offline").join("downloads");
-        let prepared = prepare_downloads_dir(&format!("  {}  ", nested.display()), &[])
+        let nested = tmp.path().join("data").join("torrents");
+        let prepared = prepare_torrent_data_root(&format!("  {}  ", nested.display()))
             .await
             .unwrap();
         // On Windows `canonicalize` answers with a `\\?\C:\...` verbatim
-        // path; `prepare_downloads_dir` hands back the plain drive
+        // path; `prepare_torrent_data_root` hands back the plain drive
         // spelling, because the stored value reaches settings.json and
-        // every client, and because a verbatim path compares unequal to
-        // the plain one -- the cache cleaner would stop recognising the
-        // downloads dir under a walked root. Stripped here independently
-        // of the helper under test; a no-op on unix.
+        // every client, and because the engine is opened on it -- a
+        // verbatim path compares unequal to the plain one everything else
+        // is spelled with. Stripped here independently of the helper under
+        // test; a no-op on unix.
         let canonical = nested.canonicalize().unwrap();
         let expected = match canonical.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
             Some(plain) if plain.as_bytes().get(1) == Some(&b':') => {
@@ -1547,90 +1446,52 @@ mod tests {
         );
     }
 
-    /// The stored `downloadsDir` is the resolved path, and a refused one
-    /// leaves nothing on disk. Both matter to the cleaner: it walks this
-    /// directory and decides what may not go there by plain path prefix
-    /// against what the engines report -- a spelling that reaches the same
-    /// directory through a symlinked prefix would match neither, leaving a
-    /// dormant pin's download evictable.
+    /// A directory that exists but cannot be written is refused, and refused
+    /// *here* rather than by librqbit half a startup later: the write probe
+    /// is the only part of the check that a mere `create_dir_all` of an
+    /// existing directory says nothing about.
+    ///
+    /// Unix only, and skipped when the process can write the directory
+    /// anyway -- running as root, a filesystem that does not enforce the
+    /// mode -- because then there is nothing to assert.
     #[cfg(unix)]
     #[tokio::test]
-    async fn prepare_downloads_dir_stores_the_resolved_path() {
-        use super::prepare_downloads_dir;
+    async fn prepare_torrent_data_root_refuses_a_directory_it_cannot_write() {
+        use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
-        let real = tmp.path().canonicalize().unwrap();
-        let cache_root = real.join("cache");
-        std::fs::create_dir_all(&cache_root).unwrap();
-        let link = real.join("link");
-        std::os::unix::fs::symlink(&cache_root, &link).unwrap();
-
-        let prepared = prepare_downloads_dir(
-            link.join("offline").to_str().unwrap(),
-            std::slice::from_ref(&cache_root),
-        )
-        .await
-        .expect("a directory below a cache root is allowed");
-        assert_eq!(
-            prepared,
-            cache_root.join("offline"),
-            "the symlinked spelling would be walked as cache and never matched"
-        );
-        assert!(prepared.starts_with(&cache_root));
-
-        // A refused setting creates nothing: the check runs first.
-        let refused = real.join("would-cover");
+        let root = tmp.path().join("read-only");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(root.join("probe"), b"").is_ok() {
+            return;
+        }
         assert!(
-            prepare_downloads_dir(refused.to_str().unwrap(), &[refused.join("cache")])
+            super::prepare_torrent_data_root(root.to_str().unwrap())
                 .await
-                .is_err()
+                .is_err(),
+            "an existing directory nothing can write is not a usable root"
         );
-        assert!(!refused.exists(), "a refused downloadsDir is not created");
     }
 
-    /// A `downloadsDir` that is a torrent cache root, or above one, is
-    /// refused: the roots the cleaner walks are the roots it evicts from,
-    /// and one above a cache root would hand it a tree the engines do not
-    /// own. Below it and beside it are both fine.
+    /// The stored root is the resolved path: the session is opened on it and
+    /// the cleaner walks it, and a spelling that reaches the same directory
+    /// through a symlinked prefix would compare unequal to what the engine
+    /// then reports its files at.
+    #[cfg(unix)]
     #[tokio::test]
-    async fn prepare_downloads_dir_refuses_a_path_covering_a_cache_root() {
-        use super::prepare_downloads_dir;
+    async fn prepare_torrent_data_root_stores_the_resolved_path() {
+        use super::prepare_torrent_data_root;
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("cache").join("rqbit-downloads");
-        let roots = [root.clone()];
+        let real = tmp.path().canonicalize().unwrap();
+        let target = real.join("data");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = real.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        assert!(
-            prepare_downloads_dir(root.to_str().unwrap(), &roots)
-                .await
-                .is_err(),
-            "the cache root itself"
-        );
-        assert!(
-            prepare_downloads_dir(tmp.path().to_str().unwrap(), &roots)
-                .await
-                .is_err(),
-            "an ancestor of the cache root"
-        );
-
-        prepare_downloads_dir(root.join("offline").to_str().unwrap(), &roots)
+        let prepared = prepare_torrent_data_root(link.join("torrents").to_str().unwrap())
             .await
-            .expect("inside the cache root is what an unset downloadsDir already does");
-        prepare_downloads_dir(tmp.path().join("elsewhere").to_str().unwrap(), &roots)
-            .await
-            .expect("a directory beside it");
-
-        // Same directory reached through a symlink: still the cache root.
-        #[cfg(unix)]
-        {
-            std::fs::create_dir_all(&root).unwrap();
-            let link = tmp.path().join("link");
-            std::os::unix::fs::symlink(&root, &link).unwrap();
-            assert!(
-                prepare_downloads_dir(link.to_str().unwrap(), &roots)
-                    .await
-                    .is_err(),
-                "a symlink to the cache root"
-            );
-        }
+            .unwrap();
+        assert_eq!(prepared, target.join("torrents"));
     }
 
     use super::*;

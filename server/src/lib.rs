@@ -575,9 +575,6 @@ impl ServerHandle {
             enginefs::backend::Footprint::Full
         };
         self.state.engine.set_footprint(footprint);
-        if !Arc::ptr_eq(&self.state.engine, &self.state.download_engine) {
-            self.state.download_engine.set_footprint(footprint);
-        }
     }
 
     /// Whether [`Self::set_background`] last put the server in the
@@ -911,7 +908,10 @@ pub async fn run(
     }
 
     tracing::info!("Config Dir: {:?}", config_dir);
-    tracing::info!("Cache/Download Dir: {:?}", cache_dir);
+    tracing::info!(
+        "Configured cache dir (the default torrent-data root): {:?}",
+        cache_dir
+    );
     tracing::info!("Log Dir: {:?}", log_dir);
     if cfg.manage_process_globals {
         diagnostics::logging::install_native_crash_handler(&log_dir);
@@ -936,7 +936,36 @@ pub async fn run(
     // through it from here on, and `AppState` takes the same one below, so
     // the two never race for the file (see `state::SettingsFile`).
     let settings_file = Arc::new(state::SettingsFile::new(config_dir.join("settings.json")));
-    let settings = settings_file.load(&default_settings);
+    let mut settings = settings_file.load(&default_settings);
+
+    // The one torrent-data root, prepared before anything is opened on it:
+    // the piece store, the session's own records and the proxy cache all
+    // live under it, and it is the only tree the cache cleaner walks. A
+    // persisted `cacheRoot` that cannot be used any more (unmounted drive,
+    // permissions) falls back to the configured default rather than
+    // stopping the server, and the fallback is what gets persisted below --
+    // so the setting never claims a root the data is not in.
+    let torrent_data_root =
+        match routes::system::prepare_torrent_data_root(&settings.cache_root).await {
+            Ok(root) => root,
+            Err(error) => {
+                tracing::warn!(
+                    cache_root = %settings.cache_root,
+                    error = %format!("{error:#}"),
+                    "cacheRoot is unusable; falling back to the configured cache directory"
+                );
+                routes::system::prepare_torrent_data_root(&cache_dir.to_string_lossy()).await?
+            }
+        };
+    tracing::info!(
+        torrent_data_root = %torrent_data_root.display(),
+        "torrent data root (settings.cacheRoot)"
+    );
+    let corrected_cache_root = settings.cache_root != torrent_data_root.to_string_lossy();
+    if corrected_cache_root {
+        settings.cache_root = torrent_data_root.to_string_lossy().into_owned();
+    }
+
     let settings_arc = Arc::new(tokio::sync::RwLock::new(settings.clone()));
     let tracker_storage = Arc::new(state::TrackerStorageBridge::new(
         settings_arc.clone(),
@@ -994,24 +1023,28 @@ pub async fn run(
         },
     };
 
-    // One engine. `AppState` carries two fields, `engine` and
-    // `download_engine`, from a design that meant to pair a memory-only
-    // stream engine with a disk-backed download engine; librqbit sessions
-    // always persist to disk and no memory-only storage was ever built, so
-    // `EngineFS::new_disk_backed` is `new_with_storage` under another name
-    // and the same `Arc` goes in both fields. (There used to be a retry
-    // through `new_with_storage` when `new_disk_backed` failed, described as
-    // falling back to memory-only mode -- the same constructor, failing the
-    // same way, so a failure here is a failure.) Whatever reads the two
-    // fields reads one instance twice, which `Arc::ptr_eq` lets it skip.
-    let download_engine = Arc::new(
-        EngineFS::new_disk_backed(cache_dir.clone(), backend_config, Some(tracker_storage)).await?,
+    // One engine, opened on the one torrent-data root. `AppState` used to
+    // carry two fields, `engine` and `download_engine`, from a design that
+    // meant to pair a memory-only stream engine with a disk-backed download
+    // engine; librqbit sessions always persist to disk and no memory-only
+    // storage was ever built, so `EngineFS::new_disk_backed` was
+    // `new_with_storage` under another name and the same `Arc` went in both
+    // fields -- every reader read one instance twice and skipped the
+    // duplicate with `Arc::ptr_eq`. (There was also a retry through
+    // `new_with_storage` when `new_disk_backed` failed, described as falling
+    // back to memory-only mode: the same constructor, failing the same way.
+    // A failure here is a failure.)
+    let engine = Arc::new(
+        EngineFS::new_disk_backed(
+            torrent_data_root.clone(),
+            backend_config,
+            Some(tracker_storage),
+        )
+        .await?,
     );
-    let engine = download_engine.clone();
 
-    let mut state = AppState::new_with_shared_settings_log_dir_and_download_engine(
+    let mut state = AppState::new_with_shared_settings_and_log_dir(
         engine,
-        download_engine,
         settings_arc.clone(),
         config_dir.clone(),
         log_dir.clone(),
@@ -1038,47 +1071,22 @@ pub async fn run(
         None => tracing::warn!("control API authentication is disabled; every route is open"),
     }
 
-    let mut cleared_downloads_dir = false;
-    let seeding_enabled;
-    {
-        let mut settings = settings_arc.write().await;
-        seeding_enabled = settings.seeding_enabled;
-        // A persisted downloadsDir that cannot be used any more (unmounted
-        // drive, permissions) is cleared rather than kept as a setting
-        // nothing can act on: `GET /settings` says so, and so does the
-        // settings file (below, once the lock is released) -- an embedder
-        // reading it sees the same value, and the next boot does not warn
-        // again. What the value still does is give the cache cleaner a root
-        // to walk (`cache_cleaner::cache_roots`, which reads it from the
-        // settings); no torrent is written there.
-        if let Some(raw) = settings.downloads_dir.clone()
-            && let Err(error) =
-                routes::system::prepare_downloads_dir(&raw, &routes::system::cache_roots(&state))
-                    .await
-        {
-            tracing::warn!(
-                downloads_dir = %raw,
-                error = %format!("{error:#}"),
-                "downloadsDir is unusable; clearing it (nothing is written there, but the \
-                 cache cleaner would have walked it)"
-            );
-            settings.downloads_dir = None;
-            cleared_downloads_dir = true;
-        }
-    }
-    // Outside the settings lock, and after it: applying the setting now
-    // awaits a reconcile of every restored torrent, which reaches
-    // librqbit's persistence file. Holding the settings write guard across
-    // that would park every route that reads a setting behind a disk write.
+    let seeding_enabled = settings_arc.read().await.seeding_enabled;
+    // Outside the settings lock: applying the setting awaits a reconcile of
+    // every restored torrent, which reaches librqbit's persistence file.
+    // Holding the settings write guard across that would park every route
+    // that reads a setting behind a disk write.
     state.engine.set_seeding_enabled(seeding_enabled).await;
-    state
-        .download_engine
-        .set_seeding_enabled(seeding_enabled)
-        .await;
-    if cleared_downloads_dir && let Err(error) = state.save_settings().await {
+    // The root the session was actually opened on, persisted, so
+    // `GET /settings`, the settings file and the next boot all name the
+    // directory the data is in. Only a value that was already something else
+    // is written -- an unusable one that was replaced by the default, or a
+    // spelling that resolved to another (a symlinked prefix, a Windows 8.3
+    // name).
+    if corrected_cache_root && let Err(error) = state.save_settings().await {
         tracing::warn!(
             error = %format!("{error:#}"),
-            "could not persist the cleared downloadsDir"
+            "could not persist the torrent-data root the session opened on"
         );
     }
 
@@ -1103,25 +1111,18 @@ pub async fn run(
     // found, but it is being shutdown") -- caught by tokio, so only noise,
     // but noise a real panic can hide in. See
     // `TrackerManager::take_refresh_task`. The task has one owner, so it is
-    // taken, not read: both engines are asked because `AppState` allows two,
-    // and the second call yields `None` here, where they are the same `Arc`.
+    // taken, not read.
     background_tasks.extend(state.engine.take_tracker_refresh_task());
-    background_tasks.extend(state.download_engine.take_tracker_refresh_task());
-    // And the engines' housekeeping sweep, the other forever loop they start
-    // for themselves. It is parked on a 15-second sleep between passes rather
+    // And the engine's housekeeping sweep, the other forever loop it starts
+    // for itself. It is parked on a 15-second sleep between passes rather
     // than an hourly one, so of the two it is the likelier to be holding a
     // timer when the driver goes down.
     background_tasks.extend(state.engine.take_sweep_task());
-    background_tasks.extend(state.download_engine.take_sweep_task());
     // And the reconciler, which recomputes what every torrent should be
     // doing and makes it so -- stopping one before it runs the volume out,
-    // starting it again when there is room. One per engine, and one for
-    // both where they are the same `Arc` (a second reconciler would only
-    // race the first for the same torrents).
+    // starting it again when there is room. One, for the one engine (a
+    // second would only race the first for the same torrents).
     background_tasks.push(state.engine.start_reconciler());
-    if !Arc::ptr_eq(&state.engine, &state.download_engine) {
-        background_tasks.push(state.download_engine.start_reconciler());
-    }
     if cfg.enable_cache_cleaner {
         background_tasks.push(cache_cleaner::start(Arc::new(state.clone())));
     }
@@ -1137,7 +1138,7 @@ pub async fn run(
     // Unconditional and unconfigurable: two routing-table length reads on a
     // timer, and the only thing that ever states whether the DHT works here.
     // See `diagnostics::dht_health`.
-    background_tasks.push(diagnostics::dht_health::start(state.stream_engine()));
+    background_tasks.push(diagnostics::dht_health::start(state.engine.clone()));
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel(1);
     if cfg.use_tui

@@ -143,7 +143,7 @@ pub async fn create_engine(
                 trackers.into_iter().chain(link_trackers).collect(),
             );
             match state
-                .stream_engine()
+                .engine
                 .get_or_add_magnet(&info_hash, Some(trackers))
                 .await
             {
@@ -152,11 +152,7 @@ pub async fn create_engine(
             }
         }
         CreateSource::TorrentFile(source) => {
-            match state
-                .stream_engine()
-                .add_torrent(source, Some(trackers))
-                .await
-            {
+            match state.engine.add_torrent(source, Some(trackers)).await {
                 Ok(engine) => engine,
                 // stremio-video's createTorrent.js checks resp.ok before
                 // reading the body (createTorrent.js:62); a 200 here on
@@ -232,11 +228,7 @@ pub async fn create_magnet(
     let file_must_include = payload.file_must_include;
     let guess = parse_guess_file_idx(payload.guess_file_idx.as_ref());
 
-    match state
-        .stream_engine()
-        .get_or_add_magnet(ih, Some(trackers))
-        .await
-    {
+    match state.engine.get_or_add_magnet(ih, Some(trackers)).await {
         Ok(engine) => {
             let stats = stats_with_guess(&engine, &file_must_include, guess).await;
             (StatusCode::OK, Json(stats))

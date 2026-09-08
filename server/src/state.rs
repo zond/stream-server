@@ -8,8 +8,10 @@ use tokio::sync::RwLock;
 
 #[derive(Clone)]
 pub struct AppState {
+    /// The one torrent engine: every route, the cleaner and the
+    /// diagnostics read this. There used to be a second field,
+    /// `download_engine`, holding the same `Arc` -- see `run()`.
     pub engine: Arc<EngineFS>,
-    pub download_engine: Arc<EngineFS>,
     pub settings: Arc<RwLock<ServerSettings>>,
     /// `settings.json` on disk and the one way anything writes it (see
     /// [`SettingsFile`]). Shared with the tracker refresher's
@@ -58,21 +60,6 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// The `EngineFS` every torrent-creating route uses -- the stream route,
-    /// `/create`, the stats polls -- so they all share one torrent per hash.
-    ///
-    /// In production this is the one engine there is: `run()` builds a single
-    /// `EngineFS` and puts the same `Arc` in `engine` and `download_engine`
-    /// (there is no memory-only engine to prefer it over; see `run`). It used
-    /// to choose between the two on a `download_engine_disk_backed` flag that
-    /// was `true` in production and `false` in every test constructor -- and
-    /// both of those hand the same `Arc` to both fields, so the flag never
-    /// selected anything. For an `AppState` built with two distinct engines
-    /// the download engine is the one that streams.
-    pub fn stream_engine(&self) -> Arc<EngineFS> {
-        self.download_engine.clone()
-    }
-
     #[allow(unused)]
     pub fn new(engine: Arc<EngineFS>, settings: ServerSettings, config_dir: PathBuf) -> Self {
         let log_dir = config_dir.join("logs");
@@ -100,29 +87,12 @@ impl AppState {
         config_dir: PathBuf,
         log_dir: PathBuf,
     ) -> Self {
-        Self::new_with_shared_settings_log_dir_and_download_engine(
-            engine.clone(),
-            engine,
-            settings,
-            config_dir,
-            log_dir,
-        )
-    }
-
-    pub fn new_with_shared_settings_log_dir_and_download_engine(
-        engine: Arc<EngineFS>,
-        download_engine: Arc<EngineFS>,
-        settings: Arc<RwLock<ServerSettings>>,
-        config_dir: PathBuf,
-        log_dir: PathBuf,
-    ) -> Self {
         let settings_file = Arc::new(SettingsFile::new(config_dir.join("settings.json")));
         let proxy_cache = Arc::new(crate::proxy_cache::ProxyCache::new(&engine.download_dir));
         let https = Arc::new(crate::https::HttpsListener::new(None, &config_dir));
 
         Self {
             engine,
-            download_engine,
             settings,
             settings_file,
             config_dir,
