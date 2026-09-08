@@ -2597,10 +2597,31 @@ fn a_restart_leaves_a_torrent_stopped_and_a_stream_request_starts_it() -> anyhow
         "the timer must not start a torrent into a volume inside the resume margin"
     );
 
-    // The request. It goes to the same route a player uses, whose
-    // metadata-resolution guard is what asks the reconciler; no peer will
-    // ever bring these bytes, so the client giving up is the expected end.
+    // A player's first request for a file it has not seen before, which is
+    // a HEAD: it asks how long the file is and whether ranges work. That
+    // path resolves the torrent's file list and nothing else -- no stream
+    // is started, so the metadata-resolution guard is the only thing on it
+    // that asks the reconciler anything. It is also the request that must
+    // work on a torrent whose metadata is not resolved at all, which is a
+    // torrent that has to be running to resolve it.
     let anonymous = reqwest::blocking::Client::new();
+    let head = anonymous
+        .head(format!("{base}/{info_hash}/0"))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()?
+        .error_for_status()?;
+    assert_eq!(
+        header_value(&head, "content-length"),
+        (64 * 1024).to_string()
+    );
+    assert!(
+        !swarm_paused(&client)?,
+        "the request started the torrent it was about to read from"
+    );
+
+    // And the GET that follows is not refused: there is room above the
+    // floor. No peer will ever bring these bytes, so the client giving up
+    // is the expected end.
     match anonymous
         .get(format!("{base}/{info_hash}/0"))
         .header(reqwest::header::RANGE, "bytes=0-1023")
@@ -2614,10 +2635,6 @@ fn a_restart_leaves_a_torrent_stopped_and_a_stream_request_starts_it() -> anyhow
         ),
         Err(error) => assert!(error.is_timeout(), "{error}"),
     }
-    assert!(
-        !swarm_paused(&client)?,
-        "the stream request started the torrent it was about to read from"
-    );
 
     handle.shutdown()?;
     handle.join()?;
