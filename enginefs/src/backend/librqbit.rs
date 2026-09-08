@@ -6922,29 +6922,39 @@ mod tests {
 
     /// The other side of that restart, and the one nothing on this branch
     /// covered: with seeding turned off, a torrent the last process left
-    /// stopped stays stopped.
+    /// stopped is stopped again once the idle grace has run out -- and the
+    /// grace is measured from the instant *this* process started, so it
+    /// really does have to run out.
     ///
     /// The reconciler starts anything the ladder says should run, the
     /// previous process's pause included -- that is the point of it -- so
     /// the only thing standing between "seeding is off and nobody is
-    /// watching" and a restart that starts every torrent there is is the
-    /// idle arm, and the idle arm's grace is measured from
-    /// `Engine::last_active_at`. That used to be initialised to the clock,
-    /// which for a restored torrent is a claim about a past this process
-    /// never saw: it read as "used a moment ago", so `idle_for` was zero,
-    /// the idle arm could not fire, and the anti-flap dwell does not apply
-    /// to a torrent this process has never moved. Every restart therefore
-    /// announced, found peers and downloaded every stopped torrent for a
-    /// whole `INACTIVE_TORRENT_PAUSE_GRACE` before stopping it again --
-    /// over a metered connection and a television's disk, with the setting
-    /// that exists to prevent exactly that turned on. `None` is the honest
-    /// answer and the arm reads it as quiet.
+    /// watching" and a restart that leaves every torrent there is running
+    /// is the idle arm, and the idle arm's grace is measured from
+    /// `Engine::last_active_at`. That used to be initialised per engine to
+    /// the clock, which for a restored torrent is a claim about a past this
+    /// process never saw: it read as "used a moment ago" for as long as the
+    /// engine lived, so `idle_for` restarted with every engine and the arm
+    /// could not fire until a grace after each one appeared. Seeded at the
+    /// process's own epoch it counts from the one instant this process can
+    /// vouch for, and the two readings this test takes -- one at the epoch,
+    /// one a whole grace later -- are the two sides of that.
+    ///
+    /// The first of them is the price of the grace and is asserted rather
+    /// than hidden: for one grace after a restart the ladder does want this
+    /// torrent running, and the reconciler starts it. What the grace buys
+    /// is that a player which was mid-film when the process was restarted
+    /// finds its torrent running; what it costs is up to
+    /// `INACTIVE_TORRENT_PAUSE_GRACE` of a torrent nobody asked for.
     ///
     /// Driven over a real persisted session because the restart is where
     /// the defect lives, and asserted on `run_state` and on the backend's
-    /// own byte counters, never on a flag this code wrote.
+    /// own byte counters, never on a flag this code wrote. The clock
+    /// reading is handed in (`reconcile_tick_at`) because a real librqbit
+    /// session cannot run under a paused clock, and sitting out the grace
+    /// in wall time would put it in every run of the suite.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_restart_with_seeding_off_does_not_start_what_the_last_process_stopped() {
+    async fn a_restart_with_seeding_off_stops_what_the_last_process_left_once_the_grace_is_out() {
         use crate::backend::TorrentBackend;
         let tmp = tempfile::tempdir().unwrap();
 
@@ -7005,19 +7015,37 @@ mod tests {
         efs.set_free_space_probe(|_| Ok(u64::MAX));
         efs.set_seeding_enabled(false).await;
 
-        // The want-set is back, so `settled` is not what is holding it:
-        // what holds it is that nothing in this process has used it.
+        // The want-set is back, so `settled` is not what is holding it or
+        // letting it go: what decides is how long nothing has used it.
         efs.restore_pinned_downloads().await;
+        let grace = crate::INACTIVE_TORRENT_PAUSE_GRACE.as_secs();
+        let engine = efs.get_engine(&hash).await.expect("the restored engine");
+
+        // At the process's own epoch the grace has not run out, and the
+        // reconciler does start the torrent the last process stopped.
         assert_eq!(
-            efs.reconcile_tick().await,
+            efs.reconcile_tick_at(0).await,
+            vec![(hash.clone(), crate::reconcile::Decision::Run)],
+            "the restart's grace has not run out yet"
+        );
+        assert_eq!(
+            engine.handle.run_state(),
+            RunState::Live,
+            "and the reconciler really did start it"
+        );
+
+        // A whole grace later, with nothing having used it in between, the
+        // idle arm fires -- and this is the reading the old per-engine
+        // stamp could never reach, because it moved with the engine.
+        assert_eq!(
+            efs.reconcile_tick_at(grace).await,
             vec![(hash.clone(), crate::reconcile::Decision::Stop)],
             "seeding is off and nobody has watched this torrent"
         );
-        let engine = efs.get_engine(&hash).await.expect("the restored engine");
         assert_eq!(
             engine.handle.run_state(),
             RunState::Paused,
-            "and it really is still stopped"
+            "and it really is stopped"
         );
 
         // A seeder with the whole file dials it, exactly as one would after
@@ -7050,17 +7078,11 @@ mod tests {
             .await
             .expect("seeder add");
 
-        // The real clock throughout, and deliberately: `reconcile_tick_at`
-        // exists so a real session can reach the idle arm without sitting
-        // out the grace, but it hands in a `now` the engine's own stamp
-        // never saw, which is the very comparison under test here. What
-        // makes the wait unnecessary instead is that the honest answer is
-        // available on the *first* tick -- nothing has used this torrent,
-        // so there is no grace left to run out.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while std::time::Instant::now() < deadline {
+        // Two seconds of ticks while the seeder knocks, each one a second
+        // further past the grace, as the timer's own passes would be.
+        for tick in 0..20u64 {
             assert_eq!(
-                efs.reconcile_tick().await,
+                efs.reconcile_tick_at(grace + tick).await,
                 vec![(hash.clone(), crate::reconcile::Decision::Stop)],
             );
             tokio::time::sleep(Duration::from_millis(100)).await;

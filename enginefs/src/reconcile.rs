@@ -121,19 +121,19 @@ pub struct Conditions {
     /// probe failed. `None` is "unknown", never "full".
     pub available: Option<u64>,
     /// How long since anything was **using** this torrent -- a stream, a
-    /// file read, an HLS lease, a multi-file selection -- and `None` when
-    /// nothing has in this process.
+    /// file read, an HLS lease, a multi-file selection.
     ///
-    /// `None` is not "idle for no time at all": it is the absence of a
-    /// claim, and the idle arm reads it as quiet, because a torrent this
-    /// process has never seen used has not been used. That is the same
-    /// property [`Self::settled`] has and the same one every record this
-    /// design deleted lacked -- the honest answer at start, rather than a
-    /// fresh timestamp standing in for a past the process did not see.
+    /// For a torrent nothing has used yet it is the time since **this
+    /// process started**, which is the honest reading of a use that has not
+    /// happened: this process can vouch for its own uptime and for nothing
+    /// before it. It is never "idle for no time at all", which is what a
+    /// per-engine `now` would make it -- a fresh timestamp standing in for
+    /// a past the process did not see, the same claim every record this
+    /// design deleted was making.
     ///
     /// It is **not** the registry's idle-eviction clock, which counts
     /// lookups: see `Engine::last_active_at`.
-    pub idle_for: Option<Duration>,
+    pub idle_for: Duration,
 }
 
 /// Whether this torrent should be running, from the conditions alone.
@@ -189,9 +189,10 @@ pub struct Conditions {
 ///    is fetching a film nobody is watching while we have promised to
 ///    upload nothing. [`crate::INACTIVE_TORRENT_PAUSE_GRACE`] of quiet
 ///    first, so a player that stops one segment and starts the next does
-///    not stop and start the torrent with it -- and a torrent nothing has
-///    used in this process at all ([`Conditions::idle_for`] of `None`) has
-///    been quiet for all of it.
+///    not stop and start the torrent with it -- and for a torrent nothing
+///    has used in this process at all, the grace runs from the instant the
+///    process started ([`Conditions::idle_for`]), so a restart's own
+///    torrents become eligible when it has really run out and not before.
 /// 8. Otherwise **[`Decision::Run`]**.
 pub fn desired(conditions: &Conditions, trigger: Trigger) -> Decision {
     verdict(conditions, trigger).decision
@@ -260,9 +261,7 @@ pub fn verdict(conditions: &Conditions, trigger: Trigger) -> Verdict {
     if conditions.playing || conditions.pinned {
         return arm(Decision::Run);
     }
-    let quiet = conditions
-        .idle_for
-        .is_none_or(|idle| idle >= crate::INACTIVE_TORRENT_PAUSE_GRACE);
+    let quiet = conditions.idle_for >= crate::INACTIVE_TORRENT_PAUSE_GRACE;
     if !conditions.seeding_enabled && quiet {
         return arm(Decision::Stop);
     }
@@ -688,7 +687,7 @@ mod tests {
             has_metadata: true,
             finished: false,
             available: Some(u64::MAX),
-            idle_for: Some(Duration::ZERO),
+            idle_for: Duration::ZERO,
         }
     }
 
@@ -760,7 +759,7 @@ mod tests {
             has_metadata: false,
             available: Some(0),
             seeding_enabled: false,
-            idle_for: Some(Duration::from_secs(86_400)),
+            idle_for: Duration::from_secs(86_400),
             ..healthy()
         };
         assert_eq!(desired(&resolving, Trigger::Timer), Decision::Run);
@@ -814,7 +813,7 @@ mod tests {
     fn playback_and_pins_outrank_the_idle_policy() {
         let idle_and_unseeded = Conditions {
             seeding_enabled: false,
-            idle_for: Some(INACTIVE_TORRENT_PAUSE_GRACE),
+            idle_for: INACTIVE_TORRENT_PAUSE_GRACE,
             ..healthy()
         };
         assert_eq!(desired(&idle_and_unseeded, Trigger::Timer), Decision::Stop);
@@ -847,14 +846,14 @@ mod tests {
     fn the_idle_arm_needs_seeding_off_and_the_whole_grace() {
         let quiet = Conditions {
             seeding_enabled: false,
-            idle_for: Some(INACTIVE_TORRENT_PAUSE_GRACE),
+            idle_for: INACTIVE_TORRENT_PAUSE_GRACE,
             ..healthy()
         };
         assert_eq!(desired(&quiet, Trigger::Timer), Decision::Stop);
         assert_eq!(
             desired(
                 &Conditions {
-                    idle_for: Some(INACTIVE_TORRENT_PAUSE_GRACE - Duration::from_millis(1)),
+                    idle_for: INACTIVE_TORRENT_PAUSE_GRACE - Duration::from_millis(1),
                     ..quiet
                 },
                 Trigger::Timer
@@ -865,27 +864,12 @@ mod tests {
             desired(
                 &Conditions {
                     seeding_enabled: true,
-                    idle_for: Some(Duration::from_secs(86_400)),
+                    idle_for: Duration::from_secs(86_400),
                     ..quiet
                 },
                 Trigger::Timer
             ),
             Decision::Run
-        );
-
-        // And a torrent nothing has used in this process has been quiet for
-        // the whole of it. `None` is the absence of a claim, not "idle for
-        // no time at all": read the other way, every torrent a restart
-        // restores is one this arm may never stop.
-        assert_eq!(
-            desired(
-                &Conditions {
-                    idle_for: None,
-                    ..quiet
-                },
-                Trigger::Timer
-            ),
-            Decision::Stop
         );
     }
 

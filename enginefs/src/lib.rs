@@ -1484,7 +1484,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             has_metadata = conditions.has_metadata,
             finished = conditions.finished,
             available = ?conditions.available,
-            idle_secs = ?conditions.idle_for.map(|idle| idle.as_secs()),
+            idle_secs = conditions.idle_for.as_secs(),
             settled = conditions.settled,
             "torrent_reconciled"
         );
@@ -1563,7 +1563,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     playing = conditions.playing,
                     pinned = conditions.pinned,
                     seeding_enabled = conditions.seeding_enabled,
-                    idle_secs = ?conditions.idle_for.map(|idle| idle.as_secs()),
+                    idle_secs = conditions.idle_for.as_secs(),
                     "torrent_stopped_by_reconciler"
                 );
                 true
@@ -6486,6 +6486,48 @@ mod tests {
 
         enginefs.reconcile_tick().await;
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
+    }
+
+    /// The idle clock belongs to the process, not to the engine.
+    ///
+    /// An engine made an hour into the run has had nothing playing on it
+    /// since the process started, and that is what its `idle_for` says, so
+    /// the arm may stop it on the first tick. Seeded per engine at `now` --
+    /// the shipped defect, and the one thing the restored-torrent tests
+    /// cannot tell apart, because at a restart the two readings coincide --
+    /// every engine would instead buy itself a fresh grace merely by
+    /// appearing, and a server that adds a torrent every few minutes has an
+    /// idle arm that never fires.
+    ///
+    /// The engine is made through the ordinary add, and what is asserted is
+    /// what the torrent then does.
+    #[tokio::test(start_paused = true)]
+    async fn an_engine_made_late_is_quiet_for_as_long_as_the_process_has_run() {
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
+
+        // Nothing is registered, and the process runs on for graces.
+        enginefs.remove_engine(TEST_HASH).await;
+        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE * 4).await;
+
+        let engine = enginefs
+            .add_torrent(TorrentSource::Bytes(b"a .torrent blob".to_vec()), None)
+            .await
+            .expect("the add publishes an engine");
+        assert_eq!(
+            engine.handle.run_state(),
+            RunState::Live,
+            "a freshly added torrent is running, as a real backend's is"
+        );
+
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), Decision::Stop)],
+            "nothing has played it since this process started"
+        );
+        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
+        assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), 1);
     }
 
     /// A magnet that has not resolved its info dictionary keeps running
