@@ -21,6 +21,7 @@ pub mod metadata_pins;
 pub mod piece_cache;
 pub mod piece_store;
 pub mod piece_waiter;
+pub mod reconcile;
 pub mod scrape;
 pub mod tracker_prober;
 pub mod trackers;
@@ -134,7 +135,11 @@ const _: () = assert!(
     METADATA_RESOLVE_TIMEOUT.as_secs() < INACTIVE_TORRENT_REMOVE_TIMEOUT.as_secs(),
     "a waiting magnet add must time out before it can be swept as idle"
 );
-const INACTIVE_TORRENT_PAUSE_GRACE: Duration = Duration::from_secs(15);
+/// How long a torrent must be quiet before the idle policy stops it (with
+/// seeding off). Read by the grace-period task and by
+/// [`crate::reconcile::desired`], which is one number so the two cannot
+/// disagree about when a torrent has gone quiet.
+pub(crate) const INACTIVE_TORRENT_PAUSE_GRACE: Duration = Duration::from_secs(15);
 const HLS_PLAYBACK_LEASE_TTL: Duration = Duration::from_secs(300);
 const NATIVE_LIFECYCLE_HLS_PLAYBACK_LEASE_TTL: Duration = Duration::from_secs(15);
 
