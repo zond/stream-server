@@ -1055,29 +1055,40 @@ async fn stream_video_with(
     } else {
         end.saturating_sub(start) + 1
     };
-    // This torrent's own volume, before the shared one below. The two are
-    // not the same device: a pinned download lives under `downloadsDir`,
-    // a setting whose entire purpose is to put downloads on a second card,
-    // while `ensure_disk_ready_or_refuse` probes `engine_fs.download_dir`
-    // and nothing else. The reconciler measures `output_folder()`, so with
-    // the downloads volume full and the cache root roomy the gate below
-    // waves the request through, the ladder stops the torrent underneath
-    // it, and the reader parks until the body dies mid-stream with
-    // `StorageFull` -- where a 507 was owed before a byte was sent.
+    // A torrent the ladder is already holding stopped for want of disk,
+    // answered from the reading the reconciler took rather than by walking
+    // the cache again.
     //
-    // This gate existed and was removed with the stored `stopped_for_space`
-    // bit, on the grounds that it read a record rather than the disk. That
-    // objection is spent: `Engine::is_stopped_for_space` now recomputes the
-    // predicate from the run state and a fresh probe of this torrent's own
-    // volume, at the same floor a `PlaybackStart` is measured against
-    // (`reconcile::line`), so the gate and the ladder cannot disagree about
-    // this request.
+    // This used to be here because the two gates measured two devices: a
+    // pinned download lived under `downloadsDir` -- a setting whose entire
+    // purpose is a second card -- while `ensure_disk_ready_or_refuse`
+    // probes `engine_fs.download_dir` and nothing else. That gap is closed:
+    // the piece store is the session's default storage and its root is
+    // inside `download_dir`, so every payload byte of every torrent, pinned
+    // or streamed, lands on the volume the gate below probes.
+    //
+    // What is left is a short circuit, and it is worth keeping as one. The
+    // gate below answers a refusal by running a whole cache-cleaner pass
+    // and asking again, which is right for a request that has just met a
+    // full disk -- and wrong to repeat for a player retrying a torrent this
+    // process already stopped for space and already rang the cleaner for
+    // (`out_of_space_signal`): that is a walk of every cache root per
+    // retry, several a second, for an answer nothing has changed. This
+    // costs a lookup of the last reading instead. It can only be reached
+    // while the ladder holds the stop, which it lifts within one
+    // `RECONCILE_INTERVAL` of the volume clearing.
+    //
+    // `Engine::is_stopped_for_space` recomputes the predicate from the run
+    // state and that reading, at the same floor a `PlaybackStart` is
+    // measured against (`reconcile::line`), so the gate and the ladder
+    // cannot disagree about this request -- which is what the stored
+    // `stopped_for_space` bit this replaced could not manage.
     if engine.is_stopped_for_space().await {
         tracing::warn!(
             stream_id,
             info_hash = %info_hash,
             file_idx = idx,
-            "stream refused: this torrent's own volume has no room"
+            "stream refused: the volume this torrent's pieces land on has no room"
         );
         return (
             StatusCode::INSUFFICIENT_STORAGE,

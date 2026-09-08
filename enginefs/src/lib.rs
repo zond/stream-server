@@ -2,7 +2,7 @@ use crate::engine::Engine;
 use anyhow::{Context, Result};
 use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -1023,7 +1023,9 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         tracker_storage: Option<Arc<dyn crate::trackers::TrackerStorage>>,
     ) -> Self {
         let clock = Clock::start();
-        let volumes = Arc::new(crate::reconcile::Volumes::new(download_dir.clone()));
+        let volumes = Arc::new(crate::reconcile::Volumes::new(crate::piece_store::root_in(
+            &download_dir,
+        )));
         // A backend that sets piece reclaim restores every torrent paused
         // and wanting every hole in its storage, because the piece-level
         // want-set is not in the record. Until this process has put the
@@ -1351,7 +1353,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         // await parks every later reader behind any writer that queues
         // meanwhile.
         let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
-        let mut probed: HashSet<std::path::PathBuf> = HashSet::new();
+        let mut probed = false;
         let mut decisions = Vec::with_capacity(engines.len());
         let mut stopped_any = false;
         for engine in engines {
@@ -1396,7 +1398,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     ) -> Option<crate::reconcile::Decision> {
         let engine = self.peek_engine(info_hash).await?;
         let now = self.clock.now_secs();
-        let mut probed = HashSet::new();
+        let mut probed = false;
         let mut stopped_any = false;
         let decision = self
             .reconcile_engine(&engine, trigger, now, &mut probed, &mut stopped_any)
@@ -1433,15 +1435,19 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         engine: &Arc<Engine<B::Handle>>,
         trigger: crate::reconcile::Trigger,
         now: u64,
-        probed: &mut HashSet<std::path::PathBuf>,
+        probed: &mut bool,
         stopped_any: &mut bool,
     ) -> Option<crate::reconcile::Decision> {
         if engine.handle.manages_playback_lifecycle() {
             return None;
         }
         let _guard = self.reconcile_locks.lock(&engine.info_hash).await;
-        let folder = self.volumes.folder_of(engine.handle.output_folder());
-        if probed.insert(folder.clone()) {
+        // The volume the pieces land on, which is one folder for every
+        // torrent in the session (`Volumes::data_folder`) -- so a pass
+        // probes it once, not once per torrent.
+        let folder = self.volumes.data_folder().to_path_buf();
+        if !*probed {
+            *probed = true;
             self.probe_volume(&folder, now);
         }
         let conditions = crate::reconcile::Conditions {
@@ -1452,7 +1458,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             seeding_enabled: self.seeding_enabled.load(Ordering::Relaxed),
             has_metadata: engine.handle.has_metadata().await,
             finished: engine.handle.is_finished().await,
-            available: self.volumes.available(&folder),
+            available: self.volumes.available(),
             idle_for: engine.quiet_for(now),
         };
         let verdict = crate::reconcile::verdict(&conditions, trigger);
@@ -1490,7 +1496,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     self.after_stopping_for_space(
                         engine,
                         &conditions,
-                        &folder,
                         now,
                         stopped_here,
                         stopped_any,
@@ -1586,7 +1591,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         &self,
         engine: &Arc<Engine<B::Handle>>,
         conditions: &crate::reconcile::Conditions,
-        folder: &std::path::Path,
         now: u64,
         stopped_here: bool,
         stopped_any: &mut bool,
@@ -1601,7 +1605,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 "torrent_stopped_for_space"
             );
         }
-        let short_for = self.volumes.short_for(folder, now).unwrap_or_default();
+        let short_for = self.volumes.short_for(now).unwrap_or_default();
         if !engine.reads_refused() && short_for >= STOPPED_READ_STALL_BOUND {
             tracing::warn!(
                 info_hash = %engine.info_hash,
@@ -1732,12 +1736,13 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 debug!(
                     folder = %folder.display(),
                     %error,
-                    "could not read the output volume's free space; the reconciler leaves its torrents alone"
+                    "could not read the free space of the volume the pieces land on; \
+                     the reconciler leaves its torrents alone"
                 );
                 None
             }
         };
-        self.volumes.record(folder, available, now);
+        self.volumes.record(available, now);
     }
 
     /// Whether anything is using this torrent right now: a response body
@@ -8072,6 +8077,69 @@ mod tests {
         enginefs.reconcile_tick().await;
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
         assert!(engine.is_stopped_for_space().await);
+    }
+
+    /// The ladder measures the volume the *pieces* land on, which since the
+    /// piece store became the session's default storage is the only volume
+    /// any payload byte is written to. A torrent's output folder still
+    /// names a place -- and a pinned one names a place under `downloadsDir`,
+    /// a setting whose entire purpose is a second card -- but nothing writes
+    /// there any more, so probing it answers about the wrong device in both
+    /// directions: it would leave a torrent running onto a full store, and
+    /// stop one whose store has room because some other card is full.
+    #[tokio::test(start_paused = true)]
+    async fn the_free_space_arm_measures_the_volume_the_pieces_land_on() {
+        // Placed as a pin is: an output folder on a card of its own.
+        let placed = std::path::PathBuf::from("/offline").join(TEST_HASH);
+
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
+        *counters.output_folder.lock().unwrap() = Some(placed.clone());
+        let pieces = crate::piece_store::root_in(&enginefs.download_dir);
+        enginefs.set_free_space_probe(move |path| {
+            Ok(if path.starts_with(&pieces) {
+                0
+            } else {
+                u64::MAX
+            })
+        });
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.reconcile_tick().await;
+        assert_eq!(
+            run_state_of(&enginefs, TEST_HASH).await,
+            RunState::Paused,
+            "the volume the pieces are written to is full, so the torrent must be stopped"
+        );
+        assert!(
+            engine.is_stopped_for_space().await,
+            "and a client asking what is wrong is told the device is"
+        );
+        assert_eq!(
+            enginefs.out_of_space_torrents().await,
+            vec![TEST_HASH.to_string()],
+            "and the cleaner is asked for the room that would end it"
+        );
+
+        // The other direction: the placed folder's card is full and the
+        // store's has room, so there is nothing to stop.
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
+        *counters.output_folder.lock().unwrap() = Some(placed);
+        let pieces = crate::piece_store::root_in(&enginefs.download_dir);
+        enginefs.set_free_space_probe(move |path| {
+            Ok(if path.starts_with(&pieces) {
+                u64::MAX
+            } else {
+                0
+            })
+        });
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.reconcile_tick().await;
+        assert_eq!(
+            run_state_of(&enginefs, TEST_HASH).await,
+            RunState::Live,
+            "a full card nothing writes to is not this torrent's problem"
+        );
+        assert!(!engine.is_stopped_for_space().await);
+        assert!(enginefs.out_of_space_torrents().await.is_empty());
     }
 
     /// The master bug this closes. The free-space watch skipped any engine

@@ -568,8 +568,7 @@ impl<H: TorrentHandle> Engine<H> {
                 crate::reconcile::line(crate::reconcile::Trigger::Timer, run_state),
                 self.handle.has_metadata().await,
                 self.handle.is_finished().await,
-                self.volumes
-                    .available(&self.volumes.folder_of(self.handle.output_folder())),
+                self.volumes.available(),
             )
     }
 
@@ -583,6 +582,12 @@ impl<H: TorrentHandle> Engine<H> {
     /// wrong in both directions), and the volume it writes to is short for
     /// it ([`crate::reconcile::volume_is_short`], the same predicate the
     /// reconciler's free-space arm applies).
+    ///
+    /// The volume it writes to is the piece store's root
+    /// (`reconcile::Volumes::data_folder`) -- for this torrent and for every
+    /// other, since that is where the session's default storage puts every
+    /// byte. Not the backend's output folder, which is a name with no
+    /// payload under it.
     ///
     /// **At [`crate::CACHE_FREE_SPACE_FLOOR`], not at the reconciler's
     /// hysteresis line.** The two readers of this are a client's statistics
@@ -622,8 +627,7 @@ impl<H: TorrentHandle> Engine<H> {
                 crate::CACHE_FREE_SPACE_FLOOR,
                 self.handle.has_metadata().await,
                 self.handle.is_finished().await,
-                self.volumes
-                    .available(&self.volumes.folder_of(self.handle.output_folder())),
+                self.volumes.available(),
             )
     }
 

@@ -368,8 +368,8 @@ pub(crate) fn line(trigger: Trigger, observed: RunState) -> u64 {
     }
 }
 
-/// The last free-space reading of every volume the reconciler has looked
-/// at, and how long each has been too short to run a torrent on.
+/// The last free-space reading of the volume the session writes to, and how
+/// long it has been too short to run a torrent on.
 ///
 /// This is not a record of anything the process decided. It is the
 /// reconciler's most recent *observation* of a live input -- at most one
@@ -380,18 +380,30 @@ pub(crate) fn line(trigger: Trigger, observed: RunState) -> u64 {
 /// asker would be a syscall per torrent per poll for a number that changes
 /// on the scale of seconds.
 ///
-/// Keyed by output folder rather than by torrent, because that is what a
-/// volume is: two torrents writing to one folder share one reading and one
-/// `Reading::short_since`, and a bound counted per torrent would start
-/// the clock again for each of them (see `Self::short_for`).
+/// **One reading for the whole session, not one per torrent.** It is a
+/// property of a device: torrents writing to it share it, and the stall
+/// bound counted per torrent would start its clock again for each of them
+/// (see `Self::short_for`). It used to be a map keyed by each torrent's
+/// output folder, and the folder to ask about was every caller's to work
+/// out -- which is how three of them came to ask about a card nothing
+/// writes to.
 pub struct Volumes {
-    /// Where a torrent that names no output folder of its own writes --
-    /// the engine's download directory.
-    default_folder: std::path::PathBuf,
-    readings: parking_lot::Mutex<std::collections::HashMap<std::path::PathBuf, Reading>>,
+    /// The folder every torrent's payload is written to -- the piece
+    /// store's root ([`crate::piece_store::root_in`]), which is where the
+    /// session's default storage puts every byte of every torrent.
+    ///
+    /// One folder for all of them, and not the per-torrent output folder
+    /// the backend reports, because that folder is a *name* now: librqbit
+    /// records one and reports file paths under it, and no payload byte is
+    /// written there (see `backend::librqbit::session_storage_factory`).
+    /// Probing it answered about the wrong device in both directions --
+    /// loudest for a pinned download, placed under `downloadsDir`, a
+    /// setting whose entire purpose is to be a second card.
+    data_folder: std::path::PathBuf,
+    reading: parking_lot::Mutex<Reading>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct Reading {
     /// Free bytes at the last probe, or `None` when that probe failed.
     /// `None` is "unknown" everywhere, never "full".
@@ -407,35 +419,29 @@ struct Reading {
 }
 
 impl Volumes {
-    pub(crate) fn new(default_folder: std::path::PathBuf) -> Self {
+    pub(crate) fn new(data_folder: std::path::PathBuf) -> Self {
         Self {
-            default_folder,
-            readings: Default::default(),
+            data_folder,
+            reading: Default::default(),
         }
     }
 
-    /// The folder a torrent writes to: its own if the backend names one,
-    /// otherwise the engine's download directory.
-    pub(crate) fn folder_of(
-        &self,
-        output_folder: Option<std::path::PathBuf>,
-    ) -> std::path::PathBuf {
-        output_folder.unwrap_or_else(|| self.default_folder.clone())
+    /// The folder whose free space decides whether any torrent in this
+    /// session can go on writing: the one they all write to. See
+    /// [`Self::data_folder`].
+    pub(crate) fn data_folder(&self) -> &std::path::Path {
+        &self.data_folder
     }
 
-    /// Record a probe of `folder` taken at `now_secs`.
+    /// Record a probe of [`Self::data_folder`] taken at `now_secs`.
     ///
     /// A failed probe (`available` of `None`) leaves [`Reading::short_since`]
     /// exactly as it was: it is evidence neither that the volume filled nor
     /// that it cleared, and starting or clearing the stall clock on a
     /// `statvfs` that stopped answering would fail a player's reads because
     /// of a broken environment rather than because of a full disk.
-    pub(crate) fn record(&self, folder: &std::path::Path, available: Option<u64>, now_secs: u64) {
-        let mut readings = self.readings.lock();
-        let reading = readings.entry(folder.to_path_buf()).or_insert(Reading {
-            available: None,
-            short_since: None,
-        });
+    pub(crate) fn record(&self, available: Option<u64>, now_secs: u64) {
+        let mut reading = self.reading.lock();
         reading.available = available;
         match available {
             Some(available) if available < resume_line() => {
@@ -446,14 +452,14 @@ impl Volumes {
         }
     }
 
-    /// The last reading of `folder`, or `None` for a volume nothing has
-    /// probed yet and for one whose probe failed. Both are "unknown", which
-    /// is what [`volume_is_short`] refuses to treat as full.
-    pub fn available(&self, folder: &std::path::Path) -> Option<u64> {
-        self.readings.lock().get(folder).and_then(|r| r.available)
+    /// The last reading, or `None` before anything has probed and for a
+    /// probe that failed. Both are "unknown", which is what
+    /// [`volume_is_short`] refuses to treat as full.
+    pub fn available(&self) -> Option<u64> {
+        self.reading.lock().available
     }
 
-    /// How long `folder` has been under the line a stopped torrent has to
+    /// How long the volume has been under the line a stopped torrent has to
     /// see cleared before anything starts it again; `None` when it is not.
     ///
     /// Per volume and not per torrent, which is the point of it. The bound
@@ -463,12 +469,8 @@ impl Volumes {
     /// full volume a minute later has readers as doomed as the first one's,
     /// and counting from its own stop would give them a fresh twenty
     /// seconds of spinning for a disk that has been full the whole time.
-    pub(crate) fn short_for(&self, folder: &std::path::Path, now_secs: u64) -> Option<Duration> {
-        let since = self
-            .readings
-            .lock()
-            .get(folder)
-            .and_then(|r| r.short_since)?;
+    pub(crate) fn short_for(&self, now_secs: u64) -> Option<Duration> {
+        let since = self.reading.lock().short_since?;
         Some(Duration::from_secs(now_secs.saturating_sub(since)))
     }
 }
@@ -643,67 +645,45 @@ mod tests {
     #[test]
     fn a_volumes_stall_clock_runs_from_the_moment_it_went_short() {
         use std::path::{Path, PathBuf};
-        let volumes = Volumes::new(PathBuf::from("/downloads"));
-        let folder = Path::new("/downloads");
+        let volumes = Volumes::new(PathBuf::from("/downloads/.pieces"));
+
+        // Nothing probed yet: unknown, never short.
+        assert_eq!(volumes.available(), None);
+        assert_eq!(volumes.short_for(100), None);
 
         // Room: no clock at all.
-        volumes.record(folder, Some(u64::MAX), 100);
-        assert_eq!(volumes.available(folder), Some(u64::MAX));
-        assert_eq!(volumes.short_for(folder, 200), None);
+        volumes.record(Some(u64::MAX), 100);
+        assert_eq!(volumes.available(), Some(u64::MAX));
+        assert_eq!(volumes.short_for(200), None);
 
         // Short: the clock starts, and a later short reading does not
         // restart it.
-        volumes.record(folder, Some(CACHE_FREE_SPACE_FLOOR - 1), 200);
-        volumes.record(folder, Some(0), 210);
-        assert_eq!(
-            volumes.short_for(folder, 230),
-            Some(Duration::from_secs(30))
-        );
+        volumes.record(Some(CACHE_FREE_SPACE_FLOOR - 1), 200);
+        volumes.record(Some(0), 210);
+        assert_eq!(volumes.short_for(230), Some(Duration::from_secs(30)));
 
         // Over the floor but inside the resume margin: still short.
         volumes.record(
-            folder,
             Some(CACHE_FREE_SPACE_FLOOR + FREE_SPACE_RESUME_MARGIN - 1),
             240,
         );
-        assert_eq!(
-            volumes.short_for(folder, 240),
-            Some(Duration::from_secs(40))
-        );
+        assert_eq!(volumes.short_for(240), Some(Duration::from_secs(40)));
 
         // A probe that failed leaves the clock exactly as it was, and the
         // reading unknown.
-        volumes.record(folder, None, 250);
-        assert_eq!(
-            volumes.short_for(folder, 250),
-            Some(Duration::from_secs(50))
-        );
-        assert_eq!(volumes.available(folder), None);
+        volumes.record(None, 250);
+        assert_eq!(volumes.short_for(250), Some(Duration::from_secs(50)));
+        assert_eq!(volumes.available(), None);
 
         // Cleared: the clock stops, and going short again starts a new one.
-        volumes.record(
-            folder,
-            Some(CACHE_FREE_SPACE_FLOOR + FREE_SPACE_RESUME_MARGIN),
-            260,
-        );
-        assert_eq!(volumes.short_for(folder, 260), None);
-        volumes.record(folder, Some(0), 300);
-        assert_eq!(
-            volumes.short_for(folder, 310),
-            Some(Duration::from_secs(10))
-        );
+        volumes.record(Some(CACHE_FREE_SPACE_FLOOR + FREE_SPACE_RESUME_MARGIN), 260);
+        assert_eq!(volumes.short_for(260), None);
+        volumes.record(Some(0), 300);
+        assert_eq!(volumes.short_for(310), Some(Duration::from_secs(10)));
 
-        // A volume nothing has probed is unknown, never short -- and a
-        // torrent that names no folder of its own is measured against the
-        // engine's download directory.
-        let elsewhere = Path::new("/elsewhere");
-        assert_eq!(volumes.available(elsewhere), None);
-        assert_eq!(volumes.short_for(elsewhere, 310), None);
-        assert_eq!(volumes.folder_of(None), PathBuf::from("/downloads"));
-        assert_eq!(
-            volumes.folder_of(Some(PathBuf::from("/elsewhere"))),
-            PathBuf::from("/elsewhere")
-        );
+        // The folder it is a reading of is the one the session's storage
+        // writes to, and there is only the one.
+        assert_eq!(volumes.data_folder(), Path::new("/downloads/.pieces"));
     }
 
     /// A torrent with nothing wrong with it: running, alive, watched by
