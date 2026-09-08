@@ -819,8 +819,9 @@ pub struct LibrqbitBackend {
 /// records one per torrent and still reports file paths under it -- that is
 /// where a torrent's *name* lives -- but no byte of payload is written there
 /// any more. Data placement is the piece store's root and the info hash,
-/// nothing else, so `EngineFS::engine_paths` names the piece directory and
-/// not those paths.
+/// nothing else, so nothing above this backend chooses an output folder or
+/// reads one: `EngineFS` protects, measures and deletes by the piece
+/// directory alone.
 fn session_storage_factory(download_dir: &std::path::Path) -> librqbit::storage::BoxStorageFactory {
     use librqbit::storage::StorageFactoryExt;
     crate::piece_store::PieceStoreFactory::new(crate::piece_store::root_in(download_dir)).boxed()

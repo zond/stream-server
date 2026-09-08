@@ -116,9 +116,9 @@
 //! version wrote is neither converted nor read: the torrent that owns it
 //! comes up with an empty have-set and re-downloads as pieces, and the old
 //! bytes are ordinary cache for `cache_cleaner` to age out. That only works
-//! because `EngineFS::engine_paths` stopped naming the backend's file paths
-//! -- an engine that named them would protect its own superseded copy for as
-//! long as the torrent is in the session.
+//! because an engine's protected set (`EngineFS::eviction_classes`) stopped
+//! naming the backend's file paths -- an engine that named them would protect
+//! its own superseded copy for as long as the torrent is in the session.
 //!
 //! Nothing else has a stake in the default factory. The client's activity
 //! signal briefly did -- its counters were a storage wrapper around the
