@@ -466,7 +466,7 @@ impl HashLocks {
 
     /// How many hashes currently have a lock in the map.
     #[cfg(test)]
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.locks.lock().len()
     }
 }

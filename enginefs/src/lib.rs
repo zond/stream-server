@@ -7515,6 +7515,67 @@ mod tests {
         );
     }
 
+    /// The anti-flap dwell, and both halves of its asymmetry.
+    ///
+    /// A condition that oscillates around one of the ladder's lines costs
+    /// peers rather than CPU -- every stop drops the swarm and every start
+    /// re-announces -- so after the reconciler moves a torrent, its
+    /// **timer** leaves it stopped for `RECONCILE_MIN_DWELL`. A user is
+    /// never made to wait that out: a playback start goes through it, which
+    /// is the half that keeps the dwell from becoming a stall somebody can
+    /// see.
+    #[tokio::test(start_paused = true)]
+    async fn the_timer_waits_out_a_dwell_after_moving_a_torrent_and_a_playback_does_not() {
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
+        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE).await;
+
+        // The idle arm stops it, which is the transition the dwell runs from.
+        enginefs.reconcile_tick().await;
+        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
+
+        // The condition that stopped it goes away at once. Written to the
+        // flag rather than through `set_seeding_enabled`, which would
+        // reconcile for itself with the trigger that is exempt.
+        enginefs.seeding_enabled.store(true, Ordering::Relaxed);
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), Decision::Run)],
+            "the ladder wants it running again"
+        );
+        assert_eq!(
+            run_state_of(&enginefs, TEST_HASH).await,
+            RunState::Paused,
+            "and the timer leaves it alone this soon after moving it"
+        );
+        assert_eq!(counters.start_torrent.load(Ordering::SeqCst), 0);
+
+        // A user pressing play is not made to wait for it.
+        enginefs.on_stream_start(TEST_HASH, 0).await;
+        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
+        assert_eq!(counters.start_torrent.load(Ordering::SeqCst), 1);
+    }
+
+    /// The dwell is a delay and not a refusal: once it is out, the timer
+    /// starts the torrent with nobody having asked.
+    #[tokio::test(start_paused = true)]
+    async fn the_timer_starts_the_torrent_once_the_dwell_is_out() {
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
+        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE).await;
+        enginefs.reconcile_tick().await;
+        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
+
+        enginefs.seeding_enabled.store(true, Ordering::Relaxed);
+        tokio::time::advance(RECONCILE_MIN_DWELL + Duration::from_secs(1)).await;
+
+        enginefs.reconcile_tick().await;
+        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
+        assert_eq!(counters.start_torrent.load(Ordering::SeqCst), 1);
+    }
+
     /// The activity inputs, both ways round: a torrent with a stream open
     /// on it runs however long it has been since anything asked it for a
     /// byte, and the same torrent with the stream gone is stopped.
@@ -8760,6 +8821,120 @@ mod tests {
         counters.stop_gate.notify_one();
         tick.await.expect("the tick finished");
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
+    }
+
+    /// A request that walks away while its reconcile is inside the backend
+    /// leaves nothing behind: no half-applied state the next caller has to
+    /// undo, no lock nobody will release, and no detached task still
+    /// running the decision.
+    ///
+    /// Dropping a future is how every HTTP handler ends when a player
+    /// closes the connection, and the reconcile is now awaited *on* that
+    /// future rather than spawned beside it -- which is what makes this
+    /// worth pinning. Both outcomes are acceptable and either may happen:
+    /// the backend's start had already taken effect, or it had not. What
+    /// may not happen is a torrent stuck between the two, or a hash whose
+    /// reconcile lock is never released, because that would freeze every
+    /// later decision about that torrent for the life of the process.
+    #[tokio::test]
+    async fn a_reconcile_whose_caller_walked_away_leaves_nothing_behind() {
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        let enginefs = Arc::new(enginefs);
+        stop_torrent(&enginefs, TEST_HASH).await;
+
+        counters.hold_start.store(true, Ordering::SeqCst);
+        let request = tokio::spawn({
+            let enginefs = enginefs.clone();
+            async move { enginefs.on_stream_start(TEST_HASH, 0).await }
+        });
+        assert!(
+            wait_until(TEST_WAIT_BOUND, || counters
+                .start_torrent
+                .load(Ordering::SeqCst)
+                == 1)
+            .await,
+            "the reconcile reached the backend and is waiting there"
+        );
+
+        // The player closed the connection.
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        counters.start_gate.notify_one();
+
+        // Nothing is left holding the hash: a later decision about this
+        // torrent gets in, rather than waiting on a guard that was dropped
+        // with the future that held it.
+        assert!(
+            wait_until(TEST_WAIT_BOUND, || enginefs.reconcile_locks.len() == 0).await,
+            "the reconcile lock was released with the future that held it"
+        );
+
+        // And whichever way it landed, the state is one of the two the
+        // ladder recognises -- never a torrent that is neither.
+        let after = run_state_of(&enginefs, TEST_HASH).await;
+        assert!(
+            matches!(after, RunState::Paused | RunState::Live),
+            "{after:?}"
+        );
+
+        // Nothing detached is still working on it: the call count does not
+        // move on its own once the gate is open.
+        let calls = counters.start_torrent.load(Ordering::SeqCst);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            counters.start_torrent.load(Ordering::SeqCst),
+            calls,
+            "a task nobody owns is still reconciling this torrent"
+        );
+
+        // And the next reconcile finishes the job either way, which is the
+        // property that makes an abandoned reconcile harmless.
+        enginefs.reconcile_tick().await;
+        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
+    }
+
+    /// The statistics snapshot's list of stopped torrents is an
+    /// observation, taken from the backend's state machine when the
+    /// snapshot is built.
+    ///
+    /// It used to be the engines carrying an `idle_paused` flag this
+    /// process had written, which is empty in a fresh process while the
+    /// pauses it described are not -- so after every restart it reported
+    /// nothing at all, and the diagnostics line built on it read zero on
+    /// exactly the boot where somebody would be looking.
+    #[tokio::test(start_paused = true)]
+    async fn the_snapshot_lists_the_torrents_that_are_actually_stopped() {
+        let (mut enginefs, _counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+
+        assert!(
+            enginefs
+                .stream_activity_snapshot()
+                .await
+                .paused_torrents
+                .is_empty(),
+            "a running torrent is not listed"
+        );
+
+        // Stopped with no note anywhere -- which is what a pause inherited
+        // from the previous process looks like.
+        stop_torrent(&enginefs, TEST_HASH).await;
+        assert_eq!(
+            enginefs.stream_activity_snapshot().await.paused_torrents,
+            vec![TEST_HASH.to_string()]
+        );
+
+        enginefs.reconcile_tick().await;
+        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
+        assert!(
+            enginefs
+                .stream_activity_snapshot()
+                .await
+                .paused_torrents
+                .is_empty(),
+            "and it stops being listed the moment it is running again"
+        );
     }
 
     // --- free-space check before pinning ---

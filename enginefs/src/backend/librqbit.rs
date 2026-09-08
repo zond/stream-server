@@ -4161,6 +4161,252 @@ mod tests {
         );
     }
 
+    /// A reconcile that lands *during* an initial check never pauses the
+    /// torrent -- and the reader that follows it does not hang.
+    ///
+    /// This is the third librqbit shape, and the reason the ladder's first
+    /// arm is where it is. `ManagedTorrent::pause` on an `Initializing`
+    /// torrent sets the persisted flag and calls `request_pause()`;
+    /// `FileOps::initial_check` bails on that (`file_ops.rs:113`) and the
+    /// `Err` arm returns `Ok` without changing the state
+    /// (`torrent_state/mod.rs:590-593`), leaving the torrent
+    /// `Initializing` with no check running -- which
+    /// `wait_until_initialized` (`mod.rs:759`) polls for ever. Every
+    /// `/stream` request for that torrent goes through
+    /// `LibrqbitHandle::await_initialized`, so the visible symptom is a
+    /// player that never gets a first byte and a request that never
+    /// returns.
+    ///
+    /// The volume here is full, so the free-space arm wants this torrent
+    /// stopped and would make the call on any settled reading. It is the
+    /// unsettled reading, not the arm, that holds the call back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reconcile_during_an_initial_check_does_not_wedge_it() {
+        use crate::backend::TorrentHandle;
+        let tmp = tempfile::tempdir().unwrap();
+        // The payload lives outside the download dir, so the torrent this
+        // session adds is one that still wants every byte it has -- which
+        // is what the free-space arm is about. A torrent checked over its
+        // own complete data would be `finished`, and that arm would never
+        // apply to it however full the volume was.
+        let src = tmp.path().join("src");
+        tokio::fs::create_dir_all(&src).await.unwrap();
+        let payload = src.join("payload.bin");
+        write_payload(&payload, 4 * 16 * 1024).await;
+        let (torrent_bytes, hash) = make_torrent(&payload).await;
+        let dir = tmp.path().join("dl");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let (storage, gate) = gated_storage();
+        let (backend, _restored) = LibrqbitBackend::new_for_tests_with(
+            dir.clone(),
+            TestSessionOptions {
+                default_storage: Some(storage),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("open the session");
+        let handle = backend
+            .add_torrent(TorrentSource::Bytes(torrent_bytes), vec![])
+            .await
+            .expect("add the torrent");
+        gate.wait_until_held(1).await;
+
+        let available = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let probe = available.clone();
+        let mut efs = crate::BackendEngineFS::new_with_backend(
+            backend,
+            HashMap::from([(hash.clone(), handle.clone())]),
+            dir.join("cache"),
+            dir.clone(),
+        );
+        efs.set_free_space_probe(move |_| Ok(probe.load(Ordering::SeqCst)));
+
+        // Inside the window, on a volume with nothing free.
+        assert_eq!(
+            efs.reconcile_tick().await,
+            vec![(hash.clone(), crate::reconcile::Decision::Stop)],
+            "the ladder says a torrent whose check is running should not be running"
+        );
+        assert_eq!(
+            handle.run_state(),
+            RunState::Initializing {
+                pause_requested: false
+            },
+            "and it made no pause call: a pause here is what bails the check"
+        );
+
+        // The check runs to the end and the torrent settles, which a bailed
+        // check would never do.
+        gate.open();
+        let waited = Instant::now();
+        handle
+            .await_initialized()
+            .await
+            .expect("the check finished, so the reader has something to open");
+        let waited = waited.elapsed();
+        assert!(
+            waited < Duration::from_secs(30),
+            "the reader waited {waited:?} on a check that was bailed"
+        );
+        assert_eq!(handle.run_state(), RunState::Live);
+
+        // Now that the reading is settled the same full volume does stop
+        // it, which is the arm the reading was holding back.
+        efs.reconcile_tick().await;
+        assert_eq!(handle.run_state(), RunState::Paused);
+
+        // And room brings it back.
+        available.store(u64::MAX, Ordering::SeqCst);
+        efs.reconcile_tick().await;
+        assert_eq!(handle.run_state(), RunState::Live);
+    }
+
+    /// A restart, over a real persisted librqbit session, with one torrent
+    /// that the previous process had stopped: the engine that comes out is
+    /// what a fresh boot really holds.
+    ///
+    /// This is the situation every deleted record was wrong about. The
+    /// pause is in `session.json` and survived; nothing in this process
+    /// knows it exists, let alone why, and on master the three call sites
+    /// that could have lifted it all read `if idle_paused.swap(false) &&
+    /// resume()` -- `false && ...` here, so none of them ever ran.
+    ///
+    /// The free-space probe is declared, so the decisions the tests below
+    /// make are about their own inputs rather than about however much room
+    /// the machine running them happens to have.
+    #[cfg(test)]
+    async fn restarted_over_a_stopped_torrent(
+        dir: &std::path::Path,
+    ) -> (crate::BackendEngineFS<LibrqbitBackend>, String) {
+        use crate::backend::TorrentHandle;
+        tokio::fs::create_dir_all(dir).await.unwrap();
+        let payload = dir.join("movie.bin");
+        write_payload(&payload, 4 * 16 * 1024).await;
+        let (torrent_bytes, hash) = make_torrent(&payload).await;
+
+        // The process before this one: it added the torrent and stopped it.
+        {
+            let (backend, _restored) = LibrqbitBackend::new_for_tests_with(
+                dir.to_path_buf(),
+                TestSessionOptions {
+                    persist: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("open the first session");
+            let handle = backend
+                .add_torrent(TorrentSource::Bytes(torrent_bytes), vec![])
+                .await
+                .expect("add the torrent");
+            handle.await_initialized().await.expect("the check ends");
+            handle.stop_torrent().await.expect("and it is stopped");
+            let deadline = Instant::now() + TEST_WAIT_BOUND;
+            let session_json = dir.join("session.json");
+            while !session_json.exists() && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(session_json.exists(), "the session was persisted");
+        }
+
+        // This one.
+        let (backend, restored) = LibrqbitBackend::new_for_tests_with(
+            dir.to_path_buf(),
+            TestSessionOptions {
+                persist: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("open the second session");
+        assert_eq!(restored.len(), 1, "the torrent came back");
+        assert_eq!(
+            wait_until_settled(&restored[&hash]).await,
+            RunState::Paused,
+            "and it came back stopped, exactly as it was left"
+        );
+
+        let mut efs = crate::BackendEngineFS::new_with_backend(
+            backend,
+            restored,
+            dir.join("cache"),
+            dir.to_path_buf(),
+        );
+        efs.set_free_space_probe(|_| Ok(u64::MAX));
+        efs.restore_pinned_downloads().await;
+        (efs, hash)
+    }
+
+    /// What the torrent is doing, from the engine registry -- never
+    /// `is_paused()`, which across an initial check is wrong in both
+    /// directions.
+    #[cfg(test)]
+    async fn restored_run_state(
+        efs: &crate::BackendEngineFS<LibrqbitBackend>,
+        hash: &str,
+    ) -> RunState {
+        use crate::backend::TorrentHandle;
+        efs.get_engine(hash)
+            .await
+            .expect("the restored engine")
+            .handle
+            .run_state()
+    }
+
+    /// A stream starting on a torrent the last process left stopped starts
+    /// it -- over a real persisted session, which is the only place the bug
+    /// lived.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stream_starting_after_a_restart_starts_the_stopped_torrent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (efs, hash) = restarted_over_a_stopped_torrent(&tmp.path().join("dl")).await;
+
+        efs.on_stream_start(&hash, 0).await;
+
+        assert_eq!(restored_run_state(&efs, &hash).await, RunState::Live);
+    }
+
+    /// The same of `pin_download`: an offline download that is not running
+    /// is not a download. On master this site read
+    /// `if idle_paused.swap(false) && resume()`, so after a restart the pin
+    /// was recorded and nothing ever fetched a byte for it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pinning_after_a_restart_starts_the_stopped_torrent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (efs, hash) = restarted_over_a_stopped_torrent(&tmp.path().join("dl")).await;
+
+        efs.pin_download(&hash, 0, None).await.expect("the pin");
+
+        assert_eq!(restored_run_state(&efs, &hash).await, RunState::Live);
+    }
+
+    /// The same of `focus_torrent`, the third of the three dead sites.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn focusing_after_a_restart_starts_the_stopped_torrent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (efs, hash) = restarted_over_a_stopped_torrent(&tmp.path().join("dl")).await;
+
+        efs.focus_torrent(&hash).await;
+
+        assert_eq!(restored_run_state(&efs, &hash).await, RunState::Live);
+    }
+
+    /// And of the seeding switch. The user turns seeding back on after a
+    /// restart; every torrent the last process had stopped for want of it
+    /// must seed again, and on master none of them did.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn re_enabling_seeding_after_a_restart_starts_the_stopped_torrent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (efs, hash) = restarted_over_a_stopped_torrent(&tmp.path().join("dl")).await;
+        efs.seeding_enabled.store(false, Ordering::Relaxed);
+
+        efs.set_seeding_enabled(true).await;
+
+        assert_eq!(restored_run_state(&efs, &hash).await, RunState::Live);
+    }
+
     /// How far a torrent's initial check has got, or `None` once it is past
     /// initializing. `get_checked_bytes` is incremented by a whole piece as
     /// each one is taken up, before it is read
