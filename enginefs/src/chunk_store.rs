@@ -362,9 +362,11 @@ impl ChunkDir {
     ///
     /// **Crate-private, and that is the point.** There is one door into the
     /// unlink per adapter and this is not a third one: the torrent
-    /// adapter's is `StoreRoot::delete_pieces`, callable only under the
+    /// adapter's is `StoreRoot::delete_pieces`, itself crate-private and
+    /// called only from `retention`, which either holds the
     /// `DroppedFilePieces` claim that keeps the delete atomic with
-    /// librqbit's have-set, and the `/proxy` adapter's is its own. A
+    /// librqbit's have-set or has established there is no have-set to
+    /// interlock against; and the `/proxy` adapter's is its own. A
     /// generic *public* `remove` on the shared store would be exactly the
     /// second door that interlock exists to refuse -- somewhere to unlink a
     /// torrent's piece behind the backend's back and have it go on

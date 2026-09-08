@@ -102,7 +102,7 @@ sysinfo = "0.39.5"
 # Turns on the test-root registry in the same enginefs the tests link, so the
 # proxy's TLS fixture can present a chain that verifies. Feature unification
 # keeps this to test builds -- `cargo build --release` never sees it.
-enginefs = { path = "../enginefs", features = ["test-roots"] }
+enginefs = { path = "../enginefs", features = ["test-roots", "test-unlink"] }
 # Generates that fixture's CA and leaf at run time. The old fixture shipped a
 # self-signed CA certificate used as an end entity, which rustls refuses
 # whatever it is trusted as, so it could only ever be the unverifiable case.

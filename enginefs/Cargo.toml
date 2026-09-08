@@ -8,6 +8,10 @@ edition = "2024"
 # stand up an HTTPS origin whose chain actually verifies. Off in every release
 # build; `server` turns it on through its dev-dependency only.
 test-roots = []
+# Opens the piece store's unlink to `server`'s cache-cleaner tests, which
+# have no engine to go through. Off in every release build, so the cleaner
+# cannot reach the unlink in production -- see `piece_store::store`.
+test-unlink = []
 
 [dependencies]
 # default-features=false + rust-tls keeps the whole crypto stack on rustls +

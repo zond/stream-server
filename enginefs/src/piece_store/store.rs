@@ -648,7 +648,39 @@ impl StoreRoot {
     /// room, so booking zero for a delete that freed real blocks restarts
     /// the torrents onto a disk nothing gained. What could not be unlinked
     /// is logged where it happens.
-    pub fn delete_pieces(&self, info_hash: &str, pieces: impl IntoIterator<Item = u32>) -> usize {
+    /// The unlink, for a test that has no engine behind it.
+    ///
+    /// Behind a feature `server` turns on only as a dev-dependency, so it
+    /// does not exist in a release build. The cache cleaner's tests need to
+    /// stand in for what the production releaser ends at once the backend
+    /// has agreed to forget a piece, and the honest way to give them that is
+    /// a door that cannot be opened outside a test -- not a `pub` on the
+    /// real one, which would hand the cleaner itself the capability the
+    /// claim exists to withhold.
+    #[cfg(feature = "test-unlink")]
+    #[doc(hidden)]
+    pub fn delete_pieces_for_tests(
+        &self,
+        info_hash: &str,
+        pieces: impl IntoIterator<Item = u32>,
+    ) -> usize {
+        self.delete_pieces(info_hash, pieces)
+    }
+
+    /// `pub(crate)`, and that is the interlock rather than a style choice.
+    /// Unlinking a piece the backend still counts as had is the
+    /// advertise-then-serve-a-hole this whole path exists to prevent, so the
+    /// only callers are in [`crate::retention`], which has just had the
+    /// backend forget the pieces and holds the claim proving it. The cache
+    /// cleaner lives in `server` and holds a `&StoreRoot` across both of its
+    /// eviction loops; this is what stops it reaching the unlink from there,
+    /// and a `pub` here would hand it exactly the capability the claim
+    /// exists to withhold -- documented as denied is not denied.
+    pub(crate) fn delete_pieces(
+        &self,
+        info_hash: &str,
+        pieces: impl IntoIterator<Item = u32>,
+    ) -> usize {
         let chunks = self.chunks(info_hash);
         let mut removed = 0;
         for piece in pieces {
