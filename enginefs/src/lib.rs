@@ -8123,22 +8123,45 @@ mod tests {
     /// The other half of that: a torrent the backend really did stop with
     /// an error is the cleaner's to restart, and the reconciler will not
     /// touch it however much room there is.
+    ///
+    /// The restart also lets its reads park again. A torrent whose volume
+    /// was short long enough for the stall bound to fail its readers, and
+    /// which then died of the ENOSPC the bound was waiting out, comes back
+    /// through here -- and a reader opened on it afterwards must wait for
+    /// pieces that are being fetched again rather than be handed
+    /// `StorageFull` for a disk the cleaner has since emptied.
     #[tokio::test(start_paused = true)]
     async fn the_error_restart_is_the_cleaners_and_the_reconciler_leaves_it() {
         let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
-        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
-        counters.out_of_space.store(true, Ordering::SeqCst);
+        let available = Arc::new(AtomicU64::new(0));
+        let probe_available = available.clone();
+        enginefs.set_free_space_probe(move |_| Ok(probe_available.load(Ordering::SeqCst)));
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
 
+        // Stopped, then short for long enough that its readers are failed.
+        enginefs.reconcile_tick().await;
+        tokio::time::advance(STOPPED_READ_STALL_BOUND).await;
+        enginefs.reconcile_tick().await;
+        assert!(engine.reads_refused());
+
+        // And then the backend kills it outright.
+        available.store(u64::MAX, Ordering::SeqCst);
+        counters.out_of_space.store(true, Ordering::SeqCst);
         assert_eq!(
             enginefs.reconcile_tick().await,
             vec![(TEST_HASH.to_string(), Decision::Leave)]
         );
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Error);
         assert_eq!(counters.start_torrent.load(Ordering::SeqCst), 0);
+        assert!(engine.reads_refused(), "and nothing has fetched for them");
 
         assert!(enginefs.restart_from_error(TEST_HASH).await.unwrap());
         assert_eq!(counters.restart_from_error.load(Ordering::SeqCst), 1);
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
+        assert!(
+            !engine.reads_refused(),
+            "it is fetching again, so a read on it waits rather than fails"
+        );
     }
 
     /// To the backend a torrent the reconciler stopped is merely paused,
