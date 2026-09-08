@@ -588,11 +588,16 @@ async fn clean_cache_with_headroom(
             .collect();
         let evictors: Vec<_> = roots.stopped.iter().map(StoppedTorrent::evictor).collect();
         let release = releaser(state.engine.clone());
+        // The live promise, asked at each unlink. `roots.gate` was filled
+        // before the walk below and goes stale under a reader that seeks.
+        let retention = state.proxy_cache.retention().clone();
+        let still_free = move |path: &std::path::Path| retention.still_free(path);
         evict(
             &roots.root,
             &roots.store,
             &roots.gate,
             &release,
+            &still_free,
             &stopped,
             &evictors,
             roots.limit,
@@ -853,11 +858,12 @@ impl EvictionReport {
 /// which covers live engines and the dormant pins that have no engine to
 /// speak for them.
 #[allow(clippy::too_many_arguments)]
-async fn evict<E, R>(
+async fn evict<E, R, S>(
     download_dir: &std::path::Path,
     store: &enginefs::piece_store::StoreRoot,
     gate: &enginefs::retention::ReclaimGate,
     release: &R,
+    still_free: &S,
     stopped: &[String],
     evictors: &[E],
     limit: CacheLimit,
@@ -866,6 +872,7 @@ async fn evict<E, R>(
 where
     E: for<'a> Fn(&'a str) -> BoxFuture<'a, anyhow::Result<bool>>,
     R: for<'a> Fn(&'a str, u32) -> BoxFuture<'a, bool>,
+    S: Fn(&std::path::Path) -> bool,
 {
     debug_assert_eq!(stopped.len(), evictors.len());
     // 1. Walk. On the blocking pool, not on the worker this future is
@@ -906,7 +913,7 @@ where
     let mut aged_out_files = 0usize;
     for (item, size) in aged_out {
         info!("Older than 30 days, deleting: {}", item);
-        match reclaim(&item, release, download_dir).await {
+        match reclaim(&item, release, still_free, download_dir).await {
             Ok(true) => {
                 aged_out_bytes += size;
                 aged_out_files += 1;
@@ -991,7 +998,7 @@ where
             }
 
             debug!("Deleting (size limit): {}", item);
-            match reclaim(&item, release, download_dir).await {
+            match reclaim(&item, release, still_free, download_dir).await {
                 Ok(true) => {
                     total_size = total_size.saturating_sub(size);
                     freed_space += size;
@@ -1369,16 +1376,27 @@ impl WalkInputs {
 /// `DiskFullRecovery` exists to stop. A piece the backend refuses to forget
 /// answers the same way, and for a reason of the same shape: the bytes are
 /// still there and no delete of ours may reach them.
-async fn reclaim<R>(
+async fn reclaim<R, S>(
     item: &Reclaimable,
     release: &R,
+    still_free: &S,
     download_dir: &std::path::Path,
 ) -> std::io::Result<bool>
 where
     R: for<'a> Fn(&'a str, u32) -> BoxFuture<'a, bool>,
+    S: Fn(&std::path::Path) -> bool,
 {
     match item {
         Reclaimable::File(path) => {
+            // Asked again here, not only in the gate this pass carries. That
+            // gate was filled before a walkdir over the whole root and before
+            // every delete ahead of this one; a reader that seeks meanwhile
+            // promises chunks the snapshot calls free. The torrent arm below
+            // has always re-asked -- `release` goes to the engine, which
+            // consults the live policy -- and this is its sibling.
+            if !still_free(path) {
+                return Ok(false);
+            }
             // A walked file that is already gone stays an `Err(NotFound)`,
             // as it has always been: not counted either way, and this arm
             // has no second reading of the disk to reconcile with the
@@ -1557,6 +1575,61 @@ mod tests {
         }
     }
 
+    /// A file the live promise refuses is not unlinked, whatever the gate
+    /// this pass is carrying says.
+    ///
+    /// `evict`'s gate is filled once, before the walk and before every
+    /// delete ahead of this one, so a reader that seeks meanwhile promises
+    /// chunks the gate calls free. The torrent arm has always re-asked --
+    /// `release` goes to the engine and it consults the live policy -- and
+    /// this is the file arm's sibling. Without it the promise is a reading
+    /// rather than a refusal, and the player loses the bytes under its head.
+    #[tokio::test]
+    async fn a_file_the_live_promise_refuses_survives_the_pass() {
+        let tmp = tempfile::tempdir().expect("a scratch root");
+        let root = tmp.path();
+        let kept = root.join("entity").join("0").join("4");
+        let taken = root.join("entity").join("0").join("9");
+        // `kept` is the older, so the size rule reaches for it first and the
+        // refusal is what it runs into.
+        std::fs::create_dir_all(kept.parent().unwrap()).unwrap();
+        std::fs::write(&kept, vec![0u8; 64 * 1024]).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&taken, vec![0u8; 64 * 1024]).unwrap();
+
+        // A cap between one file and two, so the rule evicts exactly one --
+        // and above a single file's size, or the "bigger than the whole cap
+        // is kept" arm above would skip both.
+        let limit = CacheLimit::configured(100_000);
+        let gate = ReclaimGate::default();
+        let kept_for_closure = kept.clone();
+        let report = evict(
+            root,
+            &store(root),
+            &gate,
+            &store_releaser(store(root)),
+            // The live answer, taken at the door and disagreeing with the
+            // gate about the file the rule wants -- which is what a seek
+            // does while the walk is still running.
+            &move |path: &Path| path != kept_for_closure,
+            &[],
+            &no_evictors(),
+            limit,
+            0,
+        )
+        .await
+        .expect("a pass");
+
+        assert!(
+            kept.exists(),
+            "the live promise refused the file the rule reached for: report={report:?}"
+        );
+        assert!(
+            !taken.exists(),
+            "so it took the next one instead, rather than giving up: report={report:?}"
+        );
+    }
+
     /// `evict` over the one torrent-data root, with nothing stopped and
     /// nothing to evict first: the shape a pass has whenever no torrent is
     /// in the backend's error state.
@@ -1570,6 +1643,9 @@ mod tests {
             &store(download_dir),
             gate,
             &store_releaser(store(download_dir)),
+            // No proxy retention behind these tests, so nothing is promised
+            // and the gate they build is the whole answer.
+            &|_: &std::path::Path| true,
             &[],
             &no_evictors(),
             limit,
@@ -2101,6 +2177,8 @@ mod tests {
             &store(&root),
             &dead_torrents(&[HASH]),
             &store_releaser(store(&root)),
+            // No proxy retention behind these tests.
+            &|_: &std::path::Path| true,
             &[],
             &no_evictors(),
             CacheLimit::configured(occupied - dead_occupancy / 2),
@@ -2122,6 +2200,8 @@ mod tests {
             &store(&root),
             &dead_torrents(&[OTHER_HASH]),
             &store_releaser(store(&root)),
+            // No proxy retention behind these tests.
+            &|_: &std::path::Path| true,
             &[],
             &no_evictors(),
             CacheLimit::configured(occupancy(&old_film) + occupancy(&p1)),
@@ -2263,6 +2343,8 @@ mod tests {
             &store(&root),
             &ReclaimGate::default(),
             &refuse,
+            // No proxy retention behind these tests.
+            &|_: &std::path::Path| true,
             &[],
             &no_evictors(),
             CacheLimit::configured(u64::MAX),
@@ -2333,6 +2415,8 @@ mod tests {
             &store(&root),
             &ReclaimGate::default(),
             &store_releaser(store(&root)),
+            // No proxy retention behind these tests.
+            &|_: &std::path::Path| true,
             &stopped,
             &[fake_evictor(&calls, &root, true)],
             CacheLimit::configured(old_occupancy + partial_occupancy - old_occupancy / 2),
@@ -2360,6 +2444,8 @@ mod tests {
             &store(&root),
             &ReclaimGate::default(),
             &store_releaser(store(&root)),
+            // No proxy retention behind these tests.
+            &|_: &std::path::Path| true,
             &stopped,
             &[fake_evictor(&calls, &root, true)],
             CacheLimit::configured(partial_occupancy / 2),
@@ -2384,6 +2470,8 @@ mod tests {
             &store(&root),
             &ReclaimGate::default(),
             &store_releaser(store(&root)),
+            // No proxy retention behind these tests.
+            &|_: &std::path::Path| true,
             &stopped,
             &[fake_evictor(&calls, &root, false)],
             CacheLimit::configured(partial_occupancy / 2),
@@ -2429,6 +2517,8 @@ mod tests {
             &store(&root),
             &ReclaimGate::default(),
             &store_releaser(store(&root)),
+            // No proxy retention behind these tests.
+            &|_: &std::path::Path| true,
             &[],
             &no_evictors(),
             CacheLimit::configured(occupied),

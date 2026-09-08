@@ -496,6 +496,27 @@ impl ProxyRetention {
     /// and [`IDLE`] has passed since its last delivered byte -- so what a
     /// map that was never pruned could grow is one entry per entity played
     /// since the last pass, and not one per URL ever played.
+    /// Whether this path is still outside every live window, asked at the
+    /// instant of the unlink rather than read from a gate.
+    ///
+    /// **The second asking, and the sibling of the torrent side's.** The
+    /// gate the cleaner carries was filled before a walkdir over the whole
+    /// root -- sixteen thousand files on the television that prompted the
+    /// debounce -- and before every delete ahead of this one. A reader that
+    /// seeks in that time promises chunks the snapshot says are free, and
+    /// unlinking one costs the player a broken read and the origin the same
+    /// fetch again, which are the two things a cache is for. So the promise
+    /// is a refusal at the door and not only a reading taken at the start.
+    ///
+    /// `true` for anything this has no opinion about: a path that is not a
+    /// chunk name, an entity nothing is reading. The cleaner's own rules
+    /// decide those, as they did before.
+    pub fn still_free(&self, path: &std::path::Path) -> bool {
+        let mut gate = ReclaimGate::default();
+        self.fill_gate(&mut gate);
+        gate.releases_file(path)
+    }
+
     pub fn fill_gate(&self, gate: &mut ReclaimGate) {
         let Ok(mut streams) = self.streams.lock() else {
             return;
@@ -681,9 +702,26 @@ impl LiveStream {
         self.policy = None;
         self.bounded = false;
         self.stride = 1;
-        // A different budget is a different shape, so the windows the last
-        // one's passes chose say nothing about this one.
-        self.windows.clear();
+        // Every reader is due again. A budget is a different shape, so the
+        // stride the last one's passes measured against is not this one's,
+        // and `passed_at` is where a reader stood for a pass that no longer
+        // describes anything: left standing, a reader that has not travelled
+        // a whole *new* stride is never due, so no pass runs and the windows
+        // below are never rebuilt. A paused player never moves at all.
+        for reader in self.readers.values_mut() {
+            reader.passed_at = None;
+        }
+        // The windows are NOT cleared. They are the last measurement a pass
+        // really made, and `fill_gate` reads empty windows beside a live
+        // reader as "protect the whole entity" -- the honest answer when
+        // nothing has ever been measured, and a wrong one the moment it
+        // means "measured, but against a budget one byte different". The
+        // budget is `CacheLimit::effective` minus headroom, which moves with
+        // the volume's free space, so it differs on most passes: clearing
+        // here made the fallback the normal case and the proxy cache
+        // effectively unreclaimable. A window measured against a slightly
+        // different budget is superseded by the next pass, which the reset
+        // above makes due on the next delivered byte.
         let CacheBudget::Bytes(bytes) = budget else {
             return;
         };
@@ -718,6 +756,53 @@ impl LiveStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A promise made after the cleaner took its reading still refuses the
+    /// unlink.
+    ///
+    /// The gate a pass carries is filled once, before a walkdir over the
+    /// whole root -- sixteen thousand files on the television that prompted
+    /// the debounce -- and before every delete ahead of this one. A reader
+    /// that seeks in that time promises chunks the reading calls free, and
+    /// unlinking one costs the player a broken read and the origin the same
+    /// fetch again, which are the two things a cache is for.
+    ///
+    /// The torrent half has always re-asked: its delete goes to the engine,
+    /// which consults the live policy under the lock. This is the sibling,
+    /// and it was missing -- the promise was a snapshot rather than a
+    /// refusal at the door.
+    #[tokio::test]
+    async fn a_promise_made_since_the_reading_still_refuses_the_unlink() {
+        let tmp = tempfile::tempdir().expect("a scratch root");
+        let dir = ChunkDir::new(tmp.path().join("entity"));
+        write_chunks(&dir, [4]);
+        let path = dir.chunk_path(4);
+        let retention = retention(Some(CHUNK_BYTES));
+
+        // The reading the cleaner would take: nothing is promised, so the
+        // chunk is free.
+        let mut reading = ReclaimGate::default();
+        retention.fill_gate(&mut reading);
+        assert!(
+            reading.releases_file(&path),
+            "with nothing open, the chunk is ordinary cache"
+        );
+        assert!(retention.still_free(&path));
+
+        // A reader opens and promises that very chunk, which is what a seek
+        // does while the walk is still running.
+        let reader = retention.reader(&dir, TOTAL);
+        reader.promises(4..5);
+
+        assert!(
+            reading.releases_file(&path),
+            "the reading is a snapshot and cannot know: this is the defect"
+        );
+        assert!(
+            !retention.still_free(&path),
+            "but asked now, the promise refuses the unlink"
+        );
+    }
 
     /// A 4 MiB entity: sixteen chunks.
     const TOTAL: u64 = 16 * CHUNK_BYTES;
