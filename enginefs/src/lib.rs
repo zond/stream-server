@@ -2590,6 +2590,23 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             info_hash,
             file_idx
         );
+
+        // Last, because the stream has to be registered before the question
+        // is asked: `Trigger::PlaybackStart` says *why* the decision is
+        // being taken, not that anything is playing, and `playing` is read
+        // from the registers above like every other condition.
+        //
+        // It is here because of the hysteresis band. A torrent stopped for
+        // want of space is not started again by a timer until the volume
+        // clears the floor *plus* `FREE_SPACE_RESUME_MARGIN`, and in
+        // between a request would otherwise open a reader on a torrent
+        // nothing is fetching for -- the player's spinner, with no end and
+        // no error. A user pressing play is owed the floor itself, which is
+        // what this trigger is measured against, and `resume_torrent` above
+        // cannot do it: the reconciler's stop is deliberately not a pause
+        // that call can lift.
+        self.reconcile_hash(&info_hash, crate::reconcile::Trigger::PlaybackStart)
+            .await;
     }
 
     async fn activate_file(
@@ -4775,6 +4792,13 @@ mod tests {
         /// fake torrent is always running, and anything that reconciles a
         /// run state would be tested against a torrent that never obeys.
         paused: AtomicBool,
+        /// Whether the pause it is under is the *idle* one, which is the
+        /// only pause `resume_torrent` may lift -- `LibrqbitBackend` keeps
+        /// the same distinction in its `IdlePauses` set. A fake whose
+        /// `resume_torrent` lifted any pause would quietly answer for the
+        /// reconciler in every test where a playback starts on a stopped
+        /// torrent.
+        idle_pause: AtomicBool,
         /// How many times `has_metadata` was asked -- the reconciler's tick
         /// asks every torrent once per pass, so this is how a test sees the
         /// loop actually running.
@@ -5224,9 +5248,12 @@ mod tests {
             !self.files.is_empty()
         }
 
+        /// Lifts the idle pause and no other, as the real backend's does.
         async fn resume_torrent(&self) -> Result<()> {
             self.counters.resume_torrent.fetch_add(1, Ordering::SeqCst);
-            self.counters.paused.store(false, Ordering::SeqCst);
+            if self.counters.idle_pause.swap(false, Ordering::SeqCst) {
+                self.counters.paused.store(false, Ordering::SeqCst);
+            }
             Ok(())
         }
 
@@ -5254,6 +5281,7 @@ mod tests {
                 anyhow::bail!("already paused");
             }
             Ok(())
+            // Recorded nowhere, so `resume_torrent` cannot lift it.
         }
 
         /// Refuses a torrent that is not stopped, as `Session::unpause`
@@ -5267,6 +5295,7 @@ mod tests {
             self.counters.start_torrent.fetch_add(1, Ordering::SeqCst);
             if !self.counters.swallow_start.load(Ordering::SeqCst) {
                 self.counters.paused.store(false, Ordering::SeqCst);
+                self.counters.idle_pause.store(false, Ordering::SeqCst);
             }
             Ok(())
         }
@@ -5282,12 +5311,14 @@ mod tests {
                 .fetch_add(1, Ordering::SeqCst);
             self.counters.out_of_space.store(false, Ordering::SeqCst);
             self.counters.paused.store(false, Ordering::SeqCst);
+            self.counters.idle_pause.store(false, Ordering::SeqCst);
             Ok(())
         }
 
         async fn pause_torrent(&self) -> Result<()> {
             self.counters.pause_torrent.fetch_add(1, Ordering::SeqCst);
             self.counters.paused.store(true, Ordering::SeqCst);
+            self.counters.idle_pause.store(true, Ordering::SeqCst);
             Ok(())
         }
 
@@ -7902,28 +7933,65 @@ mod tests {
 
         // A playback starting on it lifts the idle pause -- that is what
         // `resume_torrent` is for, and it cannot tell one pause from
-        // another. The reconciler is what refuses to leave it running:
-        // measured against the floor, which is what the volume is under, it
-        // is stopped again, and nothing here consults a record of who
-        // stopped it first.
+        // another. The reconcile `on_stream_start` takes is what refuses to
+        // leave it running: measured against the floor, which is what the
+        // volume is under, and consulting no record of who stopped it
+        // first.
+        enginefs.on_stream_start(TEST_HASH, 0).await;
+        assert_eq!(
+            run_state_of(&enginefs, TEST_HASH).await,
+            RunState::Paused,
+            "nothing left it running on the full volume"
+        );
+        assert_eq!(
+            counters.start_torrent.load(Ordering::SeqCst),
+            0,
+            "and the reconciler did not start it either"
+        );
+    }
+
+    /// The hysteresis band is a window a starting playback must not fall
+    /// into, and `on_stream_start` is what closes it.
+    ///
+    /// A torrent stopped for want of space is not started again by a timer
+    /// until the volume has cleared the floor *plus* the resume margin --
+    /// the margin exists so a timer does not restart something into a
+    /// nearly-full volume for nobody. A user pressing play is not nobody,
+    /// and inside that band nothing else would start the torrent for them:
+    /// `resume_torrent`, which every playback start calls, cannot lift the
+    /// reconciler's stop by design. The reader would open on a torrent
+    /// nothing is fetching for and park -- a spinner with no end and no
+    /// error, which is the failure the stall bound exists to convert into
+    /// an error twenty seconds later.
+    #[tokio::test(start_paused = true)]
+    async fn a_playback_starting_inside_the_hysteresis_band_starts_the_torrent() {
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
+        let available = Arc::new(AtomicU64::new(CACHE_FREE_SPACE_FLOOR - 1));
+        let probe_available = available.clone();
+        enginefs.set_free_space_probe(move |_| Ok(probe_available.load(Ordering::SeqCst)));
+
+        enginefs.reconcile_tick().await;
+        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
+
+        // Inside the band: over the floor, under the floor plus the margin.
+        available.store(
+            CACHE_FREE_SPACE_FLOOR + FREE_SPACE_RESUME_MARGIN - 1,
+            Ordering::SeqCst,
+        );
+        enginefs.reconcile_tick().await;
+        assert_eq!(
+            run_state_of(&enginefs, TEST_HASH).await,
+            RunState::Paused,
+            "a timer leaves it alone in the band, which is what the margin is for"
+        );
+
         enginefs.on_stream_start(TEST_HASH, 0).await;
         assert_eq!(
             run_state_of(&enginefs, TEST_HASH).await,
             RunState::Live,
-            "the playback start put it back on the full volume"
+            "the reader about to open on it has something fetching for it"
         );
-        assert_eq!(
-            enginefs
-                .reconcile_hash(TEST_HASH, Trigger::PlaybackStart)
-                .await,
-            Some(Decision::Stop)
-        );
-        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
-        assert_eq!(
-            counters.start_torrent.load(Ordering::SeqCst),
-            0,
-            "nothing put it back onto the full volume"
-        );
+        assert_eq!(counters.start_torrent.load(Ordering::SeqCst), 1);
     }
 
     /// The idle pause has an owner, and it is not this reconciler yet.
