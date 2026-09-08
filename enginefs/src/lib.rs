@@ -2954,15 +2954,31 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             .await;
         if let Err(error) = checked {
             // Torn down only when demonstrably this pin's and nobody
-            // else's: this call started the add and nothing joined it while
-            // metadata resolved. A stream request that looked the hash up
-            // meanwhile joined this very add and is holding the same
-            // engine, and dropping the torrent from the backend fails every
-            // read it is about to make (and any it has already opened), so
-            // a joined torrent stays for the idle sweeper. What this cannot
-            // see is a lookup that found the *published* engine between the
-            // add finishing and this check -- a window of one free-space
-            // probe rather than of a metadata resolution.
+            // else's, which takes two questions and not one.
+            //
+            // *Was the add mine?* This call started it and nothing joined
+            // it while metadata resolved (`joiners` counts the lookups that
+            // found the add in flight and waited on it). A stream request
+            // that looked the hash up meanwhile joined this very add and is
+            // holding the same engine, and dropping the torrent from the
+            // backend fails every read it is about to make (and any it has
+            // already opened), so a joined torrent stays for the idle
+            // sweeper.
+            //
+            // *Is anyone on it now?* `joiners` cannot answer that: it
+            // counts who joined the **pending add**, and the engine has
+            // been published by the time this runs, so every lookup after
+            // that -- a stream opening on the freshly resolved torrent
+            // being exactly the one that matters -- finds the engine and
+            // increments nothing. The window is not one free-space probe
+            // wide either: it spans the whole precondition check, which
+            // awaits `file_count()` and `stats()` before it ever probes.
+            // So the live registers are asked as well
+            // ([`Self::torrent_activity_registers`]: the engine's own
+            // stream count and the three activity maps), the same evidence
+            // the idle arm uses for "nobody is watching this". Without
+            // them a reader that opened inside that window had its torrent
+            // dropped from the session under it.
             //
             // It used to take the torrent's placement as the evidence
             // instead ("it sits in the folder only pins place under"),
@@ -2979,7 +2995,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             // this pin's to delete. That is why nothing here asks where a
             // torrent's data is: it used to take the files whenever the
             // pin's own placement folder had not existed before the add.
-            let added_by_this_pin = started_here && joiners == 0 && !engine.is_pinned();
+            let added_by_this_pin = started_here
+                && joiners == 0
+                && !engine.is_pinned()
+                && !self.torrent_activity_registers(info_hash, &engine).await;
             if added_by_this_pin {
                 self.remove_engine_if_current(&engine).await;
                 if let Err(e) = self.backend.remove_torrent(info_hash).await {
@@ -3047,14 +3066,17 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// pinned (the caller wants the download gone; a pin lost to a crash
     /// must not leave the bytes behind), see
     /// `Self::delete_download_data`: the whole torrent when this was its
-    /// last pin, only this file while other pins hold. A dormant pin has no
-    /// torrent to delete anything of beyond its placement folder under the
-    /// downloads dir, which this layer named itself and removes
-    /// (`Self::delete_dormant_download_data`) -- while the pin stands
-    /// [`Self::protected_paths`] keeps the cleaner off it, so this is what
-    /// takes it now rather than in thirty days. What was
-    /// really deleted is reported, not what was asked for
-    /// ([`UnpinOutcome`]). A `file_idx` the torrent does not
+    /// last pin, only this file while other pins hold. A *dormant* pin has
+    /// no engine to delete anything through, so its bytes -- the torrent's
+    /// directory in the piece store -- are taken by
+    /// `Self::delete_dormant_download_data`, which first makes sure the
+    /// session neither holds nor is adding the torrent; while the pin
+    /// stands [`Self::protected_paths`] keeps the cleaner off that
+    /// directory, so this is what takes it now rather than in thirty days.
+    /// With no engine **and** no pin there is nothing this call may delete:
+    /// the bytes belong to no download it knows of and stay for the
+    /// cleaner. What was really deleted is reported, not what was asked
+    /// for ([`UnpinOutcome`]). A `file_idx` the torrent does not
     /// have is then refused with [`PinDownloadError::FileNotFound`], as
     /// [`Self::pin_download`] refuses it: a stale index must not be read as
     /// "delete the whole torrent".
@@ -3110,7 +3132,16 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 self.persist_pinned_downloads().await;
                 tracing::info!(info_hash, file_idx, "dormant_download_unpinned");
             }
+            // `was_dormant` is the warrant, and there is no other one
+            // here. Without an engine and without a pin this layer holds
+            // no record tying the hash's bytes to a download at all: they
+            // are whatever an earlier stream left in the store, which is
+            // the cleaner's to reclaim by age, not this call's to unlink.
+            // Ungated, an unpin of a hash nobody ever pinned -- a stale
+            // client index, a retry after the registry dropped the engine
+            // -- was a delete of any torrent's cache.
             let deleted_files = delete_files
+                && was_dormant
                 && self
                     .delete_dormant_download_data(&info_hash, file_idx, hash_still_pinned)
                     .await;
@@ -3192,11 +3223,32 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// answers for every pin, because a pin is a retention flag and the
     /// store is the one place a torrent's bytes are.
     ///
-    /// There is no have-set to keep in step here: the backend does not have
-    /// this torrent, which is what dormant means, so nothing in the session
-    /// believes it holds these pieces. (A live torrent's per-file delete is
-    /// the opposite case, and `Self::delete_download_data` holds
-    /// `drop_file_pieces`' claim across the unlink for it.)
+    /// **That precondition is checked here rather than assumed.** The
+    /// caller reached this path because the *registry* had no engine, and
+    /// the registry is not the session: [`Self::remove_engine`] drops an
+    /// entry and leaves the torrent running (the TUI's delete key does
+    /// exactly that, and so does the idle sweep for the moment between
+    /// dropping the entry and telling the backend), and a magnet add
+    /// parks the hash outside both for as long as metadata takes. Unlinking
+    /// the directory in either case is the corruption this layer exists to
+    /// avoid: the torrent goes on believing it holds those pieces,
+    /// advertises them, and answers a peer's request with a read past the
+    /// end of nothing. So the session is asked -- [`TorrentBackend::get_torrent`]
+    /// and [`Self::pending_magnet_add`] -- and only a hash it has never
+    /// heard of is deleted by hand. A torrent it *does* hold is deleted
+    /// through the backend instead ([`TorrentBackend::remove_torrent_and_files`]),
+    /// which takes the torrent out of the session before its storage
+    /// releases the pieces: the same interlock, kept in the same one place.
+    /// A hash still being added is left alone entirely -- there is no
+    /// handle to remove it through yet, and the add is about to give the
+    /// torrent a have-set built from the pieces on disk.
+    ///
+    /// There is no have-set to keep in step for the remaining case: the
+    /// backend does not have this torrent, which is what dormant means, so
+    /// nothing in the session believes it holds these pieces. (A live
+    /// torrent's per-file delete is the opposite case, and
+    /// `Self::delete_download_data` holds `drop_file_pieces`' claim across
+    /// the unlink for it.)
     ///
     /// Nothing goes while another file of the same hash is still pinned --
     /// the directory holds that file's pieces too. Either way the bytes are
@@ -3217,6 +3269,36 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 "other files of the torrent are still pinned; its pieces stay"
             );
             return false;
+        }
+        if self.pending_magnet_add(info_hash).await.is_some() {
+            tracing::warn!(
+                info_hash,
+                file_idx,
+                "the torrent is being added right now; its pieces stay for the add to find"
+            );
+            return false;
+        }
+        if self.backend.get_torrent(info_hash).await.is_some() {
+            // Not dormant at all: the registry lost the engine but the
+            // session still holds the torrent. It goes through the backend,
+            // whose delete removes the torrent first and releases the
+            // pieces through its storage -- never by hand, behind a
+            // have-set that would go on advertising them.
+            return match self.backend.remove_torrent_and_files(info_hash).await {
+                Ok(()) => {
+                    tracing::info!(info_hash, file_idx, "download_deleted_through_the_session");
+                    true
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        info_hash,
+                        file_idx,
+                        %error,
+                        "could not delete the torrent the session still holds"
+                    );
+                    false
+                }
+            };
         }
         let folder = self.piece_dir(info_hash);
         match tokio::fs::remove_dir_all(&folder).await {
@@ -8589,6 +8671,51 @@ mod tests {
         assert_eq!(enginefs.backend.placements.lock().unwrap().len(), 1);
     }
 
+    /// `joiners` counts who joined the *pending add*, and by the time the
+    /// preconditions are checked the engine has been published: a stream
+    /// that opens on the freshly resolved torrent finds the engine, joins
+    /// nothing, and is invisible to that count. The window is the whole
+    /// precondition check -- `file_count()`, `stats()` and the free-space
+    /// probe -- so the refusal asks the live activity registers too, and
+    /// leaves the torrent to the reader that is on it.
+    #[tokio::test]
+    async fn a_refused_pin_leaves_the_torrent_a_reader_took_while_it_checked() {
+        let (mut enginefs, _counters) = test_enginefs_unmanaged();
+        let engines = enginefs.engines.clone();
+        enginefs.set_free_space_probe(move |_| {
+            // A stream-shaped read of the published engine, inside the
+            // window: it registers on the engine and holds it.
+            let engine = engines
+                .try_read()
+                .expect("the registry is idle here")
+                .get(TEST_HASH)
+                .cloned()
+                .expect("the add published its engine before this check");
+            engine.active_streams.fetch_add(1, Ordering::SeqCst);
+            Ok(0)
+        });
+
+        assert!(matches!(
+            enginefs.pin_download(TEST_HASH, 0, None).await,
+            Err(PinDownloadError::InsufficientSpace { .. })
+        ));
+        let engine = enginefs
+            .get_engine(TEST_HASH)
+            .await
+            .expect("the reader's torrent stays registered");
+        assert!(!engine.is_pinned());
+        assert!(
+            enginefs.backend.removed.lock().unwrap().is_empty()
+                && enginefs
+                    .backend
+                    .removed_with_files
+                    .lock()
+                    .unwrap()
+                    .is_empty(),
+            "and stays in the session, instead of being dropped under the read"
+        );
+    }
+
     /// The other order: the pin's add is the one in flight and a stream
     /// request joins *it*. A teardown that took the torrent whenever this
     /// call had started the add would remove it -- with its files -- from
@@ -9905,6 +10032,155 @@ mod tests {
         assert_eq!(
             read_pinned_downloads(&enginefs.pinned_downloads_path()),
             serde_json::json!({})
+        );
+    }
+
+    /// The registry is not the session. `remove_engine` drops the registry
+    /// entry and leaves the torrent running in the backend -- it is what
+    /// the TUI's delete key does, and the idle sweep's own first step --
+    /// so an unpin arriving afterwards finds no engine while the torrent is
+    /// very much alive. Nothing was pinned and nothing may be deleted: the
+    /// bytes in the store belong to a torrent this call has no engine to
+    /// reach, and unlinking them by hand is exactly the have-set desync
+    /// `delete_download_data` holds a claim across the unlink to avoid.
+    #[tokio::test]
+    async fn an_unpin_of_a_hash_the_registry_lost_leaves_the_live_torrent_alone() {
+        let (enginefs, _counters) = test_enginefs_unmanaged();
+        let pieces = crate::piece_store::root_in(&enginefs.download_dir).join(TEST_HASH);
+        std::fs::create_dir_all(pieces.join("0")).unwrap();
+        let piece = pieces.join("0").join("1");
+        std::fs::write(&piece, [7u8; 100]).unwrap();
+
+        enginefs.get_or_add_engine(TEST_HASH).await.unwrap();
+        enginefs.remove_engine(TEST_HASH).await;
+        assert!(enginefs.get_engine(TEST_HASH).await.is_none());
+        assert!(
+            enginefs
+                .get_backend()
+                .get_torrent(TEST_HASH)
+                .await
+                .is_some(),
+            "the session still has it, which is the whole point"
+        );
+
+        assert_eq!(
+            enginefs.unpin_download(TEST_HASH, 0, true).await.unwrap(),
+            UnpinOutcome {
+                unpinned: false,
+                deleted_files: false,
+            }
+        );
+        assert!(
+            piece.is_file(),
+            "no pin was removed, so nothing here has any warrant to delete the torrent's bytes"
+        );
+        assert!(
+            enginefs.backend.removed.lock().unwrap().is_empty()
+                && enginefs
+                    .backend
+                    .removed_with_files
+                    .lock()
+                    .unwrap()
+                    .is_empty(),
+            "and the torrent nobody unpinned stays in the session"
+        );
+    }
+
+    /// The same lost-engine window, but with a dormant pin behind it, so
+    /// the delete does have its warrant. The bytes still may not be
+    /// unlinked by hand -- the session holds the torrent and would go on
+    /// advertising the pieces -- so the delete goes through the backend,
+    /// which drops the torrent before its storage releases them.
+    #[tokio::test]
+    async fn a_dormant_pins_delete_goes_through_the_session_that_still_holds_the_torrent() {
+        let (enginefs, _counters) = test_enginefs_unmanaged();
+        let pieces = crate::piece_store::root_in(&enginefs.download_dir).join(TEST_HASH);
+        std::fs::create_dir_all(pieces.join("0")).unwrap();
+        let piece = pieces.join("0").join("1");
+        std::fs::write(&piece, [7u8; 100]).unwrap();
+        std::fs::create_dir_all(&enginefs.download_dir).unwrap();
+        std::fs::write(
+            enginefs.pinned_downloads_path(),
+            serde_json::to_vec(&serde_json::json!({ TEST_HASH: [0] })).unwrap(),
+        )
+        .unwrap();
+        // Dormant: the registry has no engine for it, whatever the session
+        // holds.
+        assert_eq!(enginefs.restore_pinned_downloads().await, 0);
+
+        assert_eq!(
+            enginefs.unpin_download(TEST_HASH, 0, true).await.unwrap(),
+            UnpinOutcome {
+                unpinned: true,
+                deleted_files: true,
+            }
+        );
+        assert_eq!(
+            enginefs
+                .backend
+                .removed_with_files
+                .lock()
+                .unwrap()
+                .as_slice(),
+            &[TEST_HASH.to_string()],
+            "deleted through the session, which takes the torrent out before its storage frees \
+             the pieces"
+        );
+        assert!(
+            piece.is_file(),
+            "and not by hand behind a torrent that still advertises them"
+        );
+    }
+
+    /// A magnet add parks its hash outside both the registry and the
+    /// backend for as long as metadata takes, and the pin lock does not
+    /// cover a *stream's* add. An unpin landing in that window must leave
+    /// the store alone: the torrent being added builds its have-set from
+    /// the pieces that are there, and a directory removed under it is the
+    /// same desync by another route.
+    #[tokio::test]
+    async fn a_dormant_pins_delete_leaves_an_add_in_flight_its_pieces() {
+        let (enginefs, _counters) = test_enginefs_unmanaged();
+        let pieces = crate::piece_store::root_in(&enginefs.download_dir).join(TEST_HASH);
+        std::fs::create_dir_all(pieces.join("0")).unwrap();
+        let piece = pieces.join("0").join("1");
+        std::fs::write(&piece, [7u8; 100]).unwrap();
+        std::fs::create_dir_all(&enginefs.download_dir).unwrap();
+        std::fs::write(
+            enginefs.pinned_downloads_path(),
+            serde_json::to_vec(&serde_json::json!({ TEST_HASH: [0] })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(enginefs.restore_pinned_downloads().await, 0);
+
+        // The session has not got the torrent yet -- it is being added.
+        enginefs.backend.hide_torrents.store(true, Ordering::SeqCst);
+        enginefs.backend.hold_add.store(true, Ordering::SeqCst);
+        let adding = match enginefs.get_or_begin_add_magnet(TEST_HASH, None).await {
+            EngineLookup::Adding(pending) => pending,
+            _ => panic!("the stream's add should be in flight"),
+        };
+
+        assert_eq!(
+            enginefs.unpin_download(TEST_HASH, 0, true).await.unwrap(),
+            UnpinOutcome {
+                unpinned: true,
+                deleted_files: false,
+            },
+            "the pin goes; the bytes the add is about to claim do not"
+        );
+        assert!(piece.is_file(), "left for the add to find");
+
+        enginefs.backend.hold_add.store(false, Ordering::SeqCst);
+        enginefs.backend.add_hold.add_permits(1);
+        adding.done.await.expect("the add finishes");
+        assert!(
+            enginefs.get_engine(TEST_HASH).await.is_some(),
+            "and the engine is live immediately after"
+        );
+        assert!(
+            piece.is_file(),
+            "holding pieces the session was never told had gone"
         );
     }
 
