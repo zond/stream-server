@@ -1194,6 +1194,77 @@ mod tests {
         );
     }
 
+    /// **Reading bytes off the disk is a playhead too.**
+    ///
+    /// The two places a proxied byte reaches a player are this body and the
+    /// origin's on its way past, and only one of them is on the path that
+    /// matters here: a rewatch off a warm cache asks the origin nothing at
+    /// all, so if a cached read moved no playhead there would be no window
+    /// over the very stream a player is inside, and the cache cleaner would
+    /// be free to take the chunk under its head.
+    ///
+    /// Sixteen chunks on disk, a budget of four, and a read of the first
+    /// three: what is left afterwards is a window round where the read got
+    /// to, and the tail of the entity -- written last, so the *newest* thing
+    /// in the directory and the last thing any age or size rule would take
+    /// -- is gone. Nothing but the window can produce that shape.
+    #[tokio::test]
+    async fn a_read_off_the_disk_moves_the_playhead_and_the_window_follows_it() {
+        use futures_util::StreamExt as _;
+
+        let dir = tempfile::tempdir().expect("a scratch root");
+        let budget = Arc::new(enginefs::retention::RetentionBudget::default());
+        budget.set(Some(4 * CHUNK_BYTES));
+        let cache = ProxyCache::new(dir.path(), budget);
+        let entry = entry_of(&cache, "https://host/film.mkv");
+
+        let total = 16 * CHUNK_BYTES;
+        let dir = entry
+            .dir
+            .join(entity_dir_name(total, "video/mp4", VALIDATOR));
+        let whole = vec![7u8; CHUNK_BYTES as usize];
+        for index in 0..16 {
+            write_chunk(&dir, index, &whole);
+        }
+
+        let cached = entry
+            .look_up(Some(&format!("bytes=0-{}", 3 * CHUNK_BYTES - 1)))
+            .expect("the whole range is on disk");
+        assert!(cached.complete(), "and nothing here asks an origin");
+        let served: Vec<Result<Bytes, io::Error>> = cached.body().collect().await;
+        assert_eq!(
+            served
+                .iter()
+                .map(|chunk| chunk.as_ref().expect("a chunk").len())
+                .sum::<usize>(),
+            3 * CHUNK_BYTES as usize
+        );
+
+        // The pass runs on the blocking pool once the last byte has gone
+        // past. Bounded so a regression fails rather than hangs.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if !chunk_path(&dir, 15).exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        assert!(
+            !chunk_path(&dir, 15).exists(),
+            "the end of the film is nowhere near the playhead, and it went"
+        );
+        assert!(
+            chunk_path(&dir, 2).is_file(),
+            "the chunk the read ended in is still here"
+        );
+        assert!(
+            chunks(&dir).held().len() <= 5,
+            "and what is left is a window, not sixteen chunks: {:?}",
+            chunks(&dir).held()
+        );
+    }
+
     /// The lookup reads bucket directories, not chunk files, so what is in a
     /// bucket that is not a chunk must not be mistaken for one, and a run of
     /// held chunks must be followed from one bucket's listing into the next.

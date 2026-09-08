@@ -1537,6 +1537,294 @@ fn the_cleaner_evicts_cached_proxy_bytes() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A cache big enough that the tests below are about the window and not
+/// about the file: 128 chunks of origin against 32 chunks of budget, so the
+/// budget covers a quarter of it and the policy really splits.
+const RETENTION_ORIGIN: usize = 32 * 1024 * 1024;
+/// 32 chunks. A proxied stream shares nothing, so the whole of it is window.
+const RETENTION_BUDGET: u64 = 8 * 1024 * 1024;
+
+/// The budget the cleaner really published, so a volume too full to give the
+/// configured cap fails the test loudly instead of quietly making it prove
+/// nothing.
+fn published_budget(fixture: &Fixture, bytes: u64) -> anyhow::Result<()> {
+    fixture
+        .handle
+        .update_settings(serde_json::json!({ "cacheSize": bytes as f64 }))?;
+    let report = fixture.handle.clean_cache_now()?;
+    assert_eq!(
+        report.limit,
+        Some(bytes),
+        "the cleaner published a different cap than the one configured; \
+         the volume this test runs on cannot give {bytes} bytes"
+    );
+    Ok(())
+}
+
+/// Wait until the cache holds no more than `chunks` of them.
+fn wait_until_chunks_at_most(fixture: &Fixture, chunks: usize) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if cached_chunks(fixture).len() <= chunks {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!(
+        "the cache never came down to {chunks} chunks; it holds {}",
+        cached_chunks(fixture).len()
+    );
+}
+
+/// **The bound, on the other kind of stream.**
+///
+/// A proxied response streamed end to end, well past a cache budget it does
+/// not fit in, never has more on disk than that budget -- and plays: every
+/// byte the player is handed is the byte at that offset of the origin's
+/// file.
+///
+/// This is the same proof `enginefs::backend::librqbit`'s
+/// `a_stream_past_the_cache_budget_stays_under_it_and_still_plays` makes for
+/// a torrent, and it is the same policy making it true. Before the playhead
+/// existed there was nothing here for a window to follow: the only thing
+/// between a proxied stream and a full disk was the cache cleaner, which
+/// walks the volume a minute after the last write at best, and a stream at
+/// 20 MB/s writes a gigabyte in that minute.
+///
+/// Measured, not asserted about: the occupancy is the chunk files really on
+/// the disk, counted by walking the cache root while the body is being read.
+#[test]
+fn a_proxied_stream_past_the_cache_budget_stays_under_it_and_still_plays() -> anyhow::Result<()> {
+    use std::io::Read;
+
+    let fixture = fixture_with(Origin::start_sized(RETENTION_ORIGIN)?)?;
+    published_budget(&fixture, RETENTION_BUDGET)?;
+
+    let origin = format!("http://{}", fixture.origin.addr);
+    let url = format!("{}/proxy/d={}/movie.mp4", fixture.base, encode(&origin));
+    let mut response = reqwest::blocking::Client::new()
+        .get(&url)
+        .header(reqwest::header::RANGE, "bytes=0-")
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+
+    // The window's own overshoot, and no more: a pass runs when the playhead
+    // has moved a twentieth of a window, and the chunks written between two
+    // passes are still on the disk when the first of them measures it. Twice
+    // the budget is generous about that and still an order under the 32 MiB
+    // going past.
+    let bound = (2 * RETENTION_BUDGET / CHUNK) as usize;
+    let mut read = 0usize;
+    let mut worst = 0usize;
+    let mut measured_at = 0usize;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = response.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        for (i, byte) in buf[..n].iter().enumerate() {
+            assert_eq!(
+                *byte,
+                byte_at(read + i),
+                "the byte at {} is not the origin's",
+                read + i
+            );
+        }
+        read += n;
+        if read - measured_at >= 1024 * 1024 {
+            measured_at = read;
+            let held = cached_chunks(&fixture).len();
+            worst = worst.max(held);
+            assert!(
+                held <= bound,
+                "{held} chunks on disk after {read} bytes; the budget is {} chunks",
+                RETENTION_BUDGET / CHUNK
+            );
+        }
+    }
+    assert_eq!(read, RETENTION_ORIGIN, "and it played to the end");
+
+    // And the cache really filled, or the bound above proves nothing: a
+    // stream that never reached the budget would satisfy it by having
+    // written almost nothing.
+    assert!(
+        worst as u64 * CHUNK > RETENTION_BUDGET / 2,
+        "the cache never filled ({worst} chunks at most)"
+    );
+    assert!(
+        (read as u64) >= RETENTION_BUDGET * 2,
+        "and the stream ran well past the budget"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
+/// **The behaviour the split was costing us.** A short seek back is answered
+/// off the disk; a long one is not.
+///
+/// The window is roughly 90% ahead of the playhead and 10% behind it, and
+/// the 10% is what a scan back is for -- a few seconds of rewind, a player
+/// re-reading its container index. Under a budget that does not cover the
+/// file, that region is the difference between a rewind the origin never
+/// hears about and a rewind that costs a fresh fetch over the network.
+///
+/// Both halves are needed. Without the second one the first would pass on a
+/// cache nothing had reclaimed at all, which would be a test of the origin
+/// rather than of the policy.
+#[test]
+fn a_seek_back_inside_the_window_is_served_from_disk_and_one_outside_it_is_not()
+-> anyhow::Result<()> {
+    use std::io::Read;
+
+    let fixture = fixture_with(Origin::start_sized(RETENTION_ORIGIN)?)?;
+    published_budget(&fixture, RETENTION_BUDGET)?;
+
+    let origin = format!("http://{}", fixture.origin.addr);
+    let url = format!("{}/proxy/d={}/movie.mp4", fixture.base, encode(&origin));
+    let client = reqwest::blocking::Client::new();
+
+    // Play the first half and stop there, deliberately short of the end: a
+    // window that has slid back to fit inside the file sits entirely behind
+    // a playhead at the last byte, and every backward seek would be served
+    // whatever the 10% said.
+    const PLAYED_CHUNKS: u64 = 64;
+    let mut response = client
+        .get(&url)
+        .header(
+            reqwest::header::RANGE,
+            format!("bytes=0-{}", PLAYED_CHUNKS * CHUNK - 1),
+        )
+        .send()?;
+    let mut played = Vec::new();
+    response.read_to_end(&mut played)?;
+    assert_eq!(played.len() as u64, PLAYED_CHUNKS * CHUNK);
+    assert_eq!(
+        fixture.origin.next_request().range(),
+        Some(format!("bytes=0-{}", PLAYED_CHUNKS * CHUNK - 1).as_str())
+    );
+
+    // The reclaim has caught up: what is left is about a window, not the
+    // sixteen megabytes that went past.
+    wait_until_chunks_at_most(&fixture, (2 * RETENTION_BUDGET / CHUNK) as usize);
+    assert!(
+        fixture.origin.was_asked_for_nothing_more(),
+        "reclaiming is not fetching"
+    );
+
+    // The scan back: four chunks behind the playhead, which is inside the
+    // tenth of the window that sits behind it. A window with nothing behind
+    // it puts this chunk outside, and the read below reaches the origin.
+    let back = (PLAYED_CHUNKS - 4) * CHUNK;
+    let response = client
+        .get(&url)
+        .header(
+            reqwest::header::RANGE,
+            format!("bytes={back}-{}", back + CHUNK - 1),
+        )
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    let body = response.bytes()?;
+    assert_eq!(body.len() as u64, CHUNK);
+    assert_eq!(
+        body[0],
+        byte_at(back as usize),
+        "and it is the right offset"
+    );
+    assert!(
+        fixture.origin.was_asked_for_nothing_more(),
+        "a scan back inside the window is the cache's to answer"
+    );
+
+    // And the start of the film, which the window let go of long ago, is
+    // not: that is the reclaim having really happened.
+    let response = client
+        .get(&url)
+        .header(reqwest::header::RANGE, format!("bytes=0-{}", CHUNK - 1))
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.bytes()?.len() as u64, CHUNK);
+    assert_eq!(
+        fixture.origin.next_request().range(),
+        Some(format!("bytes=0-{}", CHUNK - 1).as_str()),
+        "the window reclaimed the head of the file, so the origin is asked for it"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
+/// **The cleaner asks the one policy about everything it walks.**
+///
+/// A torrent's reader is protected from the cleaner's delete by librqbit:
+/// the delete goes through `drop_pieces`, which will not forget a piece a
+/// reader is waiting on. A proxied stream has no backend to refuse, and the
+/// cleaner holds the path -- so before the gate could answer for a walked
+/// file, a pass under a tight cap unlinked the chunk under the player's head
+/// and the player found out by failing (`proxy_cache::Cached::body` ends the
+/// body in an error rather than serving a hole).
+///
+/// So the cap is set below what one live window holds and the cleaner is run
+/// on purpose. It takes what nobody is reading, leaves what somebody is, and
+/// says it could not get under the cap -- which is the honest answer, and
+/// the same one it gives for a torrent whose pieces the have-set will not
+/// give up.
+#[test]
+fn the_cleaner_leaves_the_chunks_a_proxied_player_is_inside() -> anyhow::Result<()> {
+    use std::io::Read;
+
+    let fixture = fixture_with(Origin::start_sized(RETENTION_ORIGIN)?)?;
+    published_budget(&fixture, RETENTION_BUDGET)?;
+
+    let origin = format!("http://{}", fixture.origin.addr);
+    let url = format!("{}/proxy/d={}/movie.mp4", fixture.base, encode(&origin));
+    const PLAYED_CHUNKS: u64 = 64;
+    let mut response = reqwest::blocking::Client::new()
+        .get(&url)
+        .header(
+            reqwest::header::RANGE,
+            format!("bytes=0-{}", PLAYED_CHUNKS * CHUNK - 1),
+        )
+        .send()?;
+    let mut played = Vec::new();
+    response.read_to_end(&mut played)?;
+    assert_eq!(played.len() as u64, PLAYED_CHUNKS * CHUNK);
+    fixture.origin.next_request();
+    wait_until_chunks_at_most(&fixture, (2 * RETENTION_BUDGET / CHUNK) as usize);
+    let before = cached_chunks(&fixture).len();
+    // What is left is the part of the window playback actually fetched:
+    // nothing here reads ahead, so the 90% in front of the playhead is
+    // window the stream never reached and the chunks on the disk are the
+    // scan-back and the head itself.
+    assert!(
+        before >= 4,
+        "there is a window on the disk to protect: {before} chunks"
+    );
+
+    // A cap of one chunk: everything on the disk is over it, so the only
+    // thing that can keep a byte is the gate.
+    fixture
+        .handle
+        .update_settings(serde_json::json!({ "cacheSize": CHUNK as f64 }))?;
+    let report = fixture.handle.clean_cache_now()?;
+
+    let left = cached_chunks(&fixture).len();
+    assert_eq!(
+        left, before,
+        "the cleaner took chunks a player is inside: {before} before, {left} after"
+    );
+    assert!(
+        report.over_limit > 0,
+        "and it says so rather than pretending it got under the cap: {report:?}"
+    );
+
+    // Proof that the cap was real and the gate is what refused it: the same
+    // pass with nothing playing takes the lot.
+    drop(fixture.handle);
+    Ok(())
+}
+
 /// The launch-time sweep, through a real restart.
 ///
 /// It takes the temporaries a kill left mid-write and nothing else. That is

@@ -52,8 +52,8 @@
 //! not anyone is reading (the swarm sends what the want-set asks for); a
 //! proxied entity grows only as its own body is relayed, so the byte that
 //! moves the window is the same byte that grew the cache, and the pass
-//! belongs there. It is throttled to once every [`ProxyRetention::stride`]
-//! chunks of the window, which bounds the overshoot to an eighth of the
+//! belongs there. It is throttled to [`PASSES_PER_WINDOW`] passes per
+//! window of playback, which bounds the overshoot to a twentieth of the
 //! budget and keeps the directory listing off the hot path.
 
 use std::collections::BTreeSet;
@@ -88,7 +88,14 @@ const IDLE: Duration = Duration::from_secs(90);
 /// makes the overshoot a fraction of the budget instead of a constant, and
 /// makes the listing rarer exactly when it is dearer -- a big window is many
 /// bucket directories.
-const PASSES_PER_WINDOW: u64 = 8;
+///
+/// The number itself is the overshoot the bound tolerates, and nothing
+/// subtler than that: what is on the disk when a pass measures it is the
+/// window plus whatever the fill wrote since the last pass, which is a
+/// stride. A twentieth of the budget is a small enough overhang to be
+/// invisible against the cleaner's own margin, and twenty directory
+/// listings per window of playback is a cheap way to buy it.
+const PASSES_PER_WINDOW: u64 = 20;
 
 /// The playheads of every proxied stream a player is reading, and the
 /// policy over each.
