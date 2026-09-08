@@ -2272,6 +2272,18 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         self.budget.set(limit);
     }
 
+    /// The budget itself, for the *other* adapter over the chunk store.
+    ///
+    /// `/proxy`'s cache is bounded by the same policy against the same
+    /// number, and it has to be the same number: two readings of "how much
+    /// room is there" over one volume is how two layers come to evict
+    /// against different limits. Handing out the shared cell rather than a
+    /// copy is what makes that structural -- there is one place the
+    /// cleaner's cap is written, and everything that reads it reads that.
+    pub fn cache_budget(&self) -> Arc<crate::retention::RetentionBudget> {
+        self.budget.clone()
+    }
+
     /// What one walk of the engines tells the cache cleaner: what the
     /// retention policy will part with, piece by piece, and which torrents
     /// can only be taken whole.

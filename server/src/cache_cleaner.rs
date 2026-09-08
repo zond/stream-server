@@ -493,7 +493,13 @@ async fn cache_roots(state: &AppState) -> CacheRoots {
     // stopped, still unpinned) before it takes one, so this list is a
     // candidate set and not a verdict.
     let verdicts = state.engine.reclaim_verdicts().await;
-    let gate = verdicts.gate;
+    let mut gate = verdicts.gate;
+    // The *same* gate, told what the other adapter over the chunk store is
+    // holding. One policy answers for everything this pass walks: the piece
+    // store's answer arrives per torrent and per index, the proxy cache's
+    // per directory and per chunk, and both are the one question -- is
+    // anything speaking for these bytes?
+    state.proxy_cache.retention().fill_gate(&mut gate);
     let stopped = verdicts
         .stopped_for_space
         .into_iter()
@@ -1212,6 +1218,21 @@ impl WalkInputs {
             // pre-allocated wanted files at full size, and those files are
             // still here.
             let size = occupied_bytes(&metadata);
+            // The gate, asked about a walked file exactly as it is asked
+            // about a piece the store reported. A chunk inside a live
+            // proxied stream's window is the bytes under a player's head and
+            // the scan-back and read-ahead either side of it; taking one
+            // costs that player a broken read and costs the origin the same
+            // fetch again. A torrent's reader is protected from this by
+            // librqbit -- the cleaner's delete goes through `drop_pieces`,
+            // which will not forget a piece a reader is waiting on -- and a
+            // proxied one has no backend to refuse, so the refusal is here.
+            if !self.gate.releases_file(&path) {
+                walked.total_size += size;
+                walked.protected_size += size;
+                walked.protected_files += 1;
+                continue;
+            }
             self.sort_one(
                 walked,
                 Reclaimable::File(path),

@@ -79,6 +79,28 @@
 //! here is in `EngineFS::protected_paths` either -- a proxied stream nobody is
 //! reading is the first thing that should go.
 //!
+//! # What bounds it, and where the playhead comes from
+//!
+//! The cleaner is the outer bound and it is not a fast one: it walks the
+//! volume a minute after the last write at best, and a proxied stream at
+//! 20 MB/s writes a gigabyte in that minute. So the same retention policy
+//! the piece store is under bounds this too --
+//! `enginefs::piece_store::policy`, one budget, a window roughly 90% ahead
+//! of the playhead and 10% behind it -- driven by
+//! [`crate::proxy_retention`]. The only input it was missing is the
+//! playhead: a proxied stream serves ranges, so the reads were always here,
+//! but nothing recorded where playback had got to. It is recorded now, in
+//! the two places a byte of a proxied response reaches a player --
+//! [`Cached::body`] for what came off the disk and [`Filler::take`] for what
+//! came off the origin -- and nowhere else. A `Range` header is what a
+//! player *asks* for and is not one of them.
+//!
+//! The one thing that follows for the cleaner: a chunk inside a live
+//! stream's window is not offered to the size rule
+//! (`enginefs::retention::ReclaimGate::releases_file`). Everything else
+//! here, including every byte of every stream nobody is reading, is
+//! ordinary cache exactly as before.
+//!
 //! # What is not here, and no comment may imply otherwise
 //!
 //! * **Nothing here is revalidated.** No `If-None-Match`, no
@@ -108,6 +130,7 @@
 //!   boundary are dropped rather than provoking a wider fetch than the player
 //!   asked for. Every whole chunk after that boundary is written as usual.
 
+use crate::proxy_retention::ProxyRetention;
 use bytes::Bytes;
 use enginefs::chunk_store::ChunkDir;
 use futures_util::Stream;
@@ -117,6 +140,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use url::Url;
 
@@ -152,19 +176,35 @@ const RANGE_REQUEST_HEADERS: [&str; 2] = ["range", "if-range"];
 /// One cache, rooted where the cleaner can find it.
 pub struct ProxyCache {
     root: PathBuf,
+    /// Where playback has got to in each entity being read, and the window
+    /// that follows it (see [`crate::proxy_retention`]). It lives here
+    /// rather than beside the cache because the two things that can observe
+    /// a proxied playhead are both this module's -- the body served from
+    /// disk and the body filled on its way past -- and a playhead nothing
+    /// observes is the gap this whole policy exists to close.
+    retention: Arc<ProxyRetention>,
 }
 
 impl ProxyCache {
     /// The cache under an engine's `download_dir` -- the directory
-    /// `cache_cleaner::cache_roots` already walks.
-    pub fn new(download_dir: &Path) -> Self {
+    /// `cache_cleaner::cache_roots` already walks -- bounded by the cache
+    /// cleaner's cap, which is the *same* cell the torrent half reads
+    /// (`EngineFS::cache_budget`) and not a second copy of the number.
+    pub fn new(download_dir: &Path, budget: Arc<enginefs::retention::RetentionBudget>) -> Self {
         Self {
             root: download_dir.join(PROXY_CACHE_DIR),
+            retention: Arc::new(ProxyRetention::new(budget)),
         }
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The playheads and windows of what is being read right now, for the
+    /// cache cleaner's gate.
+    pub fn retention(&self) -> &Arc<ProxyRetention> {
+        &self.retention
     }
 
     /// The entry this request reads and writes, or `None` for a request the
@@ -279,6 +319,7 @@ impl ProxyCache {
         }
         Some(Entry {
             dir: self.root.join(hex::encode(hash.finalize())),
+            retention: self.retention.clone(),
         })
     }
 }
@@ -312,6 +353,7 @@ fn names_this_server(url: &Url, self_addr: std::net::SocketAddr) -> bool {
 /// shape. Normally there is exactly one entity in it.
 pub struct Entry {
     dir: PathBuf,
+    retention: Arc<ProxyRetention>,
 }
 
 impl Entry {
@@ -382,6 +424,7 @@ impl Entry {
         }
         Some(Cached {
             dir,
+            retention: self.retention.clone(),
             total,
             content_type,
             validator,
@@ -415,6 +458,7 @@ impl Entry {
         });
         Filler {
             dir: ChunkDir::new(dir),
+            retention: self.retention.clone(),
             total,
             offset: body_start,
             collecting: None,
@@ -533,6 +577,7 @@ fn chunk_len(index: u64, total: u64) -> u64 {
 /// What one entity holds for one request's range.
 pub struct Cached {
     dir: ChunkDir,
+    retention: Arc<ProxyRetention>,
     /// The entity's length, which is what a `Content-Range` has to state.
     pub total: u64,
     /// What the origin labelled the entity, empty when it said nothing.
@@ -590,10 +635,12 @@ impl Cached {
     /// finds the gap, and the next fill writes the chunk again.
     pub fn body(&self) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static {
         let dir = self.dir.clone();
+        let retention = self.retention.clone();
         let total = self.total;
         let last = self.held_to;
         futures_util::stream::unfold(self.first, move |offset| {
             let dir = dir.clone();
+            let retention = retention.clone();
             async move {
                 if offset > last {
                     return None;
@@ -620,6 +667,12 @@ impl Cached {
                 // chunk in flight at once.
                 let served =
                     Bytes::from(bytes).slice((offset - start) as usize..=(to - start) as usize);
+                // A byte that really went out, which is the only thing this
+                // server will call a playhead. Here and in [`Filler::take`]
+                // are the two places one exists for a proxied stream, and
+                // between them they cover a hit, a miss and the two halves
+                // of a partial hit.
+                retention.note(&dir, total, to);
                 Some((Ok(served), to + 1))
             }
         })
@@ -635,6 +688,7 @@ impl Cached {
 /// chunk later, and the reactor never blocks on the write.
 pub struct Filler {
     dir: ChunkDir,
+    retention: Arc<ProxyRetention>,
     total: u64,
     /// Absolute offset of the next byte to arrive.
     offset: u64,
@@ -685,6 +739,13 @@ impl Filler {
             // nothing to be done with them but drop them.
             self.offset += take as u64;
             bytes = &bytes[take..];
+        }
+        // The origin's body is on its way to the player as it goes past
+        // here, so this is a playhead exactly as a cached read is -- and it
+        // is the one that matters most, since a miss is when the cache is
+        // growing and the window is what bounds that growth.
+        if self.offset > 0 {
+            self.retention.note(&self.dir, self.total, self.offset - 1);
         }
     }
 }
@@ -846,7 +907,10 @@ mod tests {
 
     fn cache() -> (tempfile::TempDir, ProxyCache) {
         let dir = tempfile::tempdir().expect("a scratch root");
-        let cache = ProxyCache::new(dir.path());
+        // No budget: nothing has published one, which is what these tests
+        // are about anyway -- they are about the key, the entity and the
+        // arithmetic, and no chunk here is ever reclaimed by the window.
+        let cache = ProxyCache::new(dir.path(), Arc::default());
         (dir, cache)
     }
 

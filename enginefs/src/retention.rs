@@ -376,6 +376,31 @@ pub(crate) fn runs(pieces: &[u32]) -> Vec<Range<u32>> {
 #[derive(Debug, Default, Clone)]
 pub struct ReclaimGate {
     torrents: std::collections::HashMap<String, TorrentGate>,
+    /// The windows live readers hold in the chunk stores the cleaner walks
+    /// **as files** -- which is the proxy cache and nothing else, since the
+    /// piece store answers by info hash and index instead.
+    ///
+    /// This is the same question the torrent half asks, put where the
+    /// proxy's answer can come from. On a torrent, a piece a live stream is
+    /// about to read is refused by librqbit itself: the cleaner's delete
+    /// goes through `TorrentHandle::drop_pieces`, which will not forget a
+    /// piece a reader is waiting on, so the reader's own bytes cannot be
+    /// unlinked out from under it. A proxied stream has no such backend to
+    /// refuse -- the cleaner holds the path and `remove_file` takes it --
+    /// and the reader finds out by failing (`proxy_cache::Cached::body`
+    /// ends the body in an error rather than serving a hole). So the refusal
+    /// has to be here, and this is it: one gate, asked about everything the
+    /// cleaner walks.
+    windows: Vec<ReaderWindow>,
+}
+
+/// One live reader's window in a chunk store the cleaner walks by path.
+#[derive(Debug, Clone)]
+struct ReaderWindow {
+    /// The directory the chunks are bucketed under.
+    dir: std::path::PathBuf,
+    /// The chunk indices the window covers.
+    chunks: Range<u64>,
 }
 
 /// One torrent's answer, in the three shapes it comes in.
@@ -470,6 +495,51 @@ impl ReclaimGate {
             .get(info_hash)
             .is_some_and(TorrentGate::goes_first)
     }
+
+    /// A live reader holds `chunks` of the chunk store bucketed under `dir`.
+    ///
+    /// `dir` is a chunk store's directory, so the files under it are
+    /// `<dir>/<index / CHUNKS_PER_DIRECTORY>/<index>` -- which is the whole
+    /// of what [`Self::releases_file`] needs to read an index back off a
+    /// path.
+    pub fn insert_window(&mut self, dir: std::path::PathBuf, chunks: Range<u64>) {
+        self.windows.push(ReaderWindow { dir, chunks });
+    }
+
+    /// Whether a file the cleaner walked may be taken.
+    ///
+    /// Everything the walk finds is cache with nobody to speak for it --
+    /// **except** a chunk inside a window some reader is playing through
+    /// right now. That one is the bytes under the player's head, or the
+    /// scan-back and the read-ahead either side of it; unlinking it costs
+    /// the player a broken read and costs the origin the same fetch again,
+    /// which is the two things a cache is for.
+    ///
+    /// A path with no window over it releases, which is the answer for every
+    /// byte in the root when nothing is playing.
+    pub fn releases_file(&self, path: &std::path::Path) -> bool {
+        if self.windows.is_empty() {
+            return true;
+        }
+        let Some(index) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(crate::chunk_store::canonical_index)
+        else {
+            // Not a name a chunk store writes, so no window can be about it.
+            return true;
+        };
+        // `<dir>/<bucket>/<index>`: the bucket is not checked against the
+        // index, because a file under the wrong bucket is unreachable debris
+        // rather than a chunk, and debris is not what a window is holding.
+        let Some(dir) = path.parent().and_then(std::path::Path::parent) else {
+            return true;
+        };
+        !self
+            .windows
+            .iter()
+            .any(|window| window.dir == dir && window.chunks.contains(&index))
+    }
 }
 
 #[cfg(test)]
@@ -511,5 +581,43 @@ mod tests {
             !gate.releases("cc", 25),
             "outside the policy's file, so still announced whole"
         );
+    }
+
+    /// The same gate, asked about a file the cleaner walked rather than a
+    /// piece the store reported. The proxy cache is the one chunk store the
+    /// cleaner unlinks from itself, so the refusal a live reader needs has
+    /// to be expressible about a path.
+    #[test]
+    fn a_chunk_under_a_live_readers_window_is_not_the_cleaners_to_take() {
+        let entity = std::path::PathBuf::from("/cache/.proxy/key/entity");
+        let mut gate = ReclaimGate::default();
+        assert!(
+            gate.releases_file(&entity.join("0/7")),
+            "nothing is playing, so every byte in the root is ordinary cache"
+        );
+
+        gate.insert_window(entity.clone(), 5..12);
+        assert!(
+            !gate.releases_file(&entity.join("0/5")),
+            "the window's first"
+        );
+        assert!(!gate.releases_file(&entity.join("0/11")), "and its last");
+        assert!(
+            gate.releases_file(&entity.join("0/4")),
+            "a chunk the window has moved past"
+        );
+        assert!(
+            gate.releases_file(&entity.join("0/12")),
+            "and one it has not reached"
+        );
+
+        // Another entity's chunk 7 is another entity's, whatever this one is
+        // playing: the window is over one directory, not over an index.
+        let other = std::path::PathBuf::from("/cache/.proxy/key/other");
+        assert!(gate.releases_file(&other.join("0/7")));
+
+        // And a name no chunk store writes is not a chunk to hold on to.
+        assert!(gate.releases_file(&entity.join("0/7.tmp")));
+        assert!(gate.releases_file(&entity.join("0/007")));
     }
 }

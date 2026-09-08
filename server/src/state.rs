@@ -37,7 +37,8 @@ pub struct AppState {
     /// `crate::proxy_cache`). Rooted inside the engine's `download_dir`,
     /// which is where the cache cleaner already walks, so every byte of it
     /// is ordinary cache to the cleaner: counted, aged, evicted, never
-    /// pinned.
+    /// pinned -- with the one exception the retention policy makes, a chunk
+    /// under a live stream's window (`crate::proxy_retention`).
     pub proxy_cache: Arc<crate::proxy_cache::ProxyCache>,
     /// The optional LAN media listener shared by `run` and `ServerHandle`
     /// (see `crate::lan_media`). Constructed disabled; `run` replaces it with
@@ -88,7 +89,14 @@ impl AppState {
         log_dir: PathBuf,
     ) -> Self {
         let settings_file = Arc::new(SettingsFile::new(config_dir.join("settings.json")));
-        let proxy_cache = Arc::new(crate::proxy_cache::ProxyCache::new(&engine.download_dir));
+        // The cleaner's cap, shared and not copied: `/proxy`'s cache and
+        // the piece store are two adapters over one chunk store on one
+        // volume, and the retention policy over them is sized from one
+        // number.
+        let proxy_cache = Arc::new(crate::proxy_cache::ProxyCache::new(
+            &engine.download_dir,
+            engine.cache_budget(),
+        ));
         let https = Arc::new(crate::https::HttpsListener::new(None, &config_dir));
 
         Self {

@@ -79,6 +79,7 @@ mod diagnostics;
 mod https;
 mod lan_media;
 mod proxy_cache;
+mod proxy_retention;
 mod proxy_streams;
 mod routes;
 mod ssdp;
