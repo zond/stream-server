@@ -5242,11 +5242,17 @@ mod tests {
         /// `Session::pause` does. Without that a reconciler pausing the
         /// same torrent every tick would look exactly like one that pauses
         /// it once.
+        ///
+        /// The counter counts the *asking*, not the succeeding, for the
+        /// same reason: a caller that asks every two seconds and is refused
+        /// every two seconds has a bug -- a log line per stopped torrent
+        /// per tick -- and a counter that only saw the first call could not
+        /// tell it from a caller that asks once.
         async fn stop_torrent(&self) -> Result<()> {
+            self.counters.stop_torrent.fetch_add(1, Ordering::SeqCst);
             if self.counters.paused.swap(true, Ordering::SeqCst) {
                 anyhow::bail!("already paused");
             }
-            self.counters.stop_torrent.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
@@ -7540,7 +7546,7 @@ mod tests {
         assert_eq!(
             counters.stop_torrent.load(Ordering::SeqCst),
             1,
-            "a torrent that is already stopped is not stopped again"
+            "a torrent that is already stopped is not asked to stop again"
         );
 
         // The same torrent with everything it wants writes nothing, so the
