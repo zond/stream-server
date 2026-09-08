@@ -2312,6 +2312,49 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         hashes
     }
 
+    /// Turn seeding on or off session-wide, and put back to work the
+    /// torrents the idle policy paused for want of it.
+    ///
+    /// Generic rather than `librqbit`-only because nothing in it is: the
+    /// flag is this layer's, the backend call has a no-op default on the
+    /// trait, and the resume pass talks to `TorrentHandle`. On the concrete
+    /// impl no fake backend could reach it, so what it does under the
+    /// engine registry's lock could not be tested at all.
+    pub fn set_seeding_enabled(&self, enabled: bool) {
+        self.seeding_enabled.store(enabled, Ordering::Relaxed);
+        self.backend.set_seeding_enabled(enabled);
+        tracing::info!(seeding_enabled = enabled, "Seeding policy updated");
+
+        // When seeding is turned back on, resume torrents the seeding-disabled
+        // policy had paused so they can seed again. Turning seeding off is
+        // handled lazily by the periodic loop / schedule_torrent_pause.
+        if enabled {
+            let engines = self.engines.clone();
+            tokio::spawn(async move {
+                let read = engines.read().await;
+                for engine in read.values() {
+                    if engine.handle.manages_playback_lifecycle() {
+                        continue;
+                    }
+                    if engine.idle_paused.swap(false, Ordering::Relaxed)
+                        && let Err(err) = engine.handle.resume_torrent().await
+                    {
+                        tracing::warn!(
+                            info_hash = %engine.info_hash,
+                            error = %err,
+                            "Failed to resume torrent after re-enabling seeding"
+                        );
+                        engine.idle_paused.store(true, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+    }
+
+    pub fn seeding_enabled(&self) -> bool {
+        self.seeding_enabled.load(Ordering::Relaxed)
+    }
+
     /// Put the torrent `info_hash` back to work after the backend stopped it
     /// with an **error** -- and only then. `false` when no engine holds that
     /// hash any more (it was swept while space was being reclaimed) and when
@@ -4695,40 +4738,6 @@ impl BackendEngineFS<LibrqbitBackend> {
         report
     }
 
-    pub fn set_seeding_enabled(&self, enabled: bool) {
-        self.seeding_enabled.store(enabled, Ordering::Relaxed);
-        self.backend.set_seeding_enabled(enabled);
-        tracing::info!(seeding_enabled = enabled, "Seeding policy updated");
-
-        // When seeding is turned back on, resume torrents the seeding-disabled
-        // policy had paused so they can seed again. Turning seeding off is
-        // handled lazily by the periodic loop / schedule_torrent_pause.
-        if enabled {
-            let engines = self.engines.clone();
-            tokio::spawn(async move {
-                let read = engines.read().await;
-                for engine in read.values() {
-                    if engine.handle.manages_playback_lifecycle() {
-                        continue;
-                    }
-                    if engine.idle_paused.swap(false, Ordering::Relaxed)
-                        && let Err(err) = engine.handle.resume_torrent().await
-                    {
-                        tracing::warn!(
-                            info_hash = %engine.info_hash,
-                            error = %err,
-                            "Failed to resume torrent after re-enabling seeding"
-                        );
-                        engine.idle_paused.store(true, Ordering::Relaxed);
-                    }
-                }
-            });
-        }
-    }
-
-    pub fn seeding_enabled(&self) -> bool {
-        self.seeding_enabled.load(Ordering::Relaxed)
-    }
 
     /// Shrink to, or grow back from, a [`Footprint`] -- see the enum for
     /// what `Lean` sheds and what it deliberately keeps (seeding). Forwarded
