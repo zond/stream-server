@@ -7,7 +7,7 @@ use anyhow::Context;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::files::FileHandle;
 use regex::Regex;
@@ -249,6 +249,14 @@ impl GetFileError {
 /// has stopped (`Engine::is_stopped_for_space`): a fixed, path-free
 /// sentence, like `librqbit::TORRENT_ERROR_MESSAGE` for the backend's own
 /// error state.
+/// `Engine::last_active_at` for a torrent nothing has used in this
+/// process. A sentinel rather than `0`, because the clock is
+/// instance-relative ([`crate::Clock`]) and `0` is a real reading -- the
+/// instant the engine was made, which is when a restored torrent's engine
+/// *is* made, so the two would be indistinguishable exactly where the
+/// difference matters.
+const NEVER_ACTIVE: u64 = u64::MAX;
+
 pub const STOPPED_FOR_SPACE_MESSAGE: &str =
     "the torrent is stopped for want of disk space; free some space and it will resume";
 
@@ -280,6 +288,35 @@ pub struct Engine<H: TorrentHandle> {
     ///
     /// [`crate::BackendEngineFS::start_if_stopped`]: crate::BackendEngineFS
     last_transition_at: AtomicU64,
+    /// The clock reading at the last moment something was **using** this
+    /// torrent, or [`NEVER_ACTIVE`] for one nothing has used since this
+    /// process started. The idle arm of the ladder measures its grace from
+    /// here ([`Self::quiet_for`]).
+    ///
+    /// Deliberately not [`Self::last_accessed`], which is the registry's
+    /// idle-eviction clock and counts *lookups*: every
+    /// `GET /{infoHash}/stats.json` reaches its engine through
+    /// `BackendEngineFS::get_engine`, so a client that polls the statistics
+    /// resets that one. Read by the ladder, it made "somebody is asking
+    /// about this torrent" mean "somebody is watching it", and a poll every
+    /// few seconds -- which is what a Stremio client does while its details
+    /// page is open -- kept a torrent nobody was watching downloading for
+    /// ever with seeding turned off. This one moves only when
+    /// `BackendEngineFS::torrent_is_active` actually reads true, so looking
+    /// is not using.
+    ///
+    /// And it starts at [`NEVER_ACTIVE`] rather than at the clock, for the
+    /// reason [`Self::settled`] starts false: an engine made for a torrent
+    /// the *previous* process left behind has had nothing active on it
+    /// here, and a fresh `now` would be this design's third in-memory claim
+    /// about a past this process did not see. It read as "active a moment
+    /// ago", which put every restored torrent's `idle_for` at zero, so with
+    /// seeding off every restart started every torrent the last process had
+    /// stopped -- announcing, finding peers and downloading -- until the
+    /// grace ran out and the reconciler stopped it again.
+    ///
+    /// [`Self::settled`]: Engine::settled
+    last_active_at: AtomicU64,
     /// Files pinned as offline downloads (`BackendEngineFS::pin_download`).
     /// While non-empty the engine is exempt from idle removal and the
     /// seeding-disabled pause; the handle keeps its own copy for the
@@ -323,6 +360,7 @@ impl<H: TorrentHandle> Engine<H> {
                 .build(),
             settled: AtomicBool::new(true),
             last_transition_at: AtomicU64::new(0),
+            last_active_at: AtomicU64::new(NEVER_ACTIVE),
             pinned_files: parking_lot::RwLock::new(BTreeSet::new()),
             volumes,
             reads_refused: AtomicBool::new(false),
@@ -366,6 +404,21 @@ impl<H: TorrentHandle> Engine<H> {
     /// Record that the reconciler has just started or stopped this torrent.
     pub(crate) fn record_transition(&self, now: u64) {
         self.last_transition_at.store(now, Ordering::Relaxed);
+    }
+
+    /// Something is using this torrent right now (see [`Self::last_active_at`]).
+    pub(crate) fn mark_active(&self, now: u64) {
+        self.last_active_at.store(now, Ordering::SeqCst);
+    }
+
+    /// How long since anything was using this torrent, or `None` when
+    /// nothing has been in this process -- which is not "idle for zero
+    /// seconds" and must not be read as one: see [`Self::last_active_at`].
+    pub(crate) fn quiet_for(&self, now: u64) -> Option<Duration> {
+        match self.last_active_at.load(Ordering::SeqCst) {
+            NEVER_ACTIVE => None,
+            at => Some(Duration::from_secs(now.saturating_sub(at))),
+        }
     }
 
     /// Whether this torrent is stopped, and stopped because the volume it

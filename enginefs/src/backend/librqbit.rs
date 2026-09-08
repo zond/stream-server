@@ -6920,6 +6920,163 @@ mod tests {
         }
     }
 
+    /// The other side of that restart, and the one nothing on this branch
+    /// covered: with seeding turned off, a torrent the last process left
+    /// stopped stays stopped.
+    ///
+    /// The reconciler starts anything the ladder says should run, the
+    /// previous process's pause included -- that is the point of it -- so
+    /// the only thing standing between "seeding is off and nobody is
+    /// watching" and a restart that starts every torrent there is is the
+    /// idle arm, and the idle arm's grace is measured from
+    /// `Engine::last_active_at`. That used to be initialised to the clock,
+    /// which for a restored torrent is a claim about a past this process
+    /// never saw: it read as "used a moment ago", so `idle_for` was zero,
+    /// the idle arm could not fire, and the anti-flap dwell does not apply
+    /// to a torrent this process has never moved. Every restart therefore
+    /// announced, found peers and downloaded every stopped torrent for a
+    /// whole `INACTIVE_TORRENT_PAUSE_GRACE` before stopping it again --
+    /// over a metered connection and a television's disk, with the setting
+    /// that exists to prevent exactly that turned on. `None` is the honest
+    /// answer and the arm reads it as quiet.
+    ///
+    /// Driven over a real persisted session because the restart is where
+    /// the defect lives, and asserted on `run_state` and on the backend's
+    /// own byte counters, never on a flag this code wrote.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restart_with_seeding_off_does_not_start_what_the_last_process_stopped() {
+        use crate::backend::TorrentBackend;
+        let tmp = tempfile::tempdir().unwrap();
+
+        let content = tmp.path().join("content");
+        tokio::fs::create_dir_all(&content).await.unwrap();
+        write_payload(&content.join("movie.bin"), 256 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&content.join("movie.bin")).await;
+
+        let client_dir = tmp.path().join("client");
+        let opts = || TestSessionOptions {
+            default_storage: Some(reclaimable_storage()),
+            persist: true,
+            listen_loopback: true,
+        };
+
+        // First run: the torrent is added and persisted, incomplete.
+        {
+            let (backend, restored) =
+                LibrqbitBackend::new_for_tests_with(client_dir.clone(), opts())
+                    .await
+                    .unwrap();
+            assert!(restored.is_empty(), "nothing to restore yet");
+            let handle = backend
+                .add_torrent(TorrentSource::Bytes(torrent_bytes.clone()), vec![])
+                .await
+                .unwrap();
+            handle.handle.wait_until_initialized().await.unwrap();
+            let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
+            let session_json = client_dir.join("session.json");
+            while !session_json.exists() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(session_json.exists(), "the session was persisted");
+        }
+
+        // The restart, with the user's seeding switch off.
+        let (backend, restored) = LibrqbitBackend::new_for_tests_with(client_dir.clone(), opts())
+            .await
+            .unwrap();
+        assert_eq!(restored.len(), 1, "the torrent came back");
+        let hash = restored.keys().next().unwrap().clone();
+        restored[&hash]
+            .handle
+            .wait_until_initialized()
+            .await
+            .unwrap();
+        let client_addr = backend
+            .session
+            .listen_addr()
+            .expect("the client listens for the seeder");
+
+        let mut efs = crate::BackendEngineFS::new_with_backend(
+            backend,
+            restored,
+            client_dir.join("cache"),
+            client_dir.clone(),
+        );
+        efs.set_free_space_probe(|_| Ok(u64::MAX));
+        efs.set_seeding_enabled(false).await;
+
+        // The want-set is back, so `settled` is not what is holding it:
+        // what holds it is that nothing in this process has used it.
+        efs.restore_pinned_downloads().await;
+        assert_eq!(
+            efs.reconcile_tick().await,
+            vec![(hash.clone(), crate::reconcile::Decision::Stop)],
+            "seeding is off and nobody has watched this torrent"
+        );
+        let engine = efs.get_engine(&hash).await.expect("the restored engine");
+        assert_eq!(
+            engine.handle.run_state(),
+            RunState::Paused,
+            "and it really is still stopped"
+        );
+
+        // A seeder with the whole file dials it, exactly as one would after
+        // a restart that announced. A started torrent would take the bytes.
+        let seeder = librqbit::Session::new_with_opts(
+            content.clone(),
+            librqbit::SessionOptions {
+                dht: None,
+                persistence: None,
+                listen: Some(librqbit::ListenerOptions {
+                    listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seeder session");
+        seeder
+            .add_torrent(
+                librqbit::AddTorrent::from_bytes(bytes::Bytes::from(torrent_bytes.clone())),
+                Some(librqbit::AddTorrentOptions {
+                    paused: false,
+                    output_folder: Some(content.to_str().unwrap().to_owned()),
+                    overwrite: true,
+                    initial_peers: Some(vec![client_addr]),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("seeder add");
+
+        // The real clock throughout, and deliberately: `reconcile_tick_at`
+        // exists so a real session can reach the idle arm without sitting
+        // out the grace, but it hands in a `now` the engine's own stamp
+        // never saw, which is the very comparison under test here. What
+        // makes the wait unnecessary instead is that the honest answer is
+        // available on the *first* tick -- nothing has used this torrent,
+        // so there is no grace left to run out.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            assert_eq!(
+                efs.reconcile_tick().await,
+                vec![(hash.clone(), crate::reconcile::Decision::Stop)],
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            engine.handle.run_state(),
+            RunState::Paused,
+            "and it stays stopped while the seeder is knocking"
+        );
+        let stats = engine.handle.handle.stats();
+        assert!(
+            !stats.finished && stats.progress_bytes == 0,
+            "a stopped torrent takes no bytes from the seeder: {stats}"
+        );
+    }
+
     /// A seeder session for `torrent_bytes` on an ephemeral loopback port,
     /// uploading at `upload_bps` so a download from a swarm of them outlasts
     /// what a test asserts about its peers. No DHT, no trackers: the only way

@@ -1467,9 +1467,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             has_metadata: engine.handle.has_metadata().await,
             finished: engine.handle.is_finished().await,
             available: self.volumes.available(&folder),
-            idle_for: Duration::from_secs(
-                now.saturating_sub(engine.last_accessed.load(Ordering::SeqCst)),
-            ),
+            idle_for: engine.quiet_for(now),
         };
         let verdict = crate::reconcile::verdict(&conditions, trigger);
         // Every input, so a field log answers *why* on its own: a decision
@@ -1486,7 +1484,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             has_metadata = conditions.has_metadata,
             finished = conditions.finished,
             available = ?conditions.available,
-            idle_secs = conditions.idle_for.as_secs(),
+            idle_secs = ?conditions.idle_for.map(|idle| idle.as_secs()),
             settled = conditions.settled,
             "torrent_reconciled"
         );
@@ -1565,7 +1563,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     playing = conditions.playing,
                     pinned = conditions.pinned,
                     seeding_enabled = conditions.seeding_enabled,
-                    idle_secs = conditions.idle_for.as_secs(),
+                    idle_secs = ?conditions.idle_for.map(|idle| idle.as_secs()),
                     "torrent_stopped_by_reconciler"
                 );
                 true
@@ -1754,7 +1752,33 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// were five questions asked in three places -- the housekeeping
     /// sweep's idle pause, the per-stream grace-period task and this -- and
     /// the first two are gone: the ladder is the only thing that asks.
+    ///
+    /// A `true` answer is stamped on the engine ([`Engine::mark_active`]),
+    /// and that stamp is the whole of the idle arm's grace clock. It is
+    /// written here, where the registers are actually read, rather than
+    /// taken from `Engine::last_accessed`: that one is the registry's
+    /// idle-eviction clock and counts every lookup, so every `stats.json`
+    /// poll -- which reaches its engine through [`Self::get_engine`] --
+    /// reset it, and a client with a details page open kept a torrent
+    /// nobody was watching downloading for ever with seeding off.
     async fn torrent_is_active(
+        &self,
+        info_hash: &str,
+        engine: &Engine<B::Handle>,
+        now: u64,
+    ) -> bool {
+        let active = self
+            .torrent_activity_registers(info_hash, engine, now)
+            .await;
+        if active {
+            engine.mark_active(now);
+        }
+        active
+    }
+
+    /// [`Self::torrent_is_active`] without the stamp: the five registers
+    /// and nothing else.
+    async fn torrent_activity_registers(
         &self,
         info_hash: &str,
         engine: &Engine<B::Handle>,
@@ -4400,12 +4424,14 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             false
         };
 
-        // Nothing schedules a pause here any more. The last stream ending
-        // is not a decision, it is a change of condition: the reconciler
-        // reads `idle_for` from the engine's own `last_accessed`, which
-        // `touch()` above has just set, and stops the torrent on the first
-        // tick after `INACTIVE_TORRENT_PAUSE_GRACE` of quiet -- from one
-        // ladder, with no task per stream deciding a second time.
+        // Nothing schedules a pause here any more, and nothing stamps
+        // anything either. The last stream ending is not a decision, it is
+        // a change of condition: the reconciler reads `idle_for` from
+        // `Engine::last_active_at`, which was stamped while this stream was
+        // *running* -- by `on_stream_start`'s own reconcile and by every
+        // tick that read the registers true since -- and stops the torrent
+        // on the first tick after `INACTIVE_TORRENT_PAUSE_GRACE` of quiet.
+        // One ladder, with no task per stream deciding a second time.
 
         if !native_lifecycle && file_streams_remaining == 0 {
             self.schedule_file_cleanup(info_hash.clone(), file_idx)
@@ -7653,14 +7679,112 @@ mod tests {
         );
 
         // The stream goes, without going through `on_stream_end` -- which
-        // would schedule the old grace-period pause, and this test is about
-        // the reconciler's own reading.
+        // would stamp the engine itself, and this test is about the
+        // reconciler's own reading.
         enginefs.active_streams.write().await.clear();
         enginefs.active_file_streams.write().await.clear();
+
+        // The grace runs from the last time the torrent was *used*, which
+        // the tick above observed, so it starts again here rather than
+        // being already spent: a torrent watched until a second ago has not
+        // been idle for the grace, whatever the clock said before the
+        // stream opened.
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), Decision::Run)]
+        );
+        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE).await;
         assert_eq!(
             enginefs.reconcile_tick().await,
             vec![(TEST_HASH.to_string(), Decision::Stop)]
         );
+    }
+
+    /// A stream that begins and ends between two ticks still spends the
+    /// grace.
+    ///
+    /// The idle arm's clock is written where activity is *observed*, and
+    /// for a stream longer than a [`RECONCILE_INTERVAL`] that is the
+    /// reconciler's own pass. A short one -- an HLS segment, a player's
+    /// probe read -- can be opened and closed without any timer pass seeing
+    /// it; what stamps the engine for it is the reconcile
+    /// [`Self::on_stream_start`] awaits for itself, which is taken after
+    /// the registers are set and so reads them true. Without that stamp the
+    /// very next tick stops the torrent the player is about to ask for the
+    /// next segment of: peers dropped and re-announced between two
+    /// segments, which is the flapping [`INACTIVE_TORRENT_PAUSE_GRACE`]
+    /// exists to prevent.
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_shorter_than_a_tick_still_spends_the_grace() {
+        let (mut enginefs, _counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
+
+        // Opened and closed without a single pass in between.
+        enginefs.on_stream_start(TEST_HASH, 0).await;
+        enginefs.on_stream_end(TEST_HASH, 0).await;
+
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), Decision::Run)],
+            "the player is between two segments, not gone"
+        );
+        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE).await;
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), Decision::Stop)],
+            "and once the grace is out it really is gone"
+        );
+    }
+
+    /// A client polling the statistics is *looking at* a torrent, not
+    /// watching it, and the idle arm must not confuse the two.
+    ///
+    /// `GET /{infoHash}/stats.json` reaches its engine through
+    /// [`BackendEngineFS::get_engine`], which counts as a poll for the
+    /// registry's idle eviction -- rightly: nothing may drop an engine a
+    /// client is still asking about. The idle arm's grace used to be
+    /// measured from that same `last_accessed`, and it was the arm's only
+    /// quiet test, so a details page left open in the client -- which polls
+    /// every few seconds -- reset the grace before it could ever run out.
+    /// Seeding off, nobody watching, and the torrent downloading all night.
+    ///
+    /// Master's sweep read the five activity registers and never
+    /// `last_accessed`, so it had no such hole; the reconciler has to keep
+    /// that guarantee, which is the whole point of the seeding-off policy.
+    ///
+    /// The torrent is used first, so what is under test is the grace
+    /// running out rather than the "nothing has ever used this" answer.
+    #[tokio::test(start_paused = true)]
+    async fn polling_the_statistics_does_not_keep_an_idle_torrent_running() {
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
+
+        // Watched once, then not: the registers are cleared by hand so that
+        // the only thing touching this engine afterwards is the poll.
+        enginefs.on_stream_start(TEST_HASH, 0).await;
+        enginefs.reconcile_tick().await;
+        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
+        enginefs.active_streams.write().await.clear();
+        enginefs.active_file_streams.write().await.clear();
+
+        // Five minutes of a details page polling every ten seconds.
+        for _ in 0..30 {
+            enginefs
+                .get_engine(TEST_HASH)
+                .await
+                .expect("the statistics route reaches its engine this way");
+            tokio::time::advance(Duration::from_secs(10)).await;
+            enginefs.reconcile_tick().await;
+        }
+
+        assert_eq!(
+            run_state_of(&enginefs, TEST_HASH).await,
+            RunState::Paused,
+            "nobody is watching it, and we have promised to upload nothing"
+        );
+        assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), 1);
     }
 
     /// The free-space arm through the whole tick, and the arm is above
