@@ -2276,9 +2276,9 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     ///
     /// Every registry engine's data -- bar a dead one's, see
     /// [`Self::eviction_classes`] -- which is its directory in the piece
-    /// store and nothing else ([`Self::engine_paths`], where the "and
-    /// nothing else" is argued: the backend's file paths hold no byte any
-    /// more, and naming them would make an old whole-file download immortal).
+    /// store and nothing else (`Self::engine_paths`, where the "and nothing
+    /// else" is argued: the backend's file paths hold no byte any more, and
+    /// naming them would make an old whole-file download immortal).
     ///
     /// Plus the placement folder of every *dormant* pin. Those have no engine
     /// -- that is what dormant means -- so nothing above would name them, and
@@ -2295,7 +2295,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// since [`crate::piece_store::PieceStoreFactory`] became the session's
     /// default storage is where *all* of a torrent's data is, the streaming
     /// cache and an offline download alike. It is the whole of what an
-    /// engine protects now (see [`Self::engine_paths`], which no longer
+    /// engine protects now (see `Self::engine_paths`, which no longer
     /// names the backend's file paths): the store's root is inside the cache
     /// root on purpose, so every piece in it is walked, and leaving it out
     /// would make live piece data evictable mid-playback with nothing to

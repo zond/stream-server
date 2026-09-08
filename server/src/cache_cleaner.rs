@@ -824,13 +824,22 @@ pub(crate) async fn usage(state: &AppState) -> CacheUsage {
 
 /// What a cache root costs on disk, as the cleaner must count it.
 ///
-/// librqbit pre-allocates every file it wants at its **full** length, so a
-/// part-streamed film is a multi-gigabyte apparent length over a handful of
-/// allocated blocks -- `Metadata::len` on such a file describes the movie,
-/// not the phone. A device reporting 17 GB of cache had 3.85 GB on it, and
-/// the cleaner spent every run trying to evict its way under a limit the
-/// disk was never over. (enginefs learned the same lesson about progress:
-/// count what the backend allocated, never `metadata().len()`.)
+/// librqbit's filesystem storage pre-allocates every file it wants at its
+/// **full** length, so a part-streamed film is a multi-gigabyte apparent
+/// length over a handful of allocated blocks -- `Metadata::len` on such a
+/// file describes the movie, not the phone. A device reporting 17 GB of cache
+/// had 3.85 GB on it, and the cleaner spent every run trying to evict its way
+/// under a limit the disk was never over. (enginefs learned the same lesson
+/// about progress: count what the backend allocated, never
+/// `metadata().len()`.)
+///
+/// The session does not run on that storage any more -- it is the piece
+/// store, which pre-allocates nothing and whose files are exactly as long as
+/// the bytes in them -- so nothing this server *writes* is sparse today. This
+/// still has to count occupancy, for two reasons that are not going away:
+/// the walked roots are full of whole-file downloads earlier versions
+/// pre-allocated and nothing migrates, and a rule that reads a length as a
+/// cost is one bad add away from the same 17 GB reading again.
 ///
 /// On Unix `st_blocks` is the allocated block count in 512-byte units *by
 /// definition* -- the unit is POSIX, not the filesystem's block size -- so

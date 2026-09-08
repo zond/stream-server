@@ -90,7 +90,7 @@
 //! this data again, and the have-bitfield will not outlive it.
 //!
 //! [`store::PieceStoreFactory`] makes that promise
-//! ([`store::PieceStoreFactory::ensure_persistable`]) and may only make it
+//! (its `StorageFactory` impl in [`store`]) and may only make it
 //! because it is the default and its root is derived from the session's own
 //! `download_dir`: the next process builds a store over the same directory
 //! and finds the same pieces under the same info hash. Handed to a single
