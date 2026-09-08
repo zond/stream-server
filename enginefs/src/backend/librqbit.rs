@@ -2,8 +2,8 @@ use crate::backend::dht_bootstrap::{self, BootstrapResolvers};
 use crate::backend::{
     BackendFileInfo, BackendMemoryDiagnostics, BtSettingEffect, BtSettingSupport, BtSettingsReport,
     DhtStatus, DroppedFilePieces, EngineStats, FileStreamTrait, Footprint, Growler,
-    LEAN_PEER_LIMIT, PeerDiscovery, PeerSearch, PieceReadiness, Source, StartupPhase, StatsFile,
-    StatsOptions, SwarmCap, TorrentBackend, TorrentFilePriorityPlan, TorrentHandle,
+    LEAN_PEER_LIMIT, PeerDiscovery, PeerSearch, PieceReadiness, RunState, Source, StartupPhase,
+    StatsFile, StatsOptions, SwarmCap, TorrentBackend, TorrentFilePriorityPlan, TorrentHandle,
     TorrentListenPort, TorrentPlacement, TorrentPrivacyConfig, TorrentProxyType, TorrentSource,
     TorrentSpeedProfile, TransferTotals,
 };
@@ -2470,6 +2470,45 @@ impl TorrentHandle for LibrqbitHandle {
     async fn is_in_error_state(&self) -> bool {
         self.handle
             .with_state(|state| matches!(state, ManagedTorrentState::Error(_)))
+    }
+
+    /// librqbit's `ManagedTorrentState` (one `parking_lot` read through
+    /// `ManagedTorrent::with_state`, `torrent_state/mod.rs:317`), plus the
+    /// `paused` flag (`ManagedTorrent::is_paused`, `:662`) for the one
+    /// variant that carries a pause intent. No stats rebuild, no per-file
+    /// walk, no syscall.
+    ///
+    /// `ManagedTorrentState::None` becomes [`RunState::Gone`]: librqbit calls
+    /// it a bug state the outside world should never see, and normally it is
+    /// invisible because every swap through it happens under one write guard
+    /// -- except in `_start`'s `Paused` arm, which takes the state out and
+    /// then does `TorrentStateLive::new(..)?` (`mod.rs:610-612`), so a live
+    /// state that fails to build leaves the torrent empty for good. A torrent
+    /// like that is neither running nor restartable, which is what `Gone`
+    /// says; reporting it as `Live` would have a caller believe it is
+    /// downloading.
+    fn run_state(&self) -> RunState {
+        // Two separate reads, never nested: both go to the same
+        // `parking_lot::RwLock`, which is write-preferring, so taking the
+        // second inside the first would deadlock the moment a writer queued
+        // between them. The cost is that the pair can be torn -- a pause
+        // landing between them reports `pause_requested: false` once -- which
+        // is why nothing may conclude anything lasting from an
+        // `Initializing` reading: it is not a settled state either way, and
+        // the next poll sees the pause.
+        let initializing = self.handle.with_state(|state| match state {
+            ManagedTorrentState::Live(_) => Some(RunState::Live),
+            ManagedTorrentState::Paused(_) => Some(RunState::Paused),
+            ManagedTorrentState::Error(_) => Some(RunState::Error),
+            ManagedTorrentState::None => Some(RunState::Gone),
+            ManagedTorrentState::Initializing(_) => None,
+        });
+        match initializing {
+            Some(settled) => settled,
+            None => RunState::Initializing {
+                pause_requested: self.handle.is_paused(),
+            },
+        }
     }
 
     /// `Session::unpause` -> `ManagedTorrent::start`, whose `Error(_)` arm

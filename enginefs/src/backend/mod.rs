@@ -210,6 +210,45 @@ impl std::fmt::Debug for DroppedFilePieces {
     }
 }
 
+/// What a torrent is actually doing, read from the backend's own state
+/// machine rather than from its persisted "paused" flag.
+///
+/// The two are not the same thing, and the difference is not academic:
+/// librqbit keeps a `paused` bool on the torrent *and* a
+/// `ManagedTorrentState` enum, writes them at different moments, and lets
+/// them disagree in **both** directions across a torrent's initial check
+/// (see [`TorrentHandle::run_state`] for the two sequences and the source
+/// lines). A caller that asks "is it paused?" therefore gets an answer that
+/// can be wrong either way; a caller that asks "what is it doing?" gets the
+/// state the torrent will actually behave as.
+///
+/// Nothing here is a claim about *why* a torrent is stopped -- that is the
+/// caller's policy to recompute, not the backend's to remember.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunState {
+    /// Connected to peers, reading and writing: the only state in which a
+    /// torrent can consume disk or bandwidth.
+    Live,
+    /// Settled and stopped, piece map kept. Starting it again is a state
+    /// transition the backend can make synchronously, with no re-check.
+    Paused,
+    /// Hash-checking, or between checks. **Not a settled state**: nothing may
+    /// be concluded from it about where the torrent will end up, because that
+    /// depends on a `start_paused` captured when the check began, which is
+    /// not observable from here.
+    ///
+    /// `pause_requested` is the backend's persisted pause intent for a
+    /// torrent in this state -- see [`TorrentHandle::run_state`] for exactly
+    /// what it can and cannot tell you.
+    Initializing { pause_requested: bool },
+    /// Stopped by an error. Whose error, and whether it is worth clearing, is
+    /// [`TorrentHandle::is_out_of_space`]'s question.
+    Error,
+    /// The backend holds no state for this torrent at all, so it is neither
+    /// running nor restartable.
+    Gone,
+}
+
 #[async_trait::async_trait]
 pub trait TorrentHandle: Send + Sync + Clone {
     fn info_hash(&self) -> String;
@@ -249,6 +288,60 @@ pub trait TorrentHandle: Send + Sync + Clone {
     async fn is_file_complete(&self, _file_idx: usize) -> bool {
         false
     }
+    /// What the torrent is doing right now: [`RunState`], read from the
+    /// backend's state machine, never from its `paused` flag.
+    ///
+    /// The flag is what `is_paused()` returns and what every "did we pause
+    /// this?" question used to be asked of, and across a torrent's initial
+    /// check it is wrong in both directions. Read against librqbit at the
+    /// pinned rev (`c280959`), all line numbers in
+    /// `crates/librqbit/src/`:
+    ///
+    /// * **A swallowed unpause.** `Session::unpause` (`session.rs:1660`) is
+    ///   `ManagedTorrent::start`, which writes `g.paused = false`
+    ///   (`torrent_state/mod.rs:649`) *before* `_start` looks at the state.
+    ///   The `Initializing` arm then finds a check already running --
+    ///   `if !init.try_start_check() { return Ok(()) }` (`:548-551`) -- and
+    ///   returns success having started nothing. That in-flight check
+    ///   finishes with the `start_paused` captured when *it* began, so its
+    ///   continuation re-enters `_start` (`:587`) and, if the torrent was
+    ///   added paused, returns at `:607` leaving the state `Paused`. Net:
+    ///   a stopped torrent whose flag says it is running.
+    /// * **A swallowed pause.** `TorrentStateInitializing::check` only ever
+    ///   passes `pause_requested` to `FileOps::initial_check`
+    ///   (`torrent_state/initializing.rs:279`, read at `file_ops.rs:113`);
+    ///   `validate_fastresume` (`initializing.rs:117-244`) never reads it.
+    ///   So a pause landing during a *fastresume* check sets the flag,
+    ///   `request_pause()` is ignored, the check returns `Ok`, and the
+    ///   continuation applies the add-time `start_paused` -- `false` for a
+    ///   torrent restored unpaused -- and takes it `Live` (`:606-620`). Net:
+    ///   a downloading torrent whose flag says it is paused. This is the
+    ///   measured 3 MiB -> 12 MiB overshoot past the free-space floor.
+    ///
+    /// There is a third shape with no flag divergence but no settled state
+    /// either: a pause during a *full* check does bail it (`file_ops.rs:113`),
+    /// and the `Err` arm returns `Ok` without changing the state
+    /// (`mod.rs:590-593`), leaving the torrent `Initializing` with no check
+    /// running -- which `wait_until_initialized` (`mod.rs:759`) polls
+    /// forever. `Paused` and `Initializing { .. }` are different answers here
+    /// for that reason: only the first is a state a caller can start again.
+    ///
+    /// `pause_requested` on that variant is the backend's *persisted pause
+    /// intent*, not librqbit's private `pause_requested` bool, which is
+    /// `pub(crate)` (`initializing.rs:103`) and cannot be read from outside
+    /// the crate at this rev. For an initializing torrent the two agree
+    /// wherever `ManagedTorrent::pause` set them, since it writes both under
+    /// the one write guard (`mod.rs:677-683`); they differ for a torrent
+    /// *added* paused, where `start_paused` sets the flag and the
+    /// `Initializing` arm clears the bool (`mod.rs:550`). Both mean the same
+    /// thing to a caller -- a pause is pending on this check -- which is why
+    /// the flag is the honest thing to report. What it does **not** tell you
+    /// is whether the check is still running.
+    ///
+    /// Must be cheap: it is polled on a timer for every torrent that exists,
+    /// so it is a couple of lock reads and no I/O, never a `stats()` walk.
+    fn run_state(&self) -> RunState;
+
     /// Lift an idle pause ([`Self::pause_torrent`]) -- and only an idle
     /// pause. Called on every playback start, so for a torrent this never
     /// paused it must be a silent no-op rather than an error, and it must

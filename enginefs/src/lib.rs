@@ -4437,7 +4437,8 @@ mod tests {
     use crate::backend::librqbit::{DeferredSelection, await_initialized};
     use crate::backend::{
         BackendFileInfo, EngineStats, FileStreamTrait, Growler, PeerDiscovery, PeerSearch,
-        PieceReadiness, StartupPhase, StatsFile, StatsOptions, SwarmCap, TorrentFilePriorityPlan,
+        PieceReadiness, RunState, StartupPhase, StatsFile, StatsOptions, SwarmCap,
+        TorrentFilePriorityPlan,
     };
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -4878,6 +4879,27 @@ mod tests {
         async fn file_path(&self, file_idx: usize) -> Option<std::path::PathBuf> {
             let folder = self.output_folder()?;
             Some(folder.join(&self.files.get(file_idx)?.name))
+        }
+
+        /// The fake models only what its tests ask of it, so this reports
+        /// only what it really knows: `FakeInit` for the initializing state
+        /// and the error knobs for the error one. It can never report
+        /// `Paused`, because `pause_torrent` and `resume_torrent` below only
+        /// *count* calls -- the fake torrent never actually stops. Anything
+        /// that reconciles a run state has to make the fake model the pause
+        /// first, or it will be testing a torrent that is always running.
+        fn run_state(&self) -> RunState {
+            if self.counters.in_error_state.load(Ordering::SeqCst)
+                || self.counters.out_of_space.load(Ordering::SeqCst)
+            {
+                RunState::Error
+            } else if !self.init.is_ready() {
+                RunState::Initializing {
+                    pause_requested: false,
+                }
+            } else {
+                RunState::Live
+            }
         }
 
         async fn resume_torrent(&self) -> Result<()> {
