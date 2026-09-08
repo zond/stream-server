@@ -1703,7 +1703,11 @@ fn plan_only_files(
 struct ReleaseThenReselect {
     dropped: Option<librqbit::DroppedPieces>,
     torrent: Arc<ManagedTorrent>,
-    range: std::ops::Range<u32>,
+    /// The range to want again once the release is over, or `None` for a
+    /// reclaim ([`crate::backend::AfterRelease::LeaveDropped`]), which
+    /// asked for the bytes back and would get them downloaded again
+    /// within the second.
+    range: Option<std::ops::Range<u32>>,
 }
 
 impl Drop for ReleaseThenReselect {
@@ -1711,7 +1715,10 @@ impl Drop for ReleaseThenReselect {
         // Release first, then re-select: a piece re-selected while still
         // under release would be one the deletion could race.
         drop(self.dropped.take());
-        match self.torrent.reselect_pieces(self.range.clone()) {
+        let Some(range) = self.range.clone() else {
+            return;
+        };
+        match self.torrent.reselect_pieces(range) {
             Ok(reselected) => debug!(
                 info_hash = %self.torrent.info_hash().as_string(),
                 reselected,
@@ -2812,12 +2819,35 @@ impl TorrentHandle for LibrqbitHandle {
     /// file. What it does *not* heal is the disk: with no claim there are no
     /// piece indices, and `delete_download_data` will not take pieces the
     /// backend still believes it has.
-    async fn drop_file_pieces(&self, file_idx: usize) -> Result<Option<DroppedFilePieces>> {
-        let range = self
-            .handle
-            .with_metadata(|m| m.file_infos.get(file_idx).map(|f| f.piece_range.clone()))
-            .context("torrent has no metadata to name the file's pieces")?
-            .with_context(|| format!("file index {file_idx} out of range"))?;
+    /// The file's piece range, its offset in the torrent, and what those
+    /// pieces hold -- which is not the file's length when it shares its
+    /// first or last piece with a neighbour. The last piece of the
+    /// *torrent* may be short, so the byte count is clamped against the
+    /// torrent's own length rather than assumed to be a whole multiple.
+    async fn file_pieces(&self, file_idx: usize) -> Option<crate::backend::FilePieceSpan> {
+        self.handle
+            .with_metadata(|m| {
+                let file = m.file_infos.get(file_idx)?;
+                let piece_length = u64::from(m.lengths().default_piece_length());
+                let total = m.lengths().total_length();
+                let first = u64::from(file.piece_range.start) * piece_length;
+                let last = (u64::from(file.piece_range.end) * piece_length).min(total);
+                Some(crate::backend::FilePieceSpan {
+                    pieces: file.piece_range.clone(),
+                    offset: file.offset_in_torrent,
+                    bytes: last.saturating_sub(first),
+                })
+            })
+            .ok()
+            .flatten()
+    }
+
+    async fn drop_pieces(
+        &self,
+        pieces: std::ops::Range<u32>,
+        after: crate::backend::AfterRelease,
+    ) -> Result<Option<DroppedFilePieces>> {
+        let range = pieces;
         let dropped = match self.handle.drop_pieces(range.clone()) {
             Ok(dropped) => dropped,
             Err(e)
@@ -2830,23 +2860,43 @@ impl TorrentHandle for LibrqbitHandle {
                      off -- and librqbit will not forget a piece it has before the next restart",
                 ));
             }
-            Err(e) => return Err(e.context("librqbit could not forget the file's pieces")),
+            Err(e) => return Err(e.context("librqbit could not forget the pieces")),
         };
-        let pieces = dropped.pieces().to_vec();
+        let dropped_pieces = dropped.pieces().to_vec();
         debug!(
             info_hash = %self.info_hash,
-            file_idx,
-            pieces = pieces.len(),
-            "dropped the file's pieces from the have-set"
+            first = range.start,
+            end = range.end,
+            pieces = dropped_pieces.len(),
+            ?after,
+            "dropped pieces from the have-set"
         );
+        let reselect = match after {
+            crate::backend::AfterRelease::Reselect => Some(range),
+            crate::backend::AfterRelease::LeaveDropped => None,
+        };
         Ok(Some(DroppedFilePieces::new(
-            pieces,
+            dropped_pieces,
             ReleaseThenReselect {
                 dropped: Some(dropped),
                 torrent: self.handle.clone(),
-                range,
+                range: reselect,
             },
         )))
+    }
+
+    /// librqbit's own hold-back set, which is what makes the retention
+    /// policy's "only what is committed is advertised" expressible at all:
+    /// a suppression bitfield on the chunk tracker, independent of both the
+    /// have-set and the reclaim want-set.
+    async fn set_pieces_advertised(
+        &self,
+        pieces: std::ops::Range<u32>,
+        advertised: bool,
+    ) -> Result<usize> {
+        self.handle
+            .set_pieces_advertised(pieces, advertised)
+            .context("librqbit could not change what the torrent announces")
     }
 
     /// The engine's primary multi-file switching hook
@@ -8145,5 +8195,426 @@ mod tests {
         assert!(!cached.exists(), "cached .torrent should be removed");
         // Data files are kept (delete_files=false).
         assert!(payload.exists(), "payload must survive remove_torrent");
+    }
+
+    // --- what the retention policy makes true ---
+
+    /// A session that has the whole torrent and listens, dialling `peer` so
+    /// nothing has to find anything.
+    async fn seeder_dialling(
+        content: &std::path::Path,
+        torrent_bytes: &[u8],
+        peer: std::net::SocketAddr,
+    ) -> Arc<librqbit::Session> {
+        let session = librqbit::Session::new_with_opts(
+            content.to_path_buf(),
+            librqbit::SessionOptions {
+                dht: None,
+                persistence: None,
+                listen: Some(librqbit::ListenerOptions {
+                    listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seeder session");
+        session
+            .add_torrent(
+                librqbit::AddTorrent::from_bytes(bytes::Bytes::from(torrent_bytes.to_owned())),
+                Some(librqbit::AddTorrentOptions {
+                    paused: false,
+                    output_folder: Some(content.to_str().unwrap().to_owned()),
+                    overwrite: true,
+                    initial_peers: Some(vec![peer]),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("seeder add");
+        session
+    }
+
+    /// An `EngineFS` on the piece store, listening for peers, with the
+    /// free-space arm satisfied -- the shape both retention tests need.
+    async fn streaming_engine_fs(
+        client_dir: &std::path::Path,
+    ) -> (
+        crate::BackendEngineFS<LibrqbitBackend>,
+        std::net::SocketAddr,
+    ) {
+        use librqbit::storage::StorageFactoryExt;
+        let pieces = crate::piece_store::StoreRoot::in_download_dir(client_dir);
+        let (backend, restored) = LibrqbitBackend::new_for_tests_with(
+            client_dir.to_path_buf(),
+            TestSessionOptions {
+                default_storage: Some(crate::piece_store::PieceStoreFactory::new(pieces).boxed()),
+                persist: false,
+                listen_loopback: true,
+            },
+        )
+        .await
+        .expect("client session");
+        assert!(restored.is_empty());
+        let addr = backend
+            .session
+            .listen_addr()
+            .expect("the client listens for peers");
+        let mut efs = crate::BackendEngineFS::new_with_backend(
+            backend,
+            restored,
+            client_dir.join("cache"),
+            client_dir.to_path_buf(),
+        );
+        efs.set_free_space_probe(|_| Ok(u64::MAX));
+        (efs, addr)
+    }
+
+    /// 256 KiB pieces: big enough that a 32 MiB file is 128 of them rather
+    /// than thousands, small enough that the budget below is a real split.
+    const RETENTION_PIECE: u64 = 256 * 1024;
+    /// 128 pieces.
+    const RETENTION_FILE_BYTES: usize = 32 * 1024 * 1024;
+    /// Half the file: 64 pieces, so the policy splits it into a 32-piece
+    /// window and a 32-piece committed half.
+    ///
+    /// The window has to be wider than librqbit's own stream lookahead
+    /// (`MAX_STARTUP_WINDOW_BYTES`, 4 MiB = 16 pieces), or the bound would
+    /// not be the policy's to keep: librqbit refuses to drop a piece a live
+    /// stream is about to read, and rightly -- deleting the read-ahead
+    /// under the player would only fetch it again. 90% of a 32-piece window
+    /// is 28 pieces ahead, so everything it protects is inside what the
+    /// policy is keeping anyway.
+    const RETENTION_BUDGET: u64 = 16 * 1024 * 1024;
+
+    /// **The bound.** A torrent streamed end to end, well past a cache
+    /// budget it does not fit in, never has more on disk than the budget --
+    /// and plays: every byte the reader delivers is the byte that was in
+    /// the file.
+    ///
+    /// This is the whole point of the policy being wired. Before it, the
+    /// only thing between a stream and a full disk was the cache cleaner,
+    /// which walks the volume a minute after the last write at best; a
+    /// torrent playing at 20 MB/s writes a gigabyte in that minute, and on
+    /// the television this was written for the filesystem got there first
+    /// and killed the torrent with ENOSPC ninety minutes into a film.
+    ///
+    /// Measured, not asserted about: the occupancy is `StoreRoot::held`,
+    /// which is the piece files that are actually on the disk, taken after
+    /// every retention pass -- not a counter this code keeps.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stream_past_the_cache_budget_stays_under_it_and_still_plays() {
+        use tokio::io::AsyncReadExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let content = tmp.path().join("content");
+        tokio::fs::create_dir_all(&content).await.unwrap();
+        let payload = content.join("movie.bin");
+        write_payload(&payload, RETENTION_FILE_BYTES).await;
+        let original = tokio::fs::read(&payload).await.unwrap();
+        let (torrent_bytes, _) =
+            make_torrent_with_piece_length(&payload, RETENTION_PIECE as u32).await;
+
+        let client_dir = tmp.path().join("client");
+        let (efs, client_addr) = streaming_engine_fs(&client_dir).await;
+        let store = efs.piece_store();
+
+        // The cleaner's number, pushed in before anything opens a reader:
+        // the policy is sized once, when the stream starts.
+        efs.set_cache_budget(Some(RETENTION_BUDGET));
+
+        let engine = efs
+            .add_torrent(TorrentSource::Bytes(torrent_bytes.clone()), None)
+            .await
+            .expect("add");
+        let hash = engine.info_hash.clone();
+        engine.handle.handle.wait_until_initialized().await.unwrap();
+        let _seeder = seeder_dialling(&content, &torrent_bytes, client_addr).await;
+
+        let mut reader = engine
+            .try_get_file_with_intent(
+                0,
+                0,
+                255,
+                crate::backend::priorities::PlaybackIntent::DirectInitial,
+                crate::backend::priorities::BufferProfile::Normal,
+            )
+            .await
+            .expect("reader");
+
+        let budget_pieces = (RETENTION_BUDGET / RETENTION_PIECE) as usize;
+        let mut read = Vec::with_capacity(original.len());
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut worst = 0usize;
+        let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
+        while read.len() < original.len() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stream stalled at {} of {} bytes",
+                read.len(),
+                original.len()
+            );
+            let n = reader.read(&mut buf).await.expect("read");
+            assert_ne!(n, 0, "the stream ended early at {}", read.len());
+            read.extend_from_slice(&buf[..n]);
+            // One retention pass per megabyte read, which is what the
+            // reconciler's two-second tick amounts to at any playback rate
+            // this test can reach.
+            if read.len() % (1024 * 1024) < n {
+                efs.reconcile_tick().await;
+                let held = store.held(&hash).len();
+                worst = worst.max(held);
+                assert!(
+                    held <= budget_pieces,
+                    "{held} pieces on disk after reading {} bytes, budget is {budget_pieces}",
+                    read.len()
+                );
+            }
+        }
+        drop(reader);
+
+        assert_eq!(read, original, "and it played: every byte is the film's");
+
+        // And the reclaim has to *stay* reclaimed. A piece put back into
+        // the want-set the moment its claim is released is re-downloaded at
+        // once: the disk still measures under the cap, because the next
+        // pass takes it again, and the swarm pays for the same bytes for as
+        // long as the torrent is up. So the second reading is the one the
+        // occupancy cannot show -- what the peers sent us while nothing was
+        // being read at all.
+        let fetched_before = engine.handle.transfer_totals().fetched;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            efs.reconcile_tick().await;
+        }
+        let refetched = engine
+            .handle
+            .transfer_totals()
+            .fetched
+            .saturating_sub(fetched_before);
+        assert!(
+            refetched < RETENTION_BUDGET / 4,
+            "{refetched} bytes came back off the swarm after playback ended: \
+             what the policy released is being wanted again"
+        );
+        assert!(
+            worst > budget_pieces / 2,
+            "the cache really filled ({worst} pieces at most), or the bound proves nothing"
+        );
+        assert!(
+            (read.len() as u64) >= RETENTION_BUDGET * 2,
+            "and the stream ran well past the budget"
+        );
+    }
+
+    /// **The freshness half of the budget.** Before any cache pass has run,
+    /// this process has not been told a budget -- and "not told" is not
+    /// "nothing". Nothing is held back, nothing is reclaimed, and the
+    /// torrent behaves exactly as it did before the policy was wired.
+    ///
+    /// The failure this rules out is the one this codebase keeps having to
+    /// delete: a value invented at startup and read back as an
+    /// observation. A budget defaulting to `0` would read as "the cache may
+    /// hold nothing" and would reclaim every piece the window has passed
+    /// from the first stream of every boot, before anything had measured
+    /// the disk at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stream_before_the_first_cache_pass_is_not_bounded_at_all() {
+        use tokio::io::AsyncReadExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let content = tmp.path().join("content");
+        tokio::fs::create_dir_all(&content).await.unwrap();
+        let payload = content.join("movie.bin");
+        write_payload(&payload, RETENTION_FILE_BYTES).await;
+        let (torrent_bytes, _) =
+            make_torrent_with_piece_length(&payload, RETENTION_PIECE as u32).await;
+
+        let client_dir = tmp.path().join("client");
+        let (efs, client_addr) = streaming_engine_fs(&client_dir).await;
+        let store = efs.piece_store();
+        // Deliberately no `set_cache_budget`: no cache pass has run.
+
+        let engine = efs
+            .add_torrent(TorrentSource::Bytes(torrent_bytes.clone()), None)
+            .await
+            .expect("add");
+        let hash = engine.info_hash.clone();
+        engine.handle.handle.wait_until_initialized().await.unwrap();
+        let _seeder = seeder_dialling(&content, &torrent_bytes, client_addr).await;
+
+        let mut reader = engine
+            .try_get_file_with_intent(
+                0,
+                0,
+                255,
+                crate::backend::priorities::PlaybackIntent::DirectInitial,
+                crate::backend::priorities::BufferProfile::Normal,
+            )
+            .await
+            .expect("reader");
+
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut done = 0usize;
+        let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
+        while done < RETENTION_FILE_BYTES {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stream stalled at {done} bytes"
+            );
+            let n = reader.read(&mut buf).await.expect("read");
+            assert_ne!(n, 0, "the stream ended early at {done}");
+            done += n;
+            if done % (1024 * 1024) < n {
+                efs.reconcile_tick().await;
+            }
+        }
+        efs.reconcile_tick().await;
+        drop(reader);
+
+        let pieces = (RETENTION_FILE_BYTES as u64 / RETENTION_PIECE) as usize;
+        assert_eq!(
+            store.held(&hash).len(),
+            pieces,
+            "every piece is still here: an unknown budget bounds nothing"
+        );
+    }
+
+    /// **The citizenship half.** A peer is never told about a piece we
+    /// later reclaim.
+    ///
+    /// A leecher with no way to find anything but this server downloads
+    /// what it is offered while the stream runs and the policy reclaims
+    /// behind the playhead. Whatever the leecher ends up holding, it holds
+    /// because we announced it -- and every one of those pieces is still on
+    /// our disk when the stream is over. There is no un-Have in BitTorrent,
+    /// so a piece announced and then reclaimed is a peer that asks for
+    /// bytes we have thrown away.
+    ///
+    /// Both sides are read off a disk: the leecher runs on a piece store of
+    /// its own, so the pieces it received are a directory listing rather
+    /// than a counter either side keeps.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_peer_is_never_told_about_a_piece_we_later_reclaim() {
+        use librqbit::storage::StorageFactoryExt;
+        use tokio::io::AsyncReadExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let content = tmp.path().join("content");
+        tokio::fs::create_dir_all(&content).await.unwrap();
+        let payload = content.join("movie.bin");
+        write_payload(&payload, RETENTION_FILE_BYTES).await;
+        let (torrent_bytes, _) =
+            make_torrent_with_piece_length(&payload, RETENTION_PIECE as u32).await;
+
+        let client_dir = tmp.path().join("client");
+        let (efs, client_addr) = streaming_engine_fs(&client_dir).await;
+        let store = efs.piece_store();
+        efs.set_cache_budget(Some(RETENTION_BUDGET));
+
+        let engine = efs
+            .add_torrent(TorrentSource::Bytes(torrent_bytes.clone()), None)
+            .await
+            .expect("add");
+        let hash = engine.info_hash.clone();
+        engine.handle.handle.wait_until_initialized().await.unwrap();
+        let _seeder = seeder_dialling(&content, &torrent_bytes, client_addr).await;
+
+        // The peer: no DHT, no trackers, one address -- so anything it ends
+        // up with, it got from us, because we said we had it.
+        let leecher_dir = tmp.path().join("leecher");
+        tokio::fs::create_dir_all(&leecher_dir).await.unwrap();
+        let leecher_store = crate::piece_store::StoreRoot::in_download_dir(&leecher_dir);
+        let leecher = librqbit::Session::new_with_opts(
+            leecher_dir.clone(),
+            librqbit::SessionOptions {
+                dht: None,
+                persistence: None,
+                default_storage_factory: Some(
+                    crate::piece_store::PieceStoreFactory::new(leecher_store.clone()).boxed(),
+                ),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("leecher session");
+        leecher
+            .add_torrent(
+                librqbit::AddTorrent::from_bytes(bytes::Bytes::from(torrent_bytes.clone())),
+                Some(librqbit::AddTorrentOptions {
+                    paused: false,
+                    initial_peers: Some(vec![client_addr]),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("leecher add");
+
+        let mut reader = engine
+            .try_get_file_with_intent(
+                0,
+                0,
+                255,
+                crate::backend::priorities::PlaybackIntent::DirectInitial,
+                crate::backend::priorities::BufferProfile::Normal,
+            )
+            .await
+            .expect("reader");
+
+        // Half the budget is the committed set, and the committed set is
+        // the whole of what a peer is ever offered.
+        let committed_pieces = (RETENTION_BUDGET / RETENTION_PIECE / 2) as usize;
+        // Every piece the peer has taken off us at any point in the run.
+        // Taken as we go, so a piece it got early and we reclaimed later
+        // cannot slip past by the peer having dropped it too.
+        let mut told = std::collections::BTreeSet::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut done = 0usize;
+        let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
+        while done < RETENTION_FILE_BYTES {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stream stalled at {done} bytes"
+            );
+            let n = reader.read(&mut buf).await.expect("read");
+            assert_ne!(n, 0, "the stream ended early at {done}");
+            done += n;
+            if done % (1024 * 1024) < n {
+                efs.reconcile_tick().await;
+                told.extend(leecher_store.held(&hash));
+            }
+        }
+        // Then let the peer take what it is still being offered. The
+        // playhead has stopped, so the policy's answer is fixed from here:
+        // the committed half stays advertised and stays on the disk, and
+        // the window stays held back. The reader is deliberately still
+        // open -- dropping it would end the playback the ladder reads, and
+        // this is about what a peer sees, not about idleness.
+        let settle = std::time::Instant::now() + TEST_WAIT_BOUND;
+        while told.len() < committed_pieces && std::time::Instant::now() < settle {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            efs.reconcile_tick().await;
+            told.extend(leecher_store.held(&hash));
+        }
+        drop(reader);
+
+        assert!(
+            told.len() >= committed_pieces / 4,
+            "the peer got {} of the {committed_pieces} pieces we commit, which is too few \
+             for this to say anything about what we announce",
+            told.len()
+        );
+        let ours = store.held(&hash);
+        let broken: Vec<u32> = told.iter().copied().filter(|p| !ours.contains(p)).collect();
+        assert!(
+            broken.is_empty(),
+            "we announced {} pieces we then reclaimed: {broken:?}",
+            broken.len()
+        );
+        assert!(
+            told.len() < (RETENTION_FILE_BYTES as u64 / RETENTION_PIECE) as usize,
+            "the peer was offered the whole torrent, so nothing was ever held back"
+        );
     }
 }

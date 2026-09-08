@@ -51,8 +51,13 @@
 //! to `(piece, offset_in_piece)` -- and [`policy`] is the arithmetic of *which*
 //! pieces we keep and which of those we share; neither has a filesystem or a
 //! librqbit type in it. [`store`] is the
-//! [`librqbit::storage::TorrentStorage`] implementation over the first.
-//! [`sweep`] reconciles the store against the session at launch.
+//! [`librqbit::storage::TorrentStorage`] implementation over the first, and
+//! the one type that knows the directory shape: it scans, it stats, and it
+//! deletes one piece. [`sweep`] reconciles the store against the session at
+//! launch. What drives [`policy`] against a real torrent -- the playhead, the
+//! hold-back, the reclaim, and the claim that keeps a delete atomic with the
+//! have-set -- is [`crate::retention`], which is also what answers the cache
+//! cleaner.
 //!
 //! # How it is wired in
 //!
@@ -64,8 +69,8 @@
 //! It is passed to no individual add, and that is not a stylistic choice:
 //! three things had to be decided in the rqbit fork before it could be wired
 //! at all, and all three are about the have-set rather than about storage.
-//! Two are settled at the rev this crate pins; one is not, and it is why
-//! [`policy`] is still unwired.
+//! All three are settled at the rev this crate pins, and the last of them is
+//! what let [`policy`] be wired up ([`crate::retention`]).
 //!
 //! **Settled: where the have-set comes from.** `initial_check` walks files in
 //! order and, on the first read error in a file, marks the rest of that file
@@ -129,26 +134,28 @@
 //! ([`crate::traffic`]) and never sees the storage, so this factory is the
 //! bare default, and its own initial-check reads are nobody's traffic.
 //!
-//! **Not settled: a have-bit that is not an announcement.** [`policy`] decides
+//! **Settled: a have-bit that is not an announcement.** [`policy`] decides
 //! that only the committed set is advertised and that a window piece is held
-//! and readable and *not* announced. That is not expressible through the
-//! fork's API today: `have` implies announced on both paths -- the `have`
-//! broadcast (`should_transmit_have` reaching
-//! `TorrentStateLive::should_advertise_have`) and the handshake bitfield,
-//! which serialises `get_have_pieces()` whole -- and a window piece has to be
-//! `have` for the stream to read it. `drop_pieces` gives *not* have, not
-//! wanted, not advertised, so there is no third state to put a window piece
-//! in. A store wired up without one would announce every window piece and
-//! withdraw it again as the window moved, which is the advertise-then-refuse
-//! the policy exists to avoid. It is now the only one of the three left, and
-//! nothing in this crate can lift it.
+//! and readable and *not* announced. That used to be inexpressible: `have`
+//! implied announced on both paths -- the `have` broadcast and the handshake
+//! bitfield, which serialises `get_have_pieces()` whole -- and a window piece
+//! has to be `have` for the stream to read it, while `drop_pieces` gives
+//! *not* have, not wanted, not advertised. The fork's
+//! `ManagedTorrent::set_pieces_advertised` is the third state: a suppression
+//! set on the chunk tracker, independent of both the have-set and the reclaim
+//! want-set, and settable before a piece is downloaded, which is the only
+//! ordering under which no Have ever goes out for a window piece.
+//! [`crate::retention`] is the wiring, and it is why the policy is no longer
+//! a decision nothing performs.
 //!
-//! The first two are exercised rather than assumed: the storage is driven
-//! through a real librqbit session's own initial check below, and through a
-//! real *persisted* session across a restart in
-//! `backend::librqbit`'s `a_restart_on_the_piece_store_finds_its_data_and_the_reconciler_starts_it`.
-//! The third cannot be -- there is no API to observe an announcement
-//! separately from a have-bit, which is the whole of the problem.
+//! All three are exercised rather than assumed. The storage is driven through
+//! a real librqbit session's own initial check below, and through a real
+//! *persisted* session across a restart in `backend::librqbit`'s
+//! `a_restart_on_the_piece_store_finds_its_data_and_the_reconciler_starts_it`.
+//! The third is exercised over two real sessions on the wire, in the same
+//! module's `a_peer_is_never_told_about_a_piece_we_later_reclaim`: what the
+//! peer ends up holding is what we announced, and every one of those pieces
+//! is still on our disk when the stream is over.
 
 pub mod layout;
 pub mod policy;

@@ -171,6 +171,14 @@ impl<H: TorrentHandle> AsyncRead for FileHandle<H> {
                 {
                     self.log_blocked_read(waited);
                 }
+                // Where a byte really reached a player from, which is what
+                // the retention policy calls the playhead. Written after
+                // the read rather than before it, so a read that failed or
+                // parked moves nothing.
+                if delivered > 0 {
+                    self.engine
+                        .note_playhead(self.file_idx, self.cursor.position);
+                }
             }
         }
         polled

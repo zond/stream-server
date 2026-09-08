@@ -540,7 +540,7 @@ pub struct StoreContents {
 pub struct StoredTorrent {
     /// The directory's name. For anything this store wrote that is a
     /// torrent's lowercase info hash, which is how a caller addresses it
-    /// back ([`StoreRoot::delete_piece`]).
+    /// back ([`StoreRoot::delete_pieces`]).
     pub info_hash: String,
     /// Every piece with a file, in ascending index order.
     pub pieces: Vec<StoredPiece>,
@@ -551,7 +551,7 @@ pub struct StoredTorrent {
     pub strays: Vec<std::fs::Metadata>,
 }
 
-/// One piece on disk: both copies of it, because [`StoreRoot::delete_piece`]
+/// One piece on disk: both copies of it, because [`StoreRoot::delete_pieces`]
 /// takes them together -- half of a piece nobody wants is worth exactly as
 /// little as the whole of it.
 #[derive(Debug)]
@@ -650,7 +650,7 @@ impl StoreRoot {
             }
             // A directory name this store would not have written --
             // [`Self::torrent_dir`] lowercases, so `<HASH>` names a
-            // directory no `delete_piece` could ever address, and a name
+            // directory no `delete_pieces` could ever address, and a name
             // that is not UTF-8 is not an info hash at all. Its bytes are
             // on the volume, so they are counted; its files are never
             // offered as pieces, because a delete addressed to them would
@@ -704,7 +704,7 @@ impl StoreRoot {
             let bucket_name = bucket.file_name();
             // The bucket's *spelling*, not merely the number it parses
             // to: `<hash>/00/0` and `<hash>/+0/0` both parse as bucket 0,
-            // and `delete_piece(hash, 0)` would go to `<hash>/0/0` and
+            // and `delete_pieces(hash, [0])` would go to `<hash>/0/0` and
             // free nothing. Same rule as [`piece_of_name`] applies to the
             // file name.
             let bucket_index = bucket_name.to_str().and_then(canonical_index);
@@ -724,7 +724,7 @@ impl StoreRoot {
                 }
                 let name = entry.file_name();
                 // A name this store never wrote, or a piece file sitting in
-                // a bucket it does not belong to: `delete_piece` would look
+                // a bucket it does not belong to: `delete_pieces` would look
                 // for it somewhere else, so reporting it as that piece would
                 // promise bytes back that no delete could take.
                 let stray = match name.to_str().and_then(piece_of_name) {
@@ -752,30 +752,67 @@ impl StoreRoot {
         stored
     }
 
-    /// Reclaim one piece: both copies of it.
+    /// Which pieces of one torrent are **complete** on disk, which under
+    /// this design is the have-set: presence means complete, because the
+    /// bytes are written under a staging name and renamed into place only
+    /// once librqbit's hash check has passed.
     ///
-    /// Returns whether anything left the disk, so a caller counting what it
-    /// freed does not have to stat first.
+    /// [`Self::stat`] answers the same question and more, and the more is
+    /// what makes it the wrong call here: it costs a `metadata` per file,
+    /// and the retention pass asks this of a streaming torrent every couple
+    /// of seconds -- some 6,750 `statx` calls a pass for a 27 GB torrent,
+    /// for two numbers it does not want. This reads directory *names* and
+    /// nothing else: one `read_dir` per bucket, no `stat` at all.
     ///
-    /// **This does not ask whether the piece may go.** A piece of a torrent
-    /// the session still holds may only be deleted under the have-set
-    /// interlock -- see [`Self::delete_pieces`], which is where that
-    /// interlock's one caller lives.
-    pub fn delete_piece(&self, info_hash: &str, piece: u32) -> anyhow::Result<bool> {
+    /// Same spelling rules as [`Self::stat`], and for the same reason: a
+    /// piece is only reported when both halves of its address are spelled
+    /// the way a delete will spell them, or the answer would promise bytes
+    /// no delete could take.
+    pub fn held(&self, info_hash: &str) -> std::collections::BTreeSet<u32> {
         let dir = self.torrent_dir(info_hash);
-        Ok(unlink_piece(&dir, piece)?.removed_anything)
+        let mut held = std::collections::BTreeSet::new();
+        let Ok(buckets) = std::fs::read_dir(&dir) else {
+            return held;
+        };
+        for bucket in buckets.flatten() {
+            if !bucket.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let bucket_name = bucket.file_name();
+            let bucket_index = bucket_name.to_str().and_then(canonical_index);
+            let Ok(entries) = std::fs::read_dir(bucket.path()) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if let Some((piece, staged)) = name.to_str().and_then(piece_of_name)
+                    && !staged
+                    && bucket_index == Some(piece / PIECES_PER_DIRECTORY)
+                {
+                    held.insert(piece);
+                }
+            }
+        }
+        held
     }
 
-    /// [`Self::delete_piece`] over many, for a caller that has already had
-    /// the backend forget it has them ([`crate::backend::DroppedFilePieces`])
-    /// and is holding that claim across this call.
+    /// Reclaim pieces: both copies of each.
     ///
-    /// That claim is the interlock, and it lives in one place:
-    /// `BackendEngineFS::delete_download_data`, which takes it from
-    /// `TorrentHandle::drop_file_pieces` and drops it only once these
-    /// unlinks have returned. Without it the torrent goes on believing it
-    /// holds the piece -- it advertises it, and answers a peer's request
+    /// **Only for a caller that has already had the backend forget it has
+    /// them** ([`crate::backend::DroppedFilePieces`]) and is holding that
+    /// claim across this call. That claim is the interlock, and it lives in
+    /// one place: [`crate::retention::take_claimed`], which every reclaim
+    /// in this server ends at -- the retention policy's and the per-file
+    /// delete an unpin does alike. Without it the torrent goes on believing
+    /// it holds the piece: it advertises it, and answers a peer's request
     /// with a read past the end of nothing.
+    ///
+    /// There is deliberately no single-piece sibling of this. The cache
+    /// cleaner had one and called it directly, which was safe only while
+    /// everything it was allowed to touch belonged to no torrent in the
+    /// session; the policy now offers it pieces of torrents that do, and a
+    /// second door into the unlink is a second place the interlock can be
+    /// forgotten.
     ///
     /// Not [`PieceStore::delete_piece`], and it cannot be: the live
     /// `PieceStore` of a running torrent is librqbit's, built by the factory
@@ -1408,7 +1445,7 @@ mod tests {
     /// reclaim and what it mis-names is a delete that frees nothing.
     ///
     /// Three things it has to get right. Both copies of a piece are **one**
-    /// entry, because `delete_piece` takes them together. A name the store
+    /// entry, because `delete_pieces` takes them together. A name the store
     /// would never have written is a stray, reported so the bytes are
     /// visible and *not* as a piece, since a delete addressed to that index
     /// would look somewhere else and free nothing. And a torrent it holds
@@ -1478,7 +1515,7 @@ mod tests {
         assert_eq!(contents.torrents[0].pieces.len(), 2);
 
         // Deleting one piece takes both its copies, and the scan says so.
-        assert!(root.delete_piece(hash, 2500).unwrap());
+        assert_eq!(root.delete_pieces(hash, [2500]).unwrap(), 1);
         assert_eq!(
             root.stat(hash)
                 .pieces
@@ -1498,7 +1535,7 @@ mod tests {
     /// store writes, not merely for the number it parses to.
     ///
     /// `<hash>/00/0`, `<hash>/+0/0`, `<hash>/0/00` and `<hash>/0/+0` all
-    /// parse as piece 0, and `delete_piece(hash, 0)` goes to `<hash>/0/0`
+    /// parse as piece 0, and `delete_pieces(hash, [0])` goes to `<hash>/0/0`
     /// and takes none of them. Reported as piece 0 they are bytes a cleaner
     /// asks for and never gets: it books them as freed, the disk gives
     /// nothing, and the next pass re-finds the very same file and books them
@@ -1558,9 +1595,10 @@ mod tests {
         // What the scan promised, the delete keeps: piece 0's bytes come
         // back once, and nothing else does -- so nothing here can be booked
         // as freed twice.
-        assert!(root.delete_piece(hash, 0).unwrap());
-        assert!(
-            !root.delete_piece(hash, 0).unwrap(),
+        assert_eq!(root.delete_pieces(hash, [0]).unwrap(), 1);
+        assert_eq!(
+            root.delete_pieces(hash, [0]).unwrap(),
+            0,
             "and asking again frees nothing, which is what the caller counts"
         );
         for (path, len) in &debris {
@@ -1576,7 +1614,7 @@ mod tests {
     /// debris too, for the same reason one level down.
     ///
     /// [`StoreRoot::torrent_dir`] lowercases, so `<HASH>` is a directory no
-    /// `delete_piece` can address: reported as a torrent it would be scanned
+    /// `delete_pieces` can address: reported as a torrent it would be scanned
     /// *and* stat'd under the lowercase name, counting the real torrent's
     /// pieces twice and offering a delete that frees nothing.
     #[test]

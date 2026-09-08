@@ -37,22 +37,19 @@
 //! *not* announced, because the window moves and it will go. On a small volume
 //! that means we honestly seed little; on a roomy one we seed everything.
 //!
-//! **That last part is a decision, not yet a behaviour, and nothing in this
-//! module can make it one.** At the rev this crate pins, `have` implies
-//! announced on both paths out of librqbit -- the `have` broadcast
-//! (`should_transmit_have` reaching `TorrentStateLive::should_advertise_have`)
+//! **That last part was a decision this module could state and not perform,
+//! and it performs it now.** At the rev this crate used to pin, `have`
+//! implied announced on both paths out of librqbit -- the `have` broadcast
 //! and the handshake bitfield, which serialises `get_have_pieces()` whole --
-//! and a window piece has to be `have` for the stream to read it.
-//! `drop_pieces` gives *not* have, not wanted, not advertised; there is no
-//! have-readable-unannounced third state to put a window piece in. So
-//! [`RetentionPolicy::advertised`] is what a peer *should* be shown and not
-//! what one is shown: wiring this policy to a torrent today would announce
-//! every window piece and withdraw it again a few seconds later, which is
-//! precisely the advertise-then-refuse the rule exists to avoid. The third
-//! state is a fork change, it is the one thing [`super`] is still waiting on,
-//! and until it lands nothing here is wired up -- so the policy decides the
-//! honest thing rather than a weaker thing a wiring commit would have to
-//! undo.
+//! and a window piece has to be `have` for the stream to read it, so wiring
+//! this policy up would have announced every window piece and withdrawn it
+//! again a few seconds later. The fork now has the third state,
+//! `ManagedTorrent::set_pieces_advertised`: a suppression set on the chunk
+//! tracker, independent of both the have-set and the reclaim want-set, and
+//! settable *before* a piece is downloaded so no Have ever goes out for it.
+//! [`crate::retention`] is what holds a window back with it and what puts a
+//! committed piece into what we announce, and [`RetentionPolicy::advertised`]
+//! is now what a peer really is shown.
 //!
 //! # Two choices worth stating, because they look arbitrary
 //!
@@ -311,11 +308,13 @@ impl RetentionPolicy {
         self.shape
     }
 
-    /// The committed set: what may be advertised, and nothing else may.
+    /// The committed set: what is advertised, and nothing else is.
     ///
-    /// *May be*, not *is*. Nothing reads this yet, and the engine has no way
-    /// to be told it -- `have` implies announced at the rev we pin, so a
-    /// window piece is announced by being readable. See the module docs.
+    /// [`crate::retention`] is what makes that true -- it holds the whole
+    /// file back from what the torrent announces before the reader opens,
+    /// and puts a piece back only when [`Self::advance`] commits it. It is
+    /// also what the cache cleaner is answered from: what we announce is
+    /// exactly what nothing will reclaim.
     pub fn advertised(&self) -> &BTreeSet<u32> {
         &self.committed
     }

@@ -460,15 +460,18 @@ struct CacheRoots {
     /// cache to answer a shortage on an external drive it could reclaim
     /// nothing from. With one root there is one volume and one cap.
     limit: CacheLimit,
-    /// Torrents whose pieces a pass may not take (`EvictionClasses::protected`).
-    protected: HashSet<String>,
-    /// Torrents whose pieces go before any other cache -- what a dead
-    /// torrent left behind (`EvictionClasses::dead`). Ordinary cache in
-    /// every other respect: counted and aged; they only sort to the front
-    /// of the size rule.
-    evict_first: HashSet<String>,
+    /// What the retention policy will let this pass take, piece by piece
+    /// (`EngineFS::reclaim_gate`). It replaced two lists of info hashes the
+    /// cleaner used to reason from -- the protected and the dead -- because
+    /// those were one question in two spellings, and the question is the
+    /// policy's: *have we told a peer about this piece?*
+    gate: enginefs::retention::ReclaimGate,
     /// Torrents stopped for want of disk space, to be evicted whole through
-    /// the engine when nothing else can go -- see [`evict`].
+    /// the engine when nothing else can go -- see [`evict`]. Not a class of
+    /// protection: such a torrent keeps its piece map and announces it
+    /// again the moment it resumes, so the gate refuses its pieces like any
+    /// other announced ones, and this is the *other* kind of eviction
+    /// rather than an exception to the first.
     stopped: Vec<StoppedTorrent>,
 }
 
@@ -484,12 +487,14 @@ async fn cache_roots(state: &AppState) -> CacheRoots {
     // is where it is now.
     let root = state.engine.download_dir.clone();
 
-    // Everything a live engine writes, at the paths the backend reports (a
-    // pinned engine stays live, so its data is protected for as long as
-    // the pin holds) -- and, from the same walk, what a dead one left
-    // behind, which goes first.
-    let classes = state.engine.eviction_classes().await;
-    let stopped = classes
+    // What the policy will part with, piece by piece -- and, separately,
+    // the torrents a full disk stopped, which go whole or not at all.
+    // `evict_stopped_torrent` re-checks both halves of that condition (still
+    // stopped, still unpinned) before it takes one, so this list is a
+    // candidate set and not a verdict.
+    let verdicts = state.engine.reclaim_verdicts().await;
+    let gate = verdicts.gate;
+    let stopped = verdicts
         .stopped_for_space
         .into_iter()
         .map(|info_hash| StoppedTorrent {
@@ -505,9 +510,22 @@ async fn cache_roots(state: &AppState) -> CacheRoots {
         },
         store: state.engine.piece_store(),
         root,
-        protected: classes.protected.into_iter().collect(),
-        evict_first: classes.dead.into_iter().collect(),
+        gate,
         stopped,
+    }
+}
+
+/// `EngineFS::release_pieces` in the shape [`evict`] takes, so a test can
+/// hand it something else -- and so the cleaner has no way to reach a piece
+/// file except through the engine, which is where the have-set interlock
+/// lives.
+fn releaser(
+    engine: Arc<enginefs::EngineFS>,
+) -> impl for<'a> Fn(&'a str, u32) -> BoxFuture<'a, bool> {
+    move |info_hash: &str, piece: u32| {
+        let engine = engine.clone();
+        let info_hash = info_hash.to_string();
+        Box::pin(async move { engine.release_pieces(&info_hash, &[piece]).await > 0 })
     }
 }
 
@@ -563,11 +581,12 @@ async fn clean_cache_with_headroom(
             .map(|torrent| torrent.info_hash.clone())
             .collect();
         let evictors: Vec<_> = roots.stopped.iter().map(StoppedTorrent::evictor).collect();
+        let release = releaser(state.engine.clone());
         evict(
             &roots.root,
             &roots.store,
-            &roots.protected,
-            &roots.evict_first,
+            &roots.gate,
+            &release,
             &stopped,
             &evictors,
             roots.limit,
@@ -575,6 +594,11 @@ async fn clean_cache_with_headroom(
         )
         .await?
     };
+    // The cap this pass enforced is the budget the retention policy is
+    // sized against -- one number, computed once, by the layer that owns
+    // "how much room is there". A policy that recomputed it would have the
+    // two evicting against different limits.
+    state.engine.set_cache_budget(report.limit);
     state.last_eviction.record(&report);
     Ok(report)
 }
@@ -628,12 +652,11 @@ pub(crate) async fn usage(state: &AppState) -> CacheUsage {
     let inputs = WalkInputs {
         download_dir: roots.root,
         store: roots.store,
-        protected: roots.protected,
-        // Neither rule this run: nothing is evicted, so nothing has an
-        // order to be evicted in and nothing is set aside for the engine.
-        // A stopped torrent's pieces are counted like any other cache,
-        // which is what they are until a pass decides to take them.
-        evict_first: HashSet::new(),
+        gate: roots.gate,
+        // Not a rule this run: nothing is evicted, so nothing is set aside
+        // for the engine. A stopped torrent's pieces are counted like any
+        // other cache, which is what they are until a pass decides to take
+        // them.
         stopped: Vec::new(),
         max_age: Duration::MAX,
         now: std::time::SystemTime::now(),
@@ -839,11 +862,11 @@ impl EvictionReport {
 /// which covers live engines and the dormant pins that have no engine to
 /// speak for them.
 #[allow(clippy::too_many_arguments)]
-async fn evict<E>(
+async fn evict<E, R>(
     download_dir: &std::path::Path,
     store: &enginefs::piece_store::StoreRoot,
-    protected: &HashSet<String>,
-    evict_first: &HashSet<String>,
+    gate: &enginefs::retention::ReclaimGate,
+    release: &R,
     stopped: &[String],
     evictors: &[E],
     limit: CacheLimit,
@@ -851,6 +874,7 @@ async fn evict<E>(
 ) -> anyhow::Result<EvictionReport>
 where
     E: for<'a> Fn(&'a str) -> BoxFuture<'a, anyhow::Result<bool>>,
+    R: for<'a> Fn(&'a str, u32) -> BoxFuture<'a, bool>,
 {
     debug_assert_eq!(stopped.len(), evictors.len());
     // 1. Walk. On the blocking pool, not on the worker this future is
@@ -866,8 +890,7 @@ where
     let walk = WalkInputs {
         download_dir: download_dir.to_path_buf(),
         store: store.clone(),
-        protected: protected.clone(),
-        evict_first: evict_first.clone(),
+        gate: gate.clone(),
         stopped: stopped.to_vec(),
         max_age: Duration::from_secs(30 * 24 * 60 * 60),
         now: std::time::SystemTime::now(),
@@ -892,7 +915,7 @@ where
     let mut aged_out_files = 0usize;
     for (item, size) in aged_out {
         info!("Older than 30 days, deleting: {}", item);
-        match reclaim(&item, store, download_dir).await {
+        match reclaim(&item, release, download_dir).await {
             Ok(true) => {
                 aged_out_bytes += size;
                 aged_out_files += 1;
@@ -977,7 +1000,7 @@ where
             }
 
             debug!("Deleting (size limit): {}", item);
-            match reclaim(&item, store, download_dir).await {
+            match reclaim(&item, release, download_dir).await {
                 Ok(true) => {
                     total_size = total_size.saturating_sub(size);
                     freed_space += size;
@@ -1088,14 +1111,12 @@ impl std::fmt::Display for Reclaimable {
 struct WalkInputs {
     download_dir: std::path::PathBuf,
     store: enginefs::piece_store::StoreRoot,
-    /// Torrents whose pieces may not be taken. Nothing the *walk* finds is
-    /// protected: since the piece store became the session's storage,
+    /// Which of the store's pieces the retention policy will part with, and
+    /// which of them sort to the front. Nothing the *walk* finds goes
+    /// through it: since the piece store became the session's storage,
     /// everything a live torrent owns is a piece, and everything else under
     /// the root is cache with no one to speak for it.
-    protected: HashSet<String>,
-    /// Torrents whose pieces sort to the front of the size rule, whatever
-    /// their age -- see [`evict`].
-    evict_first: HashSet<String>,
+    gate: enginefs::retention::ReclaimGate,
     /// Each torrent stopped for want of space, in the caller's order.
     /// Counted into their own buckets ([`Walked::stopped`]), never into the
     /// reclaimable list -- the engine, not the cleaner, takes those.
@@ -1160,10 +1181,10 @@ impl WalkInputs {
         self.ask_the_store(&mut walked);
         // The size rule's order: a dead torrent's pieces first, then oldest
         // first. The sort is stable, so equal keys keep the scan's order.
-        let evict_first = &self.evict_first;
+        let gate = &self.gate;
         walked.files.sort_by_key(|(item, _, modified)| {
             let first = match item {
-                Reclaimable::Piece { info_hash, .. } => evict_first.contains(info_hash),
+                Reclaimable::Piece { info_hash, .. } => gate.goes_first(info_hash),
                 Reclaimable::File(_) => false,
             };
             (!first, *modified)
@@ -1215,40 +1236,32 @@ impl WalkInputs {
         }
     }
 
-    /// What the piece store holds, per torrent, as the store reports it.
+    /// What the piece store holds, per torrent, as the store reports it --
+    /// and, per piece, whether the retention policy will part with it.
     ///
-    /// A protected torrent is counted and set aside; a stopped one is
-    /// counted into its own bucket, because the engine and not the cleaner
-    /// is what may take it; anything else is ordinary cache, one entry per
-    /// piece so the rules act at the granularity reclaim actually has.
+    /// The question is asked of the gate one piece at a time, which is the
+    /// granularity a reclaim actually has, and it is the only question
+    /// asked: a piece the policy keeps is counted and set aside, a piece it
+    /// releases is ordinary cache. A torrent stopped for want of space is
+    /// counted into its own bucket before either, because the *engine* and
+    /// not the cleaner is what may take one of those, and it takes it
+    /// whole.
     ///
     /// A stray -- something in the store that is not a piece file -- is
     /// counted and never offered up. It is on the disk, so it must show in
     /// the total or the cache would read smaller than it is; and only
     /// `piece_store::sweep` can say whether it is debris, so this pass has
-    /// no business unlinking it.
+    /// no business unlinking it. It is counted as protected for the same
+    /// reason: nothing this pass can do will free it.
     fn ask_the_store(&self, walked: &mut Walked) {
         let contents = self.store.scan();
-        walked.total_size += contents.strays.iter().map(occupied_bytes).sum::<u64>();
+        let root_strays: u64 = contents.strays.iter().map(occupied_bytes).sum();
+        walked.total_size += root_strays;
+        walked.protected_size += root_strays;
+        walked.protected_files += contents.strays.len();
         for torrent in contents.torrents {
             let stray_bytes: u64 = torrent.strays.iter().map(occupied_bytes).sum();
             walked.total_size += stray_bytes;
-            if self.protected.contains(&torrent.info_hash) {
-                let bytes: u64 = torrent
-                    .pieces
-                    .iter()
-                    .flat_map(|piece| piece.files())
-                    .map(occupied_bytes)
-                    .sum();
-                let files = torrent.pieces.iter().flat_map(|p| p.files()).count();
-                walked.total_size += bytes;
-                // The strays go in too: no pass can reclaim one, so a
-                // caller told "over the limit and nothing is evictable"
-                // has to see them in what protection holds.
-                walked.protected_size += bytes + stray_bytes;
-                walked.protected_files += files + torrent.strays.len();
-                continue;
-            }
             if let Some(i) = self
                 .stopped
                 .iter()
@@ -1264,8 +1277,16 @@ impl WalkInputs {
                 walked.stopped[i].files += torrent.strays.len();
                 continue;
             }
+            walked.protected_size += stray_bytes;
+            walked.protected_files += torrent.strays.len();
             for piece in torrent.pieces {
                 let bytes: u64 = piece.files().map(occupied_bytes).sum();
+                if !self.gate.releases(&torrent.info_hash, piece.piece) {
+                    walked.total_size += bytes;
+                    walked.protected_size += bytes;
+                    walked.protected_files += piece.files().count();
+                    continue;
+                }
                 let modified = piece.modified();
                 self.sort_one(
                     walked,
@@ -1312,9 +1333,13 @@ impl WalkInputs {
 /// actually left it.
 ///
 /// A walked file the cleaner unlinks itself, pruning the directories the
-/// deletion emptied. A piece it asks the store to delete: the store owns the
-/// layout, so it is the store that knows which files that is and where they
-/// are.
+/// deletion emptied. **A piece it never unlinks at all**: it asks the
+/// engine, which has the backend forget the piece and only then lets the
+/// store take it (`EngineFS::release_pieces`). The cleaner used to call the
+/// store directly, which was safe only for as long as everything it was
+/// allowed to touch belonged to no torrent in the session; the policy now
+/// offers it pieces of torrents that are, and unlinking one of those behind
+/// librqbit's back leaves it advertising a piece it does not have.
 ///
 /// **`Ok(false)` is not success and it is not failure: it is "there were no
 /// bytes here to take".** The walk's answer and the delete's are two
@@ -1324,13 +1349,17 @@ impl WalkInputs {
 /// one of them can take it. Whichever loses must not book the bytes: what
 /// `EvictionReport::freed` decides is whether a torrent stopped by ENOSPC is
 /// restarted, and restarting it onto a disk that gained nothing is the loop
-/// `DiskFullRecovery` exists to stop. It is the store's answer, and only the
-/// store's: it is the only source here that reads the disk twice.
-async fn reclaim(
+/// `DiskFullRecovery` exists to stop. A piece the backend refuses to forget
+/// answers the same way, and for a reason of the same shape: the bytes are
+/// still there and no delete of ours may reach them.
+async fn reclaim<R>(
     item: &Reclaimable,
-    store: &enginefs::piece_store::StoreRoot,
+    release: &R,
     download_dir: &std::path::Path,
-) -> std::io::Result<bool> {
+) -> std::io::Result<bool>
+where
+    R: for<'a> Fn(&'a str, u32) -> BoxFuture<'a, bool>,
+{
     match item {
         Reclaimable::File(path) => {
             // A walked file that is already gone stays an `Err(NotFound)`,
@@ -1343,15 +1372,7 @@ async fn reclaim(
             }
             Ok(true)
         }
-        Reclaimable::Piece { info_hash, piece } => {
-            let store = store.clone();
-            let info_hash = info_hash.clone();
-            let piece = *piece;
-            tokio::task::spawn_blocking(move || store.delete_piece(&info_hash, piece))
-                .await
-                .map_err(std::io::Error::other)?
-                .map_err(std::io::Error::other)
-        }
+        Reclaimable::Piece { info_hash, piece } => Ok(release(info_hash, *piece).await),
     }
 }
 
@@ -1433,6 +1454,7 @@ mod tests {
         is_session_artifact, occupied_bytes, remove_empty_parents, scan_usage,
     };
     use enginefs::piece_store::{FileSpec, PieceLayout, PieceStore, StoreRoot};
+    use enginefs::retention::ReclaimGate;
     use futures_util::future::BoxFuture;
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
@@ -1523,14 +1545,14 @@ mod tests {
     /// in the backend's error state.
     async fn evict_root(
         download_dir: &Path,
-        protected: &HashSet<String>,
+        gate: &ReclaimGate,
         limit: CacheLimit,
     ) -> anyhow::Result<EvictionReport> {
         evict(
             download_dir,
             &store(download_dir),
-            protected,
-            &HashSet::new(),
+            gate,
+            &store_releaser(store(download_dir)),
             &[],
             &no_evictors(),
             limit,
@@ -1541,21 +1563,59 @@ mod tests {
 
     /// The inputs `usage` builds: the same scan a pass makes its decisions
     /// from, with nothing to age out and no rules to order by.
-    fn usage_inputs(download_dir: &Path, protected: &HashSet<String>) -> WalkInputs {
+    fn usage_inputs(download_dir: &Path, gate: &ReclaimGate) -> WalkInputs {
         WalkInputs {
             download_dir: download_dir.to_path_buf(),
             store: store(download_dir),
-            protected: protected.clone(),
-            evict_first: HashSet::new(),
+            gate: gate.clone(),
             stopped: Vec::new(),
             max_age: Duration::MAX,
             now: SystemTime::now(),
         }
     }
 
-    /// A protected set of one torrent.
-    fn torrents(hashes: &[&str]) -> HashSet<String> {
-        hashes.iter().map(|hash| hash.to_string()).collect()
+    /// A gate that announces (and so keeps) every piece of `hashes`, and
+    /// parts with everything else -- the answer `EngineFS::reclaim_gate`
+    /// gives for a live engine nothing is streaming.
+    fn torrents(hashes: &[&str]) -> ReclaimGate {
+        let mut gate = ReclaimGate::default();
+        for hash in hashes {
+            gate.insert_announced((*hash).to_string());
+        }
+        gate
+    }
+
+    /// A gate for torrents the backend stopped with an error: they
+    /// announce nothing, so every piece of them may go and goes first.
+    fn dead_torrents(hashes: &[&str]) -> ReclaimGate {
+        let mut gate = ReclaimGate::default();
+        for hash in hashes {
+            gate.insert_dead((*hash).to_string());
+        }
+        gate
+    }
+
+    /// A releaser standing in for an engine that will not forget the piece
+    /// -- the backend still believes it has it -- recording what it was
+    /// asked for.
+    fn refusing_releaser(
+        asked: Arc<std::sync::Mutex<Vec<(String, u32)>>>,
+    ) -> impl for<'a> Fn(&'a str, u32) -> BoxFuture<'a, bool> {
+        move |info_hash: &str, piece: u32| {
+            asked.lock().unwrap().push((info_hash.to_string(), piece));
+            Box::pin(async { false })
+        }
+    }
+
+    /// A releaser for a test with no engine behind it: the store on its
+    /// own, which is what the production one ends at once the backend has
+    /// agreed to forget the piece.
+    fn store_releaser(store: StoreRoot) -> impl for<'a> Fn(&'a str, u32) -> BoxFuture<'a, bool> {
+        move |info_hash: &str, piece: u32| {
+            let store = store.clone();
+            let info_hash = info_hash.to_string();
+            Box::pin(async move { store.delete_pieces(&info_hash, [piece]).unwrap_or(0) > 0 })
+        }
     }
 
     /// The shape `evict` takes an evictor in, for a run with none.
@@ -1610,9 +1670,13 @@ mod tests {
         write_aged(&film, &[0u8; 4096], Duration::ZERO);
 
         WALKED_ON_THIS_THREAD.set(false);
-        let report = evict_root(&root, &HashSet::new(), CacheLimit::configured(u64::MAX))
-            .await
-            .unwrap();
+        let report = evict_root(
+            &root,
+            &ReclaimGate::default(),
+            CacheLimit::configured(u64::MAX),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             report.total,
             occupancy(&film),
@@ -1647,7 +1711,7 @@ mod tests {
         let recent = root.join("recent.mkv");
         write_aged(&recent, &[0u8; 4096], Duration::from_secs(60));
 
-        evict_root(&root, &HashSet::new(), CacheLimit::configured(0))
+        evict_root(&root, &ReclaimGate::default(), CacheLimit::configured(0))
             .await
             .unwrap();
         for record in &records {
@@ -1665,9 +1729,13 @@ mod tests {
         let newer = root.join("newer.mkv");
         write_aged(&newer, &[0u8; 4096], Duration::from_secs(1));
         let limit = limit_between(&newer, &recent);
-        evict_root(&root, &HashSet::new(), CacheLimit::configured(limit))
-            .await
-            .unwrap();
+        evict_root(
+            &root,
+            &ReclaimGate::default(),
+            CacheLimit::configured(limit),
+        )
+        .await
+        .unwrap();
         for record in &records {
             assert!(
                 record.is_file(),
@@ -1781,7 +1849,7 @@ mod tests {
         let stale = root.join(HASH).join("movie.mkv");
         write_aged(&stale, &[0u8; 8192], Duration::from_secs(40 * 24 * 60 * 60));
 
-        evict_root(&root, &HashSet::new(), CacheLimit::configured(0))
+        evict_root(&root, &ReclaimGate::default(), CacheLimit::configured(0))
             .await
             .unwrap();
 
@@ -1827,7 +1895,7 @@ mod tests {
         let piece_bytes = occupancy_of(&[&complete, &staged]);
         let stray_bytes = occupancy(&stray);
 
-        let report = evict_root(&root, &HashSet::new(), CacheLimit::configured(0))
+        let report = evict_root(&root, &ReclaimGate::default(), CacheLimit::configured(0))
             .await
             .unwrap();
 
@@ -1894,10 +1962,10 @@ mod tests {
             .build()
             .unwrap();
         let (first, second) = runtime.block_on(async {
-            let protected = HashSet::new();
+            let gate = ReclaimGate::default();
             tokio::join!(
-                evict_root(&root, &protected, limit),
-                evict_root(&root, &protected, limit),
+                evict_root(&root, &gate, limit),
+                evict_root(&root, &gate, limit),
             )
         });
         let (first, second) = (first.unwrap(), second.unwrap());
@@ -1974,8 +2042,8 @@ mod tests {
         let report = evict(
             &root,
             &store(&root),
-            &HashSet::new(),
-            &torrents(&[HASH]),
+            &dead_torrents(&[HASH]),
+            &store_releaser(store(&root)),
             &[],
             &no_evictors(),
             CacheLimit::configured(occupied - dead_occupancy / 2),
@@ -1995,8 +2063,8 @@ mod tests {
         let report = evict(
             &root,
             &store(&root),
-            &HashSet::new(),
-            &torrents(&[OTHER_HASH]),
+            &dead_torrents(&[OTHER_HASH]),
+            &store_releaser(store(&root)),
             &[],
             &no_evictors(),
             CacheLimit::configured(occupancy(&old_film) + occupancy(&p1)),
@@ -2010,6 +2078,151 @@ mod tests {
             !(p1.exists() && p2.exists()),
             "and it came from the dead torrent"
         );
+    }
+
+    /// The cleaner asks the policy per *piece*, not per torrent. A torrent
+    /// something is streaming is live, announced and protected in the old
+    /// reading of the word -- and the policy will still part with every
+    /// piece outside the playback window, because those are the ones it has
+    /// told nobody about. Committed pieces are what it keeps, and what the
+    /// pass has to leave alone: they are advertised, and taking one is the
+    /// advertise-then-refuse the whole design is about.
+    ///
+    /// This is the half of `eviction_classes` that could not survive: a
+    /// list of hashes can only say all or nothing about a torrent.
+    #[tokio::test]
+    async fn evict_takes_the_pieces_a_policy_released_and_keeps_the_ones_it_committed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("rqbit-downloads");
+        let mut pieces = Vec::new();
+        for piece in 0..6u32 {
+            pieces.push(write_piece(
+                &root,
+                HASH,
+                piece,
+                4096,
+                Duration::from_secs(60),
+            ));
+        }
+
+        // A stream on pieces 0..6 whose window has released and committed 2
+        // and 3. Everything else of it is window or read-ahead: held,
+        // readable, announced to nobody.
+        let mut gate = ReclaimGate::default();
+        gate.insert_policy(HASH.to_string(), 0..6, [2, 3].into_iter().collect());
+
+        // Room for two pieces, so the size rule wants four gone and the
+        // only thing deciding *which* four is the gate.
+        let keep = occupancy_of(&[&pieces[2], &pieces[3]]);
+        let report = evict_root(&root, &gate, CacheLimit::configured(keep))
+            .await
+            .unwrap();
+
+        for (piece, path) in pieces.iter().enumerate() {
+            let committed = piece == 2 || piece == 3;
+            assert_eq!(
+                path.is_file(),
+                committed,
+                "piece {piece} (committed: {committed})"
+            );
+        }
+        assert_eq!(report.deleted, 4);
+        assert_eq!(
+            report.protected,
+            occupancy_of(&[&pieces[2], &pieces[3]]),
+            "what the policy kept is what the report calls protected"
+        );
+        assert_eq!(report.total, report.protected);
+    }
+
+    /// Debris in the store is counted **and** reported as protected,
+    /// whoever it belongs to.
+    ///
+    /// It is on the volume, so the total has to show it or the cache reads
+    /// smaller than it is; and no pass can free it -- only
+    /// `piece_store::sweep` can say whether it is debris, and a delete
+    /// addressed to it would look under the name the store *would* have
+    /// written and free nothing. So a caller told "over the limit and
+    /// nothing is evictable" has to see it in what protection holds, or the
+    /// two numbers do not add up and the shortfall has no explanation.
+    ///
+    /// This used to depend on whose torrent it was: a protected torrent's
+    /// debris was protected and everybody else's was invisible in that
+    /// column. Protection is per piece now and debris is not a piece, so
+    /// the question does not arise -- and the reason the old code gave
+    /// applies to all of it.
+    #[tokio::test]
+    async fn debris_in_the_store_is_counted_and_reported_as_what_no_pass_can_free() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("rqbit-downloads");
+        // A real piece, so the pass has something it *can* take.
+        let piece = write_piece(&root, HASH, 0, 4096, Duration::from_secs(60));
+        // And debris: a name in the store the store would never have
+        // written, so nothing can address it back.
+        let debris = store(&root).torrent_dir(HASH).join("0").join("00");
+        write_aged(&debris, &[0u8; 4096], Duration::from_secs(60));
+
+        // Room for one of the two, so the pass has to take something.
+        let debris_bytes = occupancy(&debris);
+        let report = evict_root(
+            &root,
+            &ReclaimGate::default(),
+            CacheLimit::configured(debris_bytes),
+        )
+        .await
+        .unwrap();
+
+        assert!(!piece.is_file(), "the piece the gate released went");
+        assert!(debris.is_file(), "the debris could not go");
+        assert_eq!(report.total, debris_bytes);
+        assert_eq!(
+            report.protected, debris_bytes,
+            "and it is named as what is holding the cache over its limit"
+        );
+        assert_eq!(report.protected_files, 1);
+    }
+
+    /// The cleaner never unlinks a piece file. It asks, and a refusal is a
+    /// piece still on the disk and bytes it must not book as freed.
+    ///
+    /// The refusal is the backend declining to forget the piece -- which is
+    /// the interlock doing its job, since a piece librqbit still believes it
+    /// has is one it is advertising and will serve. Booking those bytes as
+    /// freed is how a torrent stopped by ENOSPC gets restarted onto a disk
+    /// that gained nothing, which is a loop and not a recovery.
+    #[tokio::test]
+    async fn a_piece_the_engine_will_not_release_stays_on_the_disk_and_is_not_booked_as_freed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("rqbit-downloads");
+        // Past the age rule, so the pass wants it whatever the cap is and
+        // the only thing between it and the disk is the refusal.
+        let piece = write_piece(&root, HASH, 0, 4096, Duration::from_secs(31 * 24 * 60 * 60));
+        let occupied = occupancy(&piece);
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let refuse = refusing_releaser(asked.clone());
+        let report = evict(
+            &root,
+            &store(&root),
+            &ReclaimGate::default(),
+            &refuse,
+            &[],
+            &no_evictors(),
+            CacheLimit::configured(u64::MAX),
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![(HASH.to_lowercase(), 0)],
+            "the cleaner asked rather than unlinking"
+        );
+        assert!(piece.is_file(), "and the refusal left the bytes alone");
+        assert_eq!(report.freed, 0, "nothing was booked as freed");
+        assert_eq!(report.deleted, 0);
+        assert_eq!(report.total, occupied, "and they are still counted");
     }
 
     /// An evictor standing in for the engine: records the hash and removes
@@ -2061,8 +2274,8 @@ mod tests {
         let report = evict(
             &root,
             &store(&root),
-            &HashSet::new(),
-            &HashSet::new(),
+            &ReclaimGate::default(),
+            &store_releaser(store(&root)),
             &stopped,
             &[fake_evictor(&calls, &root, true)],
             CacheLimit::configured(old_occupancy + partial_occupancy - old_occupancy / 2),
@@ -2088,8 +2301,8 @@ mod tests {
         let report = evict(
             &root,
             &store(&root),
-            &HashSet::new(),
-            &HashSet::new(),
+            &ReclaimGate::default(),
+            &store_releaser(store(&root)),
             &stopped,
             &[fake_evictor(&calls, &root, true)],
             CacheLimit::configured(partial_occupancy / 2),
@@ -2112,8 +2325,8 @@ mod tests {
         let report = evict(
             &root,
             &store(&root),
-            &HashSet::new(),
-            &HashSet::new(),
+            &ReclaimGate::default(),
+            &store_releaser(store(&root)),
             &stopped,
             &[fake_evictor(&calls, &root, false)],
             CacheLimit::configured(partial_occupancy / 2),
@@ -2143,9 +2356,13 @@ mod tests {
         let occupied = occupancy(&older) + occupancy(&newer);
 
         // Exactly at the cap: an ordinary pass evicts nothing.
-        let report = evict_root(&root, &HashSet::new(), CacheLimit::configured(occupied))
-            .await
-            .unwrap();
+        let report = evict_root(
+            &root,
+            &ReclaimGate::default(),
+            CacheLimit::configured(occupied),
+        )
+        .await
+        .unwrap();
         assert_eq!(report.deleted, 0);
 
         // The same cap with headroom: the pass makes that much room, oldest
@@ -2153,8 +2370,8 @@ mod tests {
         let report = evict(
             &root,
             &store(&root),
-            &HashSet::new(),
-            &HashSet::new(),
+            &ReclaimGate::default(),
+            &store_releaser(store(&root)),
             &[],
             &no_evictors(),
             CacheLimit::configured(occupied),
@@ -2216,9 +2433,13 @@ mod tests {
         // the single-file-larger-than-the-limit rule, so the eviction fell
         // on the only other candidate and freed nothing that mattered.
         let limit = 1u64 << 30;
-        let report = evict_root(&root, &HashSet::new(), CacheLimit::configured(limit))
-            .await
-            .unwrap();
+        let report = evict_root(
+            &root,
+            &ReclaimGate::default(),
+            CacheLimit::configured(limit),
+        )
+        .await
+        .unwrap();
 
         assert!(
             report.total < 1 << 20,
@@ -2264,7 +2485,7 @@ mod tests {
         }
 
         let usage = scan_usage(
-            usage_inputs(&root, &HashSet::new()),
+            usage_inputs(&root, &ReclaimGate::default()),
             CacheLimit::configured(0),
         );
 
@@ -2686,7 +2907,9 @@ mod tests {
 
         // Unlimited by setting, and the walk found nothing to age out.
         let unlimited = CacheLimit::configured(u64::MAX);
-        let report = evict_root(&root, &HashSet::new(), unlimited).await.unwrap();
+        let report = evict_root(&root, &ReclaimGate::default(), unlimited)
+            .await
+            .unwrap();
         assert_eq!(
             report.deleted, 0,
             "nothing caps it without a free-space reading"
@@ -2701,7 +2924,9 @@ mod tests {
             configured: u64::MAX,
             available: Some(CACHE_FREE_SPACE_FLOOR - stale_occupancy / 2),
         };
-        let report = evict_root(&root, &HashSet::new(), squeezed).await.unwrap();
+        let report = evict_root(&root, &ReclaimGate::default(), squeezed)
+            .await
+            .unwrap();
         assert!(
             !stale.exists(),
             "the least recently modified file goes first"
@@ -2803,7 +3028,7 @@ mod tests {
 
         // No cap of any kind: the size rule cannot run, so whatever this
         // pass reports having freed came from the age rule alone.
-        let report = evict_root(&root, &HashSet::new(), CacheLimit::configured(0))
+        let report = evict_root(&root, &ReclaimGate::default(), CacheLimit::configured(0))
             .await
             .unwrap();
 

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::ops::Range;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncSeek};
 
@@ -159,16 +160,40 @@ impl TransferTotals {
     }
 }
 
+/// What the backend does with the pieces once the claim on them is
+/// released -- the one thing that differs between the two callers of
+/// [`TorrentHandle::drop_pieces`].
+///
+/// The drop itself is the same either way: not have, not wanted, not
+/// advertised. What is not the same is what the caller wanted the space
+/// for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AfterRelease {
+    /// Want the range again. For the per-file delete: a file that shares
+    /// its first or last piece with a neighbour still pinned takes that
+    /// piece down with it, and the neighbour would be left a piece short
+    /// with no way to fetch it. Re-selecting queues the pieces of files
+    /// that are still selected and leaves the deleted file's own as plain
+    /// missing pieces.
+    Reselect,
+    /// Leave the range dropped. For a reclaim: the caller asked for the
+    /// bytes back, and a piece re-wanted the moment it is deleted is a
+    /// download that undoes the reclaim within the second. A reader that
+    /// seeks back into the range gets it again through the stream's own
+    /// lookahead.
+    LeaveDropped,
+}
+
 /// Pieces a backend has agreed to forget it has, handed out by
-/// [`TorrentHandle::drop_file_pieces`] to whoever is about to delete the
+/// [`TorrentHandle::drop_pieces`] to whoever is about to delete the
 /// bytes behind them.
 ///
 /// Hold it for the length of the deletion and drop it when the bytes are
 /// gone. Dropping is not tidiness: it is what tells the backend the release
 /// is over. Until then the pieces are neither had nor wanted, so a stream's
-/// lookahead cannot download one of them back into the file that is being
-/// deleted under it; afterwards a piece that is still selected (a boundary
-/// piece the neighbouring file shares) is queued for download again.
+/// lookahead cannot download one of them back into the range that is being
+/// deleted under it; afterwards the backend does what
+/// [`AfterRelease`] asked for.
 #[must_use = "the pieces stay claimed until this is dropped: delete their bytes first"]
 pub struct DroppedFilePieces {
     pieces: Vec<u32>,
@@ -444,23 +469,71 @@ pub trait TorrentHandle: Send + Sync + Clone {
     async fn unpin_file(&self, _file_idx: usize) -> Result<()> {
         Ok(())
     }
-    /// Forget that the torrent has the pieces `file_idx` lies in, because
-    /// the caller is about to delete the file's bytes and the backend's
-    /// have-set is the other record of them. Deleting the bytes alone leaves
-    /// that record standing: the backend goes on reporting the file
-    /// complete, advertising its pieces to peers and serving them a read
-    /// past the end of an empty file, and a later re-pin of the file finds
-    /// nothing to download. The file must already be out of the want-set
-    /// (`reconcile_file_priorities` without it), or the drop would only
+    /// Where a file lies in the torrent's pieces -- what a reader's offset
+    /// has to go through to become a piece index, and what the retention
+    /// policy governs. `None` without metadata or for a bad index.
+    async fn file_pieces(&self, _file_idx: usize) -> Option<FilePieceSpan> {
+        None
+    }
+
+    /// Forget that the torrent has `pieces`, because the caller is about to
+    /// delete the bytes behind them and the backend's have-set is the other
+    /// record of them. Deleting the bytes alone leaves that record standing:
+    /// the backend goes on reporting them complete, advertising them to
+    /// peers and answering a request with a read past the end of nothing,
+    /// and a later re-pin finds nothing to download. Anything still wanting
+    /// the range must already be out of the want-set, or the drop would only
     /// queue the pieces again.
     ///
     /// Returns the claim to hold while the bytes go -- see
-    /// [`DroppedFilePieces`]. `Ok(None)` is a backend with no have-set of
-    /// its own for a deletion to disagree with. `Err` is a backend that has
-    /// one and could not drop it: the caller deletes the bytes regardless
-    /// (it was asked to) and says what stands until the next restart.
-    async fn drop_file_pieces(&self, _file_idx: usize) -> Result<Option<DroppedFilePieces>> {
+    /// [`DroppedFilePieces`], and [`AfterRelease`] for what dropping it
+    /// does. `Ok(None)` is a backend with no have-set of its own for a
+    /// deletion to disagree with. `Err` is a backend that has one and could
+    /// not drop it: it still believes it holds the pieces, so the caller
+    /// must not take them.
+    async fn drop_pieces(
+        &self,
+        _pieces: std::ops::Range<u32>,
+        _after: AfterRelease,
+    ) -> Result<Option<DroppedFilePieces>> {
         Ok(None)
+    }
+
+    /// [`Self::drop_pieces`] over the pieces `file_idx` lies in, putting
+    /// the range back in the want-set afterwards for the sake of a
+    /// boundary piece a still-pinned neighbour shares.
+    ///
+    /// A file whose pieces the backend cannot name is an `Err` and not an
+    /// `Ok(None)`: `None` means "this backend keeps no have-set", and a
+    /// backend that keeps one but could not tell us where the file is has
+    /// not agreed to forget anything.
+    async fn drop_file_pieces(&self, file_idx: usize) -> Result<Option<DroppedFilePieces>> {
+        let Some(span) = self.file_pieces(file_idx).await else {
+            return Ok(None);
+        };
+        self.drop_pieces(span.pieces, AfterRelease::Reselect).await
+    }
+
+    /// Hold `pieces` back from what we announce to peers, or put them back.
+    ///
+    /// A held-back piece is one we have, read and serve but tell nobody
+    /// about: it is cleared from the handshake bitfield and completing it
+    /// sends no Have. It is the third state the retention policy is written
+    /// for -- a piece inside the playback window is kept and readable and
+    /// *may be reclaimed*, so announcing it invites a request for bytes we
+    /// are about to throw away.
+    ///
+    /// Idempotent, and settable **before** a piece is downloaded, which is
+    /// the only ordering under which no Have ever goes out for it: there is
+    /// no un-Have in BitTorrent. Returns how many pieces changed. A backend
+    /// with nothing to hold back answers `Ok(0)` and has announced
+    /// everything it has, which is what the reclaim gate reads.
+    async fn set_pieces_advertised(
+        &self,
+        _pieces: std::ops::Range<u32>,
+        _advertised: bool,
+    ) -> Result<usize> {
+        Ok(0)
     }
     /// The file's on-disk path, as the backend names it (librqbit: the
     /// torrent's own output folder joined with the file's relative name).
@@ -609,6 +682,26 @@ pub struct TorrentMemoryDiagnostics {
 pub struct BackendFileInfo {
     pub name: String,
     pub length: u64,
+}
+
+/// Where one file of a torrent lies, in pieces.
+///
+/// The unit here is the piece and not the file, because the piece is what
+/// the store keeps and what a reclaim takes: a file that begins or ends
+/// inside a piece shares that piece with its neighbour, and neither of them
+/// can have it without the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilePieceSpan {
+    /// The torrent pieces the file lies in, first to last.
+    pub pieces: Range<u32>,
+    /// The file's first byte within the torrent, so a reader's offset
+    /// inside the file becomes a torrent piece index.
+    pub offset: u64,
+    /// What [`Self::pieces`] holds on disk -- **not** the file's length.
+    /// A file that shares its first or last piece with a neighbour is
+    /// shorter than the pieces it lies in, and the pieces are what the
+    /// budget has to cover.
+    pub bytes: u64,
 }
 
 /// Byte progress of the single piece an open reader is sitting on -- the
