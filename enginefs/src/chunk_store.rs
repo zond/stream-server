@@ -142,16 +142,7 @@ pub struct ChunkDir {
     dir: PathBuf,
 }
 
-/// What one [`ChunkDir::remove`] took.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct Removed {
-    /// The complete copy went -- the chunk really was readable.
-    pub complete: bool,
-    /// Either copy went, so the volume really got bytes back.
-    pub anything: bool,
-}
-
-/// One chunk on disk: both copies of it, because [`ChunkDir::remove`] takes
+/// One chunk on disk: both copies of it, because `ChunkDir::remove` takes
 /// them together -- half of a chunk nobody wants is worth exactly as little
 /// as the whole of it.
 #[derive(Debug)]
@@ -369,25 +360,45 @@ impl ChunkDir {
 
     /// Unlink both copies of `index`.
     ///
+    /// **Crate-private, and that is the point.** There is one door into the
+    /// unlink per adapter and this is not a third one: the torrent
+    /// adapter's is `StoreRoot::delete_pieces`, callable only under the
+    /// `DroppedFilePieces` claim that keeps the delete atomic with
+    /// librqbit's have-set, and the `/proxy` adapter's is its own. A
+    /// generic *public* `remove` on the shared store would be exactly the
+    /// second door that interlock exists to refuse -- somewhere to unlink a
+    /// torrent's piece behind the backend's back and have it go on
+    /// advertising bytes it no longer has -- so the `server` crate, cleaner
+    /// and routes and `/proxy` alike, cannot name this at all.
+    ///
     /// The bucket directory is left behind; it is pruned when the whole
     /// directory goes ([`Self::remove_if_empty`]). Removing it here would be
     /// a rmdir per chunk against a directory a concurrent write may have just
     /// created and not yet opened its file in.
     ///
     /// A chunk with no file was not on the disk to leave it, and is not an
-    /// error -- the caller asked for bytes back and there were none.
-    pub fn remove(&self, index: u64) -> io::Result<Removed> {
-        let mut removed = Removed::default();
-        for (path, complete) in [
-            (self.staging_path(index), false),
-            (self.chunk_path(index), true),
-        ] {
+    /// error -- the caller asked for bytes back and there were none. A
+    /// *directory* wearing either of a chunk's two names is not a chunk
+    /// either, and is the same non-event. It has to be: this is one chunk of
+    /// a whole run whose have-bits the caller has **already** cleared, and
+    /// `remove_file` answers `EISDIR` for a directory rather than
+    /// `NotFound`, so treating it as a failure abandoned every chunk after
+    /// it in the run. [`Self::held_in_bucket`] refuses to offer a directory
+    /// wearing the *complete* name, and the two halves of that rule only
+    /// close together: a directory wearing the *staged* name spells no index
+    /// at all, so no listing can filter it and only the delete ever meets
+    /// it.
+    pub(crate) fn remove(&self, index: u64) -> io::Result<bool> {
+        let mut removed = false;
+        for path in [self.staging_path(index), self.chunk_path(index)] {
             match std::fs::remove_file(&path) {
-                Ok(()) => {
-                    removed.anything = true;
-                    removed.complete |= complete;
-                }
+                Ok(()) => removed = true,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                // Asked of the path rather than of the errno: `EISDIR` is
+                // Linux's answer to unlinking a directory and not every
+                // platform's, and what this arm means is "there is no chunk
+                // here", which is a question about the name.
+                Err(_) if path.is_dir() => {}
                 Err(e) => return Err(e),
             }
         }

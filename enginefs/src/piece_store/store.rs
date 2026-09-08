@@ -209,11 +209,9 @@ impl PieceStore {
         // served the deleted bytes through the handle that outlived them.
         self.forget_handles(piece);
         self.staged.lock().remove(&piece);
-        Ok(self
-            .chunks
+        self.chunks
             .remove(u64::from(piece))
-            .with_context(|| format!("could not delete piece {piece}"))?
-            .anything)
+            .with_context(|| format!("could not delete piece {piece}"))
     }
 
     /// Whether any file of the torrent owns payload bytes in this piece.
@@ -637,22 +635,38 @@ impl StoreRoot {
     ///
     /// A piece with no file at all was not on the disk to leave it, and is
     /// not an error -- the caller asked for bytes back and there were none.
-    pub fn delete_pieces(
-        &self,
-        info_hash: &str,
-        pieces: impl IntoIterator<Item = u32>,
-    ) -> anyhow::Result<usize> {
+    ///
+    /// **The run is never abandoned part-way, and this cannot fail.** By the
+    /// time it is called the backend has already forgotten *every* piece in
+    /// the run, so a piece this leaves on the disk is one nothing will ever
+    /// read, ever offer, or ever count as ours again -- and there is no
+    /// retry a caller could make with an error, because the claim it would
+    /// need has been released by then. Returning at the first failure meant
+    /// the pieces after it stayed on a disk the caller had been told it
+    /// freed, and it threw away the count of the ones that had already gone:
+    /// `ENOSPC` recovery reads that number to decide whether a pass made
+    /// room, so booking zero for a delete that freed real blocks restarts
+    /// the torrents onto a disk nothing gained. What could not be unlinked
+    /// is logged where it happens.
+    pub fn delete_pieces(&self, info_hash: &str, pieces: impl IntoIterator<Item = u32>) -> usize {
         let chunks = self.chunks(info_hash);
         let mut removed = 0;
         for piece in pieces {
-            removed += usize::from(
-                chunks
-                    .remove(u64::from(piece))
-                    .with_context(|| format!("could not delete piece {piece} of {info_hash}"))?
-                    .anything,
-            );
+            match chunks.remove(u64::from(piece)) {
+                Ok(taken) => removed += usize::from(taken),
+                // Logged and stepped over rather than returned. There is
+                // nothing above this that could act on it -- see the note
+                // on the run above -- and every piece after it in the run
+                // is one whose have-bit is already gone.
+                Err(error) => tracing::warn!(
+                    info_hash = %info_hash,
+                    piece,
+                    error = %error,
+                    "a piece the backend had agreed to forget could not be unlinked"
+                ),
+            }
         }
-        Ok(removed)
+        removed
     }
 }
 
@@ -1210,7 +1224,7 @@ mod tests {
         assert_eq!(contents.torrents[0].pieces.len(), 2);
 
         // Deleting one piece takes both its copies, and the scan says so.
-        assert_eq!(root.delete_pieces(hash, [2500]).unwrap(), 1);
+        assert_eq!(root.delete_pieces(hash, [2500]), 1);
         assert_eq!(
             root.stat(hash)
                 .pieces
@@ -1290,9 +1304,9 @@ mod tests {
         // What the scan promised, the delete keeps: piece 0's bytes come
         // back once, and nothing else does -- so nothing here can be booked
         // as freed twice.
-        assert_eq!(root.delete_pieces(hash, [0]).unwrap(), 1);
+        assert_eq!(root.delete_pieces(hash, [0]), 1);
         assert_eq!(
-            root.delete_pieces(hash, [0]).unwrap(),
+            root.delete_pieces(hash, [0]),
             0,
             "and asking again frees nothing, which is what the caller counts"
         );
@@ -1462,12 +1476,111 @@ mod tests {
         // the delete.
         let held = root.held(HASH);
         assert_eq!(
-            root.delete_pieces(HASH, held).unwrap(),
+            root.delete_pieces(HASH, held),
             3,
             "and every piece the listing named really goes"
         );
         assert!(!store.has_piece(0) && !store.has_piece(2) && !store.has_piece(3));
         assert!(usurper.is_dir(), "what is not ours is left where it is");
+    }
+
+    /// The other half of that one predicate: the *staged* name, which no
+    /// listing can filter because it spells no piece at all.
+    ///
+    /// `held` names a piece by its complete file, so a directory wearing
+    /// `<piece>.part` is invisible to it -- the run it offers is entirely
+    /// right -- and the delete meets the directory anyway, because it takes
+    /// both copies of every piece it is given. `remove_file` answers
+    /// `EISDIR` there and not `NotFound`, and the run is being deleted
+    /// *after* the backend has agreed to forget every piece in it: a piece
+    /// left behind here is bytes nothing will ever read, offer or count as
+    /// ours again, on a disk the caller has been told it freed.
+    #[test]
+    fn a_directory_wearing_a_pieces_staging_name_does_not_abandon_the_run() {
+        const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = StoreRoot::new(tmp.path().to_path_buf());
+        let store = PieceStore::new(root.torrent_dir(HASH), Arc::new(layout_for(4)));
+        let payload = global_bytes(store.layout().total_length());
+        store.pwrite_all(0, 0, &payload).unwrap();
+        for piece in 0..4 {
+            store.complete_piece(piece).unwrap();
+        }
+        // Somebody else's directory, beside piece 1, wearing the name its
+        // staged copy would have.
+        let usurper = store.staging_path(1);
+        std::fs::create_dir(&usurper).unwrap();
+        std::fs::write(usurper.join("inside"), b"not ours").unwrap();
+
+        let held = root.held(HASH);
+        assert_eq!(
+            held,
+            BTreeSet::from([0, 1, 2, 3]),
+            "all four pieces are complete on the disk, and a `.part` name is no piece"
+        );
+        // The path the retention pass takes, once the backend has dropped
+        // the have-bits for the whole run: what `held` said, offered to the
+        // delete.
+        let freed = root.delete_pieces(HASH, held);
+        for piece in 0..4 {
+            assert!(
+                !store.piece_path(piece).exists(),
+                "piece {piece} is still on a disk the caller was told it freed"
+            );
+        }
+        assert_eq!(freed, 4, "and every piece that went is counted back");
+        assert!(usurper.is_dir(), "what is not ours is left where it is");
+    }
+
+    /// One piece the volume will not give up does not keep the rest of the
+    /// run either.
+    ///
+    /// Same reason, one step more general: the have-bits for the whole run
+    /// are already gone when this is called, so stopping at the first
+    /// failure leaves every later piece orphaned *and* throws away the
+    /// count of the ones that did go -- and that count is what `ENOSPC`
+    /// recovery reads to decide whether the pass made room.
+    #[cfg(unix)]
+    #[test]
+    fn a_piece_that_will_not_be_unlinked_does_not_keep_the_rest_of_the_run() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = StoreRoot::new(tmp.path().to_path_buf());
+        let dir = root.torrent_dir(HASH);
+        let store = PieceStore::new(dir.clone(), Arc::new(layout_for(2001)));
+        // One piece per bucket, so the middle one's directory can be the
+        // only one that refuses.
+        for piece in [0, 1000, 2000] {
+            let path = store.piece_path(piece);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"0123456789").unwrap();
+        }
+        let refuses = dir.join("1");
+        let probe = refuses.join("probe");
+        std::fs::write(&probe, b"x").unwrap();
+        std::fs::set_permissions(&refuses, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // A process that ignores the mode (root, and some CI containers)
+        // cannot be shown this, and would see three pieces go.
+        let unstoppable = std::fs::remove_file(&probe).is_ok();
+        if unstoppable {
+            std::fs::set_permissions(&refuses, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+
+        let freed = root.delete_pieces(HASH, [0, 1000, 2000]);
+        std::fs::set_permissions(&refuses, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(
+            !store.piece_path(0).exists() && !store.piece_path(2000).exists(),
+            "the pieces either side of the one that refused are still on the disk"
+        );
+        assert!(
+            store.piece_path(1000).exists(),
+            "and the one that refused is still there, which is what makes this a partial run"
+        );
+        assert_eq!(freed, 2, "the caller is told what really left the disk");
     }
 
     #[test]

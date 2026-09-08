@@ -1610,7 +1610,7 @@ mod tests {
         move |info_hash: &str, piece: u32| {
             let store = store.clone();
             let info_hash = info_hash.to_string();
-            Box::pin(async move { store.delete_pieces(&info_hash, [piece]).unwrap_or(0) > 0 })
+            Box::pin(async move { store.delete_pieces(&info_hash, [piece]) > 0 })
         }
     }
 

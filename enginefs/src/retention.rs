@@ -283,16 +283,7 @@ pub(crate) async fn release<H: TorrentHandle>(
         Ok(Some(dropped)) => take_claimed(store, info_hash, dropped),
         // A backend with no have-set of its own for the deletion to
         // disagree with: there is nothing to interlock against.
-        Ok(None) => store
-            .delete_pieces(info_hash, pieces)
-            .unwrap_or_else(|error| {
-                tracing::warn!(
-                    info_hash = %info_hash,
-                    error = %format!("{error:#}"),
-                    "could not delete the pieces the policy released"
-                );
-                0
-            }),
+        Ok(None) => store.delete_pieces(info_hash, pieces),
         // It still believes it has them, so they are not ours to take:
         // unlinking here is exactly the advertise-then-serve-a-hole this
         // whole path exists to prevent.
@@ -325,24 +316,19 @@ pub(crate) async fn release<H: TorrentHandle>(
 /// [`release`], and the per-file delete an unpin does, through
 /// `BackendEngineFS::delete_download_data`.
 ///
-/// Returns how many complete piece files really left the disk. A piece with
-/// no file was not there to leave it, and is not an error.
+/// Returns how many pieces really left the disk -- either copy of one
+/// counts, since either occupies blocks the volume gets back. A piece with
+/// no file was not there to leave it, and is not an error; nor is one the
+/// volume refuses to unlink, which is logged and stepped over rather than
+/// abandoning the rest of the run: every piece in it has had its have-bit
+/// cleared already, and the claim that would let a caller retry is released
+/// on the way out of here.
 pub(crate) fn take_claimed(
     store: &StoreRoot,
     info_hash: &str,
     dropped: crate::backend::DroppedFilePieces,
 ) -> usize {
-    let freed = match store.delete_pieces(info_hash, dropped.pieces().iter().copied()) {
-        Ok(freed) => freed,
-        Err(error) => {
-            tracing::warn!(
-                info_hash = %info_hash,
-                error = %format!("{error:#}"),
-                "could not delete the pieces the backend had agreed to forget"
-            );
-            0
-        }
-    };
+    let freed = store.delete_pieces(info_hash, dropped.pieces().iter().copied());
     // Released only now that the bytes are gone.
     drop(dropped);
     freed

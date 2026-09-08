@@ -2240,16 +2240,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             )
         });
         let Some(_handle) = live else {
-            return store
-                .delete_pieces(info_hash, pieces.iter().copied())
-                .unwrap_or_else(|error| {
-                    tracing::warn!(
-                        info_hash = %info_hash,
-                        error = %format!("{error:#}"),
-                        "could not delete pieces of a torrent the session does not run"
-                    );
-                    0
-                });
+            return store.delete_pieces(info_hash, pieces.iter().copied());
         };
         // Through the engine, so the question the cleaner asked before its
         // walk is asked again against the live policy -- see
