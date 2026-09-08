@@ -193,10 +193,9 @@ pub fn sweep_unadopted(root: &StoreRoot, adopted: &HashSet<String>) -> SweepRepo
     report
 }
 
-/// What one torrent's directory occupies, counted the way the cache cleaner
-/// counts: allocated blocks, never apparent length. A piece file written by
-/// one chunk out of many is a hole plus 16 KiB, and reporting the piece's full
-/// length as freed would be a number the disk never gives back.
+/// What one torrent's directory occupies, in the one occupancy accounting
+/// this repository has ([`crate::chunk_store::occupied_bytes`]): allocated
+/// blocks, never apparent length.
 ///
 /// Strays included: this is about to remove the directory whole, so what
 /// leaves the disk with it is what it holds, piece file or not.
@@ -206,23 +205,8 @@ fn occupancy(stored: &super::store::StoredTorrent) -> u64 {
         .iter()
         .flat_map(|piece| piece.files())
         .chain(stored.strays.iter())
-        .map(occupied_bytes)
+        .map(crate::chunk_store::occupied_bytes)
         .sum()
-}
-
-#[cfg(unix)]
-fn occupied_bytes(metadata: &std::fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    // `st_blocks` is in 512-byte units by POSIX, not the filesystem's block
-    // size.
-    metadata.blocks() * 512
-}
-
-#[cfg(not(unix))]
-fn occupied_bytes(metadata: &std::fs::Metadata) -> u64 {
-    // `std` exposes no cheap allocated-size call on Windows; the apparent
-    // length is the same overestimate the cache cleaner accepts there.
-    metadata.len()
 }
 
 #[cfg(test)]

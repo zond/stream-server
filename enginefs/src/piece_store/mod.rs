@@ -16,7 +16,8 @@
 //!   crash to leave disagreeing with the disk; the disk *is* the record. That
 //!   is why a piece's bytes are written under a staging name and renamed into
 //!   place only once librqbit's hash check has passed
-//!   ([`store::STAGING_SUFFIX`]): presence has to mean *complete*, and a
+//!   ([`crate::chunk_store::STAGING_SUFFIX`]): presence has to mean
+//!   *complete*, and a
 //!   file created by a piece's first 16 KiB chunk is there for the whole of
 //!   the download. The errors are not symmetric -- a wrong "no" costs a
 //!   re-download, a wrong "yes" leaves a have-bit standing over bytes nothing
@@ -47,17 +48,36 @@
 //!
 //! # The parts
 //!
+//! The bytes are not this module's. They are
+//! [`crate::chunk_store::ChunkDir`]'s -- the one chunk store, shared with
+//! `/proxy`'s cache, which owns the bucketed directory shape, the two
+//! staging spellings, the rename that makes presence mean complete, the
+//! listings, the occupancy, the typed read and the open-handle LRU. What is
+//! here is the torrent half.
+//!
 //! [`layout`] is the arithmetic of *where* a byte lives -- `(file_id, offset)`
 //! to `(piece, offset_in_piece)` -- and [`policy`] is the arithmetic of *which*
 //! pieces we keep and which of those we share; neither has a filesystem or a
 //! librqbit type in it. [`store`] is the
-//! [`librqbit::storage::TorrentStorage`] implementation over the first, and
-//! the one type that knows the directory shape: it scans, it stats, and it
-//! deletes one piece. [`sweep`] reconciles the store against the session at
+//! [`librqbit::storage::TorrentStorage`] adapter over the first: the piece
+//! and file-table arithmetic, BEP-47 padding, info-hash keying and its
+//! spelling rule, and the have-set interlock -- everything a chunk store
+//! cannot know. [`sweep`] reconciles the store against the session at
 //! launch. What drives [`policy`] against a real torrent -- the playhead, the
 //! hold-back, the reclaim, and the claim that keeps a delete atomic with the
 //! have-set -- is [`crate::retention`], which is also what answers the cache
 //! cleaner.
+//!
+//! Two things about the chunk store are *parameters* an adapter sets, and
+//! this one sets both differently from `/proxy`. Its staged copy is
+//! **addressable** (`<piece>.part`, reopened across many 16 KiB writes, read
+//! back by the hash check through one handle, recovered at `init`), where a
+//! `/proxy` fill stages anonymously because two uncoalesced fillers may be
+//! writing one chunk. And it commits with **no expected length**: librqbit
+//! never writes padding, so a piece whose tail is padding is committed
+//! short, and there is no length a legal padded piece would satisfy. A URL
+//! response, which has no hash to be checked against, passes the byte count
+//! it buffered instead.
 //!
 //! # How it is wired in
 //!
@@ -162,11 +182,11 @@ pub mod policy;
 pub mod store;
 pub mod sweep;
 
+pub use crate::chunk_store::StoredChunk as StoredPiece;
 pub use layout::{FileSpec, PieceLayout, Segment};
 pub use policy::{Decision, RetentionPolicy, Shape};
 pub use store::{
-    MissingPiece, PIECES_PER_DIRECTORY, PieceStore, PieceStoreFactory, StoreContents, StoreRoot,
-    StoredPiece, StoredTorrent, layout_of,
+    MissingPiece, PieceStore, PieceStoreFactory, StoreContents, StoreRoot, StoredTorrent, layout_of,
 };
 pub use sweep::{SweepReport, session_recorded_hashes, sweep_unadopted};
 

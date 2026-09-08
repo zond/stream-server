@@ -2,7 +2,7 @@
 //! per piece, under one directory per torrent.
 
 use std::collections::BTreeSet;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,34 +14,9 @@ use anyhow::Context;
 use librqbit::storage::{StorageFactory, TorrentStorage};
 use parking_lot::Mutex;
 
+use crate::chunk_store::{ChunkDir, ChunkError, OpenChunks, StoredChunk, collect_strays};
+
 use super::layout::{FileSpec, PieceLayout};
-
-/// How many piece files share one directory.
-///
-/// Flat would work on ext4 and f2fs, which hash directory entries, but not
-/// everywhere the cache can land: a 27 GB torrent at 4 MB pieces is ~6,750
-/// files, and on a filesystem that scans a directory linearly (exFAT and
-/// FAT32 on a phone's SD card, which is exactly where a large offline
-/// download goes) every open in a 6,750-entry directory walks the entries.
-/// Bucketing by a thousand puts a ceiling on that -- seven directories of at
-/// most a thousand for that torrent -- for the cost of one extra path
-/// component. A thousand rather than a power of two because the names are
-/// decimal, and `4/4200` reading as "piece 4200" is worth more when reading a
-/// directory listing by hand than the shift it saves.
-pub const PIECES_PER_DIRECTORY: u32 = 1000;
-
-/// What a piece file is called while it is still being written.
-///
-/// A piece arrives 16 KiB at a time, so a file created by its first chunk is
-/// there for the whole of the download -- and the storage contract is that
-/// presence means **complete**, because a wrong "yes" is not a re-download but
-/// silent corruption: the have-set a restart starts from is the resume data
-/// intersected with what the storage says it still holds, the intersection can
-/// only clear bits, and the fastresume hash check samples ~65 pieces of a
-/// torrent however large. So the bytes go to this name and are renamed into
-/// place in [`TorrentStorage::on_piece_completed`], which runs after the hash
-/// check. A rename within one directory is atomic on every filesystem here.
-pub const STAGING_SUFFIX: &str = ".part";
 
 /// A read asked for a piece that is not on disk.
 ///
@@ -104,8 +79,8 @@ pub struct MissingPiece {
 /// is an `Arc` -- and keeps reading the bytes it had, which is the same
 /// thing a read that had already begun would do.
 pub struct PieceStore {
-    /// `<root>/<info hash>`.
-    dir: PathBuf,
+    /// `<root>/<info hash>`, as a directory of bucketed chunks.
+    chunks: ChunkDir,
     layout: Arc<PieceLayout>,
     /// File ids [`Self::remove_file`] has been asked to drop. A piece may
     /// only go when every file that owns bytes in it is in here.
@@ -119,9 +94,9 @@ pub struct PieceStore {
     /// there is one falls through to the complete copy -- so a stale entry
     /// costs one probe, never a wrong answer.
     staged: Mutex<BTreeSet<u32>>,
-    /// The handles most recently opened, most recent last -- see the type
-    /// doc. Empty on a store that has just been created or taken.
-    handles: Mutex<Vec<OpenHandle>>,
+    /// The handles most recently opened -- see the type doc. Empty on a
+    /// store that has just been created or taken.
+    handles: OpenChunks,
     /// False once [`TorrentStorage::take`] has handed the data path to a
     /// successor. The path-based operations keep working on a taken store,
     /// exactly as the filesystem backend's do: `Session::delete` calls
@@ -135,36 +110,17 @@ pub struct PieceStore {
     staging_probes: AtomicUsize,
 }
 
-/// How many piece files a store keeps open.
-///
-/// librqbit has a handful of pieces in flight for a torrent and a stream
-/// reads one piece at a time in order, so a few entries cover the working
-/// set; the point is the ratio (one open per piece instead of one per
-/// chunk), not a hit rate, and eight of them is eight descriptors per
-/// torrent rather than the filesystem backend's one per file.
-pub const OPEN_HANDLES: usize = 8;
-
-/// One entry of [`PieceStore::handles`]: which piece, which copy of it
-/// (the staged one is a different file from the complete one), and the
-/// handle. The `Arc` is what a read or write borrows, so forgetting an
-/// entry never closes a file mid-operation.
-struct OpenHandle {
-    piece: u32,
-    staged: bool,
-    file: Arc<File>,
-}
-
 impl PieceStore {
     /// A store for one torrent. Creates nothing -- `init` does that, and
     /// librqbit has a path (`Session::delete` with no live storage to
     /// recover) that constructs a storage purely to delete through it.
     pub fn new(dir: PathBuf, layout: Arc<PieceLayout>) -> Self {
         Self {
-            dir,
+            chunks: ChunkDir::new(dir),
             layout,
             removed_files: Mutex::new(BTreeSet::new()),
             staged: Mutex::new(BTreeSet::new()),
-            handles: Mutex::new(Vec::new()),
+            handles: OpenChunks::new(),
             live: AtomicBool::new(true),
             #[cfg(test)]
             opens: AtomicUsize::new(0),
@@ -175,7 +131,7 @@ impl PieceStore {
 
     /// The directory this torrent's pieces live in.
     pub fn dir(&self) -> &Path {
-        &self.dir
+        self.chunks.path()
     }
 
     pub fn layout(&self) -> &Arc<PieceLayout> {
@@ -184,13 +140,13 @@ impl PieceStore {
 
     /// Where one piece is stored once it is whole.
     pub fn piece_path(&self, piece: u32) -> PathBuf {
-        piece_path(&self.dir, piece)
+        self.chunks.chunk_path(u64::from(piece))
     }
 
     /// Where its bytes go while it is being written -- see
-    /// [`STAGING_SUFFIX`].
+    /// [`crate::chunk_store::STAGING_SUFFIX`].
     pub fn staging_path(&self, piece: u32) -> PathBuf {
-        staging_path(&self.dir, piece)
+        self.chunks.staging_path(u64::from(piece))
     }
 
     /// Whether this piece is on disk, **complete**. A piece halfway through
@@ -204,7 +160,7 @@ impl PieceStore {
     /// [`TorrentStorage::has_piece`] answers a different question and does not
     /// have that hole -- see there.
     pub fn has_piece(&self, piece: u32) -> bool {
-        self.piece_path(piece).is_file()
+        self.chunks.has_chunk(u64::from(piece))
     }
 
     /// Promote a written piece to a complete one. Nothing may read it as ours
@@ -215,21 +171,23 @@ impl PieceStore {
     /// place with nothing staged, it says so rather than failing, because
     /// librqbit logs a failure here at debug and marks the piece have anyway.
     pub fn complete_piece(&self, piece: u32) -> anyhow::Result<()> {
-        let staged = self.staging_path(piece);
-        let path = self.piece_path(piece);
         // Before the rename: the staged handle names a file about to become
         // the complete one, and a cached complete handle -- the old copy a
         // re-download is replacing -- names bytes about to be unlinked.
         self.forget_handles(piece);
-        let completed = match std::fs::rename(&staged, &path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound && path.is_file() => Ok(()),
-            Err(e) => Err(anyhow::Error::new(e).context(format!(
+        // `None`, and it has to be. librqbit never writes BEP-47 padding, so
+        // a piece whose tail is padding is committed *short* -- there is no
+        // length a legal padded piece would satisfy, and the completeness
+        // criterion for a torrent piece is the swarm's SHA-1, which has
+        // already passed by the time this runs. The URL adapter, which has no
+        // hash, passes its expected byte count here instead.
+        let completed = self.chunks.commit(u64::from(piece), None).map_err(|e| {
+            anyhow::Error::new(e).context(format!(
                 "could not move the completed piece {} into place at {}",
-                staged.display(),
-                path.display()
-            ))),
-        };
+                self.staging_path(piece).display(),
+                self.piece_path(piece).display()
+            ))
+        });
         if completed.is_ok() {
             self.staged.lock().remove(&piece);
         }
@@ -251,7 +209,11 @@ impl PieceStore {
         // served the deleted bytes through the handle that outlived them.
         self.forget_handles(piece);
         self.staged.lock().remove(&piece);
-        Ok(unlink_piece(&self.dir, piece)?.removed_anything)
+        Ok(self
+            .chunks
+            .remove(u64::from(piece))
+            .with_context(|| format!("could not delete piece {piece}"))?
+            .anything)
     }
 
     /// Whether any file of the torrent owns payload bytes in this piece.
@@ -282,87 +244,33 @@ impl PieceStore {
     /// that has been used, not only on a fresh one.
     fn discard_shadowing_staged(&self) -> anyhow::Result<()> {
         let mut kept = BTreeSet::new();
-        let buckets = match std::fs::read_dir(&self.dir) {
-            Ok(buckets) => buckets,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                *self.staged.lock() = kept;
-                return Ok(());
-            }
-            Err(e) => {
-                return Err(anyhow::Error::new(e).context(format!(
-                    "could not read piece directory {}",
-                    self.dir.display()
-                )));
-            }
-        };
-        for bucket in buckets.flatten() {
-            let Ok(entries) = std::fs::read_dir(bucket.path()) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let staged = entry.path();
-                // Both halves of this go through `STAGING_SUFFIX` rather than
-                // through a spelling of it. What a staged file is called is
-                // one decision, taken in one place by `staging_path`, and a
-                // second copy of it here would let the constant change while
-                // this pass silently stopped finding anything -- which is not
-                // a cosmetic failure: the stale shadow it exists to delete is
-                // exactly what gets a half-written piece served as a verified
-                // one.
-                let name = entry.file_name();
-                let Some(complete) = name
-                    .to_str()
-                    .and_then(|name| name.strip_suffix(STAGING_SUFFIX))
-                else {
-                    continue;
-                };
-                let piece = complete.parse::<u32>().ok();
-                if staged.with_file_name(complete).is_file() {
+        // What a staged file is *called* is the chunk store's one decision,
+        // and this walk asks it rather than spelling the suffix a second
+        // time: a second copy of it here would let the constant change while
+        // this pass silently stopped finding anything -- which is not a
+        // cosmetic failure, since the stale shadow it exists to delete is
+        // exactly what gets a half-written piece served as a verified one.
+        self.chunks
+            .walk_staged(|staged| {
+                let piece = staged.index.and_then(|index| u32::try_from(index).ok());
+                if staged.complete.as_ref().is_some_and(|c| c.is_file()) {
                     if let Some(piece) = piece {
                         self.forget_handles(piece);
                     }
-                    let _ = std::fs::remove_file(&staged);
+                    let _ = std::fs::remove_file(&staged.staged);
                 } else if let Some(piece) = piece {
                     kept.insert(piece);
                 }
-            }
-        }
+            })
+            .with_context(|| format!("could not read piece directory {}", self.dir().display()))?;
         *self.staged.lock() = kept;
         Ok(())
-    }
-
-    /// The cached handle for one copy of a piece, made the most recently
-    /// used.
-    fn cached_handle(&self, piece: u32, staged: bool) -> Option<Arc<File>> {
-        let mut handles = self.handles.lock();
-        let at = handles
-            .iter()
-            .position(|h| h.piece == piece && h.staged == staged)?;
-        let handle = handles.remove(at);
-        let file = handle.file.clone();
-        handles.push(handle);
-        Some(file)
-    }
-
-    /// Keep a freshly opened handle, dropping the least recently used one
-    /// past [`OPEN_HANDLES`].
-    fn remember_handle(&self, piece: u32, staged: bool, file: &Arc<File>) {
-        let mut handles = self.handles.lock();
-        handles.retain(|h| !(h.piece == piece && h.staged == staged));
-        if handles.len() >= OPEN_HANDLES {
-            handles.remove(0);
-        }
-        handles.push(OpenHandle {
-            piece,
-            staged,
-            file: file.clone(),
-        });
     }
 
     /// Drop every cached handle of a piece: its files are about to be
     /// renamed, deleted or shadowed.
     fn forget_handles(&self, piece: u32) {
-        self.handles.lock().retain(|h| h.piece != piece);
+        self.handles.forget(u64::from(piece));
     }
 
     #[cfg(test)]
@@ -396,7 +304,7 @@ impl PieceStore {
     /// that have gone empty, so a bucket really can disappear between one
     /// write and the next.
     fn open_for_write(&self, piece: u32) -> anyhow::Result<Arc<File>> {
-        if let Some(file) = self.cached_handle(piece, true) {
+        if let Some(file) = self.handles.get(u64::from(piece), true) {
             return Ok(file);
         }
         if self.staged.lock().insert(piece) {
@@ -405,30 +313,18 @@ impl PieceStore {
             // old copy -- must not answer for the piece any more.
             self.forget_handles(piece);
         }
-        let path = self.staging_path(piece);
-        let mut opts = OpenOptions::new();
-        // Read as well as write: the handle is cached under the staged copy
-        // and the hash check reads that copy back through the same entry.
-        opts.read(true).write(true).create(true).truncate(false);
-        let file = match opts.open(&path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent).with_context(|| {
-                        format!("could not create piece directory {}", parent.display())
-                    })?;
-                }
-                opts.open(&path)
-                    .with_context(|| format!("could not create piece file {}", path.display()))?
-            }
-            Err(e) => {
-                return Err(anyhow::Error::new(e)
-                    .context(format!("could not open piece file {}", path.display())));
-            }
-        };
+        let file = self
+            .chunks
+            .open_staged_for_write(u64::from(piece))
+            .with_context(|| {
+                format!(
+                    "could not open piece file {}",
+                    self.staging_path(piece).display()
+                )
+            })?;
         self.count_open();
         let file = Arc::new(file);
-        self.remember_handle(piece, true, &file);
+        self.handles.remember(u64::from(piece), true, &file);
         Ok(file)
     }
 
@@ -453,63 +349,63 @@ impl PieceStore {
     /// only its "no" is trusted, and a wrong "no" would need a staged file
     /// this process neither wrote nor saw at `init`, which nothing makes.
     fn open_for_read(&self, piece: u32) -> anyhow::Result<Arc<File>> {
+        let index = u64::from(piece);
         if self.staged.lock().contains(&piece) {
-            if let Some(file) = self.cached_handle(piece, true) {
+            if let Some(file) = self.handles.get(index, true) {
                 return Ok(file);
             }
-            let staged = self.staging_path(piece);
-            match File::open(&staged) {
-                Ok(f) => {
+            match self.chunks.open_staged(index) {
+                Ok(Some(f)) => {
                     self.count_open();
                     let file = Arc::new(f);
-                    self.remember_handle(piece, true, &file);
+                    self.handles.remember(index, true, &file);
                     return Ok(file);
                 }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => self.count_staging_probe(),
+                Ok(None) => self.count_staging_probe(),
                 Err(e) => {
-                    return Err(anyhow::Error::new(e)
-                        .context(format!("could not open staged piece {}", staged.display())));
+                    return Err(anyhow::Error::new(e).context(format!(
+                        "could not open staged piece {}",
+                        self.staging_path(piece).display()
+                    )));
                 }
             }
         }
-        if let Some(file) = self.cached_handle(piece, false) {
+        if let Some(file) = self.handles.get(index, false) {
             return Ok(file);
         }
-        let path = self.piece_path(piece);
-        match File::open(&path) {
+        match self.chunks.open_complete(index) {
             Ok(f) => {
                 self.count_open();
                 let file = Arc::new(f);
-                self.remember_handle(piece, false, &file);
+                self.handles.remember(index, false, &file);
                 Ok(file)
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                Err(anyhow::Error::new(MissingPiece { piece }))
-            }
-            Err(e) => Err(anyhow::Error::new(e)
-                .context(format!("could not open piece file {}", path.display()))),
+            // "Not there" is an ordinary state a reclaim creates, and the
+            // layer above has to be able to tell it from a disk that is
+            // failing -- see [`MissingPiece`]. The chunk store draws that
+            // line; this names the piece the caller asked for.
+            Err(ChunkError::Missing { .. }) => Err(anyhow::Error::new(MissingPiece { piece })),
+            Err(e) => Err(anyhow::Error::new(e).context(format!(
+                "could not open piece file {}",
+                self.piece_path(piece).display()
+            ))),
         }
     }
-}
-
-/// `<dir>/<bucket>/<piece>` -- see [`PIECES_PER_DIRECTORY`].
-pub(super) fn piece_path(dir: &Path, piece: u32) -> PathBuf {
-    let mut path = dir.join((piece / PIECES_PER_DIRECTORY).to_string());
-    path.push(piece.to_string());
-    path
 }
 
 /// The piece store's root, and **the only thing outside this module that may
 /// be asked what is under it**.
 ///
 /// Every other layer addresses the store by info hash and piece index. The
-/// directory shape -- `<root>/<info hash>/<bucket>/<piece>`, the bucketing
-/// ([`PIECES_PER_DIRECTORY`]) and the staging suffix ([`STAGING_SUFFIX`]) --
-/// belongs to this type and to [`PieceStore`], and to nothing else. The
-/// cache cleaner used to walk the tree itself and unlink what it found, so
-/// the bucketing was written down in two crates at once: a change to it
-/// would have shown up over there as a silent accounting error rather than
-/// as a compile failure.
+/// directory shape below the info hash -- the bucketing
+/// ([`crate::chunk_store::CHUNKS_PER_DIRECTORY`]) and the staging suffix
+/// ([`crate::chunk_store::STAGING_SUFFIX`]) -- is
+/// [`crate::chunk_store::ChunkDir`]'s, shared with `/proxy`'s cache; what
+/// this type adds is the info hash and the have-set interlock. The cache
+/// cleaner used to walk the tree itself and unlink what it found, so the
+/// bucketing was written down in two crates at once: a change to it would
+/// have shown up over there as a silent accounting error rather than as a
+/// compile failure.
 ///
 /// What this type does *not* decide is which pieces may go. That is
 /// [`super::policy`]'s, and a caller that deletes a piece of a torrent the
@@ -542,46 +438,15 @@ pub struct StoredTorrent {
     /// torrent's lowercase info hash, which is how a caller addresses it
     /// back ([`StoreRoot::delete_pieces`]).
     pub info_hash: String,
-    /// Every piece with a file, in ascending index order.
-    pub pieces: Vec<StoredPiece>,
+    /// Every piece with a file, in ascending index order. Never one whose
+    /// index a `u32` could not hold: nothing addressable by
+    /// [`StoreRoot::delete_pieces`] is, so such a file is a stray.
+    pub pieces: Vec<StoredChunk>,
     /// Metadata of the files under it that are not piece files -- a name
     /// this store never wrote, or a piece file in the wrong bucket. Same
     /// reason as [`StoreContents::strays`]: counted, never silently
     /// reclaimed.
     pub strays: Vec<std::fs::Metadata>,
-}
-
-/// One piece on disk: both copies of it, because [`StoreRoot::delete_pieces`]
-/// takes them together -- half of a piece nobody wants is worth exactly as
-/// little as the whole of it.
-#[derive(Debug)]
-pub struct StoredPiece {
-    pub piece: u32,
-    /// The complete copy: the file whose presence is the have-record.
-    pub complete: Option<std::fs::Metadata>,
-    /// The staged copy, being written now or left behind by a process that
-    /// died mid-piece.
-    pub staged: Option<std::fs::Metadata>,
-}
-
-impl StoredPiece {
-    /// Both copies' metadata, for a caller totting up what deleting this
-    /// piece would free. Never empty: a scan reports no piece it found no
-    /// file for.
-    pub fn files(&self) -> impl Iterator<Item = &std::fs::Metadata> {
-        self.complete.iter().chain(self.staged.iter())
-    }
-
-    /// The more recent modification time of the two copies, or `None` when
-    /// neither can be read.
-    ///
-    /// The more recent, not the older: the two exist together only while a
-    /// piece is being downloaded again over one not yet deleted, and the age
-    /// that describes those bytes is the age of the download, not of the
-    /// copy it is replacing.
-    pub fn modified(&self) -> Option<std::time::SystemTime> {
-        self.files().filter_map(|file| file.modified().ok()).max()
-    }
 }
 
 impl StoreRoot {
@@ -655,7 +520,7 @@ impl StoreRoot {
             // on the volume, so they are counted; its files are never
             // offered as pieces, because a delete addressed to them would
             // look under the lowercase name and free nothing. The same
-            // rule as [`piece_of_name`], one level up.
+            // rule as [`crate::chunk_store::canonical_index`], one level up.
             let name = entry.file_name();
             let Some(name) = name
                 .to_str()
@@ -677,79 +542,32 @@ impl StoreRoot {
     /// an error: "the store holds none of it" is an answer, and the caller
     /// asked what is there.
     pub fn stat(&self, info_hash: &str) -> StoredTorrent {
-        let dir = self.torrent_dir(info_hash);
-        let mut stored = StoredTorrent {
-            info_hash: info_hash.to_ascii_lowercase(),
-            pieces: Vec::new(),
-            strays: Vec::new(),
-        };
-        let Ok(buckets) = std::fs::read_dir(&dir) else {
-            return stored;
-        };
-        // Both copies of a piece are one entry, so they are counted, aged
-        // and deleted together -- keyed by index while the walk runs,
-        // because the staged file and the complete one are two directory
-        // entries that may arrive in either order.
-        let mut pieces: std::collections::BTreeMap<u32, StoredPiece> =
-            std::collections::BTreeMap::new();
-        for bucket in buckets.flatten() {
-            // Anything but a bucket directory at this level is debris an
-            // interrupted write left. Counted, because it is on the disk.
-            if !bucket.file_type().is_ok_and(|t| t.is_dir()) {
-                if let Ok(metadata) = bucket.metadata() {
-                    stored.strays.push(metadata);
-                }
-                continue;
-            }
-            let bucket_name = bucket.file_name();
-            // The bucket's *spelling*, not merely the number it parses
-            // to: `<hash>/00/0` and `<hash>/+0/0` both parse as bucket 0,
-            // and `delete_pieces(hash, [0])` would go to `<hash>/0/0` and
-            // free nothing. Same rule as [`piece_of_name`] applies to the
-            // file name.
-            let bucket_index = bucket_name.to_str().and_then(canonical_index);
-            let Ok(entries) = std::fs::read_dir(bucket.path()) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let Ok(metadata) = entry.metadata() else {
-                    continue;
-                };
-                if metadata.is_dir() {
-                    // Nothing this store makes, so everything under it is
-                    // debris -- but it is occupying the volume, and a
-                    // caller counting the disk must see all of it.
-                    collect_strays(&entry.path(), &mut stored.strays);
-                    continue;
-                }
-                let name = entry.file_name();
-                // A name this store never wrote, or a piece file sitting in
-                // a bucket it does not belong to: `delete_pieces` would look
-                // for it somewhere else, so reporting it as that piece would
-                // promise bytes back that no delete could take.
-                let stray = match name.to_str().and_then(piece_of_name) {
-                    Some((piece, staged)) if bucket_index == Some(piece / PIECES_PER_DIRECTORY) => {
-                        let slot = pieces.entry(piece).or_insert(StoredPiece {
-                            piece,
-                            complete: None,
-                            staged: None,
-                        });
-                        if staged {
-                            slot.staged = Some(metadata);
-                        } else {
-                            slot.complete = Some(metadata);
-                        }
-                        None
-                    }
-                    _ => Some(metadata),
-                };
-                if let Some(metadata) = stray {
-                    stored.strays.push(metadata);
-                }
+        let mut stored = self.chunks(info_hash).stat();
+        // A piece index is a `u32` everywhere above here, so a chunk file
+        // whose name spells a larger number names no piece: offering it as
+        // one would promise bytes back that `delete_pieces` -- which takes
+        // `u32` -- could never address. It is on the volume, so it is
+        // counted, exactly like every other stray.
+        let mut pieces = Vec::with_capacity(stored.chunks.len());
+        for chunk in stored.chunks {
+            if u32::try_from(chunk.index).is_ok() {
+                pieces.push(chunk);
+            } else {
+                stored.strays.extend(chunk.complete);
+                stored.strays.extend(chunk.staged);
             }
         }
-        stored.pieces = pieces.into_values().collect();
-        stored
+        StoredTorrent {
+            info_hash: info_hash.to_ascii_lowercase(),
+            pieces,
+            strays: stored.strays,
+        }
+    }
+
+    /// One torrent's directory as a directory of chunks -- the one place the
+    /// piece store's `(info hash, piece)` addressing meets the chunk store.
+    fn chunks(&self, info_hash: &str) -> ChunkDir {
+        ChunkDir::new(self.torrent_dir(info_hash))
     }
 
     /// Which pieces of one torrent are **complete** on disk, which under
@@ -769,31 +587,11 @@ impl StoreRoot {
     /// the way a delete will spell them, or the answer would promise bytes
     /// no delete could take.
     pub fn held(&self, info_hash: &str) -> std::collections::BTreeSet<u32> {
-        let dir = self.torrent_dir(info_hash);
-        let mut held = std::collections::BTreeSet::new();
-        let Ok(buckets) = std::fs::read_dir(&dir) else {
-            return held;
-        };
-        for bucket in buckets.flatten() {
-            if !bucket.file_type().is_ok_and(|t| t.is_dir()) {
-                continue;
-            }
-            let bucket_name = bucket.file_name();
-            let bucket_index = bucket_name.to_str().and_then(canonical_index);
-            let Ok(entries) = std::fs::read_dir(bucket.path()) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                if let Some((piece, staged)) = name.to_str().and_then(piece_of_name)
-                    && !staged
-                    && bucket_index == Some(piece / PIECES_PER_DIRECTORY)
-                {
-                    held.insert(piece);
-                }
-            }
-        }
-        held
+        self.chunks(info_hash)
+            .held()
+            .into_iter()
+            .filter_map(|index| u32::try_from(index).ok())
+            .collect()
     }
 
     /// Reclaim pieces: both copies of each.
@@ -828,123 +626,34 @@ impl StoreRoot {
     /// -- a re-download of one writes under the staging name, which the
     /// cache keys separately and which a read prefers.
     ///
-    /// Returns how many *complete* piece files really left the disk. A piece
-    /// with no file was not on the disk to leave it, and is not an error --
-    /// the caller asked for bytes back and there were none.
+    /// Returns for how many pieces a file really left the disk -- **either
+    /// copy**, not the complete one alone. A piece the caller was offered
+    /// with only a staged copy (a torrent whose directory nothing ran `init`
+    /// on this boot) occupies real blocks and gives them back when it goes,
+    /// and counting only the complete copy reported nothing freed while the
+    /// volume gained space -- which is the number
+    /// `cache_cleaner::EvictionReport::freed` uses to decide whether a
+    /// torrent stopped by ENOSPC may be restarted.
+    ///
+    /// A piece with no file at all was not on the disk to leave it, and is
+    /// not an error -- the caller asked for bytes back and there were none.
     pub fn delete_pieces(
         &self,
         info_hash: &str,
         pieces: impl IntoIterator<Item = u32>,
     ) -> anyhow::Result<usize> {
-        let dir = self.torrent_dir(info_hash);
+        let chunks = self.chunks(info_hash);
         let mut removed = 0;
         for piece in pieces {
-            removed += usize::from(unlink_piece(&dir, piece)?.removed_complete);
+            removed += usize::from(
+                chunks
+                    .remove(u64::from(piece))
+                    .with_context(|| format!("could not delete piece {piece} of {info_hash}"))?
+                    .anything,
+            );
         }
         Ok(removed)
     }
-}
-
-/// What one [`unlink_piece`] took.
-struct Unlinked {
-    /// The complete copy went -- the piece really was on the disk.
-    removed_complete: bool,
-    /// Either copy went.
-    removed_anything: bool,
-}
-
-/// Unlink both copies of `piece` under `dir`, a torrent's directory in the
-/// store.
-///
-/// The bucket directory is left behind; it is pruned when the torrent's own
-/// directory goes ([`TorrentStorage::remove_directory_if_empty`]). Removing
-/// it here would be a rmdir per piece against a directory a concurrent write
-/// may have just created and not yet opened its file in.
-fn unlink_piece(dir: &Path, piece: u32) -> anyhow::Result<Unlinked> {
-    let mut unlinked = Unlinked {
-        removed_complete: false,
-        removed_anything: false,
-    };
-    for (path, complete) in [
-        (staging_path(dir, piece), false),
-        (piece_path(dir, piece), true),
-    ] {
-        match std::fs::remove_file(&path) {
-            Ok(()) => {
-                unlinked.removed_anything = true;
-                unlinked.removed_complete |= complete;
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(anyhow::Error::new(e)
-                    .context(format!("could not delete piece file {}", path.display())));
-            }
-        }
-    }
-    Ok(unlinked)
-}
-
-/// Every file under `dir`, however deep, as debris.
-///
-/// The store makes no directory below a bucket, so a tree found there is
-/// somebody else's -- but its blocks are on the same volume, and a scan that
-/// stayed silent about them would be inventing exactly the invisible disk
-/// usage one file per piece exists to abolish.
-fn collect_strays(dir: &Path, out: &mut Vec<std::fs::Metadata>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        if metadata.is_dir() {
-            collect_strays(&entry.path(), out);
-        } else {
-            out.push(metadata);
-        }
-    }
-}
-
-/// A file name in a bucket directory back to the piece it holds and which
-/// copy of it, or `None` when it is not a name this store writes.
-fn piece_of_name(name: &str) -> Option<(u32, bool)> {
-    let (index, staged) = match name.strip_suffix(STAGING_SUFFIX) {
-        Some(index) => (index, true),
-        None => (name, false),
-    };
-    canonical_index(index).map(|piece| (piece, staged))
-}
-
-/// The number a name spells, or `None` when it is not how this store
-/// spells that number.
-///
-/// `str::parse` would accept a leading `+` and leading zeroes; the store
-/// writes neither, so `00`, `+0` and `0` all parse to the same piece while
-/// only the last of them is a name [`piece_path`] would ever produce. Both
-/// halves of a piece's address go through this -- the bucket directory and
-/// the file in it -- because a piece is only *reachable* when both are
-/// spelled the way a delete will spell them. Reporting debris as a piece
-/// would promise bytes back that no delete could take: the delete would
-/// build `<piece / PIECES_PER_DIRECTORY>/<piece>`, find nothing there and
-/// free nothing, while the file sat on the volume being re-found by every
-/// later pass.
-fn canonical_index(name: &str) -> Option<u32> {
-    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    if name.len() > 1 && name.starts_with('0') {
-        return None;
-    }
-    name.parse::<u32>().ok()
-}
-
-/// The same path with [`STAGING_SUFFIX`] on it: in the same bucket directory,
-/// so promoting it is a rename and not a move across directories.
-pub(super) fn staging_path(dir: &Path, piece: u32) -> PathBuf {
-    let mut path = piece_path(dir, piece).into_os_string();
-    path.push(STAGING_SUFFIX);
-    path.into()
 }
 
 impl TorrentStorage for PieceStore {
@@ -958,8 +667,9 @@ impl TorrentStorage for PieceStore {
         _shared: &librqbit::ManagedTorrentShared,
         _metadata: &librqbit::TorrentMetadata,
     ) -> anyhow::Result<()> {
-        std::fs::create_dir_all(&self.dir)
-            .with_context(|| format!("could not create piece directory {}", self.dir.display()))?;
+        std::fs::create_dir_all(self.dir()).with_context(|| {
+            format!("could not create piece directory {}", self.dir().display())
+        })?;
         self.discard_shadowing_staged()
     }
 
@@ -1053,25 +763,9 @@ impl TorrentStorage for PieceStore {
         if path != Path::new("") && path != Path::new(".") {
             return Ok(());
         }
-        let entries = match std::fs::read_dir(&self.dir) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => {
-                return Err(anyhow::Error::new(e).context(format!(
-                    "could not read piece directory {}",
-                    self.dir.display()
-                )));
-            }
-        };
-        for entry in entries.flatten() {
-            if entry.file_type().is_ok_and(|t| t.is_dir()) {
-                // Fails while the bucket still holds pieces, which is the
-                // answer we want.
-                let _ = std::fs::remove_dir(entry.path());
-            }
-        }
-        let _ = std::fs::remove_dir(&self.dir);
-        Ok(())
+        self.chunks
+            .remove_if_empty()
+            .with_context(|| format!("could not read piece directory {}", self.dir().display()))
     }
 
     /// A no-op: the piece file is the allocation unit and it grows as bytes
@@ -1139,7 +833,7 @@ impl TorrentStorage for PieceStore {
     /// where the pieces are would delete nothing.
     fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
         let successor = PieceStore {
-            dir: self.dir.clone(),
+            chunks: self.chunks.clone(),
             layout: self.layout.clone(),
             removed_files: Mutex::new(self.removed_files.lock().clone()),
             // The successor keeps knowing which pieces are staged -- a
@@ -1147,7 +841,7 @@ impl TorrentStorage for PieceStore {
             // handles; the dead store's are closed, so a paused torrent
             // holds no descriptors.
             staged: Mutex::new(self.staged.lock().clone()),
-            handles: Mutex::new(Vec::new()),
+            handles: OpenChunks::new(),
             live: AtomicBool::new(true),
             #[cfg(test)]
             opens: AtomicUsize::new(0),
@@ -1155,7 +849,7 @@ impl TorrentStorage for PieceStore {
             staging_probes: AtomicUsize::new(0),
         };
         self.live.store(false, Ordering::Release);
-        self.handles.lock().clear();
+        self.handles.clear();
         Ok(Box::new(successor))
     }
 }
@@ -1316,6 +1010,7 @@ fn pwrite_all_at(file: &File, mut offset: u64, mut buf: &[u8]) -> io::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chunk_store::{CHUNKS_PER_DIRECTORY, STAGING_SUFFIX};
     use crate::piece_store::layout::FileSpec;
 
     /// A torrent shaped to exercise every case at once over 8-byte pieces:
@@ -1480,7 +1175,7 @@ mod tests {
 
         let stored = root.stat(hash);
         assert_eq!(
-            stored.pieces.iter().map(|p| p.piece).collect::<Vec<_>>(),
+            stored.pieces.iter().map(|p| p.index).collect::<Vec<_>>(),
             vec![0, 2500],
             "one entry per piece, whichever bucket it is in"
         );
@@ -1520,7 +1215,7 @@ mod tests {
             root.stat(hash)
                 .pieces
                 .iter()
-                .map(|p| p.piece)
+                .map(|p| p.index)
                 .collect::<Vec<_>>(),
             vec![0]
         );
@@ -1571,7 +1266,7 @@ mod tests {
 
         let stored = root.stat(hash);
         assert_eq!(
-            stored.pieces.iter().map(|p| p.piece).collect::<Vec<_>>(),
+            stored.pieces.iter().map(|p| p.index).collect::<Vec<_>>(),
             vec![0],
             "the one piece the store wrote, and nothing that merely parses like it"
         );
@@ -1716,6 +1411,12 @@ mod tests {
             "piece 1 ends in a padding file nobody writes, so its file stops \
              at the last real byte instead of being padded out"
         );
+        assert!(
+            store.has_piece(1),
+            "and it is still committed: a piece the swarm's hash passed is ours \
+             whatever its length, so the commit takes no expected length from \
+             this adapter"
+        );
         assert_eq!(std::fs::read(store.piece_path(2)).unwrap(), global[16..24]);
         assert_eq!(
             std::fs::read(store.piece_path(3)).unwrap(),
@@ -1724,6 +1425,49 @@ mod tests {
         );
         assert_eq!(store.layout().piece_count(), 4);
         assert!(!store.piece_path(4).exists());
+    }
+
+    /// The hot listing and the delete have to be one predicate about one
+    /// kind of thing.
+    ///
+    /// A *directory* named like a piece is not a piece, and the retention
+    /// pass reaches the disk through `held` -- so if `held` reports it, the
+    /// `delete_pieces` that follows calls `remove_file` on a directory,
+    /// which fails with `EISDIR`. That is not `NotFound`, so the whole run
+    /// of pieces is abandoned at it: every later piece in the run stays on a
+    /// disk the caller has been told it freed.
+    #[test]
+    fn a_directory_wearing_a_pieces_name_is_never_offered_as_one() {
+        const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = StoreRoot::new(tmp.path().to_path_buf());
+        let store = PieceStore::new(root.torrent_dir(HASH), Arc::new(layout_for(4)));
+        let payload = global_bytes(store.layout().total_length());
+        store.pwrite_all(0, 0, &payload).unwrap();
+        for piece in 0..4 {
+            store.complete_piece(piece).unwrap();
+        }
+        // Somebody else's directory, in the bucket, wearing piece 1's name.
+        let usurper = store.piece_path(1);
+        std::fs::remove_file(&usurper).unwrap();
+        std::fs::create_dir(&usurper).unwrap();
+        std::fs::write(usurper.join("inside"), b"not ours").unwrap();
+
+        assert_eq!(
+            root.held(HASH),
+            BTreeSet::from([0, 2, 3]),
+            "a directory is not a held piece"
+        );
+        // The path the retention pass takes: what `held` said, offered to
+        // the delete.
+        let held = root.held(HASH);
+        assert_eq!(
+            root.delete_pieces(HASH, held).unwrap(),
+            3,
+            "and every piece the listing named really goes"
+        );
+        assert!(!store.has_piece(0) && !store.has_piece(2) && !store.has_piece(3));
+        assert!(usurper.is_dir(), "what is not ours is left where it is");
     }
 
     #[test]
@@ -2124,7 +1868,7 @@ mod tests {
         let again: Vec<u8> = global[0..8].iter().map(|b| !b).collect();
         store.pwrite_all(0, 0, &again).unwrap();
         store.pread_exact(0, 0, &mut [0u8; 4]).unwrap();
-        assert!(!store.handles.lock().is_empty(), "handles are open");
+        assert!(!store.handles.is_empty(), "handles are open");
 
         let successor = store.take().unwrap();
         assert!(
@@ -2133,7 +1877,7 @@ mod tests {
         );
         assert!(store.pwrite_all(0, 0, &[0u8; 4]).is_err());
         assert!(
-            store.handles.lock().is_empty(),
+            store.handles.is_empty(),
             "and holds no descriptors: a paused torrent keeps no files open"
         );
         let mut buf = [0u8; 4];
@@ -2221,10 +1965,10 @@ mod tests {
         assert_eq!(files, pieces as usize, "one file per piece, no more");
         assert_eq!(
             buckets, 7,
-            "6750 pieces over {PIECES_PER_DIRECTORY} a bucket"
+            "6750 pieces over {CHUNKS_PER_DIRECTORY} a bucket"
         );
         assert!(
-            widest <= PIECES_PER_DIRECTORY as usize,
+            widest <= CHUNKS_PER_DIRECTORY as usize,
             "a directory grew to {widest} entries"
         );
         assert!(store.has_piece(6749) && !store.has_piece(6750));

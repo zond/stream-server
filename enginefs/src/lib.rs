@@ -12,6 +12,7 @@ use tracing::debug;
 
 pub mod backend;
 pub mod cache;
+pub mod chunk_store;
 pub mod disk_cache;
 pub mod engine;
 pub mod files;

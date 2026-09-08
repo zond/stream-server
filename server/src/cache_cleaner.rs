@@ -689,7 +689,11 @@ fn scan_usage(inputs: WalkInputs, limit: CacheLimit) -> CacheUsage {
     }
 }
 
-/// What a cache root costs on disk, as the cleaner must count it.
+/// What a cache root costs on disk, as the cleaner must count it -- and
+/// **the one copy of that arithmetic**, which is
+/// [`enginefs::chunk_store::occupied_bytes`]. The cleaner, the piece sweep
+/// and the proxy cache each carried their own; three readings of "how much
+/// would deleting this give back" are three numbers that can disagree.
 ///
 /// librqbit's filesystem storage pre-allocates every file it wants at its
 /// **full** length, so a part-streamed film is a multi-gigabyte apparent
@@ -700,33 +704,14 @@ fn scan_usage(inputs: WalkInputs, limit: CacheLimit) -> CacheUsage {
 /// about progress: count what the backend allocated, never
 /// `metadata().len()`.)
 ///
-/// The session does not run on that storage any more -- it is the piece
+/// The session does not run on that storage any more -- it is the chunk
 /// store, which pre-allocates nothing and whose files are exactly as long as
 /// the bytes in them -- so nothing this server *writes* is sparse today. This
 /// still has to count occupancy, for two reasons that are not going away:
 /// the walked roots are full of whole-file downloads earlier versions
 /// pre-allocated and nothing migrates, and a rule that reads a length as a
 /// cost is one bad add away from the same 17 GB reading again.
-///
-/// On Unix `st_blocks` is the allocated block count in 512-byte units *by
-/// definition* -- the unit is POSIX, not the filesystem's block size -- so
-/// `blocks() * 512` is the occupancy including any tail slack. Windows has
-/// no equivalent through `std` (it needs `GetCompressedFileSize` or
-/// `FSCTL_QUERY_ALLOCATED_RANGES` through the Win32 API), so there the
-/// apparent length stands in, exactly as it did everywhere before: it is an
-/// over-estimate for a sparse file, which errs towards cleaning too eagerly
-/// rather than letting a disk fill.
-pub(crate) fn occupied_bytes(metadata: &std::fs::Metadata) -> u64 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        metadata.blocks().saturating_mul(512)
-    }
-    #[cfg(not(unix))]
-    {
-        metadata.len()
-    }
-}
+pub(crate) use enginefs::chunk_store::occupied_bytes;
 
 /// What the cache currently occupies against its configured limit
 /// ([`usage`]), in the same occupancy accounting eviction uses
@@ -1281,7 +1266,18 @@ impl WalkInputs {
             walked.protected_files += torrent.strays.len();
             for piece in torrent.pieces {
                 let bytes: u64 = piece.files().map(occupied_bytes).sum();
-                if !self.gate.releases(&torrent.info_hash, piece.piece) {
+                // `StoreRoot::stat` promises this: a chunk whose index a
+                // `u32` could not hold is one no piece index names, so it
+                // comes back as a stray and never as a piece. Counted and
+                // set aside if that promise ever changed, because a piece
+                // this pass cannot address is a piece it cannot free.
+                let Ok(index) = u32::try_from(piece.index) else {
+                    walked.total_size += bytes;
+                    walked.protected_size += bytes;
+                    walked.protected_files += piece.files().count();
+                    continue;
+                };
+                if !self.gate.releases(&torrent.info_hash, index) {
                     walked.total_size += bytes;
                     walked.protected_size += bytes;
                     walked.protected_files += piece.files().count();
@@ -1292,7 +1288,7 @@ impl WalkInputs {
                     walked,
                     Reclaimable::Piece {
                         info_hash: torrent.info_hash.clone(),
-                        piece: piece.piece,
+                        piece: index,
                     },
                     bytes,
                     modified,
@@ -1914,6 +1910,46 @@ mod tests {
             report.total, stray_bytes,
             "what is left is exactly the stray, counted once"
         );
+    }
+
+    /// A torrent whose directory holds nothing but *staged* pieces still
+    /// gives its blocks back, and the pass has to book them.
+    ///
+    /// That is the ordinary state of a dormant pin nothing ran `init` on
+    /// this boot: the scan reports the piece (both copies are one thing to
+    /// reclaim), the pass offers it, the delete takes the `.part` and the
+    /// volume really gains the space. While the store counted only the
+    /// *complete* copy as having left, this pass reported nothing freed --
+    /// and `EvictionReport::freed` is the whole of `made_room()`, so
+    /// `DiskFullRecovery` would keep a torrent stopped by ENOSPC stopped on
+    /// a disk that had just gained room, or restart it on one that had not.
+    ///
+    /// Measured on the volume either side of the pass, never on what the
+    /// store thinks it removed.
+    #[tokio::test]
+    async fn a_piece_that_was_only_ever_staged_books_what_the_volume_gave_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("rqbit-downloads");
+        let forty_days = Duration::from_secs(40 * 24 * 60 * 60);
+        let staged = piece_store_for(&root, HASH, 1).staging_path(0);
+        write_aged(&staged, &[0u8; 65536], forty_days);
+        let staged_bytes = occupancy(&staged);
+        assert!(staged_bytes > 0, "the staged piece is really on the disk");
+
+        let report = evict_root(&root, &ReclaimGate::default(), CacheLimit::configured(0))
+            .await
+            .unwrap();
+
+        assert!(!staged.exists(), "the staged piece went");
+        assert_eq!(
+            report.deleted, 1,
+            "and the pass knows a piece left the disk: {report:?}"
+        );
+        assert_eq!(
+            report.freed, staged_bytes,
+            "with the bytes the volume actually gave back: {report:?}"
+        );
+        assert_eq!(report.total, 0, "nothing of it is left to count");
     }
 
     /// Two passes over one disk book its bytes once.
