@@ -51,12 +51,14 @@ pub enum Decision {
     Leave,
 }
 
-/// What made a decision be taken now. It changes two things -- which
-/// free-space line the volume is measured against ([`line`]), and whether
-/// the anti-flap dwell applies -- and both differences are the same
-/// difference: a decision taken because *somebody is waiting for it* is
-/// answering a person, while a decision taken by the timer is answering
-/// nobody.
+/// What made a decision be taken now. It changes three things -- which
+/// free-space line the volume is measured against ([`line`]), whether the
+/// anti-flap dwell applies, and whether the idle arm is walked at all
+/// ([`verdict`]) -- and all three differences are the same difference: a
+/// decision taken because *somebody is waiting for it* is answering a
+/// person, while a decision taken by the timer is answering nobody. The
+/// third is the one that is not a concession but a correctness rule: the
+/// idle arm reads registers the asker may still be writing.
 ///
 /// [`line`]: line
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,15 +193,17 @@ pub struct Conditions {
 ///    is `line` and [`volume_is_short`].
 /// 6. **Playing or pinned -> [`Decision::Run`].** Someone is watching it,
 ///    or someone asked for it offline.
-/// 7. **Seeding off and idle -> [`Decision::Stop`].** The idle policy: with
-///    seeding disabled and nothing playing, what a running torrent is doing
-///    is fetching a film nobody is watching while we have promised to
-///    upload nothing. `crate::INACTIVE_TORRENT_PAUSE_GRACE` of quiet
-///    first, so a player that stops one segment and starts the next does
-///    not stop and start the torrent with it -- and a torrent nothing has
-///    been seen using at all ([`Conditions::idle_for`] `None`, a restored
+/// 7. **Seeding off and idle, on a [`Trigger::Timer`] -> [`Decision::Stop`].**
+///    The idle policy: with seeding disabled and nothing playing, what a
+///    running torrent is doing is fetching a film nobody is watching while
+///    we have promised to upload nothing. `crate::INACTIVE_TORRENT_PAUSE_GRACE`
+///    of quiet first, so a player that stops one segment and starts the next
+///    does not stop and start the torrent with it -- and a torrent nothing
+///    has been seen using at all ([`Conditions::idle_for`] `None`, a restored
 ///    one) counts as quiet, because there is no recent stream for the grace
-///    to protect.
+///    to protect. The only arm the trigger can switch off, and the reason is
+///    that this is the only arm whose inputs the *asker* is still writing:
+///    see the comment on it.
 /// 8. Otherwise **[`Decision::Run`]**.
 pub fn desired(conditions: &Conditions, trigger: Trigger) -> Decision {
     verdict(conditions, trigger).decision
@@ -273,7 +277,24 @@ pub fn verdict(conditions: &Conditions, trigger: Trigger) -> Verdict {
     let quiet = conditions
         .idle_for
         .is_none_or(|idle| idle >= crate::INACTIVE_TORRENT_PAUSE_GRACE);
-    if !conditions.seeding_enabled && quiet {
+    // And the idle policy is the timer's alone. `PlaybackStart` means
+    // somebody is about to open a reader on *this* torrent, and "nothing
+    // is playing" is never an answer to that: `playing` is read from
+    // registers the caller may still be in the middle of writing, so a
+    // caller that asks before it has finished registering gets the very
+    // torrent it named stopped under it. `BackendEngineFS::focus_torrent`
+    // is such a caller -- it writes no register at all -- and was safe
+    // only because the one production call site happens to run
+    // `on_stream_start` two lines earlier.
+    //
+    // The alternative was to let that caller stamp `Engine::last_active_at`
+    // for itself, which buys the same answer by *inventing* the reading the
+    // idle arm then treats as an observation, and buys it for a whole
+    // `crate::INACTIVE_TORRENT_PAUSE_GRACE`. This costs one tick instead: a
+    // torrent started for a reader that never comes is stopped by the next
+    // `Timer` pass, `RECONCILE_INTERVAL` later, from registers that were
+    // actually read.
+    if trigger == Trigger::Timer && !conditions.seeding_enabled && quiet {
         return arm(Decision::Stop);
     }
     arm(Decision::Run)
@@ -884,6 +905,44 @@ mod tests {
             ),
             Decision::Run
         );
+    }
+
+    /// The idle arm is the timer's. A `PlaybackStart` is somebody about to
+    /// open a reader on this torrent, and `playing` is read from registers
+    /// that caller may still be writing -- `BackendEngineFS::focus_torrent`
+    /// writes none at all -- so answering "nothing is playing, stop it"
+    /// would stop the very torrent the question was asked about.
+    ///
+    /// Every other arm is the trigger's equal: an unsettled reading, a
+    /// resolving magnet and a volume under the floor answer the same to
+    /// both, and that is the point -- this is the one arm whose inputs the
+    /// asker is in the middle of writing.
+    #[test]
+    fn the_idle_arm_is_the_timers_and_a_playback_start_never_takes_it() {
+        let quiet = Conditions {
+            seeding_enabled: false,
+            idle_for: Some(INACTIVE_TORRENT_PAUSE_GRACE),
+            ..healthy()
+        };
+        assert_eq!(desired(&quiet, Trigger::Timer), Decision::Stop);
+        assert_eq!(desired(&quiet, Trigger::PlaybackStart), Decision::Run);
+
+        // A torrent nothing has ever been seen using -- a restored one --
+        // is the same: quiet for the timer, owed to the asker.
+        let never_seen = Conditions {
+            idle_for: None,
+            ..quiet
+        };
+        assert_eq!(desired(&never_seen, Trigger::Timer), Decision::Stop);
+        assert_eq!(desired(&never_seen, Trigger::PlaybackStart), Decision::Run);
+
+        // The concession stops at this arm. A volume under the floor still
+        // stops the torrent the asker is waiting for.
+        let starving = Conditions {
+            available: Some(CACHE_FREE_SPACE_FLOOR - 1),
+            ..quiet
+        };
+        assert_eq!(desired(&starving, Trigger::PlaybackStart), Decision::Stop);
     }
 
     /// The idle arm needs both halves -- seeding off *and* quiet for the

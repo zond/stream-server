@@ -2803,16 +2803,26 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// restart, and a restart is exactly when a torrent comes up stopped
     /// with nothing in this process able to say why.
     ///
-    /// **The stamp is this call's own, not its caller's.** The name says a
-    /// reader is being opened on this torrent, and [`crate::reconcile::Trigger::PlaybackStart`]
-    /// says only *why* the question is being asked -- `playing` is read
-    /// from the activity registers, which this call does not write. Without
-    /// a stamp the ladder can therefore answer `Stop` for the very torrent
-    /// it was asked to focus: seeding off, registers empty, `idle_for`
-    /// `None`, which the idle arm reads as quiet. It was safe only because
-    /// the one production caller happens to run `on_stream_start` first,
-    /// two lines earlier in `routes::stream`, so the fix belonged here
-    /// rather than in a comment over there asking nobody to swap them.
+    /// **This call writes no activity register, and stamps no clock.** It
+    /// says a reader is about to be opened, which is
+    /// [`crate::reconcile::Trigger::PlaybackStart`] -- and the trigger says
+    /// only *why* the question is being asked, never that anything is
+    /// playing. So on the ladder's own conditions this is a torrent nobody
+    /// is using, and until the idle arm was made the timer's alone the
+    /// ladder could answer `Stop` for the very torrent it had been asked to
+    /// focus (seeding off, registers empty, `idle_for` `None`, which the
+    /// idle arm reads as quiet). That was latent only because the one
+    /// production caller happens to run `on_stream_start` two lines earlier
+    /// in `routes::stream`.
+    ///
+    /// The fix is not a stamp here. Stamping `Engine::last_active_at` from
+    /// a call that read no register invents the observation the idle arm
+    /// then measures its grace from -- the freshness mistake this whole
+    /// design keeps deleting -- and buys a whole
+    /// `INACTIVE_TORRENT_PAUSE_GRACE` of it on any torrent any caller
+    /// names. The arm is gated on [`crate::reconcile::Trigger::Timer`]
+    /// instead ([`crate::reconcile::verdict`]), so the ordering at the call
+    /// site does not matter and nothing is claimed that was not read.
     pub async fn focus_torrent(&self, target_info_hash: &str) {
         let info_hash = target_info_hash.to_lowercase();
         let Some(engine) = self.get_engine(&info_hash).await else {
@@ -2822,7 +2832,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             return;
         }
         engine.touch();
-        engine.mark_active(self.clock.now_secs());
         self.reconcile_hash(&info_hash, crate::reconcile::Trigger::PlaybackStart)
             .await;
     }
@@ -9107,15 +9116,21 @@ mod tests {
     /// Every condition here says stop: seeding is off, no stream, file
     /// stream or multi-file selection names this torrent, and it has been
     /// quiet for the whole grace. `Trigger::PlaybackStart` does not change
-    /// that -- it says why the question is being asked, not that anything
-    /// is playing -- so the stamp `focus_torrent` takes for itself is the
-    /// only thing between this reading and `Decision::Stop` on the very
+    /// any of that -- it says why the question is being asked, not that
+    /// anything is playing -- so the idle arm being the `Timer`'s alone is
+    /// the only thing between this reading and `Decision::Stop` on the very
     /// torrent the caller named.
     ///
     /// It was latent rather than absent because the one production caller
     /// runs `on_stream_start` two lines earlier (`routes::stream`), which
     /// does register a stream; a reordering there would have made it live.
     /// This test is the reason that ordering no longer matters.
+    ///
+    /// Note what is *not* asserted: nothing here reads `last_active_at`.
+    /// `focus_torrent` stamps nothing, so after this call the torrent is
+    /// still one nothing has been seen using -- and the next `Timer` pass
+    /// stops it again, two seconds later, which is the whole cost of the
+    /// arm being trigger-gated.
     #[tokio::test(start_paused = true)]
     async fn focusing_a_torrent_starts_it_with_nothing_else_registered() {
         let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
@@ -9132,6 +9147,16 @@ mod tests {
             "the torrent the caller asked to focus is the one the ladder stopped"
         );
         assert_eq!(counters.start_torrent.load(Ordering::SeqCst), 1);
+
+        // And the concession is one tick wide, not a grace period: nothing
+        // registered a stream and nothing stamped a clock, so the timer --
+        // which reads the same conditions and is the owner of the idle
+        // policy -- stops it again on its very next pass.
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), Decision::Stop)]
+        );
+        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
     }
 
     /// The statistics snapshot's list of stopped torrents is an
