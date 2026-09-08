@@ -7769,12 +7769,18 @@ mod tests {
         enginefs.active_streams.write().await.clear();
         enginefs.active_file_streams.write().await.clear();
 
-        // Five minutes of a details page polling every ten seconds.
+        // Five minutes of a details page polling every ten seconds. Both
+        // halves of what the route does to the engine, because both write
+        // `last_accessed`: `routes::system::stats_target` finds it with
+        // `get_engine`, and then `engine.get_statistics()` builds the body.
+        // Either one alone, read as activity, is enough to hold the grace
+        // open for ever.
         for _ in 0..30 {
-            enginefs
+            let engine = enginefs
                 .get_engine(TEST_HASH)
                 .await
                 .expect("the statistics route reaches its engine this way");
+            engine.get_statistics().await;
             tokio::time::advance(Duration::from_secs(10)).await;
             enginefs.reconcile_tick().await;
         }
