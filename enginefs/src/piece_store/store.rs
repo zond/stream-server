@@ -510,6 +510,51 @@ pub(super) fn piece_path(dir: &Path, piece: u32) -> PathBuf {
     path
 }
 
+/// Delete the files of `pieces` under `dir`, a torrent's directory in the
+/// store, for a caller that has already had the backend forget it has them
+/// ([`crate::backend::DroppedFilePieces`]) and is holding that claim.
+///
+/// Not [`PieceStore::delete_piece`], and it cannot be: the live `PieceStore`
+/// of a running torrent is librqbit's, built by the factory and handed to a
+/// torrent state this crate has no reference to. What that costs is the
+/// store's open-handle cache -- a piece deleted from out here may still have
+/// a cached handle in the live store, and the filesystem keeps an unlinked
+/// inode's blocks until the last descriptor on it goes. It is bounded by
+/// [`OPEN_HANDLES`] and the handle leaves as soon as another piece takes its
+/// slot. It costs nothing in *correctness*: [`PieceStore::has_piece`] asks
+/// the filesystem and not the cache, so the store never claims a piece whose
+/// file has gone, and nothing reads a piece the backend has just been told it
+/// does not have -- a re-download of one writes under the staging name, which
+/// the cache keys separately and which a read prefers.
+///
+/// Takes the staged copy with it, for [`PieceStore::delete_piece`]'s reason:
+/// half of a piece nobody wants is worth exactly as little as the whole of
+/// it. The bucket directories are left; they are pruned when the torrent's
+/// own directory goes.
+///
+/// Returns how many *complete* piece files really left the disk. A piece with
+/// no file was not on the disk to leave it, and is not an error -- the caller
+/// asked for bytes back and there were none.
+pub fn delete_pieces(dir: &Path, pieces: impl IntoIterator<Item = u32>) -> anyhow::Result<usize> {
+    let mut removed = 0;
+    for piece in pieces {
+        for (path, counts) in [
+            (staging_path(dir, piece), false),
+            (piece_path(dir, piece), true),
+        ] {
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed += usize::from(counts),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(anyhow::Error::new(e)
+                        .context(format!("could not delete piece file {}", path.display())));
+                }
+            }
+        }
+    }
+    Ok(removed)
+}
+
 /// The same path with [`STAGING_SUFFIX`] on it: in the same bucket directory,
 /// so promoting it is a rename and not a move across directories.
 pub(super) fn staging_path(dir: &Path, piece: u32) -> PathBuf {

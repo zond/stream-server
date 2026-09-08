@@ -3422,12 +3422,16 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// from the backend with its files and its (then empty) per-torrent
     /// folder ([`TorrentBackend::remove_torrent_and_files`]). While other
     /// files of it stay pinned the torrent must keep running, so only this
-    /// file goes -- truncated to nothing and then unlinked, since librqbit
-    /// keeps an open `File` on it for the torrent's lifetime and an unlink
-    /// alone would not free a byte. The caller reconciles the want-set
-    /// without the file first, so the backend does not write it again.
-    /// Best effort: a failure is logged, the unpin stands, and the returned
-    /// flag says whether the data is actually gone.
+    /// file goes. That is two deletions, because a torrent's bytes are piece
+    /// files ([`crate::piece_store`]) and the whole-file copy an earlier
+    /// version of this server wrote may also still be sitting at the path
+    /// the backend reports: **the dropped pieces**, and that path -- which is
+    /// truncated before it is unlinked, since librqbit keeps an open `File`
+    /// on every file of a running torrent and an unlink alone would not free
+    /// a byte. The caller reconciles the want-set without the file first, so
+    /// the backend does not write it again. Best effort: a failure is logged,
+    /// the unpin stands, and the returned flag says whether anything
+    /// actually left the disk -- never that it was already absent.
     ///
     /// The bytes are one record of the file and the backend's have-set is
     /// the other, and deleting the first does nothing to the second: left
@@ -3444,7 +3448,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// librqbit handle's doc for why, and for what the next restart does
     /// about it) is a warning and the delete goes ahead: the caller asked
     /// for the disk back, and the stale have-set is the lesser of the two
-    /// lies.
+    /// lies. It goes ahead over the *file*, though, and not over the
+    /// pieces: the claim is where their indices come from, and taking
+    /// pieces a backend still believes it has is the corruption this whole
+    /// dance exists to avoid.
     async fn delete_download_data(&self, engine: &Arc<Engine<B::Handle>>, file_idx: usize) -> bool {
         if engine.is_pinned() {
             let Some(path) = engine.handle.file_path(file_idx).await else {
@@ -3495,18 +3502,13 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     "could not open the download's file to release its blocks"
                 ),
             }
-            let deleted = match tokio::fs::remove_file(&path).await {
-                Ok(()) => {
-                    tracing::info!(
-                        info_hash = %engine.info_hash,
-                        file_idx,
-                        path = %path.display(),
-                        pieces_dropped = dropped.as_ref().map(|d| d.pieces().len()),
-                        "download_file_deleted"
-                    );
-                    true
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            let file_removed = match tokio::fs::remove_file(&path).await {
+                Ok(()) => true,
+                // Nothing at that path, which is the ordinary case now: the
+                // torrent's bytes are the piece files taken below, and this
+                // path is a whole-file copy only an earlier version of this
+                // server ever wrote. "Already absent" is not "freed".
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
                 Err(error) => {
                     tracing::warn!(
                         info_hash = %engine.info_hash,
@@ -3518,9 +3520,48 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     false
                 }
             };
+            // And the bytes themselves. `drop_file_pieces` is librqbit's own
+            // have-set bookkeeping and frees nothing -- it hands back the
+            // piece indices precisely so that whoever asked can delete them
+            // -- so without this the caller was told the disk had come back
+            // while every piece of the file was still in the store, and
+            // nothing would ever have reclaimed them: the directory is
+            // protected for as long as the torrent has any pin left.
+            let pieces_freed = match dropped.as_ref() {
+                Some(claim) => {
+                    let dir =
+                        crate::piece_store::root_in(&self.download_dir).join(&engine.info_hash);
+                    match crate::piece_store::delete_pieces(&dir, claim.pieces().iter().copied()) {
+                        Ok(freed) => freed,
+                        Err(error) => {
+                            tracing::warn!(
+                                info_hash = %engine.info_hash,
+                                file_idx,
+                                error = %format!("{error:#}"),
+                                "could not delete the download's pieces"
+                            );
+                            0
+                        }
+                    }
+                }
+                // No claim, so no list of pieces to take and no right to
+                // take them: the backend still believes it has them.
+                None => 0,
+            };
             // Released only now that the bytes are gone -- see the doc above
             // for what the claim holds off while they go.
             drop(dropped);
+            let deleted = file_removed || pieces_freed > 0;
+            if deleted {
+                tracing::info!(
+                    info_hash = %engine.info_hash,
+                    file_idx,
+                    path = %path.display(),
+                    file_removed,
+                    pieces_freed,
+                    "download_file_deleted"
+                );
+            }
             return deleted;
         }
         self.remove_engine_if_current(engine).await;
@@ -4634,6 +4675,10 @@ mod tests {
         applied_while_initializing: AtomicUsize,
         last_active_file: Mutex<Option<usize>>,
         last_generation: AtomicU64,
+        /// Test knob: the piece indices `drop_file_pieces` hands back as
+        /// the ones the backend has agreed to forget. Empty by default,
+        /// which is a backend with nothing had.
+        drops_pieces: Mutex<Vec<u32>>,
         /// Test knob: report every file as fully on disk (seeded torrent)
         /// instead of the default half-downloaded state.
         seeded: AtomicBool,
@@ -5083,7 +5128,8 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(file_idx);
-            Ok(Some(crate::backend::DroppedFilePieces::new(vec![], ())))
+            let pieces = self.counters.drops_pieces.lock().unwrap().clone();
+            Ok(Some(crate::backend::DroppedFilePieces::new(pieces, ())))
         }
 
         fn output_folder(&self) -> Option<std::path::PathBuf> {
@@ -10957,6 +11003,76 @@ mod tests {
     }
 
     /// A dormant pin asked to take its data with it: the placement folder
+    /// A destructive unpin of one file of a torrent that keeps others has to
+    /// take the **piece files**, and until the piece store became the
+    /// session's default storage nothing here did.
+    ///
+    /// `drop_file_pieces` is librqbit's own have-set bookkeeping: it forgets
+    /// the pieces and frees not one byte, handing the indices back precisely
+    /// so that whoever asked can delete them (`DroppedFilePieces`). While the
+    /// session wrote whole files the delete of the file *was* the delete of
+    /// the bytes and there was nothing else to do; now the file at the
+    /// backend's path is at most a leftover an earlier version wrote, and the
+    /// data is the pieces. Without this the caller was answered
+    /// `deletedFiles: true` with every piece of the deleted file still in the
+    /// store -- and nothing would ever have reclaimed them, since the
+    /// torrent's piece directory is protected for as long as it has a pin.
+    ///
+    /// Which is also why `deleted_files` stops reading "already absent" as
+    /// "freed": under this storage the backend's path is *always* absent, so
+    /// the old `NotFound => true` would have made the flag a constant true.
+    #[tokio::test]
+    async fn a_per_file_delete_takes_the_pieces_the_backend_gave_up() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        *counters.output_folder.lock().unwrap() = Some(enginefs.download_dir.join("show"));
+        let pieces = crate::piece_store::root_in(&enginefs.download_dir).join(TEST_HASH);
+        let bucket = pieces.join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in [3u32, 4, 5] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 4096]).unwrap();
+        }
+        // A staged copy of one of them, from a re-download that was in
+        // flight: half a piece nobody wants is worth as little as all of it.
+        std::fs::write(bucket.join("4.part"), [7u8; 512]).unwrap();
+        // Piece 5 is the still-pinned neighbour's, and the backend does not
+        // give it up.
+        *counters.drops_pieces.lock().unwrap() = vec![3, 4];
+
+        enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
+        enginefs.pin_download(TEST_HASH, 1, None).await.unwrap();
+
+        assert_eq!(
+            enginefs.unpin_download(TEST_HASH, 0, true).await.unwrap(),
+            UnpinOutcome {
+                unpinned: true,
+                deleted_files: true,
+            },
+            "the bytes really left the disk"
+        );
+        assert!(!bucket.join("3").exists());
+        assert!(!bucket.join("4").exists());
+        assert!(!bucket.join("4.part").exists(), "and the staged copy");
+        assert!(
+            bucket.join("5").is_file(),
+            "the still-pinned file's piece is not the delete's to take"
+        );
+        assert!(
+            enginefs.get_engine(TEST_HASH).await.is_some(),
+            "the torrent keeps running for its other pin"
+        );
+
+        // And nothing left the disk the second time, so the answer says so
+        // rather than echoing the request flag: the pieces are already gone
+        // and the backend's path never held anything.
+        assert_eq!(
+            enginefs.unpin_download(TEST_HASH, 0, true).await.unwrap(),
+            UnpinOutcome {
+                unpinned: false,
+                deleted_files: false,
+            }
+        );
+    }
+
     /// `<downloadsDir>/<info hash>` is one this layer named itself, so it
     /// goes at once rather than waiting on the cleaner's age rule, which
     /// `protected_paths` holds off for as long as the pin stands -- and the
