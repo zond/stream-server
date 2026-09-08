@@ -1241,8 +1241,20 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 // playback is active. A later playback request resumes the
                 // torrent before making its requested file wanted.
                 if !seeding_flag.load(Ordering::Relaxed) {
-                    let read = engines_clone.read().await;
-                    for (hash, engine) in read.iter() {
+                    // Snapshotted, and the guard dropped, before the loop:
+                    // `engines` is a write-preferring `RwLock`, and the loop
+                    // awaits the backend twice per engine (the metadata and
+                    // finished questions) and then `Session::pause`, which
+                    // flushes librqbit's persistence file. Held across those,
+                    // one torrent's disk write parks every route waiting to
+                    // look an engine up.
+                    let engines: Vec<_> = engines_clone
+                        .read()
+                        .await
+                        .iter()
+                        .map(|(hash, engine)| (hash.clone(), engine.clone()))
+                        .collect();
+                    for (hash, engine) in &engines {
                         if engine.handle.manages_playback_lifecycle() {
                             continue;
                         }
@@ -2331,8 +2343,16 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         if enabled {
             let engines = self.engines.clone();
             tokio::spawn(async move {
-                let read = engines.read().await;
-                for engine in read.values() {
+                // Snapshotted, and the guard dropped, before the first
+                // `.await` on a backend call. `engines` is a
+                // write-preferring `RwLock`, so a read guard held across an
+                // await parks every later reader behind any writer that
+                // queues meanwhile -- and the await here is
+                // `Session::unpause`, which flushes librqbit's persistence
+                // file: one torrent's disk write would stall every route
+                // that wants to look an engine up.
+                let engines: Vec<_> = engines.read().await.values().cloned().collect();
+                for engine in engines {
                     if engine.handle.manages_playback_lifecycle() {
                         continue;
                     }
@@ -4738,7 +4758,6 @@ impl BackendEngineFS<LibrqbitBackend> {
         report
     }
 
-
     /// Shrink to, or grow back from, a [`Footprint`] -- see the enum for
     /// what `Lean` sheds and what it deliberately keeps (seeding). Forwarded
     /// to the backend, which applies it to every torrent now and to every
@@ -4861,6 +4880,19 @@ mod tests {
         /// `Paused` from the `start_paused` it captured before the unpause
         /// arrived.
         swallow_start: AtomicBool,
+        /// Test knobs: hold `pause_torrent` / `resume_torrent` open at the
+        /// matching gate until the test releases it, so a test can see what
+        /// the caller is still holding while it awaits the backend.
+        ///
+        /// A slow pause is the ordinary case, not a contrived one:
+        /// `Session::pause` and `Session::unpause` both flush librqbit's
+        /// persistence file before they return. A caller that holds the
+        /// engine registry across one is invisible against a fake that
+        /// answers in the same poll.
+        hold_pause: AtomicBool,
+        pause_gate: tokio::sync::Notify,
+        hold_resume: AtomicBool,
+        resume_gate: tokio::sync::Notify,
     }
 
     /// Simulates librqbit's `Initializing` state for the fake torrent: the
@@ -5298,6 +5330,9 @@ mod tests {
         /// Lifts the idle pause and no other, as the real backend's does.
         async fn resume_torrent(&self) -> Result<()> {
             self.counters.resume_torrent.fetch_add(1, Ordering::SeqCst);
+            if self.counters.hold_resume.load(Ordering::SeqCst) {
+                self.counters.resume_gate.notified().await;
+            }
             if self.counters.idle_pause.swap(false, Ordering::SeqCst) {
                 self.counters.paused.store(false, Ordering::SeqCst);
             }
@@ -5364,6 +5399,9 @@ mod tests {
 
         async fn pause_torrent(&self) -> Result<()> {
             self.counters.pause_torrent.fetch_add(1, Ordering::SeqCst);
+            if self.counters.hold_pause.load(Ordering::SeqCst) {
+                self.counters.pause_gate.notified().await;
+            }
             self.counters.paused.store(true, Ordering::SeqCst);
             self.counters.idle_pause.store(true, Ordering::SeqCst);
             Ok(())
@@ -8557,6 +8595,90 @@ mod tests {
             engines[1].reads_refused(),
             "the clock it is judged by is the volume's, which has been short all along"
         );
+    }
+
+    /// Put the torrent where the housekeeping sweep leaves an idle one when
+    /// seeding is off: paused, with the engine's record that the pause is
+    /// the idle policy's. The reconciler fixtures abort that sweep, so its
+    /// two calls are made here.
+    async fn idle_pause(engine: &Arc<Engine<FakeHandle>>) {
+        engine.idle_paused.store(true, Ordering::Relaxed);
+        engine.handle.pause_torrent().await.unwrap();
+    }
+
+    /// Re-enabling seeding resumes the torrents the idle policy paused, and
+    /// it does not hold the engine registry while it waits for the backend
+    /// to do it.
+    ///
+    /// `engines` is a write-preferring `RwLock`: a read guard held across
+    /// an await parks every later reader behind any writer that queues
+    /// meanwhile, and the await here is `Session::unpause`, which flushes
+    /// librqbit's persistence file. One torrent's disk write would stall
+    /// every route that wants to look an engine up.
+    #[tokio::test]
+    async fn re_enabling_seeding_resumes_without_holding_the_engine_registry() {
+        let (enginefs, counters) = test_enginefs_for_reconciler(1);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        idle_pause(&engine).await;
+
+        counters.hold_resume.store(true, Ordering::SeqCst);
+        enginefs.set_seeding_enabled(true);
+        assert!(
+            wait_until(TEST_WAIT_BOUND, || counters
+                .resume_torrent
+                .load(Ordering::SeqCst)
+                == 1)
+            .await,
+            "the resume reached the backend and is waiting there"
+        );
+
+        let engines = enginefs.engines.clone();
+        let writer = tokio::spawn(async move { drop(engines.write().await) });
+        assert!(
+            wait_until(TEST_WAIT_BOUND, || writer.is_finished()).await,
+            "a writer on the engine registry is not parked behind that call"
+        );
+
+        counters.resume_gate.notify_one();
+        assert!(
+            wait_until(TEST_WAIT_BOUND, || !counters.paused.load(Ordering::SeqCst)).await,
+            "and the resume it was waiting on still lands"
+        );
+        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
+    }
+
+    /// The same of the housekeeping sweep, which pauses an idle torrent
+    /// when seeding is off. Its await is `Session::pause`, the other half
+    /// of the same persistence flush, and this stage widened the window by
+    /// asking the backend twice more under the guard (whether the torrent
+    /// has metadata and whether it is finished).
+    #[tokio::test(start_paused = true)]
+    async fn the_idle_sweep_pauses_without_holding_the_engine_registry() {
+        let (enginefs, counters) = test_enginefs_with_file_count(1);
+        enginefs.set_seeding_enabled(false);
+        counters.hold_pause.store(true, Ordering::SeqCst);
+        assert!(
+            wait_until(TEST_WAIT_BOUND, || counters
+                .pause_torrent
+                .load(Ordering::SeqCst)
+                == 1)
+            .await,
+            "the sweep's pause reached the backend and is waiting there"
+        );
+
+        let engines = enginefs.engines.clone();
+        let writer = tokio::spawn(async move { drop(engines.write().await) });
+        assert!(
+            wait_until(TEST_WAIT_BOUND, || writer.is_finished()).await,
+            "a writer on the engine registry is not parked behind that call"
+        );
+
+        counters.pause_gate.notify_one();
+        assert!(
+            wait_until(TEST_WAIT_BOUND, || counters.paused.load(Ordering::SeqCst)).await,
+            "and the pause it was waiting on still lands"
+        );
+        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
     }
 
     // --- free-space check before pinning ---
