@@ -7,33 +7,34 @@
 //! fills* rather than being fetched and then served. A design that only cached
 //! whole responses would be no use to a demuxer.
 //!
-//! # Why this is not the piece store
+//! # One chunk store, two adapters
 //!
-//! `enginefs::piece_store` stores fixed-size chunks as files, buckets them a
-//! thousand to a directory, reclaims with `remove_file`, tells "not there"
-//! from "the disk is failing" as a typed error, counts occupancy in
-//! `st_blocks`, and lives inside the cache root so the cleaner can see it.
-//! **All of that is reused here -- as design.** None of the code is, and the
-//! reason is worth writing down rather than discovering twice:
+//! The bytes themselves are [`enginefs::chunk_store::ChunkDir`]'s -- the
+//! same store the torrent pieces are in, and none of its code is written
+//! twice. It owns the directory shape, the bucketing, the two staging
+//! spellings, the rename that makes presence mean complete, the typed read,
+//! the listings and the occupancy. What is here is the *adapter*: the key,
+//! the entity, the refusals, and the arithmetic, which for a URL response is
+//! `offset / CHUNK` where a torrent's is a file table with BEP-47 padding in
+//! it.
 //!
-//! * It is a [`librqbit::storage::TorrentStorage`] implementation. Its entry
-//!   points are `init`, `pread_exact`, `pwrite_all`, `remove_file` and
-//!   `take`, it is built from a `TorrentMetadata` by a `StorageFactory` keyed
-//!   on an info hash, and its arithmetic (`PieceLayout`) maps a *multi-file
-//!   torrent's* global byte space through a file table with BEP-47 padding in
-//!   it. A URL response is one file. Its arithmetic is `offset / CHUNK`.
-//! * **Presence there means "some of this piece is on disk"; here it has to
-//!   mean "all of it".** The piece store can afford the weaker claim because
-//!   librqbit hash-checks every piece against the swarm's own SHA-1 before it
-//!   counts as had, so a short file is caught by machinery outside the store.
-//!   A URL response has no hashes to check against. So completeness is built
-//!   rather than inherited: a chunk is buffered whole in memory, written to a
-//!   temporary name and renamed into place, and a chunk file whose length is
-//!   not the length its entity says it should be is refused at the read and
-//!   deleted, never served (see [`Cached::body`]).
-//! * It is also not wired into a session yet, for two reasons that are about
-//!   torrent have-sets. This must not wait on that, and must not be a second
-//!   `TorrentStorage`.
+//! Only two things about the store differ between the two adapters, and they
+//! are parameters of it rather than a reason for a second one:
+//!
+//! * **Staging identity.** A `/proxy` chunk is buffered whole and written
+//!   once, and two readers of one stream may fill the same chunk at the same
+//!   time, so it is staged *anonymously*
+//!   ([`enginefs::chunk_store::ChunkDir::write_whole`]) and a kill leaves
+//!   nothing resumable. librqbit writes a piece 16 KiB at a time and resumes
+//!   it, so its staged copy is addressable.
+//! * **The commit trigger.** Completeness for a URL response has to be
+//!   established internally: there is no hash to check the bytes against. So
+//!   a chunk is buffered until it is `chunk_len` bytes and that count is
+//!   passed to the store as the commit criterion, where a torrent piece
+//!   passes `None` -- librqbit never writes padding, so a piece whose tail is
+//!   padding is legally short. A chunk file whose length disagrees with its
+//!   entity is refused at the read and deleted, never served (see
+//!   [`Cached::body`]).
 //!
 //! # On disk
 //!
@@ -65,9 +66,9 @@
 //!   of the evidence, and it is the whole of what is claimed here: an origin
 //!   that serves new bytes under an old validator is being untruthful, and
 //!   nothing in this module can catch that.
-//! * `<bucket>` is `<chunk> / 1000`, for the same reason the piece store
-//!   buckets: exFAT and FAT32 scan a directory linearly, and that is exactly
-//!   where a phone's cache lives.
+//! * `<bucket>` is `<chunk> / 1000`, the chunk store's own bucketing
+//!   ([`enginefs::chunk_store::CHUNKS_PER_DIRECTORY`]): exFAT and FAT32 scan
+//!   a directory linearly, and that is exactly where a phone's cache lives.
 //!
 //! The root is `.proxy` inside the engine's `download_dir`, beside
 //! `.pieces` -- inside the cache root on purpose, so the cleaner walks,
@@ -108,14 +109,14 @@
 //!   asked for. Every whole chunk after that boundary is written as usual.
 
 use bytes::Bytes;
+use enginefs::chunk_store::ChunkDir;
 use futures_util::Stream;
 use reqwest::Method;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use url::Url;
 
@@ -137,11 +138,6 @@ pub const PROXY_CACHE_DIR: &str = ".proxy";
 /// rather than a hundred thousand.
 pub const CHUNK_BYTES: u64 = 256 * 1024;
 
-/// How many chunk files share one directory. A thousand, decimal, for the
-/// reason `piece_store::PIECES_PER_DIRECTORY` is a thousand: a filesystem
-/// that scans directory entries linearly is exactly where this cache lives.
-pub const CHUNKS_PER_DIRECTORY: u64 = 1000;
-
 /// The forwarded request headers that say *which bytes* of one answer are
 /// wanted rather than what the answer is.
 ///
@@ -152,11 +148,6 @@ pub const CHUNKS_PER_DIRECTORY: u64 = 1000;
 /// direction: the unsafe one is a header that changes the origin's answer
 /// and is not in the key.
 const RANGE_REQUEST_HEADERS: [&str; 2] = ["range", "if-range"];
-
-/// Names each written chunk's temporary file apart from every other one in
-/// the process. The process id goes with it, for a kill that leaves one
-/// behind while another process is writing the same chunk.
-static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 /// One cache, rooted where the cleaner can find it.
 pub struct ProxyCache {
@@ -352,6 +343,7 @@ impl Entry {
     /// `Range: bytes=0-`, which is the ranged path.
     pub fn look_up(&self, range: Option<&str>) -> Option<Cached> {
         let (dir, total, content_type, validator) = self.sole_entity()?;
+        let dir = ChunkDir::new(dir);
         let (first, last) = match range {
             Some(header) => crate::routes::util::parse_range(header, total)?,
             None => (0, total.checked_sub(1)?),
@@ -362,14 +354,14 @@ impl Entry {
         // The bucket directory being read from, listed once and consulted
         // for every chunk in it; the walk moves to the next listing when the
         // run of held chunks crosses into the next bucket.
-        let mut bucket: Option<(u64, HashSet<u64>)> = None;
+        let mut bucket: Option<(u64, std::collections::HashSet<u64>)> = None;
         loop {
-            let in_bucket = index / CHUNKS_PER_DIRECTORY;
+            let in_bucket = index / enginefs::chunk_store::CHUNKS_PER_DIRECTORY;
             if bucket
                 .as_ref()
                 .is_none_or(|(listed, _)| *listed != in_bucket)
             {
-                bucket = Some((in_bucket, committed_chunks(&dir, in_bucket)));
+                bucket = Some((in_bucket, dir.held_in_bucket(in_bucket)));
             }
             if !bucket
                 .as_ref()
@@ -422,7 +414,7 @@ impl Entry {
             remove_other_entities(&stale, &fresh);
         });
         Filler {
-            dir,
+            dir: ChunkDir::new(dir),
             total,
             offset: body_start,
             collecting: None,
@@ -531,48 +523,6 @@ fn remove_other_entities(key_dir: &Path, keep: &Path) {
     }
 }
 
-/// The chunks committed in bucket `bucket` of the entity at `dir`: every
-/// entry whose name is a chunk index spelled the way [`chunk_path`] spells
-/// one, and that is a file. One `read_dir`, which is what makes the lookup a
-/// listing per thousand chunks rather than a stat per chunk.
-///
-/// The name is matched by re-spelling, not by parsing alone: `007` and `+7`
-/// parse as 7 but no chunk was ever written under either, and a name that
-/// parses to an index outside this bucket was not put here by a fill. A
-/// temporary carries a `.` and parses as nothing, which is how a chunk still
-/// being written stays invisible to a read.
-fn committed_chunks(dir: &Path, bucket: u64) -> HashSet<u64> {
-    let mut present = HashSet::new();
-    let Ok(entries) = std::fs::read_dir(dir.join(bucket.to_string())) else {
-        return present;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(index) = name
-            .to_str()
-            .and_then(|name| name.parse::<u64>().ok())
-            .filter(|index| index.to_string().as_str() == name)
-        else {
-            continue;
-        };
-        if index / CHUNKS_PER_DIRECTORY != bucket {
-            continue;
-        }
-        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
-            continue;
-        }
-        present.insert(index);
-    }
-    present
-}
-
-/// `<entity dir>/<bucket>/<chunk>`.
-fn chunk_path(dir: &Path, index: u64) -> PathBuf {
-    let mut path = dir.join((index / CHUNKS_PER_DIRECTORY).to_string());
-    path.push(index.to_string());
-    path
-}
-
 /// How long chunk `index` of a `total`-byte entity is: a whole chunk, or
 /// whatever is left at the end of the entity.
 fn chunk_len(index: u64, total: u64) -> u64 {
@@ -582,7 +532,7 @@ fn chunk_len(index: u64, total: u64) -> u64 {
 
 /// What one entity holds for one request's range.
 pub struct Cached {
-    dir: PathBuf,
+    dir: ChunkDir,
     /// The entity's length, which is what a `Content-Range` has to state.
     pub total: u64,
     /// What the origin labelled the entity, empty when it said nothing.
@@ -651,7 +601,7 @@ impl Cached {
                 let index = offset / CHUNK_BYTES;
                 let start = index * CHUNK_BYTES;
                 let want = chunk_len(index, total);
-                let path = chunk_path(&dir, index);
+                let path = dir.chunk_path(index);
                 let bytes = match tokio::fs::read(&path).await {
                     Ok(bytes) if bytes.len() as u64 == want => bytes,
                     Ok(_) => {
@@ -684,7 +634,7 @@ impl Cached {
 /// vanishes mid-chunk leaves *nothing* on disk to be mistaken for a complete
 /// chunk later, and the reactor never blocks on the write.
 pub struct Filler {
-    dir: PathBuf,
+    dir: ChunkDir,
     total: u64,
     /// Absolute offset of the next byte to arrive.
     offset: u64,
@@ -705,7 +655,7 @@ impl Filler {
                 // A chunk already on disk is not written again: the fill is
                 // only ever asked for what the lookup did not hold, but a
                 // second reader of the same stream can overlap it.
-                if chunk_path(&self.dir, index).is_file() {
+                if self.dir.has_chunk(index) {
                     self.offset += take as u64;
                     bytes = &bytes[take..];
                     continue;
@@ -727,7 +677,7 @@ impl Filler {
                     let chunk = std::mem::take(&mut self.buffer);
                     self.collecting = None;
                     let dir = self.dir.clone();
-                    tokio::task::spawn_blocking(move || write_chunk(&dir, index, &chunk));
+                    tokio::task::spawn_blocking(move || write_chunk(&dir, index, &chunk, want));
                 }
             }
             // Bytes before the first chunk boundary of a body belong to a
@@ -739,31 +689,19 @@ impl Filler {
     }
 }
 
-/// Write one complete chunk: temporary name, then rename. Nothing fails
-/// loudly -- a cache that cannot write is a slower stream and never a broken
-/// one.
-fn write_chunk(dir: &Path, index: u64, chunk: &[u8]) {
-    let path = chunk_path(dir, index);
-    let Some(bucket) = path.parent() else {
-        return;
-    };
-    if let Err(error) = std::fs::create_dir_all(bucket) {
-        tracing::debug!(path = %bucket.display(), %error, "could not create a proxy cache bucket");
-        return;
-    }
-    let temp = bucket.join(format!(
-        "{index}.{}-{}.part",
-        std::process::id(),
-        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
-    ));
-    if let Err(error) = std::fs::write(&temp, chunk) {
-        tracing::debug!(path = %temp.display(), %error, "could not write a proxy cache chunk");
-        let _ = std::fs::remove_file(&temp);
-        return;
-    }
-    if let Err(error) = std::fs::rename(&temp, &path) {
-        tracing::debug!(path = %path.display(), %error, "could not commit a proxy cache chunk");
-        let _ = std::fs::remove_file(&temp);
+/// Write one complete chunk through the store's anonymous staging: a
+/// temporary no other filler can be using, then the rename into place.
+///
+/// `want` is the commit criterion -- what this entity says the chunk's length
+/// is. There is no hash to check a URL's bytes against, so this count is the
+/// whole of what establishes completeness, and it is checked by the store
+/// before anything is renamed.
+///
+/// Nothing fails loudly -- a cache that cannot write is a slower stream and
+/// never a broken one.
+fn write_chunk(dir: &ChunkDir, index: u64, chunk: &[u8], want: u64) {
+    if let Err(error) = dir.write_whole(index, chunk, Some(want)) {
+        tracing::debug!(path = %dir.chunk_path(index).display(), %error, "could not write a proxy cache chunk");
     }
 }
 
@@ -819,16 +757,22 @@ pub struct SweepReport {
     pub errors: usize,
 }
 
-/// Delete the temporary files a kill left behind, at launch.
+/// Delete the staged files a kill left behind, at launch.
 ///
 /// **This is not the piece store's sweep, and the difference is the claim
-/// set.** A torrent's pieces are claimed by the session, so anything
-/// unclaimed there is data nothing will ever reclaim. Nothing claims a
+/// set and the staging identity.** A torrent's pieces are claimed by the
+/// session, so anything unclaimed there is data nothing will ever reclaim,
+/// and its staged copy is addressable and resumable -- so its sweep discards
+/// a staged copy only when it *shadows* a complete one. Nothing claims a
 /// cached URL: every chunk here is cache, the cleaner counts and evicts all
-/// of it, and surviving a restart is the whole point. So the only thing a
-/// kill can leave that is not cache is a chunk that was being written when
-/// the process died -- a `.part` file, which no read will ever look at and
-/// no fill will ever finish.
+/// of it, and surviving a restart is the whole point. And a staged chunk
+/// here is anonymous: nothing can address it, so nothing can resume it. So
+/// the only thing a kill can leave that is not cache is a chunk that was
+/// being written when the process died, and all of those go.
+///
+/// What a staged file is *called* is asked of the store
+/// ([`enginefs::chunk_store::is_staged_name`]) rather than spelled a second
+/// time here.
 pub fn sweep(root: &Path) -> SweepReport {
     let mut report = SweepReport::default();
     for entry in walkdir::WalkDir::new(root) {
@@ -844,10 +788,15 @@ pub fn sweep(root: &Path) -> SweepReport {
                 continue;
             }
         };
-        if !entry.file_type().is_file() || !entry.file_name().to_string_lossy().ends_with(".part") {
+        if !entry.file_type().is_file()
+            || !enginefs::chunk_store::is_staged_name(&entry.file_name().to_string_lossy())
+        {
             continue;
         }
-        let freed = entry.metadata().map(|m| occupied_bytes(&m)).unwrap_or(0);
+        let freed = entry
+            .metadata()
+            .map(|m| enginefs::chunk_store::occupied_bytes(&m))
+            .unwrap_or(0);
         match std::fs::remove_file(entry.path()) {
             Ok(()) => {
                 report.removed += 1;
@@ -869,24 +818,31 @@ pub fn sweep(root: &Path) -> SweepReport {
     report
 }
 
-/// Occupancy, never apparent length -- the same rule as
-/// `cache_cleaner::occupied_bytes` and the piece sweep's, so a partly
-/// written temporary is reported at what deleting it actually frees.
-#[cfg(unix)]
-fn occupied_bytes(metadata: &std::fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    metadata.blocks() * 512
-}
-
-#[cfg(not(unix))]
-fn occupied_bytes(metadata: &std::fs::Metadata) -> u64 {
-    metadata.len()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::HeaderMap;
+    use enginefs::chunk_store::CHUNKS_PER_DIRECTORY;
+    use std::collections::HashSet;
+
+    /// The entity directory as the store sees it.
+    fn chunks(dir: &Path) -> ChunkDir {
+        ChunkDir::new(dir.to_path_buf())
+    }
+
+    /// Put a file at a chunk's committed name, whatever its length -- a test
+    /// standing in for a fill, and for the accidents a fill cannot produce.
+    fn write_chunk(dir: &Path, index: u64, bytes: &[u8]) {
+        chunks(dir).write_whole(index, bytes, None).expect("write");
+    }
+
+    fn chunk_path(dir: &Path, index: u64) -> PathBuf {
+        chunks(dir).chunk_path(index)
+    }
+
+    fn committed_chunks(dir: &Path, bucket: u64) -> HashSet<u64> {
+        chunks(dir).held_in_bucket(bucket)
+    }
 
     fn cache() -> (tempfile::TempDir, ProxyCache) {
         let dir = tempfile::tempdir().expect("a scratch root");
@@ -1310,7 +1266,7 @@ mod tests {
             !old.exists(),
             "the old entity is not this resource any more"
         );
-        assert!(filler.dir.is_dir());
+        assert!(filler.dir.path().is_dir());
     }
 
     /// Only whole chunks are written, and a body that stops mid-chunk leaves
