@@ -404,14 +404,14 @@ pub trait TorrentHandle: Send + Sync + Clone {
     /// cannot restart one, so a caller never mistakes silence for recovery.
     /// Also what puts a torrent stopped by [`Self::stop_for_space`] back to
     /// work.
-    async fn restart_after_error(&self) -> Result<()> {
+    async fn restart_from_error(&self) -> Result<()> {
         anyhow::bail!("this backend cannot restart a stopped torrent")
     }
     /// Stop the torrent -- no more reads from peers, no more writes to disk
     /// -- because the volume it writes to is about to run out. Distinct from
     /// the idle pause ([`Self::pause_torrent`]) not in what it does to the
     /// torrent (for librqbit both are `Session::pause`) but in who owns it:
-    /// this stop is lifted by [`Self::restart_after_error`] when the space
+    /// this stop is lifted by [`Self::restart_from_error`] when the space
     /// comes back, never by [`Self::resume_torrent`] on a starting stream.
     /// It must actually stop the writes, since the alternative is the
     /// filesystem stopping them with ENOSPC and the backend declaring the

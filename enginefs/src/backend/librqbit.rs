@@ -2718,14 +2718,14 @@ impl TorrentHandle for LibrqbitHandle {
     /// this safe after an eviction took files out from under the torrent: it
     /// discovers what is actually there rather than trusting the piece map it
     /// died with.
-    async fn restart_after_error(&self) -> Result<()> {
+    async fn restart_from_error(&self) -> Result<()> {
         self.session.unpause(&self.handle).await
     }
 
     /// `Session::pause` -> `ManagedTorrent::pause`: a live torrent's state
     /// becomes `Paused`, which drops its peers and its pending writes and
     /// keeps its files and piece map -- and which `Session::unpause` (our
-    /// `restart_after_error`) takes straight back to live, no re-check, so
+    /// `restart_from_error`) takes straight back to live, no re-check, so
     /// nothing may touch those files while it is paused. A torrent still
     /// in its initial check is asked to pause once the check ends. Errs on
     /// a torrent already paused or in the error state, in librqbit's words.
@@ -4219,7 +4219,7 @@ mod tests {
     /// Against the shipped librqbit: `stop_for_space` is `Session::pause`,
     /// which takes a live torrent to `Paused` (no peers, no writes, files and
     /// piece map kept) and refuses a torrent already paused, and
-    /// `restart_after_error` is `Session::unpause`, which takes it straight
+    /// `restart_from_error` is `Session::unpause`, which takes it straight
     /// back to live.
     #[tokio::test]
     async fn stop_for_space_pauses_a_live_torrent_and_restart_takes_it_back() {
@@ -4251,7 +4251,7 @@ mod tests {
         );
 
         handle
-            .restart_after_error()
+            .restart_from_error()
             .await
             .expect("unpause takes it back to live");
         assert!(!handle.handle.is_paused());
@@ -4301,7 +4301,7 @@ mod tests {
             "a stream starting must not unpause a torrent stopped for want of disk"
         );
         handle
-            .restart_after_error()
+            .restart_from_error()
             .await
             .expect("the watch lifts its own stop");
         assert!(!handle.handle.is_paused());

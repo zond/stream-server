@@ -270,7 +270,7 @@ pub struct Engine<H: TorrentHandle> {
     /// The free-space watch stopped this torrent because the volume it
     /// writes to fell under the floor (`BackendEngineFS::free_space_watch_tick`).
     /// Cleared by whatever puts it back to work -- the watch when space
-    /// recovers, or the cache cleaner's `restart_after_error` once it has
+    /// recovers, or the cache cleaner's `restart_from_error` once it has
     /// made room. Read on the stream route, which answers `507` for it.
     stopped_for_space: AtomicBool,
     /// `Clock::now_secs()` of the stop, for the stall bound on its readers.

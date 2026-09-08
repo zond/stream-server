@@ -449,7 +449,7 @@ async fn recover_out_of_space_torrents(state: &AppState, recovery: &mut DiskFull
     recovery.room_was_made();
 
     for (engine, info_hash) in stopped {
-        match engine.restart_after_error(&info_hash).await {
+        match engine.restart_from_error(&info_hash).await {
             Ok(true) => info!(
                 info_hash = %info_hash,
                 freed = report.freed,

@@ -1363,7 +1363,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
 
             if let Some(stopped_for) = engine.stopped_for_space_for(now) {
                 if available >= CACHE_FREE_SPACE_FLOOR.saturating_add(FREE_SPACE_RESUME_MARGIN) {
-                    match engine.handle.restart_after_error().await {
+                    match engine.handle.restart_from_error().await {
                         Ok(()) => {
                             engine.clear_space_stop();
                             tracing::info!(
@@ -2232,7 +2232,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// reporting: the swarm is fine, the torrent is fine, the device is out
     /// of room. The caller that can do something about it is the server's
     /// cache cleaner, which evicts and then calls
-    /// [`Self::restart_after_error`] -- this is how it finds out there is
+    /// [`Self::restart_from_error`] -- this is how it finds out there is
     /// anything to evict *for*. Cheap on purpose (one lock read per engine,
     /// no I/O), because it is asked on a timer.
     pub async fn out_of_space_torrents(&self) -> Vec<String> {
@@ -2250,12 +2250,12 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// with an error, or after the free-space watch stopped it. `false` when
     /// no engine holds that hash any more (it was swept while space was
     /// being reclaimed), which is not a failure.
-    pub async fn restart_after_error(&self, info_hash: &str) -> Result<bool> {
+    pub async fn restart_from_error(&self, info_hash: &str) -> Result<bool> {
         let engine = self.engines.read().await.get(info_hash).cloned();
         let Some(engine) = engine else {
             return Ok(false);
         };
-        engine.handle.restart_after_error().await?;
+        engine.handle.restart_from_error().await?;
         engine.clear_space_stop();
         Ok(true)
     }
@@ -4714,7 +4714,7 @@ mod tests {
         fetched: AtomicU64,
         uploaded: AtomicU64,
         /// How many times the torrent was put back to work after that.
-        restart_after_error: AtomicUsize,
+        restart_from_error: AtomicUsize,
         /// How many times the free-space watch stopped the torrent.
         stop_for_space: AtomicUsize,
         /// Whether the fake torrent is stopped, set by the calls that stop
@@ -5182,9 +5182,9 @@ mod tests {
                 || self.counters.out_of_space.load(Ordering::SeqCst)
         }
 
-        async fn restart_after_error(&self) -> Result<()> {
+        async fn restart_from_error(&self) -> Result<()> {
             self.counters
-                .restart_after_error
+                .restart_from_error
                 .fetch_add(1, Ordering::SeqCst);
             self.counters.out_of_space.store(false, Ordering::SeqCst);
             self.counters.paused.store(false, Ordering::SeqCst);
@@ -7135,7 +7135,7 @@ mod tests {
 
         // A healthy torrent is nobody's business.
         assert!(enginefs.out_of_space_torrents().await.is_empty());
-        assert_eq!(counters.restart_after_error.load(Ordering::SeqCst), 0);
+        assert_eq!(counters.restart_from_error.load(Ordering::SeqCst), 0);
 
         counters.out_of_space.store(true, Ordering::SeqCst);
         assert_eq!(
@@ -7143,8 +7143,8 @@ mod tests {
             vec![TEST_HASH.to_string()]
         );
 
-        assert!(enginefs.restart_after_error(TEST_HASH).await.unwrap());
-        assert_eq!(counters.restart_after_error.load(Ordering::SeqCst), 1);
+        assert!(enginefs.restart_from_error(TEST_HASH).await.unwrap());
+        assert_eq!(counters.restart_from_error.load(Ordering::SeqCst), 1);
         assert!(
             enginefs.out_of_space_torrents().await.is_empty(),
             "a restarted torrent is no longer stopped"
@@ -7154,11 +7154,11 @@ mod tests {
         // reclaimed -- is not an error, and restarts nothing.
         assert!(
             !enginefs
-                .restart_after_error("ffffffffffffffffffffffffffffffffffffffff")
+                .restart_from_error("ffffffffffffffffffffffffffffffffffffffff")
                 .await
                 .unwrap()
         );
-        assert_eq!(counters.restart_after_error.load(Ordering::SeqCst), 1);
+        assert_eq!(counters.restart_from_error.load(Ordering::SeqCst), 1);
     }
 
     /// A torrent the backend stopped with an error nothing will retry is
@@ -7355,7 +7355,7 @@ mod tests {
         assert_eq!(counters.pause_torrent.load(Ordering::SeqCst), 0);
         assert_eq!(counters.resume_torrent.load(Ordering::SeqCst), 0);
         assert_eq!(counters.stop_for_space.load(Ordering::SeqCst), 0);
-        assert_eq!(counters.restart_after_error.load(Ordering::SeqCst), 0);
+        assert_eq!(counters.restart_from_error.load(Ordering::SeqCst), 0);
     }
 
     /// Stage one: the reconciler decides and it logs, and that is all it
@@ -7517,7 +7517,7 @@ mod tests {
             vec![(TEST_HASH.to_string(), Decision::Run)]
         );
         assert_eq!(
-            counters.restart_after_error.load(Ordering::SeqCst),
+            counters.restart_from_error.load(Ordering::SeqCst),
             0,
             "deciding Run is not doing it"
         );
@@ -7682,7 +7682,7 @@ mod tests {
         );
         enginefs.free_space_watch_tick().await;
         assert!(engine.is_stopped_for_space());
-        assert_eq!(counters.restart_after_error.load(Ordering::SeqCst), 0);
+        assert_eq!(counters.restart_from_error.load(Ordering::SeqCst), 0);
 
         // The margin over: started again, and off the cleaner's list.
         available.store(
@@ -7690,7 +7690,7 @@ mod tests {
             Ordering::SeqCst,
         );
         enginefs.free_space_watch_tick().await;
-        assert_eq!(counters.restart_after_error.load(Ordering::SeqCst), 1);
+        assert_eq!(counters.restart_from_error.load(Ordering::SeqCst), 1);
         assert!(!engine.is_stopped_for_space());
         assert!(enginefs.out_of_space_torrents().await.is_empty());
     }
@@ -7737,7 +7737,7 @@ mod tests {
     }
 
     /// A stop rings the cleaner, and the cleaner's own restart is the other
-    /// way a stopped torrent comes back: `restart_after_error` clears the
+    /// way a stopped torrent comes back: `restart_from_error` clears the
     /// stop whatever the volume reads, since the cleaner has just made the
     /// room it is restarting into.
     #[tokio::test]
@@ -7755,8 +7755,8 @@ mod tests {
             .expect("the stop rang the cleaner");
         assert!(engine.is_stopped_for_space());
 
-        assert!(enginefs.restart_after_error(TEST_HASH).await.unwrap());
-        assert_eq!(counters.restart_after_error.load(Ordering::SeqCst), 1);
+        assert!(enginefs.restart_from_error(TEST_HASH).await.unwrap());
+        assert_eq!(counters.restart_from_error.load(Ordering::SeqCst), 1);
         assert!(!engine.is_stopped_for_space());
         assert!(enginefs.out_of_space_torrents().await.is_empty());
     }
@@ -7780,7 +7780,7 @@ mod tests {
             Some(crate::engine::STOPPED_FOR_SPACE_MESSAGE)
         );
 
-        enginefs.restart_after_error(TEST_HASH).await.unwrap();
+        enginefs.restart_from_error(TEST_HASH).await.unwrap();
         let stats = engine.get_statistics().await;
         assert_ne!(stats.phase, StartupPhase::Error);
         assert_eq!(stats.error, None);
@@ -7874,7 +7874,7 @@ mod tests {
         assert!(engine.reads_refused(), "its readers are failed");
         assert!(enginefs.out_of_space_torrents().await.is_empty());
         assert!(
-            !enginefs.restart_after_error(TEST_HASH).await.unwrap(),
+            !enginefs.restart_from_error(TEST_HASH).await.unwrap(),
             "and there is nothing left to restart"
         );
         assert!(
