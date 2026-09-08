@@ -1293,6 +1293,199 @@ pub struct TestSessionOptions {
     pub listen_loopback: bool,
 }
 
+/// A gate a test closes to hold librqbit's initial check exactly where it
+/// is, and opens to let it run on.
+///
+/// Every check -- the fastresume sample and the full hash walk alike --
+/// reads its pieces through the storage, so a storage that blocks in
+/// `pread_exact` blocks the check. That is the only way to be *inside* the
+/// window this file's pause/unpause questions are about: the divergences
+/// between librqbit's `paused` flag and its state machine all open and close
+/// during a check, and a test that waits the check out cannot see one at
+/// all.
+///
+/// A `std` mutex and condvar, not tokio's: what waits on it is librqbit's
+/// blocking check thread, not a task.
+#[cfg(test)]
+#[derive(Default)]
+struct InitCheckGateState {
+    open: bool,
+    /// How many reads have reached the gate. A check is held at its *first*
+    /// read and makes no further call while it is there, so before the gate
+    /// is opened this counts the checks waiting in it; afterwards it counts
+    /// pieces read, which is how a test tells a check that bailed from one
+    /// that ran on.
+    reads: usize,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct InitCheckGate {
+    state: std::sync::Mutex<InitCheckGateState>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl InitCheckGate {
+    /// Called from the storage, on the check's own thread: record that the
+    /// check got here, and hold it until the test lets go.
+    fn hold(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.reads += 1;
+        self.changed.notify_all();
+        while !state.open {
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+
+    fn open(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.open = true;
+        self.changed.notify_all();
+    }
+
+    fn reads(&self) -> usize {
+        self.state.lock().unwrap().reads
+    }
+}
+
+/// librqbit's filesystem storage with every read held at an
+/// [`InitCheckGate`].
+///
+/// Deliberately *not* reclaim-capable -- it forwards `ensure_persistable`,
+/// so a persistent session accepts it, and leaves `ensure_can_release_pieces`
+/// at the trait's refusal -- because that is the shipped shape: with reclaim
+/// on, librqbit forces every restored torrent paused, and the restored-and-
+/// unpaused sequence these tests are about would never arise.
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct GatedFilesystemFactory {
+    inner: librqbit::storage::filesystem::FilesystemStorageFactory,
+    gate: Arc<InitCheckGate>,
+}
+
+#[cfg(test)]
+impl librqbit::storage::StorageFactory for GatedFilesystemFactory {
+    type Storage = GatedFilesystemStorage;
+
+    fn create(
+        &self,
+        shared: &librqbit::ManagedTorrentShared,
+        metadata: &librqbit::TorrentMetadata,
+    ) -> anyhow::Result<Self::Storage> {
+        Ok(GatedFilesystemStorage {
+            inner: self.inner.create(shared, metadata)?,
+            gate: self.gate.clone(),
+        })
+    }
+
+    fn ensure_persistable(&self) -> anyhow::Result<()> {
+        self.inner.ensure_persistable()
+    }
+
+    fn clone_box(&self) -> librqbit::storage::BoxStorageFactory {
+        use librqbit::storage::StorageFactoryExt;
+        self.clone().boxed()
+    }
+}
+
+#[cfg(test)]
+struct GatedFilesystemStorage {
+    inner: librqbit::storage::filesystem::FilesystemStorage,
+    gate: Arc<InitCheckGate>,
+}
+
+#[cfg(test)]
+impl librqbit::storage::TorrentStorage for GatedFilesystemStorage {
+    fn init(
+        &mut self,
+        shared: &librqbit::ManagedTorrentShared,
+        metadata: &librqbit::TorrentMetadata,
+    ) -> anyhow::Result<()> {
+        self.inner.init(shared, metadata)
+    }
+
+    fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+        self.gate.hold();
+        self.inner.pread_exact(file_id, offset, buf)
+    }
+
+    fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
+        self.inner.pwrite_all(file_id, offset, buf)
+    }
+
+    fn remove_file(&self, file_id: usize, filename: &std::path::Path) -> anyhow::Result<()> {
+        self.inner.remove_file(file_id, filename)
+    }
+
+    fn remove_directory_if_empty(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        self.inner.remove_directory_if_empty(path)
+    }
+
+    fn ensure_file_length(&self, file_id: usize, length: u64) -> anyhow::Result<()> {
+        self.inner.ensure_file_length(file_id, length)
+    }
+
+    fn take(&self) -> anyhow::Result<Box<dyn librqbit::storage::TorrentStorage>> {
+        self.inner.take()
+    }
+}
+
+/// A test's end of an [`InitCheckGate`]: it opens the gate however the test
+/// ends, its own panics included.
+///
+/// Not tidiness. A check blocked in `pread_exact` is blocked on a runtime
+/// worker, and dropping the runtime waits for it, so an assertion that fires
+/// while the gate is shut would hang the test binary instead of failing it
+/// -- and every assertion here is *about* what is true inside that window.
+#[cfg(test)]
+struct HeldInitCheck(Arc<InitCheckGate>);
+
+#[cfg(test)]
+impl HeldInitCheck {
+    /// Let the check run to its end. Idempotent, so a test says it where it
+    /// means it and the drop is only a backstop.
+    fn open(&self) {
+        self.0.open();
+    }
+
+    /// Block until `checks` initial checks are actually inside the gate, so
+    /// whatever follows is known to happen in the window and not before it.
+    async fn wait_until_held(&self, checks: usize) {
+        // Generous on purpose: the bound is here so a regression fails
+        // instead of hanging, not as a timing assertion.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if self.0.reads() >= checks {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "only {} of {checks} initial checks reached the storage",
+                self.0.reads()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for HeldInitCheck {
+    fn drop(&mut self) {
+        self.0.open();
+    }
+}
+
+/// A storage whose reads are held at the returned gate, and the test's end
+/// of that gate.
+#[cfg(test)]
+fn gated_storage() -> (librqbit::storage::BoxStorageFactory, HeldInitCheck) {
+    use librqbit::storage::StorageFactoryExt;
+    let factory = GatedFilesystemFactory::default();
+    let gate = HeldInitCheck(factory.gate.clone());
+    (factory.boxed(), gate)
+}
+
 /// A filesystem storage that also *claims* it can release a single piece, so
 /// a hermetic test can seed a torrent from real files on disk (which the
 /// piece store cannot do without a download) *and* have the session set
@@ -4119,6 +4312,357 @@ mod tests {
             .await
             .expect("a second resume is a no-op again");
         assert!(!handle.handle.is_paused());
+    }
+
+    /// How far a torrent's initial check has got, or `None` once it is past
+    /// initializing. `get_checked_bytes` is incremented by a whole piece as
+    /// each one is taken up, before it is read
+    /// (`crates/librqbit/src/file_ops.rs:120`), so over the whole-piece
+    /// fixtures here it counts pieces exactly -- which is how these tests
+    /// tell a check that stopped from one that ran on, with no sleeping.
+    #[cfg(test)]
+    fn checked_pieces(handle: &LibrqbitHandle) -> Option<u64> {
+        handle.handle.with_state(|state| match state {
+            ManagedTorrentState::Initializing(init) => Some(init.get_checked_bytes() / (16 * 1024)),
+            _ => None,
+        })
+    }
+
+    /// Poll `run_state` until it reports something settled, i.e. not
+    /// `Initializing`. The bound is only there so a regression fails instead
+    /// of hanging.
+    #[cfg(test)]
+    async fn wait_until_settled(handle: &LibrqbitHandle) -> RunState {
+        let deadline = Instant::now() + TEST_WAIT_BOUND;
+        loop {
+            let state = handle.run_state();
+            if !matches!(state, RunState::Initializing { .. }) {
+                return state;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the initial check never finished: {state:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The swallowed unpause, against the shipped librqbit: after it, the
+    /// `paused` flag says the torrent is running and the torrent is stopped.
+    ///
+    /// `Session::unpause` writes `g.paused = false` before `_start` has
+    /// looked at anything (`torrent_state/mod.rs:649`), then finds the
+    /// initial check already running and returns success having started
+    /// nothing (`:548-551`). The check that *is* running was spawned by the
+    /// add, with `start_paused = true` captured, so when it finishes its own
+    /// continuation parks the torrent in `Paused` (`:587`, returning at
+    /// `:607`).
+    ///
+    /// The last assertion is librqbit's own opinion rather than either of
+    /// the two readings: it refuses to pause a torrent it considers paused,
+    /// so a pause that errs is the state machine agreeing with `run_state`
+    /// and contradicting the flag.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_state_sees_the_pause_a_swallowed_unpause_left_behind() {
+        use crate::backend::TorrentHandle;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("dl");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let payload = dir.join("payload.bin");
+        write_payload(&payload, 4 * 16 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+
+        let (storage, gate) = gated_storage();
+        let (backend, _restored) = LibrqbitBackend::new_for_tests_with(
+            dir.clone(),
+            TestSessionOptions {
+                default_storage: Some(storage),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("open the session");
+
+        // Added paused, because that is what decides the outcome: the check
+        // the add spawns captures `start_paused = true`, and it is that
+        // capture -- not anything the unpause does -- that the continuation
+        // acts on.
+        let response = backend
+            .session
+            .add_torrent(
+                librqbit::AddTorrent::from_bytes(bytes::Bytes::from(torrent_bytes)),
+                Some(librqbit::AddTorrentOptions {
+                    overwrite: true,
+                    paused: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("add the torrent paused");
+        let handle = match response {
+            librqbit::AddTorrentResponse::Added(_, handle) => backend.wrap(handle),
+            _ => panic!("the torrent was not added"),
+        };
+        gate.wait_until_held(1).await;
+
+        // Inside the window: the check is running, so the unpause below has
+        // something to be swallowed by.
+        assert_eq!(
+            handle.run_state(),
+            RunState::Initializing {
+                pause_requested: true
+            },
+            "the check is running and a pause is pending on it"
+        );
+
+        backend
+            .session
+            .unpause(&handle.handle)
+            .await
+            .expect("librqbit reports the unpause a success");
+        assert!(
+            !handle.handle.is_paused(),
+            "the flag was cleared before _start looked at the state"
+        );
+
+        gate.open();
+        let settled = wait_until_settled(&handle).await;
+
+        assert_eq!(
+            settled,
+            RunState::Paused,
+            "the unpause started nothing; the in-flight check parked the torrent"
+        );
+        assert!(
+            !handle.handle.is_paused(),
+            "...while the flag it cleared still says the torrent is running"
+        );
+        assert!(
+            backend.session.pause(&handle.handle).await.is_err(),
+            "librqbit refuses to pause it again, which is it agreeing with run_state"
+        );
+    }
+
+    /// The other direction: a pause landing during a *fastresume* check is
+    /// dropped on the floor, and the torrent goes live with the flag set.
+    ///
+    /// `TorrentStateInitializing::check` hands `pause_requested` to
+    /// `FileOps::initial_check` and to nothing else
+    /// (`torrent_state/initializing.rs:279`); `validate_fastresume` never
+    /// reads it. So the check returns `Ok`, its continuation applies the
+    /// add-time `start_paused` -- `false`, this torrent having been restored
+    /// unpaused -- and takes it `Live` (`torrent_state/mod.rs:606-620`).
+    ///
+    /// This is the shape behind the measured 3 MiB -> 12 MiB overshoot: the
+    /// free-space watch stopped the torrent, was told it was paused, and the
+    /// torrent went on writing to the full volume.
+    ///
+    /// A restart is not decoration here. Fastresume needs a have-bitfield
+    /// from a previous run, so the first session is what makes the second
+    /// one take the fastresume path at all -- and a restart is exactly when
+    /// this happens in the field.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_state_sees_the_torrent_a_swallowed_pause_took_live() {
+        use crate::backend::TorrentHandle;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("dl");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let payload = dir.join("payload.bin");
+        write_payload(&payload, 4 * 16 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+
+        // First run: a persistent session over data that is already on disk,
+        // so its check finds every piece and stores the bitfield the second
+        // run will resume from.
+        {
+            let (backend, restored) = LibrqbitBackend::new_for_tests_with(
+                dir.clone(),
+                TestSessionOptions {
+                    persist: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("open the first session");
+            assert!(restored.is_empty(), "nothing to restore yet");
+            let handle = backend
+                .add_torrent(TorrentSource::Bytes(torrent_bytes.clone()), vec![])
+                .await
+                .expect("add the torrent");
+            handle
+                .handle
+                .wait_until_initialized()
+                .await
+                .expect("the first check ends");
+            assert!(
+                handle.handle.stats().finished,
+                "the payload was already on disk, so the check has every piece"
+            );
+            let deadline = Instant::now() + TEST_WAIT_BOUND;
+            while !bitfield_written(&dir) && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                bitfield_written(&dir),
+                "the have-bitfield was persisted; without it the restart does a full check"
+            );
+        }
+
+        // The restart, over a storage that holds every read.
+        let (storage, gate) = gated_storage();
+        let (backend, restored) = LibrqbitBackend::new_for_tests_with(
+            dir.clone(),
+            TestSessionOptions {
+                default_storage: Some(storage),
+                persist: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("open the second session");
+        assert_eq!(restored.len(), 1, "the torrent came back");
+        let handle = restored
+            .values()
+            .next()
+            .expect("the restored handle")
+            .clone();
+        gate.wait_until_held(1).await;
+        assert_eq!(
+            handle.run_state(),
+            RunState::Initializing {
+                pause_requested: false
+            },
+            "restored unpaused, and its fastresume check is inside the storage"
+        );
+
+        // The free-space watch's stop, landing in that window.
+        handle
+            .stop_for_space()
+            .await
+            .expect("librqbit accepts a pause on an initializing torrent");
+        assert!(handle.handle.is_paused(), "the flag says paused");
+
+        gate.open();
+        let settled = wait_until_settled(&handle).await;
+
+        assert_eq!(
+            settled,
+            RunState::Live,
+            "the fastresume check never read the pause request, so the torrent went live"
+        );
+        assert!(
+            handle.handle.is_paused(),
+            "...while the flag still says it is paused"
+        );
+        backend
+            .session
+            .pause(&handle.handle)
+            .await
+            .expect("librqbit pauses it, which it would refuse for a paused torrent");
+    }
+
+    /// Whether the session has written a have-bitfield yet
+    /// (`<info hash>.bitv` beside `session.json`, see
+    /// `crates/librqbit/src/session_persistence/json.rs:121`). Matched by
+    /// extension rather than by name so nothing here depends on how librqbit
+    /// formats an info hash.
+    #[cfg(test)]
+    fn bitfield_written(folder: &std::path::Path) -> bool {
+        std::fs::read_dir(folder)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .any(|e| e.path().extension().and_then(|x| x.to_str()) == Some("bitv"))
+            })
+            .unwrap_or(false)
+    }
+
+    /// The third shape: a pause during a *full* check does stop it, and the
+    /// torrent is left `Initializing` rather than `Paused` -- a state
+    /// `wait_until_initialized` (`torrent_state/mod.rs:759`) polls forever.
+    /// `is_paused()` says "paused" for it, which is the one word that
+    /// suggests the very thing it is not: something a caller can start again
+    /// in one transition.
+    ///
+    /// `FileOps::initial_check` bails on the request (`file_ops.rs:113`) and
+    /// the `Err` arm returns `Ok` without touching the state
+    /// (`torrent_state/mod.rs:590-593`).
+    ///
+    /// A second torrent shares the gate and is *not* paused. It is the
+    /// clock: nothing here waits on a duration, and "the paused torrent
+    /// never moved" would otherwise be a claim about a machine that had not
+    /// got round to it yet. The control's check runs the whole way through
+    /// the same storage after the same `open()`; when it is live, the paused
+    /// torrent has had every chance, and its checked-piece count says
+    /// exactly where it stopped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_state_keeps_a_wedged_initial_check_apart_from_a_pause() {
+        use crate::backend::TorrentHandle;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("dl");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let paused_payload = dir.join("paused.bin");
+        let control_payload = dir.join("control.bin");
+        write_payload(&paused_payload, 4 * 16 * 1024).await;
+        write_payload(&control_payload, 4 * 16 * 1024).await;
+        let (paused_bytes, _) = make_torrent(&paused_payload).await;
+        let (control_bytes, _) = make_torrent(&control_payload).await;
+
+        let (storage, gate) = gated_storage();
+        let (backend, _restored) = LibrqbitBackend::new_for_tests_with(
+            dir.clone(),
+            TestSessionOptions {
+                default_storage: Some(storage),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("open the session");
+
+        let wedged = backend
+            .add_torrent(TorrentSource::Bytes(paused_bytes), vec![])
+            .await
+            .expect("add the torrent to be paused");
+        let control = backend
+            .add_torrent(TorrentSource::Bytes(control_bytes), vec![])
+            .await
+            .expect("add the control torrent");
+        // Both checks are inside the gate, each held at its first read.
+        gate.wait_until_held(2).await;
+
+        wedged
+            .stop_for_space()
+            .await
+            .expect("librqbit accepts a pause on an initializing torrent");
+        assert!(wedged.handle.is_paused(), "the flag says paused");
+        assert_eq!(
+            wedged.run_state(),
+            RunState::Initializing {
+                pause_requested: true
+            },
+            "run_state says what the flag cannot: this is a check, not a pause"
+        );
+
+        gate.open();
+        assert_eq!(
+            wait_until_settled(&control).await,
+            RunState::Live,
+            "the control's whole check ran through the open gate"
+        );
+
+        assert_eq!(
+            wedged.run_state(),
+            RunState::Initializing {
+                pause_requested: true
+            },
+            "the paused torrent's check bailed and left it initializing for good"
+        );
+        assert_eq!(
+            checked_pieces(&wedged),
+            Some(1),
+            "it stopped at the piece it was already reading, and never took up another"
+        );
+        assert!(wedged.handle.is_paused(), "and the flag calls that a pause");
     }
 
     /// The idle pause really stops the fetching, and the resume gets the
