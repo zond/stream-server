@@ -444,7 +444,7 @@ impl<H: TorrentHandle> Engine<H> {
                 .build(),
             settled: AtomicBool::new(true),
             last_transition_at: AtomicU64::new(NEVER_MOVED),
-            last_active_at: AtomicU64::new(NEVER_ACTIVE),
+            last_active_at: AtomicU64::new(clock.now_secs()),
             pinned_files: parking_lot::RwLock::new(BTreeSet::new()),
             volumes,
             reads_refused: AtomicBool::new(false),
@@ -466,6 +466,26 @@ impl<H: TorrentHandle> Engine<H> {
     /// (see the field).
     pub(crate) fn is_settled(&self) -> bool {
         self.settled.load(Ordering::Relaxed)
+    }
+
+    /// Forget when this torrent was last used, for an engine built over a
+    /// torrent a *previous* process left behind.
+    ///
+    /// The constructor stamps the creation instant, and for an engine this
+    /// process made that is a real observation: nothing can have used a
+    /// torrent in an interval that did not exist. Stamping it for a
+    /// *restored* one would be the claim this design keeps having to
+    /// delete -- "used at boot" for something nobody has touched in a week,
+    /// which hands it a fresh grace on every restart.
+    ///
+    /// The two need opposite seeds, so the difference is said here rather
+    /// than folded into one value that is wrong for half its callers. It
+    /// cost a real bug in the other direction first: seeding every engine
+    /// with the absence paused a freshly added torrent on its first tick
+    /// with seeding off, dropping the swarm it had just dialled and paying
+    /// a re-announce at the start of playback.
+    pub(crate) fn forget_last_active(&self) {
+        self.last_active_at.store(NEVER_ACTIVE, Ordering::SeqCst);
     }
 
     /// Mark the want-set as not yet re-applied -- a restored torrent on a
@@ -509,6 +529,43 @@ impl<H: TorrentHandle> Engine<H> {
             NEVER_ACTIVE => None,
             at => Some(Duration::from_secs(now.saturating_sub(at))),
         }
+    }
+
+    /// Whether the reconciler is holding this torrent stopped for want of
+    /// disk -- which is a wider question than [`Self::is_stopped_for_space`]
+    /// and has to be, because they were being asked with two different
+    /// lines and the gap between them swallowed torrents whole.
+    ///
+    /// The ladder measures a `Paused` torrent on a timer at
+    /// [`crate::reconcile::line`], which is the floor plus
+    /// `FREE_SPACE_RESUME_MARGIN`; the stall clock that fails its reads is
+    /// started at the same line. `is_stopped_for_space` measures at the
+    /// floor alone, deliberately, because eviction and the 507 gate are
+    /// about whether there is room *now*.
+    ///
+    /// So for a volume between the two -- which is exactly where a cleaner
+    /// pass leaves it, since `CacheLimit::effective` stops the instant
+    /// `available` reaches the floor -- the reconciler stopped the torrent
+    /// and failed its reads while every reader that asks "is anything
+    /// wrong?" was told no: `stats.json` reported buffering with no error,
+    /// and `out_of_space_torrents` returned nothing, so the cleaner was
+    /// never asked to free the space that would end it. A pinned download
+    /// stalled at whatever percent it had reached, in silence, for good.
+    ///
+    /// Readers that report a condition or ask for room use this. Readers
+    /// that decide whether *this request* can proceed keep the floor: a
+    /// playback is measured at the floor too, so the gate and the ladder
+    /// agree about it.
+    pub async fn held_stopped_for_space(&self) -> bool {
+        let run_state = self.handle.run_state();
+        matches!(run_state, crate::backend::RunState::Paused)
+            && crate::reconcile::volume_is_short(
+                crate::reconcile::line(crate::reconcile::Trigger::Timer, run_state),
+                self.handle.has_metadata().await,
+                self.handle.is_finished().await,
+                self.volumes
+                    .available(&self.volumes.folder_of(self.handle.output_folder())),
+            )
     }
 
     /// Whether this torrent is stopped, and stopped because the volume it
@@ -691,7 +748,7 @@ impl<H: TorrentHandle> Engine<H> {
         // backend, which is `buffering` to a client -- a wheel that never
         // ends. It is an error in the sense the `error` field has always
         // had: a full disk, and the client can act on it.
-        if self.is_stopped_for_space().await {
+        if self.held_stopped_for_space().await {
             stats.phase = crate::backend::StartupPhase::Error;
             stats
                 .error

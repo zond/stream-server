@@ -931,6 +931,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let mut engines_map = HashMap::new();
         for (hash, handle) in restored_handles {
             let engine = Engine::new_with_handle(handle, &hash, clock, volumes.clone());
+            // Nothing in this process has used it, and the last one's
+            // reading did not survive -- so there is no reading, which is
+            // not the same as a reading of now. See
+            // `Engine::forget_last_active`.
+            engine.forget_last_active();
             if restored_unsettled {
                 engine.mark_unsettled();
             }
@@ -2439,7 +2444,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
         let mut hashes = Vec::new();
         for engine in engines {
-            if engine.is_stopped_for_space().await || engine.handle.is_out_of_space().await {
+            if engine.held_stopped_for_space().await || engine.handle.is_out_of_space().await {
                 hashes.push(engine.handle.info_hash());
             }
         }
@@ -5428,6 +5433,59 @@ mod tests {
         test_enginefs_with_file_count(1)
     }
 
+    /// The two seeds, and why they are two.
+    ///
+    /// A torrent added a moment ago has been used by nothing -- but that is
+    /// a fact about an interval that did not exist, not about a past this
+    /// process failed to see, so it has a reading and the grace applies to
+    /// it. A restored one has no reading at all, and reading `now` there is
+    /// the claim this design keeps having to delete.
+    ///
+    /// Folding them into one seed breaks one of the two. Seeding everything
+    /// with the absence stops a freshly added torrent on its first tick with
+    /// seeding off, dropping the swarm it has just dialled and paying a
+    /// re-announce at the start of playback. Seeding everything with `now`
+    /// is the "used at boot" claim that hands every restored torrent a fresh
+    /// grace on every restart -- see
+    /// `backend::librqbit::tests::a_restart_with_seeding_off_stops_what_the_last_process_left_without_waiting`
+    /// for that half, over a real persisted session.
+    #[tokio::test]
+    async fn an_added_engine_has_a_reading_where_a_restored_one_has_none() {
+        let (enginefs, _counters) = test_enginefs();
+
+        // The fixture registers its torrent through the restored map, which
+        // is the half with no reading to take.
+        let restored = enginefs.get_engine(TEST_HASH).await.unwrap();
+        assert_eq!(
+            restored.quiet_for(0),
+            None,
+            "nothing in this process has used a torrent it inherited"
+        );
+        assert_eq!(
+            enginefs.reconcile_tick_at(0).await,
+            vec![(TEST_HASH.to_string(), crate::reconcile::Decision::Run)],
+            "and with seeding on it runs regardless"
+        );
+
+        // An engine this process built has one, and it is zero: no interval
+        // has passed in which anything could have used it.
+        let fresh = Engine::new_with_handle(
+            restored.handle.clone(),
+            TEST_HASH,
+            enginefs.clock,
+            enginefs.volumes.clone(),
+        );
+        assert_eq!(
+            fresh.quiet_for(0),
+            Some(Duration::ZERO),
+            "a torrent added this instant has been idle for no time at all"
+        );
+        assert!(
+            Duration::ZERO < INACTIVE_TORRENT_PAUSE_GRACE,
+            "so the idle arm cannot reach it yet"
+        );
+    }
+
     /// An observer -- the per-stream progress logger, a diagnostics sweep --
     /// must be able to read an engine without that being what keeps its
     /// torrent out of the idle sweep. `get_engine` counts as a poll on
@@ -6495,21 +6553,31 @@ mod tests {
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
     }
 
-    /// The idle clock belongs to the process, not to the engine.
+    /// An engine made late has a reading, and the grace applies to it.
     ///
-    /// An engine made an hour into the run has had nothing playing on it
-    /// since the process started, and that is what its `idle_for` says, so
-    /// the arm may stop it on the first tick. Seeded per engine at `now` --
-    /// the shipped defect, and the one thing the restored-torrent tests
-    /// cannot tell apart, because at a restart the two readings coincide --
-    /// every engine would instead buy itself a fresh grace merely by
-    /// appearing, and a server that adds a torrent every few minutes has an
-    /// idle arm that never fires.
+    /// This asserted the opposite until the seed was split, on the argument
+    /// that "a server that adds a torrent every few minutes has an idle arm
+    /// that never fires". That argument is arithmetically wrong: the grace
+    /// is `INACTIVE_TORRENT_PAUSE_GRACE`, so an engine that starts its clock
+    /// at its own creation escapes the arm for exactly that long and no
+    /// longer -- the arm fires on the next tick after it.
+    ///
+    /// What it cost was the mirror of the bug it was written against. An add
+    /// with seeding off was stopped on its first tick, dropping the swarm it
+    /// had just dialled, and started again at the first byte of playback --
+    /// a pause, an unpause and a re-announce, which is the churn the dwell
+    /// exists to prevent.
+    ///
+    /// The distinction the old seed could not draw: a torrent this process
+    /// added has been used by nothing over an interval that did not exist,
+    /// which is a reading of zero; a torrent it *restored* has no reading at
+    /// all. Only the second may be read as quiet. The restart half is
+    /// `backend::librqbit::tests::a_restart_with_seeding_off_stops_what_the_last_process_left_without_waiting`.
     ///
     /// The engine is made through the ordinary add, and what is asserted is
     /// what the torrent then does.
     #[tokio::test(start_paused = true)]
-    async fn an_engine_made_late_is_quiet_for_as_long_as_the_process_has_run() {
+    async fn an_engine_made_late_keeps_its_grace_and_loses_it_on_time() {
         let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
         enginefs.set_free_space_probe(|_| Ok(u64::MAX));
         enginefs.seeding_enabled.store(false, Ordering::Relaxed);
@@ -6528,10 +6596,22 @@ mod tests {
             "a freshly added torrent is running, as a real backend's is"
         );
 
+        // Its own clock starts here, however long the process has run.
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), Decision::Run)],
+            "an add is not idle the instant it is made"
+        );
+        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
+        assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), 0);
+
+        // And a grace later, with nothing having played it, the arm fires --
+        // so the grace is deferred, not spent.
+        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE).await;
         assert_eq!(
             enginefs.reconcile_tick().await,
             vec![(TEST_HASH.to_string(), Decision::Stop)],
-            "nothing has played it since this process started"
+            "nothing has played it for a whole grace"
         );
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
         assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), 1);
@@ -8189,18 +8269,21 @@ mod tests {
 
         // Back over the floor but inside the margin: still stopped -- the
         // margin is what it has to see cleared before anything starts it
-        // again. The *device* is no longer short, though, so nothing tells
-        // a client it is out of disk and nothing offers this torrent's
-        // files to the cleaner: the hysteresis is the ladder's line and
-        // nobody else's.
+        // again -- and said so, because the ladder holding a torrent stopped
+        // is the condition a client and the cleaner both need to know about.
+        // Eviction still measures the floor, so the torrent's own files stay
+        // protected while the volume is over it.
         available.store(
             CACHE_FREE_SPACE_FLOOR + FREE_SPACE_RESUME_MARGIN - 1,
             Ordering::SeqCst,
         );
         enginefs.reconcile_tick().await;
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
-        assert!(!engine.is_stopped_for_space().await);
-        assert!(enginefs.out_of_space_torrents().await.is_empty());
+        assert!(!engine.is_stopped_for_space().await, "the floor is clear");
+        assert!(
+            !enginefs.out_of_space_torrents().await.is_empty(),
+            "but the ladder is still holding it, and says so"
+        );
 
         // The margin over: started again, and off the cleaner's list. Past
         // the dwell as well, which every timer start of a torrent this
@@ -9089,7 +9172,7 @@ mod tests {
     /// under a torrent that still holds them open with a piece map that
     /// says it has them.
     #[tokio::test(start_paused = true)]
-    async fn a_paused_torrent_over_the_floor_is_not_out_of_disk() {
+    async fn a_paused_torrent_inside_the_margin_is_reported_and_offered_to_the_cleaner() {
         let (mut enginefs, _counters) = test_enginefs_for_reconciler(1);
         enginefs.set_free_space_probe(|_| Ok(CACHE_FREE_SPACE_FLOOR + 1));
         enginefs.seeding_enabled.store(false, Ordering::Relaxed);
@@ -9102,13 +9185,33 @@ mod tests {
         enginefs.reconcile_tick().await;
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
 
+        // Inside the margin the ladder is holding this torrent stopped, and
+        // `after_stopping_for_space` will fail its reads once the volume has
+        // been short for `STOPPED_READ_STALL_BOUND`. So the readers that
+        // report a condition are asked at the ladder's own line: a client
+        // that is about to be told `StorageFull` is not told everything is
+        // fine, and the cleaner is asked for the room that would end it.
+        //
+        // This asserted the opposite, on the rule that the hysteresis was
+        // the ladder's line and nobody else's. That rule made the band an
+        // absorbing state: reads refused, `stats.json` reporting buffering
+        // with no error, `out_of_space_torrents` empty so no recovery pass
+        // ever ran -- and the band is where a cleaner pass leaves the volume
+        // by construction, since `CacheLimit::effective` stops the instant
+        // `available` reaches the floor. A pinned download stalled at
+        // whatever percent it had reached, in silence, for good.
         let stats = engine.get_statistics().await;
-        assert_ne!(
+        assert_eq!(
             stats.phase,
             StartupPhase::Error,
-            "the volume is above the floor, so nothing is out of space"
+            "the ladder is holding it stopped, so the client is told so"
         );
-        assert_eq!(stats.error, None);
+        assert!(stats.error.is_some());
+        assert!(!enginefs.out_of_space_torrents().await.is_empty());
+
+        // Eviction keeps the floor, deliberately: taking a torrent's files
+        // is about whether there is room *now*, not about what the ladder is
+        // waiting for, and the volume is over the floor.
         let classes = enginefs.eviction_classes().await;
         assert!(
             classes.stopped_for_space.is_empty(),
@@ -9116,7 +9219,6 @@ mod tests {
         );
         assert!(!classes.protected.is_empty());
         assert!(!engine.is_stopped_for_space().await);
-        assert!(enginefs.out_of_space_torrents().await.is_empty());
     }
 
     /// Re-enabling seeding starts the torrents the idle arm stopped, and it

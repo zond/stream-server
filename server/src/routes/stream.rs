@@ -1022,6 +1022,36 @@ async fn stream_video_with(
     } else {
         end.saturating_sub(start) + 1
     };
+    // This torrent's own volume, before the shared one below. The two are
+    // not the same device: a pinned download lives under `downloadsDir`,
+    // a setting whose entire purpose is to put downloads on a second card,
+    // while `ensure_disk_ready_or_refuse` probes `engine_fs.download_dir`
+    // and nothing else. The reconciler measures `output_folder()`, so with
+    // the downloads volume full and the cache root roomy the gate below
+    // waves the request through, the ladder stops the torrent underneath
+    // it, and the reader parks until the body dies mid-stream with
+    // `StorageFull` -- where a 507 was owed before a byte was sent.
+    //
+    // This gate existed and was removed with the stored `stopped_for_space`
+    // bit, on the grounds that it read a record rather than the disk. That
+    // objection is spent: `Engine::is_stopped_for_space` now recomputes the
+    // predicate from the run state and a fresh probe of this torrent's own
+    // volume, at the same floor a `PlaybackStart` is measured against
+    // (`reconcile::line`), so the gate and the ladder cannot disagree about
+    // this request.
+    if engine.is_stopped_for_space().await {
+        tracing::warn!(
+            stream_id,
+            info_hash = %info_hash,
+            file_idx = idx,
+            "stream refused: this torrent's own volume has no room"
+        );
+        return (
+            StatusCode::INSUFFICIENT_STORAGE,
+            INSUFFICIENT_DISK_SPACE_BODY,
+        )
+            .into_response();
+    }
     if let Err(refusal) = ensure_disk_ready_or_refuse(
         &state,
         &engine_fs,
