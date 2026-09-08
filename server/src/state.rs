@@ -37,8 +37,9 @@ pub struct AppState {
     /// `crate::proxy_cache`). Rooted inside the engine's `download_dir`,
     /// which is where the cache cleaner already walks, so every byte of it
     /// is ordinary cache to the cleaner: counted, aged, evicted, never
-    /// pinned -- with the one exception the retention policy makes, a chunk
-    /// under a live stream's window (`crate::proxy_retention`).
+    /// pinned -- with the two exceptions the retention policy makes, a chunk
+    /// under a live stream's window and one an open body has been framed to
+    /// deliver and has not yet (`crate::proxy_retention`).
     pub proxy_cache: Arc<crate::proxy_cache::ProxyCache>,
     /// The optional LAN media listener shared by `run` and `ServerHandle`
     /// (see `crate::lan_media`). Constructed disabled; `run` replaces it with

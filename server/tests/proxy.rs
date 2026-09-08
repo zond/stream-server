@@ -1755,6 +1755,161 @@ fn a_seek_back_inside_the_window_is_served_from_disk_and_one_outside_it_is_not()
     Ok(())
 }
 
+/// **What the window kept, a player may read back whole.**
+///
+/// A response is framed before its first byte goes out: the `Content-Length`
+/// and the `Content-Range` a player is handed are a promise about bytes that
+/// are still on the disk when it reads them. The window that keeps a run is
+/// 90% ahead of the playhead and 10% behind it, so a body that starts at the
+/// front of a run a whole window long has its own tail *outside* the window
+/// the moment its first chunk goes out -- and the pass that its own reading
+/// starts is what would unlink it. The player then gets a `206` of
+/// 8 388 608 bytes that dies after 7 602 176 of them, which is exactly nine
+/// tenths of the window, with `IncompleteBody`.
+///
+/// A torrent's reader is refused this by librqbit -- `drop_pieces` will not
+/// forget a piece a reader is waiting on. A proxied read makes the refusal
+/// for itself, and this is the whole of what it is for.
+#[test]
+fn the_run_the_window_kept_is_served_back_whole() -> anyhow::Result<()> {
+    use std::io::Read;
+
+    let fixture = fixture_with(Origin::start_sized(RETENTION_ORIGIN)?)?;
+    published_budget(&fixture, RETENTION_BUDGET)?;
+
+    let origin = format!("http://{}", fixture.origin.addr);
+    let url = format!("{}/proxy/d={}/movie.mp4", fixture.base, encode(&origin));
+    let client = reqwest::blocking::Client::new();
+
+    // Play the whole film. What is left when the last byte has gone past is
+    // the window round the end of it, which is a window's worth of
+    // contiguous chunks -- the shape a player rewinding into the credits
+    // asks for.
+    let mut response = client
+        .get(&url)
+        .header(reqwest::header::RANGE, "bytes=0-")
+        .send()?;
+    let mut played = Vec::new();
+    response.read_to_end(&mut played)?;
+    assert_eq!(played.len(), RETENTION_ORIGIN);
+    fixture.origin.next_request();
+    wait_until_chunks_at_most(&fixture, (2 * RETENTION_BUDGET / CHUNK) as usize);
+
+    let run = longest_cached_run(&fixture);
+    assert!(
+        run.end - run.start >= RETENTION_BUDGET / CHUNK,
+        "the window kept a run to ask for: {run:?}"
+    );
+    let (first, last) = (run.start * CHUNK, run.end * CHUNK - 1);
+    let want = last - first + 1;
+
+    let mut response = client
+        .get(&url)
+        .header(reqwest::header::RANGE, format!("bytes={first}-{last}"))
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        header(response.headers(), "content-length"),
+        Some(want.to_string()).as_deref(),
+        "the response promises the whole run"
+    );
+    let mut body = Vec::new();
+    if let Err(error) = response.read_to_end(&mut body) {
+        panic!(
+            "the body broke after {} of {want} bytes: {error}",
+            body.len()
+        );
+    }
+    assert_eq!(body.len() as u64, want, "and delivers it");
+    assert_eq!(body[0], byte_at(first as usize), "at the right offset");
+    assert!(
+        fixture.origin.was_asked_for_nothing_more(),
+        "all of it came off the disk, which is what makes this the cache's promise"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
+/// **The second player in one entity is not the first one's read-ahead.**
+///
+/// `p=` is out of the cache key on purpose, so two players reading one
+/// stream share its chunks and read it at two offsets. The window follows a
+/// playhead, and there are two of them; what neither of them may do is
+/// delete the bytes the other has already been promised. Here the second
+/// player fetches the head of the film, which drags the window to the front
+/// while the first player is still reading the run at the back off the disk.
+#[test]
+fn a_second_player_fetching_does_not_truncate_the_first_ones_read() -> anyhow::Result<()> {
+    use std::io::Read;
+
+    let fixture = fixture_with(Origin::start_sized(RETENTION_ORIGIN)?)?;
+    published_budget(&fixture, RETENTION_BUDGET)?;
+
+    let origin = format!("http://{}", fixture.origin.addr);
+    let url = |token: &str| {
+        format!(
+            "{}/proxy/d={}&p={token}/movie.mp4",
+            fixture.base,
+            encode(&origin)
+        )
+    };
+    let client = reqwest::blocking::Client::new();
+
+    let mut response = client
+        .get(url("one"))
+        .header(reqwest::header::RANGE, "bytes=0-")
+        .send()?;
+    let mut played = Vec::new();
+    response.read_to_end(&mut played)?;
+    assert_eq!(played.len(), RETENTION_ORIGIN);
+    fixture.origin.next_request();
+    wait_until_chunks_at_most(&fixture, (2 * RETENTION_BUDGET / CHUNK) as usize);
+
+    // The first player asks for the run the window kept, and reads the first
+    // chunk of it.
+    let run = longest_cached_run(&fixture);
+    let (first, last) = (run.start * CHUNK, run.end * CHUNK - 1);
+    let want = last - first + 1;
+    let mut one = client
+        .get(url("one"))
+        .header(reqwest::header::RANGE, format!("bytes={first}-{last}"))
+        .send()?;
+    let mut head = vec![0u8; CHUNK as usize];
+    one.read_exact(&mut head)?;
+
+    // The second player, at the other end of the film, on bytes the window
+    // let go of long ago: its fetch is what moves the window away from the
+    // body still being read above.
+    let two = client
+        .get(url("two"))
+        .header(reqwest::header::RANGE, format!("bytes=0-{}", 8 * CHUNK - 1))
+        .send()?;
+    assert_eq!(two.bytes()?.len() as u64, 8 * CHUNK);
+    assert_eq!(
+        fixture.origin.next_request().range(),
+        Some(format!("bytes=0-{}", 8 * CHUNK - 1).as_str()),
+        "the head of the film was reclaimed, so this really went to the origin"
+    );
+
+    let mut rest = Vec::new();
+    if let Err(error) = one.read_to_end(&mut rest) {
+        panic!(
+            "the first player's body broke after {} of {want} bytes: {error}",
+            head.len() + rest.len()
+        );
+    }
+    assert_eq!(
+        (head.len() + rest.len()) as u64,
+        want,
+        "the first player was handed every byte its response promised"
+    );
+    assert_eq!(rest[0], byte_at((first + CHUNK) as usize));
+
+    drop(fixture.handle);
+    Ok(())
+}
+
 /// **The cleaner asks the one policy about everything it walks.**
 ///
 /// A torrent's reader is protected from the cleaner's delete by librqbit:
@@ -5410,6 +5565,37 @@ fn cached_chunks(fixture: &Fixture) -> Vec<std::path::PathBuf> {
                 && !path.to_string_lossy().ends_with(".part")
         })
         .collect()
+}
+
+/// The chunk indices the proxy cache holds, ascending. A chunk file is named
+/// by its index inside a bucket directory, which is the whole of what says
+/// which bytes it is.
+fn cached_chunk_indices(fixture: &Fixture) -> Vec<u64> {
+    let mut indices: Vec<u64> = cached_chunks(fixture)
+        .into_iter()
+        .filter_map(|path| path.file_name()?.to_str()?.parse().ok())
+        .collect();
+    indices.sort_unstable();
+    indices
+}
+
+/// The longest contiguous run of chunks on the disk, as a half-open range of
+/// indices. What the window kept, after a pass has reclaimed round it.
+fn longest_cached_run(fixture: &Fixture) -> std::ops::Range<u64> {
+    let indices = cached_chunk_indices(fixture);
+    let mut best = 0..0;
+    let mut run = 0..0;
+    for index in indices {
+        if run.end == index {
+            run.end = index + 1;
+        } else {
+            run = index..index + 1;
+        }
+        if run.end - run.start > best.end - best.start {
+            best = run.clone();
+        }
+    }
+    best
 }
 
 /// Wait until the cache holds at least `chunks` of them.

@@ -391,6 +391,14 @@ pub struct ReclaimGate {
     /// ends the body in an error rather than serving a hole). So the refusal
     /// has to be here, and this is it: one gate, asked about everything the
     /// cleaner walks.
+    ///
+    /// Two different claims are inserted here and the difference matters to
+    /// nothing but the caller: a *window* is where a playhead is and what
+    /// playback is about to want, and a *promise* is the chunks an open
+    /// body was framed to deliver and has not yet -- which is the other
+    /// half of what librqbit's refusal gives a torrent for free. Both are
+    /// "somebody is inside these bytes", so both are a range of one chunk
+    /// store's directory and both are read the same way.
     windows: Vec<ReaderWindow>,
 }
 

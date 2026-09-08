@@ -95,11 +95,19 @@
 //! came off the origin -- and nowhere else. A `Range` header is what a
 //! player *asks* for and is not one of them.
 //!
-//! The one thing that follows for the cleaner: a chunk inside a live
-//! stream's window is not offered to the size rule
-//! (`enginefs::retention::ReclaimGate::releases_file`). Everything else
-//! here, including every byte of every stream nobody is reading, is
-//! ordinary cache exactly as before.
+//! Two things follow for what may be unlinked, and they are the same fact
+//! from two sides. A chunk inside a live stream's window is not offered to
+//! the cleaner's size rule
+//! (`enginefs::retention::ReclaimGate::releases_file`), and a chunk an open
+//! body has been framed to deliver and has not delivered yet is offered to
+//! neither the cleaner nor the retention pass -- a response says its length
+//! before its first byte goes out, and a window 90% ahead of the playhead
+//! does not cover a body longer than that, so without it the pass a read's
+//! own playhead drives would delete that read's tail. `Cached` opens a
+//! [`crate::proxy_retention::Reader`] and tells it what the response is
+//! framed around; the promise shrinks as the bytes go out and is released
+//! when the body ends. Everything else here, including every byte of every
+//! stream nobody is reading, is ordinary cache exactly as before.
 //!
 //! # What is not here, and no comment may imply otherwise
 //!
@@ -422,9 +430,13 @@ impl Entry {
         if range.is_none() && held_to < last {
             return None;
         }
+        // What a response framed around this will have promised: every
+        // chunk from the one the range starts in to the one it ends in.
+        let reader = self.retention.reader(&dir, total);
+        reader.promises(first / CHUNK_BYTES..held_to / CHUNK_BYTES + 1);
         Some(Cached {
             dir,
-            retention: self.retention.clone(),
+            reader: Arc::new(reader),
             total,
             content_type,
             validator,
@@ -456,9 +468,10 @@ impl Entry {
             }
             remove_other_entities(&stale, &fresh);
         });
+        let dir = ChunkDir::new(dir);
         Filler {
-            dir: ChunkDir::new(dir),
-            retention: self.retention.clone(),
+            reader: self.retention.reader(&dir, total),
+            dir,
             total,
             offset: body_start,
             collecting: None,
@@ -577,7 +590,16 @@ fn chunk_len(index: u64, total: u64) -> u64 {
 /// What one entity holds for one request's range.
 pub struct Cached {
     dir: ChunkDir,
-    retention: Arc<ProxyRetention>,
+    /// This read, for as long as it lasts: the chunks between
+    /// [`Cached::first`] and [`Cached::held_to`] are promised to whatever
+    /// response is framed around them, and nothing may unlink one until it
+    /// has gone out or this read has ended (see [`crate::proxy_retention`]).
+    /// It is also where the bytes that do go out are noted as a playhead.
+    ///
+    /// An `Arc` because [`Cached::body`] hands the promise to a stream that
+    /// outlives this struct -- the route drops the `Cached` once the
+    /// response is built, and the body it built is what is still reading.
+    reader: Arc<crate::proxy_retention::Reader>,
     /// The entity's length, which is what a `Content-Range` has to state.
     pub total: u64,
     /// What the origin labelled the entity, empty when it said nothing.
@@ -635,12 +657,12 @@ impl Cached {
     /// finds the gap, and the next fill writes the chunk again.
     pub fn body(&self) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static {
         let dir = self.dir.clone();
-        let retention = self.retention.clone();
+        let reader = self.reader.clone();
         let total = self.total;
         let last = self.held_to;
         futures_util::stream::unfold(self.first, move |offset| {
             let dir = dir.clone();
-            let retention = retention.clone();
+            let reader = reader.clone();
             async move {
                 if offset > last {
                     return None;
@@ -672,7 +694,7 @@ impl Cached {
                 // are the two places one exists for a proxied stream, and
                 // between them they cover a hit, a miss and the two halves
                 // of a partial hit.
-                retention.note(&dir, total, to);
+                reader.note(to);
                 Some((Ok(served), to + 1))
             }
         })
@@ -688,7 +710,12 @@ impl Cached {
 /// chunk later, and the reactor never blocks on the write.
 pub struct Filler {
     dir: ChunkDir,
-    retention: Arc<ProxyRetention>,
+    /// This fill, as a read of the entity: the origin's body is on its way
+    /// to the player as it goes past here, so every byte of it is a
+    /// playhead. It promises nothing -- what a fill delivers comes off the
+    /// origin and not off the disk, so there is no chunk of ours it is
+    /// waiting to read.
+    reader: crate::proxy_retention::Reader,
     total: u64,
     /// Absolute offset of the next byte to arrive.
     offset: u64,
@@ -745,7 +772,7 @@ impl Filler {
         // is the one that matters most, since a miss is when the cache is
         // growing and the window is what bounds that growth.
         if self.offset > 0 {
-            self.retention.note(&self.dir, self.total, self.offset - 1);
+            self.reader.note(self.offset - 1);
         }
     }
 }
@@ -1263,6 +1290,73 @@ mod tests {
             "and what is left is a window, not sixteen chunks: {:?}",
             chunks(&dir).held()
         );
+    }
+
+    /// **A read is handed every byte its response was framed around, while
+    /// the window its own reading moves passes over them.**
+    ///
+    /// The `Content-Length` and `Content-Range` of a hit are a promise about
+    /// chunks that are still on the disk when the player gets to them, and
+    /// the thing most likely to take one is not the cleaner: it is the
+    /// retention pass this very body's playhead is driving. A window is 90%
+    /// ahead of the playhead, so a body longer than that has its own tail
+    /// outside the window from its first chunk onwards.
+    ///
+    /// Twenty chunks on disk, four chunks of budget, a read of the first
+    /// sixteen. The pass really runs -- the four chunks nothing promised go
+    /// while the body is open, which is what says this is not a test of a
+    /// pass that never happened -- and the read is served whole regardless.
+    #[tokio::test]
+    async fn a_read_is_served_every_byte_it_was_promised() {
+        use futures_util::StreamExt as _;
+
+        let dir = tempfile::tempdir().expect("a scratch root");
+        let budget = Arc::new(enginefs::retention::RetentionBudget::default());
+        budget.set(Some(4 * CHUNK_BYTES));
+        let cache = ProxyCache::new(dir.path(), budget);
+        let entry = entry_of(&cache, "https://host/film.mkv");
+
+        let total = 20 * CHUNK_BYTES;
+        let dir = entry
+            .dir
+            .join(entity_dir_name(total, "video/mp4", VALIDATOR));
+        let whole = vec![7u8; CHUNK_BYTES as usize];
+        for index in 0..20 {
+            write_chunk(&dir, index, &whole);
+        }
+
+        let want = 16 * CHUNK_BYTES;
+        let cached = entry
+            .look_up(Some(&format!("bytes=0-{}", want - 1)))
+            .expect("all of it is here");
+        assert!(cached.complete());
+
+        let mut served = 0usize;
+        let mut body = Box::pin(cached.body());
+        let mut waited = false;
+        while let Some(next) = body.next().await {
+            match next {
+                Ok(bytes) => served += bytes.len(),
+                Err(error) => panic!("the body broke after {served} of {want}: {error}"),
+            }
+            if waited {
+                continue;
+            }
+            // A player reads as it plays, so the pass its own playhead
+            // started runs while the body is still open. Wait for it once,
+            // on something it is free to take: the four chunks past the end
+            // of what this read promised.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                if !chunk_path(&dir, 19).exists() {
+                    waited = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(waited, "no pass ever ran, so this proves nothing");
+        }
+        assert_eq!(served as u64, want, "every byte the response promised");
     }
 
     /// The lookup reads bucket directories, not chunk files, so what is in a
