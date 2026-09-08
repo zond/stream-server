@@ -7920,6 +7920,48 @@ mod tests {
         );
     }
 
+    /// The idle pause has an owner, and it is not this reconciler yet.
+    ///
+    /// Seeding is on and the volume is roomy, so the ladder wants this
+    /// torrent running -- and it is stopped, by the housekeeping sweep,
+    /// which still keeps its own record of that in `Engine::idle_paused`.
+    /// Starting it from here would make two owners of one librqbit pause,
+    /// which is the entire class of bug being closed; the reconciler takes
+    /// the free-space arm in this stage and hands everything else back.
+    ///
+    /// The guard errs in the safe direction, and the second half of the
+    /// test is that direction: the moment nothing claims the pause -- which
+    /// is every pause in a fresh process, since the flag does not survive a
+    /// restart and the pause does -- the reconciler starts it.
+    #[tokio::test(start_paused = true)]
+    async fn a_pause_the_idle_policy_still_claims_is_left_to_the_idle_policy() {
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        assert!(enginefs.seeding_enabled.load(Ordering::Relaxed));
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+
+        engine.handle.pause_torrent().await.unwrap();
+        engine.idle_paused.store(true, Ordering::Relaxed);
+
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), Decision::Run)],
+            "the ladder wants it running"
+        );
+        assert_eq!(
+            run_state_of(&enginefs, TEST_HASH).await,
+            RunState::Paused,
+            "and leaves it to the owner that took this pause"
+        );
+        assert_eq!(counters.start_torrent.load(Ordering::SeqCst), 0);
+
+        // Nobody claims it any more -- which is what a restart looks like.
+        engine.idle_paused.store(false, Ordering::Relaxed);
+        enginefs.reconcile_tick().await;
+        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
+        assert_eq!(counters.start_torrent.load(Ordering::SeqCst), 1);
+    }
+
     /// The defect that four rounds of this work kept re-introducing, and it
     /// is a property of librqbit rather than of any policy: `Session::unpause`
     /// writes `paused = false` and returns success, and if an initial check
