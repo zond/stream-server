@@ -737,6 +737,17 @@ mod tests {
         };
         assert_eq!(desired(&dead, Trigger::Timer), Decision::Leave);
         assert_eq!(desired(&dead, Trigger::PlaybackStart), Decision::Leave);
+
+        // Only once its want-set is back, though. Until then the torrent is
+        // not the cleaner's either -- the cleaner will not restart one it
+        // cannot give a want-set to -- and `Leave` would hold a read
+        // refusal that nothing was ever going to lift.
+        let unsettled = Conditions {
+            settled: false,
+            ..dead
+        };
+        assert_eq!(desired(&unsettled, Trigger::Timer), Decision::Stop);
+        assert_eq!(desired(&unsettled, Trigger::PlaybackStart), Decision::Stop);
     }
 
     /// A magnet that has not resolved its info dictionary is fetching that

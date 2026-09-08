@@ -8391,6 +8391,73 @@ mod tests {
         );
     }
 
+    /// The `Error` arm is only the *settled* one's, and the difference is a
+    /// read refusal that would otherwise never lapse.
+    ///
+    /// `Leave` is deliberately narrower than "the backend killed it": a
+    /// torrent this process has not put its want-set back on is not a
+    /// statement about a disk, so the ladder answers `Stop` for it -- which
+    /// calls nothing (there is nothing running to stop) but does let its
+    /// reads park again. Hand the whole `Error` state to the cleaner and
+    /// that lift never happens: `restart_from_error` is the only other
+    /// thing that lifts one, and the cleaner will not restart a torrent
+    /// whose want-set is not back either, so a reader opened on it is
+    /// handed `StorageFull` on a volume with room to spare, for good.
+    ///
+    /// Asserted through [`poll_a_read`] rather than on `reads_refused`,
+    /// which is the flag the code under test writes; what a player gets is
+    /// this.
+    #[tokio::test(start_paused = true)]
+    async fn an_errored_torrent_is_the_cleaners_only_once_its_want_set_is_back() {
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
+        let available = Arc::new(AtomicU64::new(0));
+        let probe_available = available.clone();
+        enginefs.set_free_space_probe(move |_| Ok(probe_available.load(Ordering::SeqCst)));
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+
+        // Stopped for space, short past the stall bound, so its readers are
+        // failed; then the backend kills the torrent outright.
+        enginefs.reconcile_tick().await;
+        tokio::time::advance(STOPPED_READ_STALL_BOUND).await;
+        enginefs.reconcile_tick().await;
+        available.store(u64::MAX, Ordering::SeqCst);
+        counters.out_of_space.store(true, Ordering::SeqCst);
+        enginefs.reconcile_tick().await;
+        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Error);
+
+        // Settled: the cleaner owns it, and its refusal is held for the
+        // cleaner to lift by restarting it.
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), Decision::Leave)]
+        );
+        assert_eq!(
+            poll_a_read(&engine)
+                .await
+                .expect("the refusal stands")
+                .kind(),
+            std::io::ErrorKind::StorageFull
+        );
+
+        // Unsettled -- a torrent restored without its want-set, which the
+        // cleaner will not restart either. The refusal lapses.
+        engine.mark_unsettled();
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), Decision::Stop)]
+        );
+        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Error);
+        assert!(
+            poll_a_read(&engine).await.is_none(),
+            "no arm of the ladder is claiming the device is full, so a read waits"
+        );
+        assert_eq!(
+            counters.stop_torrent.load(Ordering::SeqCst),
+            1,
+            "and the `Stop` made no call on a torrent that is not running"
+        );
+    }
+
     /// To the backend a torrent the reconciler stopped is merely paused,
     /// which the client would show as buffering for ever; the statistics say
     /// what is actually wrong, in the field a torrent error has always used,
