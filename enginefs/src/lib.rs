@@ -667,6 +667,10 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     /// cache cleaner to run a pass at once rather than on its next poll --
     /// see [`Self::out_of_space_signal`].
     out_of_space_notify: Arc<tokio::sync::Notify>,
+    /// One lock per info hash, serialising the reconciler's decisions about
+    /// one torrent without serialising them across torrents. See
+    /// [`crate::reconcile::HashLocks`].
+    reconcile_locks: crate::reconcile::HashLocks,
 }
 
 #[derive(Debug, Clone)]
@@ -863,6 +867,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             clock,
             sweep_task: parking_lot::Mutex::new(None),
             out_of_space_notify: Arc::new(tokio::sync::Notify::new()),
+            reconcile_locks: Default::default(),
         };
 
         let engines_clone = engines.clone();
@@ -1418,6 +1423,223 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         if stopped_any {
             self.out_of_space_notify.notify_one();
         }
+    }
+
+    /// Start the reconciler: [`Self::reconcile_tick`] every
+    /// [`RECONCILE_INTERVAL`] for as long as this engine exists, on the same
+    /// terms as [`Self::start_free_space_watch`] -- the caller owns the task
+    /// and aborts it on shutdown, and the task holds the engine weakly so an
+    /// embedder that drops the engine without aborting ends it too.
+    ///
+    /// **It is a shadow.** It decides and it logs the decision; it issues no
+    /// pause and no resume, and the sweep, the grace-period task and the
+    /// free-space watch go on owning those calls exactly as before. What it
+    /// is for is the field log: a decision that disagrees with what the old
+    /// policies actually did is the bug this reconciler exists to close, and
+    /// the disagreement can be read off a running server before anything
+    /// acts on it.
+    pub fn start_reconciler(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(crate::reconcile::RECONCILE_INTERVAL);
+            loop {
+                interval.tick().await;
+                let Some(engine_fs) = weak.upgrade() else {
+                    return;
+                };
+                engine_fs.reconcile_tick().await;
+            }
+        })
+    }
+
+    /// One pass of the reconciler: what every torrent should be doing, from
+    /// what is true of it now. Returns the decisions in registry order, for
+    /// tests and for a caller that wants them; the pass itself only logs.
+    ///
+    /// One free-space probe per distinct output folder, as the free-space
+    /// watch does, and no `stats()` anywhere: every question asked of a
+    /// handle here ([`TorrentHandle::run_state`],
+    /// [`TorrentHandle::has_metadata`], [`TorrentHandle::is_finished`]) is
+    /// one the trait promises to answer from state the backend already
+    /// holds, because this runs every two seconds over every torrent there
+    /// is.
+    pub async fn reconcile_tick(&self) -> Vec<(String, crate::reconcile::Decision)> {
+        // Cloned out and the guard dropped before the first `.await`: this
+        // is a write-preferring `RwLock`, so a read guard held across an
+        // await parks every later reader behind any writer that queues
+        // meanwhile.
+        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
+        let now = self.clock.now_secs();
+        let mut readings: HashMap<std::path::PathBuf, Option<u64>> = HashMap::new();
+        let mut decisions = Vec::with_capacity(engines.len());
+        for engine in engines {
+            if let Some(decision) = self
+                .reconcile_engine(
+                    &engine,
+                    crate::reconcile::Trigger::Timer,
+                    now,
+                    &mut readings,
+                )
+                .await
+            {
+                decisions.push((engine.info_hash.clone(), decision));
+            }
+        }
+        decisions
+    }
+
+    /// Reconcile one torrent, for a caller with a reason of its own -- a
+    /// playback starting on it, which is measured against a different
+    /// free-space line (see [`crate::reconcile::desired`]). `None` when
+    /// there is no such engine, or when its backend owns its own lifecycle.
+    ///
+    /// Looks the engine up with [`Self::peek_engine`], never `get_engine`:
+    /// a reconcile is an observation, and counting it as a poll would both
+    /// keep an idle torrent from ever being removed and reset the very
+    /// idleness the decision is made of.
+    ///
+    /// [`crate::reconcile::Trigger::PlaybackStart`] says why the decision is
+    /// being taken, **not** that anything is playing: `playing` is read from
+    /// the activity registers like every other condition. A caller must
+    /// therefore register its stream before it asks, or it will be told what
+    /// to do with a torrent nobody is watching.
+    pub async fn reconcile_hash(
+        &self,
+        info_hash: &str,
+        trigger: crate::reconcile::Trigger,
+    ) -> Option<crate::reconcile::Decision> {
+        let engine = self.peek_engine(info_hash).await?;
+        let now = self.clock.now_secs();
+        let mut readings = HashMap::new();
+        self.reconcile_engine(&engine, trigger, now, &mut readings)
+            .await
+    }
+
+    /// The decision for one engine, under that hash's reconcile lock.
+    ///
+    /// `None` for a backend that manages its own playback lifecycle: it
+    /// pauses and resumes its torrents itself, and a second opinion from
+    /// here would be a second owner of the same state -- which is the whole
+    /// class of bug this reconciler exists to end.
+    async fn reconcile_engine(
+        &self,
+        engine: &Arc<Engine<B::Handle>>,
+        trigger: crate::reconcile::Trigger,
+        now: u64,
+        readings: &mut HashMap<std::path::PathBuf, Option<u64>>,
+    ) -> Option<crate::reconcile::Decision> {
+        if engine.handle.manages_playback_lifecycle() {
+            return None;
+        }
+        let _guard = self.reconcile_locks.lock(&engine.info_hash).await;
+        let conditions = crate::reconcile::Conditions {
+            run_state: engine.handle.run_state(),
+            playing: self.torrent_is_active(&engine.info_hash, engine, now).await,
+            pinned: engine.is_pinned(),
+            seeding_enabled: self.seeding_enabled.load(Ordering::Relaxed),
+            has_metadata: engine.handle.has_metadata().await,
+            finished: engine.handle.is_finished().await,
+            available: self.available_to(engine, readings),
+            idle_for: Duration::from_secs(
+                now.saturating_sub(engine.last_accessed.load(Ordering::SeqCst)),
+            ),
+        };
+        let decision = crate::reconcile::desired(&conditions, trigger);
+        // Every input, so a field log answers *why* on its own: the
+        // decisions this shadow disagrees with are the ones worth reading,
+        // and a decision without its inputs cannot be argued with.
+        tracing::debug!(
+            info_hash = %engine.info_hash,
+            ?decision,
+            ?trigger,
+            run_state = ?conditions.run_state,
+            playing = conditions.playing,
+            pinned = conditions.pinned,
+            seeding_enabled = conditions.seeding_enabled,
+            has_metadata = conditions.has_metadata,
+            finished = conditions.finished,
+            available = ?conditions.available,
+            idle_secs = conditions.idle_for.as_secs(),
+            "torrent_reconciled"
+        );
+        Some(decision)
+    }
+
+    /// Free bytes on the volume this engine writes to, one probe per
+    /// distinct folder per pass (`readings` is that cache). `None` is a
+    /// probe that failed, which [`crate::reconcile::desired`] reads as
+    /// unknown and never as full.
+    fn available_to(
+        &self,
+        engine: &Engine<B::Handle>,
+        readings: &mut HashMap<std::path::PathBuf, Option<u64>>,
+    ) -> Option<u64> {
+        let folder = engine
+            .handle
+            .output_folder()
+            .unwrap_or_else(|| self.download_dir.clone());
+        *readings.entry(folder.clone()).or_insert_with(|| {
+            match probe_at_existing_ancestor(&*self.free_space_probe, &folder) {
+                Ok(available) => Some(available),
+                Err(error) => {
+                    debug!(
+                        folder = %folder.display(),
+                        %error,
+                        "could not read the output volume's free space; the reconciler leaves its torrents alone"
+                    );
+                    None
+                }
+            }
+        })
+    }
+
+    /// Whether anything is using this torrent right now: a response body
+    /// open on it, a file stream, an unexpired HLS playback lease, a
+    /// multi-file selection, or a reader parked inside the engine. The same
+    /// five questions the idle sweep and the grace-period task each ask for
+    /// themselves today.
+    async fn torrent_is_active(
+        &self,
+        info_hash: &str,
+        engine: &Engine<B::Handle>,
+        now: u64,
+    ) -> bool {
+        if engine.active_streams.load(Ordering::SeqCst) > 0 {
+            return true;
+        }
+        if self
+            .active_streams
+            .read()
+            .await
+            .get(info_hash)
+            .copied()
+            .unwrap_or(0)
+            > 0
+        {
+            return true;
+        }
+        if self
+            .active_file_streams
+            .read()
+            .await
+            .iter()
+            .any(|((hash, _), count)| hash == info_hash && *count > 0)
+        {
+            return true;
+        }
+        if self
+            .active_playback_leases
+            .read()
+            .await
+            .iter()
+            .any(|((hash, _), lease)| hash == info_hash && playback_lease_is_active(lease, now))
+        {
+            return true;
+        }
+        self.active_multifile_files
+            .read()
+            .await
+            .contains_key(info_hash)
     }
 
     /// Completes once the free-space watch has stopped a torrent since the
@@ -4445,6 +4667,7 @@ mod tests {
         PieceReadiness, RunState, StartupPhase, StatsFile, StatsOptions, SwarmCap,
         TorrentFilePriorityPlan,
     };
+    use crate::reconcile::{Decision, Trigger};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -4494,6 +4717,19 @@ mod tests {
         restart_after_error: AtomicUsize,
         /// How many times the free-space watch stopped the torrent.
         stop_for_space: AtomicUsize,
+        /// Whether the fake torrent is stopped, set by the calls that stop
+        /// one and cleared by the calls that start it again. Without it the
+        /// fake torrent is always running, and anything that reconciles a
+        /// run state would be tested against a torrent that never obeys.
+        paused: AtomicBool,
+        /// How many times `has_metadata` was asked -- the reconciler's tick
+        /// asks every torrent once per pass, so this is how a test sees the
+        /// loop actually running.
+        has_metadata: AtomicUsize,
+        /// Test knob: this handle pauses and resumes its own torrent, like
+        /// the native Android lifecycle backend. Everything at this layer
+        /// that decides when a torrent should run has to leave it alone.
+        native_lifecycle: AtomicBool,
     }
 
     /// Simulates librqbit's `Initializing` state for the fake torrent: the
@@ -4886,13 +5122,13 @@ mod tests {
             Some(folder.join(&self.files.get(file_idx)?.name))
         }
 
-        /// The fake models only what its tests ask of it, so this reports
-        /// only what it really knows: `FakeInit` for the initializing state
-        /// and the error knobs for the error one. It can never report
-        /// `Paused`, because `pause_torrent` and `resume_torrent` below only
-        /// *count* calls -- the fake torrent never actually stops. Anything
-        /// that reconciles a run state has to make the fake model the pause
-        /// first, or it will be testing a torrent that is always running.
+        /// The fake's state machine, from the knobs its tests set: the
+        /// error ones first (as librqbit's error state outranks its pause),
+        /// then `FakeInit` for a check still running, then the `paused` flag
+        /// the four calls that stop and start a torrent write. A test that
+        /// reconciles run states needs the last of those: without it the
+        /// fake torrent is always running, and the reconciler would only
+        /// ever be tested against a torrent that never obeys it.
         fn run_state(&self) -> RunState {
             if self.counters.in_error_state.load(Ordering::SeqCst)
                 || self.counters.out_of_space.load(Ordering::SeqCst)
@@ -4900,15 +5136,30 @@ mod tests {
                 RunState::Error
             } else if !self.init.is_ready() {
                 RunState::Initializing {
-                    pause_requested: false,
+                    pause_requested: self.counters.paused.load(Ordering::SeqCst),
                 }
+            } else if self.counters.paused.load(Ordering::SeqCst) {
+                RunState::Paused
             } else {
                 RunState::Live
             }
         }
 
+        fn manages_playback_lifecycle(&self) -> bool {
+            self.counters.native_lifecycle.load(Ordering::SeqCst)
+        }
+
+        /// Counted, so a test can see the reconciler's tick reach this
+        /// torrent; the answer itself is the fake's files, as the real
+        /// backend's is its metadata slot.
+        async fn has_metadata(&self) -> bool {
+            self.counters.has_metadata.fetch_add(1, Ordering::SeqCst);
+            !self.files.is_empty()
+        }
+
         async fn resume_torrent(&self) -> Result<()> {
             self.counters.resume_torrent.fetch_add(1, Ordering::SeqCst);
+            self.counters.paused.store(false, Ordering::SeqCst);
             Ok(())
         }
 
@@ -4922,6 +5173,7 @@ mod tests {
 
         async fn stop_for_space(&self) -> Result<()> {
             self.counters.stop_for_space.fetch_add(1, Ordering::SeqCst);
+            self.counters.paused.store(true, Ordering::SeqCst);
             Ok(())
         }
 
@@ -4935,11 +5187,13 @@ mod tests {
                 .restart_after_error
                 .fetch_add(1, Ordering::SeqCst);
             self.counters.out_of_space.store(false, Ordering::SeqCst);
+            self.counters.paused.store(false, Ordering::SeqCst);
             Ok(())
         }
 
         async fn pause_torrent(&self) -> Result<()> {
             self.counters.pause_torrent.fetch_add(1, Ordering::SeqCst);
+            self.counters.paused.store(true, Ordering::SeqCst);
             Ok(())
         }
 
@@ -7079,6 +7333,315 @@ mod tests {
         ) -> std::task::Poll<std::io::Result<u64>> {
             std::task::Poll::Ready(Ok(0))
         }
+    }
+
+    /// A fixture whose housekeeping sweep is not running. The sweep pauses
+    /// idle torrents itself when seeding is off, so left running it would
+    /// move the very torrent these tests watch the reconciler decide about,
+    /// and "nothing moved" would be a statement about which of the two got
+    /// there first.
+    fn test_enginefs_for_reconciler(
+        file_count: usize,
+    ) -> (BackendEngineFS<FakeBackend>, Arc<FakeCounters>) {
+        let (enginefs, counters) = test_enginefs_with_file_count(file_count);
+        if let Some(sweep) = enginefs.take_sweep_task() {
+            sweep.abort();
+        }
+        (enginefs, counters)
+    }
+
+    /// Every call the reconciler could make and does not, in one place.
+    fn assert_nothing_moved(counters: &FakeCounters) {
+        assert_eq!(counters.pause_torrent.load(Ordering::SeqCst), 0);
+        assert_eq!(counters.resume_torrent.load(Ordering::SeqCst), 0);
+        assert_eq!(counters.stop_for_space.load(Ordering::SeqCst), 0);
+        assert_eq!(counters.restart_after_error.load(Ordering::SeqCst), 0);
+    }
+
+    /// Stage one: the reconciler decides and it logs, and that is all it
+    /// does. The decision here is `Stop` -- seeding off, nothing playing,
+    /// quiet for the whole grace -- and the torrent is still running
+    /// afterwards, which is the observed state and not a flag anything in
+    /// this codebase wrote.
+    #[tokio::test(start_paused = true)]
+    async fn the_shadow_decides_and_moves_nothing() {
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
+        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE).await;
+
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), Decision::Stop)]
+        );
+        assert_nothing_moved(&counters);
+        assert_eq!(
+            enginefs
+                .peek_engine(TEST_HASH)
+                .await
+                .unwrap()
+                .handle
+                .run_state(),
+            RunState::Live,
+            "the shadow decided Stop and the torrent kept running"
+        );
+    }
+
+    /// The activity inputs, both ways round: a torrent with a stream open
+    /// on it runs however long it has been since anything asked it for a
+    /// byte, and the same torrent with the stream gone is stopped.
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_open_on_a_torrent_keeps_it_running() {
+        let (mut enginefs, _counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
+
+        enginefs.on_stream_start(TEST_HASH, 0).await;
+        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE).await;
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), Decision::Run)]
+        );
+
+        // The stream goes, without going through `on_stream_end` -- which
+        // would schedule the old grace-period pause, and this test is about
+        // the reconciler's own reading.
+        enginefs.active_streams.write().await.clear();
+        enginefs.active_file_streams.write().await.clear();
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), Decision::Stop)]
+        );
+    }
+
+    /// The free-space arm through the whole tick: seeding on and a stream
+    /// playing, so the only thing that can stop this torrent is the volume
+    /// under it.
+    #[tokio::test(start_paused = true)]
+    async fn a_volume_under_the_floor_stops_even_a_playing_torrent() {
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(CACHE_FREE_SPACE_FLOOR - 1));
+        enginefs.on_stream_start(TEST_HASH, 0).await;
+
+        assert!(enginefs.seeding_enabled.load(Ordering::Relaxed));
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), Decision::Stop)]
+        );
+        assert_eq!(
+            counters.stop_for_space.load(Ordering::SeqCst),
+            0,
+            "the shadow still calls nothing"
+        );
+
+        // The same torrent with everything it wants writes nothing, so the
+        // volume under it is not about it: stopping it would cost its
+        // seeding for no bytes saved.
+        counters.seeded.store(true, Ordering::SeqCst);
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), Decision::Run)]
+        );
+    }
+
+    /// A volume that cannot be probed is not a full one: the timer says
+    /// nothing about it, and a playback starting on the same torrent at the
+    /// same moment gets its stream.
+    #[tokio::test(start_paused = true)]
+    async fn an_unreadable_volume_stops_nothing_and_starts_a_playback() {
+        let (mut enginefs, _counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Err(std::io::Error::other("no statvfs here")));
+
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), Decision::Leave)]
+        );
+        assert_eq!(
+            enginefs
+                .reconcile_hash(TEST_HASH, Trigger::PlaybackStart)
+                .await,
+            Some(Decision::Run)
+        );
+    }
+
+    /// A magnet still fetching its info dictionary keeps its swarm, whatever
+    /// else is true: seeding off, idle for the whole grace, and a volume
+    /// with nothing left on it.
+    #[tokio::test(start_paused = true)]
+    async fn a_torrent_without_metadata_is_decided_to_run() {
+        let (mut enginefs, _counters) = test_enginefs_for_reconciler(0);
+        enginefs.set_free_space_probe(|_| Ok(0));
+        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
+        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE).await;
+
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), Decision::Run)]
+        );
+    }
+
+    /// The hysteresis, read off the torrent rather than off a stored bit:
+    /// a stopped torrent inside the band stays stopped, and the same
+    /// reading with the margin cleared starts it. Nothing about this
+    /// torrent changes between the two ticks except the volume.
+    #[tokio::test(start_paused = true)]
+    async fn a_stopped_torrent_is_left_stopped_inside_the_band() {
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
+        let available = Arc::new(AtomicU64::new(
+            CACHE_FREE_SPACE_FLOOR + FREE_SPACE_RESUME_MARGIN - 1,
+        ));
+        let probe_available = available.clone();
+        enginefs.set_free_space_probe(move |_| Ok(probe_available.load(Ordering::SeqCst)));
+
+        // The torrent is stopped, as the free-space watch would have left
+        // it -- and the reconciler reads that off the torrent's state.
+        enginefs
+            .peek_engine(TEST_HASH)
+            .await
+            .unwrap()
+            .handle
+            .stop_for_space()
+            .await
+            .unwrap();
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), Decision::Stop)]
+        );
+
+        available.store(
+            CACHE_FREE_SPACE_FLOOR + FREE_SPACE_RESUME_MARGIN,
+            Ordering::SeqCst,
+        );
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), Decision::Run)]
+        );
+        assert_eq!(
+            counters.restart_after_error.load(Ordering::SeqCst),
+            0,
+            "deciding Run is not doing it"
+        );
+    }
+
+    /// Looking at a torrent is not using it. The reconciler polls every
+    /// engine every two seconds, so an eye that counted as a poll would
+    /// keep every torrent this server has ever seen from ever being idle --
+    /// including for the idle arm of its own decision.
+    #[tokio::test(start_paused = true)]
+    async fn reconciling_a_torrent_does_not_count_as_using_it() {
+        let (mut enginefs, _counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
+        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE).await;
+
+        assert_eq!(
+            enginefs.reconcile_hash(TEST_HASH, Trigger::Timer).await,
+            Some(Decision::Stop)
+        );
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), Decision::Stop)],
+            "the torrent is still as idle as it was before it was looked at"
+        );
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), Decision::Stop)],
+            "and stays so however often it is looked at"
+        );
+    }
+
+    /// A pin is a promise to have the file offline, so the idle policy does
+    /// not apply to the torrent holding it -- with seeding off and nothing
+    /// playing, the pinned torrent still runs.
+    #[tokio::test(start_paused = true)]
+    async fn a_pinned_torrent_is_decided_to_run() {
+        let (mut enginefs, _counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
+        enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
+        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE).await;
+
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), Decision::Run)]
+        );
+    }
+
+    /// A backend that pauses and resumes its own torrents gets no second
+    /// opinion from here. Two owners of one pause is the whole class of bug
+    /// the reconciler exists to end, and it must not start by becoming one.
+    #[tokio::test(start_paused = true)]
+    async fn a_torrent_whose_backend_owns_its_lifecycle_is_left_alone() {
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(0));
+        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
+        counters.native_lifecycle.store(true, Ordering::SeqCst);
+        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE).await;
+
+        assert!(enginefs.reconcile_tick().await.is_empty());
+        assert_eq!(
+            enginefs.reconcile_hash(TEST_HASH, Trigger::Timer).await,
+            None
+        );
+    }
+
+    /// Every torrent gets a decision, and the volume they share is read
+    /// once for the pass: this runs every two seconds over every torrent
+    /// there is, and one `statvfs` per torrent is a syscall per torrent per
+    /// tick for one number.
+    #[tokio::test(start_paused = true)]
+    async fn a_pass_decides_for_every_torrent_and_probes_each_volume_once() {
+        let TwoEngines {
+            mut enginefs,
+            counters: _counters,
+            removed: _removed,
+        } = test_enginefs_with_two_engines();
+        if let Some(sweep) = enginefs.take_sweep_task() {
+            sweep.abort();
+        }
+        let probes = Arc::new(AtomicUsize::new(0));
+        let counted = probes.clone();
+        enginefs.set_free_space_probe(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Ok(u64::MAX)
+        });
+
+        let mut decided: Vec<String> = enginefs
+            .reconcile_tick()
+            .await
+            .into_iter()
+            .map(|(hash, decision)| {
+                assert_eq!(decision, Decision::Run);
+                hash
+            })
+            .collect();
+        decided.sort();
+        assert_eq!(decided, vec![TEST_HASH.to_string(), OTHER_HASH.to_string()]);
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            1,
+            "both torrents write to the same folder"
+        );
+    }
+
+    /// The loop runs on its own, on its own interval, and moves nothing
+    /// while it does.
+    #[tokio::test(start_paused = true)]
+    async fn the_reconciler_ticks_by_itself() {
+        let (enginefs, counters) = test_enginefs_for_reconciler(1);
+        let enginefs = Arc::new(enginefs);
+        let task = enginefs.start_reconciler();
+
+        assert!(
+            wait_until(TEST_WAIT_BOUND, || counters
+                .has_metadata
+                .load(Ordering::SeqCst)
+                >= 3)
+            .await,
+            "the reconciler asked the torrent about itself, tick after tick"
+        );
+        task.abort();
+        assert_nothing_moved(&counters);
     }
 
     /// The whole point: a torrent that is writing is stopped when the volume
