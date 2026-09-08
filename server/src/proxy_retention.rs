@@ -285,7 +285,10 @@ impl ProxyRetention {
     /// The pruning is here because this is the one call that happens once
     /// per cleaner pass rather than once per delivered chunk: a map that
     /// grew a permanent entry per URL ever played would be a leak measured
-    /// in playbacks.
+    /// in playbacks. That cadence is enough on its own -- writing a chunk
+    /// is a filesystem event, and a filesystem event under the cache root
+    /// is what arms the cleaner's debounce, so the case where entries are
+    /// being added is exactly the case where this runs often.
     pub fn fill_gate(&self, gate: &mut ReclaimGate) {
         let Ok(mut streams) = self.streams.lock() else {
             return;
