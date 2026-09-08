@@ -523,6 +523,85 @@ mod tests {
         assert_eq!(locks.len(), 0, "nothing is left behind");
     }
 
+    /// The stall clock a volume keeps, which is what decides whether a
+    /// stopped torrent's parked readers have anything coming.
+    ///
+    /// Three of its rules had nothing behind them until this test. It runs
+    /// from the moment the volume goes short and is not restarted by later
+    /// short readings, or a disk that stayed full would keep handing its
+    /// readers fresh patience. It is judged against the **resume line** and
+    /// not the floor, because between the two a stopped torrent is still
+    /// not started: its readers are still waiting for something that is not
+    /// coming. And a probe that failed clears nothing -- an unreadable
+    /// `statvfs` is evidence neither that the volume filled nor that it
+    /// emptied, and failing a player's reads because the environment broke
+    /// is not what the bound is for.
+    #[test]
+    fn a_volumes_stall_clock_runs_from_the_moment_it_went_short() {
+        use std::path::{Path, PathBuf};
+        let volumes = Volumes::new(PathBuf::from("/downloads"));
+        let folder = Path::new("/downloads");
+
+        // Room: no clock at all.
+        volumes.record(folder, Some(u64::MAX), 100);
+        assert_eq!(volumes.available(folder), Some(u64::MAX));
+        assert_eq!(volumes.short_for(folder, 200), None);
+
+        // Short: the clock starts, and a later short reading does not
+        // restart it.
+        volumes.record(folder, Some(CACHE_FREE_SPACE_FLOOR - 1), 200);
+        volumes.record(folder, Some(0), 210);
+        assert_eq!(
+            volumes.short_for(folder, 230),
+            Some(Duration::from_secs(30))
+        );
+
+        // Over the floor but inside the resume margin: still short.
+        volumes.record(
+            folder,
+            Some(CACHE_FREE_SPACE_FLOOR + FREE_SPACE_RESUME_MARGIN - 1),
+            240,
+        );
+        assert_eq!(
+            volumes.short_for(folder, 240),
+            Some(Duration::from_secs(40))
+        );
+
+        // A probe that failed leaves the clock exactly as it was, and the
+        // reading unknown.
+        volumes.record(folder, None, 250);
+        assert_eq!(
+            volumes.short_for(folder, 250),
+            Some(Duration::from_secs(50))
+        );
+        assert_eq!(volumes.available(folder), None);
+
+        // Cleared: the clock stops, and going short again starts a new one.
+        volumes.record(
+            folder,
+            Some(CACHE_FREE_SPACE_FLOOR + FREE_SPACE_RESUME_MARGIN),
+            260,
+        );
+        assert_eq!(volumes.short_for(folder, 260), None);
+        volumes.record(folder, Some(0), 300);
+        assert_eq!(
+            volumes.short_for(folder, 310),
+            Some(Duration::from_secs(10))
+        );
+
+        // A volume nothing has probed is unknown, never short -- and a
+        // torrent that names no folder of its own is measured against the
+        // engine's download directory.
+        let elsewhere = Path::new("/elsewhere");
+        assert_eq!(volumes.available(elsewhere), None);
+        assert_eq!(volumes.short_for(elsewhere, 310), None);
+        assert_eq!(volumes.folder_of(None), PathBuf::from("/downloads"));
+        assert_eq!(
+            volumes.folder_of(Some(PathBuf::from("/elsewhere"))),
+            PathBuf::from("/elsewhere")
+        );
+    }
+
     /// A torrent with nothing wrong with it: running, alive, watched by
     /// nobody, on a roomy volume, with seeding on. Every test below changes
     /// the one condition it is about.
