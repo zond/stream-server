@@ -59,7 +59,8 @@
 //! [`store::PieceStoreFactory`] is the librqbit session's **default** storage
 //! factory ([`crate::backend::librqbit::LibrqbitBackend`]'s
 //! `session_storage_factory`, installed in `open_session`), rooted at
-//! [`root_in`] of the same `download_dir` librqbit persists the session into.
+//! [`store::StoreRoot::in_download_dir`] of the same `download_dir` librqbit
+//! persists the session into.
 //! It is passed to no individual add, and that is not a stylistic choice:
 //! three things had to be decided in the rqbit fork before it could be wired
 //! at all, and all three are about the have-set rather than about storage.
@@ -157,7 +158,8 @@ pub mod sweep;
 pub use layout::{FileSpec, PieceLayout, Segment};
 pub use policy::{Decision, RetentionPolicy, Shape};
 pub use store::{
-    MissingPiece, PIECES_PER_DIRECTORY, PieceStore, PieceStoreFactory, delete_pieces, layout_of,
+    MissingPiece, PIECES_PER_DIRECTORY, PieceStore, PieceStoreFactory, StoreContents, StoreRoot,
+    StoredPiece, StoredTorrent, layout_of,
 };
 pub use sweep::{SweepReport, session_recorded_hashes, sweep_unadopted};
 
@@ -167,12 +169,19 @@ pub use sweep::{SweepReport, session_recorded_hashes, sweep_unadopted};
 /// `.metadata`) so that a torrent named `pieces` cannot land on top of it.
 ///
 /// Inside the cache root rather than beside it, deliberately: piece files are
-/// cache, and the cache cleaner has to be able to see and count them. It is
-/// not one of `cache_cleaner::is_session_artifact`'s exempt directories for
-/// the same reason -- pieces are exactly what a full disk should be reclaiming.
-pub const PIECE_STORE_DIR: &str = ".pieces";
+/// cache, and the cache cleaner has to be able to see and count them --
+/// which it does by asking [`store::StoreRoot::scan`], never by walking in
+/// here ([`store::StoreRoot::holds`] is what prunes it out of the cleaner's
+/// own walk). Nor is it one of `cache_cleaner::is_session_artifact`'s exempt
+/// directories: pieces are exactly what a full disk should be reclaiming.
+pub(crate) const PIECE_STORE_DIR: &str = ".pieces";
 
 /// Where a torrent cache root keeps its piece store.
-pub fn root_in(download_dir: &std::path::Path) -> std::path::PathBuf {
+///
+/// Crate-private, and reached from outside only through
+/// [`store::StoreRoot::in_download_dir`]: naming the store is the one thing
+/// a caller needs, and giving it the *path* is how the directory shape
+/// escaped into the cache cleaner in the first place.
+pub(crate) fn root_in(download_dir: &std::path::Path) -> std::path::PathBuf {
     download_dir.join(PIECE_STORE_DIR)
 }

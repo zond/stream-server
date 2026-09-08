@@ -1425,7 +1425,23 @@ fn seed_piece_store_pieces(
         "the fixture and the torrent disagree about the payload"
     );
 
-    let dir = enginefs::piece_store::root_in(&cache_root.join("rqbit-downloads")).join(&info_hash);
+    // Where each piece goes is asked of the store, never spelled out here:
+    // the bucketed layout is `enginefs::piece_store`'s, and a fixture with a
+    // second copy of it would go on seeding happily after it changed.
+    let store = piece_store(cache_root);
+    let layout = enginefs::piece_store::PieceLayout::new(
+        piece_length,
+        blob.len() as u64,
+        [enginefs::piece_store::FileSpec {
+            len: blob.len() as u64,
+            padding: false,
+        }],
+    )
+    .expect("a layout for the fixture");
+    let pieces = enginefs::piece_store::PieceStore::new(
+        store.torrent_dir(&info_hash),
+        std::sync::Arc::new(layout),
+    );
     let mut written = 0usize;
     for (index, piece) in blob.chunks(piece_length as usize).enumerate() {
         let start = index as u64 * piece_length;
@@ -1439,32 +1455,24 @@ fn seed_piece_store_pieces(
         {
             continue;
         }
-        let index = index as u32;
-        let bucket = dir.join((index / enginefs::piece_store::PIECES_PER_DIRECTORY).to_string());
-        std::fs::create_dir_all(&bucket).expect("piece bucket");
-        std::fs::write(bucket.join(index.to_string()), piece).expect("write a piece");
+        let path = pieces.piece_path(index as u32);
+        std::fs::create_dir_all(path.parent().expect("a bucket")).expect("piece bucket");
+        std::fs::write(&path, piece).expect("write a piece");
         written += 1;
     }
     assert!(written > 0, "the fixture seeded no piece at all");
 }
 
-/// The torrent's own directory in the session's piece store, where all of
-/// its data is -- the streaming cache and an offline download alike.
-fn piece_store_dir(cache_root: &std::path::Path, info_hash: &str) -> std::path::PathBuf {
-    enginefs::piece_store::root_in(&cache_root.join("rqbit-downloads")).join(info_hash)
+/// The session's piece store, where all of a torrent's data is -- the
+/// streaming cache and an offline download alike.
+fn piece_store(cache_root: &std::path::Path) -> enginefs::piece_store::StoreRoot {
+    enginefs::piece_store::StoreRoot::in_download_dir(&cache_root.join("rqbit-downloads"))
 }
 
-/// How many piece files that directory holds, counted over the bucket
-/// fan-out rather than assuming one directory.
-fn pieces_held(dir: &std::path::Path) -> usize {
-    let Ok(buckets) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    buckets
-        .filter_map(|b| b.ok())
-        .filter(|b| b.file_type().is_ok_and(|t| t.is_dir()))
-        .map(|b| std::fs::read_dir(b.path()).map(|f| f.count()).unwrap_or(0))
-        .sum()
+/// How many pieces the store holds for a torrent -- asked of the store, so
+/// nothing here has to know how they are laid out.
+fn pieces_held(cache_root: &std::path::Path, info_hash: &str) -> usize {
+    piece_store(cache_root).stat(info_hash).pieces.len()
 }
 
 /// Deterministic, non-trivial payload so piece hashes mean something.
@@ -1846,8 +1854,7 @@ fn a_pin_moves_nothing_and_survives_a_restart() -> anyhow::Result<()> {
     // where a torrent added without a placement puts it -- and where one
     // *with* a placement puts it too.
     seed_piece_store(&cache_root, &torrent, &content);
-    let pieces = piece_store_dir(&cache_root, &info_hash);
-    let seeded_pieces = pieces_held(&pieces);
+    let seeded_pieces = pieces_held(&cache_root, &info_hash);
     let base = format!("http://{}", handle.http_addr());
     let client = bearer_client(&handle)?;
 
@@ -1882,7 +1889,7 @@ fn a_pin_moves_nothing_and_survives_a_restart() -> anyhow::Result<()> {
     // piece files under the store's one root.
     assert!(!root_folder.join("e2.bin").exists(), "no whole file");
     assert_eq!(
-        pieces_held(&pieces),
+        pieces_held(&cache_root, &info_hash),
         seeded_pieces,
         "the pin kept every piece it had"
     );
@@ -1936,7 +1943,7 @@ fn a_pin_moves_nothing_and_survives_a_restart() -> anyhow::Result<()> {
     assert_eq!(info.path, before, "still where it always was");
     assert!(info.complete);
     assert_eq!(
-        pieces_held(&pieces),
+        pieces_held(&cache_root, &info_hash),
         seeded_pieces,
         "the restart found the same pieces"
     );
@@ -2075,8 +2082,8 @@ fn fastresume_persists_piece_bitfields_for_a_pinned_torrent_too() -> anyhow::Res
     // store, and the restart read the bitfields against those.
     assert!(!session_dir.join("Pinned").join("p2.bin").exists());
     assert!(!session_dir.join("Streamed").exists());
-    assert!(pieces_held(&piece_store_dir(&cache_root, &streamed_hash)) > 0);
-    assert!(pieces_held(&piece_store_dir(&cache_root, &pinned_hash)) > 0);
+    assert!(pieces_held(&cache_root, &streamed_hash) > 0);
+    assert!(pieces_held(&cache_root, &pinned_hash) > 0);
 
     handle.shutdown()?;
     handle.join()?;
@@ -2111,8 +2118,7 @@ fn download_routes_match_the_library_api() -> anyhow::Result<()> {
     // The data is already in the piece store, as after streaming it -- which
     // is the only place a torrent's bytes are now, downloads included.
     seed_piece_store(&cache_root, &torrent, &content);
-    let pieces = piece_store_dir(&cache_root, &info_hash);
-    let seeded_pieces = pieces_held(&pieces);
+    let seeded_pieces = pieces_held(&cache_root, &info_hash);
     let base = format!("http://{}", handle.http_addr());
     let client = bearer_client(&handle)?;
 
@@ -2173,7 +2179,7 @@ fn download_routes_match_the_library_api() -> anyhow::Result<()> {
     // in that name holds none of them.
     assert!(!named.join("e1.bin").exists(), "no whole file is produced");
     assert_eq!(
-        pieces_held(&pieces),
+        pieces_held(&cache_root, &info_hash),
         seeded_pieces,
         "the pin did not move, lose or duplicate the data"
     );
@@ -2256,7 +2262,7 @@ fn download_routes_match_the_library_api() -> anyhow::Result<()> {
     );
     assert!(handle.unpin_download(&info_hash, 9, true).is_err());
     assert_eq!(
-        pieces_held(&pieces),
+        pieces_held(&cache_root, &info_hash),
         seeded_pieces,
         "no byte of the torrent is touched"
     );
@@ -2277,7 +2283,11 @@ fn download_routes_match_the_library_api() -> anyhow::Result<()> {
             "deletedFiles": false,
         })
     );
-    assert_eq!(pieces_held(&pieces), seeded_pieces, "the bytes stay");
+    assert_eq!(
+        pieces_held(&cache_root, &info_hash),
+        seeded_pieces,
+        "the bytes stay"
+    );
     let listed: serde_json::Value = client
         .get(format!("{base}/downloads.json"))
         .send()?
@@ -2308,7 +2318,7 @@ fn download_routes_match_the_library_api() -> anyhow::Result<()> {
     );
     assert!(!named.exists(), "the torrent's folder is gone");
     assert_eq!(
-        pieces_held(&pieces),
+        pieces_held(&cache_root, &info_hash),
         0,
         "and the bytes with it: the pieces are where the data was"
     );
@@ -2414,8 +2424,7 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
     // Already "streamed": the data sits in the piece store, as it would
     // after playback, and `POST /create` below picks it up from there.
     seed_piece_store(&cache_root, &torrent, &content);
-    let pieces = piece_store_dir(&cache_root, &info_hash);
-    let seeded_pieces = pieces_held(&pieces);
+    let seeded_pieces = pieces_held(&cache_root, &info_hash);
     let base = format!("http://{}", handle.http_addr());
     let client = bearer_client(&handle)?;
     let anonymous = reqwest::blocking::Client::new();
@@ -2497,7 +2506,7 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
          which nothing reads and nothing else would ever reclaim: {report}"
     );
     assert_eq!(
-        pieces_held(&pieces),
+        pieces_held(&cache_root, &info_hash),
         seeded_pieces,
         "while the pin's real bytes are untouched: {report}"
     );
@@ -2519,7 +2528,7 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
     assert_eq!(api_report.deleted, 0, "nothing left to evict");
     assert_eq!(api_report.freed, 0);
     assert_eq!(api_report.protected_files, seeded_pieces);
-    assert_eq!(pieces_held(&pieces), seeded_pieces);
+    assert_eq!(pieces_held(&cache_root, &info_hash), seeded_pieces);
 
     handle.shutdown()?;
     handle.join()?;

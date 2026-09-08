@@ -748,37 +748,27 @@ pub struct EngineDiagnosticsSnapshot {
 /// construction: an engine's files land in exactly one of them.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct EvictionClasses {
-    /// May not be evicted: the piece directory of every live engine and of
-    /// every dormant pin -- what `protected_paths` returns.
-    pub protected: Vec<std::path::PathBuf>,
-    /// Should go before anything else: the files of an unpinned torrent the
-    /// backend stopped with an error that is *not* a want of space. Nothing
-    /// will restart it, so nothing will ever read these bytes again, and on
-    /// a full device they are exactly what keeps the next stream from
-    /// starting. Still walked, counted and deleted by the cleaner like any
-    /// other file -- the backend's error state holds no open handle on them
-    /// -- only sorted to the front of the eviction order.
-    pub dead: Vec<std::path::PathBuf>,
+    /// May not be reclaimed: every live engine and every dormant pin --
+    /// what `protected_torrents` returns.
+    pub protected: Vec<String>,
+    /// Should go before anything else: an unpinned torrent the backend
+    /// stopped with an error that is *not* a want of space. Nothing will
+    /// restart it, so nothing will ever read these bytes again, and on a
+    /// full device they are exactly what keeps the next stream from
+    /// starting. Counted and reclaimed by the cleaner like any other cache
+    /// -- the backend's error state holds no open handle on them -- only
+    /// sorted to the front of the eviction order.
+    pub dead: Vec<String>,
     /// Unpinned torrents stopped for want of disk space -- by the free-space
-    /// watch, or by librqbit's ENOSPC -- with every path of theirs. Not
-    /// protected, but not for the cleaner to unlink either: a paused
-    /// torrent holds its files open and its piece map says it has them, so
-    /// deleting the bytes alone would leave it resuming over nothing. The
-    /// cleaner takes one of these whole, through
+    /// watch, or by librqbit's ENOSPC. Not protected, but not for the
+    /// cleaner to take a piece off either: a paused torrent's piece map says
+    /// it has them, so deleting the bytes alone would leave it resuming over
+    /// nothing. The cleaner takes one of these whole, through
     /// `BackendEngineFS::evict_stopped_torrent`, and only when nothing else
     /// can go: while anything else can, evicting *that* lets the stopped
     /// torrent resume with its progress, which is the better outcome for
     /// the person watching it.
-    pub stopped_for_space: Vec<StoppedTorrent>,
-}
-
-/// A torrent stopped for want of disk space, as [`EvictionClasses`] lists it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoppedTorrent {
-    pub info_hash: String,
-    /// Every path its data can be at -- the same set a live torrent would
-    /// have protected.
-    pub paths: Vec<std::path::PathBuf>,
+    pub stopped_for_space: Vec<String>,
 }
 
 pub type EngineFS = BackendEngineFS<LibrqbitBackend>;
@@ -940,9 +930,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         tracker_storage: Option<Arc<dyn crate::trackers::TrackerStorage>>,
     ) -> Self {
         let clock = Clock::start();
-        let volumes = Arc::new(crate::reconcile::Volumes::new(crate::piece_store::root_in(
-            &download_dir,
-        )));
+        let volumes = Arc::new(crate::reconcile::Volumes::new(
+            crate::piece_store::StoreRoot::in_download_dir(&download_dir)
+                .path()
+                .to_path_buf(),
+        ));
         // A backend that sets piece reclaim restores every torrent paused
         // and wanting every hole in its storage, because the piece-level
         // want-set is not in the record. Until this process has put the
@@ -2186,20 +2178,20 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
     }
 
-    /// What the cache cleaner may not evict.
+    /// What the cache cleaner may not reclaim, by info hash.
     ///
-    /// Every registry engine's data -- bar a dead one's, see
-    /// [`Self::eviction_classes`] -- plus the data of every *dormant* pin,
-    /// which has no engine to speak for it (that is what dormant means).
+    /// Every registry engine -- bar a dead one, see
+    /// [`Self::eviction_classes`] -- plus every *dormant* pin, which has no
+    /// engine to speak for it (that is what dormant means).
     ///
-    /// For both that is **one directory**: the torrent's directory in the
-    /// piece store, `<cacheRoot>/rqbit-downloads/.pieces/<info hash>`. Since
+    /// A hash and not a path, which is the point of this layering: since
     /// [`crate::piece_store::PieceStoreFactory`] became the session's
-    /// default storage that is where all of a torrent's data is, the
-    /// streaming cache and an offline download alike, and the store's root
-    /// is inside the cache root on purpose, so every piece in it is walked.
-    /// Leaving it out would make live piece data evictable mid-playback with
-    /// nothing to notice it.
+    /// default storage, all of a torrent's data is its pieces -- the
+    /// streaming cache and an offline download alike -- and where those sit
+    /// is [`crate::piece_store::StoreRoot`]'s business. This used to return
+    /// `<cacheRoot>/rqbit-downloads/.pieces/<info hash>`, which meant the
+    /// cleaner matched the store's directory shape against paths it had
+    /// walked itself, so the shape was written down in two crates.
     ///
     /// And **nothing else**, which is load-bearing rather than a
     /// simplification. It used to name the backend's file paths per file --
@@ -2207,20 +2199,20 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// session wrote whole files. Naming them now would hold the
     /// *superseded* whole-file copy of the engine's own data protected for
     /// as long as the torrent is in the session: orphaned *and* immortal,
-    /// the exact failure that made the cleaner walk every root to the
-    /// bottom. There is no migration by decision, so that copy is on disk
-    /// on every existing install and the cache cleaner is the only thing
-    /// that will ever reclaim it.
+    /// the exact failure that made the cleaner walk the root to the bottom.
+    /// There is no migration by decision, so that copy is on disk on every
+    /// existing install and the cache cleaner is the only thing that will
+    /// ever reclaim it.
     ///
-    /// A dormant pin's entry used to be a second path, the placement folder
+    /// A dormant pin used to have a second entry, the placement folder
     /// `<downloadsDir>/<info hash>`. Pinning is a retention property and not
     /// a location: nothing is placed anywhere, so a dormant pin's bytes are
     /// its pieces exactly like a live engine's.
-    pub async fn protected_paths(&self) -> Vec<std::path::PathBuf> {
+    pub async fn protected_torrents(&self) -> Vec<String> {
         self.eviction_classes().await.protected
     }
 
-    /// [`Self::protected_paths`] together with what the same walk of the
+    /// [`Self::protected_torrents`] together with what the same walk of the
     /// engines says the cleaner *should* take: see [`EvictionClasses`].
     ///
     /// A torrent in the backend's error state for a reason that is not a
@@ -2241,41 +2233,43 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
         let mut classes = EvictionClasses::default();
         for engine in engines {
-            let paths = vec![self.piece_dir(&engine.info_hash)];
+            let info_hash = engine.info_hash.to_lowercase();
             if engine.is_pinned() {
-                classes.protected.extend(paths);
+                classes.protected.push(info_hash);
                 continue;
             }
             let out_of_space =
                 engine.is_stopped_for_space().await || engine.handle.is_out_of_space().await;
             if out_of_space {
-                classes.stopped_for_space.push(StoppedTorrent {
-                    info_hash: engine.info_hash.clone(),
-                    paths,
-                });
+                classes.stopped_for_space.push(info_hash);
             } else if engine.handle.is_in_error_state().await {
-                classes.dead.extend(paths);
+                classes.dead.push(info_hash);
             } else {
-                classes.protected.extend(paths);
+                classes.protected.push(info_hash);
             }
         }
         for pin in self.dormant_pinned_downloads() {
-            classes.protected.push(self.piece_dir(&pin.info_hash));
+            classes.protected.push(pin.info_hash.to_lowercase());
         }
         classes
     }
 
-    /// Where `info_hash`'s bytes are: its directory in the piece store,
-    /// `<cacheRoot>/rqbit-downloads/.pieces/<info hash>`. **The one location question this
-    /// layer asks, and the store is what it asks.**
+    /// The piece store this engine's data is in:
+    /// `<cacheRoot>/rqbit-downloads/.pieces`, the same root the session's
+    /// default storage factory is built on.
+    ///
+    /// **The one location question this layer asks, and the store is what it
+    /// answers it.** Everything past here names a torrent by info hash and a
+    /// piece by index; where those land is
+    /// [`crate::piece_store::StoreRoot`]'s and nobody else's.
     ///
     /// It replaces `download_folder`, which answered `<downloadsDir>/<info
     /// hash>` -- the folder a pin used to place a torrent in, and used to
     /// have to relocate one into. A pin decides no location any more, so
     /// there is exactly one place a torrent's data can be, and it is the
     /// same one for a streamed torrent and an offline download.
-    fn piece_dir(&self, info_hash: &str) -> std::path::PathBuf {
-        crate::piece_store::root_in(&self.download_dir).join(info_hash.to_lowercase())
+    pub fn piece_store(&self) -> crate::piece_store::StoreRoot {
+        crate::piece_store::StoreRoot::in_download_dir(&self.download_dir)
     }
 
     /// Info hashes of torrents the backend stopped because the volume they
@@ -3071,7 +3065,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// directory in the piece store -- are taken by
     /// `Self::delete_dormant_download_data`, which first makes sure the
     /// session neither holds nor is adding the torrent; while the pin
-    /// stands [`Self::protected_paths`] keeps the cleaner off that
+    /// stands [`Self::protected_torrents`] keeps the cleaner off that
     /// directory, so this is what takes it now rather than in thirty days.
     /// With no engine **and** no pin there is nothing this call may delete:
     /// the bytes belong to no download it knows of and stay for the
@@ -3301,7 +3295,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 }
             };
         }
-        let folder = self.piece_dir(info_hash);
+        let folder = self.piece_store().torrent_dir(info_hash);
         match tokio::fs::remove_dir_all(&folder).await {
             Ok(()) => {
                 tracing::info!(
@@ -3442,9 +3436,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             // protected for as long as the torrent has any pin left.
             let pieces_freed = match dropped.as_ref() {
                 Some(claim) => {
-                    let dir =
-                        crate::piece_store::root_in(&self.download_dir).join(&engine.info_hash);
-                    match crate::piece_store::delete_pieces(&dir, claim.pieces().iter().copied()) {
+                    match self
+                        .piece_store()
+                        .delete_pieces(&engine.info_hash, claim.pieces().iter().copied())
+                    {
                         Ok(freed) => freed,
                         Err(error) => {
                             tracing::warn!(
@@ -3603,7 +3598,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     }
 
     /// Reconcile the piece store against what this session actually holds:
-    /// every torrent's pieces under [`piece_store::root_in`] that nothing
+    /// every torrent's pieces under the store root ([`Self::piece_store`])
+    /// that nothing
     /// claims are deleted.
     ///
     /// Cleanup that only runs on the way out is cleanup that does not run.
@@ -3652,7 +3648,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 .keys()
                 .map(|info_hash| info_hash.to_lowercase()),
         );
-        let root = crate::piece_store::root_in(&self.download_dir);
+        let root = self.piece_store();
         let persistence_folder = self.download_dir.clone();
         match tokio::task::spawn_blocking(move || {
             let mut adopted = adopted;
@@ -3717,7 +3713,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// missing bytes.
     ///
     /// **That volume is the piece store's root, for every torrent**
-    /// ([`crate::piece_store::root_in`] of the engine's download dir), and
+    /// ([`Self::piece_store`]), and
     /// there is no other candidate left to get it wrong: the store is the
     /// session's default storage and takes one root of its own (see
     /// `backend::librqbit::session_storage_factory`), and a pin chooses no
@@ -3766,7 +3762,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         if required == 0 {
             return Ok(());
         }
-        let volume = crate::piece_store::root_in(&self.download_dir);
+        let volume = self.piece_store().path().to_path_buf();
         match probe_at_existing_ancestor(&*self.free_space_probe, &volume) {
             Ok(available) if free_space_allows(available, required, PIN_FREE_SPACE_MARGIN) => {
                 Ok(())
@@ -6136,21 +6132,19 @@ mod tests {
     #[tokio::test]
     async fn a_dead_torrents_files_are_the_cleaners_to_take_first() {
         let (enginefs, counters) = test_enginefs_with_file_count(2);
-        let root = enginefs.download_dir.clone();
-        let pieces = crate::piece_store::root_in(&root).join(TEST_HASH);
-        let files = vec![pieces.clone()];
+        let torrent = vec![TEST_HASH.to_lowercase()];
 
         let live = enginefs.eviction_classes().await;
-        assert_eq!(live.protected, files, "a live torrent is protected");
+        assert_eq!(live.protected, torrent, "a live torrent is protected");
         assert!(live.dead.is_empty());
 
         counters.in_error_state.store(true, Ordering::SeqCst);
         let dead = enginefs.eviction_classes().await;
         assert!(dead.protected.is_empty(), "a dead one protects nothing");
-        assert_eq!(dead.dead, files, "and its files go first");
+        assert_eq!(dead.dead, torrent, "and its data goes first");
         assert!(
-            enginefs.protected_paths().await.is_empty(),
-            "protected_paths is the same walk"
+            enginefs.protected_torrents().await.is_empty(),
+            "protected_torrents is the same walk"
         );
 
         // Out of space is not dead: that one is listed whole, for the
@@ -6165,7 +6159,7 @@ mod tests {
         // Pinned and dead: the pin outranks the death.
         enginefs.pin_download(TEST_HASH, 1, None).await.unwrap();
         let pinned = enginefs.eviction_classes().await;
-        assert_eq!(pinned.protected, files);
+        assert_eq!(pinned.protected, torrent);
         assert!(pinned.dead.is_empty());
     }
 
@@ -6179,7 +6173,7 @@ mod tests {
     /// pin placed a torrent in -- which is not where any byte of it is, and
     /// which no longer exists as an idea.
     #[tokio::test]
-    async fn protected_paths_cover_a_dormant_pins_pieces_and_nothing_else() {
+    async fn protected_torrents_cover_a_dormant_pin_and_nothing_else() {
         let (enginefs, _counters) = test_enginefs_with_file_count(1);
         std::fs::create_dir_all(&enginefs.download_dir).unwrap();
         std::fs::write(
@@ -6189,12 +6183,10 @@ mod tests {
         .unwrap();
         enginefs.restore_pinned_downloads().await;
 
-        let pieces = crate::piece_store::root_in(&enginefs.download_dir);
-        let folder = pieces.join(OTHER_HASH);
         assert_eq!(
-            enginefs.protected_paths().await,
-            vec![pieces.join(TEST_HASH), folder.clone()],
-            "the live engine's pieces and the dormant pin's, and nothing else"
+            enginefs.protected_torrents().await,
+            vec![TEST_HASH.to_lowercase(), OTHER_HASH.to_lowercase()],
+            "the live engine and the dormant pin, and nothing else"
         );
 
         // And it stops being protected the moment the pin does, so the bytes
@@ -6206,11 +6198,11 @@ mod tests {
                 .unwrap()
                 .unpinned
         );
-        let after = enginefs.protected_paths().await;
-        assert!(!after.contains(&folder));
+        let after = enginefs.protected_torrents().await;
+        assert!(!after.contains(&OTHER_HASH.to_lowercase()));
         assert!(
-            after.contains(&pieces.join(TEST_HASH)),
-            "the live engine's pieces are protected for as long as it runs"
+            after.contains(&TEST_HASH.to_lowercase()),
+            "the live engine is protected for as long as it runs"
         );
     }
 
@@ -6237,7 +6229,7 @@ mod tests {
     async fn an_engine_protects_its_pieces_and_not_the_files_it_used_to_write() {
         let (enginefs, counters) = test_enginefs_with_file_count(2);
         let root = enginefs.download_dir.clone();
-        let pieces = crate::piece_store::root_in(&root).join(TEST_HASH);
+        let store = enginefs.piece_store();
 
         // The whole-file copy an earlier version of this server would have
         // written, at the path the backend reports for file 0.
@@ -6252,8 +6244,8 @@ mod tests {
         ] {
             *counters.output_folder.lock().unwrap() = folder.clone();
             assert_eq!(
-                enginefs.protected_paths().await,
-                vec![pieces.clone()],
+                enginefs.protected_torrents().await,
+                vec![TEST_HASH.to_lowercase()],
                 "output folder {folder:?}"
             );
         }
@@ -6264,10 +6256,10 @@ mod tests {
         );
         assert!(
             !enginefs
-                .protected_paths()
+                .protected_torrents()
                 .await
                 .iter()
-                .any(|path| legacy.starts_with(path)),
+                .any(|info_hash| legacy.starts_with(store.torrent_dir(info_hash))),
             "and nothing protects them from the cleaner"
         );
     }
@@ -7000,7 +6992,7 @@ mod tests {
 
         let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
         *counters.output_folder.lock().unwrap() = Some(placed.clone());
-        let pieces = crate::piece_store::root_in(&enginefs.download_dir);
+        let pieces = enginefs.piece_store().path().to_path_buf();
         enginefs.set_free_space_probe(move |path| {
             Ok(if path.starts_with(&pieces) {
                 0
@@ -7029,7 +7021,7 @@ mod tests {
         // store's has room, so there is nothing to stop.
         let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
         *counters.output_folder.lock().unwrap() = Some(placed);
-        let pieces = crate::piece_store::root_in(&enginefs.download_dir);
+        let pieces = enginefs.piece_store().path().to_path_buf();
         enginefs.set_free_space_probe(move |path| {
             Ok(if path.starts_with(&pieces) {
                 u64::MAX
@@ -7405,19 +7397,14 @@ mod tests {
     #[tokio::test]
     async fn a_torrent_stopped_for_space_is_listed_whole_for_the_cleaner() {
         let (mut enginefs, counters) = test_enginefs_with_file_count(2);
-        let root = enginefs.download_dir.clone();
-        let files = vec![crate::piece_store::root_in(&root).join(TEST_HASH)];
-        let whole = StoppedTorrent {
-            info_hash: TEST_HASH.to_string(),
-            paths: files.clone(),
-        };
+        let whole = vec![TEST_HASH.to_lowercase()];
 
         enginefs.set_free_space_probe(|_| Ok(0));
         enginefs.reconcile_tick().await;
         let classes = enginefs.eviction_classes().await;
         assert!(classes.protected.is_empty() && classes.dead.is_empty());
-        assert_eq!(classes.stopped_for_space, vec![whole.clone()]);
-        assert!(enginefs.protected_paths().await.is_empty());
+        assert_eq!(classes.stopped_for_space, whole);
+        assert!(enginefs.protected_torrents().await.is_empty());
 
         // librqbit's own ENOSPC stop reads the same.
         enginefs.set_free_space_probe(|_| Ok(u64::MAX));
@@ -7430,15 +7417,12 @@ mod tests {
                 .is_empty()
         );
         counters.out_of_space.store(true, Ordering::SeqCst);
-        assert_eq!(
-            enginefs.eviction_classes().await.stopped_for_space,
-            vec![whole]
-        );
+        assert_eq!(enginefs.eviction_classes().await.stopped_for_space, whole);
 
         // The pin outranks the stop.
         enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
         let classes = enginefs.eviction_classes().await;
-        assert_eq!(classes.protected, files);
+        assert_eq!(classes.protected, whole);
         assert!(classes.stopped_for_space.is_empty());
     }
 
@@ -8438,7 +8422,7 @@ mod tests {
     async fn a_pin_is_measured_against_the_volume_the_pieces_land_on() {
         // Fake files are 100 bytes, half downloaded: 50 remain to write.
         let (mut enginefs, _counters) = test_enginefs_with_file_count(2);
-        let pieces = crate::piece_store::root_in(&enginefs.download_dir);
+        let pieces = enginefs.piece_store().path().to_path_buf();
         enginefs.set_free_space_probe(move |path| {
             Ok(if path.starts_with(&pieces) {
                 PIN_FREE_SPACE_MARGIN + 49
@@ -8466,7 +8450,7 @@ mod tests {
         // The other direction: every other volume is full, and the pin
         // writes to none of them.
         let (mut enginefs, _counters) = test_enginefs_with_file_count(2);
-        let pieces = crate::piece_store::root_in(&enginefs.download_dir);
+        let pieces = enginefs.piece_store().path().to_path_buf();
         enginefs.set_free_space_probe(move |path| {
             Ok(if path.starts_with(&pieces) {
                 u64::MAX
@@ -8569,7 +8553,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_pin_drops_its_torrent_and_keeps_the_bytes() {
         let (mut enginefs, _counters) = test_enginefs_unmanaged_checking();
-        let pieces = crate::piece_store::root_in(&enginefs.download_dir).join(TEST_HASH);
+        let pieces = enginefs.piece_store().torrent_dir(TEST_HASH);
         std::fs::create_dir_all(pieces.join("0")).unwrap();
         let piece = pieces.join("0").join("1");
         std::fs::write(&piece, [7u8; 100]).unwrap();
@@ -9080,7 +9064,7 @@ mod tests {
         enginefs.restore_pinned_downloads().await;
         assert_eq!(enginefs.dormant_pinned_downloads().len(), 1);
 
-        let pieces = crate::piece_store::root_in(&enginefs.download_dir);
+        let pieces = enginefs.piece_store().path().to_path_buf();
         for hash in [TEST_HASH, OTHER_HASH, ORPHAN_HASH] {
             let dir = pieces.join(hash).join("0");
             std::fs::create_dir_all(&dir).unwrap();
@@ -9147,7 +9131,7 @@ mod tests {
         // reason enough not to delete what it describes.
         std::fs::write(download_dir.join(format!("{OTHER_HASH}.bitv")), [0u8; 8]).unwrap();
 
-        let pieces = crate::piece_store::root_in(&enginefs.download_dir);
+        let pieces = enginefs.piece_store().path().to_path_buf();
         for hash in [TEST_HASH, OTHER_HASH, ORPHAN_HASH] {
             let dir = pieces.join(hash).join("0");
             std::fs::create_dir_all(&dir).unwrap();
@@ -9906,7 +9890,7 @@ mod tests {
     async fn a_per_file_delete_takes_the_pieces_the_backend_gave_up() {
         let (enginefs, counters) = test_enginefs_with_file_count(2);
         *counters.output_folder.lock().unwrap() = Some(enginefs.download_dir.join("show"));
-        let pieces = crate::piece_store::root_in(&enginefs.download_dir).join(TEST_HASH);
+        let pieces = enginefs.piece_store().torrent_dir(TEST_HASH);
         let bucket = pieces.join("0");
         std::fs::create_dir_all(&bucket).unwrap();
         for piece in [3u32, 4, 5] {
@@ -9983,7 +9967,7 @@ mod tests {
             root.path().join("rqbit-downloads"),
         );
         std::fs::create_dir_all(root.path().join("rqbit-downloads")).unwrap();
-        let pieces = crate::piece_store::root_in(&enginefs.download_dir);
+        let pieces = enginefs.piece_store().path().to_path_buf();
         let folder = pieces.join(TEST_HASH);
         std::fs::create_dir_all(folder.join("0")).unwrap();
         for piece in [1, 2] {
@@ -10047,7 +10031,7 @@ mod tests {
     #[tokio::test]
     async fn an_unpin_of_a_hash_the_registry_lost_leaves_the_live_torrent_alone() {
         let (enginefs, _counters) = test_enginefs_unmanaged();
-        let pieces = crate::piece_store::root_in(&enginefs.download_dir).join(TEST_HASH);
+        let pieces = enginefs.piece_store().torrent_dir(TEST_HASH);
         std::fs::create_dir_all(pieces.join("0")).unwrap();
         let piece = pieces.join("0").join("1");
         std::fs::write(&piece, [7u8; 100]).unwrap();
@@ -10095,7 +10079,7 @@ mod tests {
     #[tokio::test]
     async fn a_dormant_pins_delete_goes_through_the_session_that_still_holds_the_torrent() {
         let (enginefs, _counters) = test_enginefs_unmanaged();
-        let pieces = crate::piece_store::root_in(&enginefs.download_dir).join(TEST_HASH);
+        let pieces = enginefs.piece_store().torrent_dir(TEST_HASH);
         std::fs::create_dir_all(pieces.join("0")).unwrap();
         let piece = pieces.join("0").join("1");
         std::fs::write(&piece, [7u8; 100]).unwrap();
@@ -10142,7 +10126,7 @@ mod tests {
     #[tokio::test]
     async fn a_dormant_pins_delete_leaves_an_add_in_flight_its_pieces() {
         let (enginefs, _counters) = test_enginefs_unmanaged();
-        let pieces = crate::piece_store::root_in(&enginefs.download_dir).join(TEST_HASH);
+        let pieces = enginefs.piece_store().torrent_dir(TEST_HASH);
         std::fs::create_dir_all(pieces.join("0")).unwrap();
         let piece = pieces.join("0").join("1");
         std::fs::write(&piece, [7u8; 100]).unwrap();

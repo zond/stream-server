@@ -797,7 +797,7 @@ pub struct LibrqbitBackend {
 
 /// The session's default storage: the piece store
 /// ([`crate::piece_store::PieceStoreFactory`]), rooted at
-/// [`crate::piece_store::root_in`] of the same `download_dir` librqbit
+/// [`crate::piece_store::StoreRoot::in_download_dir`] of the same `download_dir` librqbit
 /// persists the session into.
 ///
 /// One file per piece, uniformly -- for the streaming cache and for offline
@@ -824,7 +824,10 @@ pub struct LibrqbitBackend {
 /// directory alone.
 fn session_storage_factory(download_dir: &std::path::Path) -> librqbit::storage::BoxStorageFactory {
     use librqbit::storage::StorageFactoryExt;
-    crate::piece_store::PieceStoreFactory::new(crate::piece_store::root_in(download_dir)).boxed()
+    crate::piece_store::PieceStoreFactory::new(crate::piece_store::StoreRoot::in_download_dir(
+        download_dir,
+    ))
+    .boxed()
 }
 
 /// Whether the storage the session gives a torrent that names none can
@@ -6836,7 +6839,7 @@ mod tests {
         // The same root `session_storage_factory` derives in production, so
         // both processes build a store over the same directory -- which is
         // the other half of what makes the promise keepable.
-        let pieces = crate::piece_store::root_in(&client_dir);
+        let pieces = crate::piece_store::StoreRoot::in_download_dir(&client_dir);
         let opts = || TestSessionOptions {
             default_storage: Some(
                 crate::piece_store::PieceStoreFactory::new(pieces.clone()).boxed(),

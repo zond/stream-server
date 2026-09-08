@@ -251,18 +251,7 @@ impl PieceStore {
         // served the deleted bytes through the handle that outlived them.
         self.forget_handles(piece);
         self.staged.lock().remove(&piece);
-        let mut removed = false;
-        for path in [self.staging_path(piece), self.piece_path(piece)] {
-            match std::fs::remove_file(&path) {
-                Ok(()) => removed = true,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(anyhow::Error::new(e)
-                        .context(format!("could not delete piece file {}", path.display())));
-                }
-            }
-        }
-        Ok(removed)
+        Ok(unlink_piece(&self.dir, piece)?.removed_anything)
     }
 
     /// Whether any file of the torrent owns payload bytes in this piece.
@@ -510,49 +499,407 @@ pub(super) fn piece_path(dir: &Path, piece: u32) -> PathBuf {
     path
 }
 
-/// Delete the files of `pieces` under `dir`, a torrent's directory in the
-/// store, for a caller that has already had the backend forget it has them
-/// ([`crate::backend::DroppedFilePieces`]) and is holding that claim.
+/// The piece store's root, and **the only thing outside this module that may
+/// be asked what is under it**.
 ///
-/// Not [`PieceStore::delete_piece`], and it cannot be: the live `PieceStore`
-/// of a running torrent is librqbit's, built by the factory and handed to a
-/// torrent state this crate has no reference to. What that costs is the
-/// store's open-handle cache -- a piece deleted from out here may still have
-/// a cached handle in the live store, and the filesystem keeps an unlinked
-/// inode's blocks until the last descriptor on it goes. It is bounded by
-/// [`OPEN_HANDLES`] and the handle leaves as soon as another piece takes its
-/// slot. It costs nothing in *correctness*: [`PieceStore::has_piece`] asks
-/// the filesystem and not the cache, so the store never claims a piece whose
-/// file has gone, and nothing reads a piece the backend has just been told it
-/// does not have -- a re-download of one writes under the staging name, which
-/// the cache keys separately and which a read prefers.
+/// Every other layer addresses the store by info hash and piece index. The
+/// directory shape -- `<root>/<info hash>/<bucket>/<piece>`, the bucketing
+/// ([`PIECES_PER_DIRECTORY`]) and the staging suffix ([`STAGING_SUFFIX`]) --
+/// belongs to this type and to [`PieceStore`], and to nothing else. The
+/// cache cleaner used to walk the tree itself and unlink what it found, so
+/// the bucketing was written down in two crates at once: a change to it
+/// would have shown up over there as a silent accounting error rather than
+/// as a compile failure.
 ///
-/// Takes the staged copy with it, for [`PieceStore::delete_piece`]'s reason:
-/// half of a piece nobody wants is worth exactly as little as the whole of
-/// it. The bucket directories are left; they are pruned when the torrent's
-/// own directory goes.
-///
-/// Returns how many *complete* piece files really left the disk. A piece with
-/// no file was not on the disk to leave it, and is not an error -- the caller
-/// asked for bytes back and there were none.
-pub fn delete_pieces(dir: &Path, pieces: impl IntoIterator<Item = u32>) -> anyhow::Result<usize> {
-    let mut removed = 0;
-    for piece in pieces {
-        for (path, counts) in [
-            (staging_path(dir, piece), false),
-            (piece_path(dir, piece), true),
-        ] {
-            match std::fs::remove_file(&path) {
-                Ok(()) => removed += usize::from(counts),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(anyhow::Error::new(e)
-                        .context(format!("could not delete piece file {}", path.display())));
+/// What this type does *not* decide is which pieces may go. That is
+/// [`super::policy`]'s, and a caller that deletes a piece of a torrent the
+/// session still holds owes the have-set interlock -- see
+/// [`Self::delete_pieces`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoreRoot {
+    /// Shared, because the storage factory is one of these and librqbit
+    /// clones it per add.
+    root: Arc<PathBuf>,
+}
+
+/// Everything one [`StoreRoot::scan`] found.
+#[derive(Debug, Default)]
+pub struct StoreContents {
+    /// One entry per directory under the root, whether or not any torrent
+    /// still claims it.
+    pub torrents: Vec<StoredTorrent>,
+    /// Metadata of what lies directly under the root and is not a directory:
+    /// debris from an interrupted write. Reported so that nothing in the
+    /// store is invisible to whoever is counting the disk, and left where it
+    /// is -- [`super::sweep`] takes it at the next launch.
+    pub strays: Vec<std::fs::Metadata>,
+}
+
+/// One directory under the root, as a scan found it.
+#[derive(Debug)]
+pub struct StoredTorrent {
+    /// The directory's name. For anything this store wrote that is a
+    /// torrent's lowercase info hash, which is how a caller addresses it
+    /// back ([`StoreRoot::delete_piece`]).
+    pub info_hash: String,
+    /// Every piece with a file, in ascending index order.
+    pub pieces: Vec<StoredPiece>,
+    /// Metadata of the files under it that are not piece files -- a name
+    /// this store never wrote, or a piece file in the wrong bucket. Same
+    /// reason as [`StoreContents::strays`]: counted, never silently
+    /// reclaimed.
+    pub strays: Vec<std::fs::Metadata>,
+}
+
+/// One piece on disk: both copies of it, because [`StoreRoot::delete_piece`]
+/// takes them together -- half of a piece nobody wants is worth exactly as
+/// little as the whole of it.
+#[derive(Debug)]
+pub struct StoredPiece {
+    pub piece: u32,
+    /// The complete copy: the file whose presence is the have-record.
+    pub complete: Option<std::fs::Metadata>,
+    /// The staged copy, being written now or left behind by a process that
+    /// died mid-piece.
+    pub staged: Option<std::fs::Metadata>,
+}
+
+impl StoredPiece {
+    /// Both copies' metadata, for a caller totting up what deleting this
+    /// piece would free. Never empty: a scan reports no piece it found no
+    /// file for.
+    pub fn files(&self) -> impl Iterator<Item = &std::fs::Metadata> {
+        self.complete.iter().chain(self.staged.iter())
+    }
+
+    /// The more recent modification time of the two copies, or `None` when
+    /// neither can be read.
+    ///
+    /// The more recent, not the older: the two exist together only while a
+    /// piece is being downloaded again over one not yet deleted, and the age
+    /// that describes those bytes is the age of the download, not of the
+    /// copy it is replacing.
+    pub fn modified(&self) -> Option<std::time::SystemTime> {
+        self.files().filter_map(|file| file.modified().ok()).max()
+    }
+}
+
+impl StoreRoot {
+    /// The store under a torrent-data root: `<download dir>/.pieces`, the
+    /// same root the session's storage factory is built on.
+    pub fn in_download_dir(download_dir: &Path) -> Self {
+        Self::new(super::root_in(download_dir))
+    }
+
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            root: Arc::new(root),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.root
+    }
+
+    /// Whether `path` is inside the store.
+    ///
+    /// What lets the cache cleaner walk the rest of the torrent-data root
+    /// without ever descending in here. `Path::starts_with` matches whole
+    /// components, so a sibling whose name merely begins with the same
+    /// letters is not swallowed.
+    pub fn holds(&self, path: &Path) -> bool {
+        path.starts_with(self.root.as_path())
+    }
+
+    /// Where one torrent's pieces live.
+    ///
+    /// Lowercase, and in one place: `librqbit` hex-encodes an info hash in
+    /// lowercase, [`PieceStoreFactory::create`] makes the directory through
+    /// this very function, and a caller that spelled the hash any other way
+    /// still reaches the same directory.
+    pub fn torrent_dir(&self, info_hash: &str) -> PathBuf {
+        self.root.join(info_hash.to_ascii_lowercase())
+    }
+
+    /// Everything the store holds: one entry per directory under the root,
+    /// each with the pieces in it.
+    ///
+    /// One `read_dir` per bucket and one `metadata` per file -- the same
+    /// filesystem work walking the tree would cost -- but the caller is
+    /// handed piece indices rather than paths, so whatever it means to do
+    /// next it has to ask this type to do.
+    ///
+    /// An unreadable entry is skipped, not reported as an error: a scan is a
+    /// reading of what is there, and a caller counting the disk must not be
+    /// stopped by one directory it may not enter. A root that does not exist
+    /// yet scans empty, which is the ordinary state before the first add.
+    pub fn scan(&self) -> StoreContents {
+        let mut contents = StoreContents::default();
+        let Ok(entries) = std::fs::read_dir(self.root.as_path()) else {
+            return contents;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                if let Ok(metadata) = entry.metadata() {
+                    contents.strays.push(metadata);
+                }
+                continue;
+            }
+            // A directory name this store would not have written --
+            // [`Self::torrent_dir`] lowercases, so `<HASH>` names a
+            // directory no `delete_piece` could ever address, and a name
+            // that is not UTF-8 is not an info hash at all. Its bytes are
+            // on the volume, so they are counted; its files are never
+            // offered as pieces, because a delete addressed to them would
+            // look under the lowercase name and free nothing. The same
+            // rule as [`piece_of_name`], one level up.
+            let name = entry.file_name();
+            let Some(name) = name
+                .to_str()
+                .filter(|name| !name.bytes().any(|b| b.is_ascii_uppercase()))
+            else {
+                collect_strays(&entry.path(), &mut contents.strays);
+                continue;
+            };
+            contents.torrents.push(self.stat(name));
+        }
+        contents
+    }
+
+    /// [`Self::scan`] for one directory under the root, named as
+    /// [`StoreRoot::torrent_dir`] names it.
+    ///
+    /// A torrent with no directory -- nothing of it has ever been written,
+    /// or it has all been reclaimed -- stats as one with no pieces, not as
+    /// an error: "the store holds none of it" is an answer, and the caller
+    /// asked what is there.
+    pub fn stat(&self, info_hash: &str) -> StoredTorrent {
+        let dir = self.torrent_dir(info_hash);
+        let mut stored = StoredTorrent {
+            info_hash: info_hash.to_ascii_lowercase(),
+            pieces: Vec::new(),
+            strays: Vec::new(),
+        };
+        let Ok(buckets) = std::fs::read_dir(&dir) else {
+            return stored;
+        };
+        // Both copies of a piece are one entry, so they are counted, aged
+        // and deleted together -- keyed by index while the walk runs,
+        // because the staged file and the complete one are two directory
+        // entries that may arrive in either order.
+        let mut pieces: std::collections::BTreeMap<u32, StoredPiece> =
+            std::collections::BTreeMap::new();
+        for bucket in buckets.flatten() {
+            // Anything but a bucket directory at this level is debris an
+            // interrupted write left. Counted, because it is on the disk.
+            if !bucket.file_type().is_ok_and(|t| t.is_dir()) {
+                if let Ok(metadata) = bucket.metadata() {
+                    stored.strays.push(metadata);
+                }
+                continue;
+            }
+            let bucket_name = bucket.file_name();
+            // The bucket's *spelling*, not merely the number it parses
+            // to: `<hash>/00/0` and `<hash>/+0/0` both parse as bucket 0,
+            // and `delete_piece(hash, 0)` would go to `<hash>/0/0` and
+            // free nothing. Same rule as [`piece_of_name`] applies to the
+            // file name.
+            let bucket_index = bucket_name.to_str().and_then(canonical_index);
+            let Ok(entries) = std::fs::read_dir(bucket.path()) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(metadata) = entry.metadata() else {
+                    continue;
+                };
+                if metadata.is_dir() {
+                    // Nothing this store makes, so everything under it is
+                    // debris -- but it is occupying the volume, and a
+                    // caller counting the disk must see all of it.
+                    collect_strays(&entry.path(), &mut stored.strays);
+                    continue;
+                }
+                let name = entry.file_name();
+                // A name this store never wrote, or a piece file sitting in
+                // a bucket it does not belong to: `delete_piece` would look
+                // for it somewhere else, so reporting it as that piece would
+                // promise bytes back that no delete could take.
+                let stray = match name.to_str().and_then(piece_of_name) {
+                    Some((piece, staged)) if bucket_index == Some(piece / PIECES_PER_DIRECTORY) => {
+                        let slot = pieces.entry(piece).or_insert(StoredPiece {
+                            piece,
+                            complete: None,
+                            staged: None,
+                        });
+                        if staged {
+                            slot.staged = Some(metadata);
+                        } else {
+                            slot.complete = Some(metadata);
+                        }
+                        None
+                    }
+                    _ => Some(metadata),
+                };
+                if let Some(metadata) = stray {
+                    stored.strays.push(metadata);
                 }
             }
         }
+        stored.pieces = pieces.into_values().collect();
+        stored
     }
-    Ok(removed)
+
+    /// Reclaim one piece: both copies of it.
+    ///
+    /// Returns whether anything left the disk, so a caller counting what it
+    /// freed does not have to stat first.
+    ///
+    /// **This does not ask whether the piece may go.** A piece of a torrent
+    /// the session still holds may only be deleted under the have-set
+    /// interlock -- see [`Self::delete_pieces`], which is where that
+    /// interlock's one caller lives.
+    pub fn delete_piece(&self, info_hash: &str, piece: u32) -> anyhow::Result<bool> {
+        let dir = self.torrent_dir(info_hash);
+        Ok(unlink_piece(&dir, piece)?.removed_anything)
+    }
+
+    /// [`Self::delete_piece`] over many, for a caller that has already had
+    /// the backend forget it has them ([`crate::backend::DroppedFilePieces`])
+    /// and is holding that claim across this call.
+    ///
+    /// That claim is the interlock, and it lives in one place:
+    /// `BackendEngineFS::delete_download_data`, which takes it from
+    /// `TorrentHandle::drop_file_pieces` and drops it only once these
+    /// unlinks have returned. Without it the torrent goes on believing it
+    /// holds the piece -- it advertises it, and answers a peer's request
+    /// with a read past the end of nothing.
+    ///
+    /// Not [`PieceStore::delete_piece`], and it cannot be: the live
+    /// `PieceStore` of a running torrent is librqbit's, built by the factory
+    /// and handed to a torrent state this crate has no reference to. What
+    /// that costs is the store's open-handle cache -- a piece deleted from
+    /// out here may still have a cached handle in the live store, and the
+    /// filesystem keeps an unlinked inode's blocks until the last descriptor
+    /// on it goes. It is bounded by [`OPEN_HANDLES`] and the handle leaves
+    /// as soon as another piece takes its slot. It costs nothing in
+    /// *correctness*: [`PieceStore::has_piece`] asks the filesystem and not
+    /// the cache, so the store never claims a piece whose file has gone, and
+    /// nothing reads a piece the backend has just been told it does not have
+    /// -- a re-download of one writes under the staging name, which the
+    /// cache keys separately and which a read prefers.
+    ///
+    /// Returns how many *complete* piece files really left the disk. A piece
+    /// with no file was not on the disk to leave it, and is not an error --
+    /// the caller asked for bytes back and there were none.
+    pub fn delete_pieces(
+        &self,
+        info_hash: &str,
+        pieces: impl IntoIterator<Item = u32>,
+    ) -> anyhow::Result<usize> {
+        let dir = self.torrent_dir(info_hash);
+        let mut removed = 0;
+        for piece in pieces {
+            removed += usize::from(unlink_piece(&dir, piece)?.removed_complete);
+        }
+        Ok(removed)
+    }
+}
+
+/// What one [`unlink_piece`] took.
+struct Unlinked {
+    /// The complete copy went -- the piece really was on the disk.
+    removed_complete: bool,
+    /// Either copy went.
+    removed_anything: bool,
+}
+
+/// Unlink both copies of `piece` under `dir`, a torrent's directory in the
+/// store.
+///
+/// The bucket directory is left behind; it is pruned when the torrent's own
+/// directory goes ([`TorrentStorage::remove_directory_if_empty`]). Removing
+/// it here would be a rmdir per piece against a directory a concurrent write
+/// may have just created and not yet opened its file in.
+fn unlink_piece(dir: &Path, piece: u32) -> anyhow::Result<Unlinked> {
+    let mut unlinked = Unlinked {
+        removed_complete: false,
+        removed_anything: false,
+    };
+    for (path, complete) in [
+        (staging_path(dir, piece), false),
+        (piece_path(dir, piece), true),
+    ] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                unlinked.removed_anything = true;
+                unlinked.removed_complete |= complete;
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(anyhow::Error::new(e)
+                    .context(format!("could not delete piece file {}", path.display())));
+            }
+        }
+    }
+    Ok(unlinked)
+}
+
+/// Every file under `dir`, however deep, as debris.
+///
+/// The store makes no directory below a bucket, so a tree found there is
+/// somebody else's -- but its blocks are on the same volume, and a scan that
+/// stayed silent about them would be inventing exactly the invisible disk
+/// usage one file per piece exists to abolish.
+fn collect_strays(dir: &Path, out: &mut Vec<std::fs::Metadata>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.is_dir() {
+            collect_strays(&entry.path(), out);
+        } else {
+            out.push(metadata);
+        }
+    }
+}
+
+/// A file name in a bucket directory back to the piece it holds and which
+/// copy of it, or `None` when it is not a name this store writes.
+fn piece_of_name(name: &str) -> Option<(u32, bool)> {
+    let (index, staged) = match name.strip_suffix(STAGING_SUFFIX) {
+        Some(index) => (index, true),
+        None => (name, false),
+    };
+    canonical_index(index).map(|piece| (piece, staged))
+}
+
+/// The number a name spells, or `None` when it is not how this store
+/// spells that number.
+///
+/// `str::parse` would accept a leading `+` and leading zeroes; the store
+/// writes neither, so `00`, `+0` and `0` all parse to the same piece while
+/// only the last of them is a name [`piece_path`] would ever produce. Both
+/// halves of a piece's address go through this -- the bucket directory and
+/// the file in it -- because a piece is only *reachable* when both are
+/// spelled the way a delete will spell them. Reporting debris as a piece
+/// would promise bytes back that no delete could take: the delete would
+/// build `<piece / PIECES_PER_DIRECTORY>/<piece>`, find nothing there and
+/// free nothing, while the file sat on the volume being re-found by every
+/// later pass.
+fn canonical_index(name: &str) -> Option<u32> {
+    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if name.len() > 1 && name.starts_with('0') {
+        return None;
+    }
+    name.parse::<u32>().ok()
 }
 
 /// The same path with [`STAGING_SUFFIX`] on it: in the same bucket directory,
@@ -786,18 +1133,18 @@ impl TorrentStorage for PieceStore {
 /// would have written.
 #[derive(Clone)]
 pub struct PieceStoreFactory {
-    root: Arc<PathBuf>,
+    root: StoreRoot,
 }
 
 impl PieceStoreFactory {
-    pub fn new(root: PathBuf) -> Self {
-        Self {
-            root: Arc::new(root),
-        }
+    /// Over one [`StoreRoot`] -- the same type everything else asks about
+    /// the store, so there is one way to say where it is.
+    pub fn new(root: StoreRoot) -> Self {
+        Self { root }
     }
 
     pub fn root(&self) -> &Path {
-        &self.root
+        self.root.path()
     }
 }
 
@@ -827,7 +1174,7 @@ impl StorageFactory for PieceStoreFactory {
     ) -> anyhow::Result<PieceStore> {
         let layout = layout_of(metadata)?;
         Ok(PieceStore::new(
-            self.root.join(shared.info_hash.as_string()),
+            self.root.torrent_dir(&shared.info_hash.as_string()),
             Arc::new(layout),
         ))
     }
@@ -852,7 +1199,7 @@ impl StorageFactory for PieceStoreFactory {
     /// selection and no storage at all. So the promise is kept by two
     /// things together, and neither alone: the store being that default,
     /// and its root being derived from the same `download_dir` librqbit
-    /// persists the session into (`piece_store::root_in`), so the next
+    /// persists the session into (`StoreRoot::in_download_dir`), so the next
     /// process builds a factory over the same directory and finds the same
     /// pieces under the same info hash.
     ///
@@ -1053,6 +1400,265 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The scan is the store's answer to "what is on the disk", and it is
+    /// the only answer anything outside this module gets: the cache cleaner
+    /// counts and evicts from it, so what it omits is disk nothing will ever
+    /// reclaim and what it mis-names is a delete that frees nothing.
+    ///
+    /// Three things it has to get right. Both copies of a piece are **one**
+    /// entry, because `delete_piece` takes them together. A name the store
+    /// would never have written is a stray, reported so the bytes are
+    /// visible and *not* as a piece, since a delete addressed to that index
+    /// would look somewhere else and free nothing. And a torrent it holds
+    /// nothing of stats empty rather than failing.
+    #[test]
+    fn a_scan_reports_both_copies_of_a_piece_as_one_and_names_the_rest_strays() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = StoreRoot::new(tmp.path().join(".pieces"));
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let dir = root.torrent_dir(hash);
+
+        // Piece 0: complete only. Piece 2500 (a different bucket): complete
+        // with a staged copy over it, as a re-download leaves.
+        let store = PieceStore::new(dir.clone(), Arc::new(layout_for(2501)));
+        for path in [
+            store.piece_path(0),
+            store.piece_path(2500),
+            store.staging_path(2500),
+        ] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"0123456789").unwrap();
+        }
+        // Debris, at each depth an interrupted write can leave it.
+        std::fs::write(store.piece_path(0).parent().unwrap().join("notes"), b"x").unwrap();
+        std::fs::write(dir.join("scratch.tmp"), b"xx").unwrap();
+        std::fs::create_dir_all(dir.join("0").join("deeper")).unwrap();
+        std::fs::write(dir.join("0").join("deeper").join("x"), b"xxx").unwrap();
+        // A piece file's name in the wrong bucket: piece 0 lives in bucket
+        // 0, so `delete_piece(0)` would look there and free nothing.
+        std::fs::create_dir_all(dir.join("2")).unwrap();
+        std::fs::write(dir.join("2").join("0"), b"xxxx").unwrap();
+
+        let stored = root.stat(hash);
+        assert_eq!(
+            stored.pieces.iter().map(|p| p.piece).collect::<Vec<_>>(),
+            vec![0, 2500],
+            "one entry per piece, whichever bucket it is in"
+        );
+        assert_eq!(stored.pieces[0].files().count(), 1);
+        assert_eq!(
+            stored.pieces[1].files().count(),
+            2,
+            "the complete copy and the staged one are the same piece"
+        );
+        assert_eq!(
+            stored.strays.len(),
+            4,
+            "every file that is not a piece is still on the disk"
+        );
+        assert_eq!(
+            stored.pieces[0].files().count(),
+            1,
+            "and the misplaced name did not pass itself off as piece 0"
+        );
+
+        // And a scan of the root finds that torrent by the name a caller
+        // addresses it back with.
+        let contents = root.scan();
+        assert_eq!(
+            contents
+                .torrents
+                .iter()
+                .map(|t| t.info_hash.as_str())
+                .collect::<Vec<_>>(),
+            vec![hash]
+        );
+        assert_eq!(contents.torrents[0].pieces.len(), 2);
+
+        // Deleting one piece takes both its copies, and the scan says so.
+        assert!(root.delete_piece(hash, 2500).unwrap());
+        assert_eq!(
+            root.stat(hash)
+                .pieces
+                .iter()
+                .map(|p| p.piece)
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+        assert!(!store.staging_path(2500).exists(), "the staged copy too");
+
+        // A torrent the store holds nothing of is not an error.
+        let empty = root.stat("fedcba9876543210fedcba9876543210fedcba98");
+        assert!(empty.pieces.is_empty() && empty.strays.is_empty());
+    }
+
+    /// Every level of a piece's address is checked for the *spelling* the
+    /// store writes, not merely for the number it parses to.
+    ///
+    /// `<hash>/00/0`, `<hash>/+0/0`, `<hash>/0/00` and `<hash>/0/+0` all
+    /// parse as piece 0, and `delete_piece(hash, 0)` goes to `<hash>/0/0`
+    /// and takes none of them. Reported as piece 0 they are bytes a cleaner
+    /// asks for and never gets: it books them as freed, the disk gives
+    /// nothing, and the next pass re-finds the very same file and books them
+    /// again -- while what a pass reports freed is what decides whether a
+    /// torrent stopped by ENOSPC is restarted. So they are strays: counted,
+    /// because they are occupying the volume, and never offered.
+    #[test]
+    fn a_name_the_store_would_not_have_written_is_debris_however_it_parses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = StoreRoot::new(tmp.path().join(".pieces"));
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let dir = root.torrent_dir(hash);
+
+        // Piece 0, spelled the way the store spells it.
+        let store = PieceStore::new(dir.clone(), Arc::new(layout_for(1)));
+        let real = store.piece_path(0);
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, b"0123456789").unwrap();
+
+        // Debris that parses as piece 0 at one level or the other, each
+        // with its own length so the scan's answer says which is which.
+        let debris = [
+            (dir.join("00").join("0"), 1),
+            (dir.join("+0").join("0"), 2),
+            (dir.join("0").join("00"), 3),
+            (dir.join("0").join("+0"), 4),
+            (dir.join("0").join(format!("00{STAGING_SUFFIX}")), 5),
+        ];
+        for (path, len) in &debris {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, vec![b'x'; *len]).unwrap();
+        }
+
+        let stored = root.stat(hash);
+        assert_eq!(
+            stored.pieces.iter().map(|p| p.piece).collect::<Vec<_>>(),
+            vec![0],
+            "the one piece the store wrote, and nothing that merely parses like it"
+        );
+        assert_eq!(
+            stored.pieces[0].files().count(),
+            1,
+            "not one of them passed itself off as a copy of piece 0"
+        );
+        let mut strays = stored
+            .strays
+            .iter()
+            .map(std::fs::Metadata::len)
+            .collect::<Vec<_>>();
+        strays.sort_unstable();
+        assert_eq!(
+            strays,
+            vec![1, 2, 3, 4, 5],
+            "every one of them is on the disk, so every one of them is counted"
+        );
+
+        // What the scan promised, the delete keeps: piece 0's bytes come
+        // back once, and nothing else does -- so nothing here can be booked
+        // as freed twice.
+        assert!(root.delete_piece(hash, 0).unwrap());
+        assert!(
+            !root.delete_piece(hash, 0).unwrap(),
+            "and asking again frees nothing, which is what the caller counts"
+        );
+        for (path, len) in &debris {
+            assert!(
+                path.is_file(),
+                "{} ({len} bytes) is still there",
+                path.display()
+            );
+        }
+    }
+
+    /// A directory under the root that the store could not have made is
+    /// debris too, for the same reason one level down.
+    ///
+    /// [`StoreRoot::torrent_dir`] lowercases, so `<HASH>` is a directory no
+    /// `delete_piece` can address: reported as a torrent it would be scanned
+    /// *and* stat'd under the lowercase name, counting the real torrent's
+    /// pieces twice and offering a delete that frees nothing.
+    #[test]
+    fn a_torrent_directory_the_store_could_not_have_made_is_counted_and_never_scanned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = StoreRoot::new(tmp.path().join(".pieces"));
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+
+        let store = PieceStore::new(root.torrent_dir(hash), Arc::new(layout_for(1)));
+        let real = store.piece_path(0);
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, b"0123456789").unwrap();
+
+        // The same hash, spelled the way the store never spells it, with a
+        // file of its own inside.
+        let shouting = root.path().join(hash.to_ascii_uppercase()).join("0");
+        std::fs::create_dir_all(&shouting).unwrap();
+        std::fs::write(shouting.join("0"), b"xxx").unwrap();
+
+        let contents = root.scan();
+        assert_eq!(
+            contents
+                .torrents
+                .iter()
+                .map(|t| t.info_hash.as_str())
+                .collect::<Vec<_>>(),
+            vec![hash],
+            "one torrent, not the same one twice"
+        );
+        assert_eq!(contents.torrents[0].pieces.len(), 1);
+        assert_eq!(
+            contents
+                .strays
+                .iter()
+                .map(std::fs::Metadata::len)
+                .collect::<Vec<_>>(),
+            vec![3],
+            "and the bytes under the name nothing can address are still counted"
+        );
+
+        // A name that is not UTF-8 is not an info hash either, and its
+        // bytes are on the same volume. Linux only: a filesystem that
+        // rejects such a name cannot have one to find.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let raw = root
+                .path()
+                .join(std::ffi::OsStr::from_bytes(b"\xff\xfe.pieces"));
+            std::fs::create_dir_all(raw.join("0")).unwrap();
+            std::fs::write(raw.join("0").join("0"), b"xxxx").unwrap();
+
+            let contents = root.scan();
+            assert_eq!(contents.torrents.len(), 1, "still the one torrent");
+            let mut strays = contents
+                .strays
+                .iter()
+                .map(std::fs::Metadata::len)
+                .collect::<Vec<_>>();
+            strays.sort_unstable();
+            assert_eq!(
+                strays,
+                vec![3, 4],
+                "and what is under a name this store cannot even print is counted as well"
+            );
+        }
+    }
+
+    /// A layout wide enough to name `pieces` pieces, for a test that only
+    /// needs the store's paths.
+    fn layout_for(pieces: u32) -> PieceLayout {
+        let piece_length = 8u64;
+        let total = piece_length * u64::from(pieces);
+        PieceLayout::new(
+            piece_length,
+            total,
+            [FileSpec {
+                len: total,
+                padding: false,
+            }],
+        )
+        .expect("layout")
     }
 
     /// The proof that the mapping is right is on the volume, not in our own
@@ -1649,7 +2255,9 @@ mod librqbit_tests {
             .add_torrent(
                 librqbit::AddTorrent::from_bytes(bytes.to_vec()),
                 Some(librqbit::AddTorrentOptions {
-                    storage_factory: Some(PieceStoreFactory::new(root.to_path_buf()).boxed()),
+                    storage_factory: Some(
+                        PieceStoreFactory::new(StoreRoot::new(root.to_path_buf())).boxed(),
+                    ),
                     ..Default::default()
                 }),
             )

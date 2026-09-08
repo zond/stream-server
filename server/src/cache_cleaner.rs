@@ -442,8 +442,14 @@ struct CacheRoots {
     /// The one torrent-data root (`settings.cacheRoot`, as the engine
     /// reports it -- never as the setting spells it). Everything a torrent
     /// puts on disk is under it, so this is the whole of what the cleaner
-    /// walks, counts and evicts from.
+    /// counts and evicts from.
     root: std::path::PathBuf,
+    /// The piece store inside that root. **The cleaner does not walk it.**
+    /// Torrent payload is one file per piece under a directory shape only
+    /// the store knows, so the store is asked what it holds and asked to
+    /// let a piece go; the walk covers the rest of the root -- the proxy
+    /// cache and whatever whole-file downloads an earlier version left.
+    store: enginefs::piece_store::StoreRoot,
     /// The cap for the volume that root is on: the operator's `cacheSize`
     /// against what the filesystem can give (see [`CacheLimit::effective`]).
     /// It used to be one cap per volume, because the removed `downloadsDir`
@@ -454,11 +460,13 @@ struct CacheRoots {
     /// cache to answer a shortage on an external drive it could reclaim
     /// nothing from. With one root there is one volume and one cap.
     limit: CacheLimit,
-    protected_paths: HashSet<std::path::PathBuf>,
-    /// Files to evict before any other -- what a dead torrent left behind
-    /// (`EvictionClasses::dead`). Ordinary cache in every other respect:
-    /// walked, counted, aged; they only sort to the front of the size rule.
-    evict_first: HashSet<std::path::PathBuf>,
+    /// Torrents whose pieces a pass may not take (`EvictionClasses::protected`).
+    protected: HashSet<String>,
+    /// Torrents whose pieces go before any other cache -- what a dead
+    /// torrent left behind (`EvictionClasses::dead`). Ordinary cache in
+    /// every other respect: counted and aged; they only sort to the front
+    /// of the size rule.
+    evict_first: HashSet<String>,
     /// Torrents stopped for want of disk space, to be evicted whole through
     /// the engine when nothing else can go -- see [`evict`].
     stopped: Vec<StoppedTorrent>,
@@ -484,10 +492,9 @@ async fn cache_roots(state: &AppState) -> CacheRoots {
     let stopped = classes
         .stopped_for_space
         .into_iter()
-        .map(|torrent| StoppedTorrent {
+        .map(|info_hash| StoppedTorrent {
             engine: state.engine.clone(),
-            info_hash: torrent.info_hash,
-            paths: torrent.paths.into_iter().collect(),
+            info_hash,
         })
         .collect();
 
@@ -496,21 +503,21 @@ async fn cache_roots(state: &AppState) -> CacheRoots {
             configured,
             available: available_space(&root),
         },
+        store: state.engine.piece_store(),
         root,
-        protected_paths: classes.protected.into_iter().collect(),
+        protected: classes.protected.into_iter().collect(),
         evict_first: classes.dead.into_iter().collect(),
         stopped,
     }
 }
 
 /// A torrent stopped for want of disk space, with the engine that can evict
-/// it whole (`EngineFS::evict_stopped_torrent`) and every path its data can
-/// be at. The walk buckets what it finds under those paths per torrent, so
-/// [`evict`] knows what evicting one would reclaim without walking again.
+/// it whole (`EngineFS::evict_stopped_torrent`). The scan buckets what the
+/// store holds for it separately, so [`evict`] knows what evicting one would
+/// reclaim without asking again.
 struct StoppedTorrent {
     engine: Arc<enginefs::EngineFS>,
     info_hash: String,
-    paths: HashSet<std::path::PathBuf>,
 }
 
 impl StoppedTorrent {
@@ -550,15 +557,16 @@ async fn clean_cache_with_headroom(
             ..EvictionReport::default()
         }
     } else {
-        let stopped: Vec<(String, HashSet<std::path::PathBuf>)> = roots
+        let stopped: Vec<String> = roots
             .stopped
             .iter()
-            .map(|torrent| (torrent.info_hash.clone(), torrent.paths.clone()))
+            .map(|torrent| torrent.info_hash.clone())
             .collect();
         let evictors: Vec<_> = roots.stopped.iter().map(StoppedTorrent::evictor).collect();
         evict(
             &roots.root,
-            &roots.protected_paths,
+            &roots.store,
+            &roots.protected,
             &roots.evict_first,
             &stopped,
             &evictors,
@@ -605,26 +613,57 @@ impl LastEviction {
 }
 
 /// What the cache currently occupies against its configured limit
-/// ([`CacheUsage`]), without touching the filesystem: the same walk
-/// [`evict`] does -- same session-artifact and downloads-dir exclusions,
-/// same occupancy accounting ([`occupied_bytes`]), same protection rule --
-/// but nothing is aged out or evicted. Shared by `routes::cache::cache_usage`
-/// (`ServerHandle::cache_usage` and `GET /cache.json`).
+/// ([`CacheUsage`]), reading exactly what [`evict`] reads: the same
+/// [`WalkInputs`], so there is one implementation of "what the cache
+/// contains" and not two that have to be kept agreeing.
+///
+/// The difference is a rule, not a walk: nothing may age out here (the age
+/// rule is what a pass *acts* on, and this pass acts on nothing), so the
+/// whole of what is on disk is in the total. Shared by
+/// `routes::cache::cache_usage` (`ServerHandle::cache_usage` and
+/// `GET /cache.json`).
 pub(crate) async fn usage(state: &AppState) -> CacheUsage {
     let roots = cache_roots(state).await;
-    // The walk is synchronous filesystem work -- see [`evict`] for why it is
+    let limit = roots.limit;
+    let inputs = WalkInputs {
+        download_dir: roots.root,
+        store: roots.store,
+        protected: roots.protected,
+        // Neither rule this run: nothing is evicted, so nothing has an
+        // order to be evicted in and nothing is set aside for the engine.
+        // A stopped torrent's pieces are counted like any other cache,
+        // which is what they are until a pass decides to take them.
+        evict_first: HashSet::new(),
+        stopped: Vec::new(),
+        max_age: Duration::MAX,
+        now: std::time::SystemTime::now(),
+    };
+    // The scan is synchronous filesystem work -- see [`evict`] for why it is
     // off the runtime -- and a `GET /cache.json` is a request a worker is
     // serving.
-    tokio::task::spawn_blocking(move || {
-        scan_usage(&roots.root, &roots.protected_paths, roots.limit)
-    })
-    .await
-    .unwrap_or_else(|error| {
-        // A panic in the walk, in a debug build; the release profile aborts
-        // the process instead. Nothing to report but that nothing was read.
-        error!("the cache usage scan did not finish: {error}");
-        CacheUsage::default()
-    })
+    tokio::task::spawn_blocking(move || scan_usage(inputs, limit))
+        .await
+        .unwrap_or_else(|error| {
+            // A panic in the scan, in a debug build; the release profile aborts
+            // the process instead. Nothing to report but that nothing was read.
+            error!("the cache usage scan did not finish: {error}");
+            CacheUsage::default()
+        })
+}
+
+/// [`usage`]'s reading, without the `AppState` plumbing: the same
+/// [`WalkInputs::run`] a clean pass makes its decisions from, read as
+/// occupancy against the cap rather than acted on.
+fn scan_usage(inputs: WalkInputs, limit: CacheLimit) -> CacheUsage {
+    let walked = inputs.run();
+    CacheUsage {
+        total_bytes: walked.total_size,
+        limit_bytes: limit
+            .effective(walked.total_size)
+            .filter(|limit| *limit != u64::MAX),
+        protected_bytes: walked.protected_size,
+        protected_files: walked.protected_files,
+    }
 }
 
 /// What a cache root costs on disk, as the cleaner must count it.
@@ -689,61 +728,6 @@ pub struct CacheUsage {
     pub protected_bytes: u64,
     /// How many files that is.
     pub protected_files: usize,
-}
-
-/// The read-only half of [`evict`]'s walk: every payload file's occupancy
-/// and protection status, with nothing aged out or deleted. Mirrors
-/// `evict`'s session-artifact exclusion and protection rule exactly, so
-/// `usage` and a `clean_cache` run right after it agree about what the
-/// cache contains.
-fn scan_usage(
-    download_dir: &std::path::Path,
-    protected_paths: &HashSet<std::path::PathBuf>,
-    limit: CacheLimit,
-) -> CacheUsage {
-    #[cfg(test)]
-    WALKED_ON_THIS_THREAD.set(true);
-    let mut total = 0u64;
-    let mut protected = 0u64;
-    let mut protected_files = 0usize;
-
-    if download_dir.exists() {
-        let mut entries = walkdir::WalkDir::new(download_dir).into_iter();
-
-        loop {
-            match entries.next() {
-                Some(Ok(entry)) => {
-                    if !entry.file_type().is_file() {
-                        continue;
-                    }
-                    let path = entry.path();
-                    if is_session_artifact(path, download_dir) {
-                        continue;
-                    }
-                    let Ok(metadata) = entry.metadata() else {
-                        continue;
-                    };
-                    let size = occupied_bytes(&metadata);
-                    total += size;
-                    if is_path_protected(path, protected_paths) {
-                        protected += size;
-                        protected_files += 1;
-                    }
-                }
-                Some(Err(e)) => {
-                    debug!("Error walking directory: {}", e);
-                }
-                None => break,
-            }
-        }
-    }
-
-    CacheUsage {
-        total_bytes: total,
-        limit_bytes: limit.effective(total).filter(|limit| *limit != u64::MAX),
-        protected_bytes: protected,
-        protected_files,
-    }
 }
 
 /// What one [`evict`] run found and did, in occupancy bytes
@@ -846,18 +830,21 @@ impl EvictionReport {
 /// `headroom` lowers the cap this run evicts to (see [`RECOVERY_HEADROOM`]).
 /// Sizes are occupancy, not apparent length (see [`occupied_bytes`]).
 ///
-/// `download_dir` -- the one torrent-data root -- is walked to the bottom.
-/// Nothing is excluded by *where* it lives; what a run may not touch is
-/// decided by `protected_paths` alone, and that is the only thing between
-/// the cleaner and a download somebody is watching. Whatever must survive
-/// has to be named there -- see `EngineFS::protected_paths`, which covers
-/// live engines and the dormant pins that have no engine to speak for them.
+/// `download_dir` -- the one torrent-data root -- is covered to the bottom,
+/// in two halves: walked, except for the piece store, which is asked (see
+/// [`WalkInputs::run`]). Nothing is excluded by *where* it lives; what a run
+/// may not touch is decided by `protected` alone, and that is the only thing
+/// between the cleaner and a download somebody is watching. Whatever must
+/// survive has to be named there -- see `EngineFS::protected_torrents`,
+/// which covers live engines and the dormant pins that have no engine to
+/// speak for them.
 #[allow(clippy::too_many_arguments)]
 async fn evict<E>(
     download_dir: &std::path::Path,
-    protected_paths: &HashSet<std::path::PathBuf>,
-    evict_first: &HashSet<std::path::PathBuf>,
-    stopped: &[(String, HashSet<std::path::PathBuf>)],
+    store: &enginefs::piece_store::StoreRoot,
+    protected: &HashSet<String>,
+    evict_first: &HashSet<String>,
+    stopped: &[String],
     evictors: &[E],
     limit: CacheLimit,
     headroom: u64,
@@ -878,9 +865,10 @@ where
     // the borrow's poll.
     let walk = WalkInputs {
         download_dir: download_dir.to_path_buf(),
-        protected_paths: protected_paths.clone(),
+        store: store.clone(),
+        protected: protected.clone(),
         evict_first: evict_first.clone(),
-        stopped: stopped.iter().map(|(_, paths)| paths.clone()).collect(),
+        stopped: stopped.to_vec(),
         max_age: Duration::from_secs(30 * 24 * 60 * 60),
         now: std::time::SystemTime::now(),
     };
@@ -902,17 +890,26 @@ where
     // disk has made room whichever rule took it.
     let mut aged_out_bytes = 0u64;
     let mut aged_out_files = 0usize;
-    for (path, size) in aged_out {
-        info!("File older than 30 days, deleting: {:?}", path);
-        if let Err(e) = tokio::fs::remove_file(&path).await {
-            error!("Failed to delete file {:?}: {}", path, e);
-            // Still on the disk, so still counted against the limit.
-            total_size += size;
-        } else {
-            aged_out_bytes += size;
-            aged_out_files += 1;
-            if let Some(parent) = path.parent() {
-                remove_empty_parents(parent, download_dir).await;
+    for (item, size) in aged_out {
+        info!("Older than 30 days, deleting: {}", item);
+        match reclaim(&item, store, download_dir).await {
+            Ok(true) => {
+                aged_out_bytes += size;
+                aged_out_files += 1;
+            }
+            Ok(false) => {
+                debug!("Nothing left to delete for {}", item);
+                // The bytes are not this pass's to claim, and it cannot
+                // tell "another pass took it" from "it is still there and
+                // no delete of ours can reach it". Only the second is
+                // safe to assume, so the size goes back into the total
+                // rather than out of the report as freed.
+                total_size += size;
+            }
+            Err(e) => {
+                error!("Failed to delete {}: {}", item, e);
+                // Still on the disk, so still counted against the limit.
+                total_size += size;
             }
         }
     }
@@ -950,7 +947,7 @@ where
 
         // What a dead torrent left behind first, then oldest first: the
         // walk sorted them.
-        for (path, size, _) in files {
+        for (item, size, _) in files {
             if total_size <= limit {
                 break;
             }
@@ -973,23 +970,24 @@ where
             // which is the whole case the cap exists for.
             if size > limit && !disk_bound {
                 info!(
-                    "cache soft limit exceeded by single retained file: {:?} size={} limit={}",
-                    path, size, limit
+                    "cache soft limit exceeded by single retained file: {} size={} limit={}",
+                    item, size, limit
                 );
                 continue;
             }
 
-            debug!("Deleting old file (size limit): {:?}", path);
-            if let Err(e) = tokio::fs::remove_file(&path).await {
-                error!("Failed to delete file {:?}: {}", path, e);
-            } else {
-                total_size = total_size.saturating_sub(size);
-                freed_space += size;
-                deleted_count += 1;
-
-                if let Some(parent) = path.parent() {
-                    remove_empty_parents(parent, download_dir).await;
+            debug!("Deleting (size limit): {}", item);
+            match reclaim(&item, store, download_dir).await {
+                Ok(true) => {
+                    total_size = total_size.saturating_sub(size);
+                    freed_space += size;
+                    deleted_count += 1;
                 }
+                // Nothing left the disk here, so nothing comes off the
+                // total and nothing goes into what this pass freed; the
+                // rule moves on to the next candidate.
+                Ok(false) => debug!("Nothing left to delete for {}", item),
+                Err(e) => error!("Failed to delete {}: {}", item, e),
             }
         }
 
@@ -1010,7 +1008,7 @@ where
                 if total_size <= limit {
                     break;
                 }
-                let (info_hash, _) = &stopped[i];
+                let info_hash = &stopped[i];
                 let found = &stopped_found[i];
                 match evictors[i](info_hash).await {
                     Ok(true) => {
@@ -1054,42 +1052,78 @@ where
     Ok(report)
 }
 
-/// What [`evict`] hands the blocking pool: the root to walk and the rules to
-/// sort what it finds by. Owned, because the walk runs on another thread.
+/// One thing a pass may reclaim, and -- because the two are reclaimed by
+/// different owners -- which kind it is.
+///
+/// This is the whole of the layering the cleaner sees. A piece is named by
+/// info hash and index and nothing else: the cleaner cannot build its path,
+/// does not know that pieces are bucketed a thousand to a directory, and
+/// unlinks nothing of the store's. It used to walk that tree and
+/// `remove_file` what it found, which put the store's directory shape in
+/// this crate as well as in `enginefs::piece_store`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Reclaimable {
+    /// A file the cleaner walked and unlinks itself: the proxy cache, and
+    /// whatever whole-file downloads an earlier version of this server left
+    /// in the root.
+    File(std::path::PathBuf),
+    /// One piece of one torrent. Deleted by the store
+    /// (`StoreRoot::delete_piece`), which is the only thing that knows where
+    /// it is.
+    Piece { info_hash: String, piece: u32 },
+}
+
+impl std::fmt::Display for Reclaimable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::File(path) => write!(f, "{}", path.display()),
+            Self::Piece { info_hash, piece } => write!(f, "{info_hash} piece {piece}"),
+        }
+    }
+}
+
+/// What [`evict`] hands the blocking pool: the root to walk, the store to
+/// ask, and the rules to sort what they answer by. Owned, because the scan
+/// runs on another thread.
 struct WalkInputs {
     download_dir: std::path::PathBuf,
-    protected_paths: HashSet<std::path::PathBuf>,
-    /// Sorted to the front of the size rule, whatever their age -- see
-    /// [`evict`].
-    evict_first: HashSet<std::path::PathBuf>,
-    /// The paths of each torrent stopped for want of space, in the caller's
-    /// order. Counted into their own buckets ([`Walked::stopped`]), never
-    /// into the evictable files -- the engine, not the walk, deletes those.
-    stopped: Vec<HashSet<std::path::PathBuf>>,
+    store: enginefs::piece_store::StoreRoot,
+    /// Torrents whose pieces may not be taken. Nothing the *walk* finds is
+    /// protected: since the piece store became the session's storage,
+    /// everything a live torrent owns is a piece, and everything else under
+    /// the root is cache with no one to speak for it.
+    protected: HashSet<String>,
+    /// Torrents whose pieces sort to the front of the size rule, whatever
+    /// their age -- see [`evict`].
+    evict_first: HashSet<String>,
+    /// Each torrent stopped for want of space, in the caller's order.
+    /// Counted into their own buckets ([`Walked::stopped`]), never into the
+    /// reclaimable list -- the engine, not the cleaner, takes those.
+    stopped: Vec<String>,
     /// The age rule: a file last modified longer ago than this goes.
     max_age: Duration,
     now: std::time::SystemTime,
 }
 
-/// What the walk found, sorted into what [`evict`] does with it. Sizes are
+/// What the scan found, sorted into what [`evict`] does with it. Sizes are
 /// occupancy ([`occupied_bytes`]).
 struct Walked {
     /// Evictable by the size rule, in the order the rule takes them: what a
     /// dead torrent left behind first, then oldest modification first, with
-    /// the occupancy and modification time of each. A file whose time could
-    /// not be read sorts oldest -- it is counted, and the first of its class
-    /// to go.
-    files: Vec<(std::path::PathBuf, u64, std::time::SystemTime)>,
+    /// the occupancy and modification time of each. Something whose time
+    /// could not be read sorts oldest -- it is counted, and the first of its
+    /// class to go.
+    files: Vec<(Reclaimable, u64, std::time::SystemTime)>,
     /// Past the age rule, to be deleted whatever the size rule says.
-    aged_out: Vec<(std::path::PathBuf, u64)>,
+    aged_out: Vec<(Reclaimable, u64)>,
     /// Occupancy of everything that stays unless the size rule takes it:
     /// `files` plus the protected. The aged-out are *not* in it -- they are
     /// as good as gone -- and `evict` adds one back if its deletion fails.
     total_size: u64,
     protected_size: u64,
     protected_files: usize,
-    /// What lies under each stopped torrent's paths, in [`WalkInputs::stopped`]'s
-    /// order: in `total_size`, in no other class.
+    /// What the store holds for each stopped torrent, in
+    /// [`WalkInputs::stopped`]'s order: in `total_size`, in no other class.
     stopped: Vec<StoppedFound>,
 }
 
@@ -1101,10 +1135,16 @@ struct StoppedFound {
 }
 
 impl WalkInputs {
-    /// The walk itself: synchronous, the whole of the filesystem reading a
+    /// The scan itself: synchronous, the whole of the filesystem reading a
     /// pass does, and nothing else -- no deletion happens here, so the
     /// blocking thread holds no decision the async half has to wait on.
-    /// Mirrors [`scan_usage`]'s exclusion and protection rules exactly.
+    ///
+    /// Two sources, because the root has two kinds of thing in it. The walk
+    /// covers everything but the piece store: the proxy cache, and the
+    /// whole-file downloads an earlier version wrote and nothing migrates.
+    /// The store is *asked* what it holds, and answers in pieces rather than
+    /// in paths -- which is what keeps the bucketed directory shape in
+    /// `enginefs::piece_store` and out of this crate.
     fn run(self) -> Walked {
         #[cfg(test)]
         WALKED_ON_THIS_THREAD.set(true);
@@ -1116,68 +1156,202 @@ impl WalkInputs {
             protected_files: 0,
             stopped: vec![StoppedFound::default(); self.stopped.len()],
         };
-        if self.download_dir.exists() {
-            for entry in walkdir::WalkDir::new(&self.download_dir) {
-                let entry = match entry {
-                    Ok(entry) => entry,
-                    Err(e) => {
-                        debug!("Error walking directory: {}", e);
-                        continue;
-                    }
-                };
-                if !entry.file_type().is_file() {
-                    continue;
-                }
-                let path = entry.path().to_path_buf();
-                if is_session_artifact(&path, &self.download_dir) {
-                    continue;
-                }
-                let Ok(metadata) = entry.metadata() else {
-                    continue;
-                };
-                // Occupancy, not apparent length: librqbit pre-allocates
-                // wanted files at full size.
-                let size = occupied_bytes(&metadata);
-                if is_path_protected(&path, &self.protected_paths) {
-                    walked.total_size += size;
-                    walked.protected_size += size;
-                    walked.protected_files += 1;
-                    continue;
-                }
-                if let Some(i) = self
-                    .stopped
-                    .iter()
-                    .position(|paths| is_path_protected(&path, paths))
-                {
-                    walked.total_size += size;
-                    walked.stopped[i].bytes += size;
-                    walked.stopped[i].files += 1;
-                    continue;
-                }
-                let modified = metadata.modified().ok();
-                let age = modified.map(|modified| {
-                    self.now
-                        .duration_since(modified)
-                        .unwrap_or(Duration::from_secs(0))
-                });
-                if age.is_some_and(|age| age > self.max_age) {
-                    walked.aged_out.push((path, size));
-                } else {
-                    walked.total_size += size;
-                    walked.files.push((
-                        path,
-                        size,
-                        modified.unwrap_or(std::time::SystemTime::UNIX_EPOCH),
-                    ));
-                }
-            }
-        }
-        // The size rule's order: a dead torrent's files first, then oldest
-        // first. The sort is stable, so equal keys keep the walk's order.
-        walked.files.sort_by_key(|(path, _, modified)| {
-            (!is_path_protected(path, &self.evict_first), *modified)
+        self.walk_the_rest(&mut walked);
+        self.ask_the_store(&mut walked);
+        // The size rule's order: a dead torrent's pieces first, then oldest
+        // first. The sort is stable, so equal keys keep the scan's order.
+        let evict_first = &self.evict_first;
+        walked.files.sort_by_key(|(item, _, modified)| {
+            let first = match item {
+                Reclaimable::Piece { info_hash, .. } => evict_first.contains(info_hash),
+                Reclaimable::File(_) => false,
+            };
+            (!first, *modified)
         });
         walked
+    }
+
+    /// Everything under the torrent-data root that is not the piece store.
+    ///
+    /// `filter_entry` prunes the store's directory rather than skipping its
+    /// files one by one: descending into it would be a `statx` per piece for
+    /// a listing the store gives in one pass, and the point is that this
+    /// walk never meets a piece file at all.
+    fn walk_the_rest(&self, walked: &mut Walked) {
+        if !self.download_dir.exists() {
+            return;
+        }
+        let entries = walkdir::WalkDir::new(&self.download_dir)
+            .into_iter()
+            .filter_entry(|entry| !self.store.holds(entry.path()));
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    debug!("Error walking directory: {}", e);
+                    continue;
+                }
+            };
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let path = entry.path().to_path_buf();
+            if is_session_artifact(&path, &self.download_dir) {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            // Occupancy, not apparent length: an earlier version's librqbit
+            // pre-allocated wanted files at full size, and those files are
+            // still here.
+            let size = occupied_bytes(&metadata);
+            self.sort_one(
+                walked,
+                Reclaimable::File(path),
+                size,
+                metadata.modified().ok(),
+            );
+        }
+    }
+
+    /// What the piece store holds, per torrent, as the store reports it.
+    ///
+    /// A protected torrent is counted and set aside; a stopped one is
+    /// counted into its own bucket, because the engine and not the cleaner
+    /// is what may take it; anything else is ordinary cache, one entry per
+    /// piece so the rules act at the granularity reclaim actually has.
+    ///
+    /// A stray -- something in the store that is not a piece file -- is
+    /// counted and never offered up. It is on the disk, so it must show in
+    /// the total or the cache would read smaller than it is; and only
+    /// `piece_store::sweep` can say whether it is debris, so this pass has
+    /// no business unlinking it.
+    fn ask_the_store(&self, walked: &mut Walked) {
+        let contents = self.store.scan();
+        walked.total_size += contents.strays.iter().map(occupied_bytes).sum::<u64>();
+        for torrent in contents.torrents {
+            let stray_bytes: u64 = torrent.strays.iter().map(occupied_bytes).sum();
+            walked.total_size += stray_bytes;
+            if self.protected.contains(&torrent.info_hash) {
+                let bytes: u64 = torrent
+                    .pieces
+                    .iter()
+                    .flat_map(|piece| piece.files())
+                    .map(occupied_bytes)
+                    .sum();
+                let files = torrent.pieces.iter().flat_map(|p| p.files()).count();
+                walked.total_size += bytes;
+                // The strays go in too: no pass can reclaim one, so a
+                // caller told "over the limit and nothing is evictable"
+                // has to see them in what protection holds.
+                walked.protected_size += bytes + stray_bytes;
+                walked.protected_files += files + torrent.strays.len();
+                continue;
+            }
+            if let Some(i) = self
+                .stopped
+                .iter()
+                .position(|info_hash| *info_hash == torrent.info_hash)
+            {
+                for piece in &torrent.pieces {
+                    let bytes: u64 = piece.files().map(occupied_bytes).sum();
+                    walked.total_size += bytes;
+                    walked.stopped[i].bytes += bytes;
+                    walked.stopped[i].files += piece.files().count();
+                }
+                walked.stopped[i].bytes += stray_bytes;
+                walked.stopped[i].files += torrent.strays.len();
+                continue;
+            }
+            for piece in torrent.pieces {
+                let bytes: u64 = piece.files().map(occupied_bytes).sum();
+                let modified = piece.modified();
+                self.sort_one(
+                    walked,
+                    Reclaimable::Piece {
+                        info_hash: torrent.info_hash.clone(),
+                        piece: piece.piece,
+                    },
+                    bytes,
+                    modified,
+                );
+            }
+        }
+    }
+
+    /// The age rule, applied to one reclaimable thing: past it, and it goes
+    /// whatever the size rule says; short of it, it is counted and queued
+    /// for the size rule in modification order.
+    fn sort_one(
+        &self,
+        walked: &mut Walked,
+        item: Reclaimable,
+        size: u64,
+        modified: Option<std::time::SystemTime>,
+    ) {
+        let age = modified.map(|modified| {
+            self.now
+                .duration_since(modified)
+                .unwrap_or(Duration::from_secs(0))
+        });
+        if age.is_some_and(|age| age > self.max_age) {
+            walked.aged_out.push((item, size));
+        } else {
+            walked.total_size += size;
+            walked.files.push((
+                item,
+                size,
+                modified.unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+            ));
+        }
+    }
+}
+
+/// Take one reclaimable thing off the disk, and say whether anything
+/// actually left it.
+///
+/// A walked file the cleaner unlinks itself, pruning the directories the
+/// deletion emptied. A piece it asks the store to delete: the store owns the
+/// layout, so it is the store that knows which files that is and where they
+/// are.
+///
+/// **`Ok(false)` is not success and it is not failure: it is "there were no
+/// bytes here to take".** The walk's answer and the delete's are two
+/// readings of the disk taken a moment apart, and nothing serialises passes
+/// -- a 507'd stream runs a whole `clean_cache` on the request task while
+/// the background loop is in one -- so both may scan the same piece and only
+/// one of them can take it. Whichever loses must not book the bytes: what
+/// `EvictionReport::freed` decides is whether a torrent stopped by ENOSPC is
+/// restarted, and restarting it onto a disk that gained nothing is the loop
+/// `DiskFullRecovery` exists to stop. It is the store's answer, and only the
+/// store's: it is the only source here that reads the disk twice.
+async fn reclaim(
+    item: &Reclaimable,
+    store: &enginefs::piece_store::StoreRoot,
+    download_dir: &std::path::Path,
+) -> std::io::Result<bool> {
+    match item {
+        Reclaimable::File(path) => {
+            // A walked file that is already gone stays an `Err(NotFound)`,
+            // as it has always been: not counted either way, and this arm
+            // has no second reading of the disk to reconcile with the
+            // walk's.
+            tokio::fs::remove_file(path).await?;
+            if let Some(parent) = path.parent() {
+                remove_empty_parents(parent, download_dir).await;
+            }
+            Ok(true)
+        }
+        Reclaimable::Piece { info_hash, piece } => {
+            let store = store.clone();
+            let info_hash = info_hash.clone();
+            let piece = *piece;
+            tokio::task::spawn_blocking(move || store.delete_piece(&info_hash, piece))
+                .await
+                .map_err(std::io::Error::other)?
+                .map_err(std::io::Error::other)
+        }
     }
 }
 
@@ -1234,14 +1408,6 @@ fn is_session_artifact(path: &std::path::Path, root: &std::path::Path) -> bool {
     }
 }
 
-/// A file is protected from eviction when its full path is in `protected` or
-/// when it lives under a protected directory. Uses `Path::starts_with`, which
-/// matches whole path components — so `/dl/Movie2/x.mkv` is NOT shielded by a
-/// protected `/dl/Movie` entry, only a true `/dl/Movie/...` descendant is.
-fn is_path_protected(path: &std::path::Path, protected: &HashSet<std::path::PathBuf>) -> bool {
-    protected.contains(path) || protected.iter().any(|p| path.starts_with(p))
-}
-
 /// Prune the directories a deletion left empty, upwards, stopping at the first
 /// one that is not empty -- and never at `keep`, the torrent-data root
 /// itself. That directory is configuration (`settings.cacheRoot`, prepared at
@@ -1263,16 +1429,55 @@ async fn remove_empty_parents(mut dir: &std::path::Path, keep: &std::path::Path)
 mod tests {
     use super::{
         CACHE_FREE_SPACE_FLOOR, CacheLimit, CleanSchedule, DiskFullRecovery, EvictionReport,
-        LastEviction, WALKED_ON_THIS_THREAD, available_space, evict, is_path_protected,
+        LastEviction, WALKED_ON_THIS_THREAD, WalkInputs, available_space, evict,
         is_session_artifact, occupied_bytes, remove_empty_parents, scan_usage,
     };
+    use enginefs::piece_store::{FileSpec, PieceLayout, PieceStore, StoreRoot};
     use futures_util::future::BoxFuture;
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
     const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
     const OTHER_HASH: &str = "fedcba9876543210fedcba9876543210fedcba98";
+
+    /// The piece store inside a torrent-data root, exactly as the engine
+    /// builds it.
+    fn store(root: &Path) -> StoreRoot {
+        StoreRoot::in_download_dir(root)
+    }
+
+    /// One piece file of `info_hash`, written where the store will find it
+    /// and aged, and its path so a test can say whether it is still there.
+    ///
+    /// Placed through the store's own `PieceStore`, never by spelling the
+    /// bucketed layout out here: a test that hardcoded `<hash>/<n/1000>/<n>`
+    /// would be a second copy of the very knowledge this layering exists to
+    /// keep in one place, and would keep passing after the shape changed
+    /// under it.
+    fn piece_store_for(root: &Path, info_hash: &str, pieces: u32) -> PieceStore {
+        // One file spanning the whole torrent: the layout only has to be
+        // wide enough to name the piece, since nothing here reads through it.
+        let piece_len = 4u64 << 20;
+        let total = piece_len * u64::from(pieces);
+        let layout = PieceLayout::new(
+            piece_len,
+            total,
+            [FileSpec {
+                len: total,
+                padding: false,
+            }],
+        )
+        .unwrap();
+        PieceStore::new(store(root).torrent_dir(info_hash), Arc::new(layout))
+    }
+
+    fn write_piece(root: &Path, info_hash: &str, piece: u32, len: usize, age: Duration) -> PathBuf {
+        let path = piece_store_for(root, info_hash, piece + 1).piece_path(piece);
+        write_aged(&path, &vec![0u8; len], age);
+        path
+    }
 
     #[test]
     fn session_artifacts_are_recognised_at_the_top_level_only() {
@@ -1318,12 +1523,13 @@ mod tests {
     /// in the backend's error state.
     async fn evict_root(
         download_dir: &Path,
-        protected_paths: &HashSet<PathBuf>,
+        protected: &HashSet<String>,
         limit: CacheLimit,
     ) -> anyhow::Result<EvictionReport> {
         evict(
             download_dir,
-            protected_paths,
+            &store(download_dir),
+            protected,
             &HashSet::new(),
             &[],
             &no_evictors(),
@@ -1331,6 +1537,25 @@ mod tests {
             0,
         )
         .await
+    }
+
+    /// The inputs `usage` builds: the same scan a pass makes its decisions
+    /// from, with nothing to age out and no rules to order by.
+    fn usage_inputs(download_dir: &Path, protected: &HashSet<String>) -> WalkInputs {
+        WalkInputs {
+            download_dir: download_dir.to_path_buf(),
+            store: store(download_dir),
+            protected: protected.clone(),
+            evict_first: HashSet::new(),
+            stopped: Vec::new(),
+            max_age: Duration::MAX,
+            now: SystemTime::now(),
+        }
+    }
+
+    /// A protected set of one torrent.
+    fn torrents(hashes: &[&str]) -> HashSet<String> {
+        hashes.iter().map(|hash| hash.to_string()).collect()
     }
 
     /// The shape `evict` takes an evictor in, for a run with none.
@@ -1358,6 +1583,12 @@ mod tests {
     /// literal would be a filesystem assumption, not an assertion.
     fn occupancy(path: &Path) -> u64 {
         occupied_bytes(&std::fs::metadata(path).unwrap())
+    }
+
+    /// What `evict` counted for a set of files, measured before the pass
+    /// took them.
+    fn occupancy_of(paths: &[&Path]) -> u64 {
+        paths.iter().map(|path| occupancy(path)).sum()
     }
 
     /// A limit that `keep` fits under and `keep` + `evictable` does not, so
@@ -1493,30 +1724,14 @@ mod tests {
         assert!(root.path().exists(), "root preserved even when empty");
     }
 
-    #[test]
-    fn is_path_protected_uses_component_wise_prefix() {
-        let mut set = HashSet::new();
-        set.insert(PathBuf::from("/dl/Movie/video.mkv"));
-        set.insert(PathBuf::from("/dl/Series"));
-
-        // Exact protected path.
-        assert!(is_path_protected(Path::new("/dl/Movie/video.mkv"), &set));
-        // A descendant of a protected directory.
-        assert!(is_path_protected(Path::new("/dl/Series/S01/ep1.mkv"), &set));
-        // Component-wise prefix: /dl/Series2 is NOT under /dl/Series.
-        assert!(!is_path_protected(Path::new("/dl/Series2/ep.mkv"), &set));
-        // Wholly unrelated file.
-        assert!(!is_path_protected(Path::new("/dl/Other/x.mkv"), &set));
-    }
-
     /// A plain-file download an earlier version wrote is evictable, because
     /// nothing else will ever reclaim it.
     ///
     /// It is not migrated to the piece store and it is not read: a download
     /// is played from pieces now. Under a root left out of the walk -- as
     /// the separate `downloadsDir` used to be -- such a file would be
-    /// orphaned *and* immortal on the device where space runs out. There is
-    /// one root and all of it is walked, and what survives there survives
+    /// orphaned *and* immortal on the device where space runs out. The one
+    /// root is covered to the bottom, and what survives there survives
     /// because it is protected, not because of where it lives.
     #[tokio::test]
     async fn evict_reclaims_a_plain_file_download_nothing_else_would() {
@@ -1525,12 +1740,10 @@ mod tests {
         let forty_days = Duration::from_secs(40 * 24 * 60 * 60);
         let abandoned = root.join(HASH).join("movie.mkv");
         write_aged(&abandoned, &[0u8; 8192], forty_days);
-        // A dormant pin's folder: no engine speaks for it, so
-        // `EngineFS::protected_paths` names the folder itself.
-        let pinned_folder = root.join(OTHER_HASH);
-        let pinned = pinned_folder.join("kept.mkv");
-        write_aged(&pinned, &[0u8; 8192], forty_days);
-        let protected: HashSet<PathBuf> = HashSet::from([pinned_folder.clone()]);
+        // A dormant pin: no engine speaks for it, so
+        // `EngineFS::protected_torrents` names the torrent itself.
+        let pinned = write_piece(&root, OTHER_HASH, 0, 8192, forty_days);
+        let protected = torrents(&[OTHER_HASH]);
 
         let report = evict_root(&root, &protected, CacheLimit::configured(0))
             .await
@@ -1539,7 +1752,7 @@ mod tests {
             !abandoned.exists(),
             "an old download nothing pins is 40 days of dead weight"
         );
-        assert!(pinned.is_file(), "the dormant pin's folder is protected");
+        assert!(pinned.is_file(), "the dormant pin's pieces are protected");
         assert_eq!(report.protected_files, 1);
         assert!(report.freed >= 8192, "{report:?}");
 
@@ -1580,25 +1793,155 @@ mod tests {
         assert!(root.is_dir(), "but the root itself stays");
     }
 
-    /// A pinned download keeps its engine -- the idle sweeper skips pinned torrents -- so its
-    /// files come through `protected_paths` and neither rule touches them,
-    /// however old they are.
+    /// The cleaner reaches the piece store **only through the store**, and
+    /// this is what that buys.
+    ///
+    /// * A piece and the staged half of a re-download over it are one thing
+    ///   to reclaim, because `StoreRoot::delete_piece` takes them together:
+    ///   the pass reports one deletion, and no half-piece is left behind
+    ///   shadowing nothing.
+    /// * A file in the store the store does not recognise is counted -- it
+    ///   is on the disk, and a cache that under-reports itself is how
+    ///   invisible disk usage starts -- and left alone. Only
+    ///   `piece_store::sweep` can say whether it is debris; a cleaner
+    ///   walking the tree itself would have unlinked it like any other
+    ///   cache file.
+    ///
+    /// The counting half matters as much as the deleting half: while the
+    /// cleaner walked the store *and* asked it, every piece was counted
+    /// twice and the cache read double its size.
     #[tokio::test]
-    async fn evict_keeps_the_files_a_pinned_engine_reports() {
+    async fn the_cleaner_reclaims_the_store_only_through_the_store() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("rqbit-downloads");
         let forty_days = Duration::from_secs(40 * 24 * 60 * 60);
-        let pinned = root.join("Show").join("e1.mkv");
-        write_aged(&pinned, &[0u8; 8192], forty_days);
-        let stale = root.join("Show").join("e2.mkv");
-        write_aged(&stale, &[0u8; 4096], forty_days);
-        let protected: HashSet<PathBuf> = HashSet::from([pinned.clone()]);
+        let pieces = piece_store_for(&root, HASH, 1);
+
+        let complete = write_piece(&root, HASH, 0, 8192, forty_days);
+        let staged = pieces.staging_path(0);
+        write_aged(&staged, &[0u8; 4096], forty_days);
+        // A name the store never wrote, in the bucket beside them.
+        let stray = complete.parent().unwrap().join("notes");
+        write_aged(&stray, &[0u8; 4096], forty_days);
+        // Measured before the pass takes them.
+        let piece_bytes = occupancy_of(&[&complete, &staged]);
+        let stray_bytes = occupancy(&stray);
+
+        let report = evict_root(&root, &HashSet::new(), CacheLimit::configured(0))
+            .await
+            .unwrap();
+
+        assert!(!complete.exists(), "the piece went");
+        assert!(!staged.exists(), "and the staged half of it went with it");
+        assert!(
+            stray.is_file(),
+            "the cleaner unlinks nothing of the store's on its own account"
+        );
+        assert_eq!(
+            report.deleted, 1,
+            "one piece reclaimed, not one file per copy: {report:?}"
+        );
+        assert_eq!(report.freed, piece_bytes);
+        assert_eq!(
+            report.total, stray_bytes,
+            "what is left is exactly the stray, counted once"
+        );
+    }
+
+    /// Two passes over one disk book its bytes once.
+    ///
+    /// Nothing serialises passes: `routes::stream` runs a whole
+    /// `clean_cache` on the request task every time `ensure_download_disk_ready`
+    /// refuses a stream -- i.e. on a full disk, for every 507 -- while the
+    /// background loop is in one of its own. Both scan, both see the same
+    /// piece, and only one of them can take it. What the loser must not do is
+    /// report the bytes as freed: `EvictionReport::freed` is the whole of
+    /// `made_room()`, `DiskFullRecovery` clears its exhausted set on that and
+    /// `restart_from_error` puts the ENOSPC torrents back on a disk that
+    /// gained nothing -- the restart loop the guard exists to stop, with the
+    /// guard unable to latch because every pass "made room". The same total
+    /// is recorded in `LastEviction` and read back as the cache's occupancy.
+    ///
+    /// Both eviction rules are here: the aged-out piece goes by the 30-day
+    /// rule and the fresh ones by the size rule, and each books what it took
+    /// in its own arm.
+    ///
+    /// The assertion is against the disk, not against an expected division
+    /// of labour: whichever pass gets to a piece first, what the volume gave
+    /// up is what the two reports may claim between them.
+    #[test]
+    fn two_passes_over_one_disk_book_its_bytes_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("rqbit-downloads");
+        let pieces = [
+            write_piece(&root, HASH, 0, 8192, Duration::from_secs(40 * 24 * 60 * 60)),
+            write_piece(&root, HASH, 1, 8192, Duration::from_secs(600)),
+            write_piece(&root, HASH, 2, 8192, Duration::from_secs(60)),
+        ];
+        // Measured before the passes take them, and a cap of one piece's
+        // worth so the size rule has work to do and does not read a single
+        // file as bigger than the whole cache.
+        let occupancy: Vec<u64> = pieces.iter().map(|path| occupancy(path)).collect();
+        let limit = CacheLimit::configured(occupancy[0]);
+
+        // One blocking thread, so the filesystem work of the two passes is a
+        // queue: both walks are in it before either delete, which is the
+        // interleaving the race produces on its own, made to happen every
+        // time.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let (first, second) = runtime.block_on(async {
+            let protected = HashSet::new();
+            tokio::join!(
+                evict_root(&root, &protected, limit),
+                evict_root(&root, &protected, limit),
+            )
+        });
+        let (first, second) = (first.unwrap(), second.unwrap());
+
+        let gone: Vec<usize> = (0..pieces.len()).filter(|&i| !pieces[i].exists()).collect();
+        assert!(
+            !gone.is_empty(),
+            "the passes evicted nothing, so there is nothing to have mis-booked: {first:?} / {second:?}"
+        );
+        assert_eq!(
+            first.freed + second.freed,
+            gone.iter().map(|&i| occupancy[i]).sum::<u64>(),
+            "the volume gave these bytes up once, and that is all the two passes may claim between them: {first:?} / {second:?}"
+        );
+        assert_eq!(
+            first.deleted + second.deleted,
+            gone.len(),
+            "one deletion counted per piece that really left: {first:?} / {second:?}"
+        );
+    }
+
+    /// A pinned download keeps its engine -- the idle sweeper skips pinned
+    /// torrents -- so it comes through `protected_torrents` and neither rule
+    /// touches its pieces, however old they are.
+    ///
+    /// The pieces are never unlinked by this crate even when they *are*
+    /// evictable: the store holds the layout, and the cleaner asks it.
+    #[tokio::test]
+    async fn evict_keeps_the_pieces_a_pinned_engine_reports() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("rqbit-downloads");
+        let forty_days = Duration::from_secs(40 * 24 * 60 * 60);
+        let pinned = write_piece(&root, HASH, 0, 8192, forty_days);
+        let stale = write_piece(&root, OTHER_HASH, 7, 4096, forty_days);
+        let protected = torrents(&[HASH]);
 
         evict_root(&root, &protected, CacheLimit::configured(0))
             .await
             .unwrap();
-        assert!(pinned.is_file(), "the pinned file survives the age rule");
-        assert!(!stale.exists(), "its unpinned neighbour does not");
+        assert!(pinned.is_file(), "the pinned piece survives the age rule");
+        assert!(
+            !stale.exists(),
+            "an unprotected torrent's piece does not -- and the store deleted it"
+        );
 
         evict_root(&root, &protected, CacheLimit::configured(1024))
             .await
@@ -1613,7 +1956,7 @@ mod tests {
     /// failed for the space. Ordinary cache -- a film somebody might watch
     /// again -- goes only once those are gone.
     #[tokio::test]
-    async fn a_dead_torrents_files_go_before_anything_else() {
+    async fn a_dead_torrents_pieces_go_before_anything_else() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("rqbit-downloads");
         let old_film = root.join("Old").join("film.mkv");
@@ -1622,17 +1965,17 @@ mod tests {
             &[0u8; 8192],
             Duration::from_secs(7 * 24 * 60 * 60),
         );
-        let dead = root.join("Dead").join("film.mkv");
-        write_aged(&dead, &[0u8; 8192], Duration::from_secs(60));
+        let dead = write_piece(&root, HASH, 0, 8192, Duration::from_secs(60));
         let dead_occupancy = occupancy(&dead);
         let occupied = occupancy(&old_film) + dead_occupancy;
 
         // Room for exactly one of the two: by age alone the old film would
-        // go; the dead torrent's file goes instead.
+        // go; the dead torrent's piece goes instead.
         let report = evict(
             &root,
+            &store(&root),
             &HashSet::new(),
-            &HashSet::from([dead.clone()]),
+            &torrents(&[HASH]),
             &[],
             &no_evictors(),
             CacheLimit::configured(occupied - dead_occupancy / 2),
@@ -1640,50 +1983,48 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(!dead.exists(), "the dead torrent's file went first");
+        assert!(!dead.exists(), "the dead torrent's piece went first");
         assert!(old_film.is_file(), "and the older film stayed");
         assert_eq!(report.deleted, 1);
         assert_eq!(report.freed, dead_occupancy);
 
-        // Its whole directory qualifies, as protection would: a dead
-        // multi-file torrent is named by its folder.
-        let dead_dir = root.join("DeadShow");
-        let e1 = dead_dir.join("e1.mkv");
-        let e2 = dead_dir.join("e2.mkv");
-        write_aged(&e1, &[0u8; 4096], Duration::from_secs(30));
-        write_aged(&e2, &[0u8; 4096], Duration::from_secs(30));
+        // A dead torrent is named once and every piece of it qualifies,
+        // however many there are.
+        let p1 = write_piece(&root, OTHER_HASH, 0, 4096, Duration::from_secs(30));
+        let p2 = write_piece(&root, OTHER_HASH, 2500, 4096, Duration::from_secs(30));
         let report = evict(
             &root,
+            &store(&root),
             &HashSet::new(),
-            &HashSet::from([dead_dir.clone()]),
+            &torrents(&[OTHER_HASH]),
             &[],
             &no_evictors(),
-            CacheLimit::configured(occupancy(&old_film) + occupancy(&e1)),
+            CacheLimit::configured(occupancy(&old_film) + occupancy(&p1)),
             0,
         )
         .await
         .unwrap();
         assert!(old_film.is_file());
-        assert_eq!(report.deleted, 1, "one episode was enough");
+        assert_eq!(report.deleted, 1, "one piece was enough");
         assert!(
-            !(e1.exists() && e2.exists()),
-            "and it came from the dead torrent's folder"
+            !(p1.exists() && p2.exists()),
+            "and it came from the dead torrent"
         );
     }
 
-    /// An evictor standing in for the engine: records the hash and deletes
-    /// the torrent's directory, as `evict_stopped_torrent` would through the
-    /// session, answering `verdict`.
+    /// An evictor standing in for the engine: records the hash and removes
+    /// the torrent's data whole, as `evict_stopped_torrent` would through
+    /// the session, answering `verdict`.
     fn fake_evictor(
-        calls: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-        dir: &Path,
+        calls: &Arc<std::sync::Mutex<Vec<String>>>,
+        root: &Path,
         verdict: bool,
     ) -> impl for<'a> Fn(&'a str) -> BoxFuture<'a, anyhow::Result<bool>> {
         let calls = calls.clone();
-        let dir = dir.to_path_buf();
+        let store = store(root);
         move |hash: &str| {
             calls.lock().unwrap().push(hash.to_string());
-            let dir = dir.clone();
+            let dir = store.torrent_dir(hash);
             Box::pin(async move {
                 if verdict {
                     tokio::fs::remove_dir_all(&dir).await?;
@@ -1709,22 +2050,21 @@ mod tests {
             &[0u8; 8192],
             Duration::from_secs(7 * 24 * 60 * 60),
         );
-        let stopped_dir = root.join("Stopped");
-        let partial = stopped_dir.join("film.mkv");
-        write_aged(&partial, &[0u8; 8192], Duration::from_secs(10));
+        let partial = write_piece(&root, HASH, 0, 8192, Duration::from_secs(10));
         let old_occupancy = occupancy(&old_film);
         let partial_occupancy = occupancy(&partial);
-        let stopped = vec![(HASH.to_string(), HashSet::from([stopped_dir.clone()]))];
-        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stopped = vec![HASH.to_string()];
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
 
         // Over by half the old film: the old film goes, the stopped torrent
         // stays -- with room to resume into.
         let report = evict(
             &root,
+            &store(&root),
             &HashSet::new(),
             &HashSet::new(),
             &stopped,
-            &[fake_evictor(&calls, &stopped_dir, true)],
+            &[fake_evictor(&calls, &root, true)],
             CacheLimit::configured(old_occupancy + partial_occupancy - old_occupancy / 2),
             0,
         )
@@ -1747,17 +2087,18 @@ mod tests {
         // through the engine, and the run ends under.
         let report = evict(
             &root,
+            &store(&root),
             &HashSet::new(),
             &HashSet::new(),
             &stopped,
-            &[fake_evictor(&calls, &stopped_dir, true)],
+            &[fake_evictor(&calls, &root, true)],
             CacheLimit::configured(partial_occupancy / 2),
             0,
         )
         .await
         .unwrap();
         assert_eq!(*calls.lock().unwrap(), vec![HASH.to_string()]);
-        assert!(!stopped_dir.exists());
+        assert!(!partial.exists());
         assert_eq!(report.freed, partial_occupancy);
         assert_eq!(report.deleted, 1);
         assert_eq!(report.total, 0);
@@ -1766,14 +2107,15 @@ mod tests {
 
         // An engine that declines (the torrent restarted or was pinned
         // meanwhile) leaves the run over, and honest about it.
-        write_aged(&partial, &[0u8; 8192], Duration::from_secs(10));
+        write_piece(&root, HASH, 0, 8192, Duration::from_secs(10));
         calls.lock().unwrap().clear();
         let report = evict(
             &root,
+            &store(&root),
             &HashSet::new(),
             &HashSet::new(),
             &stopped,
-            &[fake_evictor(&calls, &stopped_dir, false)],
+            &[fake_evictor(&calls, &root, false)],
             CacheLimit::configured(partial_occupancy / 2),
             0,
         )
@@ -1810,6 +2152,7 @@ mod tests {
         // first, and reports the cap it actually evicted to.
         let report = evict(
             &root,
+            &store(&root),
             &HashSet::new(),
             &HashSet::new(),
             &[],
@@ -1889,9 +2232,9 @@ mod tests {
         assert_eq!(report.shortfall_message(), None, "the cache is not over");
     }
 
-    /// [`scan_usage`] is `usage`'s read-only walk (`usage` itself only adds
-    /// the `AppState` plumbing `evict`'s callers already do). It must count
-    /// a sparse file's occupancy honestly too: a "Storage" screen reading
+    /// [`scan_usage`] is `usage`'s reading (`usage` itself only adds the
+    /// `AppState` plumbing `evict`'s callers already do). It must count a
+    /// sparse file's occupancy honestly too: a "Storage" screen reading
     /// `len()` would report the whole film as cached before a single byte
     /// past its first block had landed on disk.
     #[cfg(unix)]
@@ -1920,7 +2263,10 @@ mod tests {
             return;
         }
 
-        let usage = scan_usage(&root, &HashSet::new(), CacheLimit::configured(0));
+        let usage = scan_usage(
+            usage_inputs(&root, &HashSet::new()),
+            CacheLimit::configured(0),
+        );
 
         assert_eq!(usage.total_bytes, allocated, "occupancy, not len()");
         assert!(
@@ -1939,11 +2285,10 @@ mod tests {
     async fn usage_reports_the_protected_bytes_a_live_engine_holds() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("rqbit-downloads");
-        let pinned = root.join("Pinned").join("movie.mkv");
-        write_aged(&pinned, &[0u8; 8192], Duration::from_secs(600));
+        let pinned = write_piece(&root, HASH, 0, 8192, Duration::from_secs(600));
         let free = root.join("Free").join("e1.mkv");
         write_aged(&free, &[0u8; 4096], Duration::from_secs(600));
-        let protected: HashSet<PathBuf> = HashSet::from([pinned.clone()]);
+        let protected = torrents(&[HASH]);
         let pinned_bytes = occupancy(&pinned);
         let free_bytes = occupancy(&free);
 
@@ -1953,7 +2298,10 @@ mod tests {
         // a distinct, explicit zero-size cap, per `ServerSettings.cache_size`
         // -- `Some(0.0)`, not `None` -- and `CacheUsage` must not blur the
         // two the way `EvictionReport::shortfall_message` does).
-        let usage = scan_usage(&root, &protected, CacheLimit::configured(u64::MAX));
+        let usage = scan_usage(
+            usage_inputs(&root, &protected),
+            CacheLimit::configured(u64::MAX),
+        );
 
         assert_eq!(usage.total_bytes, pinned_bytes + free_bytes);
         assert_eq!(usage.protected_bytes, pinned_bytes);
@@ -1975,9 +2323,9 @@ mod tests {
 
     /// The field condition: downloads land in the very root the engine
     /// streams into, because there is only one. Ordinary streamed cache
-    /// there is reclaimable; a pinned download and the file a live engine is
+    /// there is reclaimable; a pinned download and what a live engine is
     /// writing are not -- and protection is the only thing that tells them
-    /// apart, since the root is walked to the bottom.
+    /// apart, since the root is covered to the bottom.
     #[tokio::test]
     async fn evict_reclaims_unpinned_cache_sharing_the_root_with_downloads() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1986,11 +2334,9 @@ mod tests {
         write_aged(&cold, &[0u8; 4096], Duration::from_secs(7200));
         let warm = root.join("Warm").join("e1.mkv");
         write_aged(&warm, &[0u8; 4096], Duration::from_secs(60));
-        let pinned = root.join("Pinned").join("movie.mkv");
-        write_aged(&pinned, &[0u8; 8192], Duration::from_secs(9000));
-        let live = root.join("Live").join("movie.mkv");
-        write_aged(&live, &[0u8; 8192], Duration::from_secs(9000));
-        let protected: HashSet<PathBuf> = HashSet::from([pinned.clone(), live.clone()]);
+        let pinned = write_piece(&root, HASH, 0, 8192, Duration::from_secs(9000));
+        let live = write_piece(&root, OTHER_HASH, 1, 8192, Duration::from_secs(9000));
+        let protected = torrents(&[HASH, OTHER_HASH]);
 
         let protected_bytes = occupancy(&pinned) + occupancy(&live);
         let cold_bytes = occupancy(&cold);
@@ -2022,11 +2368,9 @@ mod tests {
     async fn evict_says_when_everything_over_the_limit_is_protected() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("rqbit-downloads");
-        let pinned = root.join("Pinned").join("movie.mkv");
-        write_aged(&pinned, &[0u8; 8192], Duration::from_secs(600));
-        let live = root.join("Live").join("movie.mkv");
-        write_aged(&live, &[0u8; 8192], Duration::from_secs(600));
-        let protected: HashSet<PathBuf> = HashSet::from([pinned.clone(), live.clone()]);
+        let pinned = write_piece(&root, HASH, 0, 8192, Duration::from_secs(600));
+        let live = write_piece(&root, OTHER_HASH, 1, 8192, Duration::from_secs(600));
+        let protected = torrents(&[HASH, OTHER_HASH]);
         let protected_bytes = occupancy(&pinned) + occupancy(&live);
         let limit = protected_bytes / 2;
 
@@ -2336,8 +2680,7 @@ mod tests {
         let root = tmp.path().join("rqbit-downloads");
         let stale = root.join("old-show").join("e1.mkv");
         write_aged(&stale, &[0u8; 4096], Duration::from_secs(7200));
-        let recent = root.join("recent.mkv");
-        write_aged(&recent, &[0u8; 4096], Duration::from_secs(60));
+        let recent = write_piece(&root, HASH, 0, 4096, Duration::from_secs(60));
         let stale_occupancy = occupancy(&stale);
         let occupied = stale_occupancy + occupancy(&recent);
 
@@ -2370,10 +2713,10 @@ mod tests {
             "the run reports the cap it enforced, and ended under it"
         );
 
-        // A live torrent's file is still untouchable, whatever the volume
+        // A live torrent's data is still untouchable, whatever the volume
         // says: a full disk may not delete what is being written, and the run
         // reports what protection held rather than a clean that did nothing.
-        let protected: HashSet<_> = [recent.clone()].into_iter().collect();
+        let protected = torrents(&[HASH]);
         let report = evict_root(
             &root,
             &protected,
@@ -2404,8 +2747,7 @@ mod tests {
         let root = tmp.path().join("rqbit-downloads");
         let stale = root.join("last-week").join("film.mkv");
         write_aged(&stale, &[0u8; 4096], Duration::from_secs(20 * 24 * 60 * 60));
-        let live = root.join("tonight").join("film.mkv");
-        write_aged(&live, &[0u8; 4096], Duration::from_secs(60));
+        let live = write_piece(&root, HASH, 0, 4096, Duration::from_secs(60));
         let occupied = occupancy(&stale) + occupancy(&live);
 
         // Free space chosen so the cap lands *below* either file: the volume
@@ -2422,14 +2764,15 @@ mod tests {
             "the point of the test is a file larger than the whole cap"
         );
 
-        let protected: HashSet<_> = [live.clone()].into_iter().collect();
-        let report = evict_root(&root, &protected, squeezed).await.unwrap();
+        let report = evict_root(&root, &torrents(&[HASH]), squeezed)
+            .await
+            .unwrap();
 
         assert!(
             !stale.exists(),
             "the stale film is what there is to reclaim"
         );
-        assert!(live.is_file(), "and a live torrent's file is still not it");
+        assert!(live.is_file(), "and a live torrent's data is still not it");
         assert_eq!(report.freed, occupancy(&live));
         assert!(
             report.made_room(),

@@ -27,6 +27,8 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+use super::store::StoreRoot;
+
 /// What one sweep did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SweepReport {
@@ -133,8 +135,10 @@ fn info_hash_of(name: &str) -> Option<String> {
 /// info hash, are removed too: the root belongs to this store alone, so
 /// anything in it that is not a torrent's pieces is debris from an interrupted
 /// write.
-pub fn sweep_unadopted(root: &Path, adopted: &HashSet<String>) -> SweepReport {
+pub fn sweep_unadopted(root: &StoreRoot, adopted: &HashSet<String>) -> SweepReport {
     let mut report = SweepReport::default();
+    let root = root.path();
+    let store = StoreRoot::new(root.to_path_buf());
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         // No piece root yet is the ordinary first-launch state, not a problem.
@@ -157,15 +161,18 @@ pub fn sweep_unadopted(root: &Path, adopted: &HashSet<String>) -> SweepReport {
         };
         let path = entry.path();
         let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
-        let claimed = is_dir
-            && path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| adopted.contains(name));
+        let name = path.file_name().and_then(|name| name.to_str());
+        let claimed = is_dir && name.is_some_and(|name| adopted.contains(name));
         if claimed {
             continue;
         }
-        let freed = if is_dir { occupancy(&path) } else { 0 };
+        // What the store says is in there, never a walk of our own: the
+        // bucketing is `StoreRoot`'s and this is the same reading the cache
+        // cleaner gets.
+        let freed = match (is_dir, name) {
+            (true, Some(name)) => occupancy(&store.stat(name)),
+            _ => 0,
+        };
         let removed = if is_dir {
             std::fs::remove_dir_all(&path)
         } else {
@@ -186,26 +193,21 @@ pub fn sweep_unadopted(root: &Path, adopted: &HashSet<String>) -> SweepReport {
     report
 }
 
-/// What a directory of piece files occupies, counted the way the cache cleaner
+/// What one torrent's directory occupies, counted the way the cache cleaner
 /// counts: allocated blocks, never apparent length. A piece file written by
 /// one chunk out of many is a hole plus 16 KiB, and reporting the piece's full
 /// length as freed would be a number the disk never gives back.
-fn occupancy(dir: &Path) -> u64 {
-    let mut total = 0u64;
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_dir() {
-            total += occupancy(&entry.path());
-        } else if let Ok(metadata) = entry.metadata() {
-            total += occupied_bytes(&metadata);
-        }
-    }
-    total
+///
+/// Strays included: this is about to remove the directory whole, so what
+/// leaves the disk with it is what it holds, piece file or not.
+fn occupancy(stored: &super::store::StoredTorrent) -> u64 {
+    stored
+        .pieces
+        .iter()
+        .flat_map(|piece| piece.files())
+        .chain(stored.strays.iter())
+        .map(occupied_bytes)
+        .sum()
 }
 
 #[cfg(unix)]
@@ -254,7 +256,7 @@ mod tests {
         piece(&root, ORPHAN, "2", "2500", 8192);
 
         let claimed = claims(&[ADOPTED, DORMANT]);
-        let first = sweep_unadopted(&root, &claimed);
+        let first = sweep_unadopted(&StoreRoot::new(root.clone()), &claimed);
         assert_eq!(first.removed, 1, "the orphan, and only the orphan");
         assert_eq!(first.errors, 0);
         assert!(first.freed_bytes >= 16384, "{first:?}");
@@ -262,7 +264,7 @@ mod tests {
         assert!(root.join(DORMANT).join("3").join("3001").is_file());
         assert!(!root.join(ORPHAN).exists());
 
-        let second = sweep_unadopted(&root, &claimed);
+        let second = sweep_unadopted(&StoreRoot::new(root.clone()), &claimed);
         assert_eq!(
             second,
             SweepReport::default(),
@@ -282,7 +284,7 @@ mod tests {
         std::fs::write(root.join("scratch.tmp"), b"half a write").unwrap();
         std::fs::create_dir_all(root.join("not-a-hash")).unwrap();
 
-        let report = sweep_unadopted(&root, &claims(&[ADOPTED]));
+        let report = sweep_unadopted(&StoreRoot::new(root.clone()), &claims(&[ADOPTED]));
         assert_eq!(report.removed, 2);
         assert_eq!(report.errors, 0);
         assert!(!root.join("scratch.tmp").exists());
@@ -342,7 +344,10 @@ mod tests {
     #[test]
     fn a_store_that_has_never_been_written_is_not_a_problem() {
         let tmp = tempfile::tempdir().unwrap();
-        let report = sweep_unadopted(&tmp.path().join(".pieces"), &claims(&[ADOPTED]));
+        let report = sweep_unadopted(
+            &StoreRoot::new(tmp.path().join(".pieces")),
+            &claims(&[ADOPTED]),
+        );
         assert_eq!(report, SweepReport::default());
     }
 
@@ -353,7 +358,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join(".pieces");
         piece(&root, ORPHAN, "0", "0", 512);
-        let report = sweep_unadopted(&root, &claims(&[ADOPTED, DORMANT]));
+        let report = sweep_unadopted(&StoreRoot::new(root.clone()), &claims(&[ADOPTED, DORMANT]));
         assert_eq!(report.removed, 1);
         assert!(!root.join(ADOPTED).exists());
     }

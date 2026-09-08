@@ -389,7 +389,7 @@ pub(crate) fn line(trigger: Trigger, observed: RunState) -> u64 {
 /// writes to.
 pub struct Volumes {
     /// The folder every torrent's payload is written to -- the piece
-    /// store's root ([`crate::piece_store::root_in`]), which is where the
+    /// store's root ([`crate::piece_store::StoreRoot`]), which is where the
     /// session's default storage puts every byte of every torrent.
     ///
     /// One folder for all of them, and not the per-torrent output folder
