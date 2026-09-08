@@ -2837,6 +2837,39 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             .await;
     }
 
+    /// Mark the torrent as active: librqbit has no session-wide streaming
+    /// mode, so what this can do is stamp the activity, touch the engine
+    /// and ask the reconciler whether the torrent should now be running.
+    ///
+    /// It used to read `if engine.idle_paused.swap(false) && resume()`,
+    /// which on a fresh process is `false && ...` -- dead code after every
+    /// restart, and a restart is exactly when a torrent comes up stopped
+    /// with nothing in this process able to say why.
+    ///
+    /// **The stamp is this call's own, not its caller's.** The name says a
+    /// reader is being opened on this torrent, and [`crate::reconcile::Trigger::PlaybackStart`]
+    /// says only *why* the question is being asked -- `playing` is read
+    /// from the activity registers, which this call does not write. Without
+    /// a stamp the ladder can therefore answer `Stop` for the very torrent
+    /// it was asked to focus: seeding off, registers empty, `idle_for`
+    /// `None`, which the idle arm reads as quiet. It was safe only because
+    /// the one production caller happens to run `on_stream_start` first,
+    /// two lines earlier in `routes::stream`, so the fix belonged here
+    /// rather than in a comment over there asking nobody to swap them.
+    pub async fn focus_torrent(&self, target_info_hash: &str) {
+        let info_hash = target_info_hash.to_lowercase();
+        let Some(engine) = self.get_engine(&info_hash).await else {
+            return;
+        };
+        if engine.handle.manages_playback_lifecycle() {
+            return;
+        }
+        engine.touch();
+        engine.mark_active(self.clock.now_secs());
+        self.reconcile_hash(&info_hash, crate::reconcile::Trigger::PlaybackStart)
+            .await;
+    }
+
     async fn activate_file(
         &self,
         info_hash: &str,
@@ -4727,27 +4760,6 @@ impl BackendEngineFS<LibrqbitBackend> {
     /// The [`Footprint`] in force.
     pub fn footprint(&self) -> Footprint {
         self.backend.footprint()
-    }
-
-    /// Mark the torrent as active: librqbit has no session-wide streaming
-    /// mode, so what this can do is touch the engine and ask the reconciler
-    /// whether the torrent should now be running.
-    ///
-    /// It used to read `if engine.idle_paused.swap(false) && resume()`,
-    /// which on a fresh process is `false && ...` -- dead code after every
-    /// restart, and a restart is exactly when a torrent comes up stopped
-    /// with nothing in this process able to say why.
-    pub async fn focus_torrent(&self, target_info_hash: &str) {
-        let info_hash = target_info_hash.to_lowercase();
-        let Some(engine) = self.get_engine(&info_hash).await else {
-            return;
-        };
-        if engine.handle.manages_playback_lifecycle() {
-            return;
-        }
-        engine.touch();
-        self.reconcile_hash(&info_hash, crate::reconcile::Trigger::PlaybackStart)
-            .await;
     }
 }
 
@@ -9368,6 +9380,39 @@ mod tests {
         // property that makes an abandoned reconcile harmless.
         enginefs.reconcile_tick().await;
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
+    }
+
+    /// A torrent asked to be focused runs, with nothing else registered
+    /// anywhere.
+    ///
+    /// Every condition here says stop: seeding is off, no stream, file
+    /// stream or multi-file selection names this torrent, and it has been
+    /// quiet for the whole grace. `Trigger::PlaybackStart` does not change
+    /// that -- it says why the question is being asked, not that anything
+    /// is playing -- so the stamp `focus_torrent` takes for itself is the
+    /// only thing between this reading and `Decision::Stop` on the very
+    /// torrent the caller named.
+    ///
+    /// It was latent rather than absent because the one production caller
+    /// runs `on_stream_start` two lines earlier (`routes::stream`), which
+    /// does register a stream; a reordering there would have made it live.
+    /// This test is the reason that ordering no longer matters.
+    #[tokio::test(start_paused = true)]
+    async fn focusing_a_torrent_starts_it_with_nothing_else_registered() {
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
+        stop_torrent(&enginefs, TEST_HASH).await;
+        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE + Duration::from_secs(1)).await;
+
+        enginefs.focus_torrent(TEST_HASH).await;
+
+        assert_eq!(
+            run_state_of(&enginefs, TEST_HASH).await,
+            RunState::Live,
+            "the torrent the caller asked to focus is the one the ladder stopped"
+        );
+        assert_eq!(counters.start_torrent.load(Ordering::SeqCst), 1);
     }
 
     /// The statistics snapshot's list of stopped torrents is an
