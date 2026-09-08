@@ -54,12 +54,17 @@
 //! [`librqbit::storage::TorrentStorage`] implementation over the first.
 //! [`sweep`] reconciles the store against the session at launch.
 //!
-//! # Not wired into the session yet, and why
+//! # How it is wired in
 //!
-//! [`store::PieceStoreFactory`] is not passed to librqbit anywhere. Three
-//! things had to be decided in the rqbit fork before it could be, and all
-//! three are about the have-set rather than about storage. Two of them are
-//! settled at the rev this crate pins; one is not.
+//! [`store::PieceStoreFactory`] is the librqbit session's **default** storage
+//! factory ([`crate::backend::librqbit::LibrqbitBackend`]'s
+//! `session_storage_factory`, installed in `open_session`), rooted at
+//! [`root_in`] of the same `download_dir` librqbit persists the session into.
+//! It is passed to no individual add, and that is not a stylistic choice:
+//! three things had to be decided in the rqbit fork before it could be wired
+//! at all, and all three are about the have-set rather than about storage.
+//! Two are settled at the rev this crate pins; one is not, and it is why
+//! [`policy`] is still unwired.
 //!
 //! **Settled: where the have-set comes from.** `initial_check` walks files in
 //! order and, on the first read error in a file, marks the rest of that file
@@ -72,49 +77,56 @@
 //! fail ([`store::MissingPiece`]) rather than return zeroes, or a hash check
 //! would call a hole a verified piece, and it does.
 //!
-//! **Settled: persistence.** `JsonSessionPersistenceStore::update_db` used to
-//! refuse a torrent whose storage factory was not `FilesystemStorageFactory`,
-//! and this session runs with persistence on (`LibrqbitBackend::new` hands it
+//! **Settled: persistence, and why "default" is the only place this can go.**
+//! `JsonSessionPersistenceStore::update_db` used to refuse a torrent whose
+//! storage factory was not `FilesystemStorageFactory`, and this session runs
+//! with persistence on (`LibrqbitBackend::new` hands it
 //! `SessionPersistenceConfig::Json`), so an add with this factory failed
 //! outright. What that refusal was really about is what the record omits: a
 //! `SerializedTorrent` names an output folder and a file selection and no
 //! storage at all, so a restart replays it onto the session's *default*
-//! factory. At the rev this crate pins the type check is gone, and in its
+//! factory. At the rev this crate pins the type check is gone and in its
 //! place is a `StorageFactory::ensure_persistable` promise -- a restart finds
-//! this data again, and the have-bitfield will not outlive it. The filesystem
-//! factory makes it, so the session as it runs today is unchanged.
+//! this data again, and the have-bitfield will not outlive it.
 //!
-//! [`store::PieceStoreFactory`] does not make it yet, and the default is a
-//! refusal rather than a compile error -- so this store is exactly as unwired
-//! as it was, and the first thing to hand it to a torrent gets that refusal at
-//! add time, naming the factory. Making the promise belongs to the wiring
-//! commit rather than to this one, and it is not a formality: what it is about
-//! is the storage a *restart* builds, and a restart replays the record onto
-//! the session's default factory, so this store can only keep it by *being*
-//! that default -- not by being passed to a single add.
+//! [`store::PieceStoreFactory`] makes that promise
+//! ([`store::PieceStoreFactory::ensure_persistable`]) and may only make it
+//! because it is the default and its root is derived from the session's own
+//! `download_dir`: the next process builds a store over the same directory
+//! and finds the same pieces under the same info hash. Handed to a single
+//! add instead, the promise would be a lie the next restart collects on.
 //!
 //! **Settled: reclaim capability.** The rev this crate pins adds a second
 //! factory promise, `StorageFactory::ensure_can_release_pieces`, and
 //! `Session::add_torrent` refuses `AddTorrentOptions::piece_reclaim` on a
 //! factory that does not make it -- because `drop_pieces` frees nothing on a
-//! storage that cannot let one piece go. [`store::PieceStoreFactory`] *does*
-//! make this one: a piece is a file, and releasing it is
+//! storage that cannot let one piece go. [`store::PieceStoreFactory`] makes
+//! this one too: a piece is a file, and releasing it is
 //! [`store::PieceStore::delete_piece`]. That is a statement about the layout
 //! alone, true whether or not this is the default factory, unlike
-//! `ensure_persistable` above. It is why the shipped session -- which runs on
-//! librqbit's filesystem storage, whole files, no reclaim -- adds every
-//! torrent with `piece_reclaim` *off* today (`LibrqbitBackend` asks the
-//! session's storage and finds it cannot release), and `drop_file_pieces`
-//! degrades by name; the day this store is the default the same question
-//! answers yes and reclaim turns on with no other change.
+//! `ensure_persistable` above. Because this store *is* the default, the
+//! session's answer to "can my storage release a piece?" is now yes, so
+//! every add sets `piece_reclaim` and `drop_file_pieces` works. It also means
+//! librqbit restores **every** torrent paused -- the piece-level want-set is
+//! not in the persisted record -- and the engine layer is what starts them
+//! again, once `BackendEngineFS::restore_pinned_downloads` has put the
+//! want-set back (see [`crate::reconcile::Conditions::settled`]).
 //!
-//! Nothing else has a stake in the default factory any more. The client's
-//! activity signal briefly did -- its counters were a storage wrapper around
-//! the default, and this store would have had to go inside it -- until that
+//! **There is no migration, by decision.** A whole-file download an earlier
+//! version wrote is neither converted nor read: the torrent that owns it
+//! comes up with an empty have-set and re-downloads as pieces, and the old
+//! bytes are ordinary cache for `cache_cleaner` to age out. That only works
+//! because `EngineFS::engine_paths` stopped naming the backend's file paths
+//! -- an engine that named them would protect its own superseded copy for as
+//! long as the torrent is in the session.
+//!
+//! Nothing else has a stake in the default factory. The client's activity
+//! signal briefly did -- its counters were a storage wrapper around the
+//! default, and this store would have had to go inside it -- until that
 //! wrapper counted the initial check's read-back of every restored torrent
 //! as traffic. The signal now reads librqbit's own peer counters
-//! ([`crate::traffic`]) and never sees the storage, so this factory can be
-//! the bare default, and its own initial-check reads are nobody's traffic.
+//! ([`crate::traffic`]) and never sees the storage, so this factory is the
+//! bare default, and its own initial-check reads are nobody's traffic.
 //!
 //! **Not settled: a have-bit that is not an announcement.** [`policy`] decides
 //! that only the committed set is advertised and that a window piece is held
@@ -130,10 +142,12 @@
 //! the policy exists to avoid. It is now the only one of the three left, and
 //! nothing in this crate can lift it.
 //!
-//! The first is exercised below rather than assumed: the storage is driven
-//! through a real librqbit session's own initial check. The third cannot be
-//! -- there is no API to observe an announcement separately from a have-bit,
-//! which is the whole of the problem.
+//! The first two are exercised rather than assumed: the storage is driven
+//! through a real librqbit session's own initial check below, and through a
+//! real *persisted* session across a restart in
+//! `backend::librqbit`'s `a_restart_on_the_piece_store_finds_its_data_and_the_reconciler_starts_it`.
+//! The third cannot be -- there is no API to observe an announcement
+//! separately from a have-bit, which is the whole of the problem.
 
 pub mod layout;
 pub mod policy;

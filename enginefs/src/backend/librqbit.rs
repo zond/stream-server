@@ -776,12 +776,13 @@ pub struct LibrqbitBackend {
     /// Decided once, when the session opens, by asking the storage factory
     /// the session hands its torrents ([`session_can_release_pieces`]):
     /// librqbit refuses the option on a storage that cannot release a
-    /// single piece, because with one drop frees nothing, and the session as
-    /// it runs today uses librqbit's filesystem storage, which writes whole
-    /// files and answers no. So today this is `false`, `drop_file_pieces`
-    /// is refused by name, and the delete path degrades as its doc says; it
-    /// becomes `true` the day the piece store is the session's default
-    /// factory, with no other change here.
+    /// single piece, because over one a drop frees nothing. The session's
+    /// default storage is the piece store ([`session_storage_factory`]),
+    /// which can, so this is `true` -- `drop_file_pieces` works, the
+    /// per-file delete re-selects the boundary piece its neighbour shares,
+    /// and every torrent the session *restores* comes back paused for the
+    /// reconciler to start. It was `false` for as long as the session ran on
+    /// librqbit's own whole-file filesystem storage, which answers no.
     piece_reclaim: bool,
     /// The two things that together decide a torrent's live-peer cap (see
     /// [`PeerCaps`]).
@@ -792,6 +793,37 @@ pub struct LibrqbitBackend {
     /// a torrent added during a change ends up with the cap that won, never
     /// with the loser's.
     caps: Mutex<PeerCaps>,
+}
+
+/// The session's default storage: the piece store
+/// ([`crate::piece_store::PieceStoreFactory`]), rooted at
+/// [`crate::piece_store::root_in`] of the same `download_dir` librqbit
+/// persists the session into.
+///
+/// One file per piece, uniformly -- for the streaming cache and for offline
+/// downloads alike; whole `.mkv` files are never produced. It is installed as
+/// the session **default** and is passed to no individual add, which is the
+/// only place it can be: the persisted record a restart replays names an
+/// output folder and a file selection and no storage at all, so the storage a
+/// restored torrent comes back on is whatever the next session's default is.
+/// That is also what lets the factory promise
+/// [`librqbit::storage::StorageFactory::ensure_persistable`], and through
+/// [`librqbit::storage::StorageFactory::ensure_can_release_pieces`] it is
+/// what turns `piece_reclaim` on for every add (see
+/// [`session_can_release_pieces`] and [`LibrqbitBackend::sets_piece_reclaim`]).
+///
+/// The root is inside the cache root on purpose: piece files are cache, and
+/// `cache_cleaner` has to be able to walk, count and evict them.
+///
+/// Note what this does *not* do to a torrent's output folder. librqbit still
+/// records one per torrent and still reports file paths under it -- that is
+/// where a torrent's *name* lives -- but no byte of payload is written there
+/// any more. Data placement is the piece store's root and the info hash,
+/// nothing else, so `EngineFS::engine_paths` names the piece directory and
+/// not those paths.
+fn session_storage_factory(download_dir: &std::path::Path) -> librqbit::storage::BoxStorageFactory {
+    use librqbit::storage::StorageFactoryExt;
+    crate::piece_store::PieceStoreFactory::new(crate::piece_store::root_in(download_dir)).boxed()
 }
 
 /// Whether the storage the session gives a torrent that names none can
@@ -879,8 +911,20 @@ impl LibrqbitBackend {
         let bootstrap_addrs =
             effective_dht_bootstrap_addrs(&dht_bootstrap_nodes, &bootstrap_resolvers).await;
         let mut tuning = tuning;
+        // Built once and handed to every attempt, so the factory the
+        // session actually opened with is the same object
+        // `session_can_release_pieces` is asked about below.
+        let storage = session_storage_factory(&download_dir);
         let session = loop {
-            match Self::open_session(&download_dir, &listen_port, &bootstrap_addrs, &tuning).await {
+            match Self::open_session(
+                &download_dir,
+                &listen_port,
+                &bootstrap_addrs,
+                &tuning,
+                &storage,
+            )
+            .await
+            {
                 Ok(session) => break session,
                 Err(error) if tuning.bind_device.is_some() => {
                     warn!(
@@ -895,9 +939,11 @@ impl LibrqbitBackend {
             }
         };
         let started_with = tuning;
-        // `open_session` installs no `default_storage_factory` (see there),
-        // so the storage asked here is librqbit's own filesystem storage.
-        let piece_reclaim = session_can_release_pieces(None);
+        // The very factory `open_session` installed, asked the question
+        // itself rather than answered from its type -- see
+        // `session_can_release_pieces`. It says yes (a piece is a file), so
+        // every add here sets `piece_reclaim`.
+        let piece_reclaim = session_can_release_pieces(Some(&storage));
         let deferred_selections: DeferredSelections = Default::default();
         let pinned_files: PinnedFiles = Default::default();
         let reported_errors: ReportedErrors = Default::default();
@@ -1002,6 +1048,7 @@ impl LibrqbitBackend {
         listen_port: &TorrentListenPort,
         bootstrap_addrs: &[String],
         tuning: &SessionTuning,
+        storage: &librqbit::storage::BoxStorageFactory,
     ) -> Result<Arc<Session>> {
         let upnp_forwarding = listen_port.wants_upnp_forwarding();
         let mut last_err = None;
@@ -1071,11 +1118,15 @@ impl LibrqbitBackend {
                 // change waits for the next start.
                 peer_limit: tuning.peer_limit,
                 bind_device_name: tuning.bind_device.clone(),
-                // No `default_storage_factory`: librqbit's own filesystem
-                // storage. The default factory is the one a restored
-                // torrent comes back on -- the persisted record names no
-                // storage -- so when the piece store is wired in it goes
-                // here, as the default, and nowhere else.
+                // The piece store, as the session's default and nowhere
+                // else. The default factory is the one a *restored* torrent
+                // comes back on -- the persisted record names an output
+                // folder and a file selection and no storage -- so a store
+                // handed to individual adds could not keep
+                // `StorageFactory::ensure_persistable`'s promise across a
+                // restart, and `PieceStoreFactory` makes that promise
+                // precisely because it is installed here.
+                default_storage_factory: Some(storage.clone_box()),
                 ..Default::default()
             };
             match Session::new_with_opts(download_dir.to_path_buf(), session_opts).await {
@@ -6914,6 +6965,179 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// The same restart over the storage the shipped session actually runs:
+    /// `PieceStoreFactory` as the session's **default** factory, persistence
+    /// on, and a torrent whose data was fetched from a real peer into the
+    /// piece store.
+    ///
+    /// Three things that only hold together are asserted here, and none of
+    /// them is provable over the filesystem shim the test above uses.
+    ///
+    /// **The add is accepted at all.** A persistent session asks
+    /// `StorageFactory::ensure_persistable` of the factory a torrent will be
+    /// stored on, and refuses the add when it bails -- which is what this
+    /// factory did while it was not the default. So the first run's add
+    /// failing is what the promise costs if it is taken back.
+    ///
+    /// **The promise is kept.** The restart brings the torrent back complete
+    /// with no peer anywhere: the record librqbit replays names an output
+    /// folder and a file selection and no storage, so the pieces are found
+    /// only because the next process's default factory is a store over the
+    /// same root. Nothing here is asked whether it thinks it persisted --
+    /// the test takes the seeder away and reads what the torrent has.
+    ///
+    /// **The restored torrent is paused, and the reconciler is what starts
+    /// it.** This factory can release a piece, so every add sets
+    /// `piece_reclaim`, and librqbit restores such a torrent paused whatever
+    /// it was doing at shutdown. Before `restore_pinned_downloads` the
+    /// ladder answers `Stop` (the want-set is not back); after it, `Run`.
+    /// Asserted on `run_state`, never on `is_paused()`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restart_on_the_piece_store_finds_its_data_and_the_reconciler_starts_it() {
+        use crate::backend::TorrentBackend;
+        use librqbit::storage::StorageFactoryExt;
+        let tmp = tempfile::tempdir().unwrap();
+
+        let content = tmp.path().join("content");
+        tokio::fs::create_dir_all(&content).await.unwrap();
+        write_payload(&content.join("movie.bin"), 256 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&content.join("movie.bin")).await;
+
+        let client_dir = tmp.path().join("client");
+        // The same root `session_storage_factory` derives in production, so
+        // both processes build a store over the same directory -- which is
+        // the other half of what makes the promise keepable.
+        let pieces = crate::piece_store::root_in(&client_dir);
+        let opts = || TestSessionOptions {
+            default_storage: Some(
+                crate::piece_store::PieceStoreFactory::new(pieces.clone()).boxed(),
+            ),
+            persist: true,
+            listen_loopback: true,
+        };
+
+        // First run: fetch the whole torrent from a seeder into the store.
+        let hash = {
+            let (backend, restored) =
+                LibrqbitBackend::new_for_tests_with(client_dir.clone(), opts())
+                    .await
+                    .unwrap();
+            assert!(
+                backend.sets_piece_reclaim(),
+                "a store that is one file per piece can release one"
+            );
+            assert!(restored.is_empty(), "nothing to restore yet");
+            let client_addr = backend
+                .session
+                .listen_addr()
+                .expect("the client listens for the seeder");
+            let handle = backend
+                .add_torrent(TorrentSource::Bytes(torrent_bytes.clone()), vec![])
+                .await
+                .expect("a persistent session accepts the piece store");
+            handle.handle.wait_until_initialized().await.unwrap();
+
+            let seeder = librqbit::Session::new_with_opts(
+                content.clone(),
+                librqbit::SessionOptions {
+                    dht: None,
+                    persistence: None,
+                    listen: Some(librqbit::ListenerOptions {
+                        listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seeder session");
+            seeder
+                .add_torrent(
+                    librqbit::AddTorrent::from_bytes(bytes::Bytes::from(torrent_bytes.clone())),
+                    Some(librqbit::AddTorrentOptions {
+                        paused: false,
+                        output_folder: Some(content.to_str().unwrap().to_owned()),
+                        overwrite: true,
+                        initial_peers: Some(vec![client_addr]),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .expect("seeder add");
+
+            let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
+            loop {
+                if handle.handle.stats().finished {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the torrent never finished downloading into the store: {}",
+                    handle.handle.stats()
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            // No whole file anywhere: the payload is piece files, and the
+            // output folder librqbit records for the torrent holds none of
+            // it. This is what the cache cleaner's protected set had to
+            // stop naming.
+            assert!(
+                !client_dir.join("movie.bin").exists(),
+                "the piece store produces no whole file"
+            );
+            let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
+            let session_json = client_dir.join("session.json");
+            while !session_json.exists() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(session_json.exists(), "the session was persisted");
+            handle.info_hash.clone()
+        };
+
+        // Restart, with no seeder reachable at all: whatever the torrent has
+        // now, it read off this disk.
+        let (backend, restored) = LibrqbitBackend::new_for_tests_with(client_dir.clone(), opts())
+            .await
+            .unwrap();
+        assert_eq!(restored.len(), 1, "the torrent came back");
+        restored[&hash]
+            .handle
+            .wait_until_initialized()
+            .await
+            .unwrap();
+
+        let mut efs = crate::BackendEngineFS::new_with_backend(
+            backend,
+            restored,
+            client_dir.join("cache"),
+            client_dir.clone(),
+        );
+        efs.set_free_space_probe(|_| Ok(u64::MAX));
+
+        assert_eq!(
+            efs.reconcile_tick().await,
+            vec![(hash.clone(), crate::reconcile::Decision::Stop)],
+            "a reclaim torrent restores paused and stays there until its \
+             want-set is back"
+        );
+        let engine = efs.get_engine(&hash).await.expect("the restored engine");
+        assert_eq!(engine.handle.run_state(), RunState::Paused);
+
+        efs.restore_pinned_downloads().await;
+        assert_eq!(
+            efs.reconcile_tick().await,
+            vec![(hash.clone(), crate::reconcile::Decision::Run)]
+        );
+        assert_eq!(engine.handle.run_state(), RunState::Live);
+
+        // And the data is all still here, off the disk alone.
+        let stats = engine.handle.handle.stats();
+        assert!(
+            stats.finished && stats.progress_bytes == stats.total_bytes,
+            "the restart found every piece again: {stats}"
+        );
     }
 
     /// The other side of that restart, and the one nothing on this branch

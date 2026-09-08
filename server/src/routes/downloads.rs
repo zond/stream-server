@@ -21,7 +21,14 @@ use std::collections::BTreeMap;
 pub struct DownloadInfo {
     pub info_hash: String,
     pub file_idx: usize,
-    /// Where the file is (or will be) on disk, when the engine knows.
+    /// Where the torrent's placement puts this file, when the engine knows.
+    ///
+    /// **A name, not a file.** Torrent data is stored one file per piece
+    /// (`enginefs::piece_store`), so no whole file is ever produced at this
+    /// path and nothing should try to open it; the bytes come out of the
+    /// media routes. It is still what identifies a download's placement --
+    /// `<downloadsDir>/<info hash>/<name in the torrent>` for a pin -- and
+    /// it is what `download_path` and the listing agree on.
     pub path: Option<String>,
     pub name: String,
     pub length: u64,

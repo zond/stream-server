@@ -798,18 +798,26 @@ impl StorageFactory for PieceStoreFactory {
         Ok(())
     }
 
-    // ensure_persistable stays the trait's default -- a bail naming this
-    // factory -- deliberately, and it is not the same promise as the one
-    // above. It asks whether a *restart* finds the data again, and a
-    // restart replays the persisted record onto the session's *default*
-    // factory (the record names an output folder and a file selection, no
-    // storage), so this store can only keep that promise by *being* that
-    // default. It is not wired in as the default yet (see the module doc's
-    // "Not wired into the session yet"), so promising persistability now
-    // would have a persistent session accept an add whose data the next
-    // restart would look for on the filesystem factory and not find. The
-    // wiring commit that makes this the default is what may make the
-    // promise.
+    /// Yes, and only because this is now the session's *default* factory
+    /// (`LibrqbitBackend::open_session`). It is a different promise from
+    /// [`Self::ensure_can_release_pieces`] above, which is about the layout
+    /// alone: this one asks whether a **restart** finds the data again, and
+    /// a restart replays the persisted record onto the session's default
+    /// factory -- a `SerializedTorrent` names an output folder and a file
+    /// selection and no storage at all. So the promise is kept by two
+    /// things together, and neither alone: the store being that default,
+    /// and its root being derived from the same `download_dir` librqbit
+    /// persists the session into (`piece_store::root_in`), so the next
+    /// process builds a factory over the same directory and finds the same
+    /// pieces under the same info hash.
+    ///
+    /// While this was not the default it was a bail naming this factory,
+    /// deliberately -- promising persistability then would have had a
+    /// persistent session accept an add whose data the next restart would
+    /// look for on the filesystem factory and not find.
+    fn ensure_persistable(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     fn clone_box(&self) -> librqbit::storage::BoxStorageFactory {
         use librqbit::storage::StorageFactoryExt;

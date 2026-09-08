@@ -125,10 +125,14 @@ pub trait TorrentBackend: Send + Sync {
     /// and the engine layer starts it again once the want-set is back
     /// (`BackendEngineFS::restore_pinned_downloads`, which is what marks
     /// each restored engine settled -- see
-    /// [`crate::reconcile::Conditions::settled`]). The default is `false`
-    /// (a backend whose storage keeps whole files cannot reclaim, and its
-    /// restored torrents keep whatever paused state they had), which is also
-    /// how the shipped session runs today.
+    /// [`crate::reconcile::Conditions::settled`]).
+    ///
+    /// The shipped session answers **true**: its default storage is the
+    /// piece store, one file per piece, and releasing a piece is deleting
+    /// its file. So every torrent comes back paused on every restart, and
+    /// nothing but the reconciler starts one. The default here is `false`,
+    /// for a backend whose storage keeps whole files: it cannot reclaim, and
+    /// its restored torrents keep whatever paused state they had.
     fn sets_piece_reclaim(&self) -> bool {
         false
     }

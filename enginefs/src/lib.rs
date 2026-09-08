@@ -2274,13 +2274,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
 
     /// What the cache cleaner may not evict.
     ///
-    /// Every registry engine's files -- bar a dead one's, see
-    /// [`Self::eviction_classes`] -- at the path the backend reports
-    /// (`TorrentHandle::file_path`, or the output folder joined with the
-    /// file's name when the backend knows the folder but not the path),
-    /// `<download_dir>/<name>` for a backend that knows neither. A torrent
-    /// without a file list yet protects its output folder (or
-    /// `<download_dir>/<name>`).
+    /// Every registry engine's data -- bar a dead one's, see
+    /// [`Self::eviction_classes`] -- which is its directory in the piece
+    /// store and nothing else ([`Self::engine_paths`], where the "and
+    /// nothing else" is argued: the backend's file paths hold no byte any
+    /// more, and naming them would make an old whole-file download immortal).
     ///
     /// Plus the placement folder of every *dormant* pin. Those have no engine
     /// -- that is what dormant means -- so nothing above would name them, and
@@ -2293,12 +2291,13 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// root under a folder named by metadata a dormant pin does not have, and
     /// is protected by nothing.
     ///
-    /// Plus, for both, the torrent's directory in the piece store. It does
-    /// not exist yet -- nothing hands librqbit a
-    /// [`crate::piece_store::PieceStoreFactory`] -- and naming it costs one
-    /// path that matches nothing. Leaving it out costs the film somebody is
-    /// watching: the store's root is inside the cache root on purpose, so
-    /// every piece in it is walked, and a wiring commit that forgot this
+    /// Plus, for both, the torrent's directory in the piece store -- which
+    /// since [`crate::piece_store::PieceStoreFactory`] became the session's
+    /// default storage is where *all* of a torrent's data is, the streaming
+    /// cache and an offline download alike. It is the whole of what an
+    /// engine protects now (see [`Self::engine_paths`], which no longer
+    /// names the backend's file paths): the store's root is inside the cache
+    /// root on purpose, so every piece in it is walked, and leaving it out
     /// would make live piece data evictable mid-playback with nothing to
     /// notice it.
     ///
@@ -2365,38 +2364,35 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         classes
     }
 
-    /// Every path `engine`'s data can be at: its directory in the piece store
-    /// first (that placement is this layer's own, whatever the backend
-    /// reports), then each file at the path the backend gives, or the best
-    /// guess from the output folder when it gives none.
+    /// Every path `engine`'s data is at, which since the piece store became
+    /// the session's default storage is one directory:
+    /// `<cacheRoot>/.pieces/<info hash>`.
+    ///
+    /// It used to name the backend's file paths as well -- `<output
+    /// folder>/<relative name>` for every file of the torrent. Those paths
+    /// still exist as *names* (librqbit records an output folder per torrent
+    /// and reports file paths under it) and no byte of payload is written to
+    /// them any more: `PieceStore` resolves every `(file_id, offset)` into
+    /// piece files and pre-allocates nothing, so the output folder of a
+    /// torrent added on this session holds no data at all.
+    ///
+    /// Naming them anyway is not free, and the cost is the migration. There
+    /// is no migration by decision -- a plain-file download written by an
+    /// earlier version is left where it is and re-downloaded as pieces if it
+    /// is wanted again -- and the only thing that then reclaims those bytes
+    /// is the cache cleaner. Protection is `starts_with`, so an engine that
+    /// went on naming `<cacheRoot>/<name>/<file>` would hold the old whole-file
+    /// copy of its own data protected for as long as the torrent is in the
+    /// session: orphaned *and* immortal, which is the failure the cleaner was
+    /// taught to walk `downloadsDir` to avoid. So the engine speaks for the
+    /// bytes it actually has, and the bytes it does not are ordinary cache.
     ///
     /// Factored out of [`Self::protected_paths`] because a relocation has to
     /// name exactly this set for an engine that has just left the registry:
-    /// the source of the copy is as evictable as the destination while the
-    /// move runs, and half of a download arriving is the same loss as none.
+    /// the piece directory is as evictable as the folder being written into
+    /// while the move runs, and it holds the whole of the torrent's data.
     async fn engine_paths(&self, engine: &Arc<Engine<B::Handle>>) -> Vec<std::path::PathBuf> {
-        let mut paths =
-            vec![crate::piece_store::root_in(&self.download_dir).join(&engine.info_hash)];
-        let stats = engine.get_statistics().await;
-        let folder = engine
-            .handle
-            .output_folder()
-            .filter(|folder| *folder != self.download_dir);
-        if stats.files.is_empty() {
-            paths.push(folder.unwrap_or_else(|| self.download_dir.join(&stats.name)));
-            return paths;
-        }
-        for (idx, file) in stats.files.iter().enumerate() {
-            let path = match engine.handle.file_path(idx).await {
-                Some(path) => path,
-                None => folder
-                    .as_deref()
-                    .unwrap_or(&self.download_dir)
-                    .join(&file.path),
-            };
-            paths.push(path);
-        }
-        paths
+        vec![crate::piece_store::root_in(&self.download_dir).join(&engine.info_hash)]
     }
 
     /// Info hashes of torrents the backend stopped because the volume they
@@ -6718,12 +6714,10 @@ mod tests {
                 "the destination being written into: {protected:?}"
             );
             assert!(
-                protected.contains(&show.join("video-0.mkv")),
-                "the source being copied out of: {protected:?}"
-            );
-            assert!(
                 protected.contains(&pieces.join(TEST_HASH)),
-                "and the pieces, at either end: {protected:?}"
+                "and the source being copied out of, which since the piece \
+                 store became the default is the whole of the torrent's \
+                 data at either end: {protected:?}"
             );
             enginefs.backend.relocate_hold.add_permits(1);
         };
@@ -6734,10 +6728,11 @@ mod tests {
         // for the data again -- the relocation's own entry is not left behind
         // to protect a folder nothing is using.
         let after = enginefs.protected_paths().await;
-        assert!(after.contains(&downloads.join(TEST_HASH).join("video-0.mkv")));
-        assert!(
-            !after.contains(&show.join("video-0.mkv")),
-            "the source it moved off is cache again: {after:?}"
+        assert_eq!(
+            after,
+            vec![pieces.join(TEST_HASH)],
+            "the successor engine protects the pieces, and the destination \
+             folder the relocation was holding open is not left protected"
         );
     }
 
@@ -7171,8 +7166,8 @@ mod tests {
     }
 
     /// A torrent the backend stopped with an error nothing will retry is
-    /// dead, and its files are the cleaner's to take first -- they used to
-    /// be protected like a live engine's, which on a full television kept
+    /// dead, and its data is the cleaner's to take first -- it used to be
+    /// protected like a live engine's, which on a full television kept
     /// 700 MB of two dead torrents' bytes from every later stream. One that
     /// died of a full disk is not dead (the cleaner's recovery restarts it
     /// once there is room), and a pinned one stays protected however it
@@ -7182,11 +7177,7 @@ mod tests {
         let (enginefs, counters) = test_enginefs_with_file_count(2);
         let root = enginefs.download_dir.clone();
         let pieces = crate::piece_store::root_in(&root).join(TEST_HASH);
-        let files = vec![
-            pieces.clone(),
-            root.join("video-0.mkv"),
-            root.join("video-1.mkv"),
-        ];
+        let files = vec![pieces.clone()];
 
         let live = enginefs.eviction_classes().await;
         assert_eq!(live.protected, files, "a live torrent is protected");
@@ -7266,50 +7257,61 @@ mod tests {
         );
     }
 
-    /// The cleaner's protected paths are where the files really are: the
-    /// backend's `file_path` (its output folder -- `<root>/<torrent name>`
-    /// for a multi-file torrent in the cache root, `<downloadsDir>/<hash>`
-    /// for a placed one), not `<root>/<relative name>`, which for a
-    /// multi-file torrent names a file that does not exist while the real
-    /// one goes unprotected. The engine's piece-store directory comes first
-    /// whatever the backend reports, since the store's placement is this
-    /// layer's own and not the backend's.
+    /// An engine protects its piece directory and nothing else, wherever
+    /// the backend says its files are.
+    ///
+    /// This used to be the other way round -- the protected set was the
+    /// backend's `file_path` per file, plus the piece directory -- and it had
+    /// to be, while the session wrote whole files. It cannot stay that way
+    /// now that the piece store is the default: `<output folder>/<name>` is
+    /// still a name the backend reports and is no longer a byte the torrent
+    /// owns, and there is deliberately no migration, so the whole-file copy
+    /// an earlier version wrote is sitting at exactly that path with nothing
+    /// but the cache cleaner ever going to reclaim it. Protection is
+    /// `starts_with`: an engine that named it would keep its own superseded
+    /// data alive for as long as the torrent is in the session, orphaned and
+    /// immortal both.
+    ///
+    /// So the walk is asked over three output folders the backend might
+    /// report -- none, a per-torrent one in the cache root, a placed one
+    /// under a downloads dir -- and the answer is the same one directory
+    /// every time.
     #[tokio::test]
-    async fn protected_paths_follow_the_backend_output_folder() {
+    async fn an_engine_protects_its_pieces_and_not_the_files_it_used_to_write() {
         let (enginefs, counters) = test_enginefs_with_file_count(2);
         let root = enginefs.download_dir.clone();
         let pieces = crate::piece_store::root_in(&root).join(TEST_HASH);
 
-        // Backend without a folder or path: the historical root join.
-        assert_eq!(
-            enginefs.protected_paths().await,
-            vec![
-                pieces.clone(),
-                root.join("video-0.mkv"),
-                root.join("video-1.mkv")
-            ]
-        );
+        // The whole-file copy an earlier version of this server would have
+        // written, at the path the backend reports for file 0.
+        let legacy = root.join("show").join("video-0.mkv");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, b"a film nothing reads any more").unwrap();
 
-        let show = root.join("show");
-        *counters.output_folder.lock().unwrap() = Some(show.clone());
-        assert_eq!(
-            enginefs.protected_paths().await,
-            vec![
-                pieces.clone(),
-                show.join("video-0.mkv"),
-                show.join("video-1.mkv")
-            ]
-        );
+        for folder in [
+            None,
+            Some(root.join("show")),
+            Some(std::path::PathBuf::from("/offline").join(TEST_HASH)),
+        ] {
+            *counters.output_folder.lock().unwrap() = folder.clone();
+            assert_eq!(
+                enginefs.protected_paths().await,
+                vec![pieces.clone()],
+                "output folder {folder:?}"
+            );
+        }
 
-        let placed = std::path::PathBuf::from("/offline").join(TEST_HASH);
-        *counters.output_folder.lock().unwrap() = Some(placed.clone());
-        assert_eq!(
-            enginefs.protected_paths().await,
-            vec![
-                pieces,
-                placed.join("video-0.mkv"),
-                placed.join("video-1.mkv")
-            ]
+        assert!(
+            legacy.is_file(),
+            "the bytes are still there -- there is no migration"
+        );
+        assert!(
+            !enginefs
+                .protected_paths()
+                .await
+                .iter()
+                .any(|path| legacy.starts_with(path)),
+            "and nothing protects them from the cleaner"
         );
     }
 
@@ -8384,11 +8386,7 @@ mod tests {
     async fn a_torrent_stopped_for_space_is_listed_whole_for_the_cleaner() {
         let (mut enginefs, counters) = test_enginefs_with_file_count(2);
         let root = enginefs.download_dir.clone();
-        let files = vec![
-            crate::piece_store::root_in(&root).join(TEST_HASH),
-            root.join("video-0.mkv"),
-            root.join("video-1.mkv"),
-        ];
+        let files = vec![crate::piece_store::root_in(&root).join(TEST_HASH)];
         let whole = StoppedTorrent {
             info_hash: TEST_HASH.to_string(),
             paths: files.clone(),

@@ -1322,6 +1322,124 @@ fn real_torrent(dir: &std::path::Path) -> (Vec<u8>, String) {
     })
 }
 
+/// Pre-seed a whole torrent's data where the server actually reads it: the
+/// piece store. See [`seed_piece_store_files`] for the rules.
+fn seed_piece_store(cache_root: &std::path::Path, torrent_bytes: &[u8], content: &std::path::Path) {
+    seed_piece_store_files(cache_root, torrent_bytes, content, None);
+}
+
+/// Pre-seed a torrent's data one file per piece under
+/// `<cacheRoot>/rqbit-downloads/.pieces/<info hash>/<bucket>/<piece>`, which
+/// is where the session's default storage keeps it.
+///
+/// These fixtures used to copy whole files into
+/// `rqbit-downloads/<torrent name>/` and let librqbit's filesystem storage
+/// find them at the initial check. The session's default storage is
+/// `PieceStoreFactory` now, so a whole `.mkv` there is bytes nothing reads:
+/// the check would find every piece missing and report the torrent empty.
+///
+/// `content` is the directory `real_torrent` was pointed at, and each file is
+/// read back through the path the *metainfo* gives, in the order the metainfo
+/// gives -- never the fixture's own write order. `create_torrent` walks with
+/// `walkdir` and does not sort, so the torrent's file order is the
+/// filesystem's readdir order, and a concatenation built any other way
+/// produces pieces whose hashes are wrong on some machines and right on
+/// others.
+///
+/// `only` names the files (by their last path component) to seed, for a
+/// fixture that means to leave part of a torrent missing; `None` seeds all of
+/// them. A piece is written only when *every* byte of it belongs to a named
+/// file, so a fixture whose named files share a boundary piece with an
+/// unnamed one leaves that piece out rather than writing a piece whose hash
+/// cannot check -- and the assertion below says how many pieces were seeded,
+/// so a fixture that meant to seed something and seeded nothing fails here.
+///
+/// **Call this after the server has started**, never before. The launch-time
+/// sweep (`BackendEngineFS::sweep_unadopted_pieces`) deletes every piece
+/// directory the session has no record of, and a directory seeded before the
+/// process comes up is exactly that: the server would start, delete it, and
+/// the torrent would then check as empty. Which is the sweep working.
+fn seed_piece_store_files(
+    cache_root: &std::path::Path,
+    torrent_bytes: &[u8],
+    content: &std::path::Path,
+    only: Option<&[&str]>,
+) {
+    let meta = librqbit::torrent_from_bytes(torrent_bytes).expect("parse the torrent back");
+    let info_hash = meta.info_hash.as_string();
+    let info = meta.info.data.validate().expect("validated metainfo");
+    let piece_length = info.lengths().default_piece_length() as u64;
+
+    let mut blob = Vec::new();
+    // Byte ranges of the torrent's flat layout that the fixture is seeding.
+    let mut seeded: Vec<(u64, u64)> = Vec::new();
+    for file in info.iter_file_details() {
+        let relative = file.filename.to_pathbuf();
+        let path = content.join(&relative);
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+            panic!("the fixture file {} the torrent names: {e}", path.display())
+        });
+        let wanted = only.is_none_or(|names| {
+            relative
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| names.contains(&n))
+        });
+        if wanted {
+            let from = blob.len() as u64;
+            let to = from + bytes.len() as u64;
+            // Merged as they are collected: two seeded files that follow one
+            // another share a boundary piece, and a piece that straddles two
+            // ranges is inside neither of them.
+            match seeded.last_mut() {
+                Some(last) if last.1 == from => last.1 = to,
+                _ => seeded.push((from, to)),
+            }
+        }
+        blob.extend_from_slice(&bytes);
+    }
+    assert_eq!(
+        blob.len() as u64,
+        info.lengths().total_length(),
+        "the fixture and the torrent disagree about the payload"
+    );
+
+    let dir = enginefs::piece_store::root_in(&cache_root.join("rqbit-downloads")).join(&info_hash);
+    let mut written = 0usize;
+    for (index, piece) in blob.chunks(piece_length as usize).enumerate() {
+        let start = index as u64 * piece_length;
+        let end = start + piece.len() as u64;
+        if !seeded.iter().any(|(from, to)| *from <= start && end <= *to) {
+            continue;
+        }
+        let index = index as u32;
+        let bucket = dir.join((index / enginefs::piece_store::PIECES_PER_DIRECTORY).to_string());
+        std::fs::create_dir_all(&bucket).expect("piece bucket");
+        std::fs::write(bucket.join(index.to_string()), piece).expect("write a piece");
+        written += 1;
+    }
+    assert!(written > 0, "the fixture seeded no piece at all");
+}
+
+/// The torrent's own directory in the session's piece store, where all of
+/// its data is -- the streaming cache and an offline download alike.
+fn piece_store_dir(cache_root: &std::path::Path, info_hash: &str) -> std::path::PathBuf {
+    enginefs::piece_store::root_in(&cache_root.join("rqbit-downloads")).join(info_hash)
+}
+
+/// How many piece files that directory holds, counted over the bucket
+/// fan-out rather than assuming one directory.
+fn pieces_held(dir: &std::path::Path) -> usize {
+    let Ok(buckets) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    buckets
+        .filter_map(|b| b.ok())
+        .filter(|b| b.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|b| std::fs::read_dir(b.path()).map(|f| f.count()).unwrap_or(0))
+        .sum()
+}
+
 /// Deterministic, non-trivial payload so piece hashes mean something.
 fn write_payload(path: &std::path::Path, len: usize) {
     let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
@@ -1599,13 +1717,8 @@ fn pinned_download_relocates_into_downloads_dir_and_survives_a_restart() -> anyh
     write_payload(&content.join("e2.bin"), 24 * 1024);
     let (torrent, info_hash) = real_torrent(&content);
 
-    // "Streamed before": the data already sits in the cache root, where
-    // librqbit puts a multi-file torrent added without a placement.
     let cache_root = cache_dir.path().join("cache");
     let root_folder = cache_root.join("rqbit-downloads").join("Show Season 1");
-    std::fs::create_dir_all(&root_folder)?;
-    std::fs::copy(content.join("e1.bin"), root_folder.join("e1.bin"))?;
-    std::fs::copy(content.join("e2.bin"), root_folder.join("e2.bin"))?;
 
     let config = || stream_server::ServerConfig {
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -1614,6 +1727,12 @@ fn pinned_download_relocates_into_downloads_dir_and_survives_a_restart() -> anyh
         ..offline_config()
     };
     let handle = stream_server::start(config())?;
+    // "Streamed before": the data already sits in the piece store, which is
+    // where a torrent added without a placement puts it -- and where one
+    // *with* a placement puts it too.
+    seed_piece_store(&cache_root, &torrent, &content);
+    let pieces = piece_store_dir(&cache_root, &info_hash);
+    let seeded_pieces = pieces_held(&pieces);
     let base = format!("http://{}", handle.http_addr());
     let client = bearer_client(&handle)?;
 
@@ -1673,9 +1792,16 @@ fn pinned_download_relocates_into_downloads_dir_and_survives_a_restart() -> anyh
         Some(target.join("e2.bin").to_str().unwrap()),
         "{info:?}"
     );
-    assert!(target.join("e2.bin").is_file());
-    assert!(target.join("e1.bin").is_file(), "the whole torrent moves");
-    assert!(!root_folder.exists(), "nothing left in the cache root");
+    // Nothing moved and nothing could: the torrent's bytes are piece files
+    // under one root that the placement does not name. What the relocation
+    // changes is where librqbit says the torrent's files *are*.
+    assert!(!target.join("e2.bin").exists(), "no whole file is produced");
+    assert!(!root_folder.exists(), "and none was left in the cache root");
+    assert_eq!(
+        pieces_held(&pieces),
+        seeded_pieces,
+        "the pin kept every piece it had"
+    );
     let stats = stats_after_check(&client, &base, &info_hash)?;
     assert_eq!(
         stats["files"][idx]["complete"], true,
@@ -1732,7 +1858,11 @@ fn pinned_download_relocates_into_downloads_dir_and_survives_a_restart() -> anyh
         Some(target.join("e2.bin").to_str().unwrap())
     );
     assert!(info.complete);
-    assert!(target.join("e2.bin").is_file());
+    assert_eq!(
+        pieces_held(&pieces),
+        seeded_pieces,
+        "the restart found the same pieces"
+    );
 
     handle.shutdown()?;
     handle.join()?;
@@ -1781,14 +1911,8 @@ fn fastresume_persists_piece_bitfields_on_both_roots() -> anyhow::Result<()> {
 
     let cache_root = cache_dir.path().join("cache");
     let session_dir = cache_root.join("rqbit-downloads");
-    let root_folder = session_dir.join("Streamed");
-    std::fs::create_dir_all(&root_folder)?;
-    std::fs::copy(streamed.join("s1.bin"), root_folder.join("s1.bin"))?;
-    std::fs::copy(streamed.join("s2.bin"), root_folder.join("s2.bin"))?;
     let downloads = resolved(&downloads_dir.path().join("offline"));
     let pinned_folder = downloads.join(&pinned_hash);
-    std::fs::create_dir_all(&pinned_folder)?;
-    std::fs::copy(pinned.join("p2.bin"), pinned_folder.join("p2.bin"))?;
 
     let config = || stream_server::ServerConfig {
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -1797,6 +1921,12 @@ fn fastresume_persists_piece_bitfields_on_both_roots() -> anyhow::Result<()> {
         ..offline_config()
     };
     let handle = stream_server::start(config())?;
+    // Both roots' data is in the one piece store, seeded after the launch
+    // sweep: the streamed torrent whole, the pinned one only where the pin
+    // will be. There is no second store under `downloadsDir` -- the store
+    // takes one root, and it is the cache root.
+    seed_piece_store(&cache_root, &streamed_torrent, &streamed);
+    seed_piece_store_files(&cache_root, &pinned_torrent, &pinned, Some(&["p2.bin"]));
     let base = format!("http://{}", handle.http_addr());
     let client = bearer_client(&handle)?;
 
@@ -1811,8 +1941,9 @@ fn fastresume_persists_piece_bitfields_on_both_roots() -> anyhow::Result<()> {
 
     handle.update_settings(serde_json::json!({ "downloadsDir": downloads.to_str().unwrap() }))?;
     // Only a pin places a torrent under the downloads dir, and a pin by
-    // hash needs the metadata: /create supplies it (cache root, no data
-    // there) and the pin relocates the torrent onto the pre-seeded file.
+    // hash needs the metadata: /create supplies it, and the pin relocates
+    // the torrent's *placement* -- its data does not move, being pieces in
+    // the store already.
     client
         .post(format!("{base}/create"))
         .json(&serde_json::json!({ "torrent": hex::encode(&pinned_torrent) }))
@@ -1866,8 +1997,12 @@ fn fastresume_persists_piece_bitfields_on_both_roots() -> anyhow::Result<()> {
         2,
         "bitfields survive the restart"
     );
-    assert!(pinned_folder.join("p2.bin").is_file());
-    assert!(root_folder.join("s1.bin").is_file());
+    // Neither root holds a whole file; both torrents' bytes are pieces in
+    // the one store, and the restart read the bitfields against those.
+    assert!(!pinned_folder.join("p2.bin").exists());
+    assert!(!session_dir.join("Streamed").exists());
+    assert!(pieces_held(&piece_store_dir(&cache_root, &streamed_hash)) > 0);
+    assert!(pieces_held(&piece_store_dir(&cache_root, &pinned_hash)) > 0);
 
     handle.shutdown()?;
     handle.join()?;
@@ -1893,19 +2028,18 @@ fn download_routes_match_the_library_api() -> anyhow::Result<()> {
     write_payload(&content.join("e2.bin"), 24 * 1024);
     let (torrent, info_hash) = real_torrent(&content);
 
-    // The data is already in the cache root, as after streaming it.
     let cache_root = cache_dir.path().join("cache");
-    let root_folder = cache_root.join("rqbit-downloads").join("Show Season 2");
-    std::fs::create_dir_all(&root_folder)?;
-    std::fs::copy(content.join("e1.bin"), root_folder.join("e1.bin"))?;
-    std::fs::copy(content.join("e2.bin"), root_folder.join("e2.bin"))?;
-
     let handle = stream_server::start(stream_server::ServerConfig {
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         config_dir: Some(config_dir.path().join("config")),
         cache_dir: Some(cache_root.clone()),
         ..offline_config()
     })?;
+    // The data is already in the piece store, as after streaming it -- which
+    // is the only place a torrent's bytes are now, downloads included.
+    seed_piece_store(&cache_root, &torrent, &content);
+    let pieces = piece_store_dir(&cache_root, &info_hash);
+    let seeded_pieces = pieces_held(&pieces);
     let base = format!("http://{}", handle.http_addr());
     let client = bearer_client(&handle)?;
 
@@ -1964,7 +2098,15 @@ fn download_routes_match_the_library_api() -> anyhow::Result<()> {
         target.join("e1.bin").to_str().unwrap(),
         "{pinned}"
     );
-    assert!(target.join("e1.bin").is_file());
+    // `path` is where the file *would* be, and no longer where any byte is:
+    // a pinned download is piece files like everything else, and the
+    // relocation moves an output folder that holds none of them.
+    assert!(!target.join("e1.bin").exists(), "no whole file is produced");
+    assert_eq!(
+        pieces_held(&pieces),
+        seeded_pieces,
+        "the pin did not move, lose or duplicate the data"
+    );
 
     // An empty body is a pin with no extra trackers, not a 400.
     let again = client
@@ -2043,9 +2185,10 @@ fn download_routes_match_the_library_api() -> anyhow::Result<()> {
         "{body}"
     );
     assert!(handle.unpin_download(&info_hash, 9, true).is_err());
-    assert!(
-        target.join("e1.bin").is_file() && target.join("e2.bin").is_file(),
-        "no file of the torrent is touched"
+    assert_eq!(
+        pieces_held(&pieces),
+        seeded_pieces,
+        "no byte of the torrent is touched"
     );
     assert_eq!(handle.downloads()?.len(), 2, "and both pins stand");
 
@@ -2064,7 +2207,7 @@ fn download_routes_match_the_library_api() -> anyhow::Result<()> {
             "deletedFiles": false,
         })
     );
-    assert!(target.join("e1.bin").is_file(), "the bytes stay");
+    assert_eq!(pieces_held(&pieces), seeded_pieces, "the bytes stay");
     let listed: serde_json::Value = client
         .get(format!("{base}/downloads.json"))
         .send()?
@@ -2094,6 +2237,11 @@ fn download_routes_match_the_library_api() -> anyhow::Result<()> {
         }
     );
     assert!(!target.exists(), "the whole placed torrent folder is gone");
+    assert_eq!(
+        pieces_held(&pieces),
+        0,
+        "and the bytes with it: the pieces are where the data was"
+    );
     assert!(handle.downloads()?.is_empty());
     assert_eq!(handle.download_path(&info_hash, second)?, None);
     let listed: serde_json::Value = client
@@ -2140,8 +2288,19 @@ fn download_routes_match_the_library_api() -> anyhow::Result<()> {
 /// `GET /cache.json` and `POST /cache/clean` share their functions with
 /// `ServerHandle::{cache_usage, clean_cache_now}` -- the replacement for a
 /// client restarting the server just to make the cache cleaner's start-up
-/// tick fire. A pinned download's engine stays live and protects its file;
+/// tick fire. A pinned download's engine stays live and protects its data;
 /// an idle leftover with no engine at all is ordinary, evictable cache.
+///
+/// And so is the **whole-file copy an earlier version of this server left
+/// behind**, which is what makes this the migration test. There is no
+/// migration by decision: a plain-file download is neither converted nor
+/// read, the torrent that owns it re-downloads as pieces, and the only thing
+/// that ever reclaims those bytes is this cleaner. It can only do that if the
+/// live engine over that very torrent does not protect them -- protection is
+/// `starts_with`, and the engine used to name `<output folder>/<file>`. So
+/// the fixture puts a legacy copy of a *pinned* torrent's own files where an
+/// earlier version would have written them, and the pass takes them while the
+/// pin's real bytes stay.
 #[test]
 fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -2151,27 +2310,14 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
     let content = src.path().join("Movie");
     std::fs::create_dir_all(&content)?;
     // Two files, each a whole number of 16 KiB pieces (as `lan_media_server`
-    // does), so the torrent is a *directory* torrent whose data lands in
-    // `rqbit-downloads/Movie/` -- a single-file torrent instead would place
-    // its data directly at `rqbit-downloads/movie.mkv`, with no folder.
-    // Pinning only `movie.mkv` still protects both: the engine stays live
-    // for as long as it has any pinned file, and protection covers every
-    // file that live engine reports, not only the pinned index.
+    // does). Pinning only `movie.mkv` still protects the whole torrent's
+    // data: the engine stays live for as long as it has any pinned file, and
+    // a piece store is not divisible by file at the protection level.
     write_payload(&content.join("movie.mkv"), 64 * 1024);
     write_payload(&content.join("subtitle.srt"), 16 * 1024);
     let (torrent, info_hash) = real_torrent(&content);
 
-    // Already "streamed": the data sits in the cache root, as it would
-    // after playback, and `POST /create` below picks it up from there.
     let cache_root = cache_dir.path().join("cache");
-    let root_folder = cache_root.join("rqbit-downloads").join("Movie");
-    std::fs::create_dir_all(&root_folder)?;
-    std::fs::copy(content.join("movie.mkv"), root_folder.join("movie.mkv"))?;
-    std::fs::copy(
-        content.join("subtitle.srt"),
-        root_folder.join("subtitle.srt"),
-    )?;
-
     // An idle leftover with no engine managing it at all -- ordinary cache
     // from a torrent nothing is tracking any more.
     let idle = cache_root
@@ -2180,6 +2326,15 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
         .join("old.mkv");
     std::fs::create_dir_all(idle.parent().unwrap())?;
     write_payload(&idle, 16 * 1024);
+    // And the legacy whole-file copy of *this* torrent, exactly where the
+    // filesystem storage used to put a directory torrent's data.
+    let root_folder = cache_root.join("rqbit-downloads").join("Movie");
+    std::fs::create_dir_all(&root_folder)?;
+    std::fs::copy(content.join("movie.mkv"), root_folder.join("movie.mkv"))?;
+    std::fs::copy(
+        content.join("subtitle.srt"),
+        root_folder.join("subtitle.srt"),
+    )?;
 
     let handle = stream_server::start(stream_server::ServerConfig {
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -2187,6 +2342,11 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
         cache_dir: Some(cache_root.clone()),
         ..offline_config()
     })?;
+    // Already "streamed": the data sits in the piece store, as it would
+    // after playback, and `POST /create` below picks it up from there.
+    seed_piece_store(&cache_root, &torrent, &content);
+    let pieces = piece_store_dir(&cache_root, &info_hash);
+    let seeded_pieces = pieces_held(&pieces);
     let base = format!("http://{}", handle.http_addr());
     let client = bearer_client(&handle)?;
     let anonymous = reqwest::blocking::Client::new();
@@ -2222,7 +2382,10 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
     // the pin alone needs, but under the idle leftover's own size added to
     // it, so only that leftover is evictable.
     let baseline = handle.cache_usage()?;
-    assert_eq!(baseline.protected_files, 2, "{baseline:?}");
+    assert_eq!(
+        baseline.protected_files, seeded_pieces,
+        "the pinned torrent's pieces, and nothing else: {baseline:?}"
+    );
     let limit = baseline.protected_bytes + 1;
     handle.update_settings(serde_json::json!({ "cacheSize": limit as f64 }))?;
 
@@ -2239,11 +2402,11 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
     assert_eq!(http_usage["limitBytes"], limit, "{http_usage}");
     assert!(
         http_usage["totalBytes"].as_u64().unwrap() > limit,
-        "the idle leftover pushes the cache over the limit: {http_usage}"
+        "the leftovers push the cache over the limit: {http_usage}"
     );
     assert_eq!(
-        http_usage["protectedFiles"], 2,
-        "both of the pinned torrent's files, not only the pinned index: {http_usage}"
+        http_usage["protectedFiles"], seeded_pieces,
+        "the whole torrent's pieces, not only the pinned file's: {http_usage}"
     );
     assert_eq!(
         http_usage["protectedBytes"], baseline.protected_bytes,
@@ -2260,17 +2423,23 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
         .json()?;
     assert!(!idle.exists(), "unpinned idle cache is evictable: {report}");
     assert!(
-        root_folder.join("movie.mkv").is_file() && root_folder.join("subtitle.srt").is_file(),
-        "a pinned download's files are never touched: {report}"
+        !root_folder.join("movie.mkv").exists() && !root_folder.join("subtitle.srt").exists(),
+        "and so is the pinned torrent's own superseded whole-file copy, \
+         which nothing reads and nothing else would ever reclaim: {report}"
     );
-    assert_eq!(report["deleted"], 1, "{report}");
+    assert_eq!(
+        pieces_held(&pieces),
+        seeded_pieces,
+        "while the pin's real bytes are untouched: {report}"
+    );
+    assert_eq!(report["deleted"], 3, "{report}");
     assert_eq!(report["total"], baseline.protected_bytes, "{report}");
     assert_eq!(
         report["freed"],
         http_usage["totalBytes"].as_u64().unwrap() - baseline.protected_bytes,
         "{report}"
     );
-    assert_eq!(report["protectedFiles"], 2, "{report}");
+    assert_eq!(report["protectedFiles"], seeded_pieces, "{report}");
     assert_eq!(report["protected"], baseline.protected_bytes, "{report}");
 
     // clean_cache_now() == POST /cache/clean, run right after over the
@@ -2280,8 +2449,8 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
     let api_report = handle.clean_cache_now()?;
     assert_eq!(api_report.deleted, 0, "nothing left to evict");
     assert_eq!(api_report.freed, 0);
-    assert_eq!(api_report.protected_files, 2);
-    assert!(root_folder.join("movie.mkv").is_file());
+    assert_eq!(api_report.protected_files, seeded_pieces);
+    assert_eq!(pieces_held(&pieces), seeded_pieces);
 
     handle.shutdown()?;
     handle.join()?;
@@ -2304,26 +2473,23 @@ fn lan_media_server(
     std::fs::create_dir_all(&content)?;
     // Two files, each a whole number of 16 KiB pieces, so neither shares a
     // boundary piece with the other whatever order `create_torrent`'s
-    // directory walk produced -- and so the torrent is a directory torrent
-    // whose data lands in `rqbit-downloads/Movie/`.
+    // directory walk produced.
     write_payload(&content.join("movie.bin"), 64 * 1024);
     write_payload(&content.join("extra.bin"), 16 * 1024);
     let payload = std::fs::read(content.join("movie.bin"))?;
     let (torrent, info_hash) = real_torrent(&content);
 
     let cache_root = cache_dir.join("cache");
-    let seeded = cache_root.join("rqbit-downloads").join("Movie");
-    std::fs::create_dir_all(&seeded)?;
-    std::fs::copy(content.join("movie.bin"), seeded.join("movie.bin"))?;
-    std::fs::copy(content.join("extra.bin"), seeded.join("extra.bin"))?;
-
     let handle = stream_server::start(stream_server::ServerConfig {
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         lan_media_addr,
         config_dir: Some(config_dir.join("config")),
-        cache_dir: Some(cache_root),
+        cache_dir: Some(cache_root.clone()),
         ..offline_config()
     })?;
+    // After the start, and before the add: the launch sweep has run and has
+    // nothing to say about a torrent that does not exist yet.
+    seed_piece_store(&cache_root, &torrent, &content);
     let base = format!("http://{}", handle.http_addr());
     let client = bearer_client(&handle)?;
     client
