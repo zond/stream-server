@@ -245,12 +245,32 @@ impl GetFileError {
     }
 }
 
-/// The reading [`crate::Clock`] gives at the instant this process built it,
-/// and the seed of [`Engine::last_active_at`]: "nothing has used this
-/// torrent since the process started" is the same statement as "the last
-/// time anything used it was the moment the process started", so the idle
-/// arm needs no absence-of-a-reading case and gets no sentinel to misread.
-const EPOCH: u64 = 0;
+/// [`Engine::last_active_at`] for a torrent nothing has been seen using.
+///
+/// **Not a time, and deliberately not `0`.** [`crate::Clock::now_secs`] is
+/// `epoch.elapsed().as_secs()` from an instant taken when *this process*
+/// started, so `0` on that clock does not mean "long ago", it means "now, at
+/// boot". Seeding the idle clock with it says a torrent the previous process
+/// left behind was active a moment ago, which hands every restored torrent a
+/// fresh grace period on every restart -- so an app that restarts often never
+/// idle-pauses anything. That was the third time this design stored a value
+/// the process invented at startup and then read it back as an observation;
+/// the first two were `idle_paused` and `last_accessed`.
+///
+/// "Nothing has used this since I started" and "the last use was at my start"
+/// are not the same statement: the first is about this process's knowledge,
+/// the second is a claim about the world. So the absence of a reading is
+/// carried as an absence -- [`Engine::quiet_for`] answers `None` -- and the
+/// idle arm reads `None` as quiet, because a torrent nobody is watching is
+/// eligible to be paused whether or not we can say for how long. The grace
+/// period exists to protect a stream that *just* stopped and might resume;
+/// after a restart there is no such recency to protect.
+///
+/// A wall clock would make `0` mean 1970 and read correctly, but wall clocks
+/// jump -- NTP, timezones, a television whose time is wrong until the network
+/// is up -- and this is a duration measurement, which is what the monotonic
+/// clock is for.
+const NEVER_ACTIVE: u64 = u64::MAX;
 
 /// [`Engine::last_transition_at`] for a torrent the reconciler has never
 /// started or stopped.
@@ -375,10 +395,9 @@ pub struct Engine<H: TorrentHandle> {
     /// pause once that grace has actually run out.
     ///
     /// `0` needs no sentinel here, and must not have one. A real reading of
-    /// `0` -- something used this torrent inside the first second -- means
-    /// "quiet since the epoch", which is exactly what the seed means, so
-    /// the collision is between two facts that agree. Compare
-    /// [`NEVER_MOVED`], where the two claims `0` would carry disagree.
+    /// [`NEVER_ACTIVE`] until something is actually seen using it, which is
+    /// an absence and not a time; `0` is a real reading here (something used
+    /// the torrent inside the first second) and cannot double as the seed.
     ///
     /// [`Self::settled`]: Engine::settled
     last_active_at: AtomicU64,
@@ -425,7 +444,7 @@ impl<H: TorrentHandle> Engine<H> {
                 .build(),
             settled: AtomicBool::new(true),
             last_transition_at: AtomicU64::new(NEVER_MOVED),
-            last_active_at: AtomicU64::new(EPOCH),
+            last_active_at: AtomicU64::new(NEVER_ACTIVE),
             pinned_files: parking_lot::RwLock::new(BTreeSet::new()),
             volumes,
             reads_refused: AtomicBool::new(false),
@@ -480,12 +499,16 @@ impl<H: TorrentHandle> Engine<H> {
         self.last_active_at.store(now, Ordering::SeqCst);
     }
 
-    /// How long since anything was using this torrent -- measured from
-    /// this process's own start for one nothing has used yet, which is the
-    /// honest reading of "nothing has used it": see
-    /// [`Self::last_active_at`].
-    pub(crate) fn quiet_for(&self, now: u64) -> Duration {
-        Duration::from_secs(now.saturating_sub(self.last_active_at.load(Ordering::SeqCst)))
+    /// How long since anything was seen using this torrent, or `None` if
+    /// nothing has been -- which is not the same as "nothing has used it for
+    /// zero seconds". See [`NEVER_ACTIVE`] for why the absence is carried
+    /// rather than filled in, and `reconcile::desired` for the idle arm
+    /// reading `None` as quiet.
+    pub(crate) fn quiet_for(&self, now: u64) -> Option<Duration> {
+        match self.last_active_at.load(Ordering::SeqCst) {
+            NEVER_ACTIVE => None,
+            at => Some(Duration::from_secs(now.saturating_sub(at))),
+        }
     }
 
     /// Whether this torrent is stopped, and stopped because the volume it

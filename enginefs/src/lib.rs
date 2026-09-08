@@ -1484,7 +1484,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             has_metadata = conditions.has_metadata,
             finished = conditions.finished,
             available = ?conditions.available,
-            idle_secs = conditions.idle_for.as_secs(),
+            idle_secs = conditions.idle_for.map(|d| d.as_secs()),
             settled = conditions.settled,
             "torrent_reconciled"
         );
@@ -1563,7 +1563,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     playing = conditions.playing,
                     pinned = conditions.pinned,
                     seeding_enabled = conditions.seeding_enabled,
-                    idle_secs = conditions.idle_for.as_secs(),
+                    idle_secs = conditions.idle_for.map(|d| d.as_secs()),
                     "torrent_stopped_by_reconciler"
                 );
                 true

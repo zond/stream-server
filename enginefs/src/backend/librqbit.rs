@@ -6934,21 +6934,25 @@ mod tests {
     /// the only thing standing between "seeding is off and nobody is
     /// watching" and a restart that leaves every torrent there is running
     /// is the idle arm, and the idle arm's grace is measured from
-    /// `Engine::last_active_at`. That used to be initialised per engine to
-    /// the clock, which for a restored torrent is a claim about a past this
-    /// process never saw: it read as "used a moment ago" for as long as the
-    /// engine lived, so `idle_for` restarted with every engine and the arm
-    /// could not fire until a grace after each one appeared. Seeded at the
-    /// process's own epoch it counts from the one instant this process can
-    /// vouch for, and the two readings this test takes -- one at the epoch,
-    /// one a whole grace later -- are the two sides of that.
+    /// `Engine::last_active_at`. Two seeds for it were wrong before this
+    /// one. Per engine at the clock read as "used a moment ago" for as long
+    /// as the engine lived, so the arm could not fire until a grace after
+    /// each engine appeared. The process's own epoch is `0` on this clock
+    /// (`Clock::now_secs` is `epoch.elapsed()`), which reads as "used at
+    /// boot" and hands every restored torrent a fresh grace on every
+    /// restart -- so an app that restarts often never idle-pauses anything.
     ///
-    /// The first of them is the price of the grace and is asserted rather
-    /// than hidden: for one grace after a restart the ladder does want this
-    /// torrent running, and the reconciler starts it. What the grace buys
-    /// is that a player which was mid-film when the process was restarted
-    /// finds its torrent running; what it costs is up to
-    /// `INACTIVE_TORRENT_PAUSE_GRACE` of a torrent nobody asked for.
+    /// Both were the same mistake: a value this process invented at startup,
+    /// read back as an observation. There is no reading to take for a
+    /// torrent the last process left, so `quiet_for` answers `None` and the
+    /// idle arm treats it as quiet. The pause is owed at once, which is what
+    /// this test asserts at the epoch.
+    ///
+    /// Nothing is lost by not waiting. The grace protects a stream that just
+    /// stopped and might resume; a restart has no such stream. A viewer who
+    /// does resume gets a `PlaybackStart` reconcile, which starts the
+    /// torrent -- a moment of latency instead of a guaranteed grace of
+    /// downloading nobody asked for.
     ///
     /// Driven over a real persisted session because the restart is where
     /// the defect lives, and asserted on `run_state` and on the backend's
@@ -6957,7 +6961,7 @@ mod tests {
     /// session cannot run under a paused clock, and sitting out the grace
     /// in wall time would put it in every run of the suite.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_restart_with_seeding_off_stops_what_the_last_process_left_once_the_grace_is_out() {
+    async fn a_restart_with_seeding_off_stops_what_the_last_process_left_without_waiting() {
         use crate::backend::TorrentBackend;
         let tmp = tempfile::tempdir().unwrap();
 
@@ -7024,26 +7028,28 @@ mod tests {
         let grace = crate::INACTIVE_TORRENT_PAUSE_GRACE.as_secs();
         let engine = efs.get_engine(&hash).await.expect("the restored engine");
 
-        // At the process's own epoch the grace has not run out, and the
-        // reconciler does start the torrent the last process stopped.
+        // At the process's own epoch, with nothing ever seen using this
+        // torrent, the idle arm already fires: there is no reading to
+        // measure a grace from, and a grace invented here would be the
+        // "active at boot" claim this seed exists to refuse.
         assert_eq!(
             efs.reconcile_tick_at(0).await,
-            vec![(hash.clone(), crate::reconcile::Decision::Run)],
-            "the restart's grace has not run out yet"
+            vec![(hash.clone(), crate::reconcile::Decision::Stop)],
+            "seeding is off and nothing has ever used this torrent"
         );
         assert_eq!(
             engine.handle.run_state(),
-            RunState::Live,
-            "and the reconciler really did start it"
+            RunState::Paused,
+            "and the reconciler really did stop it"
         );
 
-        // A whole grace later, with nothing having used it in between, the
-        // idle arm fires -- and this is the reading the old per-engine
-        // stamp could never reach, because it moved with the engine.
+        // Still stopped a grace later: the decision does not depend on how
+        // long the process has been up, which is what the old seeds made it
+        // depend on.
         assert_eq!(
             efs.reconcile_tick_at(grace).await,
             vec![(hash.clone(), crate::reconcile::Decision::Stop)],
-            "seeding is off and nobody has watched this torrent"
+            "and it stays stopped; the decision does not turn on uptime"
         );
         assert_eq!(
             engine.handle.run_state(),

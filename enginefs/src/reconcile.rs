@@ -133,7 +133,13 @@ pub struct Conditions {
     ///
     /// It is **not** the registry's idle-eviction clock, which counts
     /// lookups: see `Engine::last_active_at`.
-    pub idle_for: Duration,
+    ///
+    /// `None` where nothing has been seen using the torrent at all -- a
+    /// restored one, most often. That is an absence, not a zero: the clock
+    /// this is measured on starts at the process, so filling it in would
+    /// claim the torrent was active at boot and hand it a fresh grace period
+    /// on every restart. The idle arm reads `None` as quiet.
+    pub idle_for: Option<Duration>,
 }
 
 /// Whether this torrent should be running, from the conditions alone.
@@ -261,7 +267,11 @@ pub fn verdict(conditions: &Conditions, trigger: Trigger) -> Verdict {
     if conditions.playing || conditions.pinned {
         return arm(Decision::Run);
     }
-    let quiet = conditions.idle_for >= crate::INACTIVE_TORRENT_PAUSE_GRACE;
+    // `None` is quiet: nothing has been seen using this torrent, so there is
+    // no recent stream for the grace period to protect.
+    let quiet = conditions
+        .idle_for
+        .is_none_or(|idle| idle >= crate::INACTIVE_TORRENT_PAUSE_GRACE);
     if !conditions.seeding_enabled && quiet {
         return arm(Decision::Stop);
     }
@@ -687,7 +697,7 @@ mod tests {
             has_metadata: true,
             finished: false,
             available: Some(u64::MAX),
-            idle_for: Duration::ZERO,
+            idle_for: Some(Duration::ZERO),
         }
     }
 
@@ -759,7 +769,7 @@ mod tests {
             has_metadata: false,
             available: Some(0),
             seeding_enabled: false,
-            idle_for: Duration::from_secs(86_400),
+            idle_for: Some(Duration::from_secs(86_400)),
             ..healthy()
         };
         assert_eq!(desired(&resolving, Trigger::Timer), Decision::Run);
@@ -806,6 +816,42 @@ mod tests {
         assert_eq!(desired(&unreadable, Trigger::PlaybackStart), Decision::Run);
     }
 
+    /// A torrent nothing has been seen using is quiet, and quiet at once.
+    ///
+    /// This is the case a restart produces: librqbit brings the torrent back,
+    /// nothing has opened a stream on it in this process, and the clock the
+    /// idle arm measures on starts at the process, so there is no reading to
+    /// take. `None` therefore has to mean "long ago" and not "just now".
+    ///
+    /// It went the other way three times. `idle_paused` said who paused a
+    /// torrent and started empty, so a restart read "nobody". `last_accessed`
+    /// said when it was last used and was seeded to the engine's construction,
+    /// so a restart read "a moment ago" -- and a stats poll refreshed it, which
+    /// kept idle torrents downloading all night. Then the seed became the
+    /// process start, which is `0` on this clock and reads as "active at boot",
+    /// handing every restored torrent a fresh grace period on every restart.
+    ///
+    /// The grace period is there to protect a stream that *just* stopped and
+    /// might resume. After a restart there is no such stream, so there is
+    /// nothing to protect and the pause is owed immediately.
+    #[test]
+    fn a_torrent_never_seen_in_use_is_quiet_without_waiting_out_the_grace() {
+        let restored = Conditions {
+            seeding_enabled: false,
+            idle_for: None,
+            ..healthy()
+        };
+        assert_eq!(desired(&restored, Trigger::Timer), Decision::Stop);
+
+        // And the absence is doing the work: the same torrent with a reading
+        // of zero has been used, a moment ago, and keeps its grace.
+        let just_used = Conditions {
+            idle_for: Some(Duration::ZERO),
+            ..restored
+        };
+        assert_eq!(desired(&just_used, Trigger::Timer), Decision::Run);
+    }
+
     /// Playback and pins outrank the idle policy: the whole reason the idle
     /// pause is safe is that it never applies to a torrent someone is
     /// using.
@@ -813,7 +859,7 @@ mod tests {
     fn playback_and_pins_outrank_the_idle_policy() {
         let idle_and_unseeded = Conditions {
             seeding_enabled: false,
-            idle_for: INACTIVE_TORRENT_PAUSE_GRACE,
+            idle_for: Some(INACTIVE_TORRENT_PAUSE_GRACE),
             ..healthy()
         };
         assert_eq!(desired(&idle_and_unseeded, Trigger::Timer), Decision::Stop);
@@ -846,14 +892,14 @@ mod tests {
     fn the_idle_arm_needs_seeding_off_and_the_whole_grace() {
         let quiet = Conditions {
             seeding_enabled: false,
-            idle_for: INACTIVE_TORRENT_PAUSE_GRACE,
+            idle_for: Some(INACTIVE_TORRENT_PAUSE_GRACE),
             ..healthy()
         };
         assert_eq!(desired(&quiet, Trigger::Timer), Decision::Stop);
         assert_eq!(
             desired(
                 &Conditions {
-                    idle_for: INACTIVE_TORRENT_PAUSE_GRACE - Duration::from_millis(1),
+                    idle_for: Some(INACTIVE_TORRENT_PAUSE_GRACE - Duration::from_millis(1)),
                     ..quiet
                 },
                 Trigger::Timer
@@ -864,7 +910,7 @@ mod tests {
             desired(
                 &Conditions {
                     seeding_enabled: true,
-                    idle_for: Duration::from_secs(86_400),
+                    idle_for: Some(Duration::from_secs(86_400)),
                     ..quiet
                 },
                 Trigger::Timer
