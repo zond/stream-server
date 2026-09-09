@@ -644,10 +644,10 @@ async fn clean_cache_with_headroom(
     //
     // Unless a newer pass has already published its own, which is what
     // [`CachePasses`] is here to notice.
-    if state.cache_passes.is_the_newest(pass) {
+    state.cache_passes.publish(pass, || {
         state.engine.set_cache_budget(report.limit);
         state.last_eviction.record(&report);
-    }
+    });
     Ok(report)
 }
 
@@ -697,13 +697,19 @@ impl CachePasses {
         )
     }
 
-    /// Whether `pass` is still the newest reading anything has taken -- and
-    /// if it is, claim the publication for it, so a pass that started
-    /// earlier and finishes later cannot take it back.
-    pub fn is_the_newest(&self, pass: CachePass) -> bool {
-        self.published
+    /// Publish `pass`'s reading, if nothing newer has published one.
+    ///
+    /// The claim and the publication are one call so that there is nowhere
+    /// to publish from that does not go through the order: an unguarded
+    /// `set_cache_budget` beside this one is exactly the bug.
+    pub fn publish(&self, pass: CachePass, publish: impl FnOnce()) {
+        if self
+            .published
             .fetch_max(pass.0, std::sync::atomic::Ordering::Relaxed)
             < pass.0
+        {
+            publish();
+        }
     }
 }
 
@@ -2882,19 +2888,17 @@ mod tests {
         let passes = CachePasses::default();
         let launch = passes.begin();
         let asked_for = passes.begin();
-        assert!(
-            passes.is_the_newest(asked_for),
-            "the newer reading is the one to publish"
-        );
-        assert!(
-            !passes.is_the_newest(launch),
-            "and the older one, finishing after it, is not"
-        );
+        let published = std::cell::RefCell::new(Vec::new());
+        passes.publish(asked_for, || {
+            published.borrow_mut().push("the cap asked for")
+        });
+        passes.publish(launch, || published.borrow_mut().push("the launch sweep's"));
         let next = passes.begin();
-        assert!(
-            passes.is_the_newest(next),
-            "while the pass after both of them reads the volume again, and \
-             publishes"
+        passes.publish(next, || published.borrow_mut().push("the pass after both"));
+        assert_eq!(
+            *published.borrow(),
+            ["the cap asked for", "the pass after both"],
+            "the older reading, finishing last, is the one that is dropped"
         );
     }
 
