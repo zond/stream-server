@@ -596,9 +596,15 @@ pub(crate) async fn take_claimed(
 /// -- held across it and released on the far side.
 ///
 /// **Off the reactor** because this is one `unlink` per piece on the flash
-/// of a television, and every caller is holding a lock something else wants
-/// while it waits: the retention pass holds `Engine::announce`, which the
-/// stream-open path takes, and so does the unpin's delete.
+/// of a television, which is a syscall loop of no bounded length: run on
+/// the reactor thread it stalls every other task that thread is carrying,
+/// whichever door called. The retention pass compounds that -- it holds
+/// `Engine::announce` across the wait, and the stream-open path takes the
+/// same lock, so a pass on the reactor stops request handling for as long
+/// as the volume takes to answer. The unpin's delete holds no such lock:
+/// `BackendEngineFS::delete_download_data` never touches `announce`, and
+/// what orders *it* against a re-download is the claim below and nothing
+/// else. This is not a function under which `announce` is always held.
 ///
 /// **The claim travels with the work rather than staying behind.** It is
 /// what keeps the unlink ordered against the have-set, so it has to outlive
