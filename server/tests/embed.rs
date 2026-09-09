@@ -1840,7 +1840,7 @@ fn a_pin_moves_nothing_and_survives_a_restart() -> anyhow::Result<()> {
     write_payload(&content.join("e2.bin"), 24 * 1024);
     let (torrent, info_hash) = real_torrent(&content);
 
-    let cache_root = cache_dir.path().join("cache");
+    let cache_root = resolved(&cache_dir.path().join("cache"));
     let root_folder = cache_root.join("rqbit-downloads").join("Show Season 1");
 
     let config = || stream_server::ServerConfig {
@@ -1993,7 +1993,7 @@ fn fastresume_persists_piece_bitfields_for_a_pinned_torrent_too() -> anyhow::Res
     write_payload(&pinned.join("p2.bin"), 48 * 1024);
     let (pinned_torrent, pinned_hash) = real_torrent(&pinned);
 
-    let cache_root = cache_dir.path().join("cache");
+    let cache_root = resolved(&cache_dir.path().join("cache"));
     let session_dir = cache_root.join("rqbit-downloads");
 
     let config = || stream_server::ServerConfig {
@@ -2108,7 +2108,7 @@ fn download_routes_match_the_library_api() -> anyhow::Result<()> {
     write_payload(&content.join("e2.bin"), 24 * 1024);
     let (torrent, info_hash) = real_torrent(&content);
 
-    let cache_root = cache_dir.path().join("cache");
+    let cache_root = resolved(&cache_dir.path().join("cache"));
     let handle = stream_server::start(stream_server::ServerConfig {
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         config_dir: Some(config_dir.path().join("config")),
@@ -2396,7 +2396,7 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
     write_payload(&content.join("subtitle.srt"), 16 * 1024);
     let (torrent, info_hash) = real_torrent(&content);
 
-    let cache_root = cache_dir.path().join("cache");
+    let cache_root = resolved(&cache_dir.path().join("cache"));
     // An idle leftover with no engine managing it at all -- ordinary cache
     // from a torrent nothing is tracking any more.
     let idle = cache_root
@@ -2557,7 +2557,7 @@ fn lan_media_server(
     let payload = std::fs::read(content.join("movie.bin"))?;
     let (torrent, info_hash) = real_torrent(&content);
 
-    let cache_root = cache_dir.join("cache");
+    let cache_root = resolved(&cache_dir.join("cache"));
     let handle = stream_server::start(stream_server::ServerConfig {
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         lan_media_addr,
@@ -2634,7 +2634,7 @@ fn the_servers_own_reconciler_stops_a_torrent_under_the_floor_and_starts_it_agai
     let config_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
     let src = tempfile::tempdir()?;
-    let cache_root = cache_dir.path().join("cache");
+    let cache_root = resolved(&cache_dir.path().join("cache"));
     // Declared before the server starts, so its reconciler never reads the
     // machine's real disk for this root.
     stream_server::pretend_volume_space(&cache_root, u64::MAX);
@@ -2757,7 +2757,7 @@ fn a_restart_leaves_a_torrent_stopped_and_a_stream_request_starts_it() -> anyhow
     let config_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
     let src = tempfile::tempdir()?;
-    let cache_root = cache_dir.path().join("cache");
+    let cache_root = resolved(&cache_dir.path().join("cache"));
 
     let content = src.path().join("Wanted");
     std::fs::create_dir_all(&content)?;
@@ -2923,7 +2923,7 @@ fn an_archive_member_request_starts_the_torrent_it_reads_from() -> anyhow::Resul
     let config_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
     let src = tempfile::tempdir()?;
-    let cache_root = cache_dir.path().join("cache");
+    let cache_root = resolved(&cache_dir.path().join("cache"));
     stream_server::pretend_volume_space(&cache_root, u64::MAX);
 
     // A torrent whose one file is an archive. Its bytes are never read --
@@ -3068,7 +3068,7 @@ fn archive_member_server(
     std::fs::write(content.join("fixture.zip"), stored_zip(member, member_len))?;
     let (torrent, info_hash) = real_torrent(&content);
 
-    let cache_root = cache_dir.join("cache");
+    let cache_root = resolved(&cache_dir.join("cache"));
     stream_server::pretend_volume_space(&cache_root, u64::MAX);
     let handle = stream_server::start(stream_server::ServerConfig {
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -3309,7 +3309,7 @@ fn a_stream_below_the_free_space_floor_is_refused_not_degraded() -> anyhow::Resu
     let src = tempfile::tempdir()?;
     let (handle, base, info_hash, idx, payload) =
         lan_media_server(config_dir.path(), cache_dir.path(), src.path(), None)?;
-    let cache_root = cache_dir.path().join("cache");
+    let cache_root = resolved(&cache_dir.path().join("cache"));
     let client = bearer_client(&handle)?;
     let anonymous = reqwest::blocking::Client::new();
     let url = format!("{base}/{info_hash}/{idx}");
