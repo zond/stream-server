@@ -132,7 +132,8 @@ use enginefs::retention::{CacheBudget, ReclaimGate, RetentionBudget};
 use crate::proxy_cache::CHUNK_BYTES;
 
 /// How long after its last delivered byte an entity nothing is reading any
-/// more stops holding a window.
+/// more keeps its entry, and with it the windows the last pass over it
+/// chose.
 ///
 /// While a reader is open its promise and its window stand whatever the
 /// clock says -- a paused player is still going to read the body it has --
@@ -141,6 +142,23 @@ use crate::proxy_cache::CHUNK_BYTES;
 /// with no reader open, every byte of the entity is ordinary cache again --
 /// which is what the proxy cache has always been, and what a proxied stream
 /// nobody is reading should be.
+///
+/// **What it does not do is outlast the next pass.** What stands during the
+/// grace is [`LiveStream::windows`], and a pass writes those wholesale from
+/// the readers that were live when it ran ([`ProxyRetention::finish`]); a
+/// read that has ended is not one of those, and its playhead is nowhere in
+/// the protection path. So this is a grace for a player between two of its
+/// own requests, where no other read of the entity runs a pass in the gap,
+/// and not against one that does: a seek is two readers, and when the body
+/// the seek left behind ends, the first pass for the new position drops the
+/// region that was just played rather than holding it for the time here.
+/// Scrubbing back into it then refetches from the origin.
+///
+/// That is a deliberate trade and not an oversight. Holding it would mean
+/// keeping a window round every playhead a read left behind until this
+/// elapsed -- a whole extra window's worth of chunks per ended read, on the
+/// device whose disk is the reason any of this exists -- to protect a
+/// position the player has just deliberately left. The bound is the point.
 const IDLE: Duration = Duration::from_secs(90);
 
 /// How many passes one window's worth of playback gets: the pass runs when
@@ -248,12 +266,21 @@ struct LiveStream {
     /// The offset of that byte, and `None` until one has gone out.
     ///
     /// The entity's own reading of where playback was, as distinct from a
-    /// reader's: it is what a pass has to go on when the read that started
-    /// it has ended, and it is what keeps a window round the place a player
-    /// stopped for the [`IDLE`] grace, so its next request finds the bytes
-    /// it is about to ask for. An observation like any other here -- absent
-    /// until a byte really goes out, and never invented from what is on the
-    /// disk.
+    /// reader's, and it answers exactly two questions: what a pass measures
+    /// from when the read that started it has ended ([`LiveStream::head`]),
+    /// and where [`ProxyRetention::window`] splits the disk for a panel.
+    ///
+    /// **It protects nothing by itself.** It is not in `decision.window`,
+    /// not in [`Self::windows`] and not in
+    /// [`ProxyRetention::is_inside_now`]; a chunk is held because a live
+    /// reader's window or promise covers it, or because the last pass put a
+    /// window there. Nor could it be read as "where the player that just
+    /// stopped was" -- [`Reader::note`] writes it for whichever reader
+    /// delivered last, so a second read of the same entity moves it to its
+    /// own head at once.
+    ///
+    /// An observation like any other here -- absent until a byte really goes
+    /// out, and never invented from what is on the disk.
     last_playhead: Option<u64>,
     /// The budget the policy below was decided under, and `None` before any
     /// decision has been taken. A different budget is a different shape, so
@@ -269,10 +296,14 @@ struct LiveStream {
     /// recomputed so that a pass in flight, which has the policy out of its
     /// slot, does not make the gate answer "nothing is being read here".
     ///
-    /// It outlives the readers it was computed for, and that is the [`IDLE`]
-    /// grace: the gap between one request of a player and its next is a gap
-    /// with no reader open in it, and the bytes the player is about to ask
-    /// for again are the ones the last pass kept.
+    /// It outlives the readers it was computed for, which is what makes the
+    /// gap between one request of a player and its next survivable: that gap
+    /// has no reader open in it, and the bytes the player is about to ask
+    /// for again are the ones the last pass kept. It outlives them only
+    /// until the next pass, though -- this is written whole from the readers
+    /// live at that pass, so a second read of the entity replaces what a
+    /// read that ended was holding, rather than the [`IDLE`] clock doing it.
+    /// See [`IDLE`] for why that is the trade and not an accident.
     windows: Vec<Range<u64>>,
     /// Whether a policy is reclaiming here at all -- a [`Shape::Split`] was
     /// installed for the budget in [`Self::decided`].
@@ -844,8 +875,9 @@ impl Reader {
 impl Drop for Reader {
     /// The read is over, so its promise is released and its playhead is not
     /// a live reader's any more. What it leaves behind is the entity's
-    /// entry, which holds its window for [`IDLE`] so the player's next
-    /// request finds the bytes it is about to ask for.
+    /// entry, holding the windows the last pass chose until [`IDLE`] passes
+    /// or another read of this entity runs a pass, so a player's next
+    /// request usually finds the bytes it is about to ask for.
     fn drop(&mut self) {
         let Ok(mut streams) = self.retention.streams.lock() else {
             return;
@@ -2003,6 +2035,76 @@ mod tests {
             |gate| gate.releases_file(&dir.chunk_path(15)),
         )
         .await;
+    }
+
+    /// **The grace holds against the clock and not against the next pass.**
+    ///
+    /// What a read that ended leaves behind is the windows the last pass
+    /// chose, and a pass writes those whole from the readers live when it
+    /// ran. So a second read of the same entity -- which an ordinary seek
+    /// makes, the new range request opening while the old body drains --
+    /// replaces them the first time its own playhead moves a stride, well
+    /// inside [`IDLE`], and the region that was just played is ordinary
+    /// cache again. Scrubbing back into it refetches from the origin.
+    ///
+    /// This is the trade [`IDLE`] states, pinned so that it is a decision
+    /// rather than a surprise: holding that region would mean a window per
+    /// playhead every ended read left behind, kept for a minute and a half,
+    /// on the device whose disk is the reason there is a budget at all.
+    #[tokio::test]
+    async fn a_second_players_pass_replaces_what_a_read_that_ended_was_holding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = ChunkDir::new(tmp.path().join("entity"));
+        write_chunks(&dir, 0..16);
+
+        // Four chunks of budget over sixteen: two windows apart in this
+        // entity cannot both be held.
+        let retention = retention(Some(4 * CHUNK_BYTES));
+        let played = retention.reader(&dir, TOTAL, TARGET.into());
+        played.note(15 * CHUNK_BYTES);
+        // The head of the film going is what says a pass really ran: a
+        // reader with no window yet is inside all of the entity, so the gate
+        // alone would answer before anything had been measured.
+        settled(&retention, "the first player's pass ran", |_| {
+            !dir.chunk_path(0).exists()
+        })
+        .await;
+        drop(played);
+
+        let mut gate = ReclaimGate::default();
+        retention.fill_gate(&mut gate);
+        assert!(
+            !gate.releases_file(&dir.chunk_path(15)),
+            "with nothing else reading the entity, the window the read that \
+             ended left behind is still standing"
+        );
+
+        // The seek: a new body at the head of the film, and the old one is
+        // gone. Nothing here waits on a clock -- the grace is a minute and a
+        // half away, and this is what happens instead of it.
+        let seeked = retention.reader(&dir, TOTAL, TARGET.into());
+        seeked.note(0);
+        settled(
+            &retention,
+            "the pass for the position the player seeked to ran",
+            |gate| gate.releases_file(&dir.chunk_path(15)) && !dir.chunk_path(15).exists(),
+        )
+        .await;
+
+        let held = retention.streams.lock().unwrap();
+        let stream = held.get(dir.path()).expect("the entity is being read");
+        assert!(
+            stream.last_seen.elapsed() < IDLE,
+            "and it went well inside the grace, which is the point of this \
+             test: the clock never came into it"
+        );
+        assert!(
+            !dir.chunk_path(15).exists(),
+            "the chunk the player was inside a moment ago is gone from the \
+             disk, so scrubbing back to it costs the origin fetch again"
+        );
+        drop(held);
+        drop(seeked);
     }
 
     /// **Two entities can carry one target, and the panel is told about the
