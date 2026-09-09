@@ -230,6 +230,15 @@ impl DiskWork {
         DiskTicket(self.clone())
     }
 
+    /// Whether none of it is left, asked without waiting.
+    ///
+    /// The sibling of [`Self::settled`] for a caller with something else to
+    /// check while it waits -- a bound on how much work is allowed to
+    /// happen at all, which is not a thing an await can be interrupted by.
+    pub fn idle(&self) -> bool {
+        *self.count.borrow() == 0
+    }
+
     /// Wait until none of it is left.
     pub async fn settled(&self) {
         let mut count = self.count.subscribe();

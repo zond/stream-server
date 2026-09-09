@@ -199,6 +199,18 @@ pub struct ProxyRetention {
     /// spawned and never joined, so it is the other half of what makes a
     /// listing of the cache root a moving picture.
     work: Arc<crate::proxy_cache::DiskWork>,
+    /// How many passes have run here, for the tests that bound them.
+    ///
+    /// A pass can arm another ([`LiveStream::arms_another_pass`]), so the
+    /// passes of one entity are a chain, and what says a chain terminates
+    /// is a count rather than a clock: one that arms itself off a term no
+    /// pass moves runs tens of thousands of times a second, and is over any
+    /// honest bound long before a timeout would notice.
+    ///
+    /// The shipped build has neither this nor the increment in
+    /// [`ProxyRetention::pass`].
+    #[cfg(test)]
+    passes: AtomicU64,
 }
 
 /// One entity one or more readers are open on.
@@ -337,6 +349,8 @@ impl ProxyRetention {
             #[cfg(test)]
             interleave: Mutex::new(None),
             work,
+            #[cfg(test)]
+            passes: AtomicU64::new(0),
         }
     }
 
@@ -365,6 +379,8 @@ impl ProxyRetention {
     /// rather than queueing behind it. Exactly the shape
     /// `enginefs::engine::Engine::retain` uses, and for the same reason.
     fn pass(self: &Arc<Self>, key: &Path, id: u64) {
+        #[cfg(test)]
+        self.passes.fetch_add(1, Ordering::Relaxed);
         let Some(begin) = self.begin(key, id) else {
             return;
         };
@@ -377,7 +393,9 @@ impl ProxyRetention {
             others,
             promised,
         } = begin;
-        let last = (total - 1) / CHUNK_BYTES;
+        // `max(1)` as in `LiveStream::chunk`, which is the other reading of
+        // this: an entity of no bytes never reaches either of them.
+        let last = (total.max(1) - 1) / CHUNK_BYTES;
         // Where a test puts what playback does while the listing below runs.
         #[cfg(test)]
         self.interleave();
@@ -598,7 +616,7 @@ impl ProxyRetention {
                     stream.policy = Some(policy);
                 }
             }
-            stream.arms_another_pass(at)
+            stream.arms_another_pass(id, at)
         };
         if again {
             self.spawn_pass(key.to_path_buf(), id);
@@ -882,11 +900,7 @@ impl LiveStream {
     /// a reader to be gone. `None` when nothing has ever delivered a byte
     /// of this entity, which is a stream with no playhead and so no window.
     fn heads(&self, id: u64) -> Option<(u64, Vec<u64>, Vec<Range<u64>>)> {
-        let at = self
-            .readers
-            .get(&id)
-            .and_then(|reader| reader.playhead)
-            .or(self.last_playhead)?;
+        let at = self.head(id)?;
         let others = self
             .readers
             .iter()
@@ -900,6 +914,36 @@ impl LiveStream {
             .filter(|range| !range.is_empty())
             .collect();
         Some((at, others, promised))
+    }
+
+    /// The playhead a pass for `id` is about, in bytes: that reader's own
+    /// while its body is open, and the entity's last delivered byte once it
+    /// has ended.
+    ///
+    /// **One function, because it is one question.** Where a pass measures
+    /// from and whether a pass is still owed are the same question asked at
+    /// two moments ([`Self::heads`] and [`Self::arms_another_pass`]), and
+    /// the second only terminates if it is a fixed point of the first: two
+    /// spellings of it, one reading the reader and one the entity, differ by
+    /// however far apart two players are, no pass moves either of them, and
+    /// so every pass arms the next one forever.
+    fn head(&self, id: u64) -> Option<u64> {
+        self.readers
+            .get(&id)
+            .and_then(|reader| reader.playhead)
+            .or(self.last_playhead)
+    }
+
+    /// The chunk a byte offset of this entity is in, clamped to the last
+    /// one it has.
+    ///
+    /// `max(1)` for the entity of no bytes, which cannot be here at all --
+    /// [`Reader::note`] and [`Reader::promises`] both return before they
+    /// would create it -- and is written the same way in
+    /// [`ProxyRetention::pass`] so that neither reading of "the last chunk"
+    /// can drift from the other.
+    fn chunk(&self, at: u64) -> u64 {
+        (at / CHUNK_BYTES).min((self.total.max(1) - 1) / CHUNK_BYTES)
     }
 
     /// Whether the pass that just measured chunk `at` swallowed the trigger
@@ -924,15 +968,24 @@ impl LiveStream {
     /// cleaner was offered the bytes round the playhead and refused the ones
     /// behind them, which is the grace exactly inside out.
     ///
-    /// So the pass that swallowed the trigger arms the next one itself. It
-    /// terminates because the playhead of a stream that has ended does not
-    /// move again: the pass this arms measures where it is now, and asks
-    /// this same question of a distance that is then zero.
-    fn arms_another_pass(&mut self, at: u64) -> bool {
-        let last = (self.total.max(1) - 1) / CHUNK_BYTES;
+    /// So the pass that swallowed the trigger arms the next one itself, and
+    /// it asks [`Self::head`] -- the reader this pass was about, falling
+    /// back to the entity, exactly as the pass's own measurement did.
+    ///
+    /// **That is what makes the chain terminate.** `at` is what `head(id)`
+    /// answered a moment ago, so the pass this arms measures `head(id)`
+    /// again and asks this question of a distance that is zero unless a byte
+    /// really has gone out in between. Nothing a pass does moves a playhead
+    /// -- only [`Reader::note`] does, from a byte that reached a player --
+    /// so each arming is paid for by a delivered byte that arrived while a
+    /// pass held the slot, and the chain is at most one pass long per such
+    /// byte. Asked instead of `last_playhead` while `at` came from a live
+    /// reader, the two terms are a distance between two players, or between
+    /// a body and a range request that has ended, and no pass moves either.
+    fn arms_another_pass(&mut self, id: u64, at: u64) -> bool {
         let moved = self
-            .last_playhead
-            .is_some_and(|to| (to / CHUNK_BYTES).min(last).abs_diff(at) >= self.stride);
+            .head(id)
+            .is_some_and(|to| self.chunk(to).abs_diff(at) >= self.stride);
         let due = moved && self.policy.is_some() && !self.running;
         if due {
             self.running = true;
@@ -1104,6 +1157,71 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("the retention passes never got there: {what}");
+    }
+
+    /// Wait for the chain of passes over one entity to stop, and say how
+    /// many of them ran.
+    ///
+    /// **The assertion is the count.** `at_most` is what the shape under
+    /// test can honestly need, and it is checked while the passes are
+    /// running rather than after they have stopped, because a chain that
+    /// arms itself off a term no pass moves has no "after": it runs tens of
+    /// thousands of times a second for as long as the process lives. So a
+    /// regression here fails on the number of passes it ran, and the sleep
+    /// below is only what lets them run at all.
+    async fn passes_stop(retention: &Arc<ProxyRetention>, at_most: u64, what: &str) -> u64 {
+        loop {
+            let ran = retention.passes.load(Ordering::Relaxed);
+            assert!(
+                ran <= at_most,
+                "{what}: {ran} passes have run where {at_most} is the most \
+                 this shape can need, so the arming chain does not terminate"
+            );
+            if retention.work.idle() {
+                return ran;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// Deliver a byte from inside the next pass, once, and say whether the
+    /// reader that delivered it ends there.
+    ///
+    /// This is the case [`Reader::note`] swallows: a pass is in flight, so
+    /// the byte starts no pass of its own. What it does do is move the
+    /// entity's last delivered byte away from the playhead the running pass
+    /// is measuring, and that is the whole of what the two tests below are
+    /// about.
+    fn deliver_during_the_next_pass(
+        retention: &Arc<ProxyRetention>,
+        reader: Reader,
+        at: u64,
+        and_end: bool,
+    ) -> Arc<Mutex<Option<Reader>>> {
+        let held = Arc::new(Mutex::new(Some(reader)));
+        let once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook = {
+            let held = held.clone();
+            move || {
+                if once.swap(true, Ordering::Relaxed) {
+                    return;
+                }
+                let mut slot = held.lock().expect("the reader to deliver from");
+                if and_end {
+                    // The range request to the end of the file closes on its
+                    // last byte, which is what leaves the entity's last
+                    // delivered byte at the end of the film with nothing
+                    // open there.
+                    if let Some(reader) = slot.take() {
+                        reader.note(at);
+                    }
+                } else if let Some(reader) = slot.as_ref() {
+                    reader.note(at);
+                }
+            }
+        };
+        *retention.interleave.lock().expect("the interleave slot") = Some(Arc::new(hook));
+        held
     }
 
     /// **The playhead is an observation, and there is none at process
@@ -1416,6 +1534,108 @@ mod tests {
         assert!(
             dir.chunk_path(0).is_file(),
             "and the first player's chunk is still on the disk"
+        );
+    }
+
+    /// **A pass arms another pass off its own reader having moved, and a
+    /// byte some other player delivered is not that.**
+    ///
+    /// [`LiveStream::heads`] asks where the reader this pass is *about* has
+    /// got to, and falls back to the entity's last delivered byte only when
+    /// that read has ended. The arming question has to be the same question,
+    /// because a pass moves neither term of it: asked of the entity's last
+    /// delivered byte while the pass measured a live reader's own playhead,
+    /// the distance between them is whatever the other player is doing, no
+    /// pass changes it, and every pass arms the next. Two players a stride
+    /// apart is an ordinary shape -- `p=` is out of the cache key so that
+    /// they share these chunks -- and it ran the listing and the unlinks of
+    /// a whole entity tens of thousands of times a second, for as long as
+    /// both bodies were open.
+    #[tokio::test]
+    async fn a_pass_does_not_arm_itself_off_a_byte_another_player_delivered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = ChunkDir::new(tmp.path().join("entity"));
+        write_chunks(&dir, 0..16);
+
+        // Four chunks of budget over sixteen: a policy is installed and a
+        // stride is one chunk, so twelve chunks apart is many strides.
+        let retention = retention(Some(4 * CHUNK_BYTES));
+        let one = retention.reader(&dir, TOTAL, TARGET.into());
+        let two = deliver_during_the_next_pass(
+            &retention,
+            retention.reader(&dir, TOTAL, TARGET.into()),
+            12 * CHUNK_BYTES,
+            false,
+        );
+
+        one.note(0);
+        let ran = passes_stop(
+            &retention,
+            4,
+            "the first player's pass, with the second player's byte behind it",
+        )
+        .await;
+        assert!(ran >= 1, "the note really did start a pass");
+
+        assert!(
+            dir.chunk_path(0).is_file(),
+            "the first player's own chunk is where the pass left it"
+        );
+        assert!(
+            dir.chunk_path(12).is_file(),
+            "and the second player's, which the pass was told about"
+        );
+        drop(two);
+    }
+
+    /// **A player that paused after a read of the end of the file is not a
+    /// player that is moving.**
+    ///
+    /// The shape needs no second live reader at all. A progressive MP4 has
+    /// its `moov` atom at the end, so a player asks for a few kilobytes
+    /// there before it plays anything, and that request closes -- leaving
+    /// the entity's last delivered byte at the end of the film with nothing
+    /// open there, while the body that is actually playing sits where
+    /// playback is. Then the person pauses, and nothing delivers another
+    /// byte of this entity ever again.
+    ///
+    /// Asked of the entity's last delivered byte, the pass round the paused
+    /// body found the end of the film a hundred chunks away, armed itself,
+    /// measured the same two numbers and armed itself again -- a pegged core
+    /// and a listing plus an `unlink` attempt per chunk against the flash of
+    /// a television, on an idle stream. It is also what
+    /// `ServerHandle::proxy_cache_settled` waits for, so nothing that waits
+    /// on the proxy cache to stop moving could ever return.
+    #[tokio::test]
+    async fn a_paused_player_does_not_arm_passes_off_a_tail_read_that_ended() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = ChunkDir::new(tmp.path().join("entity"));
+        write_chunks(&dir, 0..16);
+
+        let retention = retention(Some(4 * CHUNK_BYTES));
+        let playing = retention.reader(&dir, TOTAL, TARGET.into());
+        let tail = deliver_during_the_next_pass(
+            &retention,
+            retention.reader(&dir, TOTAL, TARGET.into()),
+            TOTAL - 1,
+            true,
+        );
+
+        playing.note(3 * CHUNK_BYTES);
+        let ran = passes_stop(
+            &retention,
+            4,
+            "the paused player's pass, with a tail read that ended behind it",
+        )
+        .await;
+        assert!(ran >= 1, "the note really did start a pass");
+        assert!(
+            tail.lock().unwrap().is_none(),
+            "and the read of the end of the film really did end inside it"
+        );
+        assert!(
+            dir.chunk_path(3).is_file(),
+            "the chunk the paused player is inside is where the pass left it"
         );
     }
 
