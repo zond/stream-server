@@ -486,7 +486,7 @@ impl ProxyRetention {
     /// it chose where the cache cleaner can read them, and the throttle
     /// rearmed.
     fn finish(
-        &self,
+        self: &Arc<Self>,
         key: &Path,
         id: u64,
         policy: RetentionPolicy,
@@ -494,26 +494,31 @@ impl ProxyRetention {
         windows: Vec<Range<u64>>,
         at: u64,
     ) {
-        let Ok(mut streams) = self.streams.lock() else {
-            return;
+        let again = {
+            let Ok(mut streams) = self.streams.lock() else {
+                return;
+            };
+            let Some(stream) = streams.get_mut(key) else {
+                return;
+            };
+            stream.running = false;
+            if let Some(reader) = stream.readers.get_mut(&id) {
+                reader.passed_at = Some(at);
+            }
+            // A budget published while this pass was running has already
+            // rebuilt the policy and the windows for the shape it makes; this
+            // pass measured the old one, and neither its answer nor its policy
+            // is the current one.
+            if stream.decided == budget {
+                stream.windows = windows;
+                if stream.policy.is_none() {
+                    stream.policy = Some(policy);
+                }
+            }
+            stream.arms_another_pass(at)
         };
-        let Some(stream) = streams.get_mut(key) else {
-            return;
-        };
-        stream.running = false;
-        if let Some(reader) = stream.readers.get_mut(&id) {
-            reader.passed_at = Some(at);
-        }
-        // A budget published while this pass was running has already
-        // rebuilt the policy and the windows for the shape it makes; this
-        // pass measured the old one, and neither its answer nor its policy
-        // is the current one.
-        if stream.decided != budget {
-            return;
-        }
-        stream.windows = windows;
-        if stream.policy.is_none() {
-            stream.policy = Some(policy);
+        if again {
+            self.spawn_pass(key.to_path_buf(), id);
         }
     }
 
@@ -765,6 +770,44 @@ impl LiveStream {
             stride: 1,
             running: false,
         }
+    }
+
+    /// Whether the pass that just measured chunk `at` swallowed the trigger
+    /// for the next one -- and if it did, claim the slot for it.
+    ///
+    /// [`Reader::note`] starts no pass while one is in flight, because a
+    /// second listing of the same directory at the same moment measures the
+    /// same disk, **and it does not remember that it wanted one**. That is
+    /// the right answer for every byte but the last: playback delivers
+    /// another one along in a moment and it brings the trigger with it. The
+    /// last byte of a body brings nothing, and a body ends while a pass is
+    /// running as often as the blocking pool is busy -- so the pass that
+    /// would have run round where the player *stopped* never ran at all.
+    ///
+    /// Two things followed from that and neither is a small one. Every chunk
+    /// written since the running pass took its listing stayed on the disk,
+    /// over the budget, until the cleaner's own walk an hour later got to it
+    /// -- the overshoot the throttle bounds to a twentieth of a window was
+    /// in fact the whole tail of the stream. And [`ProxyRetention::fill_gate`]
+    /// answers the cleaner from `windows`, which then named where the player
+    /// *had been* when the last pass ran rather than where it stopped: the
+    /// cleaner was offered the bytes round the playhead and refused the ones
+    /// behind them, which is the grace exactly inside out.
+    ///
+    /// So the pass that swallowed the trigger arms the next one itself. It
+    /// terminates because the playhead of a stream that has ended does not
+    /// move again: the pass this arms measures where it is now, and asks
+    /// this same question of a distance that is then zero.
+    fn arms_another_pass(&mut self, at: u64) -> bool {
+        let last = (self.total.max(1) - 1) / CHUNK_BYTES;
+        let moved = self
+            .last_playhead
+            .is_some_and(|to| (to / CHUNK_BYTES).min(last).abs_diff(at) >= self.stride);
+        let due = moved && self.policy.is_some() && !self.running;
+        if due {
+            self.running = true;
+        }
+        due
     }
 
     /// Build the policy for this entity under `budget`, or say why there is
@@ -1366,6 +1409,97 @@ mod tests {
             "a cap nobody has published is not a cap to evict against: {:?}",
             dir.held()
         );
+    }
+
+    /// **The last byte of a body gets its pass, even though one was already
+    /// running.**
+    ///
+    /// A pass is throttled and it is exclusive: while one is in flight
+    /// [`Reader::note`] starts no other, and it does not remember that it
+    /// wanted one. For every byte but the last that is right -- the next one
+    /// is along in a moment and it brings the trigger with it. The last byte
+    /// of a body brings nothing after it, and a body ends while a pass is
+    /// running as often as the blocking pool is busy.
+    ///
+    /// What that left behind was not a fraction of a window. Every chunk
+    /// written since the running pass took its listing stayed on the disk,
+    /// over the budget, until the cleaner's hourly walk got to it -- and
+    /// [`ProxyRetention::fill_gate`] went on answering the cleaner with the
+    /// window that pass had measured, which names where the player *was*
+    /// rather than where it stopped. So the cleaner was offered the bytes
+    /// round the playhead and refused the ones the player had left behind,
+    /// which is the grace exactly inside out.
+    ///
+    /// The interleaving is driven by hand -- the two halves of a pass either
+    /// side of the last byte -- because that is the only way to be inside
+    /// the window at all.
+    #[tokio::test]
+    async fn the_last_byte_of_a_body_gets_a_pass_even_though_one_was_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = ChunkDir::new(tmp.path().join("entity"));
+        write_chunks(&dir, 0..16);
+
+        // Eight chunks of budget over sixteen, so a window really is smaller
+        // than the entity and a pass really has something to give back.
+        let retention = retention(Some(8 * CHUNK_BYTES));
+        let reader = retention.reader(&dir, TOTAL, TARGET.into());
+        reader.note(0);
+        settled(
+            &retention,
+            "the first pass ran at the head of the film",
+            |_| !dir.chunk_path(15).exists(),
+        )
+        .await;
+        // Playback fills what it passes over, as it does.
+        write_chunks(&dir, 0..16);
+
+        // A pass takes the policy out of its slot at the head of the film,
+        // and is still working.
+        let begun = retention
+            .begin(dir.path(), reader.id)
+            .expect("a pass over a policy that is installed");
+        assert_eq!(begun.at, 0, "it measured where the player was");
+
+        // The player reads the film to its end while that pass runs. Its
+        // last byte finds no policy in the slot, so it starts nothing -- and
+        // there is no byte after it to try again.
+        reader.note(TOTAL - 1);
+
+        // Only now does the pass that swallowed the trigger finish, with the
+        // window it chose round the head of the film.
+        let measured: Vec<Range<u64>> = std::iter::once(0..8).collect();
+        retention.finish(
+            dir.path(),
+            reader.id,
+            begun.policy,
+            begun.budget,
+            measured,
+            0,
+        );
+
+        settled(
+            &retention,
+            "the pass the swallowed trigger armed reclaimed the head of the film",
+            |_| !dir.chunk_path(0).exists(),
+        )
+        .await;
+        assert!(
+            dir.chunk_path(15).is_file(),
+            "the chunk the player stopped inside is still here"
+        );
+        let mut gate = ReclaimGate::default();
+        retention.fill_gate(&mut gate);
+        assert!(
+            !gate.releases_file(&dir.chunk_path(15)),
+            "and the cleaner is refused it, because that is where the player \
+             stopped and where its next request will start"
+        );
+        assert!(
+            gate.releases_file(&dir.chunk_path(0)),
+            "while the head of the film, which the window left behind long \
+             ago, is the cleaner's for the asking"
+        );
+        drop(reader);
     }
 
     /// **The grace is for a stream nobody is reading, and an open reader is
