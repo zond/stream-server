@@ -5532,11 +5532,26 @@ fn a_playlist_read_is_registered_and_can_be_closed() -> anyhow::Result<()> {
     let fixture = fixture_with(origin)?;
     let target = format!("http://{}/live/master.m3u8", fixture.origin.addr);
     let url = format!("{}/proxy/?d={}&p=player-hls", fixture.base, encode(&target));
+    // The player's headers, reported the moment they arrive: what is being
+    // closed below is a body a player already has a `200` for, and a close
+    // that landed before those headers would leave the player holding a
+    // connection that ended rather than a stream that stopped. That is a
+    // different thing to test -- the very next test does -- and waiting for
+    // the headers here is what tells the two apart instead of leaving it to
+    // how loaded the machine is.
+    let (headers, arrived) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
         let response = reqwest::blocking::Client::new().get(url).send()?;
         let status = response.status();
+        let _ = headers.send(status);
         Ok::<_, reqwest::Error>((status, response.text().is_err()))
     });
+    assert_eq!(
+        arrived.recv().expect("the player's own headers"),
+        reqwest::StatusCode::OK,
+        "the rewrite streams, so the player has its 200 before a byte of the \
+         playlist exists"
+    );
 
     // The read is registered while it is stuck, which is what makes it
     // addressable. Bounded so a regression fails instead of hanging.
