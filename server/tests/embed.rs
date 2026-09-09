@@ -1505,6 +1505,27 @@ fn file_index(stats: &serde_json::Value, name: &str) -> usize {
         .unwrap_or_else(|| panic!("no file {name} in {stats}"))
 }
 
+/// The torrent pieces one file of `stats.files` occupies, read off the
+/// stats the server itself answers with.
+///
+/// Only for a fixture whose files are whole numbers of pieces -- which the
+/// assertion below says -- because a file that shares a boundary piece with
+/// its neighbour has no range of pieces that are only its own.
+fn file_pieces(stats: &serde_json::Value, idx: usize, piece_length: u64) -> std::ops::Range<u32> {
+    let number = |key: &str| {
+        stats["files"][idx][key]
+            .as_u64()
+            .unwrap_or_else(|| panic!("file {idx} has no {key} in {stats}"))
+    };
+    let (offset, length) = (number("offset"), number("length"));
+    assert_eq!(
+        (offset % piece_length, length % piece_length),
+        (0, 0),
+        "file {idx} does not sit on whole pieces: {stats}"
+    );
+    (offset / piece_length) as u32..((offset + length) / piece_length) as u32
+}
+
 /// How long a hash check (or a metadata resolve that has the metadata
 /// already) may take before a test gives up on it. Not a timing
 /// assertion -- only there so a regression fails instead of hanging -- so
@@ -2424,80 +2445,224 @@ fn the_stream_numbers_route_matches_the_library_api() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// **`-1` is a file index this server plays, so it is one a panel can ask
-/// about.**
+/// **A panel's numbers are about the file its URL really resolves to.**
 ///
 /// `/{infoHash}/-1` is the documented auto-select -- "pick the file
 /// yourself", narrowed by the `f=` filters -- and it is what a client hands
 /// its player whenever it does not name the file itself. The stream route
-/// serves it, `/{infoHash}/-1/stats.json` reports on it, and a panel
-/// holding that very URL must be told about the file the player is being
-/// served rather than told this server is holding nothing. Which file the
-/// filters pick is `routes::compat::resolve_file_idx`, the route's own
-/// function, and `stream_numbers`'s unit tests pin that; what this pins is
-/// that the URL a player is really playing is one this server answers
-/// about.
+/// serves it and `/{infoHash}/-1/stats.json` reports on it, so a panel
+/// holding that URL must be told about the file the player is being served
+/// rather than told this server holds nothing.
+///
+/// **Which file that is only shows where the two files carry different
+/// numbers**, so the fixture is a season pack: two episodes, both already on
+/// the disk, both far larger than the budget, and only ever one of them
+/// bounded -- the one a reader is inside. The file being played carries a
+/// window and the other one does not, so a resolution that answers about the
+/// wrong file puts the window on the wrong URL. That is what a constant file
+/// index does, on `/{infoHash}/{fileIdx}` and on `-1` alike, and it is what
+/// an auto-select that drops its `f=` filters does to a client narrowing a
+/// pack to the episode it is playing.
+///
+/// And the window is measured over the played episode's own pieces. The rest
+/// of the pack is on the same disk under the same info hash, so a window
+/// counted over the torrent's holdings would offer a viewer the other
+/// episodes' bytes as what they can scrub back into.
 #[test]
-fn a_panel_can_ask_about_the_file_the_server_picked_itself() -> anyhow::Result<()> {
+fn a_panels_numbers_are_about_the_file_the_url_resolved_to() -> anyhow::Result<()> {
+    /// The piece length `real_torrent` builds with.
+    const PIECE: u64 = 16 * 1024;
+    /// The episode the auto-select lands on: the largest video in the pack.
+    const PICKED_PIECES: u64 = 100;
+    /// The one only the `f=` filters reach. Smaller, so it is never the
+    /// auto-select, and still far above the budget, so a policy over it is a
+    /// bounded one.
+    const FILTERED_PIECES: u64 = 60;
+    /// Thirty-two pieces of budget: sixteen committed for sharing and
+    /// sixteen of window, of which the 10% behind the playhead is one. Well
+    /// under either episode, or the budget would cover the file being played
+    /// and nothing would be bounding it.
+    const BUDGET: u64 = 32 * PIECE;
+    /// The piece of the file the player is on. Far enough in that the window
+    /// has a piece behind it rather than sitting against the start.
+    const PLAYING: u64 = 4;
+
     let config_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
     let src = tempfile::tempdir()?;
-    // Two files whose data is already on disk: the 64 KiB one the
-    // auto-select lands on, and a 16 KiB one only a filter reaches.
-    let (handle, base, info_hash, idx, payload) =
-        lan_media_server(config_dir.path(), cache_dir.path(), src.path(), None)?;
+    let content = src.path().join("Show S01");
+    std::fs::create_dir_all(&content)?;
+    // Two episodes, each a whole number of pieces, so neither shares a
+    // boundary piece with the other whatever order `create_torrent`'s
+    // directory walk produced -- and so each one's piece range is the range
+    // its own bytes are in.
+    write_payload(
+        &content.join("Show.S01E01.mkv"),
+        (PICKED_PIECES * PIECE) as usize,
+    );
+    write_payload(
+        &content.join("Show.S01E02.mkv"),
+        (FILTERED_PIECES * PIECE) as usize,
+    );
+    let (torrent, info_hash) = real_torrent(&content);
+
+    let cache_root = cache_dir.path().join("cache");
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_root.clone()),
+        ..offline_config()
+    })?;
+    seed_piece_store(&cache_root, &torrent, &content);
+    let base = format!("http://{}", handle.http_addr());
+    let client = bearer_client(&handle)?;
+    client
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
+        .send()?
+        .error_for_status()?;
+    let stats = stats_after_check(&client, &base, &info_hash)?;
+    let picked_idx = file_index(&stats, "Show.S01E01.mkv");
+    let filtered_idx = file_index(&stats, "Show.S01E02.mkv");
+    let picked_pieces = file_pieces(&stats, picked_idx, PIECE);
+    let filtered_pieces = file_pieces(&stats, filtered_idx, PIECE);
+    complete_file_stats(&client, &base, &info_hash, picked_idx)?;
+    complete_file_stats(&client, &base, &info_hash, filtered_idx)?;
+
     let anonymous = reqwest::blocking::Client::new();
-
-    let player_url = format!("{base}/{info_hash}/-1");
-    let response = anonymous
-        .get(&player_url)
-        .header(reqwest::header::RANGE, "bytes=0-15")
-        .send()?;
-    assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
-    // The whole length in the Content-Range is which file was served: both
-    // payloads start with the same bytes.
-    let served = content_range_total(&response);
-    assert_eq!(
-        served,
-        payload.len() as u64,
-        "the auto-select served the largest file"
-    );
-    assert_eq!(response.bytes()?.as_ref(), &payload[0..16]);
-
-    let numbers = handle.stream_numbers(&player_url)?.expect(
-        "a panel asks with the URL its player is playing, and this server is holding that stream",
-    );
-    assert!(
-        numbers.sharing.is_some(),
-        "a torrent stream has a sharing row: {numbers:?}"
-    );
-    assert_eq!(
-        handle.stream_numbers(&format!("{base}/{info_hash}/{idx}"))?,
-        Some(numbers),
-        "the auto-select and the index it resolves to name one stream"
-    );
-
-    // And with the filters a client narrowing a season pack sends, which
-    // reach the same resolution here as they do on the stream route: the
-    // other file, and the panel answers about that one.
-    let filtered = format!(
+    let auto_url = format!("{base}/{info_hash}/-1");
+    // The filters a client narrowing a season pack sends, which reach the
+    // same resolution here as they do on the stream route.
+    let filtered_url = format!(
         "{base}/{info_hash}/-1?f={}",
-        urlencoding::encode("/extra/i")
+        urlencoding::encode("/S01E02/i")
     );
-    let response = anonymous
-        .get(&filtered)
-        .header(reqwest::header::RANGE, "bytes=0-15")
-        .send()?;
-    assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
-    assert_ne!(
-        content_range_total(&response),
-        served,
-        "the filter picked the other file, as it does on the stream route"
+    // Play, and answer which file was served: the whole length in the
+    // Content-Range, because both episodes start with the same bytes.
+    let play = |url: &str, from: u64| -> anyhow::Result<u64> {
+        let response = anonymous
+            .get(url)
+            .header(
+                reqwest::header::RANGE,
+                format!("bytes={from}-{}", from + 15),
+            )
+            .send()?;
+        anyhow::ensure!(
+            response.status() == reqwest::StatusCode::PARTIAL_CONTENT,
+            "a read of {url} at {from} answered {}",
+            response.status()
+        );
+        let total = content_range_total(&response);
+        anyhow::ensure!(response.bytes()?.len() == 16, "the player read its bytes");
+        Ok(total)
+    };
+    // What this torrent holds of one file, taken off the store itself.
+    let held_in = |pieces: &std::ops::Range<u32>| -> u64 {
+        piece_store(&cache_root)
+            .held(&info_hash)
+            .iter()
+            .filter(|piece| pieces.contains(piece))
+            .count() as u64
+            * PIECE
+    };
+    // The window a panel is given for the file it is playing, checked
+    // against that file's own piece files -- either side of the question,
+    // because a retention pass may reclaim between the two readings and may
+    // only reclaim, nothing here downloading a piece back.
+    let window_of = |url: &str, pieces: &std::ops::Range<u32>| -> anyhow::Result<()> {
+        let before = held_in(pieces);
+        let numbers = handle
+            .stream_numbers(url)?
+            .ok_or_else(|| anyhow::anyhow!("this server is holding the stream {url} names"))?;
+        let after = held_in(pieces);
+        let window = numbers
+            .window
+            .ok_or_else(|| anyhow::anyhow!("{url} names the bounded file, so it has a window"))?;
+        let sum = window.behind_bytes + window.ahead_bytes;
+        anyhow::ensure!(
+            after <= sum && sum <= before,
+            "the window is this episode's own pieces and not the pack's: {window:?} against \
+             {after}..={before} bytes of this file, out of {} bytes of pieces the torrent holds",
+            pieces_held(&cache_root, &info_hash) as u64 * PIECE
+        );
+        anyhow::ensure!(
+            window.behind_bytes >= PIECE,
+            "the piece behind the playhead is inside the window, so a player can scrub back \
+             into what it has just played: {window:?}"
+        );
+        anyhow::ensure!(
+            window.ahead_bytes >= PIECE,
+            "and the piece under the playhead is in hand: {window:?}"
+        );
+        anyhow::ensure!(
+            numbers.sharing.is_some(),
+            "a torrent stream's bytes are seeded, so there is a sharing row: {numbers:?}"
+        );
+        Ok(())
+    };
+    // And the other file: this server holds it, and nothing is bounding it,
+    // which is a stream with no window rather than a stream with no rows.
+    let no_window_for = |url: &str| -> anyhow::Result<()> {
+        let numbers = handle
+            .stream_numbers(url)?
+            .ok_or_else(|| anyhow::anyhow!("this server is holding the stream {url} names"))?;
+        anyhow::ensure!(
+            numbers.window.is_none(),
+            "no reader is inside the file {url} names, so it has no window: {numbers:?}"
+        );
+        Ok(())
+    };
+
+    // A first read, so this torrent has an engine streaming it before the
+    // budget arrives. Nothing bounds it yet, so it announces everything it
+    // holds and the cleaner may take none of it -- which is what makes the
+    // pass below publish a budget without emptying the cache it is about to
+    // be measured against.
+    assert_eq!(
+        play(&auto_url, 0)?,
+        PICKED_PIECES * PIECE,
+        "the auto-select serves the largest video of the pack"
     );
-    assert!(
-        handle.stream_numbers(&filtered)?.is_some(),
-        "and the panel asking with that URL is told about that stream"
+    handle.update_settings(serde_json::json!({ "cacheSize": BUDGET as f64 }))?;
+    let report = handle.clean_cache_now()?;
+    assert_eq!(
+        report.limit,
+        Some(BUDGET),
+        "the cleaner published a different cap than the one configured; the \
+         volume this test runs on cannot give {BUDGET} bytes"
     );
+    assert_eq!(
+        pieces_held(&cache_root, &info_hash) as u64,
+        PICKED_PIECES + FILTERED_PIECES,
+        "and it took nothing: this torrent announces every piece it holds"
+    );
+
+    // The player seeks on and reads. Opening the reader is what installs a
+    // policy under the budget the cleaner has now published, and the byte
+    // reaching the player is what moves the playhead -- into the file the
+    // auto-select resolved to, and no other.
+    play(&auto_url, PLAYING * PIECE)?;
+    window_of(&auto_url, &picked_pieces)?;
+    window_of(&format!("{base}/{info_hash}/{picked_idx}"), &picked_pieces)?;
+    no_window_for(&format!("{base}/{info_hash}/{filtered_idx}"))?;
+
+    // Now the filters, on the URL a client narrowing the pack hands its
+    // player. The read moves the policy and the playhead to that episode,
+    // and the numbers follow it: the filtered URL is the bounded one now and
+    // the bare auto-select, which resolves to the episode nobody is inside,
+    // has no window.
+    assert_eq!(
+        play(&filtered_url, PLAYING * PIECE)?,
+        FILTERED_PIECES * PIECE,
+        "the filter picked the other episode, as it does on the stream route"
+    );
+    window_of(&filtered_url, &filtered_pieces)?;
+    window_of(
+        &format!("{base}/{info_hash}/{filtered_idx}"),
+        &filtered_pieces,
+    )?;
+    no_window_for(&auto_url)?;
+    no_window_for(&format!("{base}/{info_hash}/{picked_idx}"))?;
 
     handle.shutdown()?;
     handle.join()?;
