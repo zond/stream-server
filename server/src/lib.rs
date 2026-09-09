@@ -543,6 +543,32 @@ impl ServerHandle {
         self.block_on_server(async move { routes::cache::clean_cache_now(&state).await })?
     }
 
+    /// Wait until the proxy cache has nothing left on the blocking pool: no
+    /// chunk on its way to the disk and no retention pass on its way round
+    /// it (`proxy_cache::DiskWork`).
+    ///
+    /// **This is here for what watches the cache from outside**, which is to
+    /// say the tests, and it is the answer to a question they could not
+    /// otherwise ask. A chunk is written from a task nobody joins, so the
+    /// last chunks of a body land after the player has read the last byte of
+    /// it and in whatever order the pool ran them in; the pass that reclaims
+    /// round the final playhead lands after that again. A test that counts
+    /// the files in the cache root without this is counting a directory that
+    /// is still moving, and it will read the same policy as two different
+    /// answers depending on how loaded the machine is.
+    ///
+    /// It is a wait on a condition and not on a clock: once a body has been
+    /// read to its end, nothing can start work this count has not already
+    /// seen, so a count of nothing is a disk that has stopped. `within`
+    /// bounds it so a regression fails instead of hanging.
+    pub fn proxy_cache_settled(&self, within: std::time::Duration) -> anyhow::Result<()> {
+        let state = self.state.clone();
+        self.block_on_server(async move {
+            tokio::time::timeout(within, state.proxy_cache.settled()).await
+        })?
+        .map_err(|_| anyhow::anyhow!("the proxy cache was still writing after {within:?}"))
+    }
+
     /// End every proxied stream the client marked with `token`, and answer
     /// how many that was -- exactly what
     /// `POST /proxy-streams/{token}/close` does, through the same function.

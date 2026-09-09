@@ -180,6 +180,11 @@ pub struct ProxyRetention {
     /// wrap without meaning anything: a process would have to open
     /// eighteen quintillion bodies for two live ones to collide.
     next_reader: AtomicU64,
+    /// The passes below while they are on the blocking pool, counted beside
+    /// the cache's chunk writes: `crate::proxy_cache::DiskWork`. A pass is
+    /// spawned and never joined, so it is the other half of what makes a
+    /// listing of the cache root a moving picture.
+    work: Arc<crate::proxy_cache::DiskWork>,
 }
 
 /// One entity one or more readers are open on.
@@ -310,11 +315,12 @@ struct Begin {
 }
 
 impl ProxyRetention {
-    pub fn new(budget: Arc<RetentionBudget>) -> Self {
+    pub fn new(budget: Arc<RetentionBudget>, work: Arc<crate::proxy_cache::DiskWork>) -> Self {
         Self {
             budget,
             streams: Mutex::new(HashMap::new()),
             next_reader: AtomicU64::new(0),
+            work,
         }
     }
 
@@ -342,7 +348,7 @@ impl ProxyRetention {
     /// length of it, so a second pass that overlaps this one does nothing
     /// rather than queueing behind it. Exactly the shape
     /// `enginefs::engine::Engine::retain` uses, and for the same reason.
-    fn pass(&self, key: &Path, id: u64) {
+    fn pass(self: &Arc<Self>, key: &Path, id: u64) {
         let Some(begin) = self.begin(key, id) else {
             return;
         };
@@ -412,6 +418,21 @@ impl ProxyRetention {
             );
         }
         self.finish(key, id, policy, budget, windows, at);
+    }
+
+    /// Put a pass for `id` on the blocking pool.
+    ///
+    /// The caller has already claimed the stream's `running` slot under the
+    /// lock, so this is the spawn and the counting of it and nothing else.
+    /// It is counted because a pass unlinks files nobody joins the task for:
+    /// see `crate::proxy_cache::DiskWork`.
+    fn spawn_pass(self: &Arc<Self>, key: PathBuf, id: u64) {
+        let retention = self.clone();
+        let ticket = self.work.start();
+        tokio::task::spawn_blocking(move || {
+            let _ticket = ticket;
+            retention.pass(&key, id);
+        });
     }
 
     /// The locked half before a pass: take the policy out, and say what the
@@ -694,10 +715,7 @@ impl Reader {
         if !due {
             return;
         }
-        let retention = self.retention.clone();
-        let key = self.key.clone();
-        let id = self.id;
-        tokio::task::spawn_blocking(move || retention.pass(&key, id));
+        self.retention.spawn_pass(self.key.clone(), self.id);
     }
 }
 
@@ -883,7 +901,7 @@ mod tests {
         if let Some(limit) = limit {
             budget.set(Some(limit));
         }
-        Arc::new(ProxyRetention::new(budget))
+        Arc::new(ProxyRetention::new(budget, Arc::default()))
     }
 
     fn write_chunks(dir: &ChunkDir, indices: impl IntoIterator<Item = u64>) {
@@ -1316,7 +1334,7 @@ mod tests {
 
         let budget = Arc::new(RetentionBudget::default());
         budget.set(Some(12 * CHUNK_BYTES));
-        let retention = Arc::new(ProxyRetention::new(budget.clone()));
+        let retention = Arc::new(ProxyRetention::new(budget.clone(), Arc::default()));
         let reader = retention.reader(&dir, TOTAL, TARGET.into());
         reader.note(0);
         settled(&retention, "the published cap was applied", |_| {

@@ -181,6 +181,75 @@ pub const CHUNK_BYTES: u64 = 256 * 1024;
 /// and is not in the key.
 const RANGE_REQUEST_HEADERS: [&str; 2] = ["range", "if-range"];
 
+/// The blocking work this cache has started and has not finished: the chunk
+/// writes on their way to the disk, and the retention passes on their way
+/// round it.
+///
+/// Both are `spawn_blocking` tasks nobody joins, and that is what keeps the
+/// reactor off the disk -- a body must not wait for its own chunk to be
+/// written, and a playhead must not wait for a directory listing. What it
+/// costs is that **nothing else in the process can tell when the disk has
+/// stopped moving**: the last chunk of a body is written after the player
+/// has read the last byte of it and out of order with its neighbours, and
+/// the pass that reclaims round the final playhead runs after that again.
+/// Anything reading the cache root -- a test counting what the policy left,
+/// above all -- is therefore looking at a directory that is still being
+/// written to and deleted from, and two listings a moment apart are of two
+/// different caches.
+///
+/// So the work is counted, and [`Self::settled`] is the wait for there being
+/// none of it. Once a body has been read to its end that wait is a real
+/// quiescence and not a guess: no byte is delivered after it, so no chunk
+/// write and no pass can begin that this count has not already seen.
+/// Nothing in the server's own paths waits on it -- a stream that waited for
+/// its own cache would be the very thing the blocking pool is here to
+/// prevent -- and it is here so that what looks at the cache from outside
+/// can look at it while it is still.
+#[derive(Debug)]
+pub struct DiskWork {
+    /// The count, and the thing a waiter is woken by. A `watch` channel
+    /// rather than a counter beside a `Notify`, because a waiter that reads
+    /// the count and then registers for the wake-up has already missed the
+    /// one that arrived in between.
+    count: tokio::sync::watch::Sender<usize>,
+}
+
+impl Default for DiskWork {
+    fn default() -> Self {
+        Self {
+            count: tokio::sync::watch::channel(0).0,
+        }
+    }
+}
+
+impl DiskWork {
+    /// One more task on its way to the disk. The ticket goes into the task,
+    /// so a task that panics releases it exactly as one that returns does.
+    pub fn start(self: &Arc<Self>) -> DiskTicket {
+        self.count.send_modify(|count| *count += 1);
+        DiskTicket(self.clone())
+    }
+
+    /// Wait until none of it is left.
+    pub async fn settled(&self) {
+        let mut count = self.count.subscribe();
+        while *count.borrow_and_update() > 0 {
+            if count.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// One task's place in [`DiskWork`], released when the task ends.
+pub struct DiskTicket(Arc<DiskWork>);
+
+impl Drop for DiskTicket {
+    fn drop(&mut self) {
+        self.0.count.send_modify(|count| *count -= 1);
+    }
+}
+
 /// One cache, rooted where the cleaner can find it.
 pub struct ProxyCache {
     root: PathBuf,
@@ -191,6 +260,8 @@ pub struct ProxyCache {
     /// disk and the body filled on its way past -- and a playhead nothing
     /// observes is the gap this whole policy exists to close.
     retention: Arc<ProxyRetention>,
+    /// What this cache has on the blocking pool right now: see [`DiskWork`].
+    work: Arc<DiskWork>,
 }
 
 impl ProxyCache {
@@ -199,9 +270,11 @@ impl ProxyCache {
     /// cleaner's cap, which is the *same* cell the torrent half reads
     /// (`EngineFS::cache_budget`) and not a second copy of the number.
     pub fn new(download_dir: &Path, budget: Arc<enginefs::retention::RetentionBudget>) -> Self {
+        let work = Arc::new(DiskWork::default());
         Self {
             root: download_dir.join(PROXY_CACHE_DIR),
-            retention: Arc::new(ProxyRetention::new(budget)),
+            retention: Arc::new(ProxyRetention::new(budget, work.clone())),
+            work,
         }
     }
 
@@ -213,6 +286,12 @@ impl ProxyCache {
     /// cache cleaner's gate.
     pub fn retention(&self) -> &Arc<ProxyRetention> {
         &self.retention
+    }
+
+    /// Wait until this cache has nothing left on the blocking pool: see
+    /// [`DiskWork`].
+    pub async fn settled(&self) {
+        self.work.settled().await;
     }
 
     /// The entry this request reads and writes, or `None` for a request the
@@ -328,6 +407,7 @@ impl ProxyCache {
         Some(Entry {
             dir: self.root.join(hex::encode(hash.finalize())),
             retention: self.retention.clone(),
+            work: self.work.clone(),
             target: url.as_str().into(),
         })
     }
@@ -363,6 +443,10 @@ fn names_this_server(url: &Url, self_addr: std::net::SocketAddr) -> bool {
 pub struct Entry {
     dir: PathBuf,
     retention: Arc<ProxyRetention>,
+    /// What this entry puts on the blocking pool -- the chunk writes of the
+    /// fills it opens, and the sweep of a stale entity -- while it is on its
+    /// way to the disk. See [`DiskWork`].
+    work: Arc<DiskWork>,
     /// The origin URL this entry is of, carried down to every reader it
     /// opens so that a client holding a `/proxy` URL can ask what is held
     /// for the stream it is playing. See [`crate::proxy_retention`].
@@ -466,7 +550,9 @@ impl Entry {
         // the directory being written into.
         let stale = self.dir.clone();
         let fresh = dir.clone();
+        let ticket = self.work.start();
         tokio::task::spawn_blocking(move || {
+            let _ticket = ticket;
             if let Err(error) = std::fs::create_dir_all(&fresh) {
                 tracing::debug!(path = %fresh.display(), %error, "could not open a proxy cache entry");
                 return;
@@ -476,6 +562,7 @@ impl Entry {
         let dir = ChunkDir::new(dir);
         Filler {
             reader: self.retention.reader(&dir, total, self.target.clone()),
+            work: self.work.clone(),
             dir,
             total,
             offset: body_start,
@@ -721,6 +808,9 @@ pub struct Filler {
     /// origin and not off the disk, so there is no chunk of ours it is
     /// waiting to read.
     reader: crate::proxy_retention::Reader,
+    /// The chunk writes below, while they are on their way to the disk: see
+    /// [`DiskWork`].
+    work: Arc<DiskWork>,
     total: u64,
     /// Absolute offset of the next byte to arrive.
     offset: u64,
@@ -763,7 +853,11 @@ impl Filler {
                     let chunk = std::mem::take(&mut self.buffer);
                     self.collecting = None;
                     let dir = self.dir.clone();
-                    tokio::task::spawn_blocking(move || write_chunk(&dir, index, &chunk, want));
+                    let ticket = self.work.start();
+                    tokio::task::spawn_blocking(move || {
+                        let _ticket = ticket;
+                        write_chunk(&dir, index, &chunk, want);
+                    });
                 }
             }
             // Bytes before the first chunk boundary of a body belong to a
