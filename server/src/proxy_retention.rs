@@ -656,8 +656,27 @@ impl ProxyRetention {
             // rebuilt the policy and the windows for the shape it makes; this
             // pass measured the old one, and neither its answer nor its policy
             // is the current one.
+            //
+            // **The unlinks it already made are not taken back, and are not
+            // stale in the way the answer is.** Every one of them was a chunk
+            // outside every window and promise the entity had, under a cap
+            // that was in force when the pass read it -- and, at the door,
+            // under the readers live at the moment of the unlink, which the
+            // new budget does not change. A budget that has since risen makes
+            // them cost a refetch and nothing else, which is the same price
+            // the cleaner's own overtaken pass pays
+            // (`cache_cleaner::CachePasses`). What must not stand is the
+            // *conclusion*: a window measured against a cap nobody holds any
+            // more, and a policy that would go on reclaiming to it.
             if stream.decided == budget {
                 stream.windows = windows;
+                // Reached when the budget went away and came back while this
+                // pass ran: `decide` built a policy under the slot this pass
+                // emptied, for the very cap this pass measured. Two policies
+                // for one budget, and the fresh one is the one to keep --
+                // this pass's carries the window it advanced to, which the
+                // next pass would advance again from where playback is now
+                // anyway.
                 if stream.policy.is_none() {
                     stream.policy = Some(policy);
                 }
