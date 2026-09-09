@@ -10295,6 +10295,68 @@ mod tests {
         queued.await.expect("the queued task");
     }
 
+    /// **A pass measures against where playback is now, not where it was
+    /// when the pass began.**
+    ///
+    /// The listing is a directory walk on the blocking pool and the pass is
+    /// suspended across it -- which is the whole of what the test above
+    /// asserts, and is what makes the interleaving here a queued task
+    /// rather than a sleep. `note_playhead` takes none of the locks the
+    /// pass holds, so a byte delivered in that gap moves the playhead while
+    /// the fill writes the read-ahead the player is about to want. A pass
+    /// that read the playhead before the walk draws its window round where
+    /// playback *was*: everything written ahead of that is outside the
+    /// window, on the disk, and reclaimed, and `AfterRelease::LeaveDropped`
+    /// means nothing fetches it back until the player arrives at the hole
+    /// and parks. The same reordering was measured on the proxy's identical
+    /// pass before it was fixed there: a 16 MB read left an empty directory
+    /// under an 8 MB budget after two passes.
+    ///
+    /// One piece of window over a four-piece file, so the two readings give
+    /// disjoint answers and the assertions are opposites rather than
+    /// counts: measured at piece 0 the pass keeps 0 and takes 3, measured
+    /// at piece 3 it keeps 3 and takes 0.
+    #[tokio::test]
+    async fn a_pass_reclaims_round_where_playback_got_to_while_it_listed() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in [0u32, 1, 2, 3] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+
+        let store = enginefs.piece_store();
+        engine.note_playhead(0, 0);
+        engine.begin_retention(0).await;
+
+        // Playback, in the only gap this pass has: the queued task cannot
+        // run until the pass gives the runtime back, and the listing is the
+        // only thing in this pass that does.
+        let moved = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.note_playhead(0, 75) }
+        });
+
+        let pass = engine.retain(&store).await.expect("a pass ran");
+        moved.await.expect("the playback task");
+        assert!(pass.reclaimed > 0, "the pass gave pieces back: {pass:?}");
+        assert!(
+            bucket.join("3").is_file(),
+            "the piece under the playhead the pass ended at is not the pass's to take"
+        );
+        assert!(
+            !bucket.join("0").exists(),
+            "and what playback has left behind is"
+        );
+    }
+
     /// And the other half of a pass that is not the reactor's to do: the
     /// unlinks.
     ///

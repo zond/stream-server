@@ -397,6 +397,30 @@ pub struct RetentionPass {
     pub withdrawn: usize,
 }
 
+/// What the store holds of this torrent, off the reactor.
+///
+/// `held` lists one directory per thousand pieces, and the pass that asks
+/// holds `Engine::announce` for the whole of itself -- the lock the
+/// stream-open path takes too. Blocking the reactor thread here therefore
+/// stalls request handling as well as the pass, and the lock is held across
+/// this either way, so nothing about what the pass excludes moves: what
+/// leaves the reactor is the waiting, not the exclusion.
+///
+/// `None` is a pool that will not answer -- shutting down, or the task
+/// panicked -- which is a pass that measured nothing: it commits nothing
+/// and reclaims nothing rather than acting on a listing it does not have.
+///
+/// Listing is the caller's and not [`advance`]'s because it is the pass's
+/// long suspension, and the playhead the decision is built from has to be
+/// read on the far side of it; see `Engine::retain`.
+pub(crate) async fn listing(store: &StoreRoot, info_hash: &str) -> Option<BTreeSet<u32>> {
+    let store = store.clone();
+    let info_hash = info_hash.to_string();
+    tokio::task::spawn_blocking(move || store.held(&info_hash))
+        .await
+        .ok()
+}
+
 /// One pass: ask the policy where the playhead has left us, then make its
 /// answer true.
 ///
@@ -405,33 +429,24 @@ pub struct RetentionPass {
 /// takes a piece out of reach of the reclaim. Then reclaim, which is the
 /// backend forgetting the pieces and the store unlinking them, under the
 /// claim that keeps the two atomic.
+///
+/// `held` is the caller's listing and `offset_in_file` must be a reading
+/// taken after it: a playhead older than the listing names a window the
+/// disk has already been filled past, and everything the fill wrote ahead
+/// of it is then outside that window and reclaimed. Read the other way
+/// round the decision names pieces the listing did not find, and
+/// `RetentionPolicy::advance` takes `held` as the candidate set, so those
+/// name nothing and unlink nothing.
 pub(crate) async fn advance<H: TorrentHandle>(
     handle: &H,
     store: &StoreRoot,
     info_hash: &str,
     retention: &mut FileRetention,
     offset_in_file: u64,
+    held: &BTreeSet<u32>,
 ) -> RetentionPass {
-    // Off the reactor: `held` lists one directory per thousand pieces, and
-    // this pass holds `Engine::announce` for the whole of itself -- the lock
-    // the stream-open path takes too. Blocking the reactor thread here
-    // therefore stalls request handling as well as the pass, and the lock is
-    // held across this either way, so nothing about what the pass excludes
-    // moves: what leaves the reactor is the waiting, not the exclusion.
-    //
-    // A pool that will not answer -- shutting down, or the task panicked --
-    // is a pass that measured nothing, so it commits nothing and reclaims
-    // nothing rather than acting on a listing it does not have.
-    let held = {
-        let store = store.clone();
-        let info_hash = info_hash.to_string();
-        match tokio::task::spawn_blocking(move || store.held(&info_hash)).await {
-            Ok(held) => held,
-            Err(_) => return RetentionPass::default(),
-        }
-    };
     let playhead = retention.playhead(offset_in_file);
-    let decision = retention.policy.advance(playhead, &held);
+    let decision = retention.policy.advance(playhead, held);
 
     let mut pass = RetentionPass::default();
     // A committed piece is one nothing will ever reclaim, which is the

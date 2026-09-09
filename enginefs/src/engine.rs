@@ -905,7 +905,11 @@ impl<H: TorrentHandle> Engine<H> {
 
     /// One retention pass: what the policy makes of where the playhead is
     /// now, and the calls that make it so. `None` when there is nothing to
-    /// do -- no policy, or no reader has been anywhere yet.
+    /// do -- no policy, no reader has been anywhere yet, or the reader is
+    /// in another file than the policy governs, before or after the walk.
+    /// Every one of those leaves the policy where it was; none of them is
+    /// a pass that ran and found nothing, which is `Some` with a zeroed
+    /// count.
     ///
     /// Takes the policy out of its slot for the length of the pass rather
     /// than holding the lock across the backend calls, so a second pass
@@ -927,7 +931,12 @@ impl<H: TorrentHandle> Engine<H> {
             self.clear_retention_locked().await;
             return None;
         }
-        let (file_idx, offset) = (*self.playhead.lock())?;
+        // Only which file, and only as a filter: a torrent whose reader has
+        // moved on must not pay a `read_dir` per thousand pieces every two
+        // seconds to discover it has nothing to say. The offset is
+        // deliberately not read here, so that no part of this reading can
+        // be mistaken for the one the decision is built from.
+        let (file_idx, _) = (*self.playhead.lock())?;
         let mut retention = self.retention.lock().take()?;
         if retention.file_idx != file_idx {
             // The playhead names a different file: a reader that has just
@@ -939,9 +948,56 @@ impl<H: TorrentHandle> Engine<H> {
             self.put_back(retention);
             return None;
         }
-        let pass =
-            crate::retention::advance(&self.handle, store, &self.info_hash, &mut retention, offset)
-                .await;
+        let Some(held) = crate::retention::listing(store, &self.info_hash).await else {
+            // A listing we do not have is a pass that measured nothing, not
+            // a pass with an empty disk: it says so with a zeroed count,
+            // which is what ENOSPC recovery reads to decide whether a pass
+            // made room.
+            self.put_back(retention);
+            return Some(crate::retention::RetentionPass::default());
+        };
+        // **The deciding reading, and it is taken after the listing.**
+        //
+        // The listing is a directory walk on the blocking pool, so this
+        // pass is suspended across it while `note_playhead` -- which takes
+        // none of the locks held here -- runs on every delivered byte and
+        // the fill writes the read-ahead. Read before the walk, the
+        // playhead is the older half of the pair: the window is drawn round
+        // where playback *was*, and everything the fill wrote ahead of it
+        // in the meantime is outside that window, on the disk, and
+        // reclaimed. `AfterRelease::LeaveDropped` means nothing reselects
+        // it, so the player arrives at the hole a moment later and parks
+        // while the swarm refetches. Measured on the proxy's identical pass
+        // before it was reordered: a 16 MB read left an empty directory
+        // under an 8 MB budget after two passes.
+        //
+        // Read after the walk the pair is the other way round -- the
+        // decision may name pieces the listing did not find, which unlinks
+        // nothing, because the listing is the candidate set.
+        let Some((file_idx, offset)) = *self.playhead.lock() else {
+            self.put_back(retention);
+            return None;
+        };
+        if retention.file_idx != file_idx {
+            // The reader moved to another file while we walked the disk.
+            // Same answer as the asking above, for the same reason, and
+            // deliberately not a clear: the policy goes back into its slot
+            // still holding its range back from what we announce, because
+            // nothing was advertised and nothing unlinked, and a bail-out
+            // that dropped it would leave the range held back while the
+            // cleaner's gate read the torrent as announced.
+            self.put_back(retention);
+            return None;
+        }
+        let pass = crate::retention::advance(
+            &self.handle,
+            store,
+            &self.info_hash,
+            &mut retention,
+            offset,
+            &held,
+        )
+        .await;
         self.put_back(retention);
         Some(pass)
     }
