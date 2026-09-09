@@ -948,7 +948,7 @@ fn cache_hit_response(
 /// body that differs between two identical requests is not something to
 /// hand a caching player.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct ProxyParams {
+pub(crate) struct ProxyParams {
     /// The target URL, as `d=` spelled it. In the Core format this is the
     /// origin, and the request path is appended to it.
     target: String,
@@ -1217,6 +1217,54 @@ pub async fn proxy_handler(
     proxy(state, Some(rest.to_string()), raw_query, headers, method).await
 }
 
+/// What one `/proxy` URL asks for: its own parameters, and the origin URL
+/// they name.
+///
+/// **The one place the `/proxy` URL shape is read.** The handler below uses
+/// it to decide what to fetch, and `crate::stream_numbers` uses it to
+/// decide which stream a client's player URL is about; a second reading of
+/// the same shape is a second answer waiting to disagree with this one.
+///
+/// `rest` is what the path held after `/proxy/`, and *that is what decides
+/// the format*: `None` -- nothing in the path -- is the query format
+/// (`/proxy/?d=<url>`), anything else is the Core path format
+/// (`/proxy/d=<origin>&h=.../<path>`), whose own query belongs to the
+/// target and is folded into it. `None` is a target that will not parse as
+/// a URL, which the handler answers `400`.
+pub(crate) fn requested(rest: Option<&str>, raw_query: Option<&str>) -> Option<(ProxyParams, Url)> {
+    let params = match rest {
+        None => ProxyParams::parse(raw_query.unwrap_or_default()),
+        Some(rest) => {
+            // The Core path format: /proxy/d=...&h=.../path/to/file. The
+            // segment before the first slash is the proxy's own parameters,
+            // everything after it is the target's path.
+            let (query_seg, path_seg) = match rest.split_once('/') {
+                Some((q, p)) => (q, p),
+                None => (rest, ""),
+            };
+            let mut params = ProxyParams::parse(query_seg);
+            if params.target.is_empty() {
+                // Fallback: assume whole rest is the URL (legacy/simple proxy)
+                params.target = rest.to_string();
+            } else if !path_seg.is_empty() {
+                // `d=` is the origin, the rest of the path is the file on it.
+                if !params.target.ends_with('/') {
+                    params.target.push('/');
+                }
+                params.target.push_str(path_seg);
+            }
+            params
+        }
+    };
+    let mut url = Url::parse(&params.target).ok()?;
+    if rest.is_some()
+        && let Some(query) = raw_query
+    {
+        url.set_query(Some(query));
+    }
+    Some((params, url))
+}
+
 /// `rest` is what the path held after `/proxy/`, and *that is what decides
 /// the format*: `None` -- nothing in the path -- is the query format
 /// (`/proxy/?d=<url>`), anything else is the Core path format
@@ -1240,45 +1288,14 @@ async fn proxy(
     // Format 1: ?d=URL (standard)
     // Format 2: /<query_params>/<path> (Core) where query_params contains d=ORIGIN&h=HEADER&r=RESPONSE_HEADER
 
-    let is_path_format = rest.is_some();
-    let params = match &rest {
-        None => ProxyParams::parse(raw_query.as_deref().unwrap_or_default()),
-        Some(rest) => {
-            // The Core path format: /proxy/d=...&h=.../path/to/file. The
-            // segment before the first slash is the proxy's own parameters,
-            // everything after it is the target's path.
-            let (query_seg, path_seg) = match rest.split_once('/') {
-                Some((q, p)) => (q, p),
-                None => (rest.as_str(), ""),
-            };
-            let mut params = ProxyParams::parse(query_seg);
-            if params.target.is_empty() {
-                // Fallback: assume whole rest is the URL (legacy/simple proxy)
-                params.target = rest.clone();
-            } else if !path_seg.is_empty() {
-                // `d=` is the origin, the rest of the path is the file on it.
-                if !params.target.ends_with('/') {
-                    params.target.push('/');
-                }
-                params.target.push_str(path_seg);
-            }
-            params
-        }
+    let Some((params, url)) = requested(rest.as_deref(), raw_query.as_deref()) else {
+        return (StatusCode::BAD_REQUEST, "Invalid target URL").into_response();
     };
     // The client's name for the player this stream is for, if it minted one
     // (`p=`). It is ours, not the target's: it never travels to the origin,
     // and it is what `POST /proxy-streams/{token}/close` addresses. See
     // [`crate::proxy_streams`].
     let player_token = params.player_token.clone();
-
-    let mut url = match Url::parse(&params.target) {
-        Ok(u) => u,
-        Err(_) => return (StatusCode::BAD_REQUEST, "Invalid target URL").into_response(),
-    };
-
-    if is_path_format && let Some(q) = raw_query {
-        url.set_query(Some(&q));
-    }
 
     // A token that has been closed is not given another stream. ffmpeg
     // reconnects through the URL it already has -- token and all -- so

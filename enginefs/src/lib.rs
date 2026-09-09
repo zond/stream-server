@@ -2562,6 +2562,55 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             .collect()
     }
 
+    /// What this server holds of one file a player is inside, and what that
+    /// torrent has moved over this session -- the numbers a client's
+    /// playback panel shows for a torrent stream.
+    ///
+    /// `None` is a hash no engine exists for: a stream this server is not
+    /// holding, which is not an error and has no rows. Inside a `Some`,
+    /// `window` and `committed_bytes` are absent together and mean exactly
+    /// what [`Engine::policy_reading`] says they mean -- no policy governs
+    /// this file, no reader has been inside it, or the reader has moved to
+    /// another file. `transfer` is always there, because a torrent that
+    /// exists has moved whatever it has moved.
+    ///
+    /// **A peek, like [`Self::transfer_totals`], and for the same reason.**
+    /// It creates nothing -- no engine, no magnet add, so it never goes near
+    /// `get_or_begin_add_magnet` -- and it does not count as a poll, so a
+    /// panel that asks every second cannot hold a torrent out of the idle
+    /// sweep just by looking at it. It is *not* free, though: the window is
+    /// counted from a listing of the torrent's piece directories, which is
+    /// a `getdents` per thousand pieces on the blocking pool. Ask it while
+    /// a panel is open, not for the life of the process.
+    pub async fn torrent_stream_numbers(
+        &self,
+        info_hash: &str,
+        file_idx: usize,
+    ) -> Option<crate::retention::TorrentStreamNumbers> {
+        let engine = self.peek_engine(info_hash).await?;
+        let transfer = engine.handle.transfer_totals();
+        let Some(reading) = engine.policy_reading(file_idx) else {
+            return Some(crate::retention::TorrentStreamNumbers {
+                window: None,
+                committed_bytes: None,
+                transfer,
+            });
+        };
+        // Off the reactor: `held` lists one directory per thousand pieces.
+        // The policy reading is already a value, so nothing is held across
+        // it -- see `retention::PolicyReading`.
+        let store = self.piece_store();
+        let hash = info_hash.to_string();
+        let held = tokio::task::spawn_blocking(move || store.held(&hash))
+            .await
+            .ok()?;
+        Some(crate::retention::TorrentStreamNumbers {
+            window: Some(reading.window(&held)),
+            committed_bytes: Some(reading.committed_bytes()),
+            transfer,
+        })
+    }
+
     pub async fn get_all_statistics(&self) -> HashMap<String, crate::backend::EngineStats> {
         let engines = self.engines.read().await;
         let mut stats = HashMap::new();
@@ -4304,6 +4353,12 @@ mod tests {
         /// would.
         fetched: AtomicU64,
         uploaded: AtomicU64,
+        /// Test knob: how many pieces each file of the fake torrent spans.
+        /// Zero -- the default -- is one piece per file, which is the
+        /// geometry every test that does not set this was written against.
+        /// A test that needs a playhead to have pieces on both sides of it
+        /// raises it.
+        pieces_per_file: AtomicU64,
         /// How many times the torrent was put back to work after that.
         restart_from_error: AtomicUsize,
         /// How many times the reconciler stopped and started the torrent.
@@ -4536,6 +4591,14 @@ mod tests {
         }
     }
 
+    impl FakeHandle {
+        /// The `pieces_per_file` knob, read as a count rather than as a raw
+        /// zero: see [`FakeCounters::pieces_per_file`].
+        fn pieces_per_file(&self) -> u64 {
+            self.counters.pieces_per_file.load(Ordering::SeqCst).max(1)
+        }
+    }
+
     #[async_trait::async_trait]
     impl TorrentHandle for FakeHandle {
         fn info_hash(&self) -> String {
@@ -4677,8 +4740,10 @@ mod tests {
         /// piece range without the test having to build a layout.
         async fn file_pieces(&self, file_idx: usize) -> Option<crate::backend::FilePieceSpan> {
             let len = self.files.get(file_idx)?.length;
+            let per_file = self.pieces_per_file();
+            let first = file_idx as u32 * per_file as u32;
             Some(crate::backend::FilePieceSpan {
-                pieces: file_idx as u32..file_idx as u32 + 1,
+                pieces: first..first + per_file as u32,
                 offset: file_idx as u64 * len,
                 bytes: len,
             })
@@ -4701,7 +4766,7 @@ mod tests {
         /// One piece per file, matching `file_pieces` above, so a policy
         /// can be sized without a layout.
         fn piece_length(&self) -> Option<u64> {
-            Some(self.files.first()?.length)
+            Some(self.files.first()?.length / self.pieces_per_file())
         }
 
         async fn drop_pieces(
@@ -9810,6 +9875,169 @@ mod tests {
         counters.refuses_drop.store(true, Ordering::SeqCst);
         assert_eq!(enginefs.release_pieces(TEST_HASH, &[5]).await, 0);
         assert!(bucket.join("5").is_file());
+    }
+
+    /// **The panel's window is a reading of the disk, not of the policy's
+    /// intentions.**
+    ///
+    /// What a viewer is being told is "you can scrub back this far, and you
+    /// have this much in hand". Both halves are therefore what is *on the
+    /// disk* on each side of the playhead: the ahead half is read-ahead
+    /// that has arrived, and a stream whose read-ahead has not arrived yet
+    /// must not report the extent the policy intends to fill as though the
+    /// bytes were there.
+    #[tokio::test]
+    async fn the_window_is_what_the_store_holds_of_the_file_split_at_the_playhead() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
+        // Four pieces of twenty-five bytes, so a playhead can have pieces on
+        // both sides of it.
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        // Two pieces of budget over a four-piece file: a split, so a policy
+        // is installed at all.
+        enginefs.set_cache_budget(Some(50));
+
+        // Three of the four pieces are on the disk: the fourth is
+        // read-ahead that has not arrived.
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in [0u32, 1, 2] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+
+        // A reader sixty bytes into the file: piece two.
+        engine.note_playhead(0, 60);
+        engine.begin_retention(0).await;
+
+        let numbers = enginefs
+            .torrent_stream_numbers(TEST_HASH, 0)
+            .await
+            .expect("the engine exists");
+        assert_eq!(
+            numbers.window,
+            Some(crate::retention::CacheWindow {
+                behind_bytes: 50,
+                ahead_bytes: 25,
+            }),
+            "pieces zero and one are behind the playhead; piece two is the one \
+             under it and counts as ahead; piece three is not on the disk and \
+             is not in hand"
+        );
+    }
+
+    /// The transfer totals a panel shows are the torrent's own, this
+    /// session's, and they reach the answer with the window.
+    #[tokio::test]
+    async fn a_torrent_stream_reports_what_the_torrent_has_moved() {
+        let (enginefs, counters) = test_enginefs_with_file_count(1);
+        counters.fetched.store(4_800, Ordering::SeqCst);
+        counters.uploaded.store(2_100, Ordering::SeqCst);
+
+        let numbers = enginefs
+            .torrent_stream_numbers(TEST_HASH, 0)
+            .await
+            .expect("the engine exists");
+        assert_eq!(numbers.transfer.fetched, 4_800);
+        assert_eq!(numbers.transfer.uploaded, 2_100);
+    }
+
+    /// **Every absence here is a real one, and none of them is a zero.**
+    ///
+    /// A client draws no row for "there is no such number" and a misleading
+    /// one for "the number is zero", so the two must not be spelled the
+    /// same way. A torrent this server does not hold has no answer at all; a
+    /// torrent no reader has been inside has no playhead, and inventing one
+    /// from what is on the disk would put a window round a region nobody
+    /// has ever read; a torrent nothing is bounding has no window and no
+    /// committed set, whatever it announces.
+    #[tokio::test]
+    async fn a_stream_with_no_playhead_and_no_policy_reports_no_window() {
+        let (enginefs, _counters) = test_enginefs_with_file_count(2);
+        assert!(
+            enginefs
+                .torrent_stream_numbers("f".repeat(40).as_str(), 0)
+                .await
+                .is_none(),
+            "a hash no engine exists for is a stream this server is not holding"
+        );
+
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(1));
+        engine.begin_retention(0).await;
+        let numbers = enginefs
+            .torrent_stream_numbers(TEST_HASH, 0)
+            .await
+            .expect("the engine exists");
+        assert_eq!(
+            (numbers.window, numbers.committed_bytes),
+            (None, None),
+            "a policy is installed, but no reader has been anywhere in the file"
+        );
+
+        // A reader is inside the *other* file: this one's numbers left with
+        // it.
+        engine.note_playhead(1, 0);
+        let numbers = enginefs
+            .torrent_stream_numbers(TEST_HASH, 0)
+            .await
+            .expect("the engine exists");
+        assert_eq!((numbers.window, numbers.committed_bytes), (None, None));
+
+        // And a budget that covers the file installs no policy, so there is
+        // nothing bounding this stream to have a window or a committed set.
+        let (enginefs, _counters) = test_enginefs_with_file_count(1);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(1_000_000));
+        engine.note_playhead(0, 0);
+        engine.begin_retention(0).await;
+        let numbers = enginefs
+            .torrent_stream_numbers(TEST_HASH, 0)
+            .await
+            .expect("the engine exists");
+        assert_eq!((numbers.window, numbers.committed_bytes), (None, None));
+    }
+
+    /// The committed bytes are the set the policy has really settled on --
+    /// what we have advertised and will not reclaim -- and they grow as
+    /// playback walks past pieces, never from what happens to be on disk.
+    #[tokio::test]
+    async fn the_committed_bytes_are_what_playback_has_walked_past() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in [0u32, 1, 2, 3] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+
+        let store = enginefs.piece_store();
+        engine.note_playhead(0, 0);
+        engine.begin_retention(0).await;
+        engine.retain(&store).await.expect("a pass");
+        assert_eq!(
+            enginefs
+                .torrent_stream_numbers(TEST_HASH, 0)
+                .await
+                .and_then(|numbers| numbers.committed_bytes),
+            Some(0),
+            "the first pass of a stream commits nothing: no window has \
+             released a piece yet"
+        );
+
+        // Playback walks on to the second piece, which releases the first.
+        engine.note_playhead(0, 25);
+        engine.retain(&store).await.expect("a pass");
+        assert_eq!(
+            enginefs
+                .torrent_stream_numbers(TEST_HASH, 0)
+                .await
+                .and_then(|numbers| numbers.committed_bytes),
+            Some(25),
+            "one piece of twenty-five bytes is committed for sharing"
+        );
     }
 
     /// A piece that becomes announced between the cleaner's reading and its

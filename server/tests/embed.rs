@@ -2364,6 +2364,66 @@ fn download_routes_match_the_library_api() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `GET /stream-numbers.json?url=...` is `ServerHandle::stream_numbers`, and
+/// **a URL this server is not holding is `200 null`, not a `404`.**
+///
+/// The client is not asking whether a resource exists here; it is asking
+/// what we hold of the stream its player is on, and "nothing" is a complete
+/// answer to that -- the ordinary case for every stream this server neither
+/// torrents nor proxies. A `404` would have a panel showing an error for a
+/// film that is playing perfectly.
+#[test]
+fn the_stream_numbers_route_matches_the_library_api() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_dir.path().join("cache")),
+        ..offline_config()
+    })?;
+    let base = format!("http://{}", handle.http_addr());
+    let client = bearer_client(&handle)?;
+
+    // A control route, so it takes the token like every other one.
+    assert_eq!(
+        reqwest::blocking::Client::new()
+            .get(format!("{base}/stream-numbers.json?url=/x/0"))
+            .send()?
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+
+    // A stream this server does not hold: `null`, and the library says the
+    // same.
+    let url = format!("http://127.0.0.1:11470/{}/0", "f".repeat(40));
+    // The URL carries no `&` or `=`, so it needs no escaping to survive one
+    // query parameter.
+    let response = client
+        .get(format!("{base}/stream-numbers.json?url={url}"))
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.json::<serde_json::Value>()?,
+        serde_json::Value::Null
+    );
+    assert_eq!(handle.stream_numbers(&url)?, None);
+
+    // And a request that names no stream at all is the client's mistake.
+    assert_eq!(
+        client
+            .get(format!("{base}/stream-numbers.json"))
+            .send()?
+            .status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
 /// `GET /cache.json` and `POST /cache/clean` share their functions with
 /// `ServerHandle::{cache_usage, clean_cache_now}` -- the replacement for a
 /// client restarting the server just to make the cache cleaner's start-up
@@ -3512,6 +3572,7 @@ fn lan_media_listener_serves_media_but_no_control_route() -> anyhow::Result<()> 
         "/device-info",
         "/downloads.json",
         "/cache.json",
+        "/stream-numbers.json?url=/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/0",
         "/get-https?ipAddress=127.0.0.1",
         "/casting",
     ] {

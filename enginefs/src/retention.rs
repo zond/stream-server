@@ -144,6 +144,128 @@ impl FileRetention {
     pub fn shape(&self) -> Shape {
         self.policy.shape()
     }
+
+    /// What this policy says right now, for a reader at `offset_in_file`.
+    ///
+    /// Taken under the policy's lock and read outside it, which is the only
+    /// reason it is a value: the disk listing the numbers are finished
+    /// against is not something to hold a lock across. See
+    /// [`PolicyReading`].
+    pub fn reading(&self, offset_in_file: u64) -> PolicyReading {
+        PolicyReading {
+            pieces: self.pieces(),
+            piece_length: self.piece_length,
+            playhead: self.playhead(offset_in_file),
+            committed: self.committed().len(),
+        }
+    }
+}
+
+/// One reading of one file's retention policy: where the playhead is, what
+/// range the policy governs, and how much of it is committed.
+///
+/// A value rather than a borrow of the policy, because the question it
+/// exists to answer -- [`Self::window`] -- is finished against a listing of
+/// the disk, and that listing must not happen under the lock the policy
+/// lives behind.
+///
+/// **Every number here is an observation and none of them survives the
+/// call.** The playhead is where a reader really got to (`None` for a
+/// torrent no reader has been inside, which is why this is only ever
+/// reached through one), the committed count is what the policy has
+/// actually advertised, and nothing is stored: a second reading a moment
+/// later is a second measurement, not a memory of this one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyReading {
+    pieces: Range<u32>,
+    piece_length: u64,
+    playhead: u32,
+    committed: usize,
+}
+
+impl PolicyReading {
+    /// Bytes the policy has committed: pieces we have advertised and
+    /// promised never to reclaim.
+    ///
+    /// Piece count times piece length, so the last piece of a file counts
+    /// whole. The window below is counted the same way, and the two are
+    /// meant to be read against each other.
+    pub fn committed_bytes(&self) -> u64 {
+        (self.committed as u64).saturating_mul(self.piece_length)
+    }
+
+    /// What the store holds of this file, split at the playhead.
+    ///
+    /// `held` is the pieces on the disk now -- the store's own listing,
+    /// taken by the caller. **Neither half is a promise**: `ahead` is
+    /// read-ahead that has arrived, not read-ahead that is planned, and a
+    /// stream that has fetched nothing yet has a window of zero rather than
+    /// the extent the policy intends to fill. The piece under the playhead
+    /// counts as ahead: it is the one a player is about to read, not one it
+    /// has passed.
+    ///
+    /// Pieces outside this file are not this policy's and are skipped --
+    /// `held` is the whole torrent's.
+    pub fn window(&self, held: &BTreeSet<u32>) -> CacheWindow {
+        let mut window = CacheWindow::default();
+        for piece in held.range(self.pieces.clone()) {
+            let half = if *piece < self.playhead {
+                &mut window.behind_bytes
+            } else {
+                &mut window.ahead_bytes
+            };
+            *half = half.saturating_add(self.piece_length);
+        }
+        window
+    }
+}
+
+/// What one stream's cache holds around the playhead, in bytes.
+///
+/// A live reading of a store and nothing else: what is on the disk for the
+/// stream being played, split at the byte a player has actually reached.
+/// Both stores answer in this shape -- the piece store counting pieces of
+/// the file, the proxy cache counting chunks of the entity -- because it is
+/// the same question about the same volume.
+///
+/// It is never anything's stored state. At process start there is no
+/// playhead in either store (`enginefs::engine::Engine`'s is `None`, the
+/// proxy's map is empty), so there is nothing to read one of these off,
+/// which is the honest answer for a process that has watched nothing yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheWindow {
+    /// Bytes of the stream we hold behind the playhead: what a scan back
+    /// is served from.
+    pub behind_bytes: u64,
+    /// Bytes we hold from the playhead on: what playback has in hand.
+    pub ahead_bytes: u64,
+}
+
+/// What one torrent stream's stores say about it right now: the cache
+/// around the playhead, the set committed for sharing, and what the torrent
+/// has moved this session.
+///
+/// Every field is measured when it is asked for and none of it is kept.
+/// The transfer totals in particular are **this session's** -- librqbit's
+/// own per-torrent counters, which start at zero when the torrent is added
+/// to this process and are not persisted. A ratio taken from them is a
+/// ratio for this run and must be labelled as one; the conventional
+/// per-torrent, across-restarts ratio would need counters stored on disk,
+/// and a stored counter is a claim about a past this process never saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TorrentStreamNumbers {
+    /// What the piece store holds of the file, split at the playhead, or
+    /// `None` where there is no policy or no playhead to split at.
+    pub window: Option<CacheWindow>,
+    /// Bytes advertised and promised never to be reclaimed. Absent with
+    /// [`Self::window`] and for the same reasons: with no policy installed
+    /// nothing has been promised, whatever is announced.
+    pub committed_bytes: Option<u64>,
+    /// What this torrent has fetched and sent since it was added, in this
+    /// process. Always present: a torrent that exists has moved whatever it
+    /// has moved, even if that is nothing.
+    pub transfer: crate::backend::TransferTotals,
 }
 
 /// Build the policy for a file about to be streamed, or say why there is

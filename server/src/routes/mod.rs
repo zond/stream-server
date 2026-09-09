@@ -9,5 +9,6 @@ pub mod local_addon;
 pub mod nzb;
 pub mod proxy;
 pub mod stream;
+pub mod stream_numbers;
 pub mod system;
 pub(crate) mod util;

@@ -1661,6 +1661,85 @@ fn a_proxied_stream_past_the_cache_budget_stays_under_it_and_still_plays() -> an
     Ok(())
 }
 
+/// **What a playback panel is told about a proxied stream, end to end.**
+///
+/// A client holding the URL it handed its player asks one question and gets
+/// the window round the playhead -- and it is the disk it gets, not the
+/// policy's intentions: the two halves add up to the chunk files really in
+/// the cache, counted here by walking the root. The sharing row is absent,
+/// because a proxied response is not seeded and a row of zeroes would say
+/// the opposite.
+#[test]
+fn a_panel_asking_about_a_proxied_stream_is_told_what_is_on_the_disk() -> anyhow::Result<()> {
+    use std::io::Read;
+
+    let fixture = fixture_with(Origin::start_sized(RETENTION_ORIGIN)?)?;
+    published_budget(&fixture, RETENTION_BUDGET)?;
+
+    let origin = format!("http://{}", fixture.origin.addr);
+    let url = format!("{}/proxy/d={}/movie.mp4", fixture.base, encode(&origin));
+    let mut response = reqwest::blocking::Client::new()
+        .get(&url)
+        .header(
+            reqwest::header::RANGE,
+            format!("bytes=0-{}", 64 * CHUNK - 1),
+        )
+        .send()?;
+    let mut played = Vec::new();
+    response.read_to_end(&mut played)?;
+    assert_eq!(played.len() as u64, 64 * CHUNK, "the player read the lot");
+    wait_until_chunks_at_most(&fixture, (RETENTION_BUDGET / CHUNK) as usize);
+
+    let numbers = fixture
+        .handle
+        .stream_numbers(&url)?
+        .expect("this server is holding that stream");
+    let window = numbers.window.expect("a bounded stream has a window");
+    assert_eq!(
+        window.behind_bytes + window.ahead_bytes,
+        cached_chunks(&fixture).len() as u64 * CHUNK,
+        "the two halves are the chunk files really on the disk"
+    );
+    assert!(
+        window.behind_bytes > 0,
+        "and a player two thirds through a film can scrub back into what it \
+         has already played: {window:?}"
+    );
+    assert_eq!(
+        numbers.sharing, None,
+        "a proxied response is not seeded, so there is no sharing row"
+    );
+
+    // The same server, asked about streams it is not holding: not an error,
+    // just no rows.
+    assert_eq!(
+        fixture.handle.stream_numbers(&format!(
+            "{}/proxy/d={}/other-film.mp4",
+            fixture.base,
+            encode(&origin)
+        ))?,
+        None,
+        "a proxied URL nothing has ever been read of"
+    );
+    assert_eq!(
+        fixture
+            .handle
+            .stream_numbers(&format!("{}/{}/0", fixture.base, "f".repeat(40)))?,
+        None,
+        "a torrent this server has no engine for"
+    );
+    assert_eq!(
+        fixture
+            .handle
+            .stream_numbers("file:///home/viewer/film.mkv")?,
+        None,
+        "and a stream that never went through this server at all"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
 /// **The behaviour the split was costing us.** A short seek back is answered
 /// off the disk; a long one is not.
 ///

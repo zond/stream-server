@@ -185,6 +185,23 @@ pub struct ProxyRetention {
 /// One entity one or more readers are open on.
 struct LiveStream {
     dir: ChunkDir,
+    /// The origin URL the reader that created this entry was opened for --
+    /// `/proxy`'s `d=`, after the request's own query has been folded into
+    /// it, which is exactly the URL the cache key was built from.
+    ///
+    /// **The one thing here that is not derivable from the store**, and it
+    /// is here because nothing else can be: a cache key is a hash of the
+    /// target *and* the player headers that reach the origin, so an entity's
+    /// directory name cannot be worked back to the URL a client is holding.
+    /// A panel asking "what do you hold for the stream I am playing" has
+    /// only that URL to ask with.
+    ///
+    /// An observation like every other field of this map: it exists because
+    /// a reader was opened for that URL in this process, it is written once
+    /// when the entry is created and never revised, and it dies with the
+    /// entry. At process start there are no entries, so there is no URL to
+    /// read back -- which is true, this process has relayed nothing yet.
+    target: Arc<str>,
     /// The entity's length, as the origin stated it. A response of a
     /// different length is a different entity in a different directory, so
     /// this cannot go stale under the key.
@@ -272,6 +289,8 @@ pub struct Reader {
     retention: Arc<ProxyRetention>,
     key: PathBuf,
     dir: ChunkDir,
+    /// The origin URL this read is of; see [`LiveStream::target`].
+    target: Arc<str>,
     total: u64,
     id: u64,
 }
@@ -304,11 +323,12 @@ impl ProxyRetention {
     /// It records nothing by itself: a reader that never promises and never
     /// delivers a byte is a reader nothing has observed, and it leaves no
     /// entry behind.
-    pub fn reader(self: &Arc<Self>, dir: &ChunkDir, total: u64) -> Reader {
+    pub fn reader(self: &Arc<Self>, dir: &ChunkDir, total: u64, target: Arc<str>) -> Reader {
         Reader {
             retention: self.clone(),
             key: dir.path().to_path_buf(),
             dir: dir.clone(),
+            target,
             total,
             id: self.next_reader.fetch_add(1, Ordering::Relaxed),
         }
@@ -511,6 +531,51 @@ impl ProxyRetention {
     /// `true` for anything this has no opinion about: a path that is not a
     /// chunk name, an entity nothing is reading. The cleaner's own rules
     /// decide those, as they did before.
+    /// What this cache holds of the stream `target` names, split at the
+    /// playhead -- the proxy half of `crate::stream_numbers`.
+    ///
+    /// `None` is "nothing here is about that URL", and it covers three
+    /// different truths that a client shows the same way, by drawing no
+    /// row: no reader of this process has ever been opened on that target,
+    /// no byte of it has reached a player yet so there is no playhead to
+    /// split at, and -- the case that is a policy statement rather than an
+    /// absence -- nothing is *bounding* this entity, because the budget
+    /// covers it or no budget has been published. What is on the disk then
+    /// is not a window, it is whatever the cleaner has not yet aged out,
+    /// and putting that under the same label would give one row two
+    /// meanings.
+    ///
+    /// Two entities can carry one target -- the key covers the player
+    /// headers that reach the origin too -- so the most recently read of
+    /// them answers: that is the one a player is inside now.
+    ///
+    /// Blocking: it lists the entity's bucket directories, one `getdents`
+    /// per thousand chunks. Call it off the reactor. The lock is not held
+    /// across the listing.
+    pub fn window(&self, target: &str) -> Option<enginefs::retention::CacheWindow> {
+        let (dir, playhead) = {
+            let streams = self.streams.lock().ok()?;
+            let stream = streams
+                .values()
+                .filter(|stream| &*stream.target == target && stream.bounded)
+                .max_by_key(|stream| stream.last_seen)?;
+            (stream.dir.clone(), stream.last_playhead?)
+        };
+        let at = playhead / CHUNK_BYTES;
+        let mut window = enginefs::retention::CacheWindow::default();
+        for index in dir.held() {
+            // The chunk the playhead is in counts as ahead: it is the one a
+            // player is reading out of, not one it has passed.
+            let half = if index < at {
+                &mut window.behind_bytes
+            } else {
+                &mut window.ahead_bytes
+            };
+            *half = half.saturating_add(CHUNK_BYTES);
+        }
+        Some(window)
+    }
+
     pub fn still_free(&self, path: &std::path::Path) -> bool {
         let mut gate = ReclaimGate::default();
         self.fill_gate(&mut gate);
@@ -572,7 +637,7 @@ impl Reader {
         };
         streams
             .entry(self.key.clone())
-            .or_insert_with(|| LiveStream::new(self.dir.clone(), self.total))
+            .or_insert_with(|| LiveStream::new(self.dir.clone(), self.total, self.target.clone()))
             .readers
             .entry(self.id)
             .or_default()
@@ -596,9 +661,9 @@ impl Reader {
             let Ok(mut streams) = self.retention.streams.lock() else {
                 return;
             };
-            let stream = streams
-                .entry(self.key.clone())
-                .or_insert_with(|| LiveStream::new(self.dir.clone(), self.total));
+            let stream = streams.entry(self.key.clone()).or_insert_with(|| {
+                LiveStream::new(self.dir.clone(), self.total, self.target.clone())
+            });
             stream.last_seen = Instant::now();
             stream.last_playhead = Some(delivered_to);
             if stream.decided != Some(budget) {
@@ -667,9 +732,10 @@ fn span(chunks: Range<u32>) -> Range<u64> {
 }
 
 impl LiveStream {
-    fn new(dir: ChunkDir, total: u64) -> Self {
+    fn new(dir: ChunkDir, total: u64, target: Arc<str>) -> Self {
         Self {
             dir,
+            target,
             total,
             readers: HashMap::new(),
             last_seen: Instant::now(),
@@ -791,7 +857,7 @@ mod tests {
 
         // A reader opens and promises that very chunk, which is what a seek
         // does while the walk is still running.
-        let reader = retention.reader(&dir, TOTAL);
+        let reader = retention.reader(&dir, TOTAL, TARGET.into());
         reader.promises(4..5);
 
         assert!(
@@ -806,6 +872,11 @@ mod tests {
 
     /// A 4 MiB entity: sixteen chunks.
     const TOTAL: u64 = 16 * CHUNK_BYTES;
+
+    /// The origin URL these readers are of. Only [`ProxyRetention::window`]
+    /// reads it back; everything else here is keyed by the entity's own
+    /// directory.
+    const TARGET: &str = "https://origin.example/film.mkv";
 
     fn retention(limit: Option<u64>) -> Arc<ProxyRetention> {
         let budget = Arc::new(RetentionBudget::default());
@@ -862,7 +933,7 @@ mod tests {
         // A reader is *open* on it -- the lookup found bytes -- and has
         // delivered nothing and promised nothing. That is not a playhead,
         // and it is not a window either.
-        let reader = retention.reader(&dir, TOTAL);
+        let reader = retention.reader(&dir, TOTAL, TARGET.into());
         let mut gate = ReclaimGate::default();
         retention.fill_gate(&mut gate);
         for index in 0..16u64 {
@@ -871,6 +942,78 @@ mod tests {
                 "chunk {index} is cache: nothing has been played out of this entity"
             );
         }
+        drop(reader);
+    }
+
+    /// **What a panel is shown is what is on the disk, split where a byte
+    /// really reached a player.**
+    ///
+    /// Not the extent the policy intends to fill: the ahead half is
+    /// read-ahead that has *arrived*, and a proxied entity only ever has
+    /// what the origin has relayed so far.
+    #[tokio::test]
+    async fn the_window_a_panel_shows_is_the_disk_split_at_the_playhead() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = ChunkDir::new(tmp.path().join("entity"));
+        // Chunks three to nine: everything a player has fetched of a
+        // sixteen-chunk entity so far.
+        write_chunks(&dir, 3..10);
+
+        // Twelve chunks of budget over sixteen, so a policy is installed --
+        // and a playhead whose window covers every chunk on the disk, so
+        // this measures the reading rather than a race with the pass.
+        let retention = retention(Some(12 * CHUNK_BYTES));
+        let reader = retention.reader(&dir, TOTAL, TARGET.into());
+        reader.note(4 * CHUNK_BYTES + 5);
+
+        assert_eq!(
+            retention.window(TARGET),
+            Some(enginefs::retention::CacheWindow {
+                behind_bytes: CHUNK_BYTES,
+                ahead_bytes: 6 * CHUNK_BYTES,
+            }),
+            "chunk three is behind the head; the chunk under it and the five \
+             after it are what playback has in hand"
+        );
+        assert_eq!(
+            retention.window("https://origin.example/other-film.mkv"),
+            None,
+            "and it is the stream that was asked about, not whatever is open"
+        );
+        drop(reader);
+    }
+
+    /// The two absences a panel draws no row for, told apart from a zero.
+    ///
+    /// A reader that has delivered nothing has no playhead to split at --
+    /// the freshness rule this whole module is built on -- and a stream
+    /// nothing is *bounding* has no window at all: what is on its disk is
+    /// then whatever the cleaner has not yet aged out, which is a different
+    /// quantity, and one row cannot honestly carry both.
+    #[tokio::test]
+    async fn a_stream_with_no_playhead_or_no_policy_has_no_window_to_show() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = ChunkDir::new(tmp.path().join("entity"));
+        write_chunks(&dir, 0..16);
+
+        let bounded = retention(Some(8 * CHUNK_BYTES));
+        let opened = bounded.reader(&dir, TOTAL, TARGET.into());
+        opened.promises(0..16);
+        assert_eq!(
+            bounded.window(TARGET),
+            None,
+            "a body has been framed, but no byte of it has reached a player"
+        );
+        drop(opened);
+
+        // A budget that covers the entity: nothing here is bounded.
+        let covered = tempfile::tempdir().unwrap();
+        let dir = ChunkDir::new(covered.path().join("entity"));
+        write_chunks(&dir, 0..16);
+        let unbounded = retention(Some(32 * CHUNK_BYTES));
+        let reader = unbounded.reader(&dir, TOTAL, TARGET.into());
+        reader.note(4 * CHUNK_BYTES);
+        assert_eq!(unbounded.window(TARGET), None);
         drop(reader);
     }
 
@@ -885,7 +1028,7 @@ mod tests {
         // Eight chunks of budget over a sixteen-chunk entity: a split, so a
         // window exists at all.
         let retention = retention(Some(8 * CHUNK_BYTES));
-        let reader = retention.reader(&dir, TOTAL);
+        let reader = retention.reader(&dir, TOTAL, TARGET.into());
         reader.note(12 * CHUNK_BYTES);
         // Until the first pass has run, the window is the whole entity:
         // nothing has been measured yet and nothing is given up on a guess.
@@ -923,7 +1066,7 @@ mod tests {
 
         // Thirty-two chunks of budget over a sixteen-chunk entity.
         let retention = retention(Some(32 * CHUNK_BYTES));
-        let reader = retention.reader(&dir, TOTAL);
+        let reader = retention.reader(&dir, TOTAL, TARGET.into());
         reader.note(12 * CHUNK_BYTES);
 
         let mut gate = ReclaimGate::default();
@@ -954,7 +1097,7 @@ mod tests {
         write_chunks(&dir, 0..16);
 
         let retention = retention(None);
-        let reader = retention.reader(&dir, TOTAL);
+        let reader = retention.reader(&dir, TOTAL, TARGET.into());
         reader.note(15 * CHUNK_BYTES);
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -992,7 +1135,7 @@ mod tests {
         // sixteen: four of what it promised are outside the window at its
         // first chunk, and two chunks are promised by nobody.
         let retention = retention(Some(10 * CHUNK_BYTES));
-        let reader = retention.reader(&dir, TOTAL);
+        let reader = retention.reader(&dir, TOTAL, TARGET.into());
         reader.promises(0..14);
         reader.note(0);
         settled(&retention, "a pass reclaimed what nobody promised", |_| {
@@ -1056,8 +1199,8 @@ mod tests {
         // Four chunks of budget: two windows of four cannot both be the
         // whole entity, so this really is two windows and not one big one.
         let retention = retention(Some(4 * CHUNK_BYTES));
-        let one = retention.reader(&dir, TOTAL);
-        let two = retention.reader(&dir, TOTAL);
+        let one = retention.reader(&dir, TOTAL, TARGET.into());
+        let two = retention.reader(&dir, TOTAL, TARGET.into());
         one.note(0);
         settled(&retention, "the first player's pass ran", |gate| {
             gate.releases_file(&dir.chunk_path(15))
@@ -1108,7 +1251,7 @@ mod tests {
         write_chunks(&dir, 0..16);
 
         let retention = retention(Some(8 * CHUNK_BYTES));
-        let reader = retention.reader(&dir, TOTAL);
+        let reader = retention.reader(&dir, TOTAL, TARGET.into());
         reader.note(0);
         settled(
             &retention,
@@ -1174,7 +1317,7 @@ mod tests {
         let budget = Arc::new(RetentionBudget::default());
         budget.set(Some(12 * CHUNK_BYTES));
         let retention = Arc::new(ProxyRetention::new(budget.clone()));
-        let reader = retention.reader(&dir, TOTAL);
+        let reader = retention.reader(&dir, TOTAL, TARGET.into());
         reader.note(0);
         settled(&retention, "the published cap was applied", |_| {
             dir.held().len() <= 12
@@ -1226,7 +1369,7 @@ mod tests {
         write_chunks(&dir, 0..16);
 
         let retention = retention(Some(8 * CHUNK_BYTES));
-        let reader = retention.reader(&dir, TOTAL);
+        let reader = retention.reader(&dir, TOTAL, TARGET.into());
         reader.promises(0..16);
         reader.note(0);
 
@@ -1257,7 +1400,7 @@ mod tests {
         write_chunks(&dir, 0..16);
 
         let retention = retention(Some(8 * CHUNK_BYTES));
-        let reader = retention.reader(&dir, TOTAL);
+        let reader = retention.reader(&dir, TOTAL, TARGET.into());
         reader.promises(0..16);
         reader.note(0);
         let mut gate = ReclaimGate::default();

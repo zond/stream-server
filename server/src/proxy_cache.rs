@@ -328,6 +328,7 @@ impl ProxyCache {
         Some(Entry {
             dir: self.root.join(hex::encode(hash.finalize())),
             retention: self.retention.clone(),
+            target: url.as_str().into(),
         })
     }
 }
@@ -362,6 +363,10 @@ fn names_this_server(url: &Url, self_addr: std::net::SocketAddr) -> bool {
 pub struct Entry {
     dir: PathBuf,
     retention: Arc<ProxyRetention>,
+    /// The origin URL this entry is of, carried down to every reader it
+    /// opens so that a client holding a `/proxy` URL can ask what is held
+    /// for the stream it is playing. See [`crate::proxy_retention`].
+    target: Arc<str>,
 }
 
 impl Entry {
@@ -432,7 +437,7 @@ impl Entry {
         }
         // What a response framed around this will have promised: every
         // chunk from the one the range starts in to the one it ends in.
-        let reader = self.retention.reader(&dir, total);
+        let reader = self.retention.reader(&dir, total, self.target.clone());
         reader.promises(first / CHUNK_BYTES..held_to / CHUNK_BYTES + 1);
         Some(Cached {
             dir,
@@ -470,7 +475,7 @@ impl Entry {
         });
         let dir = ChunkDir::new(dir);
         Filler {
-            reader: self.retention.reader(&dir, total),
+            reader: self.retention.reader(&dir, total, self.target.clone()),
             dir,
             total,
             offset: body_start,

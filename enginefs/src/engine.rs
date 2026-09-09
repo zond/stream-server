@@ -731,6 +731,39 @@ impl<H: TorrentHandle> Engine<H> {
         *self.playhead.lock() = Some((file_idx, offset));
     }
 
+    /// What the retention policy says about `file_idx` right now, or `None`
+    /// where there is nothing to say.
+    ///
+    /// The three absences are all real and none of them is a zero. **No
+    /// policy** is a torrent nothing is bounding -- the budget covers the
+    /// file, no budget has been published yet, or a pin keeps everything --
+    /// so there is no window and no committed set to have a size. **No
+    /// playhead** is a torrent no reader has been inside in this process:
+    /// nothing that survives a restart says where a player had got to, and
+    /// inventing one from what is on the disk would put a window round a
+    /// region nobody has ever read. **A playhead in another file** is a
+    /// reader that has moved on, and this file's numbers left with it.
+    ///
+    /// Two locks and no I/O: the reading is finished against a listing of
+    /// the store, which the caller takes for itself (see
+    /// [`crate::retention::PolicyReading::window`]) rather than under the
+    /// policy lock.
+    pub(crate) fn policy_reading(
+        &self,
+        file_idx: usize,
+    ) -> Option<crate::retention::PolicyReading> {
+        let (at_file, offset) = (*self.playhead.lock())?;
+        if at_file != file_idx {
+            return None;
+        }
+        let retention = self.retention.lock();
+        let retention = retention.as_ref()?;
+        if retention.file_idx != file_idx {
+            return None;
+        }
+        Some(retention.reading(offset))
+    }
+
     /// Install (or keep) the retention policy for a file about to be
     /// streamed, and hold its pieces back from what we announce.
     ///

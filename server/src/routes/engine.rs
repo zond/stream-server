@@ -103,7 +103,7 @@ impl CreateSource {
 
 /// A 40-digit hex string: a v1 info hash as the routes and the registry
 /// spell it.
-fn is_info_hash(value: &str) -> bool {
+pub(crate) fn is_info_hash(value: &str) -> bool {
     value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 

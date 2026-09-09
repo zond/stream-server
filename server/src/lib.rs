@@ -84,6 +84,7 @@ mod proxy_streams;
 mod routes;
 mod ssdp;
 mod state;
+pub mod stream_numbers;
 mod tui;
 
 #[derive(Clone, Debug)]
@@ -355,6 +356,35 @@ impl ServerHandle {
     pub fn background_traffic(&self) -> anyhow::Result<enginefs::traffic::BackgroundTraffic> {
         let state = self.state.clone();
         self.block_on_server(async move { routes::system::background_traffic(&state).await })
+    }
+
+    /// What this server holds of the stream a player is playing, exactly
+    /// what `GET /stream-numbers.json?url=...` answers (see
+    /// `crate::stream_numbers`): the cache around the playhead, and for a
+    /// torrent the set committed for sharing and what the session has
+    /// moved.
+    ///
+    /// `url` is the URL handed to the player, and its shape is what decides
+    /// which store answers -- a torrent stream, a proxied one, or neither,
+    /// which is `None` and means a stream this server is not holding rather
+    /// than an error. Every number is measured when it is asked for and
+    /// nothing is kept: the transfer totals are **this session's**, and the
+    /// ratio taken from them must be labelled as one.
+    ///
+    /// It creates nothing and does not count as a poll, so it cannot hold a
+    /// torrent out of the idle sweep; it is not free, though, since the
+    /// window is counted from a listing of the stream's own directories on
+    /// the blocking pool. Ask it while a panel is open, not for the life of
+    /// the process.
+    pub fn stream_numbers(
+        &self,
+        url: &str,
+    ) -> anyhow::Result<Option<stream_numbers::StreamNumbers>> {
+        let state = self.state.clone();
+        let url = url.to_string();
+        self.block_on_server(
+            async move { routes::stream_numbers::stream_numbers(&state, &url).await },
+        )
     }
 
     /// Torrent-level stats, exactly what `GET /{infoHash}/stats.json?tr=...`
@@ -1619,6 +1649,10 @@ fn control_router() -> Router<AppState> {
         .route(
             "/proxy-streams/{token}/close",
             post(routes::proxy::close_proxy_streams),
+        )
+        .route(
+            "/stream-numbers.json",
+            get(routes::stream_numbers::get_stream_numbers),
         )
         .route("/cache.json", get(routes::cache::get_cache_usage))
         .route("/cache/clean", post(routes::cache::post_clean_cache))

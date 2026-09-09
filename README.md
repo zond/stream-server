@@ -265,6 +265,7 @@ The HTTP surface is deliberately small and split in two by `build_router()` (`se
 | DELETE | `/{infoHash}/{fileIdx}/download?deleteFiles=1` | TOKEN | offline downloads — drop the pin, and with `deleteFiles` the data too |
 | GET | `/downloads.json` | TOKEN | offline downloads — every pinned file |
 | GET | `/cache.json` | TOKEN | cache usage against `settings.cacheSize` — see [Cache usage and cleaning](#cache-usage-and-cleaning) |
+| GET | `/stream-numbers.json?url=…` | TOKEN | what this server holds of the stream a player is playing, for a playback panel — see [What a panel is told about a stream](#what-a-panel-is-told-about-a-stream) |
 | POST | `/cache/clean` | TOKEN | run one eviction pass now and report what it freed — see [Cache usage and cleaning](#cache-usage-and-cleaning) |
 | POST | `/proxy-streams/{token}/close` | TOKEN | end every `/proxy` stream carrying the client's own `p=` token, and retire the token; answers `{"closed": n}` — see [Ending a proxied stream](#ending-a-proxied-stream) |
 
@@ -315,6 +316,7 @@ An embedder holds a `ServerHandle` (from `stream_server::start`) and never needs
 | `download_path(info_hash, file_idx: usize) -> Result<Option<String>>` | the `path` of that file's `downloads()` entry on its own — where the download is *placed*, not a file that exists (data is stored one file per piece). Never creates an engine |
 | `cache_usage() -> Result<CacheUsage>` | `GET /cache.json` — what the cache occupies against its limit right now, without evicting anything. See [Cache usage and cleaning](#cache-usage-and-cleaning) |
 | `clean_cache_now() -> Result<EvictionReport>` | `POST /cache/clean` — run one eviction pass immediately and report what it freed, with the same protections as the scheduled sweep. See [Cache usage and cleaning](#cache-usage-and-cleaning) |
+| `stream_numbers(url: &str) -> Result<Option<StreamNumbers>>` | `GET /stream-numbers.json?url=…` — the cache around the playhead and, for a torrent, the committed set and this session's transfer totals. `None` is a stream this server does not hold, which is not an error. See [What a panel is told about a stream](#what-a-panel-is-told-about-a-stream) |
 | `close_proxy_streams(token: &str) -> usize` | `POST /proxy-streams/{token}/close` — end every proxied stream the client marked with `token`, retire the token, and answer how many streams that was. See [Ending a proxied stream](#ending-a-proxied-stream) |
 | `background_traffic() -> Result<BackgroundTraffic>` | no route — the one signal a client's "working in the background" indicator reads: `{active, downloading, uploading, playing, bytes_downloaded, bytes_uploaded, window_secs}`. See [Background activity](#background-activity) |
 | `proxy_streams_live() -> usize` | how many proxied streams are being read right now, over all tokens — the number of players attached through `/proxy` |
@@ -323,7 +325,25 @@ An embedder holds a `ServerHandle` (from `stream_server::start`) and never needs
 | `lan_media_requests_served() -> u64` | how many requests have reached that listener since the current cast session began — per session, reset by every start (an already-running listener included) and by every stop. Zero after a load is the receiver never having asked for the stream. See [LAN media listener](#lan-media-listener) |
 | `lan_media_base_url(for_peer: IpAddr) -> Option<Url>` | the base URL to hand a receiver at `for_peer` — host = the local interface on its subnet, or the best-ranked one when nothing matches. `None` while the listener is off |
 
-The HTTP handlers and these methods call the same functions (`routes::system::{engine_stats, file_stats, update_settings}`, `routes::downloads::{pin_download, unpin_download, downloads, download_path}`, `routes::cache::{cache_usage, clean_cache_now}`, `proxy_streams::ProxyStreams::close`), so they cannot drift; `server/tests/embed.rs` compares them.
+The HTTP handlers and these methods call the same functions (`routes::system::{engine_stats, file_stats, update_settings}`, `routes::downloads::{pin_download, unpin_download, downloads, download_path}`, `routes::cache::{cache_usage, clean_cache_now}`, `routes::stream_numbers::stream_numbers`, `proxy_streams::ProxyStreams::close`), so they cannot drift; `server/tests/embed.rs` compares them.
+
+### What a panel is told about a stream
+
+`GET /stream-numbers.json?url=…` (`ServerHandle::stream_numbers`) answers, for **the URL a client handed its player**, what this server holds of that stream right now. One call, and the shape of the URL is what dispatches it: a torrent stream is `/{infoHash}/{fileIdx}` (or its `/stream/` alias), a proxied one is `/proxy/?d=…` or the Core path format, and both of those shapes are this server's own routes — so the two stores behind them (the piece store, keyed by info hash; the proxy cache, keyed by entity) answer through one interface (`server/src/stream_numbers.rs`) that keeps no state of its own. Each answers from a live reading of its own directories and remembers nothing.
+
+```json
+{
+  "window": { "behindBytes": 1288490188, "aheadBytes": 356515840 },
+  "sharing": { "committedBytes": 859832320, "downloadedBytes": 4800, "uploadedBytes": 2100, "ratio": 0.4375 }
+}
+```
+
+- **`window`** is what is **on the disk** for this stream, split at the byte a player has actually reached: `behindBytes` is how far a scan back is served from the cache, `aheadBytes` is read-ahead that has *arrived*. Neither is the extent the policy intends to fill. Divide by the stream's bitrate for a time — the client has that and this server does not.
+- **`sharing`** is torrents only. `committedBytes` is the retention policy's committed set: pieces advertised and promised never to be reclaimed. `downloadedBytes`/`uploadedBytes` are **this session's** — librqbit's own per-torrent counters, which start at zero when the torrent is added to this process — and `ratio` is their quotient. It is deliberately not the conventional across-restarts ratio: persisting counters would mean storing a claim about a past this process never saw, and a client should label it as the session's.
+
+**Every absence is a real one, and a client draws no row rather than a zero.** The whole answer is `null` for a URL this server is not holding — a stream fetched directly from an addon, a local file — and that is a `200`, not a `404`: "nothing" is a complete answer to "what do you hold of this". `window` is absent when no retention policy is bounding the stream (the budget covers it, or the cleaner has published none yet — see [Cache usage and cleaning](#cache-usage-and-cleaning)) or when no reader has been inside it in this process; what is on the disk in that case is not a window but whatever the cleaner has not yet aged out, which is a different quantity. `sharing` is absent for a proxied stream, which is not seeded and so has no committed set and no ratio; `committedBytes` alone is absent for a torrent with no policy, which has promised nothing whatever it announces.
+
+Cheap enough to poll while a panel is open, and no cheaper: it creates no engine and starts no magnet add, and it does not count as a poll (so it cannot hold a torrent out of the idle sweep just by being asked), but the window is counted from a listing of the stream's own directories on the blocking pool. Ask it while the panel is up, not for the life of the process.
 
 ### Background activity
 
