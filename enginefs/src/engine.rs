@@ -442,6 +442,26 @@ pub struct Engine<H: TorrentHandle> {
     /// nothing of it may be reclaimed, which is exactly what this server
     /// did before the policy was wired.
     retention: parking_lot::Mutex<Option<crate::retention::FileRetention>>,
+    /// What the policy above is bounding, written beside it and read
+    /// instead of it.
+    ///
+    /// **Kept here because a pass has the policy out of its slot.**
+    /// [`Self::retain`] takes the [`crate::retention::FileRetention`] for
+    /// the whole of a pass -- a directory listing and two awaited backend
+    /// calls -- and that pass runs on the reconciler's tick for exactly the
+    /// stream a panel is asking about. Reading the slot itself would answer
+    /// "no policy is bounding this stream" every couple of seconds for a
+    /// stream that is bounded, and no policy is a statement, not a delay:
+    /// the two rows would blink out and back. The proxy cache's
+    /// `LiveStream::bounded` and `LiveStream::windows` are the same guard
+    /// for the same reason.
+    ///
+    /// Written under [`Self::announce`] with the slot beside it, so the
+    /// pair cannot disagree except for the length of a pass, and see
+    /// [`crate::retention::PolicyBounds`] for what can move in that time.
+    /// `None` at process start, which is what a process with no policy
+    /// installed has to say.
+    bounds: parking_lot::Mutex<Option<crate::retention::PolicyBounds>>,
     /// Serialises everything that changes what this torrent announces, and
     /// the deletes taken under it.
     ///
@@ -502,6 +522,7 @@ impl<H: TorrentHandle> Engine<H> {
             next_reader_id: AtomicU64::new(1),
             budget,
             retention: parking_lot::Mutex::new(None),
+            bounds: parking_lot::Mutex::new(None),
             announce: tokio::sync::Mutex::new(()),
             playhead: parking_lot::Mutex::new(None),
         }
@@ -748,6 +769,10 @@ impl<H: TorrentHandle> Engine<H> {
     /// the store, which the caller takes for itself (see
     /// [`crate::retention::PolicyReading::window`]) rather than under the
     /// policy lock.
+    ///
+    /// Read from [`Self::bounds`] and not from the policy slot, because a
+    /// pass in flight has the policy out of that slot and this is a
+    /// question a panel asks every second: see the field.
     pub(crate) fn policy_reading(
         &self,
         file_idx: usize,
@@ -756,12 +781,12 @@ impl<H: TorrentHandle> Engine<H> {
         if at_file != file_idx {
             return None;
         }
-        let retention = self.retention.lock();
-        let retention = retention.as_ref()?;
-        if retention.file_idx != file_idx {
+        let bounds = self.bounds.lock();
+        let bounds = bounds.as_ref()?;
+        if bounds.file_idx != file_idx {
             return None;
         }
-        Some(retention.reading(offset))
+        Some(bounds.reading(offset))
     }
 
     /// Install (or keep) the retention policy for a file about to be
@@ -836,7 +861,16 @@ impl<H: TorrentHandle> Engine<H> {
             shape = ?retention.shape(),
             "holding a file's pieces back and bounding it to the cache budget"
         );
-        *self.retention.lock() = Some(retention);
+        self.hold(retention);
+    }
+
+    /// Put `retention` in its slot with [`Self::bounds`] beside it. The two
+    /// are written together, under [`Self::announce`], and nothing else may
+    /// write either.
+    fn hold(&self, retention: crate::retention::FileRetention) {
+        let mut slot = self.retention.lock();
+        *self.bounds.lock() = Some(retention.bounds());
+        *slot = Some(retention);
     }
 
     /// Forget the policy and put back what it was holding back.
@@ -845,7 +879,15 @@ impl<H: TorrentHandle> Engine<H> {
     /// being announced again, which is the only order that keeps the rule:
     /// what we announce is what nothing will reclaim.
     async fn clear_retention_locked(&self) {
-        let Some(retention) = self.retention.lock().take() else {
+        let taken = {
+            let mut slot = self.retention.lock();
+            // Unconditionally, so that "nothing is bounding this stream" is
+            // never left standing beside an empty slot: the bounds are the
+            // answer a panel gets.
+            *self.bounds.lock() = None;
+            slot.take()
+        };
+        let Some(retention) = taken else {
             return;
         };
         if let Err(error) = self
@@ -894,20 +936,25 @@ impl<H: TorrentHandle> Engine<H> {
             // has no playhead for the policy it is holding, so it leaves it
             // exactly as it is -- `begin_retention` is what replaces a
             // policy, and it puts the old range back when it does.
-            let mut slot = self.retention.lock();
-            if slot.is_none() {
-                *slot = Some(retention);
-            }
+            self.put_back(retention);
             return None;
         }
         let pass =
             crate::retention::advance(&self.handle, store, &self.info_hash, &mut retention, offset)
                 .await;
+        self.put_back(retention);
+        Some(pass)
+    }
+
+    /// Put a pass's policy back where it came from, unless something has
+    /// installed another one meanwhile -- in which case this one is stale
+    /// and so are its bounds, and neither is written.
+    fn put_back(&self, retention: crate::retention::FileRetention) {
         let mut slot = self.retention.lock();
         if slot.is_none() {
+            *self.bounds.lock() = Some(retention.bounds());
             *slot = Some(retention);
         }
-        Some(pass)
     }
 
     /// What this engine will give up, right now.

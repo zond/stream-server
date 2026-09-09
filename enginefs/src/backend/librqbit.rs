@@ -2157,20 +2157,25 @@ impl TorrentHandle for LibrqbitHandle {
     /// `stats_snapshot()` -- which loads its handful of torrent-level
     /// atomics and the aggregate peer counters, because
     /// `TorrentStateLive::stats` is private at the pinned rev; cheap and
-    /// side-effect free, but a snapshot, not two loads. Zero in every other
-    /// state, because the live state is where librqbit keeps them. Not
+    /// side-effect free, but a snapshot, not two loads. Not
     /// `progress_bytes`: while a torrent initializes that mirrors the hash
     /// check's `checked_bytes`, which is disk read back, not a peer.
-    fn transfer_totals(&self) -> TransferTotals {
+    ///
+    /// **`None` in every other state, because the live state is where
+    /// librqbit keeps these counters** -- there is nothing to read for a
+    /// paused, initializing, errored or emptied torrent, and its own bytes
+    /// have not gone anywhere. Answering zero there would report a torrent
+    /// that has moved gigabytes and paused as one that has moved nothing.
+    fn transfer_totals(&self) -> Option<TransferTotals> {
         self.handle.with_state(|state| match state {
             ManagedTorrentState::Live(live) => {
                 let snapshot = live.stats_snapshot();
-                TransferTotals {
+                Some(TransferTotals {
                     fetched: snapshot.fetched_bytes,
                     uploaded: snapshot.uploaded_bytes,
-                }
+                })
             }
-            _ => TransferTotals::default(),
+            _ => None,
         })
     }
 
@@ -4845,7 +4850,11 @@ mod tests {
         let start = std::time::Instant::now();
         let deadline = start + TEST_WAIT_BOUND;
         loop {
-            if TorrentHandle::transfer_totals(handle).fetched > 0 {
+            if TorrentHandle::transfer_totals(handle)
+                .unwrap_or_default()
+                .fetched
+                > 0
+            {
                 return start.elapsed();
             }
             assert!(
@@ -5072,6 +5081,68 @@ mod tests {
         assert!(stats.sources.iter().all(|s| s.num_requests == 0));
     }
 
+    /// **A torrent that is not live has no counters to read, and `None` is
+    /// not zero.**
+    ///
+    /// librqbit keeps `fetched_bytes` and `uploaded_bytes` in the live
+    /// state, so a torrent that is paused, still checking, stopped for
+    /// space or in error has nowhere to read them from -- and a torrent
+    /// that has moved gigabytes and then paused has not moved nothing.
+    /// Everything a panel is shown about the session's sharing is built on
+    /// this answer, and every one of those states is reachable with a panel
+    /// up: the fastresume check at the start of a stream, and the idle,
+    /// background and free-space arms of the reconciler's verdict.
+    ///
+    /// So the absence is reported as one. What this test can pin without a
+    /// swarm is the shape -- readable while live, absent while parked,
+    /// readable again afterwards; that the numbers themselves are the
+    /// peers' is `the_initial_check_moves_nothing_over_the_connection`
+    /// above.
+    #[tokio::test]
+    async fn a_torrent_that_is_not_live_has_no_transfer_counters_to_read() {
+        use crate::backend::TorrentHandle;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let payload = dir.join("payload.bin");
+        write_payload(&payload, 96 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+
+        let (_backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
+        handle.handle.wait_until_initialized().await.unwrap();
+        assert_eq!(handle.run_state(), RunState::Live);
+        assert_eq!(
+            handle.transfer_totals(),
+            Some(TransferTotals::default()),
+            "a live torrent has counters, and this one has moved nothing yet"
+        );
+
+        handle
+            .stop_torrent()
+            .await
+            .expect("the reconciler stops it");
+        wait_until_paused(&handle).await;
+        assert_eq!(
+            handle.transfer_totals(),
+            None,
+            "a parked torrent's counters are unreadable, not zero: reporting \
+             zero here tells a viewer whose session moved gigabytes that it \
+             shared nothing"
+        );
+
+        handle
+            .start_torrent()
+            .await
+            .expect("and the reconciler starts it again");
+        let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
+        while handle.transfer_totals().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the counters never became readable again: {:?}",
+                handle.run_state()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
     /// End to end through the stats path: a tracker scrape's counters land on
     /// the matching `sources` entry, and the swarm totals are the max across
     /// the trackers that answered -- a tracker that did not answer reports
@@ -5532,12 +5603,18 @@ mod tests {
 
         let (_backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
         // Sampled while the check may still be running: the first reading
-        // the light takes after a restart is exactly this one.
-        assert_eq!(handle.transfer_totals(), TransferTotals::default());
+        // the light takes after a restart is exactly this one. It is either
+        // absent -- a torrent that is still checking is not live, and
+        // librqbit keeps these counters in the live state -- or zero;
+        // whichever it is, it is not bytes.
+        assert_eq!(
+            handle.transfer_totals().unwrap_or_default(),
+            TransferTotals::default()
+        );
         handle.handle.wait_until_initialized().await.unwrap();
         assert_eq!(
             handle.transfer_totals(),
-            TransferTotals::default(),
+            Some(TransferTotals::default()),
             "the initial check read the whole payload back from disk; none of it crossed \
              the connection"
         );
@@ -7546,9 +7623,9 @@ mod tests {
         );
 
         // Seeding and downloading go on from the peers left.
-        let fetched_before = handle.transfer_totals().fetched;
+        let fetched_before = handle.transfer_totals().unwrap_or_default().fetched;
         wait_for(&handle, "the download going on with the peers left", |_| {
-            handle.transfer_totals().fetched > fetched_before
+            handle.transfer_totals().unwrap_or_default().fetched > fetched_before
         })
         .await;
 
@@ -8383,7 +8460,7 @@ mod tests {
         // long as the torrent is up. So the second reading is the one the
         // occupancy cannot show -- what the peers sent us while nothing was
         // being read at all.
-        let fetched_before = engine.handle.transfer_totals().fetched;
+        let fetched_before = engine.handle.transfer_totals().unwrap_or_default().fetched;
         for _ in 0..20 {
             tokio::time::sleep(Duration::from_millis(50)).await;
             efs.reconcile_tick().await;
@@ -8391,6 +8468,7 @@ mod tests {
         let refetched = engine
             .handle
             .transfer_totals()
+            .unwrap_or_default()
             .fetched
             .saturating_sub(fetched_before);
         assert!(

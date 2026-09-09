@@ -2558,7 +2558,19 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let engines = self.engines.read().await;
         engines
             .iter()
-            .map(|(hash, engine)| (hash.clone(), engine.handle.transfer_totals()))
+            // A torrent whose backend cannot state its counters -- paused,
+            // checking, errored -- contributes nothing to the sum, which is
+            // what it contributed before this could be said in two ways:
+            // the light reads a *difference* of two sums, and a sum that
+            // dropped reads as "not grown". See [`crate::traffic`]. The
+            // absence itself matters only where the totals are reported as
+            // totals, which is [`Self::torrent_stream_numbers`].
+            .map(|(hash, engine)| {
+                (
+                    hash.clone(),
+                    engine.handle.transfer_totals().unwrap_or_default(),
+                )
+            })
             .collect()
     }
 
@@ -2571,8 +2583,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// `window` and `committed_bytes` are absent together and mean exactly
     /// what [`Engine::policy_reading`] says they mean -- no policy governs
     /// this file, no reader has been inside it, or the reader has moved to
-    /// another file. `transfer` is always there, because a torrent that
-    /// exists has moved whatever it has moved.
+    /// another file. `transfer` is absent for a torrent whose backend keeps
+    /// no counters to read: see
+    /// [`crate::backend::TorrentHandle::transfer_totals`], which is where
+    /// that absence is decided and why it is not a zero.
     ///
     /// **A peek, like [`Self::transfer_totals`], and for the same reason.**
     /// It creates nothing -- no engine, no magnet add, so it never goes near
@@ -4334,6 +4348,18 @@ mod tests {
         /// Every `set_pieces_advertised` call, in order: which range, and
         /// whether it was put into what we announce or held back out of it.
         advertised: Mutex<Vec<(std::ops::Range<u32>, bool)>>,
+        /// Test knob: park the next `set_pieces_advertised` call. The fake
+        /// sends on the first channel as it enters the call and waits on
+        /// the second before returning, so a test can ask its questions
+        /// with a retention pass really in flight -- the policy out of its
+        /// slot and a backend call awaited -- instead of racing a sleep
+        /// against one.
+        advertise_gate: Mutex<
+            Option<(
+                tokio::sync::oneshot::Sender<()>,
+                tokio::sync::oneshot::Receiver<()>,
+            )>,
+        >,
         /// The fake handle's own pin set (what the real backend keeps in its
         /// `PinnedFiles` map), reported through `stats()`.
         pinned: Mutex<std::collections::BTreeSet<usize>>,
@@ -4605,11 +4631,18 @@ mod tests {
             self.info_hash.clone()
         }
 
-        fn transfer_totals(&self) -> crate::backend::TransferTotals {
-            crate::backend::TransferTotals {
-                fetched: self.counters.fetched.load(Ordering::SeqCst),
-                uploaded: self.counters.uploaded.load(Ordering::SeqCst),
-            }
+        /// The counters, and **only while this fake torrent is running** --
+        /// librqbit keeps them in its live state and has none to read for a
+        /// torrent that is paused, checking, out of space or in error, so a
+        /// fake that answered zero for those would hide exactly the bug
+        /// that costs a viewer their session's numbers.
+        fn transfer_totals(&self) -> Option<crate::backend::TransferTotals> {
+            (self.run_state() == crate::backend::RunState::Live).then(|| {
+                crate::backend::TransferTotals {
+                    fetched: self.counters.fetched.load(Ordering::SeqCst),
+                    uploaded: self.counters.uploaded.load(Ordering::SeqCst),
+                }
+            })
         }
 
         fn name(&self) -> Option<String> {
@@ -4754,6 +4787,13 @@ mod tests {
             pieces: std::ops::Range<u32>,
             advertised: bool,
         ) -> Result<usize> {
+            // Parked inside the call, if a test asked for it: see
+            // `FakeCounters::advertise_gate`.
+            let gate = self.counters.advertise_gate.lock().unwrap().take();
+            if let Some((entered, release)) = gate {
+                let _ = entered.send(());
+                let _ = release.await;
+            }
             let count = (pieces.end - pieces.start) as usize;
             self.counters
                 .advertised
@@ -9937,8 +9977,162 @@ mod tests {
             .torrent_stream_numbers(TEST_HASH, 0)
             .await
             .expect("the engine exists");
-        assert_eq!(numbers.transfer.fetched, 4_800);
-        assert_eq!(numbers.transfer.uploaded, 2_100);
+        let transfer = numbers.transfer.expect("a running torrent's counters");
+        assert_eq!(transfer.fetched, 4_800);
+        assert_eq!(transfer.uploaded, 2_100);
+    }
+
+    /// **A torrent that has stopped moving bytes has not moved no bytes.**
+    ///
+    /// The counters live in the backend's running state, so there is
+    /// nothing to read for a torrent that is paused, still checking,
+    /// stopped for space or in error -- and every one of those is reachable
+    /// while a panel is up: the fastresume check at the start of a stream,
+    /// and the idle, background and free-space arms of the reconciler's
+    /// verdict. Reporting zero there tells a viewer whose session has moved
+    /// gigabytes that it has shared nothing, which is the reading a client
+    /// cannot tell from the truth. So the absence is passed on.
+    #[tokio::test]
+    async fn a_torrent_whose_counters_cannot_be_read_reports_no_totals() {
+        let (enginefs, counters) = test_enginefs_with_file_count(1);
+        counters.fetched.store(4_800, Ordering::SeqCst);
+        counters.uploaded.store(2_100, Ordering::SeqCst);
+        enginefs.get_engine(TEST_HASH).await.unwrap();
+
+        counters.paused.store(true, Ordering::SeqCst);
+        let numbers = enginefs
+            .torrent_stream_numbers(TEST_HASH, 0)
+            .await
+            .expect("the engine exists");
+        assert_eq!(
+            numbers.transfer, None,
+            "a paused torrent has counters nothing can read, not counters at zero"
+        );
+
+        // And they are back the moment it is running again: nothing here
+        // was forgotten, it was unreadable.
+        counters.paused.store(false, Ordering::SeqCst);
+        assert_eq!(
+            enginefs
+                .torrent_stream_numbers(TEST_HASH, 0)
+                .await
+                .and_then(|numbers| numbers.transfer)
+                .map(|transfer| transfer.fetched),
+            Some(4_800)
+        );
+    }
+
+    /// **The window is this file's, not the torrent's.**
+    ///
+    /// A season pack whose earlier episodes are still on the disk holds
+    /// pieces that have nothing to do with the episode playing. Counting
+    /// them would tell a viewer they can scrub back into bytes that belong
+    /// to another file -- the store's listing is the whole torrent's, and
+    /// only the policy knows which of it is the stream being asked about.
+    #[tokio::test]
+    async fn the_window_leaves_the_rest_of_the_torrent_out_of_this_files_numbers() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![
+            ("Show.S01E01.mkv".into(), 100),
+            ("Show.S01E02.mkv".into(), 100),
+        ]);
+        // Four twenty-five byte pieces per file: episode one is pieces
+        // 0..4, episode two 4..8.
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        // The whole of the episode watched last night, which nothing has
+        // aged out yet, and two pieces of the one playing now.
+        for piece in [0u32, 1, 2, 3, 4, 5] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+
+        // A reader twenty-five bytes into the second episode: piece five.
+        engine.note_playhead(1, 25);
+        engine.begin_retention(1).await;
+
+        let numbers = enginefs
+            .torrent_stream_numbers(TEST_HASH, 1)
+            .await
+            .expect("the engine exists");
+        assert_eq!(
+            numbers.window,
+            Some(crate::retention::CacheWindow {
+                behind_bytes: 25,
+                ahead_bytes: 25,
+            }),
+            "piece four is behind the playhead and piece five is under it;              the four pieces of the other episode are not this stream's to              scrub back into"
+        );
+    }
+
+    /// **A retention pass must not blink the panel's rows out.**
+    ///
+    /// A pass takes the policy out of its slot for a directory listing and
+    /// two awaited backend calls, and it runs on the reconciler's tick for
+    /// exactly the stream a panel is asking about. Anything that answered
+    /// from the slot itself would say "no window, no committed set" for a
+    /// second or so out of every two -- and by this server's own contract
+    /// that is not a delay but a statement: it means nothing is bounding
+    /// this stream. So the bounds are kept beside the policy and the
+    /// reading comes from there.
+    #[tokio::test]
+    async fn a_pass_in_flight_still_answers_what_is_bounding_the_stream() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in [0u32, 1, 2, 3] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+
+        let store = enginefs.piece_store();
+        engine.note_playhead(0, 0);
+        engine.begin_retention(0).await;
+        engine.retain(&store).await.expect("a pass");
+        let settled = enginefs
+            .torrent_stream_numbers(TEST_HASH, 0)
+            .await
+            .expect("the engine exists");
+        assert!(
+            settled.window.is_some() && settled.committed_bytes.is_some(),
+            "the stream is bounded between passes: {settled:?}"
+        );
+
+        // Now park a pass inside the backend call it makes to announce
+        // what the window has released, and ask while it is in there.
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *counters.advertise_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        engine.note_playhead(0, 25);
+        let running = tokio::spawn({
+            let engine = engine.clone();
+            let store = store.clone();
+            async move { engine.retain(&store).await }
+        });
+        tokio::time::timeout(Duration::from_secs(10), entered_rx)
+            .await
+            .expect("the pass reached the backend call")
+            .expect("the fake said so");
+
+        let mid_pass = enginefs
+            .torrent_stream_numbers(TEST_HASH, 0)
+            .await
+            .expect("the engine exists");
+        assert!(
+            mid_pass.window.is_some() && mid_pass.committed_bytes.is_some(),
+            "and it is still bounded while the pass that bounds it is              running: {mid_pass:?}"
+        );
+
+        release_tx.send(()).expect("the pass is waiting on this");
+        running
+            .await
+            .expect("the pass task")
+            .expect("a pass ran to the end");
     }
 
     /// **Every absence here is a real one, and none of them is a zero.**

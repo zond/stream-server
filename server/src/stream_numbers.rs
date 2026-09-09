@@ -16,6 +16,8 @@
 //! of the URL is what decides which store answers it -- a torrent stream is
 //! `/{infoHash}/{fileIdx}` (or `/stream/{infoHash}/{fileIdx}`), a proxied one
 //! is `/proxy/?d=...`, and both of those shapes are this crate's own routes.
+//! `{fileIdx}` includes `-1`, the auto-select this server's own stream and
+//! stats routes resolve with the `f=` filters: see [`StreamFile`].
 //! Each implementation recognises its own and no other, which is why a URL
 //! **neither** recognises is not an error: it is a stream this server does not
 //! hold -- a file:// path, another server's URL, an addon's direct link the
@@ -58,9 +60,17 @@
 //!   There is no swarm, so there is no committed set and no ratio, and the
 //!   row is absent rather than a line of zeroes;
 //! * **no [`Sharing::committed_bytes`]** -- a torrent with no policy has
-//!   promised nothing, whatever it announces.
+//!   promised nothing, whatever it announces;
+//! * **no [`Sharing::transfer`]** -- the backend has no counters to read
+//!   for this torrent, which for librqbit is any torrent that is not live:
+//!   paused, still checking, stopped for space, in error. A torrent that
+//!   has moved gigabytes and then paused has not moved nothing, so the
+//!   three numbers go absent together rather than reading as a session
+//!   that has shared nothing. A [`Sharing`] with neither half is no
+//!   sharing row at all.
 
 use enginefs::EngineFS;
+use enginefs::backend::TorrentHandle;
 use enginefs::retention::CacheWindow;
 use url::Url;
 
@@ -85,6 +95,24 @@ pub struct Sharing {
     /// Bytes advertised and promised never to be reclaimed -- the retention
     /// policy's committed set. `None` where no policy is installed.
     pub committed_bytes: Option<u64>,
+    /// What the torrent has moved this session, or `None` where the backend
+    /// has no counters to read: see [`Transfer`].
+    pub transfer: Option<Transfer>,
+}
+
+/// What a torrent has moved over the connection **in this session**, and
+/// the ratio of the two.
+///
+/// One value rather than three fields beside the committed set, because the
+/// three stand or fall together: librqbit keeps these counters in a
+/// torrent's live state, so a torrent that is paused, still checking,
+/// stopped for space or in error has none to read -- and a torrent that has
+/// moved gigabytes and then paused has not moved nothing. The absence is
+/// the whole group's, and a client draws no transfer row for it rather than
+/// three zeroes that say the opposite.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Transfer {
     /// Bytes this torrent has fetched from peers **in this session**.
     pub downloaded_bytes: u64,
     /// Bytes this torrent has sent to peers **in this session**.
@@ -100,15 +128,25 @@ pub struct Sharing {
 
 impl Sharing {
     /// The sharing row for a torrent whose policy has committed
-    /// `committed_bytes` and which has moved `transfer` this session.
-    fn of(committed_bytes: Option<u64>, transfer: enginefs::backend::TransferTotals) -> Self {
-        Self {
-            committed_bytes,
+    /// `committed_bytes` and whose backend reports `transfer`, or `None`
+    /// when it can say neither: a row with nothing in it is a row a client
+    /// should not draw, and this server saying "no sharing numbers for this
+    /// stream" is exactly as true of that torrent as it is of a proxied
+    /// response.
+    fn of(
+        committed_bytes: Option<u64>,
+        transfer: Option<enginefs::backend::TransferTotals>,
+    ) -> Option<Self> {
+        let transfer = transfer.map(|transfer| Transfer {
             downloaded_bytes: transfer.fetched,
             uploaded_bytes: transfer.uploaded,
             ratio: (transfer.fetched > 0)
                 .then(|| transfer.uploaded as f64 / transfer.fetched as f64),
-        }
+        });
+        (committed_bytes.is_some() || transfer.is_some()).then_some(Self {
+            committed_bytes,
+            transfer,
+        })
     }
 }
 
@@ -162,16 +200,18 @@ impl StreamStore for EngineFS {
     /// `/{infoHash}/{fileIdx}` and its `/stream/` alias -- the two paths
     /// [`crate::stream_routes`] serves a torrent's bytes on.
     ///
-    /// `None` for a hash no engine exists for. **A peek**: it creates no
-    /// engine and starts no magnet add, and it does not count as a poll, so
-    /// a panel asking every second cannot keep a torrent out of the idle
-    /// sweep by looking at it.
+    /// `None` for a hash no engine exists for, and for a `-1` that names
+    /// no file of it (see [`StreamFile`], which is where `-1` is resolved).
+    /// **A peek**: it creates no engine and starts no magnet add, and it
+    /// does not count as a poll, so a panel asking every second cannot keep
+    /// a torrent out of the idle sweep by looking at it.
     async fn stream_numbers(&self, url: &Url) -> Option<StreamNumbers> {
-        let (info_hash, file_idx) = torrent_stream(url)?;
+        let (info_hash, file) = torrent_stream(url)?;
+        let file_idx = file.resolve(self, &info_hash).await?;
         let numbers = self.torrent_stream_numbers(&info_hash, file_idx).await?;
         Some(StreamNumbers {
             window: numbers.window,
-            sharing: Some(Sharing::of(numbers.committed_bytes, numbers.transfer)),
+            sharing: Sharing::of(numbers.committed_bytes, numbers.transfer),
         })
     }
 }
@@ -213,13 +253,13 @@ fn proxied_target(url: &Url) -> Option<Url> {
     Some(target)
 }
 
-/// The info hash and file index a torrent stream URL names, or `None` for a
+/// The info hash and the file a torrent stream URL names, or `None` for a
 /// path of any other shape.
 ///
 /// The hash is spelled as the routes and the registry spell it: forty hex
 /// digits, matched case-insensitively and answered in lower case, which is
 /// how the engine registry is keyed.
-fn torrent_stream(url: &Url) -> Option<(String, usize)> {
+fn torrent_stream(url: &Url) -> Option<(String, StreamFile)> {
     let mut segments: Vec<&str> = url.path_segments()?.collect();
     if segments.first() == Some(&"stream") {
         segments.remove(0);
@@ -230,7 +270,79 @@ fn torrent_stream(url: &Url) -> Option<(String, usize)> {
     if !crate::routes::engine::is_info_hash(info_hash) {
         return None;
     }
-    Some((info_hash.to_lowercase(), file_idx.parse().ok()?))
+    let file = StreamFile::parse(file_idx, || {
+        crate::routes::compat::query_values(url.query(), "f")
+    })?;
+    Some((info_hash.to_lowercase(), file))
+}
+
+/// The file half of a torrent stream URL: `{fileIdx}`.
+///
+/// **`-1` is a file index like any other here, because it is one on the
+/// route this dispatch mirrors.** `/{infoHash}/-1` is the documented "pick
+/// the file yourself" -- `routes::compat::resolve_file_idx`, the largest
+/// video narrowed by the `f=` filters -- and the stream route, the archive
+/// route and the sibling control route `/{infoHash}/-1/stats.json` all
+/// resolve it that way. A client whose player URL is one of those is
+/// playing a file this server is holding, and answering "no rows" for it
+/// while `stats.json` answers about the same stream would be this
+/// dispatch disagreeing with the route it claims to mirror.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StreamFile {
+    /// An index, which names its file with no list to consult.
+    Index(usize),
+    /// `-1`, with the `f=` filters that narrow it -- the same values
+    /// `PlaybackQuery` reads off a stream request and `get_file_stats` off
+    /// a stats one.
+    Auto(Vec<String>),
+}
+
+impl StreamFile {
+    /// The `{fileIdx}` segment, with `filters` read only where they are
+    /// wanted -- `-1` is the only spelling that consults them.
+    fn parse(file_idx: &str, filters: impl FnOnce() -> Vec<String>) -> Option<Self> {
+        match file_idx {
+            "-1" => Some(Self::Auto(filters())),
+            index => Some(Self::Index(index.parse().ok()?)),
+        }
+    }
+
+    /// Which file of `info_hash` this is, or `None` when it cannot be
+    /// decided: no engine exists (so there is no file list, and no stream
+    /// either), or the filters match nothing playable.
+    ///
+    /// **A peek**, like everything else on this path: it looks the engine
+    /// up without creating one and without touching its idle clock. An
+    /// index needs no lookup at all, so the ordinary URL costs nothing
+    /// here; only `-1` asks for the file list, which is the same list the
+    /// stream route resolves it against.
+    async fn resolve(&self, engines: &EngineFS, info_hash: &str) -> Option<usize> {
+        let filters = match self {
+            Self::Index(index) => return Some(*index),
+            Self::Auto(filters) => filters,
+        };
+        let engine = engines.peek_engine(info_hash).await?;
+        let files = engine.handle.get_files().await;
+        let candidates: Vec<_> = files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| crate::routes::compat::FileCandidate {
+                index,
+                name: file.name.clone(),
+                length: file.length,
+            })
+            .collect();
+        Self::auto(&candidates, filters)
+    }
+
+    /// The auto-select itself: the route's own function, so the file a
+    /// panel is told about is the file the player is being served.
+    fn auto(
+        candidates: &[crate::routes::compat::FileCandidate],
+        filters: &[String],
+    ) -> Option<usize> {
+        crate::routes::compat::resolve_file_idx("-1", candidates, filters).ok()
+    }
 }
 
 #[cfg(test)]
@@ -249,7 +361,7 @@ mod tests {
         ] {
             assert_eq!(
                 torrent_stream(&parse(&url).expect("the URL parses")),
-                Some((hash.clone(), 3)),
+                Some((hash.clone(), StreamFile::Index(3))),
                 "{url}"
             );
         }
@@ -262,7 +374,55 @@ mod tests {
     fn an_upper_case_hash_names_the_same_torrent() {
         let url = parse(&format!("http://127.0.0.1:11470/{}/0", "AB".repeat(20)))
             .expect("the URL parses");
-        assert_eq!(torrent_stream(&url), Some(("ab".repeat(20), 0)));
+        assert_eq!(
+            torrent_stream(&url),
+            Some(("ab".repeat(20), StreamFile::Index(0)))
+        );
+    }
+
+    /// **`-1` is a file index this server serves, so it is one this
+    /// dispatch answers about.**
+    ///
+    /// `/{infoHash}/-1?f=...` is the documented auto-select: the stream
+    /// route plays it, and `/{infoHash}/-1/stats.json` reports on it. A
+    /// client holding that URL is holding the URL of a stream that is
+    /// playing, and the panel it is drawing must get the numbers for the
+    /// file the player is actually being served -- the same file, picked by
+    /// the same function, from the same filters.
+    #[test]
+    fn the_auto_select_is_a_stream_url_and_the_filters_pick_its_file() {
+        let hash = "a".repeat(40);
+        let url = parse(&format!(
+            "http://127.0.0.1:11470/{hash}/-1?f=%2FS01E02%2Fi&tr=udp%3A%2F%2Ftracker"
+        ))
+        .expect("the URL parses");
+        assert_eq!(
+            torrent_stream(&url),
+            Some((
+                hash.clone(),
+                StreamFile::Auto(vec!["/S01E02/i".to_string()])
+            )),
+            "the `f=` filters come with it, decoded, and nothing else does"
+        );
+
+        // And they pick the file the stream route would have played: the
+        // season pack's second episode, not the largest file in it.
+        let season = |name: &str, index: usize, length: u64| crate::routes::compat::FileCandidate {
+            index,
+            name: name.to_string(),
+            length,
+        };
+        let pack = [
+            season("Show.S01E01.mkv", 0, 900),
+            season("Show.S01E02.mkv", 1, 100),
+            season("Show.S01E03.mkv", 2, 800),
+        ];
+        assert_eq!(
+            StreamFile::auto(&pack, &["/S01E02/i".to_string()]),
+            Some(1),
+            "the filter names the episode; without it the biggest file wins"
+        );
+        assert_eq!(StreamFile::auto(&pack, &[]), Some(0));
     }
 
     #[test]
@@ -321,13 +481,13 @@ mod tests {
                 behind_bytes: 1_288_490_188,
                 ahead_bytes: 356_515_840,
             }),
-            sharing: Some(Sharing::of(
+            sharing: Sharing::of(
                 Some(859_832_320),
-                enginefs::backend::TransferTotals {
+                Some(enginefs::backend::TransferTotals {
                     fetched: 4_800,
                     uploaded: 2_100,
-                },
-            )),
+                }),
+            ),
         };
         assert_eq!(
             serde_json::to_value(numbers).expect("it serializes"),
@@ -335,9 +495,11 @@ mod tests {
                 "window": { "behindBytes": 1_288_490_188u64, "aheadBytes": 356_515_840u64 },
                 "sharing": {
                     "committedBytes": 859_832_320u64,
-                    "downloadedBytes": 4_800,
-                    "uploadedBytes": 2_100,
-                    "ratio": 2_100.0 / 4_800.0,
+                    "transfer": {
+                        "downloadedBytes": 4_800,
+                        "uploadedBytes": 2_100,
+                        "ratio": 2_100.0 / 4_800.0,
+                    },
                 },
             })
         );
@@ -364,23 +526,59 @@ mod tests {
 
         let seeding = Sharing::of(
             None,
-            TransferTotals {
+            Some(TransferTotals {
                 fetched: 0,
                 uploaded: 2_100,
-            },
-        );
+            }),
+        )
+        .expect("a torrent that has moved bytes has a sharing row");
+        let seeding = seeding.transfer.expect("its counters were readable");
         assert_eq!(seeding.ratio, None);
         assert_eq!(seeding.uploaded_bytes, 2_100);
 
         let both = Sharing::of(
             Some(820),
-            TransferTotals {
+            Some(TransferTotals {
                 fetched: 4_800,
                 uploaded: 2_100,
-            },
-        );
-        assert_eq!(both.ratio, Some(2_100.0 / 4_800.0));
+            }),
+        )
+        .expect("a sharing row");
         assert_eq!(both.committed_bytes, Some(820));
+        assert_eq!(
+            both.transfer.expect("its counters were readable").ratio,
+            Some(2_100.0 / 4_800.0)
+        );
+    }
+
+    /// **A torrent whose counters cannot be read has moved what it has
+    /// moved, and this must not say it has moved nothing.**
+    ///
+    /// librqbit keeps them in a torrent's live state, so a torrent that is
+    /// paused, still checking, stopped for space or in error has none to
+    /// read -- and every one of those is reachable with a panel up: the
+    /// fastresume check at the start of every stream, and the idle,
+    /// background and free-space arms of the reconciler. Three zeroes there
+    /// would tell a viewer their session has shared nothing.
+    #[test]
+    fn a_torrent_whose_counters_cannot_be_read_reports_no_transfer_at_all() {
+        let paused = Sharing::of(Some(820), None).expect("its policy still committed bytes");
+        assert_eq!(paused.committed_bytes, Some(820));
+        assert_eq!(
+            paused.transfer, None,
+            "absent, and never a zeroed transfer row"
+        );
+
+        assert_eq!(
+            serde_json::to_value(paused).expect("it serializes"),
+            serde_json::json!({ "committedBytes": 820, "transfer": null })
+        );
+
+        assert_eq!(
+            Sharing::of(None, None),
+            None,
+            "and with no committed set either there is no sharing row to draw"
+        );
     }
 
     #[test]
@@ -390,6 +588,9 @@ mod tests {
             "http://127.0.0.1:11470/notahash/0",
             // A hash, but the file index is not one.
             "http://127.0.0.1:11470/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/last",
+            // Nor is any other negative one: `-1` is the route's only
+            // auto-select, and `resolve_file_idx` refuses the rest.
+            "http://127.0.0.1:11470/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/-2",
             // The stats route of the same torrent is not the stream.
             "http://127.0.0.1:11470/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/0/stats.json",
             "http://127.0.0.1:11470/proxy/?d=https%3A%2F%2Forigin.example%2Ffilm.mkv",

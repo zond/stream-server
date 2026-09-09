@@ -277,7 +277,17 @@ pub trait TorrentHandle: Send + Sync + Clone {
     /// Unlike `stats()` this is polled every second or two by the activity
     /// light for every torrent that exists, so it has to be a handful of
     /// atomic loads under the state lock and must never reach the network.
-    fn transfer_totals(&self) -> TransferTotals;
+    ///
+    /// **`None` is "this backend cannot say", and it is not zero.** A
+    /// backend that keeps these counters in its running state -- librqbit
+    /// does -- has nothing to read for a torrent that is paused, still
+    /// checking, stopped for space or in error, and a torrent that has
+    /// moved gigabytes and then paused has not moved nothing. A caller
+    /// taking a *difference* may read the absence as `default()` (see
+    /// [`crate::traffic`], where a torrent that stops takes its bytes out
+    /// of the sum and the sum reads as "not grown"); a caller reporting the
+    /// totals themselves must pass the absence on.
+    fn transfer_totals(&self) -> Option<TransferTotals>;
     async fn add_trackers(&self, trackers: Vec<String>) -> Result<()>;
     /// Cheap check for whether the torrent has finished downloading its wanted
     /// data. Unlike `stats()`, this must not rebuild the full statistics or walk

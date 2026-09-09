@@ -2424,6 +2424,98 @@ fn the_stream_numbers_route_matches_the_library_api() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// **`-1` is a file index this server plays, so it is one a panel can ask
+/// about.**
+///
+/// `/{infoHash}/-1` is the documented auto-select -- "pick the file
+/// yourself", narrowed by the `f=` filters -- and it is what a client hands
+/// its player whenever it does not name the file itself. The stream route
+/// serves it, `/{infoHash}/-1/stats.json` reports on it, and a panel
+/// holding that very URL must be told about the file the player is being
+/// served rather than told this server is holding nothing. Which file the
+/// filters pick is `routes::compat::resolve_file_idx`, the route's own
+/// function, and `stream_numbers`'s unit tests pin that; what this pins is
+/// that the URL a player is really playing is one this server answers
+/// about.
+#[test]
+fn a_panel_can_ask_about_the_file_the_server_picked_itself() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    // Two files whose data is already on disk: the 64 KiB one the
+    // auto-select lands on, and a 16 KiB one only a filter reaches.
+    let (handle, base, info_hash, idx, payload) =
+        lan_media_server(config_dir.path(), cache_dir.path(), src.path(), None)?;
+    let anonymous = reqwest::blocking::Client::new();
+
+    let player_url = format!("{base}/{info_hash}/-1");
+    let response = anonymous
+        .get(&player_url)
+        .header(reqwest::header::RANGE, "bytes=0-15")
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    // The whole length in the Content-Range is which file was served: both
+    // payloads start with the same bytes.
+    let served = content_range_total(&response);
+    assert_eq!(
+        served,
+        payload.len() as u64,
+        "the auto-select served the largest file"
+    );
+    assert_eq!(response.bytes()?.as_ref(), &payload[0..16]);
+
+    let numbers = handle.stream_numbers(&player_url)?.expect(
+        "a panel asks with the URL its player is playing, and this server is holding that stream",
+    );
+    assert!(
+        numbers.sharing.is_some(),
+        "a torrent stream has a sharing row: {numbers:?}"
+    );
+    assert_eq!(
+        handle.stream_numbers(&format!("{base}/{info_hash}/{idx}"))?,
+        Some(numbers),
+        "the auto-select and the index it resolves to name one stream"
+    );
+
+    // And with the filters a client narrowing a season pack sends, which
+    // reach the same resolution here as they do on the stream route: the
+    // other file, and the panel answers about that one.
+    let filtered = format!(
+        "{base}/{info_hash}/-1?f={}",
+        urlencoding::encode("/extra/i")
+    );
+    let response = anonymous
+        .get(&filtered)
+        .header(reqwest::header::RANGE, "bytes=0-15")
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_ne!(
+        content_range_total(&response),
+        served,
+        "the filter picked the other file, as it does on the stream route"
+    );
+    assert!(
+        handle.stream_numbers(&filtered)?.is_some(),
+        "and the panel asking with that URL is told about that stream"
+    );
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
+/// The total length out of a `Content-Range: bytes a-b/total`.
+fn content_range_total(response: &reqwest::blocking::Response) -> u64 {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.rsplit_once('/').map(|(_, total)| total.to_string()))
+        .expect("a partial response says what it is part of")
+        .parse()
+        .expect("the total is a number")
+}
+
 /// `GET /cache.json` and `POST /cache/clean` share their functions with
 /// `ServerHandle::{cache_usage, clean_cache_now}` -- the replacement for a
 /// client restarting the server just to make the cache cleaner's start-up

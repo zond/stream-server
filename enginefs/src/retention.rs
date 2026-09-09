@@ -116,15 +116,7 @@ pub(crate) struct FileRetention {
 impl FileRetention {
     /// The torrent piece a reader at `offset_in_file` is sitting on.
     fn playhead(&self, offset_in_file: u64) -> u32 {
-        let absolute = self.span.offset.saturating_add(offset_in_file);
-        let piece = absolute / self.piece_length;
-        // The reader cannot be outside its own file, but a clamp is cheaper
-        // than trusting arithmetic across a resize, and the policy clamps
-        // the same way.
-        piece.clamp(
-            u64::from(self.span.pieces.start),
-            u64::from(self.span.pieces.end.saturating_sub(1)),
-        ) as u32
+        playhead_piece(&self.span, self.piece_length, offset_in_file)
     }
 
     /// The pieces this policy governs.
@@ -145,20 +137,78 @@ impl FileRetention {
         self.policy.shape()
     }
 
-    /// What this policy says right now, for a reader at `offset_in_file`.
-    ///
-    /// Taken under the policy's lock and read outside it, which is the only
-    /// reason it is a value: the disk listing the numbers are finished
-    /// against is not something to hold a lock across. See
-    /// [`PolicyReading`].
-    pub fn reading(&self, offset_in_file: u64) -> PolicyReading {
-        PolicyReading {
-            pieces: self.pieces(),
+    /// What this policy is bounding, as a value that outlives the slot it
+    /// lives in. See [`PolicyBounds`], which is where the reading is taken
+    /// from.
+    pub fn bounds(&self) -> PolicyBounds {
+        PolicyBounds {
+            file_idx: self.file_idx,
+            span: self.span.clone(),
             piece_length: self.piece_length,
-            playhead: self.playhead(offset_in_file),
             committed: self.committed().len(),
         }
     }
+}
+
+/// What one file's policy is bounding, kept beside the policy rather than
+/// read off it.
+///
+/// **Because a pass in flight has the policy out of its slot.** A retention
+/// pass ([`crate::engine::Engine::retain`]) takes the [`FileRetention`] for
+/// the length of a directory listing and two awaited backend calls, so
+/// anything that asked the slot during a pass would be told there is no
+/// policy at all -- and "no policy" is not a slower answer, it is a
+/// different one: it says nothing is bounding this stream. The proxy cache
+/// keeps `LiveStream::bounded` and `LiveStream::windows` beside its own
+/// policy for exactly this reason.
+///
+/// **What it is, and what it is not.** It is a reading, taken at the moment
+/// the policy was last written -- installed, or put back by a pass -- and
+/// replaced by the next such moment, never accumulated. At process start
+/// there is none, which is true: no policy has been installed. The one
+/// thing here that a pass can move under it is [`Self::committed`], which
+/// that pass may grow by the pieces it advertises; for the length of the
+/// pass this therefore reports the committed set as it was when the pass
+/// began, and every piece in that set is still committed (the set only
+/// grows while a policy stands), so it is a floor and never a claim about
+/// pieces that were not promised.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PolicyBounds {
+    /// The file the policy governs; a playhead reading for any other file
+    /// is not this policy's to answer about.
+    pub file_idx: usize,
+    span: FilePieceSpan,
+    piece_length: u64,
+    committed: usize,
+}
+
+impl PolicyBounds {
+    /// What the policy says for a reader at `offset_in_file`.
+    ///
+    /// A value, so the disk listing the numbers are finished against does
+    /// not happen under the lock this was read from. See [`PolicyReading`].
+    pub fn reading(&self, offset_in_file: u64) -> PolicyReading {
+        PolicyReading {
+            pieces: self.span.pieces.clone(),
+            piece_length: self.piece_length,
+            playhead: playhead_piece(&self.span, self.piece_length, offset_in_file),
+            committed: self.committed,
+        }
+    }
+}
+
+/// The torrent piece a reader at `offset_in_file` of the file `span`
+/// describes is sitting on.
+fn playhead_piece(span: &FilePieceSpan, piece_length: u64, offset_in_file: u64) -> u32 {
+    let absolute = span.offset.saturating_add(offset_in_file);
+    let piece = absolute / piece_length;
+    // The reader cannot be outside its own file, but a clamp is cheaper
+    // than trusting arithmetic across a resize, and the policy clamps
+    // the same way.
+    piece.clamp(
+        u64::from(span.pieces.start),
+        u64::from(span.pieces.end.saturating_sub(1)),
+    ) as u32
 }
 
 /// One reading of one file's retention policy: where the playhead is, what
@@ -263,9 +313,13 @@ pub struct TorrentStreamNumbers {
     /// nothing has been promised, whatever is announced.
     pub committed_bytes: Option<u64>,
     /// What this torrent has fetched and sent since it was added, in this
-    /// process. Always present: a torrent that exists has moved whatever it
-    /// has moved, even if that is nothing.
-    pub transfer: crate::backend::TransferTotals,
+    /// process, or `None` where the backend has no counters to read: a
+    /// torrent that is paused, still checking, stopped for space or in
+    /// error. **Not zero for those** -- a torrent that has moved gigabytes
+    /// and then paused has not moved nothing, and the row a client draws
+    /// from a zero says it has. See
+    /// [`crate::backend::TorrentHandle::transfer_totals`].
+    pub transfer: Option<crate::backend::TransferTotals>,
 }
 
 /// Build the policy for a file about to be streamed, or say why there is
