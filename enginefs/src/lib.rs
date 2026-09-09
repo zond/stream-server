@@ -10260,6 +10260,98 @@ mod tests {
         );
     }
 
+    /// **A stream stops being bounded, and the panel has to hear that.**
+    ///
+    /// The bounds are kept beside the policy so that a pass which has the
+    /// policy out of its slot still answers -- but they are a reading *of*
+    /// that policy, and a policy that is dropped takes its window and its
+    /// committed set with it. Two ordinary things drop one: a pin taken
+    /// while the file is playing, which hands the whole file back to the
+    /// user and to the swarm, and a budget that has grown to cover the file,
+    /// which is a torrent nothing needs to bound. Left standing, the bounds
+    /// would go on reporting a window and a promise for a stream that has
+    /// neither, which by this server's own contract is a statement and not
+    /// a stale number.
+    #[tokio::test]
+    async fn a_stream_whose_policy_is_dropped_stops_reporting_a_window() {
+        /// What this server says is bounding the first file of the fixture.
+        async fn bounded(
+            enginefs: &BackendEngineFS<FakeBackend>,
+        ) -> (Option<crate::retention::CacheWindow>, Option<u64>) {
+            let numbers = enginefs
+                .torrent_stream_numbers(TEST_HASH, 0)
+                .await
+                .expect("the engine exists");
+            (numbers.window, numbers.committed_bytes)
+        }
+        let seeded = |enginefs: &BackendEngineFS<FakeBackend>| {
+            let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+            std::fs::create_dir_all(&bucket).unwrap();
+            for piece in [0u32, 1, 2, 3] {
+                std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+            }
+        };
+
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        seeded(&enginefs);
+        engine.note_playhead(0, 25);
+        engine.begin_retention(0).await;
+        assert_eq!(
+            bounded(&enginefs).await,
+            (
+                Some(crate::retention::CacheWindow {
+                    behind_bytes: 25,
+                    ahead_bytes: 75,
+                }),
+                Some(0)
+            ),
+            "a policy is installed, and this is what it is bounding"
+        );
+
+        // The user pins the file they are watching. A pin is a retention
+        // property -- those bytes were asked for and are shared like any
+        // other bytes we keep -- so the pass drops the policy.
+        engine.pinned_files.write().insert(0);
+        let store = enginefs.piece_store();
+        assert!(
+            engine.retain(&store).await.is_none(),
+            "a pinned torrent has no retention pass to make"
+        );
+        assert_eq!(
+            bounded(&enginefs).await,
+            (None, None),
+            "and nothing bounds the stream now, so there is no window and \
+             nothing promised: the reading went with the policy it was of"
+        );
+
+        // The other way a policy goes: a budget that has grown to cover the
+        // file. The reader opens again, and there is nothing to bound.
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        seeded(&enginefs);
+        engine.note_playhead(0, 25);
+        engine.begin_retention(0).await;
+        assert!(
+            bounded(&enginefs).await.0.is_some(),
+            "bounded to begin with"
+        );
+
+        enginefs.set_cache_budget(Some(1_000_000));
+        engine.begin_retention(0).await;
+        assert_eq!(
+            bounded(&enginefs).await,
+            (None, None),
+            "the budget covers the whole file, so no policy is installed -- \
+             and a window left over from the one that was is a claim about a \
+             stream nothing is bounding"
+        );
+    }
+
     /// The committed bytes are the set the policy has really settled on --
     /// what we have advertised and will not reclaim -- and they grow as
     /// playback walks past pieces, never from what happens to be on disk.
