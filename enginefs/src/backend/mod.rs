@@ -1572,3 +1572,97 @@ impl EngineStats {
         };
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::FileWants;
+    use crate::piece_store::{FileSpec, PieceLayout};
+    use std::sync::Arc;
+
+    fn wants(files: Vec<FileSpec>, wanted: Option<Vec<usize>>) -> FileWants {
+        let total = files.iter().map(|file| file.len).sum();
+        FileWants {
+            layout: Arc::new(PieceLayout::new(25, total, files).unwrap()),
+            wanted: wanted.map(|files| files.into_iter().collect()),
+        }
+    }
+
+    /// **Overlapping a piece is not the same as wanting it back.**
+    ///
+    /// The question this answers is whether deleting a shared piece will
+    /// cost the swarm a refetch, and only a file with payload bytes of its
+    /// own can make it cost anything. A BEP-47 padding file's bytes are
+    /// zeroes nobody ever transfers and a zero-length file has no bytes at
+    /// all, so neither will ever pull the piece back down -- but both sit
+    /// in the torrent's global byte space, both land in
+    /// `PieceLayout::files_overlapping_piece`, and both are ordinary members
+    /// of a want-set nothing has narrowed.
+    ///
+    /// Counting them as neighbours would hold the boundary piece back for
+    /// ever: the padding is never deselected, so the piece is refused on
+    /// this pass and on every pass after it, and the file's last piece stays
+    /// on the disk as long as the torrent does -- the "two pieces of every
+    /// file on the disk for ever" this rule exists to avoid, arrived at from
+    /// the other side.
+    #[test]
+    fn a_neighbour_with_no_payload_bytes_of_its_own_holds_no_boundary_piece_back() {
+        // Piece four is bytes 100..125. A hundred-byte file ends on its
+        // front edge, fifteen bytes of something sit in the middle of it,
+        // and the file being reclaimed begins at 115 and runs on.
+        let padded = wants(
+            vec![
+                FileSpec::payload(100),
+                FileSpec::padding(15),
+                FileSpec::payload(110),
+            ],
+            None,
+        );
+        assert_eq!(
+            padded.layout.files_overlapping_piece(4),
+            1..3,
+            "the padding is in the piece, whatever it is made of"
+        );
+        assert!(
+            !padded.shared_with_another(4, 2),
+            "the padding will never fetch the piece back, so it is the \
+             reclaimed file's to give up"
+        );
+
+        // The same fifteen bytes as real payload: now something is waiting
+        // to download them again the moment the piece goes.
+        let neighboured = wants(
+            vec![
+                FileSpec::payload(100),
+                FileSpec::payload(15),
+                FileSpec::payload(110),
+            ],
+            None,
+        );
+        assert!(
+            neighboured.shared_with_another(4, 2),
+            "a neighbour that owns bytes in the piece keeps it"
+        );
+
+        // A zero-length file lands in whatever piece its offset falls in --
+        // here at 110, inside piece four -- and has nothing to fetch back
+        // either.
+        let empty = wants(
+            vec![
+                FileSpec::payload(110),
+                FileSpec::payload(0),
+                FileSpec::padding(15),
+                FileSpec::payload(100),
+            ],
+            None,
+        );
+        assert_eq!(
+            empty.layout.files_overlapping_piece(4),
+            0..3,
+            "the empty file is a member of the piece it sits inside"
+        );
+        assert!(
+            !empty.shared_with_another(4, 0),
+            "and it has no bytes with which to want anything"
+        );
+    }
+}
