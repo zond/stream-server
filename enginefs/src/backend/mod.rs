@@ -486,6 +486,16 @@ pub trait TorrentHandle: Send + Sync + Clone {
         None
     }
 
+    /// Where this torrent's files lie in its pieces and which of them it
+    /// still wants: what a caller has to know before it deletes a piece two
+    /// files share. See [`FileWants`].
+    ///
+    /// `None` is a backend that keeps no file table of its own, and there is
+    /// no boundary for a caller to find without one.
+    async fn file_wants(&self) -> Option<FileWants> {
+        None
+    }
+
     /// Forget that the torrent has `pieces`, because the caller is about to
     /// delete the bytes behind them and the backend's have-set is the other
     /// record of them. Deleting the bytes alone leaves that record standing:
@@ -692,6 +702,44 @@ pub struct TorrentMemoryDiagnostics {
 pub struct BackendFileInfo {
     pub name: String,
     pub length: u64,
+}
+
+/// Where a torrent's files lie in its pieces, and which of them it still
+/// wants bytes of.
+///
+/// The two halves are one fact and are read together. A piece is a fixed
+/// length across the whole torrent, so a file that does not begin and end on
+/// a piece boundary -- which is every file of a torrent without BEP-47
+/// padding -- shares its first and its last piece with its neighbours, and
+/// what deleting such a piece costs depends on whether a neighbour still
+/// wants it.
+#[derive(Debug, Clone)]
+pub struct FileWants {
+    /// Where every file of the torrent lies in the torrent's pieces.
+    pub layout: std::sync::Arc<crate::piece_store::PieceLayout>,
+    /// The files the torrent still wants, or `None` for every one of them
+    /// -- librqbit's own spelling of a want-set nothing has narrowed.
+    pub wanted: Option<std::collections::BTreeSet<usize>>,
+}
+
+impl FileWants {
+    /// Whether a file other than `except` still wants a byte of `piece`.
+    ///
+    /// The rule `crate::piece_store::PieceStore::remove_file` deletes a
+    /// boundary piece by, asked the other way round: a file holds a piece
+    /// back if it owns payload bytes in it -- a padding file's are zeroes
+    /// nobody transfers and a zero-length file has none -- and the torrent
+    /// has not stopped wanting it.
+    pub fn shared_with_another(&self, piece: u32, except: usize) -> bool {
+        self.layout.files_overlapping_piece(piece).any(|file| {
+            file != except
+                && self.layout.owns_bytes(file)
+                && self
+                    .wanted
+                    .as_ref()
+                    .is_none_or(|wanted| wanted.contains(&file))
+        })
+    }
 }
 
 /// Where one file of a torrent lies, in pieces.

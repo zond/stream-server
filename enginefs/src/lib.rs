@@ -4345,6 +4345,17 @@ mod tests {
         /// pieces up -- a torrent added without piece reclaim, or one whose
         /// state has no chunk tracker to edit.
         refuses_drop: AtomicBool,
+        /// Test knob: the backend forgets exactly the pieces it was asked to
+        /// forget, which is librqbit's answer when no peer is mid-flight and
+        /// no reader is inside the range. `drops_pieces` is the other shape
+        /// -- a fixed set it will part with whatever it is asked -- and a
+        /// test that needs to see *which* pieces a caller asked about, on the
+        /// disk rather than in a recorded call, needs this one.
+        drops_what_it_is_asked: AtomicBool,
+        /// Test knob: the files this fake torrent still wants bytes of.
+        /// `None` -- the default -- is every one of them, which is
+        /// librqbit's own spelling of a want-set nothing has narrowed.
+        wanted_files: Mutex<Option<std::collections::BTreeSet<usize>>>,
         /// Every `set_pieces_advertised` call, in order: which range, and
         /// whether it was put into what we announce or held back out of it.
         advertised: Mutex<Vec<(std::ops::Range<u32>, bool)>>,
@@ -4623,6 +4634,24 @@ mod tests {
         fn pieces_per_file(&self) -> u64 {
             self.counters.pieces_per_file.load(Ordering::SeqCst).max(1)
         }
+
+        /// The fake torrent's layout: its files in order, at a piece length
+        /// of the first file's length over `pieces_per_file`. Nothing for a
+        /// torrent with no files or one whose pieces would be zero bytes
+        /// long, neither of which is a torrent.
+        fn layout(&self) -> Option<std::sync::Arc<crate::piece_store::PieceLayout>> {
+            let piece_length = self.piece_length()?;
+            let total: u64 = self.files.iter().map(|file| file.length).sum();
+            crate::piece_store::PieceLayout::new(
+                piece_length,
+                total,
+                self.files
+                    .iter()
+                    .map(|file| crate::piece_store::FileSpec::payload(file.length)),
+            )
+            .ok()
+            .map(std::sync::Arc::new)
+        }
     }
 
     #[async_trait::async_trait]
@@ -4769,16 +4798,36 @@ mod tests {
             Ok(())
         }
 
-        /// A fake torrent of one piece per file, so a file index names a
-        /// piece range without the test having to build a layout.
+        /// Where the file lies in the fake torrent's pieces, read off the
+        /// same layout the piece store's own arithmetic is built on.
+        ///
+        /// Equal-length files that divide evenly by `pieces_per_file` -- the
+        /// geometry every fixture here has -- get a piece range of their own,
+        /// which is what this used to compute by hand. Files of *different*
+        /// lengths share their boundary pieces exactly as a real torrent
+        /// without BEP-47 padding does, and that is a thing a test needs to
+        /// be able to say.
         async fn file_pieces(&self, file_idx: usize) -> Option<crate::backend::FilePieceSpan> {
-            let len = self.files.get(file_idx)?.length;
-            let per_file = self.pieces_per_file();
-            let first = file_idx as u32 * per_file as u32;
+            let layout = self.layout()?;
+            let pieces = layout.pieces_overlapping_file(file_idx).ok()?;
+            if pieces.is_empty() {
+                return None;
+            }
+            let first = layout.piece_offset(pieces.start);
+            let last = layout
+                .piece_offset(pieces.end - 1)
+                .saturating_add(layout.piece_length_of(pieces.end - 1));
             Some(crate::backend::FilePieceSpan {
-                pieces: first..first + per_file as u32,
-                offset: file_idx as u64 * len,
-                bytes: len,
+                pieces,
+                offset: self.files[..file_idx].iter().map(|file| file.length).sum(),
+                bytes: last - first,
+            })
+        }
+
+        async fn file_wants(&self) -> Option<crate::backend::FileWants> {
+            Some(crate::backend::FileWants {
+                layout: self.layout()?,
+                wanted: self.counters.wanted_files.lock().unwrap().clone(),
             })
         }
 
@@ -4814,6 +4863,7 @@ mod tests {
             pieces: std::ops::Range<u32>,
             after: crate::backend::AfterRelease,
         ) -> Result<Option<crate::backend::DroppedFilePieces>> {
+            let asked = pieces.clone();
             self.counters
                 .dropped_ranges
                 .lock()
@@ -4822,7 +4872,11 @@ mod tests {
             if self.counters.refuses_drop.load(Ordering::SeqCst) {
                 anyhow::bail!("this fake will not forget a piece it has");
             }
-            let dropped = self.counters.drops_pieces.lock().unwrap().clone();
+            let dropped = if self.counters.drops_what_it_is_asked.load(Ordering::SeqCst) {
+                asked.collect()
+            } else {
+                self.counters.drops_pieces.lock().unwrap().clone()
+            };
             Ok(Some(crate::backend::DroppedFilePieces::new(dropped, ())))
         }
 
@@ -10409,6 +10463,118 @@ mod tests {
                 .and_then(|numbers| numbers.committed_bytes),
             Some(25),
             "one piece of twenty-five bytes is committed for sharing"
+        );
+    }
+
+    /// **A file's first and last piece are its neighbours' too.**
+    ///
+    /// Pieces are a fixed length across a whole torrent, so in one without
+    /// BEP-47 padding a file that does not begin and end on a piece boundary
+    /// shares those two pieces with whatever lies either side of it. The
+    /// policy governs one file and its reclaim set includes both, and
+    /// nothing under it refuses: librqbit drops a piece it *has* whoever
+    /// wants it -- `ChunkTracker::drop_piece` consults the want-set only for
+    /// a piece we do not have -- and the store then unlinks the bytes. The
+    /// still-selected neighbour fetches the piece again, the next pass finds
+    /// it held and outside the window again and reclaims it again: a refetch
+    /// loop at the boundary for as long as the neighbour is wanted, paid for
+    /// in the neighbour's bytes and the swarm's.
+    #[tokio::test]
+    async fn the_piece_the_next_file_shares_survives_a_reclaim_of_this_one() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![
+            ("Show.S01E01.mkv".into(), 100),
+            ("Show.S01E02.mkv".into(), 110),
+            ("Show.S01E03.mkv".into(), 100),
+        ]);
+        // Twenty-five byte pieces over three files that do not divide by
+        // them: episode two is pieces 4..9 and episode three 8..13, so piece
+        // eight holds the last ten bytes of one and the first fifteen of the
+        // other.
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        // Two pieces of budget over a five-piece file: a split, so a policy
+        // is installed at all.
+        enginefs.set_cache_budget(Some(50));
+
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in [4u32, 5, 8] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+
+        // A reader at the top of episode two: piece four is the window, and
+        // pieces five and eight are outside it.
+        engine.note_playhead(1, 0);
+        engine.begin_retention(1).await;
+        let store = enginefs.piece_store();
+        let pass = engine.retain(&store).await.expect("a pass");
+
+        assert!(
+            bucket.join("8").is_file(),
+            "the piece the next episode also lies in stays on the disk, \
+             because the torrent still wants that episode"
+        );
+        assert!(
+            !bucket.join("5").exists(),
+            "a piece of nobody else's still goes: this is a reclaim, not a refusal"
+        );
+        assert_eq!(pass.reclaimed, 1, "one piece was this file's alone to give");
+        assert_eq!(
+            *counters.dropped_ranges.lock().unwrap(),
+            vec![(5..6, crate::backend::AfterRelease::LeaveDropped)],
+            "the backend is never even asked to forget the shared piece: it \
+             would agree, and the bytes would go"
+        );
+    }
+
+    /// The same boundary piece, once nothing else wants it.
+    ///
+    /// What holds the piece back is the *neighbour*, not the boundary: a
+    /// file the torrent has stopped wanting will not fetch the piece again,
+    /// so there is no loop to avoid and no data anybody asked for to lose.
+    /// A rule that refused every boundary piece instead would leave two
+    /// pieces of every file on the disk for ever, and the cache cleaner
+    /// walking a volume of them.
+    #[tokio::test]
+    async fn a_shared_piece_goes_once_the_file_that_shares_it_is_out_of_the_want_set() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![
+            ("Show.S01E01.mkv".into(), 100),
+            ("Show.S01E02.mkv".into(), 110),
+            ("Show.S01E03.mkv".into(), 100),
+        ]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        // The third episode is out of the want-set -- the viewer never asked
+        // for it, or a delete took it -- so nothing of the torrent wants
+        // piece eight but the file being reclaimed.
+        *counters.wanted_files.lock().unwrap() = Some([0, 1].into_iter().collect());
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in [4u32, 5, 8] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+
+        engine.note_playhead(1, 0);
+        engine.begin_retention(1).await;
+        let store = enginefs.piece_store();
+        let pass = engine.retain(&store).await.expect("a pass");
+
+        assert!(
+            !bucket.join("8").exists(),
+            "nothing else wants the piece, so it is cache like any other"
+        );
+        assert!(!bucket.join("5").exists());
+        assert_eq!(
+            pass.reclaimed, 2,
+            "both pieces outside the window were this pass's to take"
         );
     }
 

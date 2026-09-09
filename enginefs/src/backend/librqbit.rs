@@ -2847,6 +2847,24 @@ impl TorrentHandle for LibrqbitHandle {
             .flatten()
     }
 
+    /// The layout the storage factory built this torrent's store from, and
+    /// librqbit's own want-set beside it. Both come from the running
+    /// torrent, so a torrent whose metadata has not arrived has neither.
+    async fn file_wants(&self) -> Option<crate::backend::FileWants> {
+        let layout = self
+            .handle
+            .with_metadata(|metadata| crate::piece_store::layout_of(metadata))
+            .ok()?
+            .ok()?;
+        Some(crate::backend::FileWants {
+            layout: Arc::new(layout),
+            wanted: self
+                .handle
+                .only_files()
+                .map(|files| files.into_iter().collect()),
+        })
+    }
+
     async fn drop_pieces(
         &self,
         pieces: std::ops::Range<u32>,
@@ -6653,6 +6671,78 @@ mod tests {
         // Out-of-range pin is a structural error and records nothing.
         assert!(handle.pin_file(3).await.is_err());
         assert!(TorrentHandle::stats(&handle).await.pinned_files.is_empty());
+    }
+
+    /// **What a caller has to know before it deletes a boundary piece.**
+    ///
+    /// Pieces are a fixed length across the whole torrent, so in one without
+    /// BEP-47 padding the piece a file ends in is also the piece its
+    /// neighbour begins in. Whether deleting it costs anything is the
+    /// want-set's answer and not the layout's: while the neighbour is
+    /// selected the bytes are fetched again the moment they go, and once it
+    /// is deselected they are cache like any other. Both halves are read off
+    /// the running torrent here, which is the only place either is true.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_boundary_piece_belongs_to_the_next_file_until_the_torrent_stops_wanting_it() {
+        use crate::backend::{TorrentFilePriorityPlan, TorrentHandle};
+        const PIECE: u64 = 16 * 1024;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let content_dir = dir.join("multi");
+        tokio::fs::create_dir_all(&content_dir).await.unwrap();
+        // Neither a whole number of pieces, so whichever order the
+        // filesystem lists them in, the two share a boundary piece.
+        write_payload(&content_dir.join("a.bin"), 40 * 1024).await;
+        write_payload(&content_dir.join("b.bin"), 56 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&content_dir).await;
+        let (_backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
+        handle.handle.wait_until_initialized().await.unwrap();
+        let lengths: Vec<u64> = handle
+            .handle
+            .with_metadata(|m| m.file_infos.iter().map(|f| f.len).collect())
+            .unwrap();
+        // The first file runs off the end of this one, so this is the piece
+        // both files have bytes in.
+        let boundary = (lengths[0] / PIECE) as u32;
+
+        let wants = handle
+            .file_wants()
+            .await
+            .expect("a torrent whose metadata has arrived knows where its files are");
+        assert_eq!(
+            wants.wanted, None,
+            "nothing has narrowed the want-set, which librqbit spells as every file"
+        );
+        assert!(
+            wants.shared_with_another(boundary, 0),
+            "piece {boundary} is the second file's as well as the first's"
+        );
+        assert!(
+            !wants.shared_with_another(0, 0),
+            "and a piece the first file is alone in is nobody else's"
+        );
+
+        // The second file leaves the want-set: the viewer asked for one file
+        // of the pack and nothing else is pinned.
+        handle.pin_file(0).await.unwrap();
+        handle
+            .reconcile_file_priorities(TorrentFilePriorityPlan {
+                active_file: None,
+                hot_file: None,
+                generation: 1,
+                reason: "test",
+            })
+            .await
+            .unwrap();
+        assert_eq!(handle.handle.only_files(), Some(vec![0]));
+
+        let wants = handle.file_wants().await.expect("still a live torrent");
+        assert_eq!(wants.wanted, Some([0].into_iter().collect()));
+        assert!(
+            !wants.shared_with_another(boundary, 0),
+            "nothing will fetch the piece back now, so it is the first file's \
+             to give up with the rest of them"
+        );
     }
 
     /// Forgetting a file's pieces against the real backend: the have-set

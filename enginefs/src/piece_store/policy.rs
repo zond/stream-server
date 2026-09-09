@@ -231,9 +231,13 @@ pub struct Decision {
 /// It governs a range of *torrent* piece indices -- the pieces of the file
 /// being played -- and ignores everything outside it, so the pieces of a
 /// torrent's other files are neither committed nor reclaimed here. A piece on
-/// the boundary between two files belongs to both, and reclaiming it is
-/// [`super::store::PieceStore`]'s business rather than this module's: it
-/// refuses to delete a piece another file still owns.
+/// the boundary between two files belongs to both, and this module cannot
+/// tell: its reclaim set includes the file's first and last piece whoever
+/// else owns bytes in them, and [`crate::retention`] is what takes those
+/// back out before anything is deleted. The unpin path has its own answer to
+/// the same question in [`super::store::PieceStore::remove_file`], which
+/// deletes a boundary piece only once every file that owns bytes in it is
+/// gone.
 #[derive(Debug, Clone)]
 pub struct RetentionPolicy {
     pieces: Range<u32>,

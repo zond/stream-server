@@ -442,10 +442,58 @@ pub(crate) async fn advance<H: TorrentHandle>(
             pass.withdrawn += (run.end - run.start) as usize;
         }
     }
-    for run in runs(&decision.reclaim) {
+    for run in runs(&this_files_alone(handle, retention.file_idx, &decision.reclaim).await) {
         pass.reclaimed += release(handle, store, info_hash, run).await;
     }
     pass
+}
+
+/// The pieces of `reclaim` no other file the torrent still wants has a byte
+/// in.
+///
+/// **A file's first and last piece are not only its own.** A piece is a
+/// fixed length across the whole torrent, so a file that does not begin and
+/// end on a piece boundary -- every file of a torrent without BEP-47
+/// padding -- shares those two with its neighbours. The policy governs one
+/// file and its reclaim set includes both of them, and nothing below here
+/// refuses: librqbit's `ChunkTracker::drop_piece` consults the want-set
+/// only for a piece we do *not* have, so a piece we have is dropped
+/// whoever else wants it, and [`take_claimed`] then unlinks the bytes.
+/// The neighbour, still selected, fetches the piece again; the next pass
+/// finds it held, inside the policy's range and outside the window, and
+/// reclaims it again -- a refetch loop at the boundary for as long as the
+/// neighbour is wanted. Nothing is advertised over a hole while that runs
+/// (the have-bit goes before the unlink), so what it costs is the
+/// neighbour's bytes and the swarm's, over and over.
+///
+/// So the reclaim is narrowed here, by the rule
+/// [`crate::piece_store::PieceStore::remove_file`] deletes a boundary piece
+/// by: a piece another wanted file owns bytes in stays.
+async fn this_files_alone<H: TorrentHandle>(
+    handle: &H,
+    file_idx: usize,
+    reclaim: &[u32],
+) -> Vec<u32> {
+    if reclaim.is_empty() {
+        return Vec::new();
+    }
+    let Some(wants) = handle.file_wants().await else {
+        // A backend with no file table has no boundary to name.
+        return reclaim.to_vec();
+    };
+    let kept: Vec<u32> = reclaim
+        .iter()
+        .copied()
+        .filter(|piece| !wants.shared_with_another(*piece, file_idx))
+        .collect();
+    if kept.len() != reclaim.len() {
+        tracing::debug!(
+            file_idx,
+            shared = reclaim.len() - kept.len(),
+            "leaving the boundary pieces another file of this torrent still wants"
+        );
+    }
+    kept
 }
 
 /// Give a run of pieces back: the backend forgets them, the store unlinks
