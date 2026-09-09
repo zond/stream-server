@@ -10191,6 +10191,75 @@ mod tests {
         assert_eq!((numbers.window, numbers.committed_bytes), (None, None));
     }
 
+    /// **The file the panel named is the file the numbers have to be
+    /// about.**
+    ///
+    /// There is one policy per torrent, so opening a reader on a second
+    /// file of the same torrent moves what is bounding this torrent to that
+    /// file -- and the playhead does not move with it: it is written as
+    /// reads return, so until the first byte of the new file goes out it
+    /// still names the old one. In that interval the playhead and the
+    /// bounds name different files, and answering from the bounds anyway
+    /// would take the second file's piece span and piece length and apply
+    /// them to an offset in the first: a window and a committed set
+    /// measured over somebody else's pieces, handed to a panel that asked
+    /// about this file. There is nothing to say about a file nothing is
+    /// bounding, so nothing is said.
+    #[tokio::test]
+    async fn a_policy_that_has_moved_to_another_file_says_nothing_about_this_one() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![
+            ("Show.S01E01.mkv".into(), 100),
+            ("Show.S01E02.mkv".into(), 100),
+        ]);
+        // Four twenty-five byte pieces per file: episode one is pieces
+        // 0..4, episode two 4..8.
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        // Two pieces of each episode, so the other file's span has numbers
+        // of its own to report if anything lets it.
+        for piece in [0u32, 1, 4, 5] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+
+        // A reader twenty-five bytes into the first episode, which is what
+        // the policy is bounding.
+        engine.note_playhead(0, 25);
+        engine.begin_retention(0).await;
+        let numbers = enginefs
+            .torrent_stream_numbers(TEST_HASH, 0)
+            .await
+            .expect("the engine exists");
+        assert_eq!(
+            numbers.window,
+            Some(crate::retention::CacheWindow {
+                behind_bytes: 25,
+                ahead_bytes: 25,
+            }),
+            "the file being read is bounded, and these are its pieces"
+        );
+
+        // A second reader opens on the next episode. That is what installs
+        // a policy, so the bounds are the other file's from here on -- and
+        // no byte of it has been read yet, so the playhead is still in this
+        // one.
+        engine.begin_retention(1).await;
+        let numbers = enginefs
+            .torrent_stream_numbers(TEST_HASH, 0)
+            .await
+            .expect("the engine exists");
+        assert_eq!(
+            (numbers.window, numbers.committed_bytes),
+            (None, None),
+            "nothing bounds this file any more, and the other file's span \
+             over this file's offset is not a window: it is a reading of \
+             somebody else's pieces"
+        );
+    }
+
     /// The committed bytes are the set the policy has really settled on --
     /// what we have advertised and will not reclaim -- and they grow as
     /// playback walks past pieces, never from what happens to be on disk.
