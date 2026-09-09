@@ -5925,8 +5925,10 @@ mod tests {
     }
 
     /// The light's reading of the connection is a peek over the engines that
-    /// exist: it touches no idle clock, looks nothing up, adds nothing, and
-    /// an engine that has gone is gone from the sum.
+    /// exist: it touches no idle clock, looks nothing up, adds nothing, an
+    /// engine that has gone is gone from the sum, and a torrent whose
+    /// counters cannot be read contributes nothing to it rather than
+    /// dropping out of it.
     #[tokio::test]
     async fn transfer_totals_is_a_peek_over_the_engines_that_exist() {
         use crate::backend::TransferTotals;
@@ -5954,6 +5956,21 @@ mod tests {
             "reading the counters counted as a poll: a light asking every second would \
              keep this torrent out of the idle sweep for ever"
         );
+
+        // A torrent nothing can read the counters of is still one of the
+        // engines that exist, and contributes nothing: the light reads a
+        // difference of two sums, so a sum that dropped when a torrent
+        // paused would read as "not grown" -- which is what an unreadable
+        // torrent means here -- only by accident, and a sum that grew again
+        // on the unpause would read as traffic that never moved.
+        counters.paused.store(true, Ordering::SeqCst);
+        let paused = enginefs.transfer_totals().await;
+        assert_eq!(
+            paused.get(TEST_HASH),
+            Some(&TransferTotals::default()),
+            "an unreadable torrent left the sum instead of contributing nothing to it"
+        );
+        counters.paused.store(false, Ordering::SeqCst);
 
         enginefs.remove_engine(TEST_HASH).await;
         assert!(
