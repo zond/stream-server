@@ -1,3 +1,4 @@
+use crate::cache_budget::{CACHE_FREE_SPACE_FLOOR, CacheLimit, available_space};
 use crate::state::AppState;
 use futures_util::future::BoxFuture;
 use std::collections::HashSet;
@@ -67,142 +68,6 @@ impl CleanSchedule {
     /// The debounced clean has fired; the next event arms a fresh one.
     fn on_clean(&mut self) {
         self.armed = false;
-    }
-}
-
-/// Free space on the cache's volume that the cleaner keeps the torrent
-/// cache out of -- `enginefs`'s constant, re-exported, because it is one
-/// line read three ways and the three may not drift apart.
-///
-/// `routes::stream::ensure_download_disk_ready` refuses to stream a torrent
-/// that still wants bytes unless this much is free -- a failed check runs
-/// one pass of this cleaner and, if the disk is still short, answers the
-/// stream `507 Insufficient Storage`. Below this line the server has
-/// therefore already decided the disk is unusable, so it is exactly the line
-/// the cleaner must keep the cache out of. (One constant, two readings: the
-/// cleaner asks `fs4::available_space`, which is `statvfs` on the path,
-/// while `ensure_download_disk_ready` matches the path against `sysinfo`'s
-/// mount list behind a 3-second cache. Same question, different syscall.)
-///
-/// The third reader is the engine's reconciler, whose free-space arm this
-/// is (`enginefs::reconcile::desired`), and it is what turns the target into
-/// something close to a guarantee. The cleaner only deletes; it cannot
-/// throttle a writer, and librqbit writes the file it wants straight through
-/// this line to ENOSPC between passes -- on the device that prompted all
-/// this, Available went to nothing in 40 s rather than stopping at 512 MiB.
-/// The reconciler stops a writing torrent when the volume falls under the
-/// floor and rings [`recover_out_of_space_torrents`], so what this cleaner
-/// is handed is a torrent paused a few MB under the line, not one dead at
-/// zero. Offline downloads keep a margin of their own
-/// (`enginefs::PIN_FREE_SPACE_MARGIN`, 500 MiB, checked once when a pin is
-/// accepted), so a pin can settle the volume below this line by design; the
-/// reconciler stops it there like any other writer.
-pub(crate) use enginefs::CACHE_FREE_SPACE_FLOOR;
-
-/// What caps the cache on one run: what the operator configured and what the
-/// filesystem can still give.
-///
-/// `settings.cacheSize` on its own is `u64::MAX` unless somebody set a number
-/// (`routes::system::cache_size_bytes`), so on a 4 GB television the cleaner
-/// evicted nothing and librqbit wrote until the filesystem refused -- and
-/// that refusal arrives as a fatal torrent error, mid-film. The enforced cap
-/// is therefore the smaller of the two, which is a number even when
-/// `cacheSize` is not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CacheLimit {
-    /// `settings.cacheSize` in bytes: `u64::MAX` when unset, and 0 for the
-    /// "no limit" the eviction rule has always read it as.
-    configured: u64,
-    /// Bytes the volume holding the cache will still give an unprivileged
-    /// writer, or `None` when it could not be read.
-    available: Option<u64>,
-}
-
-impl CacheLimit {
-    /// A limit with no filesystem reading behind it: what the cleaner
-    /// enforced before it had one, and what it falls back to when the volume
-    /// cannot be probed. Written that way only by the tests -- `cache_roots`
-    /// always carries whatever the probe returned, `None` included.
-    #[cfg(test)]
-    const fn configured(configured: u64) -> Self {
-        Self {
-            configured,
-            available: None,
-        }
-    }
-
-    /// The cap to enforce against `occupied` bytes of cache, or `None` for no
-    /// cap at all.
-    ///
-    /// `occupied + available` is what the volume would offer if the cache
-    /// were empty, so holding [`CACHE_FREE_SPACE_FLOOR`] of that back leaves
-    /// the most the cache may occupy without the free space crossing the
-    /// floor. Saturating throughout: a volume already under the floor yields
-    /// a cap below current occupancy, which is exactly the case where
-    /// something has to be evicted -- and where an unsaturated subtraction
-    /// would have wrapped to a cap of "everything".
-    fn effective(&self, occupied: u64) -> Option<u64> {
-        let configured = (self.configured != 0).then_some(self.configured);
-        let from_disk = self.available.map(|available| {
-            occupied
-                .saturating_add(available)
-                .saturating_sub(CACHE_FREE_SPACE_FLOOR)
-        });
-        match (configured, from_disk) {
-            (Some(configured), Some(from_disk)) => Some(configured.min(from_disk)),
-            (Some(only), None) | (None, Some(only)) => Some(only),
-            (None, None) => None,
-        }
-    }
-
-    /// Whether the filesystem, rather than the operator, is what caps the
-    /// cache at `occupied` bytes -- the fact worth a log line, since it is
-    /// the device overruling a setting.
-    fn disk_bound(&self, occupied: u64) -> bool {
-        match (self.effective(occupied), self.configured) {
-            (Some(effective), 0) => effective < u64::MAX,
-            (Some(effective), configured) => effective < configured,
-            (None, _) => false,
-        }
-    }
-}
-
-/// Bytes the volume holding `path` will still give an unprivileged writer, or
-/// `None` when that cannot be read.
-///
-/// `fs4::available_space` -> `rustix::fs::statvfs` -> `f_frsize * f_bavail`,
-/// the "Available" column of `df` (which excludes the blocks reserved for
-/// root, so it is what this process may actually write). One syscall against
-/// the path itself, no mount table to parse. rustix reaches it two ways and
-/// both are shipped here: on Linux its `linux_raw` backend issues the
-/// `statfs` syscall and converts, and on Android its build script picks the
-/// `libc` backend, which calls bionic's `statvfs` -- verified by building
-/// this call for `aarch64-linux-android` and by running a bionic-linked
-/// `statvfs` probe against a real directory, which agreed with glibc and with
-/// `df` to the block.
-///
-/// Failure -- a filesystem that refuses the call, a path on no volume the OS
-/// can name -- is `None`, never 0: an unreadable volume must not be read as
-/// "no room" and evict a healthy cache. The configured `cacheSize` then
-/// stands alone, exactly as it did before any of this existed. Which paths
-/// fail is the platform's business, not this function's: `statvfs` wants
-/// the path to exist, so on Unix a root not yet created is unreadable, while
-/// Windows resolves the volume from the drive letter (`GetVolumePathNameW`)
-/// and answers for a directory nothing has made yet. The tests therefore
-/// The test for what an unreadable volume does therefore writes the `None`
-/// straight into a [`CacheLimit`] rather than finding a path the OS will
-/// refuse.
-fn available_space(path: &std::path::Path) -> Option<u64> {
-    match fs4::available_space(path) {
-        Ok(available) => Some(available),
-        Err(e) => {
-            debug!(
-                path = %path.display(),
-                error = %e,
-                "could not read the cache volume's free space; enforcing the configured cacheSize alone"
-            );
-            None
-        }
     }
 }
 
@@ -637,96 +502,19 @@ async fn clean_cache_with_headroom(
         )
         .await?
     };
-    // The cap this pass enforced is the budget the retention policy is
-    // sized against -- one number, computed once, by the layer that owns
-    // "how much room is there". A policy that recomputed it would have the
-    // two evicting against different limits.
-    //
-    // Unless a newer pass has already published its own, which is what
-    // [`CachePasses`] is here to notice.
-    state.cache_passes.publish(pass, || {
-        state.engine.set_cache_budget(report.limit);
-        state.last_eviction.record(&report);
-    });
+    // This pass is one publisher of the budget among others
+    // (`crate::cache_budget`), distinguished only by having just counted
+    // the cache rather than taking the last count on trust -- so it states
+    // the cap through the same writer, in the same order, and its report
+    // stands or falls with the cap it goes with.
+    crate::cache_budget::publish(
+        &state.cache_passes,
+        &state.engine.cache_budget(),
+        pass,
+        report.limit,
+        || state.last_eviction.record(&report),
+    );
     Ok(report)
-}
-
-/// Which pass's reading of the volume is the newest.
-///
-/// Passes overlap. The sweep every launch takes runs while the first
-/// request is being served, a writer arms a debounced one, a client asks
-/// for one over `POST /cache/clean`, a stopped torrent rings one -- and the
-/// pass that finishes last is not the pass that started last, because a
-/// walk of sixteen thousand files takes as long as it takes and `cacheSize`
-/// can be changed while it runs.
-///
-/// Whoever finished last used to publish, so a pass that had read the cap
-/// before it was lowered could put the old number back over the new one.
-/// What that costs is not a slightly wrong cap: the retention policy is
-/// sized from this number, and a budget that covers the entity installs no
-/// policy at all ([`crate::proxy_retention`]), so a proxied stream measured
-/// against a stale ten gigabytes is not bounded by a window at all -- every
-/// chunk of it stays on the disk until the next pass republishes, which on
-/// a cache nothing is writing to is an hour away.
-///
-/// So a pass takes a number before it reads the volume and publishes only
-/// while nothing newer has: an older reading is dropped rather than
-/// overwriting a newer one. Its eviction still happened -- deleting what
-/// was over a cap that has since risen costs a refetch and nothing else --
-/// and it is only the *reading* that is stale.
-#[derive(Default)]
-pub struct CachePasses {
-    /// Numbers handed out, in the order passes started reading.
-    started: std::sync::atomic::AtomicU64,
-    /// The newest one that has published, so an older one can tell that it
-    /// has been overtaken.
-    published: std::sync::atomic::AtomicU64,
-}
-
-/// One pass's place in the order they started reading the volume in.
-#[derive(Clone, Copy, Debug)]
-pub struct CachePass(u64);
-
-impl CachePasses {
-    /// Number a pass that is about to read the volume.
-    pub fn begin(&self) -> CachePass {
-        CachePass(
-            self.started
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                + 1,
-        )
-    }
-
-    /// Publish `pass`'s reading, if nothing newer has published one.
-    ///
-    /// The claim and the publication are one call so that there is nowhere
-    /// to publish from that does not go through the order: an unguarded
-    /// `set_cache_budget` beside this one is exactly the bug.
-    ///
-    /// **One call is not one operation, and this does not totally order two
-    /// publications.** Two passes numbered five and six can each win the
-    /// claim -- five takes it while `published` is nought, six takes it
-    /// while `published` is five -- and then run their closures the other
-    /// way round, so six's cap lands first and five's stale one lands over
-    /// it. What the claim removes is the *long* window: the reading used to
-    /// be published after a walk of sixteen thousand files, and the race is
-    /// now the few instructions between the `fetch_max` and the call. It is
-    /// not nothing, and the cost when it is lost is what [`CachePasses`]
-    /// describes -- a cap nobody has read the volume for, standing until the
-    /// next pass republishes. Closing it means holding the claim across the
-    /// closure under a mutex, which is a small change and an untestable one:
-    /// the interleaving is a few instructions wide, so no deterministic test
-    /// distinguishes the two. It is written down here rather than implied
-    /// away.
-    pub fn publish(&self, pass: CachePass, publish: impl FnOnce()) {
-        if self
-            .published
-            .fetch_max(pass.0, std::sync::atomic::Ordering::Relaxed)
-            < pass.0
-        {
-            publish();
-        }
-    }
 }
 
 /// The report of the last pass, kept for a reader that wants to know what
@@ -1610,9 +1398,9 @@ async fn remove_empty_parents(mut dir: &std::path::Path, keep: &std::path::Path)
 #[cfg(test)]
 mod tests {
     use super::{
-        CACHE_FREE_SPACE_FLOOR, CacheLimit, CachePasses, CleanSchedule, DiskFullRecovery, Event,
-        EvictionReport, LastEviction, WALKED_ON_THIS_THREAD, WalkInputs, available_space, evict,
-        is_session_artifact, mpsc, occupied_bytes, remove_empty_parents, ring_doorbell, scan_usage,
+        CACHE_FREE_SPACE_FLOOR, CacheLimit, CleanSchedule, DiskFullRecovery, Event, EvictionReport,
+        LastEviction, WALKED_ON_THIS_THREAD, WalkInputs, evict, is_session_artifact, mpsc,
+        occupied_bytes, remove_empty_parents, ring_doorbell, scan_usage,
     };
     use enginefs::piece_store::{FileSpec, PieceLayout, PieceStore, StoreRoot};
     use enginefs::retention::ReclaimGate;
@@ -2897,38 +2685,6 @@ mod tests {
         );
     }
 
-    /// **The cap that stands is the newest reading of the volume, not the
-    /// last pass to finish.**
-    ///
-    /// Passes overlap -- the sweep every launch takes runs while the first
-    /// request is being served, and `cacheSize` can be lowered while a walk
-    /// of sixteen thousand files is still going. The pass that finished
-    /// last used to publish, so the launch sweep's ten gigabytes could land
-    /// on top of the eight megabytes a client had just asked for. The
-    /// retention policy is sized from that number and installs no policy at
-    /// all for a budget that covers the entity, so what the stale cap cost
-    /// was not a slightly wrong bound but no bound: every chunk of every
-    /// proxied stream stayed on the disk until something wrote to the cache
-    /// and armed the next pass.
-    #[test]
-    fn a_pass_that_finishes_late_does_not_publish_its_cap_over_a_newer_one() {
-        let passes = CachePasses::default();
-        let launch = passes.begin();
-        let asked_for = passes.begin();
-        let published = std::cell::RefCell::new(Vec::new());
-        passes.publish(asked_for, || {
-            published.borrow_mut().push("the cap asked for")
-        });
-        passes.publish(launch, || published.borrow_mut().push("the launch sweep's"));
-        let next = passes.begin();
-        passes.publish(next, || published.borrow_mut().push("the pass after both"));
-        assert_eq!(
-            *published.borrow(),
-            ["the cap asked for", "the pass after both"],
-            "the older reading, finishing last, is the one that is dropped"
-        );
-    }
-
     /// A torrent writes continuously while it is being watched. Re-arming
     /// the debounce on every write pushed the clean past the end of
     /// playback, so the size limit was only ever enforced by the hourly
@@ -3126,130 +2882,6 @@ mod tests {
                 serde_json::from_value(serde_json::to_value(&report).unwrap()).unwrap();
             assert_eq!(round_tripped, report);
         }
-    }
-
-    /// The cap is the smaller of the two, and which one binds depends only
-    /// on the numbers: plenty of room and `cacheSize` governs; a nearly full
-    /// volume and the filesystem does, whatever `cacheSize` says -- including
-    /// the unset `u64::MAX` that let a 4 GB television fill up.
-    #[test]
-    fn the_effective_limit_is_the_smaller_of_the_setting_and_the_volume() {
-        let gib = 1024 * 1024 * 1024;
-
-        // Room to spare: 8 GiB free, so the disk would allow occupancy up to
-        // 1 + 8 - 0.5 = 8.5 GiB and the 2 GiB setting is what bites.
-        let roomy = CacheLimit {
-            configured: 2 * gib,
-            available: Some(8 * gib),
-        };
-        assert_eq!(roomy.effective(gib), Some(2 * gib));
-        assert!(!roomy.disk_bound(gib));
-
-        // The owner's box: nothing configured, 3 GiB of cache and 523 MiB
-        // free. The cache may keep what it has plus the free space above the
-        // floor -- 11 MiB of headroom, not the 1.4 GiB film.
-        let television = CacheLimit {
-            configured: u64::MAX,
-            available: Some(523 * 1024 * 1024),
-        };
-        assert_eq!(
-            television.effective(3 * gib),
-            Some(3 * gib + 523 * 1024 * 1024 - CACHE_FREE_SPACE_FLOOR)
-        );
-        assert!(television.disk_bound(3 * gib));
-
-        // A generous setting on the same box does not buy room the device
-        // does not have.
-        let configured_too_high = CacheLimit {
-            configured: 10 * gib,
-            ..television
-        };
-        assert_eq!(
-            configured_too_high.effective(3 * gib),
-            television.effective(3 * gib)
-        );
-        assert!(configured_too_high.disk_bound(3 * gib));
-    }
-
-    /// The floor is never eaten into, and the arithmetic that keeps it out of
-    /// reach saturates rather than wrapping: a volume already below the floor
-    /// asks for eviction below current occupancy, and one with no room at all
-    /// asks for everything -- neither may come out as "no limit".
-    #[test]
-    fn the_free_space_floor_is_never_eaten_into() {
-        // Whatever occupancy the cache is at, the cap leaves the floor free.
-        for occupied in [0u64, 1, 4096, 1_000_000_000] {
-            for available in [0u64, 1, CACHE_FREE_SPACE_FLOOR, 5_000_000_000] {
-                let limit = CacheLimit {
-                    configured: u64::MAX,
-                    available: Some(available),
-                };
-                let effective = limit.effective(occupied).unwrap();
-                let free_at_the_cap = occupied + available - effective.min(occupied + available);
-                assert!(
-                    free_at_the_cap >= CACHE_FREE_SPACE_FLOOR.min(occupied + available),
-                    "occupied={occupied} available={available} effective={effective}"
-                );
-            }
-        }
-
-        // Below the floor: the cap is under what is there, so the size rule
-        // has work to do rather than seeing "already under the limit".
-        let squeezed = CacheLimit {
-            configured: u64::MAX,
-            available: Some(1024),
-        };
-        assert!(squeezed.effective(4096).unwrap() < 4096);
-
-        // Nothing left at all: a cap of 0 that must still read as a cap.
-        let full = CacheLimit {
-            configured: u64::MAX,
-            available: Some(0),
-        };
-        assert_eq!(full.effective(0), Some(0));
-        assert!(full.disk_bound(0));
-    }
-
-    /// An unreadable volume leaves the configured limit exactly as it was --
-    /// never 0 free space, which would evict a healthy cache on the strength
-    /// of a failed syscall.
-    ///
-    /// The `None` is written straight into the [`CacheLimit`] rather than
-    /// staged with a path the OS will not answer for, because there is no
-    /// such path on every platform: `statvfs` fails on a directory not yet
-    /// created, but Windows names the volume from the drive letter and
-    /// answers for it with the drive's real free space. (That is exactly how
-    /// this test used to fail there, with the real number where `None` was
-    /// expected -- the property held; the fixture did not.) What the cleaner
-    /// does with a probe that answered `None` is the property, and it is the
-    /// same on both.
-    #[test]
-    fn an_unreadable_volume_leaves_the_configured_limit_alone() {
-        assert_eq!(CacheLimit::configured(1024).effective(4096), Some(1024));
-        assert_eq!(
-            CacheLimit::configured(u64::MAX).effective(4096),
-            Some(u64::MAX)
-        );
-        assert_eq!(CacheLimit::configured(0).effective(4096), None);
-        assert!(!CacheLimit::configured(0).disk_bound(4096));
-
-        // What `cache_roots` builds when the root's free space cannot be
-        // read: a cap with no filesystem reading behind it, so the
-        // configured cap -- or no cap -- is what it enforces.
-        for (configured, expected) in [(1024, Some(1024)), (u64::MAX, Some(u64::MAX)), (0, None)] {
-            let limit = CacheLimit {
-                configured,
-                available: None,
-            };
-            assert_eq!(limit, CacheLimit::configured(configured));
-            assert_eq!(limit.effective(4096), expected);
-            assert!(!limit.disk_bound(4096));
-        }
-
-        // Whereas a real directory answers with a real number -- on every
-        // platform, which is all that can be said of the real probe here.
-        let tmp = tempfile::tempdir().unwrap();
-        assert!(available_space(tmp.path()).unwrap() > 0);
     }
 
     /// The whole point, end to end: with `cacheSize` unset -- the setting the

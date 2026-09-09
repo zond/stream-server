@@ -1549,18 +1549,31 @@ const RETENTION_ORIGIN: usize = 32 * 1024 * 1024;
 /// 32 chunks. A proxied stream shares nothing, so the whole of it is window.
 const RETENTION_BUDGET: u64 = 8 * 1024 * 1024;
 
-/// The budget the cleaner really published, so a volume too full to give the
-/// configured cap fails the test loudly instead of quietly making it prove
-/// nothing.
+/// Configure `bytes` as the cache size, which is the whole of what bounds
+/// the streams below.
+///
+/// **Nothing here runs an eviction pass.** Stating the budget is not the
+/// cleaner's job -- `update_settings` publishes it, because `cacheSize` is
+/// half of what the cap is made of and a client that changes it has changed
+/// the cap (`server::cache_budget`). Sweeping the volume here first would
+/// make these tests pass just as well with the publication back where it
+/// was, and a stream started before the first pass -- or between the change
+/// and the next pass, which is a minute after the last write at best --
+/// would be bounded by nothing at all.
+///
+/// The reading is `GET /cache.json`'s, which is the same arithmetic
+/// (`CacheLimit::effective`) and evicts nothing: it says the volume this
+/// test runs on is roomy enough that `cacheSize` is the smaller of the two,
+/// so a volume too full to give the configured cap fails the test loudly
+/// instead of quietly making it prove nothing.
 fn published_budget(fixture: &Fixture, bytes: u64) -> anyhow::Result<()> {
     fixture
         .handle
         .update_settings(serde_json::json!({ "cacheSize": bytes as f64 }))?;
-    let report = fixture.handle.clean_cache_now()?;
     assert_eq!(
-        report.limit,
+        fixture.handle.cache_usage()?.limit_bytes,
         Some(bytes),
-        "the cleaner published a different cap than the one configured; \
+        "a different cap is in force than the one configured; \
          the volume this test runs on cannot give {bytes} bytes"
     );
     Ok(())

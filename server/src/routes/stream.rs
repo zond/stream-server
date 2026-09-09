@@ -596,7 +596,7 @@ fn ensure_download_disk_ready(root: &FsPath) -> Result<(), String> {
 
     // The same floor the cache cleaner keeps free (`CacheLimit::effective`)
     // and the same one the engine's reconciler stops a torrent at.
-    let required = crate::cache_cleaner::CACHE_FREE_SPACE_FLOOR;
+    let required = crate::cache_budget::CACHE_FREE_SPACE_FLOOR;
     let available = available_space_for_path(root).ok_or_else(|| {
         format!(
             "could not determine available disk space for download cache: {}",

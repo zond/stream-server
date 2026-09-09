@@ -1038,6 +1038,15 @@ pub async fn update_settings(
     }
 
     state.engine.set_seeding_enabled(seeding_enabled).await;
+    // `cacheSize` is half of what caps the cache, so a client that changed
+    // it has changed the cap -- and that cap is the budget the retention
+    // policy over the piece store and the proxy cache is sized from. Stated
+    // here rather than left to the next eviction pass: a pass runs a minute
+    // after the last write at best, and until one did, everything already
+    // playing stayed bounded by the number the client has just replaced.
+    // Ordered against every other reading of the volume, like all of them
+    // (`crate::cache_budget`).
+    crate::cache_budget::publish_now(state).await;
     // `cacheRoot` is not pushed to the engine: a librqbit session's storage
     // root is fixed when the session opens, so a new one takes effect at the
     // next start. Nothing reads this string for where the bytes are -- the

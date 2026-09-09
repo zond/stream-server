@@ -665,7 +665,7 @@ impl ProxyRetention {
             // new budget does not change. A budget that has since risen makes
             // them cost a refetch and nothing else, which is the same price
             // the cleaner's own overtaken pass pays
-            // (`cache_cleaner::CachePasses`). What must not stand is the
+            // (`cache_budget::CachePasses`). What must not stand is the
             // *conclusion*: a window measured against a cap nobody holds any
             // more, and a policy that would go on reclaiming to it.
             if stream.decided == budget {

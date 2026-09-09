@@ -2260,10 +2260,17 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// What the cache cleaner says the torrent-data volume may hold, as of
     /// its last pass.
     ///
-    /// **Pushed in, never recomputed.** The cleaner's cap is
+    /// **Pushed in, never recomputed.** The server's cap is
     /// `min(cacheSize, occupied + available - floor)`; a second reading of
     /// the same volume taken here would disagree with it, and the two
-    /// layers would evict against different numbers. `None` is the shape
+    /// layers would evict against different numbers.
+    ///
+    /// The server states it through [`Self::cache_budget`] and its own
+    /// ordered writer (`server::cache_budget::publish`) rather than here,
+    /// because a publication that is not ordered against the other
+    /// readings of the volume can put a stale cap over a fresh one. This
+    /// is the unordered spelling, and what remains of it is the engine's
+    /// own tests, which have one reading and no order to keep. `None` is the shape
     /// `CacheLimit::effective` answers in for "no cap at all", and it is
     /// not the same thing as never having been told
     /// ([`crate::retention::CacheBudget::Unknown`], which is what this

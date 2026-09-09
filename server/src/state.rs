@@ -61,8 +61,8 @@ pub struct AppState {
     pub last_eviction: Arc<crate::cache_cleaner::LastEviction>,
     /// Which cache pass's reading of the volume is the newest, so an older
     /// one that finished later does not publish its cap over it (see
-    /// `cache_cleaner::CachePasses`).
-    pub cache_passes: Arc<crate::cache_cleaner::CachePasses>,
+    /// `cache_budget::CachePasses`).
+    pub cache_passes: Arc<crate::cache_budget::CachePasses>,
 }
 
 impl AppState {

@@ -74,6 +74,7 @@ pub mod jni;
 
 mod archives;
 mod auth;
+mod cache_budget;
 mod cache_cleaner;
 mod diagnostics;
 mod https;
@@ -1195,6 +1196,13 @@ pub async fn run(
     // starting it again when there is room. One, for the one engine (a
     // second would only race the first for the same torrents).
     background_tasks.push(state.engine.start_reconciler());
+    // And the cache budget, which is not the cleaner's even though the
+    // cleaner used to be the only thing that ever stated one. Unconditional
+    // like the DHT health check: a server whose cleaner is switched off
+    // still relays streams into the proxy cache, and a process that has
+    // published no budget holds no retention policy over them at all. See
+    // `cache_budget`.
+    background_tasks.push(cache_budget::start(Arc::new(state.clone())));
     if cfg.enable_cache_cleaner {
         background_tasks.push(cache_cleaner::start(Arc::new(state.clone())));
     }
