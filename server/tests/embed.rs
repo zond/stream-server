@@ -2503,6 +2503,165 @@ fn a_panel_can_ask_about_the_file_the_server_picked_itself() -> anyhow::Result<(
     handle.join()?;
     Ok(())
 }
+/// **What a playback panel is told about a torrent stream, end to end.**
+///
+/// The mirror of `proxy.rs`'s
+/// `a_panel_asking_about_a_proxied_stream_is_told_what_is_on_the_disk`, over
+/// the other store. A client holding the URL it handed its player asks one
+/// question -- through the library call and through the route a client
+/// really uses -- and gets the window round the playhead. It is a reading of
+/// the piece store it gets and not the policy's intentions: the two halves
+/// sum to the piece files really under the torrent's directory, which is
+/// what the bound below says, a retention pass being the only thing that can
+/// move that number and being able only to lower it.
+///
+/// Every other test of this window is a unit test over a fake backend, so
+/// none of them would notice the window failing to reach `stream_numbers` at
+/// all -- and a torrent stream's window is the row this whole feature was
+/// asked for.
+#[test]
+fn a_panel_asking_about_a_torrent_stream_is_told_what_is_on_the_disk() -> anyhow::Result<()> {
+    /// The piece length `real_torrent` builds with.
+    const PIECE: u64 = 16 * 1024;
+    /// A hundred pieces of file, so a window of sixteen sits inside it with
+    /// pieces on both sides.
+    const PIECES: u64 = 100;
+    /// Thirty-two pieces of budget: sixteen committed for sharing and
+    /// sixteen of window, of which the 10% behind the playhead is one. Well
+    /// under the file, or the budget would cover it and nothing would be
+    /// bounding this stream at all.
+    const BUDGET: u64 = 32 * PIECE;
+    /// The piece the player is on. Far enough in that the window has a
+    /// piece behind it rather than sitting against the start of the file.
+    const PLAYING: u64 = 4;
+
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    let content = src.path().join("Film");
+    std::fs::create_dir_all(&content)?;
+    // One file, so every piece the store holds for this torrent is a piece
+    // of the stream the panel is asking about and the sum below is one the
+    // test can take off the disk.
+    write_payload(&content.join("film.bin"), (PIECES * PIECE) as usize);
+    let (torrent, info_hash) = real_torrent(&content);
+
+    let cache_root = cache_dir.path().join("cache");
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_root.clone()),
+        ..offline_config()
+    })?;
+    seed_piece_store(&cache_root, &torrent, &content);
+    let base = format!("http://{}", handle.http_addr());
+    let client = bearer_client(&handle)?;
+    client
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
+        .send()?
+        .error_for_status()?;
+    let stats = stats_after_check(&client, &base, &info_hash)?;
+    let idx = file_index(&stats, "film.bin");
+    complete_file_stats(&client, &base, &info_hash, idx)?;
+
+    let anonymous = reqwest::blocking::Client::new();
+    let player_url = format!("{base}/{info_hash}/{idx}");
+    let play = |from: u64| -> anyhow::Result<()> {
+        let response = anonymous
+            .get(&player_url)
+            .header(
+                reqwest::header::RANGE,
+                format!("bytes={from}-{}", from + 15),
+            )
+            .send()?;
+        anyhow::ensure!(
+            response.status() == reqwest::StatusCode::PARTIAL_CONTENT,
+            "a read at {from} answered {}",
+            response.status()
+        );
+        anyhow::ensure!(response.bytes()?.len() == 16, "the player read its bytes");
+        Ok(())
+    };
+
+    // A first read, so this torrent has an engine streaming it before the
+    // budget arrives. Nothing bounds it yet, so it announces everything it
+    // holds and the cleaner may take none of it -- which is what makes the
+    // pass below publish a budget without emptying the cache it is about to
+    // be measured against.
+    play(0)?;
+    handle.update_settings(serde_json::json!({ "cacheSize": BUDGET as f64 }))?;
+    let report = handle.clean_cache_now()?;
+    assert_eq!(
+        report.limit,
+        Some(BUDGET),
+        "the cleaner published a different cap than the one configured; the \
+         volume this test runs on cannot give {BUDGET} bytes"
+    );
+    assert_eq!(
+        pieces_held(&cache_root, &info_hash) as u64,
+        PIECES,
+        "and it took nothing: this torrent announces every piece it holds"
+    );
+
+    // The player seeks on and reads. Opening the reader is what installs a
+    // policy under the budget the cleaner has now published, and the byte
+    // reaching the player is what moves the playhead.
+    play(PLAYING * PIECE)?;
+
+    // Either side of the question, because a retention pass may reclaim
+    // between the two -- and may only reclaim, nothing here downloading a
+    // piece back. So the sum the panel was given lies between them.
+    let before = pieces_held(&cache_root, &info_hash) as u64 * PIECE;
+    let numbers = handle
+        .stream_numbers(&player_url)?
+        .expect("this server is holding that stream");
+    let after = pieces_held(&cache_root, &info_hash) as u64 * PIECE;
+    let window = numbers.window.expect("a bounded stream has a window");
+    let held = window.behind_bytes + window.ahead_bytes;
+    assert!(
+        after <= held && held <= before,
+        "the two halves are the piece files really on the disk: {window:?} \
+         against {after}..={before} bytes of pieces"
+    );
+    assert!(
+        window.behind_bytes >= PIECE,
+        "the piece behind the playhead is inside the window, so a player can \
+         scrub back into what it has just played: {window:?}"
+    );
+    assert!(
+        window.ahead_bytes >= PIECE,
+        "and the piece under the playhead is in hand: {window:?}"
+    );
+    assert!(
+        numbers.sharing.is_some(),
+        "a torrent stream's bytes are seeded, so there is a sharing row: {numbers:?}"
+    );
+
+    // And the route a client asks with answers the same stream: the window
+    // is a number there too, not a `null` a panel draws no row for.
+    let answered: serde_json::Value = client
+        .get(format!(
+            "{base}/stream-numbers.json?url={}",
+            urlencoding::encode(&player_url)
+        ))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    assert!(
+        answered["window"]["behindBytes"]
+            .as_u64()
+            .is_some_and(|behind| behind >= PIECE)
+            && answered["window"]["aheadBytes"]
+                .as_u64()
+                .is_some_and(|ahead| ahead >= PIECE),
+        "the window reaches the route a panel really asks with: {answered}"
+    );
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
 
 /// The total length out of a `Content-Range: bytes a-b/total`.
 fn content_range_total(response: &reqwest::blocking::Response) -> u64 {
@@ -2729,25 +2888,35 @@ fn lan_media_server(
         .error_for_status()?;
     let stats = stats_after_check(&client, &base, &info_hash)?;
     let idx = file_index(&stats, "movie.bin");
-    // The hash check of the pre-seeded copy is what makes the bytes
-    // servable, and `phase` can already read `buffering` while it is still
-    // queued -- so wait on the observable state the media requests need
-    // (bounded, not a timing assertion), never on a sleep.
+    complete_file_stats(&client, &base, &info_hash, idx)?;
+
+    Ok((handle, base, info_hash, idx, payload))
+}
+
+/// Wait until the pre-seeded file really is complete, and answer its stats.
+///
+/// The hash check of the pre-seeded copy is what makes the bytes servable,
+/// and `phase` can already read `buffering` while that check is still queued
+/// -- so this waits on the observable state a media request needs (bounded,
+/// not a timing assertion), never on a sleep of its own choosing.
+fn complete_file_stats(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    info_hash: &str,
+    idx: usize,
+) -> anyhow::Result<serde_json::Value> {
     let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
-    let stats = loop {
-        let stats = file_stats_after_check(&client, &base, &info_hash, idx)?;
+    loop {
+        let stats = file_stats_after_check(client, base, info_hash, idx)?;
         if stats["files"][idx]["complete"] == true {
-            break stats;
+            return Ok(stats);
         }
         anyhow::ensure!(
             std::time::Instant::now() < deadline,
             "the pre-seeded file was still incomplete after {CHECK_WAIT_BOUND:?}: {stats}"
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
-    };
-    anyhow::ensure!(stats["files"][idx]["complete"] == true, "{stats}");
-
-    Ok((handle, base, info_hash, idx, payload))
+    }
 }
 
 /// Permit and start the LAN media listener the way a cast session does: the
