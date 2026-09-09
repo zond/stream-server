@@ -1370,10 +1370,22 @@ mod tests {
         std::fs::write(&real, b"0123456789").unwrap();
 
         // The same hash, spelled the way the store never spells it, with a
-        // file of its own inside.
-        let shouting = root.path().join(hash.to_ascii_uppercase()).join("0");
-        std::fs::create_dir_all(&shouting).unwrap();
-        std::fs::write(shouting.join("0"), b"xxx").unwrap();
+        // file of its own inside -- but only where the filesystem can hold
+        // both spellings at once. Windows and a default macOS volume are
+        // case-insensitive, so `create_dir_all` there reuses the directory
+        // above and there is no second name to find: the case this asserts
+        // cannot arise, rather than arising and being handled wrongly.
+        // Asked of the disk rather than of `cfg!`, because it is a property
+        // of the volume the test is running on and not of the target.
+        let upper = root.path().join(hash.to_ascii_uppercase());
+        let case_sensitive = !upper.exists();
+        let mut expected_strays: Vec<u64> = Vec::new();
+        if case_sensitive {
+            let shouting = upper.join("0");
+            std::fs::create_dir_all(&shouting).unwrap();
+            std::fs::write(shouting.join("0"), b"xxx").unwrap();
+            expected_strays.push(3);
+        }
 
         let contents = root.scan();
         assert_eq!(
@@ -1392,7 +1404,7 @@ mod tests {
                 .iter()
                 .map(std::fs::Metadata::len)
                 .collect::<Vec<_>>(),
-            vec![3],
+            expected_strays,
             "and the bytes under the name nothing can address are still counted"
         );
 
@@ -1416,9 +1428,10 @@ mod tests {
                 .map(std::fs::Metadata::len)
                 .collect::<Vec<_>>();
             strays.sort_unstable();
+            expected_strays.push(4);
+            expected_strays.sort_unstable();
             assert_eq!(
-                strays,
-                vec![3, 4],
+                strays, expected_strays,
                 "and what is under a name this store cannot even print is counted as well"
             );
         }
