@@ -1561,18 +1561,38 @@ fn published_budget(fixture: &Fixture, bytes: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Wait until the cache holds no more than `chunks` of them.
-fn wait_until_chunks_at_most(fixture: &Fixture, chunks: usize) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while std::time::Instant::now() < deadline {
-        if cached_chunks(fixture).len() <= chunks {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    panic!(
-        "the cache never came down to {chunks} chunks; it holds {}",
-        cached_chunks(fixture).len()
+/// Wait until the cache has stopped moving.
+///
+/// A chunk is written from a task nobody joins and a retention pass runs on
+/// another, so a listing of the cache root taken the moment a body ends is a
+/// listing of a directory more chunks are still landing in and a pass is
+/// still deleting from. Two counts either side of a cleaner's pass are then
+/// counts of two different caches, which is how the test below came to
+/// report *more* chunks after a reclaim than before it -- a number that
+/// cannot be the cleaner having taken anything, and the sign that the count
+/// was never measuring the gate at all.
+///
+/// Called after a body has been read to its end, this is a real quiescence
+/// and not a guess: no byte of that stream is delivered afterwards, so
+/// nothing can start a write or a pass the wait has not already seen
+/// (`proxy_cache::DiskWork`). Bounded, and generously, because the bound is
+/// not the assertion.
+fn settled(fixture: &Fixture) {
+    fixture
+        .handle
+        .proxy_cache_settled(std::time::Duration::from_secs(60))
+        .expect("the proxy cache stops writing");
+}
+
+/// The cache holds no more than `chunks` of them, once it has stopped
+/// moving -- so the reclaim really has happened by the time this returns,
+/// rather than being given ten seconds to.
+fn holds_no_more_than(fixture: &Fixture, chunks: usize) {
+    settled(fixture);
+    let held = cached_chunks(fixture).len();
+    assert!(
+        held <= chunks,
+        "the cache never came down to {chunks} chunks; it holds {held}"
     );
 }
 
@@ -1688,7 +1708,7 @@ fn a_panel_asking_about_a_proxied_stream_is_told_what_is_on_the_disk() -> anyhow
     let mut played = Vec::new();
     response.read_to_end(&mut played)?;
     assert_eq!(played.len() as u64, 64 * CHUNK, "the player read the lot");
-    wait_until_chunks_at_most(&fixture, (RETENTION_BUDGET / CHUNK) as usize);
+    holds_no_more_than(&fixture, (RETENTION_BUDGET / CHUNK) as usize);
 
     let numbers = fixture
         .handle
@@ -1786,7 +1806,7 @@ fn a_seek_back_inside_the_window_is_served_from_disk_and_one_outside_it_is_not()
 
     // The reclaim has caught up: what is left is about a window, not the
     // sixteen megabytes that went past.
-    wait_until_chunks_at_most(&fixture, (2 * RETENTION_BUDGET / CHUNK) as usize);
+    holds_no_more_than(&fixture, (2 * RETENTION_BUDGET / CHUNK) as usize);
     assert!(
         fixture.origin.was_asked_for_nothing_more(),
         "reclaiming is not fetching"
@@ -1872,7 +1892,7 @@ fn the_run_the_window_kept_is_served_back_whole() -> anyhow::Result<()> {
     response.read_to_end(&mut played)?;
     assert_eq!(played.len(), RETENTION_ORIGIN);
     fixture.origin.next_request();
-    wait_until_chunks_at_most(&fixture, (2 * RETENTION_BUDGET / CHUNK) as usize);
+    holds_no_more_than(&fixture, (2 * RETENTION_BUDGET / CHUNK) as usize);
 
     let run = longest_cached_run(&fixture);
     assert!(
@@ -1943,7 +1963,7 @@ fn a_second_player_fetching_does_not_truncate_the_first_ones_read() -> anyhow::R
     response.read_to_end(&mut played)?;
     assert_eq!(played.len(), RETENTION_ORIGIN);
     fixture.origin.next_request();
-    wait_until_chunks_at_most(&fixture, (2 * RETENTION_BUDGET / CHUNK) as usize);
+    holds_no_more_than(&fixture, (2 * RETENTION_BUDGET / CHUNK) as usize);
 
     // The first player asks for the run the window kept, and reads the first
     // chunk of it.
@@ -2000,10 +2020,26 @@ fn a_second_player_fetching_does_not_truncate_the_first_ones_read() -> anyhow::R
 /// body in an error rather than serving a hole).
 ///
 /// So the cap is set below what one live window holds and the cleaner is run
-/// on purpose. It takes what nobody is reading, leaves what somebody is, and
-/// says it could not get under the cap -- which is the honest answer, and
-/// the same one it gives for a torrent whose pieces the have-set will not
-/// give up.
+/// on purpose. It leaves the chunks somebody is inside, and it says it could
+/// not get under the cap -- which is the honest answer, and the same one it
+/// gives for a torrent whose pieces the have-set will not give up. That it
+/// takes what nobody is reading is the other half of the claim and it has a
+/// test of its own above (`the_cleaner_evicts_cached_proxy_bytes` -- a cache
+/// with no reader in it goes down to nothing).
+///
+/// **The chunks are named, and that is the whole point of the shape of this
+/// test.** It used to count the files before the pass and after it and
+/// assert the two numbers were equal, which cannot express this claim: a
+/// count cannot tell a chunk a player is inside from one nobody is reading,
+/// so an equality of counts passes when the cleaner takes a protected chunk
+/// and happens to leave an unprotected one. It could not even be relied on
+/// to fail honestly -- with chunks still landing while the first number was
+/// taken, the count *rose* across a reclaim often enough to fail one run of
+/// this binary in ten. What is asserted here instead is identity: these
+/// files, named before the pass by the response the player was handed, are
+/// on the disk after it. Whether the chunks outside the window went away is
+/// a different claim, and it is asserted here only as a direction -- the
+/// pass did not grow the disk -- never as an equality.
 #[test]
 fn the_cleaner_leaves_the_chunks_a_proxied_player_is_inside() -> anyhow::Result<()> {
     use std::io::Read;
@@ -2013,28 +2049,37 @@ fn the_cleaner_leaves_the_chunks_a_proxied_player_is_inside() -> anyhow::Result<
 
     let origin = format!("http://{}", fixture.origin.addr);
     let url = format!("{}/proxy/d={}/movie.mp4", fixture.base, encode(&origin));
-    const PLAYED_CHUNKS: u64 = 64;
-    let mut response = reqwest::blocking::Client::new()
+    let client = reqwest::blocking::Client::new();
+
+    // Play the film through. What is left when the last byte has gone past
+    // is the window round the end of it, which is where the player is: a
+    // player between two requests has no body open, and holding the bytes
+    // its next one will ask for is the whole of what the idle grace is for.
+    let mut response = client
         .get(&url)
-        .header(
-            reqwest::header::RANGE,
-            format!("bytes=0-{}", PLAYED_CHUNKS * CHUNK - 1),
-        )
+        .header(reqwest::header::RANGE, "bytes=0-")
         .send()?;
     let mut played = Vec::new();
     response.read_to_end(&mut played)?;
-    assert_eq!(played.len() as u64, PLAYED_CHUNKS * CHUNK);
+    assert_eq!(played.len(), RETENTION_ORIGIN);
     fixture.origin.next_request();
-    wait_until_chunks_at_most(&fixture, (2 * RETENTION_BUDGET / CHUNK) as usize);
-    let before = cached_chunks(&fixture).len();
-    // What is left is the part of the window playback actually fetched:
-    // nothing here reads ahead, so the 90% in front of the playhead is
-    // window the stream never reached and the chunks on the disk are the
-    // scan-back and the head itself.
-    assert!(
-        before >= 4,
-        "there is a window on the disk to protect: {before} chunks"
+
+    // Nothing is on its way to the disk any more, so the chunks named below
+    // are named out of a cache that has stopped moving rather than out of
+    // one more chunks are still landing in.
+    settled(&fixture);
+    let kept = longest_cached_run(&fixture);
+    assert_eq!(
+        kept.end,
+        RETENTION_ORIGIN as u64 / CHUNK,
+        "the run the window kept ends in the chunk playback stopped in: {kept:?}"
     );
+    assert!(
+        kept.end - kept.start >= RETENTION_BUDGET / CHUNK,
+        "and it is a window's worth of it: {kept:?}"
+    );
+    let inside: Vec<u64> = kept.clone().collect();
+    let before = cached_chunk_indices(&fixture);
 
     // A cap of one chunk: everything on the disk is over it, so the only
     // thing that can keep a byte is the gate.
@@ -2042,21 +2087,96 @@ fn the_cleaner_leaves_the_chunks_a_proxied_player_is_inside() -> anyhow::Result<
         .handle
         .update_settings(serde_json::json!({ "cacheSize": CHUNK as f64 }))?;
     let report = fixture.handle.clean_cache_now()?;
-
-    let left = cached_chunks(&fixture).len();
+    let left = cached_chunk_indices(&fixture);
     assert_eq!(
-        left, before,
-        "the cleaner took chunks a player is inside: {before} before, {left} after"
+        taken_from(&inside, &left),
+        Vec::<u64>::new(),
+        "the cleaner took chunks the player is inside: {inside:?} were on the \
+         disk and {left:?} are"
     );
     assert!(
         report.over_limit > 0,
         "and it says so rather than pretending it got under the cap: {report:?}"
     );
+    // A direction and not an equality: what a pass may take is a different
+    // claim from what it is refused, and the two are not one number.
+    assert!(
+        left.len() <= before.len(),
+        "the pass grew the disk: {before:?} before, {left:?} after"
+    );
 
-    // Proof that the cap was real and the gate is what refused it: the same
-    // pass with nothing playing takes the lot.
+    // Now the player comes back for those bytes, and this time it is inside
+    // them with a body open: the response is framed round the run, which is
+    // a promise about chunks that have to still be there when it reads them.
+    let (first, last) = (kept.start * CHUNK, kept.end * CHUNK - 1);
+    let mut player = client
+        .get(&url)
+        .header(reqwest::header::RANGE, format!("bytes={first}-{last}"))
+        .send()?;
+    assert_eq!(player.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    let promised = content_range(player.headers());
+    assert_eq!(
+        promised,
+        first..last + 1,
+        "the whole run survived the pass above, so the body is framed round \
+         all of it"
+    );
+    assert!(
+        fixture.origin.was_asked_for_nothing_more(),
+        "and every byte of it is the cache's to answer, which is what makes \
+         this a run the player is inside rather than one being fetched"
+    );
+    let mut head = vec![0u8; CHUNK as usize];
+    player.read_exact(&mut head)?;
+    assert_eq!(head[0], byte_at(first as usize));
+    // The read has delivered a chunk, so the pass its playhead armed is one
+    // more thing on its way round the disk.
+    settled(&fixture);
+
+    // The cleaner goes round again with that body open. What it may not take
+    // now is what the body has yet to deliver -- and *that* is asserted in
+    // bytes rather than in file names, because the chunks still owed are not
+    // the test's to name: the socket takes bytes ahead of the reader, and a
+    // megabyte or three of this run has already been handed over by the time
+    // the player has read its first chunk. What the player must be handed is
+    // exactly what it was promised, and the read below is the whole of that
+    // claim.
+    let before = cached_chunk_indices(&fixture);
+    let report = fixture.handle.clean_cache_now()?;
+    let left = cached_chunk_indices(&fixture);
+    assert!(report.over_limit > 0, "and it says so again: {report:?}");
+    assert!(
+        left.len() <= before.len(),
+        "the pass grew the disk: {before:?} before, {left:?} after"
+    );
+
+    let mut rest = Vec::new();
+    if let Err(error) = player.read_to_end(&mut rest) {
+        panic!(
+            "the player's body broke after {} of {} bytes: {error}",
+            head.len() + rest.len(),
+            promised.end - promised.start
+        );
+    }
+    assert_eq!(
+        (head.len() + rest.len()) as u64,
+        promised.end - promised.start,
+        "the player was handed every byte its response promised"
+    );
+    assert_eq!(rest[0], byte_at((first + CHUNK) as usize));
+
     drop(fixture.handle);
     Ok(())
+}
+
+/// Which of `named` are not in `left`: what a pass took of the chunks a test
+/// named before it ran.
+fn taken_from(named: &[u64], left: &[u64]) -> Vec<u64> {
+    named
+        .iter()
+        .copied()
+        .filter(|index| !left.contains(index))
+        .collect()
 }
 
 /// The launch-time sweep, through a real restart.
@@ -5622,6 +5742,27 @@ const CHUNK: u64 = stream_server::PROXY_CACHE_CHUNK_BYTES;
 /// One response header, as text.
 fn header<'a>(headers: &'a reqwest::header::HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+/// The bytes a `206` says it is carrying, as a half-open range, read off its
+/// `Content-Range`.
+///
+/// What a response was *framed* round, which is not always what was asked
+/// for: the cache narrows a range to the run it holds. That framing is the
+/// promise a body makes, so it is what a test naming the chunks a player is
+/// inside has to read them from.
+fn content_range(headers: &reqwest::header::HeaderMap) -> std::ops::Range<u64> {
+    let value = header(headers, "content-range").expect("a 206 carries a Content-Range");
+    let (range, _) = value
+        .trim_start_matches("bytes ")
+        .split_once('/')
+        .expect("a Content-Range names the entity's length");
+    let (first, last) = range
+        .split_once('-')
+        .expect("a Content-Range names its first and last byte");
+    let first: u64 = first.parse().expect("a first byte");
+    let last: u64 = last.parse().expect("a last byte");
+    first..last + 1
 }
 
 /// Every chunk file the proxy cache holds: the files under the `.proxy`
