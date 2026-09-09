@@ -1415,4 +1415,69 @@ mod tests {
         )
         .await;
     }
+
+    /// **Two entities can carry one target, and the panel is told about the
+    /// one a player is inside now.**
+    ///
+    /// A cache key covers the player headers that reach the origin -- an
+    /// origin may answer two of them with two entities -- so one `d=` URL can
+    /// have more than one directory under it, and an entry outlives the read
+    /// that made it by the [`IDLE`] grace. A session that has *ended*
+    /// therefore sits in the map beside the one being played now, both
+    /// bounded and both naming that target, and only one of them has a
+    /// playhead anybody is at. Answering from the other draws the panel a
+    /// window round a position playback left behind, and round the wrong
+    /// directory's chunks as well.
+    ///
+    /// The situation is built again and again because the order the map
+    /// yields its entries in is not ours to choose and is not the same twice:
+    /// one store answering rightly is a coin that landed face up, and what is
+    /// claimed here is that the answer comes from which entity was read last
+    /// rather than from where the two of them happen to sit. Nothing waits on
+    /// a clock for that -- the later `last_seen` is the later `note`, which is
+    /// the order the bytes really went out in.
+    #[tokio::test]
+    async fn a_panel_is_told_about_the_entity_being_read_and_not_a_session_that_ended() {
+        for _ in 0..24 {
+            let tmp = tempfile::tempdir().unwrap();
+            // Twelve chunks of budget over a sixteen-chunk entity: a policy
+            // is installed, so both of these are bounded and have a window to
+            // show at all -- and both playheads below have a window covering
+            // every chunk on their own disk, so what is asserted is the
+            // reading and not a race with a pass.
+            let retention = retention(Some(12 * CHUNK_BYTES));
+
+            // The session that is over: one player played out the end of the
+            // film and its body finished. Its entry stays for the grace,
+            // because a request ending is the ordinary gap between two
+            // requests of a player.
+            let ended = ChunkDir::new(tmp.path().join("ended"));
+            write_chunks(&ended, 12..16);
+            let finished = retention.reader(&ended, TOTAL, TARGET.into());
+            finished.note(15 * CHUNK_BYTES);
+            drop(finished);
+
+            // Then the same stream is opened again under other player headers
+            // -- a second entity of the one target -- and this is the read a
+            // player is inside. Its byte reaches a player after the other's,
+            // which is the whole of what makes it the more recent.
+            let live = ChunkDir::new(tmp.path().join("live"));
+            write_chunks(&live, 3..10);
+            let reader = retention.reader(&live, TOTAL, TARGET.into());
+            reader.note(4 * CHUNK_BYTES + 5);
+
+            assert_eq!(
+                retention.window(TARGET),
+                Some(enginefs::retention::CacheWindow {
+                    behind_bytes: CHUNK_BYTES,
+                    ahead_bytes: 6 * CHUNK_BYTES,
+                }),
+                "the seven chunks of the entity being read, split at its \
+                 playhead -- and not the four the finished session left round \
+                 the end of the film, which would be three behind and one \
+                 ahead of a playhead nobody is at"
+            );
+            drop(reader);
+        }
+    }
 }
