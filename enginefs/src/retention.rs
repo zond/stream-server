@@ -469,7 +469,15 @@ pub(crate) async fn advance<H: TorrentHandle>(
 /// So the reclaim is narrowed here, by the rule
 /// [`crate::piece_store::PieceStore::remove_file`] deletes a boundary piece
 /// by: a piece another wanted file owns bytes in stays.
-async fn this_files_alone<H: TorrentHandle>(
+///
+/// Both paths that unlink a policy's pieces come through here: [`advance`],
+/// which is the pass reclaiming under its own reader, and
+/// [`crate::engine::Engine::release_reclaimable`], which is the cache
+/// cleaner's delete. The gate the cleaner narrows by cannot answer this
+/// question -- it speaks for the torrent, and a shared piece is in range
+/// and uncommitted like any other -- so leaving that path out would leave
+/// the loop reachable from the cleaner alone.
+pub(crate) async fn this_files_alone<H: TorrentHandle>(
     handle: &H,
     file_idx: usize,
     reclaim: &[u32],

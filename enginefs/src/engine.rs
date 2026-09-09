@@ -966,12 +966,25 @@ impl<H: TorrentHandle> Engine<H> {
     /// and every delete before this one; this asking is the one that
     /// decides.
     pub(crate) fn gate_verdict(&self) -> crate::retention::TorrentGate {
+        self.gate_verdict_for_file().0
+    }
+
+    /// [`Self::gate_verdict`], and the file whose policy answered it.
+    ///
+    /// The two come out of one acquisition of the slot because they are one
+    /// policy's: a caller that asked twice could find itself narrowing one
+    /// file's reclaim by the boundaries of the file a `begin_retention` in
+    /// between had moved to.
+    fn gate_verdict_for_file(&self) -> (crate::retention::TorrentGate, Option<usize>) {
         match self.retention.lock().as_ref() {
-            Some(retention) => crate::retention::TorrentGate::Policy {
-                pieces: retention.pieces(),
-                committed: retention.committed().clone(),
-            },
-            None => crate::retention::TorrentGate::Announced,
+            Some(retention) => (
+                crate::retention::TorrentGate::Policy {
+                    pieces: retention.pieces(),
+                    committed: retention.committed().clone(),
+                },
+                Some(retention.file_idx),
+            ),
+            None => (crate::retention::TorrentGate::Announced, None),
         }
     }
 
@@ -1000,6 +1013,14 @@ impl<H: TorrentHandle> Engine<H> {
     /// the one thing this design exists to prevent, so the question is
     /// asked again here, under the lock those two also take, and the answer
     /// taken from the live policy rather than from a copy of it.
+    ///
+    /// The gate is not the only narrowing the cleaner's request needs. A
+    /// policy's file shares its first and last piece with its neighbours,
+    /// and the gate cannot see that -- it answers for the torrent, so a
+    /// shared piece is in range and uncommitted like any other. So
+    /// [`crate::retention::this_files_alone`] is asked here as well as in
+    /// the pass, and for the same reason: unlinking a piece a still-wanted
+    /// neighbour owns is a refetch loop, whichever caller does it.
     pub(crate) async fn release_reclaimable(
         &self,
         store: &crate::piece_store::StoreRoot,
@@ -1017,8 +1038,9 @@ impl<H: TorrentHandle> Engine<H> {
         // moving to another file installs a policy for *that* file, and
         // piece 0 of the file it left is outside the new range, so the
         // verdict refuses it. So does a piece the pass has committed since.
-        let still: Vec<u32> = match self.gate_verdict() {
-            verdict @ crate::retention::TorrentGate::Policy { .. } => pieces
+        let (verdict, policy_file) = self.gate_verdict_for_file();
+        let mut still: Vec<u32> = match &verdict {
+            crate::retention::TorrentGate::Policy { .. } => pieces
                 .iter()
                 .copied()
                 .filter(|piece| verdict.releases(*piece))
@@ -1032,6 +1054,17 @@ impl<H: TorrentHandle> Engine<H> {
                 taking = still.len(),
                 "pieces became announced between the cleaner's reading and its delete"
             );
+        }
+        // The gate has no answer about the boundary. It speaks for the
+        // torrent, and a piece the policy's file shares with a neighbour is
+        // in range and uncommitted exactly like any other, so a policy
+        // offers the cleaner the same shared pieces the retention pass
+        // offers itself. The same narrowing is therefore made here, or the
+        // cleaner's delete starts the refetch loop the pass no longer
+        // starts. Only a policy has a file to narrow by; where there is
+        // none this engine already has no opinion.
+        if let Some(file_idx) = policy_file {
+            still = crate::retention::this_files_alone(&self.handle, file_idx, &still).await;
         }
         let mut freed = 0;
         for run in crate::retention::runs(&still) {

@@ -10578,6 +10578,65 @@ mod tests {
         );
     }
 
+    /// **The cache cleaner's delete has the same boundary to respect.**
+    ///
+    /// Two callers unlink a policy's pieces: the retention pass, under its
+    /// own reader, and the cleaner, which walks the volume and comes back
+    /// through `Engine::release_reclaimable` for permission. The gate it
+    /// carries cannot refuse a boundary piece -- it answers for the torrent,
+    /// and a piece the policy's file shares with the next one is inside the
+    /// range and uncommitted exactly like a piece of nobody else's. So a
+    /// narrowing that lives only in the pass leaves the refetch loop fully
+    /// reachable: the cleaner unlinks the shared piece, the still-wanted
+    /// neighbour fetches it back, and the next walk finds it again.
+    #[tokio::test]
+    async fn the_cleaners_delete_also_leaves_the_piece_the_next_file_shares() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![
+            ("Show.S01E01.mkv".into(), 100),
+            ("Show.S01E02.mkv".into(), 110),
+            ("Show.S01E03.mkv".into(), 100),
+        ]);
+        // Twenty-five byte pieces, as above: episode two is pieces 4..9 and
+        // episode three 8..13, so piece eight is the one they share.
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in [5u32, 8] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+
+        engine.note_playhead(1, 0);
+        engine.begin_retention(1).await;
+        let mut gate = crate::retention::ReclaimGate::default();
+        engine.gate_entry(&mut gate);
+        assert!(
+            gate.releases(TEST_HASH, 8),
+            "the reading the cleaner walks with offers the shared piece,              because a gate has no way to know it is shared"
+        );
+
+        assert_eq!(
+            enginefs.release_pieces(TEST_HASH, &[5, 8]).await,
+            1,
+            "only the piece episode two holds alone is the cleaner's to take"
+        );
+        assert!(
+            bucket.join("8").is_file(),
+            "the piece episode three also lies in stays on the disk"
+        );
+        assert!(!bucket.join("5").exists());
+        assert_eq!(
+            *counters.dropped_ranges.lock().unwrap(),
+            vec![(5..6, crate::backend::AfterRelease::LeaveDropped)],
+            "and the backend is never asked to forget the shared piece"
+        );
+    }
+
     /// A piece that becomes announced between the cleaner's reading and its
     /// unlink is not taken.
     ///
