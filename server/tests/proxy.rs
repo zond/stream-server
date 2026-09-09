@@ -1520,6 +1520,11 @@ fn the_cleaner_evicts_cached_proxy_bytes() -> anyhow::Result<()> {
     assert_eq!(response.bytes()?.len(), ORIGIN_LENGTH);
     fixture.origin.next_request();
     wait_for_chunks(&fixture, 4);
+    // And nobody is reading it any more. The client has every byte, but the
+    // read that delivered them lives until hyper drops the response, and
+    // while it does the gate answers the cleaner "a player is inside all of
+    // this" -- which is true, and is the subject of another test.
+    nothing_is_reading(&fixture);
 
     // A cap under what is cached, so the pass has something to do. Well
     // above one chunk, so the "a single file bigger than the whole cap is
@@ -1582,6 +1587,27 @@ fn settled(fixture: &Fixture) {
         .handle
         .proxy_cache_settled(std::time::Duration::from_secs(60))
         .expect("the proxy cache stops writing");
+}
+
+/// Wait until no body is open on the proxy cache.
+///
+/// A read holds its window and its promise until it is dropped, which is
+/// after the last byte of it has reached the player -- so a test that has
+/// just read a body to its end and asks the cleaner what it may take is
+/// asking while somebody is still inside those bytes. Bounded so a
+/// regression fails instead of hanging.
+fn nothing_is_reading(fixture: &Fixture) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        if fixture.handle.proxy_cache_reads() == 0 {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!(
+        "{} reads of the proxy cache never ended",
+        fixture.handle.proxy_cache_reads()
+    );
 }
 
 /// The cache holds no more than `chunks` of them, once it has stopped

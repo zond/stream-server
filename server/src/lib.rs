@@ -543,6 +543,21 @@ impl ServerHandle {
         self.block_on_server(async move { routes::cache::clean_cache_now(&state).await })?
     }
 
+    /// How many open bodies the proxy cache is answering right now: the
+    /// reads whose windows and promises the cache cleaner's gate is refused
+    /// bytes by (`proxy_retention::ProxyRetention::reads`).
+    ///
+    /// Not [`Self::proxy_streams_live`], which counts the reads a client can
+    /// close by token: that registration goes the moment a body ends, while
+    /// the read itself lives on until hyper drops the response -- so a
+    /// cleaner run in between is still answered "somebody is inside all of
+    /// this". That gap is nanoseconds on an idle machine and milliseconds on
+    /// a loaded one, which makes it exactly the kind of thing a test has to
+    /// be able to wait for rather than hope past.
+    pub fn proxy_cache_reads(&self) -> usize {
+        self.state.proxy_cache.retention().reads()
+    }
+
     /// Wait until the proxy cache has nothing left on the blocking pool: no
     /// chunk on its way to the disk and no retention pass on its way round
     /// it (`proxy_cache::DiskWork`).

@@ -685,6 +685,22 @@ impl ProxyRetention {
         Some(window)
     }
 
+    /// How many open bodies this cache is answering: reads that have
+    /// promised chunks or delivered a byte and have not ended.
+    ///
+    /// The gate's own reason for refusing the cleaner a byte, counted. It
+    /// is *not* `crate::proxy_streams::ProxyStreams::live`, which counts
+    /// what a client can close by token and lets its registration go the
+    /// instant the body ends -- while the read itself, and the window and
+    /// promise it holds, live on until hyper drops the response. Anything
+    /// asking "is anybody inside these bytes" has to ask this one.
+    pub fn reads(&self) -> usize {
+        let Ok(streams) = self.streams.lock() else {
+            return 0;
+        };
+        streams.values().map(|stream| stream.readers.len()).sum()
+    }
+
     pub fn still_free(&self, path: &std::path::Path) -> bool {
         let mut gate = ReclaimGate::default();
         self.fill_gate(&mut gate);
