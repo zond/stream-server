@@ -996,10 +996,43 @@ impl<H: TorrentHandle> Engine<H> {
             &mut retention,
             offset,
             &held,
+            || self.reclaim_door(file_idx),
         )
         .await;
         self.put_back(retention);
         Some(pass)
+    }
+
+    /// What a pass in flight may still reclaim of `file_idx`, asked again
+    /// at every unlink it makes.
+    ///
+    /// **The two things that move under a pass.** Everything else it
+    /// measured against is frozen by [`Self::announce`], which it holds
+    /// from its first line to its last; these two are not. `pin_download`
+    /// writes [`Self::pinned_files`] and [`Self::note_playhead`] writes
+    /// [`Self::playhead`] on every delivered byte, and neither takes a
+    /// lock the pass holds -- so the pin [`Self::retain`] asked about in
+    /// its prologue and the playhead it drew its window round are both
+    /// older than the unlink by a disk walk and two awaited backend calls
+    /// per run.
+    ///
+    /// `None` is "take nothing more": the torrent is pinned now, or the
+    /// reader has left the file this policy governs, and neither is a
+    /// state that has a window for the pass to keep. `Some` is where that
+    /// reader is at this instant, which is what the window the reclaim
+    /// spares is drawn round. See [`crate::retention::advance`]'s reclaim
+    /// loop for what is done with each.
+    ///
+    /// Both readings are copied out, so no lock guard here can reach the
+    /// await on the next line of the caller.
+    fn reclaim_door(&self, file_idx: usize) -> Option<u64> {
+        if self.is_pinned() {
+            return None;
+        }
+        match *self.playhead.lock() {
+            Some((idx, offset)) if idx == file_idx => Some(offset),
+            _ => None,
+        }
     }
 
     /// Put a pass's policy back where it came from, unless something has

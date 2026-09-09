@@ -437,13 +437,20 @@ pub(crate) async fn listing(store: &StoreRoot, info_hash: &str) -> Option<BTreeS
 /// round the decision names pieces the listing did not find, and
 /// `RetentionPolicy::advance` takes `held` as the candidate set, so those
 /// name nothing and unlink nothing.
-pub(crate) async fn advance<H: TorrentHandle>(
+///
+/// `at_the_door` is the pass's last asking, and it is made again before
+/// every run is given back rather than once for the decision. `None` is
+/// "take nothing more"; `Some` is where the reader is in this file at that
+/// instant. See the loop at the foot of this function for what each answer
+/// refuses and why neither can be hoisted out of it.
+pub(crate) async fn advance<H: TorrentHandle, D: Fn() -> Option<u64>>(
     handle: &H,
     store: &StoreRoot,
     info_hash: &str,
     retention: &mut FileRetention,
     offset_in_file: u64,
     held: &BTreeSet<u32>,
+    at_the_door: D,
 ) -> RetentionPass {
     let playhead = retention.playhead(offset_in_file);
     let decision = retention.policy.advance(playhead, held);
@@ -474,8 +481,54 @@ pub(crate) async fn advance<H: TorrentHandle>(
             pass.withdrawn += (run.end - run.start) as usize;
         }
     }
+    // **The door, asked at the instant of each unlink and not a moment
+    // before it.** The decision above was measured before two awaited
+    // backend calls per committed and withdrawn run and a `file_wants`,
+    // and neither of the two things it measured against is behind a lock
+    // this pass holds: `note_playhead` writes the playhead on every
+    // delivered byte and `pin_download` writes the pin set, and
+    // `Engine::announce` stops neither.
+    //
+    // What it is *not* for: a piece becoming announced under the pass.
+    // Every `set_pieces_advertised` in this workspace is made under
+    // `announce`, which the pass holds throughout, so nothing can announce
+    // a piece between the decision and the unlink -- that half of the
+    // proxy's door is kept here by the lock, and a door built from
+    // `Engine::gate_verdict_for_file` would in any case answer
+    // `TorrentGate::Announced` (the policy is in this pass's hand, not in
+    // the slot) and reclaim nothing, ever.
+    //
+    // `None` is a pin taken since `Engine::retain` asked, or a reader that
+    // has left this file, and it stops the reclaim rather than skipping a
+    // run: a pin does not un-pin mid-loop, and there is no window for a
+    // file nobody is reading. A pinned file's pieces are the expensive
+    // ones to get wrong -- `AfterRelease::LeaveDropped` leaves them
+    // neither held nor wanted, and the pin's own reconcile short-circuits
+    // an unchanged selection, so nothing re-queues them and the download
+    // the user asked for stays short of them until a restart hash-checks
+    // the file off the disk.
+    //
+    // `Some` narrows the run by the window at the reader's *current*
+    // position. librqbit refuses a piece its own live stream is about to
+    // read, and computes that refusal under the write lock it drops
+    // beneath rather than before it -- but that is `queue_range`, the
+    // forward lookahead alone (`MAX_STARTUP_WINDOW_BYTES`, 4 MiB), so it
+    // cannot see the tenth of the window that sits behind the playhead for
+    // a scan back, it is empty whenever no stream is open, and
+    // `TorrentHandle::drop_pieces` promises it of no backend.
+    //
+    // Per run and not per piece: `release` is the unit that holds the
+    // claim across the unlink, and `runs` exists so that two hundred
+    // consecutive pieces are one call and not two hundred locks on the
+    // torrent.
     for run in runs(&this_files_alone(handle, retention.file_idx, &decision.reclaim).await) {
-        pass.reclaimed += release(handle, store, info_hash, run).await;
+        let Some(offset) = at_the_door() else {
+            break;
+        };
+        let window = retention.policy.window_at(retention.playhead(offset));
+        for run in outside(run, &window) {
+            pass.reclaimed += release(handle, store, info_hash, run).await;
+        }
     }
     pass
 }
@@ -653,6 +706,24 @@ async fn unlink(
     // this number to decide whether a pass made room, and a number invented
     // here restarts torrents onto a disk that may have gained nothing.
     .unwrap_or(0)
+}
+
+/// The parts of `run` that `window` does not cover: at most the pieces
+/// before it and the pieces after it.
+///
+/// A window that falls in the middle of a run makes it two calls on the
+/// torrent instead of one, which is the whole price of narrowing a run at
+/// the door; a window that does not touch it leaves the single call it
+/// was.
+fn outside(run: Range<u32>, window: &Range<u32>) -> Vec<Range<u32>> {
+    let mut kept = Vec::new();
+    if run.start < window.start {
+        kept.push(run.start..run.end.min(window.start));
+    }
+    if run.end > window.end {
+        kept.push(run.start.max(window.end)..run.end);
+    }
+    kept
 }
 
 /// Scattered piece indices as the fewest contiguous ranges that cover them.
@@ -893,6 +964,23 @@ mod tests {
         // A caller that offered the same piece twice gets one range, not a
         // second call on the torrent for a piece already in the first.
         assert_eq!(runs(&[5, 5, 6]), vec![5..7]);
+    }
+
+    /// The door narrows a run rather than refusing it whole: what the
+    /// reader has moved onto since the decision stays, and what it has left
+    /// behind still goes.
+    #[test]
+    fn a_run_the_window_has_moved_into_is_kept_and_the_rest_of_it_goes() {
+        assert_eq!(outside(2..6, &(0..1)), vec![2..6], "no overlap, one call");
+        assert_eq!(outside(2..6, &(9..10)), vec![2..6]);
+        assert_eq!(outside(2..6, &(4..5)), vec![2..4, 5..6], "split in two");
+        assert_eq!(outside(2..6, &(0..4)), vec![4..6], "the front is spared");
+        assert_eq!(outside(2..6, &(4..9)), vec![2..4], "and the tail can be");
+        assert_eq!(
+            outside(2..6, &(2..6)),
+            Vec::<Range<u32>>::new(),
+            "a run the window has covered entirely is not the pass's to take"
+        );
     }
 
     /// The gate's default answer is what decides whether an unknown torrent

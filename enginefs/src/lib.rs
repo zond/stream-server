@@ -10357,6 +10357,185 @@ mod tests {
         );
     }
 
+    /// **A pin taken while the pass is reclaiming keeps its bytes.**
+    ///
+    /// `Engine::retain` asks whether the torrent is pinned in its
+    /// prologue, and by the time the first piece is unlinked that answer is
+    /// a disk walk and two awaited backend calls old. `pin_download` writes
+    /// `pinned_files` under none of the locks the pass holds, so it lands
+    /// in exactly that gap -- and what the pass takes then is worse than
+    /// deleted: `AfterRelease::LeaveDropped` leaves the pieces neither held
+    /// nor wanted, and the pin's own reconcile short-circuits an unchanged
+    /// selection, so nothing re-queues them and the download the user has
+    /// just asked for stays short of them until a restart hash-checks the
+    /// file off the disk. The same failure with the pin landing a second
+    /// earlier was measured at half a 32 MiB file; this is it moved inside
+    /// the pass.
+    ///
+    /// The park is `FakeCounters::advertise_gate`, which holds the pass
+    /// inside the call it makes to announce what the window released --
+    /// after the decision and before the reclaim, which is the instant this
+    /// door is about. What the pass then does with the policy it is holding
+    /// is not this test's subject: it puts it back, as it always has.
+    #[tokio::test]
+    async fn a_pin_taken_while_the_pass_reclaims_keeps_its_bytes() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        // Two pieces of budget over four 25-byte pieces, half of which is
+        // the committed set: a one-piece window.
+        enginefs.set_cache_budget(Some(50));
+        let store = enginefs.piece_store();
+
+        // A first pass with nothing on the disk but the piece under the
+        // playhead: it takes nothing, and leaves behind the record that its
+        // window covered piece 0. That record is what lets the second pass
+        // commit piece 0, and a commit is what parks the pass in the
+        // backend call below.
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
+        engine.note_playhead(0, 0);
+        engine.begin_retention(0).await;
+        engine.retain(&store).await.expect("a pass");
+
+        // Now the rest of the file is on the disk and playback has walked
+        // on to piece 1: piece 0 commits, piece 1 is the window, and pieces
+        // 2 and 3 are what this pass sets out to reclaim.
+        for piece in [1u32, 2, 3] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *counters.advertise_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        engine.note_playhead(0, 25);
+        let running = tokio::spawn({
+            let engine = engine.clone();
+            let store = store.clone();
+            async move { engine.retain(&store).await }
+        });
+        tokio::time::timeout(Duration::from_secs(10), entered_rx)
+            .await
+            .expect("the pass reached the call it makes to announce a committed piece")
+            .expect("the fake said so");
+        // The user taps download for offline while the pass is parked.
+        engine.pinned_files.write().insert(0);
+
+        release_tx.send(()).expect("the pass is waiting on this");
+        let pass = running
+            .await
+            .expect("the pass task")
+            .expect("a pass ran to the end");
+        assert_eq!(
+            pass.reclaimed, 0,
+            "the pass stopped at the door instead of reclaiming: {pass:?}"
+        );
+        assert!(
+            bucket.join("2").is_file() && bucket.join("3").is_file(),
+            "the pieces of the file the user has just asked to keep are still here"
+        );
+        assert!(
+            !counters
+                .dropped_ranges
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(range, _)| range.contains(&2) || range.contains(&3)),
+            "and the backend was never asked to forget them either: a piece \
+             dropped here is left neither held nor wanted, and nothing on the \
+             pin path recomputes the want-set to fetch it again"
+        );
+    }
+
+    /// **And the reader that moved while the pass ran narrows the reclaim
+    /// rather than stopping it.**
+    ///
+    /// The playhead the window was drawn round is as old as the pin above:
+    /// `note_playhead` runs on every delivered byte and takes none of the
+    /// pass's locks, so playback walks on while the pass commits and
+    /// withdraws. librqbit refuses to drop what its own live stream is
+    /// about to read, but that refusal is the forward lookahead alone (4
+    /// MiB), blind to the tenth of the window kept behind the playhead for
+    /// a scan back, empty when no stream is open, and promised by no
+    /// backend -- the fake here refuses nothing at all. So the pass has to
+    /// subtract the window at the reader's current position itself.
+    ///
+    /// Same fixture and same park as the test above, so the reclaim it sets
+    /// out to make is pieces 2 and 3. Moving the playhead onto piece 3
+    /// while it is parked puts the one-piece window over piece 3 alone,
+    /// which is what makes this an assertion about narrowing and not about
+    /// refusing: piece 3 stays, piece 2 still goes.
+    #[tokio::test]
+    async fn a_run_the_reader_walked_into_while_the_pass_ran_keeps_that_much() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        // Two pieces of budget over four 25-byte pieces, half of which is
+        // the committed set: a one-piece window.
+        enginefs.set_cache_budget(Some(50));
+        let store = enginefs.piece_store();
+
+        // A first pass with nothing on the disk but the piece under the
+        // playhead: it takes nothing, and leaves behind the record that its
+        // window covered piece 0. That record is what lets the second pass
+        // commit piece 0, and a commit is what parks the pass in the
+        // backend call below.
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
+        engine.note_playhead(0, 0);
+        engine.begin_retention(0).await;
+        engine.retain(&store).await.expect("a pass");
+
+        // Now the rest of the file is on the disk and playback has walked
+        // on to piece 1: piece 0 commits, piece 1 is the window, and pieces
+        // 2 and 3 are what this pass sets out to reclaim.
+        for piece in [1u32, 2, 3] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *counters.advertise_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        engine.note_playhead(0, 25);
+        let running = tokio::spawn({
+            let engine = engine.clone();
+            let store = store.clone();
+            async move { engine.retain(&store).await }
+        });
+        tokio::time::timeout(Duration::from_secs(10), entered_rx)
+            .await
+            .expect("the pass reached the call it makes to announce a committed piece")
+            .expect("the fake said so");
+        // Playback, while the pass is parked: piece 3 of 4.
+        engine.note_playhead(0, 75);
+
+        release_tx.send(()).expect("the pass is waiting on this");
+        let pass = running
+            .await
+            .expect("the pass task")
+            .expect("a pass ran to the end");
+        assert_eq!(
+            pass.reclaimed, 1,
+            "one of the two pieces it set out to take, not both: {pass:?}"
+        );
+        assert!(
+            bucket.join("3").is_file(),
+            "the piece the reader walked onto while the pass ran is not the \
+             pass's to take"
+        );
+        assert!(
+            !bucket.join("2").exists(),
+            "and the run is narrowed rather than refused whole: what playback \
+             has left behind still goes"
+        );
+    }
+
     /// And the other half of a pass that is not the reactor's to do: the
     /// unlinks.
     ///
