@@ -2104,7 +2104,18 @@ fn the_cleaner_leaves_the_chunks_a_proxied_player_is_inside() -> anyhow::Result<
         kept.end - kept.start >= RETENTION_BUDGET / CHUNK,
         "and it is a window's worth of it: {kept:?}"
     );
-    let inside: Vec<u64> = kept.clone().collect();
+    // The window, and not the whole run. The two are the same size only
+    // when no chunk landed after the last retention pass -- and one that
+    // does arms no pass of its own, because a pass is armed by a byte
+    // reaching a player and there are no bytes left to deliver. So the run
+    // can be wider than the window by whatever the final stride wrote, and
+    // that surplus is the cleaner's to take: it is over the cap and nobody
+    // is inside it. Asserting the whole run is protected would be asserting
+    // that retention leaves no overshoot, which is a different claim, and
+    // one this test would make only on the platforms where the last pass
+    // happened to catch everything.
+    let window = RETENTION_BUDGET / CHUNK;
+    let inside: Vec<u64> = (kept.end.saturating_sub(window)..kept.end).collect();
     let before = cached_chunk_indices(&fixture);
 
     // A cap of one chunk: everything on the disk is over it, so the only
@@ -2118,7 +2129,7 @@ fn the_cleaner_leaves_the_chunks_a_proxied_player_is_inside() -> anyhow::Result<
         taken_from(&inside, &left),
         Vec::<u64>::new(),
         "the cleaner took chunks the player is inside: {inside:?} were on the \
-         disk and {left:?} are"
+         disk and {left:?} are (the run it kept was {kept:?})"
     );
     assert!(
         report.over_limit > 0,
