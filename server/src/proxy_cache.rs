@@ -185,9 +185,13 @@ const RANGE_REQUEST_HEADERS: [&str; 2] = ["range", "if-range"];
 /// writes on their way to the disk, and the retention passes on their way
 /// round it.
 ///
-/// Both are `spawn_blocking` tasks nobody joins, and that is what keeps the
-/// reactor off the disk -- a body must not wait for its own chunk to be
-/// written, and a playhead must not wait for a directory listing. What it
+/// Neither is joined by anything, and that is what keeps the reactor off
+/// the disk -- a body must not wait for its own chunk to be written, and a
+/// playhead must not wait for a directory listing. A chunk write is one
+/// `spawn_blocking` call; a pass is a task that makes two of its own, for
+/// the listing and for the unlinks, and it is counted for the whole of
+/// itself rather than for those -- see
+/// `proxy_retention::ProxyRetention::spawn_pass`. What it
 /// costs is that **nothing else in the process can tell when the disk has
 /// stopped moving**: the last chunk of a body is written after the player
 /// has read the last byte of it and out of order with its neighbours, and

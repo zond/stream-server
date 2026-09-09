@@ -203,19 +203,37 @@ pub struct ProxyRetention {
     /// A pass reads the playheads, lists the entity's directories and
     /// unlinks what no window covers, and what this exists to pin happens
     /// between those: playback moving on while the listing runs, a seek
-    /// framing a body over the run being walked. A pass is one call on the
-    /// blocking pool, so nothing outside can get in there --
-    /// `a_budget_published_while_a_pass_was_running_is_the_one_that_holds`
-    /// drives the two halves of a pass by hand for the same reason, which
+    /// framing a body over the run being walked.
+    ///
+    /// **What it guarantees is a position, not an exclusion.** It never was
+    /// an exclusion -- a pass ran on the blocking pool beside a reactor that
+    /// went on delivering bytes and taking this module's lock -- and now
+    /// that the pass is a task with the disk awaited from inside it, there
+    /// are suspension points between its steps as well, so anything the
+    /// runtime is carrying may also run there. What the hook says exactly,
+    /// and said before, is *when*: the closure is called by the pass itself,
+    /// runs to completion, and does so after the step it follows and before
+    /// the step it precedes, with no lock of this module held. That is the
+    /// one thing no test can arrange from outside -- putting a delivered
+    /// byte, a seek or a published budget strictly between two steps of one
+    /// pass. `a_budget_published_while_a_pass_was_running_is_the_one_that_holds`
+    /// drives the two halves of a pass by hand for the same reason, and that
     /// is not open to a test about the middle of one.
     ///
     /// The shipped build has neither this nor the two calls to it.
     #[cfg(test)]
     interleave: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    /// The passes below while they are on the blocking pool, counted beside
-    /// the cache's chunk writes: `crate::proxy_cache::DiskWork`. A pass is
-    /// spawned and never joined, so it is the other half of what makes a
-    /// listing of the cache root a moving picture.
+    /// The passes below while they are running, counted beside the cache's
+    /// chunk writes: `crate::proxy_cache::DiskWork`. A pass is spawned and
+    /// never joined, so it is the other half of what makes a listing of the
+    /// cache root a moving picture.
+    ///
+    /// **A whole pass, and not the blocking halves of one.** The ticket is
+    /// taken in [`ProxyRetention::spawn_pass`] and lives in the task, so it
+    /// covers the reading, the listing, the second reading, the unlinks and
+    /// the windows going back into the map. Held only round the
+    /// `spawn_blocking` calls inside a pass it would say the cache had
+    /// stopped moving at the very moments it is deciding what to move.
     work: Arc<crate::proxy_cache::DiskWork>,
     /// How many passes have run here, for the tests that bound them.
     ///
@@ -229,6 +247,18 @@ pub struct ProxyRetention {
     /// [`ProxyRetention::pass`].
     #[cfg(test)]
     passes: AtomicU64,
+    /// The threads the blocking halves of a pass really ran on.
+    ///
+    /// A `#[tokio::test]` drives its runtime on the test's own thread, so
+    /// "the reactor" is a thread identity there and this is what a test can
+    /// read it off. Nothing else can: a `read_dir` and an `unlink` leave no
+    /// trace of where they were made, and a test that instead watched for
+    /// the pass yielding would be reading a race -- a blocking task that
+    /// finishes before its handle is first polled yields nothing.
+    ///
+    /// The shipped build has neither this nor the two calls to it.
+    #[cfg(test)]
+    disk_threads: Mutex<Vec<std::thread::ThreadId>>,
 }
 
 /// One entity one or more readers are open on.
@@ -318,8 +348,8 @@ struct LiveStream {
     /// How far a playhead must move before another pass is worth its
     /// listing.
     stride: u64,
-    /// A pass is on the blocking pool for this stream right now, so a second
-    /// one would only list the same directory again.
+    /// A pass is running for this stream right now, so a second one would
+    /// only list the same directory again.
     running: bool,
 }
 
@@ -382,6 +412,8 @@ impl ProxyRetention {
             work,
             #[cfg(test)]
             passes: AtomicU64::new(0),
+            #[cfg(test)]
+            disk_threads: Mutex::new(Vec::new()),
         }
     }
 
@@ -404,12 +436,31 @@ impl ProxyRetention {
     /// One pass over one entity: what the policy makes of where the
     /// playheads are now, and the unlinks that make it so.
     ///
-    /// Blocking -- it lists the entity's bucket directories and unlinks what
-    /// no window covers -- and the policy is taken out of its slot for the
-    /// length of it, so a second pass that overlaps this one does nothing
-    /// rather than queueing behind it. Exactly the shape
-    /// `enginefs::engine::Engine::retain` uses, and for the same reason.
-    fn pass(self: &Arc<Self>, key: &Path, id: u64) {
+    /// The policy is taken out of its slot for the length of it, so a second
+    /// pass that overlaps this one does nothing rather than queueing behind
+    /// it. Exactly the shape `enginefs::engine::Engine::retain` uses, and
+    /// for the same reason.
+    ///
+    /// **An ordinary task, with the disk inside it.** The two expensive
+    /// things a pass does are a `read_dir` per thousand chunks and an
+    /// `unlink` per reclaimed chunk, and both go to the blocking pool from
+    /// in here rather than the whole pass going there as one call -- the
+    /// rule `enginefs::retention`'s `unlink` states, which is that a
+    /// syscall loop of no bounded length is not the reactor's to run. What
+    /// that buys the caller is the shape: the torrent side's pass cannot be
+    /// a `fn` at all, since `set_pieces_advertised`, `drop_pieces` and
+    /// `file_wants` are `async fn` on the handle, so this being one was the
+    /// difference between the two retention drivers that had nothing to do
+    /// with retention.
+    ///
+    /// **What it costs is that the pass can now be suspended between its
+    /// steps**, where before it ran a blocking thread to the end. Nothing
+    /// here assumed otherwise: the pass already ran beside a reactor that
+    /// went on delivering bytes and taking this module's lock, which is why
+    /// it re-reads the playheads after the listing and asks again at every
+    /// unlink. The suspension points are where those re-readings already
+    /// are.
+    async fn pass(self: &Arc<Self>, key: &Path, id: u64) {
         #[cfg(test)]
         self.passes.fetch_add(1, Ordering::Relaxed);
         let Some(begin) = self.begin(key, id) else {
@@ -430,15 +481,39 @@ impl ProxyRetention {
         // Where a test puts what playback does while the listing below runs.
         #[cfg(test)]
         self.interleave();
+        // The listing, on the blocking pool: one `read_dir` of the entity's
+        // directory and one more per thousand chunks, which on the flash of
+        // a television is whatever the device says it is. The same listing
+        // goes there from `Self::window` when a panel asks what a stream
+        // holds; this is the other caller of it.
+        //
         // A chunk index too big for the policy's index space is one the
         // policy was never built over -- see `LiveStream::decide`, which
         // refuses to build one at all in that case -- so this cannot narrow
         // a window that exists.
-        let held: BTreeSet<u32> = dir
-            .held()
-            .into_iter()
-            .filter_map(|index| u32::try_from(index).ok())
-            .collect();
+        let listing = {
+            let dir = dir.clone();
+            #[cfg(test)]
+            let retention = self.clone();
+            tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                retention.note_disk_thread();
+                dir.held()
+                    .into_iter()
+                    .filter_map(|index| u32::try_from(index).ok())
+                    .collect::<BTreeSet<u32>>()
+            })
+        };
+        let Ok(held) = listing.await else {
+            // The pool would not answer, so this pass has no listing -- and
+            // a pass with no listing has nothing to conclude, in the same
+            // way `enginefs::retention::unlink` reports nothing freed when
+            // it cannot reach the disk. It gives the policy back and takes
+            // no decision, rather than advancing one over an empty reading
+            // of a directory that is not empty.
+            self.abandon(key, Some(policy), budget);
+            return;
+        };
         // **The playheads again, now that the disk has been listed.**
         //
         // The listing and the playheads are not one reading of one moment
@@ -480,48 +555,76 @@ impl ProxyRetention {
             let other = (other / CHUNK_BYTES).min(last);
             windows.push(span(policy.window_at(other as u32)));
         }
-        let mut freed = 0usize;
         // And what it does while the unlinks below run.
         #[cfg(test)]
         self.interleave();
-        for index in &decision.reclaim {
-            let index = u64::from(*index);
-            if windows.iter().any(|window| window.contains(&index)) {
-                continue;
-            }
-            // A chunk an open body has already been told it will get is not
-            // ours to take, whatever the window says: this is the refusal
-            // librqbit makes for a torrent's reader, in the one place a
-            // proxied read can make it for itself.
-            if promised.iter().any(|range| range.contains(&index)) {
-                continue;
-            }
-            // And the third asking, at the door. Everything above is a
-            // reading, and the unlinks below take as long as they take --
-            // one `unlink` per chunk of a window, on the flash of a
-            // television -- while playback goes on delivering bytes and a
-            // seek can frame a whole new body over the run this pass is
-            // walking. This is the same refusal the cleaner's own delete
-            // makes (`still_free`, the sibling of this one) and it is made
-            // for the same reason: a chunk somebody is inside costs the
-            // player a broken read and the origin the same fetch again,
-            // while a chunk left standing costs a few bytes until the next
-            // pass.
-            if self.is_inside_now(key, index, &policy, last) {
-                continue;
-            }
-            // The chunk store's own delete is `pub(crate)` to `enginefs` --
-            // deliberately, so nothing outside it can unlink a torrent piece
-            // behind librqbit's back. This is the proxy adapter's own
-            // reclaim of its own chunk, the same `remove_file` the cache
-            // cleaner has always done to these files, and there is no
-            // have-set for it to disagree with. A staged copy is not looked
-            // for: proxy staging is anonymous, lives only inside one
-            // `write_whole`, and what a kill leaves is the launch sweep's.
-            if std::fs::remove_file(dir.chunk_path(index)).is_ok() {
-                freed += 1;
-            }
-        }
+        // The unlinks, on the blocking pool, **and the door check with
+        // them**. The third asking below has to be made at the instant of
+        // each unlink and not a moment before it, so the loop is one thing
+        // and goes to the pool whole; splitting the asking from the taking
+        // is the one rearrangement of this that would change what a pass
+        // deletes.
+        let unlinks = {
+            let retention = self.clone();
+            let key = key.to_path_buf();
+            let dir = dir.clone();
+            let reclaim = decision.reclaim;
+            tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                retention.note_disk_thread();
+                let mut freed = 0usize;
+                for index in &reclaim {
+                    let index = u64::from(*index);
+                    if windows.iter().any(|window| window.contains(&index)) {
+                        continue;
+                    }
+                    // A chunk an open body has already been told it will get
+                    // is not ours to take, whatever the window says: this is
+                    // the refusal librqbit makes for a torrent's reader, in
+                    // the one place a proxied read can make it for itself.
+                    if promised.iter().any(|range| range.contains(&index)) {
+                        continue;
+                    }
+                    // And the third asking, at the door. Everything above is
+                    // a reading, and the unlinks here take as long as they
+                    // take -- one `unlink` per chunk of a window, on the
+                    // flash of a television -- while playback goes on
+                    // delivering bytes and a seek can frame a whole new body
+                    // over the run this pass is walking. This is the same
+                    // refusal the cleaner's own delete makes (`still_free`,
+                    // the sibling of this one) and it is made for the same
+                    // reason: a chunk somebody is inside costs the player a
+                    // broken read and the origin the same fetch again, while
+                    // a chunk left standing costs a few bytes until the next
+                    // pass.
+                    if retention.is_inside_now(&key, index, &policy, last) {
+                        continue;
+                    }
+                    // The chunk store's own delete is `pub(crate)` to
+                    // `enginefs` -- deliberately, so nothing outside it can
+                    // unlink a torrent piece behind librqbit's back. This is
+                    // the proxy adapter's own reclaim of its own chunk, the
+                    // same `remove_file` the cache cleaner has always done to
+                    // these files, and there is no have-set for it to
+                    // disagree with. A staged copy is not looked for: proxy
+                    // staging is anonymous, lives only inside one
+                    // `write_whole`, and what a kill leaves is the launch
+                    // sweep's.
+                    if std::fs::remove_file(dir.chunk_path(index)).is_ok() {
+                        freed += 1;
+                    }
+                }
+                (policy, windows, freed)
+            })
+        };
+        // A blocking task already started is not cancelled, so whatever this
+        // pass has taken off the disk is really gone whether or not this
+        // await returns -- and if it does not, the policy went down with the
+        // task that was holding it, which is why nothing is put back below.
+        let Ok((policy, windows, freed)) = unlinks.await else {
+            self.abandon(key, None, budget);
+            return;
+        };
         if freed > 0 {
             tracing::debug!(
                 dir = %dir.path().display(),
@@ -531,6 +634,45 @@ impl ProxyRetention {
             );
         }
         self.finish(key, id, policy, budget, windows, at);
+    }
+
+    /// Record that this is a thread a pass did disk work on.
+    #[cfg(test)]
+    fn note_disk_thread(&self) {
+        if let Ok(mut threads) = self.disk_threads.lock() {
+            threads.push(std::thread::current().id());
+        }
+    }
+
+    /// A pass that could not reach the disk: the policy back in its slot and
+    /// the throttle rearmed, without a conclusion.
+    ///
+    /// The blocking pool refusing a task is not something a pass can measure
+    /// round. A listing it does not have says nothing about what is on the
+    /// disk, and a decision advanced over one would name a window against a
+    /// directory it never read -- the same reason
+    /// `enginefs::retention::unlink` reports nothing freed rather than a
+    /// number it cannot vouch for. So nothing is concluded: the windows the
+    /// last pass really measured stand, `passed_at` is left where it was so
+    /// the next delivered byte is due for a pass again, and no pass is armed
+    /// off a reading that was never taken.
+    ///
+    /// The policy goes back only if the budget is still the one it was built
+    /// for, exactly as [`Self::finish`] puts it back. `None` is the pass
+    /// whose policy went down with the task that was holding it, and then
+    /// this is only the `running` slot: the next budget published here
+    /// rebuilds the policy, which is what [`LiveStream::decide`] is for.
+    fn abandon(&self, key: &Path, policy: Option<RetentionPolicy>, budget: Option<CacheBudget>) {
+        let Ok(mut streams) = self.streams.lock() else {
+            return;
+        };
+        let Some(stream) = streams.get_mut(key) else {
+            return;
+        };
+        stream.running = false;
+        if stream.decided == budget && stream.policy.is_none() {
+            stream.policy = policy;
+        }
     }
 
     /// Run the interleaving a test installed, outside the lock that holds
@@ -547,18 +689,27 @@ impl ProxyRetention {
         }
     }
 
-    /// Put a pass for `id` on the blocking pool.
+    /// Start a pass for `id`.
     ///
     /// The caller has already claimed the stream's `running` slot under the
     /// lock, so this is the spawn and the counting of it and nothing else.
     /// It is counted because a pass unlinks files nobody joins the task for:
     /// see `crate::proxy_cache::DiskWork`.
+    ///
+    /// **The ticket is taken here and lives in the task**, so it stands for
+    /// the whole pass and not for the `spawn_blocking` calls inside one.
+    /// That is what `ServerHandle::proxy_cache_settled` means by the cache
+    /// having stopped moving: a pass that has listed the directory and not
+    /// yet unlinked anything is a cache that is about to move, and a wait
+    /// that returned there would answer a test with a directory the pass is
+    /// still deciding about. Taken inside [`Self::pass`] instead, that is
+    /// exactly the window it would leave.
     fn spawn_pass(self: &Arc<Self>, key: PathBuf, id: u64) {
         let retention = self.clone();
         let ticket = self.work.start();
-        tokio::task::spawn_blocking(move || {
+        tokio::spawn(async move {
             let _ticket = ticket;
-            retention.pass(&key, id);
+            retention.pass(&key, id).await;
         });
     }
 
@@ -1204,10 +1355,22 @@ mod tests {
         }
     }
 
-    /// Wait for the passes a `note` started to have got somewhere -- `what`
-    /// says where, and is what a failure is reported as. Bounded so a
-    /// regression fails instead of hanging, and generously, because the
-    /// bound is not the assertion.
+    /// Wait for the passes a `note` started to be over and to have got
+    /// somewhere -- `what` says where, and is what a failure is reported as.
+    /// Bounded so a regression fails instead of hanging, and generously,
+    /// because the bound is not the assertion.
+    ///
+    /// **Both halves, and the first one is not decoration.** What a pass
+    /// does to the disk it does from inside itself, and what it concludes
+    /// -- the windows back in the map, the throttle rearmed, the next pass
+    /// armed -- it does after that, past a suspension point, since the
+    /// unlinks are awaited on the blocking pool. So a file that has gone is
+    /// not a pass that has finished, and a test that read the gate on the
+    /// strength of one would be reading the *previous* pass's windows
+    /// beside this pass's disk. `DiskWork` counts a whole pass, which is
+    /// what `ServerHandle::proxy_cache_settled` is for, so a count of
+    /// nothing beside the condition is a cache that has stopped moving and
+    /// has said where it stopped.
     async fn settled(
         retention: &Arc<ProxyRetention>,
         what: &str,
@@ -1217,7 +1380,7 @@ mod tests {
         while Instant::now() < deadline {
             let mut gate = ReclaimGate::default();
             retention.fill_gate(&mut gate);
-            if until(&gate) {
+            if retention.work.idle() && until(&gate) {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1709,7 +1872,7 @@ mod tests {
     /// where playback stopped.**
     ///
     /// A request ends the moment its last chunk goes out, and the pass that
-    /// byte started is on the blocking pool -- so a pass running with no
+    /// byte started is still in flight -- so a pass running with no
     /// reader left is the ordinary case and not a corner. Where playback got
     /// to is still the last thing that happened to this entity, and the
     /// window belongs round there for the [`IDLE`] grace, because the
@@ -1719,8 +1882,8 @@ mod tests {
     /// which is where playback was and not where it stopped.
     ///
     /// The interleaving is driven by hand: `running` is what a pass already
-    /// on the blocking pool looks like from `note`, so the note below starts
-    /// no pass of its own and this test owns which pass runs when.
+    /// in flight looks like from `note`, so the note below starts no pass of
+    /// its own and this test owns which pass runs when.
     #[tokio::test]
     async fn a_pass_that_lands_after_its_read_has_ended_puts_the_window_where_playback_stopped() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1751,7 +1914,7 @@ mod tests {
         // started run.
         let id = reader.id;
         drop(reader);
-        retention.pass(dir.path(), id);
+        retention.pass(dir.path(), id).await;
 
         assert!(
             dir.chunk_path(15).is_file(),
@@ -1897,7 +2060,7 @@ mod tests {
             }
         }));
 
-        retention.pass(dir.path(), reader.id);
+        retention.pass(dir.path(), reader.id).await;
         settled(
             &retention,
             "the pass the movement armed reclaimed round the twentieth chunk",
@@ -1910,6 +2073,119 @@ mod tests {
             held,
             (20..28).collect::<BTreeSet<u64>>(),
             "what is on the disk is the window round where playback got to"
+        );
+        drop(reader);
+    }
+
+    /// **Neither half of a pass is the reactor's to run.**
+    ///
+    /// A pass lists the entity's bucket directories -- one `read_dir`, and
+    /// one more per thousand chunks -- and then unlinks a chunk at a time.
+    /// On the flash of a television, with nothing in the dentry cache, both
+    /// are syscall loops of no bounded length, and the reactor they would
+    /// run on is carrying every other request this server is answering.
+    /// This is the rule `enginefs::retention`'s `unlink` states, asked of
+    /// the other adapter over the same chunks.
+    ///
+    /// A `#[tokio::test]` drives its runtime on the test's own thread, so
+    /// "the reactor" here is a thread identity and not a timing. Read that
+    /// way there is no race in it: a `spawn_blocking` closure never runs on
+    /// the thread that spawned it, whereas a test that watched for the pass
+    /// yielding would be reading one -- a blocking task that finishes
+    /// before its handle is first polled yields nothing.
+    #[tokio::test]
+    async fn neither_the_listing_nor_the_unlinks_of_a_pass_run_on_the_reactor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = ChunkDir::new(tmp.path().join("entity"));
+        write_chunks(&dir, 0..16);
+
+        // Eight chunks of budget over sixteen, so the pass has a directory
+        // worth listing and chunks to give back: both halves really run.
+        let retention = retention(Some(8 * CHUNK_BYTES));
+        let reader = retention.reader(&dir, TOTAL, TARGET.into());
+        reader.note(0);
+        settled(
+            &retention,
+            "the pass reclaimed the far end of the film",
+            |_| !dir.chunk_path(15).exists(),
+        )
+        .await;
+
+        let reactor = std::thread::current().id();
+        let threads = retention.disk_threads.lock().unwrap().clone();
+        assert!(
+            threads.len() >= 2,
+            "a pass takes the listing and the unlinks to the pool as two \
+             pieces of work, and {} of them got there: {threads:?}",
+            threads.len()
+        );
+        assert!(
+            threads.iter().all(|thread| *thread != reactor),
+            "no part of a pass walks the disk on the reactor: {threads:?} \
+             against {reactor:?}"
+        );
+        drop(reader);
+    }
+
+    /// **A pass in flight is the cache moving, at every point of it.**
+    ///
+    /// `ServerHandle::proxy_cache_settled` is how anything outside this
+    /// process's own paths asks whether the cache has stopped, and it is a
+    /// wait on `proxy_cache::DiskWork` having nothing in it. A pass takes a
+    /// ticket for the whole of itself, so a pass that has read the
+    /// playheads, or listed the directory, or decided what to reclaim and
+    /// not yet unlinked it, all count as work in flight.
+    ///
+    /// Counted only round the `spawn_blocking` calls inside a pass, the
+    /// count would fall to nothing at exactly the moments a pass is deciding
+    /// what to delete -- and a test that waited for it would then look at a
+    /// directory that is about to lose files, which is the flakiness the
+    /// seam was added to end rather than a wait on a condition. The hook is
+    /// the one place a test can stand between two steps of a pass, so it is
+    /// where this is asked from.
+    #[tokio::test]
+    async fn a_pass_is_still_disk_work_between_the_listing_and_the_unlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = ChunkDir::new(tmp.path().join("entity"));
+        write_chunks(&dir, 0..16);
+
+        let retention = retention(Some(8 * CHUNK_BYTES));
+        let reader = retention.reader(&dir, TOTAL, TARGET.into());
+
+        // What the count said at each point of a pass that is not one of
+        // its two calls to the disk.
+        let seen: Arc<Mutex<Vec<bool>>> = Arc::default();
+        let watcher = Arc::downgrade(&retention);
+        let into_hook = seen.clone();
+        *retention.interleave.lock().unwrap() = Some(Arc::new(move || {
+            let Some(retention) = watcher.upgrade() else {
+                return;
+            };
+            into_hook
+                .lock()
+                .expect("what the count said")
+                .push(retention.work.idle());
+        }));
+
+        reader.note(0);
+        settled(
+            &retention,
+            "the pass reclaimed the far end of the film",
+            |_| !dir.chunk_path(15).exists(),
+        )
+        .await;
+
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            !seen.is_empty(),
+            "the note really did start a pass to be inside"
+        );
+        assert!(
+            seen.iter().all(|idle| !idle),
+            "a pass between two of its steps is still work the cache has not \
+             finished, and the count said it was idle at {} of {} of them",
+            seen.iter().filter(|idle| **idle).count(),
+            seen.len()
         );
         drop(reader);
     }
