@@ -412,7 +412,24 @@ pub(crate) async fn advance<H: TorrentHandle>(
     retention: &mut FileRetention,
     offset_in_file: u64,
 ) -> RetentionPass {
-    let held = store.held(info_hash);
+    // Off the reactor: `held` lists one directory per thousand pieces, and
+    // this pass holds `Engine::announce` for the whole of itself -- the lock
+    // the stream-open path takes too. Blocking the reactor thread here
+    // therefore stalls request handling as well as the pass, and the lock is
+    // held across this either way, so nothing about what the pass excludes
+    // moves: what leaves the reactor is the waiting, not the exclusion.
+    //
+    // A pool that will not answer -- shutting down, or the task panicked --
+    // is a pass that measured nothing, so it commits nothing and reclaims
+    // nothing rather than acting on a listing it does not have.
+    let held = {
+        let store = store.clone();
+        let info_hash = info_hash.to_string();
+        match tokio::task::spawn_blocking(move || store.held(&info_hash)).await {
+            Ok(held) => held,
+            Err(_) => return RetentionPass::default(),
+        }
+    };
     let playhead = retention.playhead(offset_in_file);
     let decision = retention.policy.advance(playhead, &held);
 
@@ -522,10 +539,11 @@ pub(crate) async fn release<H: TorrentHandle>(
         .drop_pieces(pieces.clone(), AfterRelease::LeaveDropped)
         .await
     {
-        Ok(Some(dropped)) => take_claimed(store, info_hash, dropped),
+        Ok(Some(dropped)) => take_claimed(store, info_hash, dropped).await,
         // A backend with no have-set of its own for the deletion to
-        // disagree with: there is nothing to interlock against.
-        Ok(None) => store.delete_pieces(info_hash, pieces),
+        // disagree with: there is nothing to interlock against, so there is
+        // no claim to hold -- and the same unlink, done the same way.
+        Ok(None) => unlink(store, info_hash, pieces.collect(), None).await,
         // It still believes it has them, so they are not ours to take:
         // unlinking here is exactly the advertise-then-serve-a-hole this
         // whole path exists to prevent.
@@ -565,15 +583,55 @@ pub(crate) async fn release<H: TorrentHandle>(
 /// abandoning the rest of the run: every piece in it has had its have-bit
 /// cleared already, and the claim that would let a caller retry is released
 /// on the way out of here.
-pub(crate) fn take_claimed(
+pub(crate) async fn take_claimed(
     store: &StoreRoot,
     info_hash: &str,
     dropped: crate::backend::DroppedFilePieces,
 ) -> usize {
-    let freed = store.delete_pieces(info_hash, dropped.pieces().iter().copied());
-    // Released only now that the bytes are gone.
-    drop(dropped);
-    freed
+    let pieces = dropped.pieces().to_vec();
+    unlink(store, info_hash, pieces, Some(dropped)).await
+}
+
+/// The unlink itself, off the reactor, with the claim -- where there is one
+/// -- held across it and released on the far side.
+///
+/// **Off the reactor** because this is one `unlink` per piece on the flash
+/// of a television, and every caller is holding a lock something else wants
+/// while it waits: the retention pass holds `Engine::announce`, which the
+/// stream-open path takes, and so does the unpin's delete.
+///
+/// **The claim travels with the work rather than staying behind.** It is
+/// what keeps the unlink ordered against the have-set, so it has to outlive
+/// the deletion and not merely the call that started it; moved here it is
+/// released on the blocking thread once the bytes are gone, which is the
+/// order [`take_claimed`] exists to impose. A caller that stops awaiting
+/// does not disturb that: a blocking task already started is not cancelled,
+/// so the deletion finishes and the claim goes with it.
+///
+/// Both doors come through here so that the move off the reactor is written
+/// once. The claimed one is the door every reclaim of a live torrent takes
+/// and is what the tests exercise; the claimless one is for a backend that
+/// keeps no have-set, which nothing in this workspace is.
+async fn unlink(
+    store: &StoreRoot,
+    info_hash: &str,
+    pieces: Vec<u32>,
+    claim: Option<crate::backend::DroppedFilePieces>,
+) -> usize {
+    let store = store.clone();
+    let hash = info_hash.to_string();
+    tokio::task::spawn_blocking(move || {
+        let freed = store.delete_pieces(&hash, pieces);
+        // Released only now that the bytes are gone.
+        drop(claim);
+        freed
+    })
+    .await
+    // The pool would not answer, so this process cannot say what left the
+    // disk. Zero is the answer that claims nothing: `ENOSPC` recovery reads
+    // this number to decide whether a pass made room, and a number invented
+    // here restarts torrents onto a disk that may have gained nothing.
+    .unwrap_or(0)
 }
 
 /// Scattered piece indices as the fewest contiguous ranges that cover them.

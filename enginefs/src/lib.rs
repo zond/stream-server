@@ -3599,6 +3599,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 // there, once the bytes are gone.
                 Some(claim) => {
                     crate::retention::take_claimed(&self.piece_store(), &engine.info_hash, claim)
+                        .await
                 }
                 // No claim, so no list of pieces to take and no right to
                 // take them: the backend still believes it has them.
@@ -4323,6 +4324,23 @@ mod tests {
 
     const TEST_HASH: &str = "0123456789abcdef0123456789abcdef01234567";
 
+    /// The claim the fake's `drop_pieces` hands out, which records the
+    /// thread that released it.
+    ///
+    /// Nothing about the claim's *meaning* changes: it is opaque to
+    /// everything above the backend, it is held across the deletion, and
+    /// dropping it is what ends the release. What it adds is a witness --
+    /// the thread the bytes really went on.
+    struct ClaimProbe {
+        released_on: Arc<Mutex<Option<std::thread::ThreadId>>>,
+    }
+
+    impl Drop for ClaimProbe {
+        fn drop(&mut self) {
+            *self.released_on.lock().unwrap() = Some(std::thread::current().id());
+        }
+    }
+
     #[derive(Default)]
     struct FakeCounters {
         clear_file_streaming: AtomicUsize,
@@ -4378,6 +4396,16 @@ mod tests {
                 tokio::sync::oneshot::Receiver<()>,
             )>,
         >,
+        /// Which thread released the claim `drop_pieces` handed out, and
+        /// `None` until one has been released.
+        ///
+        /// The claim is what orders the unlink against the have-set, so it
+        /// has to outlive the deletion: whichever thread drops it is the
+        /// thread the piece files were unlinked on. A retention pass runs
+        /// under `Engine::announce` and must not do that unlinking on the
+        /// reactor, and this is the only thing a test can read it off --
+        /// see `the_pass_unlinks_a_reclaimed_piece_off_the_reactor`.
+        claim_released_on: Arc<Mutex<Option<std::thread::ThreadId>>>,
         /// The fake handle's own pin set (what the real backend keeps in its
         /// `PinnedFiles` map), reported through `stats()`.
         pinned: Mutex<std::collections::BTreeSet<usize>>,
@@ -4884,7 +4912,12 @@ mod tests {
             } else {
                 self.counters.drops_pieces.lock().unwrap().clone()
             };
-            Ok(Some(crate::backend::DroppedFilePieces::new(dropped, ())))
+            Ok(Some(crate::backend::DroppedFilePieces::new(
+                dropped,
+                ClaimProbe {
+                    released_on: self.counters.claim_released_on.clone(),
+                },
+            )))
         }
 
         /// Like the real backend: the folder the backend says it writes to
@@ -10211,6 +10244,101 @@ mod tests {
             .await
             .expect("the pass task")
             .expect("a pass ran to the end");
+    }
+
+    /// A retention pass walks the torrent's piece directories, and it does
+    /// that walk while holding `Engine::announce` -- the lock the
+    /// stream-open path takes to hold a new file's window back. Doing the
+    /// walk on the reactor thread therefore stops request handling for as
+    /// long as the disk takes to answer, which on the flash of a television
+    /// is not a bounded time.
+    ///
+    /// The pass here has nothing else to do: the store is empty, so the
+    /// policy commits nothing, withdraws nothing and reclaims nothing, and
+    /// the listing is the only thing in it. On the single-threaded runtime
+    /// a `#[tokio::test]` runs on, a task queued before the pass can only
+    /// have run if the pass gave the runtime back -- which is the whole of
+    /// the claim.
+    #[tokio::test]
+    async fn a_retention_pass_hands_the_runtime_back_while_it_walks_the_disk() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        // Two pieces of budget over a four-piece file: a split, so a policy
+        // is installed and a pass has something to ask.
+        enginefs.set_cache_budget(Some(50));
+        let store = enginefs.piece_store();
+        engine.note_playhead(0, 0);
+        engine.begin_retention(0).await;
+
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let queued = tokio::spawn({
+            let ran = ran.clone();
+            async move { ran.store(true, Ordering::SeqCst) }
+        });
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "the task is queued and nothing has yielded to it yet"
+        );
+
+        let pass = engine.retain(&store).await.expect("a pass ran");
+        assert_eq!(
+            pass,
+            crate::retention::RetentionPass::default(),
+            "an empty store leaves the pass nothing to do but list it"
+        );
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "the listing left the reactor, so the runtime ran the queued task \
+             while the pass was walking the disk"
+        );
+        queued.await.expect("the queued task");
+    }
+
+    /// And the other half of a pass that is not the reactor's to do: the
+    /// unlinks.
+    ///
+    /// A reclaim is one `unlink` per piece, and the claim the backend hands
+    /// back has to outlive them -- it is what stops a stream downloading a
+    /// piece back into the range being deleted -- so whichever thread
+    /// releases the claim is the thread the bytes went on. The pass holds
+    /// `Engine::announce` throughout, so doing that work on the reactor
+    /// stops request handling for as long as the volume takes.
+    ///
+    /// A `#[tokio::test]` drives its runtime on the test's own thread, so
+    /// "the reactor" here is a thread identity and not a timing.
+    #[tokio::test]
+    async fn the_pass_unlinks_a_reclaimed_piece_off_the_reactor() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+
+        // All four pieces on the disk with the playhead at the start, so
+        // the two at the far end are outside the window and are the pass's
+        // to give back.
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in [0u32, 1, 2, 3] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+
+        let store = enginefs.piece_store();
+        engine.note_playhead(0, 0);
+        engine.begin_retention(0).await;
+        let pass = engine.retain(&store).await.expect("a pass ran");
+        assert!(pass.reclaimed > 0, "the pass gave pieces back: {pass:?}");
+
+        let released_on = *counters.claim_released_on.lock().unwrap();
+        let released_on = released_on.expect("the pass took the claim it was handed");
+        assert_ne!(
+            released_on,
+            std::thread::current().id(),
+            "the unlinks the claim covers did not run on the reactor"
+        );
     }
 
     /// **Every absence here is a real one, and none of them is a zero.**
