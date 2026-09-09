@@ -206,33 +206,62 @@ fn available_space(path: &std::path::Path) -> Option<u64> {
     }
 }
 
+/// How many rings of the doorbell below may be in flight before the rest are
+/// dropped. Anything above one is slack, not capacity: see [`ring_doorbell`].
+const DOORBELL_DEPTH: usize = 100;
+
+/// What the filesystem watcher does with an event: ring the cleaner's
+/// doorbell, once, for anything that changed the cache.
+///
+/// **It must never block, whatever the doorbell's state.** This runs on
+/// notify's own event-loop thread, and that is the thread
+/// [`Watcher::watch`] hands a registration to and then waits for an answer
+/// from. The cleaner calls `watch` from inside its `select!` -- to re-arm a
+/// watch that was lost -- so blocking here on a full channel stops both
+/// sides at once: the event-loop thread waits for the cleaner to drain the
+/// doorbell, the cleaner waits for the event-loop thread to acknowledge a
+/// watch, and neither is ever going to move. The runtime worker the cleaner
+/// was polled on is then held for the life of the process, which is a
+/// server that never finishes shutting down (dropping the runtime waits its
+/// blocking pool out) and, long before that, a cache limit nothing enforces
+/// any more. A hundred piece files written into a fresh cache is enough to
+/// fill the channel and reach it.
+///
+/// Dropping the ring is the right answer and not a compromise: this is a
+/// doorbell, not a queue. Every message on it says the same thing --
+/// something under the cache changed -- and the receiver coalesces the lot
+/// into one debounced pass ([`CleanSchedule`]). A channel already holding
+/// [`DOORBELL_DEPTH`] of them is carrying that message a hundred times over,
+/// so the hundred-and-first adds nothing a pass would do differently.
+fn ring_doorbell(doorbell: &mpsc::Sender<()>, res: Result<Event, notify::Error>) {
+    match res {
+        Ok(event) => {
+            // Filter interesting events
+            if matches!(
+                event.kind,
+                notify::EventKind::Create(_)
+                    | notify::EventKind::Modify(_)
+                    | notify::EventKind::Remove(_)
+            ) {
+                let _ = doorbell.try_send(());
+            }
+        }
+        Err(e) => error!("Watch error: {:?}", e),
+    }
+}
+
 pub fn start(state: Arc<AppState>) -> JoinHandle<()> {
     tokio::spawn(async move {
         debug!("Cache cleaner started");
 
         // Channel for file system events
-        let (tx, mut rx) = mpsc::channel::<()>(100);
+        let (tx, mut rx) = mpsc::channel::<()>(DOORBELL_DEPTH);
 
         // Setup Watcher
         // We use a sync watcher bridge to async channel
         let tx_clone = tx.clone();
         let mut watcher = match RecommendedWatcher::new(
-            move |res: Result<Event, notify::Error>| {
-                match res {
-                    Ok(event) => {
-                        // Filter interesting events
-                        if matches!(
-                            event.kind,
-                            notify::EventKind::Create(_)
-                                | notify::EventKind::Modify(_)
-                                | notify::EventKind::Remove(_)
-                        ) {
-                            let _ = tx_clone.blocking_send(());
-                        }
-                    }
-                    Err(e) => error!("Watch error: {:?}", e),
-                }
-            },
+            move |res: Result<Event, notify::Error>| ring_doorbell(&tx_clone, res),
             notify::Config::default(),
         ) {
             Ok(w) => w,
@@ -1484,13 +1513,15 @@ async fn remove_empty_parents(mut dir: &std::path::Path, keep: &std::path::Path)
 #[cfg(test)]
 mod tests {
     use super::{
-        CACHE_FREE_SPACE_FLOOR, CacheLimit, CleanSchedule, DiskFullRecovery, EvictionReport,
+        CACHE_FREE_SPACE_FLOOR, CacheLimit, CleanSchedule, DiskFullRecovery, Event, EvictionReport,
         LastEviction, WALKED_ON_THIS_THREAD, WalkInputs, available_space, evict,
-        is_session_artifact, occupied_bytes, remove_empty_parents, scan_usage,
+        is_session_artifact, mpsc, occupied_bytes, remove_empty_parents, ring_doorbell, scan_usage,
     };
     use enginefs::piece_store::{FileSpec, PieceLayout, PieceStore, StoreRoot};
     use enginefs::retention::ReclaimGate;
     use futures_util::future::BoxFuture;
+    use notify::EventKind;
+    use notify::event::CreateKind;
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -2785,6 +2816,60 @@ mod tests {
         }
         schedule.on_clean();
         assert!(schedule.on_event(), "and the next event arms a fresh one");
+    }
+
+    /// **A ring the cleaner has no room for is dropped, not waited on.**
+    ///
+    /// The handler runs on notify's event-loop thread, and that is the
+    /// thread `Watcher::watch` posts a registration to and then waits for
+    /// an answer from -- while the cleaner, the doorbell's only reader,
+    /// calls `watch` from inside its own `select!` to re-arm a lost watch.
+    /// So a handler that parks on a full doorbell parks the cleaner with
+    /// it, for the life of the process: the cache limit stops being
+    /// enforced, and the runtime worker the cleaner was polled on is never
+    /// given back, so dropping the server's runtime -- which waits its
+    /// blocking pool out -- never finishes and `ServerHandle::join` never
+    /// returns. Seeding a hundred piece files into a fresh cache is enough
+    /// to fill the doorbell, which is an ordinary torrent.
+    #[test]
+    fn a_doorbell_nobody_is_answering_is_rung_past_rather_than_waited_on() {
+        /// A bound so a regression fails instead of hanging the suite, not
+        /// a timing assertion: what it waits for is one non-blocking send.
+        const HANDLER_BOUND: Duration = Duration::from_secs(30);
+
+        // A doorbell with a ring already on it and nothing draining it.
+        // The receiver stays alive, so a send finds the channel full rather
+        // than closed -- closed is the easy case and not the one that hung.
+        let (doorbell, _cleaner) = mpsc::channel::<()>(1);
+        doorbell.try_send(()).expect("the doorbell starts empty");
+
+        let (rang, answered) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("notify-event-loop".to_string())
+            .spawn(move || {
+                ring_doorbell(
+                    &doorbell,
+                    Ok(Event::new(EventKind::Create(CreateKind::File))),
+                );
+                let _ = rang.send(());
+            })
+            .expect("a thread to stand in for notify's event loop");
+        answered.recv_timeout(HANDLER_BOUND).expect(
+            "the handler must come back from a full doorbell; parking on it deadlocks the \
+             cleaner against the watcher thread and hangs the server's shutdown for ever",
+        );
+
+        // And it is a real ring wherever there is room for one, or a cache
+        // being written to would never reach the cleaner at all.
+        let (doorbell, mut cleaner) = mpsc::channel::<()>(1);
+        ring_doorbell(
+            &doorbell,
+            Ok(Event::new(EventKind::Create(CreateKind::File))),
+        );
+        assert!(
+            cleaner.try_recv().is_ok(),
+            "a piece file appearing under the cache rings the cleaner"
+        );
     }
 
     #[test]
