@@ -439,18 +439,33 @@ impl ProxyRetention {
             .into_iter()
             .filter_map(|index| u32::try_from(index).ok())
             .collect();
-        // **The playheads again, now that the disk has been listed.** A
-        // window is where playback is against what is on the disk, and the
-        // two halves of that have to be readings of the same moment: the
-        // listing is the slow half, and a fill relaying at twenty megabytes
-        // a second writes a whole window's worth of chunks while it runs. A
-        // window taken before it therefore sat a window *behind* the chunks
-        // the listing found -- so the pass reclaimed the read-ahead the fill
-        // had just written, and the next pass, at the playhead that had by
-        // then caught up with it, reclaimed everything left behind it. Two
-        // passes, and between them a cache with nothing in it: measured
-        // here, a sixteen-megabyte read left an empty directory under an
+        // **The playheads again, now that the disk has been listed.**
+        //
+        // The listing and the playheads are not one reading of one moment
+        // and cannot be: the listing is the slow half, and a fill relaying
+        // at twenty megabytes a second writes a whole window's worth of
+        // chunks while it runs. What the order buys is the direction of the
+        // skew. Read after the listing, the playheads are the newer half, so
+        // a window may name chunks the listing did not find -- which unlinks
+        // nothing, because only what the listing found is a candidate. Read
+        // before it, the window sat a window *behind* the chunks the listing
+        // found, so the pass reclaimed the read-ahead the fill had just
+        // written, and the next pass, at the playhead that had by then caught
+        // up with it, reclaimed everything left behind it. Two passes, and
+        // between them a cache with nothing in it: measured here, a
+        // sixteen-megabyte read left an empty directory under an
         // eight-megabyte budget.
+        //
+        // So the invariant this pass really keeps, and the reason nobody
+        // should put the two halves back the other way round, is about each
+        // chunk it unlinks rather than about a moment. Every one of them was
+        // on the disk when the listing ran; was outside every window and
+        // every promise of the readers live *after* the listing, which is
+        // what the reading below and the windows built from it are; and was
+        // outside every live reader's window and promise again at the
+        // instant of the unlink, which is what `is_inside_now` asks at the
+        // door. A chunk that was written, or read, or promised after any one
+        // of those is simply not taken.
         let (at, others, promised) = self.heads(key, id).unwrap_or((at, others, promised));
         let at = (at / CHUNK_BYTES).min(last);
         let decision = policy.advance(at as u32, &held);
