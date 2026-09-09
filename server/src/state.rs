@@ -59,6 +59,10 @@ pub struct AppState {
     /// `cache_cleaner::LastEviction`), for the memory sampler to log the
     /// cache's size from rather than walking the tree itself.
     pub last_eviction: Arc<crate::cache_cleaner::LastEviction>,
+    /// Which cache pass's reading of the volume is the newest, so an older
+    /// one that finished later does not publish its cap over it (see
+    /// `cache_cleaner::CachePasses`).
+    pub cache_passes: Arc<crate::cache_cleaner::CachePasses>,
 }
 
 impl AppState {
@@ -122,6 +126,7 @@ impl AppState {
             https,
             traffic_window: Arc::new(enginefs::traffic::TrafficWindow::new()),
             last_eviction: Arc::default(),
+            cache_passes: Arc::default(),
         }
     }
 

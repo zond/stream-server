@@ -601,6 +601,9 @@ async fn clean_cache_with_headroom(
     state: &AppState,
     headroom: u64,
 ) -> anyhow::Result<EvictionReport> {
+    // Before the settings and the volume are read, which is what this
+    // numbers: see [`CachePasses`].
+    let pass = state.cache_passes.begin();
     let roots = cache_roots(state).await;
     // A root that does not exist yet has nothing to walk, but its cap is
     // still what this run enforced.
@@ -638,9 +641,70 @@ async fn clean_cache_with_headroom(
     // sized against -- one number, computed once, by the layer that owns
     // "how much room is there". A policy that recomputed it would have the
     // two evicting against different limits.
-    state.engine.set_cache_budget(report.limit);
-    state.last_eviction.record(&report);
+    //
+    // Unless a newer pass has already published its own, which is what
+    // [`CachePasses`] is here to notice.
+    if state.cache_passes.is_the_newest(pass) {
+        state.engine.set_cache_budget(report.limit);
+        state.last_eviction.record(&report);
+    }
     Ok(report)
+}
+
+/// Which pass's reading of the volume is the newest.
+///
+/// Passes overlap. The sweep every launch takes runs while the first
+/// request is being served, a writer arms a debounced one, a client asks
+/// for one over `POST /cache/clean`, a stopped torrent rings one -- and the
+/// pass that finishes last is not the pass that started last, because a
+/// walk of sixteen thousand files takes as long as it takes and `cacheSize`
+/// can be changed while it runs.
+///
+/// Whoever finished last used to publish, so a pass that had read the cap
+/// before it was lowered could put the old number back over the new one.
+/// What that costs is not a slightly wrong cap: the retention policy is
+/// sized from this number, and a budget that covers the entity installs no
+/// policy at all ([`crate::proxy_retention`]), so a proxied stream measured
+/// against a stale ten gigabytes is not bounded by a window at all -- every
+/// chunk of it stays on the disk until the next pass republishes, which on
+/// a cache nothing is writing to is an hour away.
+///
+/// So a pass takes a number before it reads the volume and publishes only
+/// while nothing newer has: an older reading is dropped rather than
+/// overwriting a newer one. Its eviction still happened -- deleting what
+/// was over a cap that has since risen costs a refetch and nothing else --
+/// and it is only the *reading* that is stale.
+#[derive(Default)]
+pub struct CachePasses {
+    /// Numbers handed out, in the order passes started reading.
+    started: std::sync::atomic::AtomicU64,
+    /// The newest one that has published, so an older one can tell that it
+    /// has been overtaken.
+    published: std::sync::atomic::AtomicU64,
+}
+
+/// One pass's place in the order they started reading the volume in.
+#[derive(Clone, Copy, Debug)]
+pub struct CachePass(u64);
+
+impl CachePasses {
+    /// Number a pass that is about to read the volume.
+    pub fn begin(&self) -> CachePass {
+        CachePass(
+            self.started
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1,
+        )
+    }
+
+    /// Whether `pass` is still the newest reading anything has taken -- and
+    /// if it is, claim the publication for it, so a pass that started
+    /// earlier and finishes later cannot take it back.
+    pub fn is_the_newest(&self, pass: CachePass) -> bool {
+        self.published
+            .fetch_max(pass.0, std::sync::atomic::Ordering::Relaxed)
+            < pass.0
+    }
 }
 
 /// The report of the last pass, kept for a reader that wants to know what
@@ -1513,8 +1577,8 @@ async fn remove_empty_parents(mut dir: &std::path::Path, keep: &std::path::Path)
 #[cfg(test)]
 mod tests {
     use super::{
-        CACHE_FREE_SPACE_FLOOR, CacheLimit, CleanSchedule, DiskFullRecovery, Event, EvictionReport,
-        LastEviction, WALKED_ON_THIS_THREAD, WalkInputs, available_space, evict,
+        CACHE_FREE_SPACE_FLOOR, CacheLimit, CachePasses, CleanSchedule, DiskFullRecovery, Event,
+        EvictionReport, LastEviction, WALKED_ON_THIS_THREAD, WalkInputs, available_space, evict,
         is_session_artifact, mpsc, occupied_bytes, remove_empty_parents, ring_doorbell, scan_usage,
     };
     use enginefs::piece_store::{FileSpec, PieceLayout, PieceStore, StoreRoot};
@@ -2797,6 +2861,40 @@ mod tests {
         assert!(
             message.contains(&format!("{protected_bytes} bytes in 2 files are protected")),
             "{message}"
+        );
+    }
+
+    /// **The cap that stands is the newest reading of the volume, not the
+    /// last pass to finish.**
+    ///
+    /// Passes overlap -- the sweep every launch takes runs while the first
+    /// request is being served, and `cacheSize` can be lowered while a walk
+    /// of sixteen thousand files is still going. The pass that finished
+    /// last used to publish, so the launch sweep's ten gigabytes could land
+    /// on top of the eight megabytes a client had just asked for. The
+    /// retention policy is sized from that number and installs no policy at
+    /// all for a budget that covers the entity, so what the stale cap cost
+    /// was not a slightly wrong bound but no bound: every chunk of every
+    /// proxied stream stayed on the disk until something wrote to the cache
+    /// and armed the next pass.
+    #[test]
+    fn a_pass_that_finishes_late_does_not_publish_its_cap_over_a_newer_one() {
+        let passes = CachePasses::default();
+        let launch = passes.begin();
+        let asked_for = passes.begin();
+        assert!(
+            passes.is_the_newest(asked_for),
+            "the newer reading is the one to publish"
+        );
+        assert!(
+            !passes.is_the_newest(launch),
+            "and the older one, finishing after it, is not"
+        );
+        let next = passes.begin();
+        assert!(
+            passes.is_the_newest(next),
+            "while the pass after both of them reads the volume again, and \
+             publishes"
         );
     }
 
