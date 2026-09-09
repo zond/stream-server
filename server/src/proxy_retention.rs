@@ -180,6 +180,20 @@ pub struct ProxyRetention {
     /// wrap without meaning anything: a process would have to open
     /// eighteen quintillion bodies for two live ones to collide.
     next_reader: AtomicU64,
+    /// The one place a test can be *inside* a pass.
+    ///
+    /// A pass reads the playheads, lists the entity's directories and
+    /// unlinks what no window covers, and what this exists to pin happens
+    /// between those: playback moving on while the listing runs, a seek
+    /// framing a body over the run being walked. A pass is one call on the
+    /// blocking pool, so nothing outside can get in there --
+    /// `a_budget_published_while_a_pass_was_running_is_the_one_that_holds`
+    /// drives the two halves of a pass by hand for the same reason, which
+    /// is not open to a test about the middle of one.
+    ///
+    /// The shipped build has neither this nor the two calls to it.
+    #[cfg(test)]
+    interleave: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// The passes below while they are on the blocking pool, counted beside
     /// the cache's chunk writes: `crate::proxy_cache::DiskWork`. A pass is
     /// spawned and never joined, so it is the other half of what makes a
@@ -320,6 +334,8 @@ impl ProxyRetention {
             budget,
             streams: Mutex::new(HashMap::new()),
             next_reader: AtomicU64::new(0),
+            #[cfg(test)]
+            interleave: Mutex::new(None),
             work,
         }
     }
@@ -362,7 +378,9 @@ impl ProxyRetention {
             promised,
         } = begin;
         let last = (total - 1) / CHUNK_BYTES;
-        let at = (at / CHUNK_BYTES).min(last);
+        // Where a test puts what playback does while the listing below runs.
+        #[cfg(test)]
+        self.interleave();
         // A chunk index too big for the policy's index space is one the
         // policy was never built over -- see `LiveStream::decide`, which
         // refuses to build one at all in that case -- so this cannot narrow
@@ -372,6 +390,20 @@ impl ProxyRetention {
             .into_iter()
             .filter_map(|index| u32::try_from(index).ok())
             .collect();
+        // **The playheads again, now that the disk has been listed.** A
+        // window is where playback is against what is on the disk, and the
+        // two halves of that have to be readings of the same moment: the
+        // listing is the slow half, and a fill relaying at twenty megabytes
+        // a second writes a whole window's worth of chunks while it runs. A
+        // window taken before it therefore sat a window *behind* the chunks
+        // the listing found -- so the pass reclaimed the read-ahead the fill
+        // had just written, and the next pass, at the playhead that had by
+        // then caught up with it, reclaimed everything left behind it. Two
+        // passes, and between them a cache with nothing in it: measured
+        // here, a sixteen-megabyte read left an empty directory under an
+        // eight-megabyte budget.
+        let (at, others, promised) = self.heads(key, id).unwrap_or((at, others, promised));
+        let at = (at / CHUNK_BYTES).min(last);
         let decision = policy.advance(at as u32, &held);
         // One window per live playhead. The policy answers for one playhead
         // at a time -- that is what a window is about -- and an entity two
@@ -385,6 +417,9 @@ impl ProxyRetention {
             windows.push(span(policy.window_at(other as u32)));
         }
         let mut freed = 0usize;
+        // And what it does while the unlinks below run.
+        #[cfg(test)]
+        self.interleave();
         for index in &decision.reclaim {
             let index = u64::from(*index);
             if windows.iter().any(|window| window.contains(&index)) {
@@ -395,6 +430,20 @@ impl ProxyRetention {
             // librqbit makes for a torrent's reader, in the one place a
             // proxied read can make it for itself.
             if promised.iter().any(|range| range.contains(&index)) {
+                continue;
+            }
+            // And the third asking, at the door. Everything above is a
+            // reading, and the unlinks below take as long as they take --
+            // one `unlink` per chunk of a window, on the flash of a
+            // television -- while playback goes on delivering bytes and a
+            // seek can frame a whole new body over the run this pass is
+            // walking. This is the same refusal the cleaner's own delete
+            // makes (`still_free`, the sibling of this one) and it is made
+            // for the same reason: a chunk somebody is inside costs the
+            // player a broken read and the origin the same fetch again,
+            // while a chunk left standing costs a few bytes until the next
+            // pass.
+            if self.is_inside_now(key, index, &policy, last) {
                 continue;
             }
             // The chunk store's own delete is `pub(crate)` to `enginefs` --
@@ -418,6 +467,20 @@ impl ProxyRetention {
             );
         }
         self.finish(key, id, policy, budget, windows, at);
+    }
+
+    /// Run the interleaving a test installed, outside the lock that holds
+    /// it, so the closure may take any lock this module has.
+    #[cfg(test)]
+    fn interleave(&self) {
+        let hook = self
+            .interleave
+            .lock()
+            .ok()
+            .and_then(|hook| hook.as_ref().cloned());
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     /// Put a pass for `id` on the blocking pool.
@@ -444,33 +507,11 @@ impl ProxyRetention {
             stream.running = false;
             return None;
         };
-        let at = stream
-            .readers
-            .get(&id)
-            .and_then(|reader| reader.playhead)
-            // The read that asked for this pass has ended in the meantime.
-            // Where it got to is still the last thing that happened to this
-            // entity, and the window belongs round there for the grace: a
-            // player between two requests is the ordinary way for a reader
-            // to be gone.
-            .or(stream.last_playhead);
-        let Some(at) = at else {
+        let Some((at, others, promised)) = stream.heads(id) else {
             stream.policy = Some(policy);
             stream.running = false;
             return None;
         };
-        let others = stream
-            .readers
-            .iter()
-            .filter(|(other, _)| **other != id)
-            .filter_map(|(_, reader)| reader.playhead)
-            .collect();
-        let promised = stream
-            .readers
-            .values()
-            .map(|reader| reader.promised.clone())
-            .filter(|range| !range.is_empty())
-            .collect();
         Some(Begin {
             dir: stream.dir.clone(),
             policy,
@@ -480,6 +521,48 @@ impl ProxyRetention {
             others,
             promised,
         })
+    }
+
+    /// Where every reader of this entity is now, and what open bodies have
+    /// been framed to deliver -- the same reading [`Self::begin`] takes,
+    /// taken again after the listing. `None` when the entity is gone or
+    /// nothing has a playhead in it.
+    fn heads(&self, key: &Path, id: u64) -> Option<(u64, Vec<u64>, Vec<Range<u64>>)> {
+        self.streams.lock().ok()?.get(key)?.heads(id)
+    }
+
+    /// Whether some live reader's window or promise covers `index` at this
+    /// instant, asked with the policy this pass has out of its slot.
+    ///
+    /// Every live reader's playhead gets its window and every open body its
+    /// promise. What is *not* asked about again is the entity's last
+    /// delivered byte: a pass whose own reader has ended is already holding
+    /// the window round that, in the `windows` the decision built, and this
+    /// is only ever asked about a chunk those have already released.
+    fn is_inside_now(&self, key: &Path, index: u64, policy: &RetentionPolicy, last: u64) -> bool {
+        let Ok(streams) = self.streams.lock() else {
+            // Nothing can be said about what is being read, so nothing is
+            // taken: the direction this leans in everywhere.
+            return true;
+        };
+        let Some(stream) = streams.get(key) else {
+            return false;
+        };
+        if stream
+            .readers
+            .values()
+            .any(|reader| reader.promised.contains(&index))
+        {
+            return true;
+        }
+        stream
+            .readers
+            .values()
+            .filter_map(|reader| reader.playhead)
+            .any(|head| {
+                let head = (head / CHUNK_BYTES).min(last);
+                span(policy.window_at(head as u32)).contains(&index)
+            })
     }
 
     /// The locked half after one: the policy back in its slot, the windows
@@ -770,6 +853,37 @@ impl LiveStream {
             stride: 1,
             running: false,
         }
+    }
+
+    /// Where every reader of this entity is, and what their open bodies
+    /// have been framed to deliver.
+    ///
+    /// The playhead the pass is *about* is `id`'s, and it falls back to the
+    /// entity's last delivered byte: the read that asked for the pass can
+    /// have ended in the meantime, and where it got to is still the last
+    /// thing that happened here -- the window belongs round there for the
+    /// grace, because a player between two requests is the ordinary way for
+    /// a reader to be gone. `None` when nothing has ever delivered a byte
+    /// of this entity, which is a stream with no playhead and so no window.
+    fn heads(&self, id: u64) -> Option<(u64, Vec<u64>, Vec<Range<u64>>)> {
+        let at = self
+            .readers
+            .get(&id)
+            .and_then(|reader| reader.playhead)
+            .or(self.last_playhead)?;
+        let others = self
+            .readers
+            .iter()
+            .filter(|(other, _)| **other != id)
+            .filter_map(|(_, reader)| reader.playhead)
+            .collect();
+        let promised = self
+            .readers
+            .values()
+            .map(|reader| reader.promised.clone())
+            .filter(|range| !range.is_empty())
+            .collect();
+        Some((at, others, promised))
     }
 
     /// Whether the pass that just measured chunk `at` swallowed the trigger
@@ -1409,6 +1523,93 @@ mod tests {
             "a cap nobody has published is not a cap to evict against: {:?}",
             dir.held()
         );
+    }
+
+    /// **A pass reclaims against where playback is, not where it was when
+    /// the pass began.**
+    ///
+    /// A pass reads the playheads, lists the entity's directories and
+    /// unlinks; the listing is the slow half, and a fill relaying at twenty
+    /// megabytes a second writes a whole window of chunks while it runs. A
+    /// window read before the listing therefore sat a window *behind* what
+    /// the listing found, so the pass reclaimed the read-ahead the fill had
+    /// just written -- and the next pass, at the playhead that had by then
+    /// caught up with it, reclaimed everything left behind. Two passes and
+    /// an empty cache: measured on a loaded machine, a sixteen-megabyte
+    /// read left nothing at all on the disk under an eight-megabyte budget,
+    /// and the panel then showed a window of zero bytes for a film that had
+    /// just been played.
+    ///
+    /// So the playheads are read after the listing, and asked about again
+    /// at each unlink -- the same second asking the cleaner's own delete
+    /// makes. Playback moves here at both of those moments, which is what
+    /// says both are load-bearing: with either reading taken early, the
+    /// chunks it did not see are reclaimed, and the pass that the movement
+    /// arms then takes the rest.
+    #[tokio::test]
+    async fn a_pass_reclaims_round_where_playback_has_got_to_while_it_ran() {
+        const CHUNKS: u64 = 32;
+        const WHOLE: u64 = CHUNKS * CHUNK_BYTES;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = ChunkDir::new(tmp.path().join("entity"));
+
+        // Eight chunks of budget over thirty-two: the window is a quarter of
+        // the entity, so where it sits is the whole of what is kept.
+        let retention = retention(Some(8 * CHUNK_BYTES));
+        let reader = retention.reader(&dir, WHOLE, TARGET.into());
+        write_chunks(&dir, 0..CHUNKS);
+        reader.note(0);
+        settled(
+            &retention,
+            "the first pass ran at the head of the film",
+            |_| !dir.chunk_path(31).exists(),
+        )
+        .await;
+        // Playback fills what it passes over, as it does.
+        write_chunks(&dir, 0..CHUNKS);
+
+        // Playback while the pass below runs: at the tenth chunk when it
+        // lists the directory, at the twentieth by the time it unlinks. The
+        // playhead is moved the way a delivered byte moves it, and no pass
+        // is started for it -- `note` starts none while the policy is out of
+        // its slot, which is exactly the case this is about.
+        let moved = std::sync::atomic::AtomicU64::new(0);
+        let key = dir.path().to_path_buf();
+        let streams = Arc::downgrade(&retention);
+        *retention.interleave.lock().unwrap() = Some(Arc::new(move || {
+            let at = match moved.fetch_add(1, Ordering::Relaxed) {
+                0 => 10,
+                1 => 20,
+                // The pass this movement arms runs after those two, and
+                // playback has stopped by then.
+                _ => return,
+            };
+            let Some(retention) = streams.upgrade() else {
+                return;
+            };
+            let mut streams = retention.streams.lock().unwrap();
+            let stream = streams.get_mut(&key).expect("the entity is being read");
+            stream.last_playhead = Some(at * CHUNK_BYTES);
+            for reader in stream.readers.values_mut() {
+                reader.playhead = Some(at * CHUNK_BYTES);
+            }
+        }));
+
+        retention.pass(dir.path(), reader.id);
+        settled(
+            &retention,
+            "the pass the movement armed reclaimed round the twentieth chunk",
+            |_| !dir.chunk_path(10).exists(),
+        )
+        .await;
+
+        let held = dir.held();
+        assert_eq!(
+            held,
+            (20..28).collect::<BTreeSet<u64>>(),
+            "what is on the disk is the window round where playback got to"
+        );
+        drop(reader);
     }
 
     /// **The last byte of a body gets its pass, even though one was already
