@@ -653,15 +653,30 @@ impl ProxyRetention {
     /// directory it never read -- the same reason
     /// `enginefs::retention::unlink` reports nothing freed rather than a
     /// number it cannot vouch for. So nothing is concluded: the windows the
-    /// last pass really measured stand, `passed_at` is left where it was so
-    /// the next delivered byte is due for a pass again, and no pass is armed
-    /// off a reading that was never taken.
+    /// last pass really measured stand, `passed_at` is left where the last
+    /// pass that really measured something put it -- so a reader is due
+    /// again once it has travelled a stride from there, not on its very next
+    /// byte -- and no pass is armed off a reading that was never taken.
     ///
     /// The policy goes back only if the budget is still the one it was built
     /// for, exactly as [`Self::finish`] puts it back. `None` is the pass
     /// whose policy went down with the task that was holding it, and then
-    /// this is only the `running` slot: the next budget published here
-    /// rebuilds the policy, which is what [`LiveStream::decide`] is for.
+    /// this is only the `running` slot.
+    ///
+    /// That entity is then unbounded, and stays so until the budget's
+    /// *value* changes: [`LiveStream::decide`] runs only when `decided`
+    /// differs from what is published, and `decided` is left standing here
+    /// because a pass that concluded nothing has no business saying which
+    /// budget the entity was last measured against. Republishing the same
+    /// number -- which the minute timer does -- therefore rebuilds nothing.
+    ///
+    /// That is left alone rather than papered over, because the only way to
+    /// reach it is the blocking pool refusing a task, which is the runtime
+    /// shutting down: the process is going away and an unbounded entity
+    /// outlives it by nothing. Should this ever become reachable while the
+    /// process keeps running, clearing `decided` here is what would make the
+    /// next delivered byte rebuild the policy -- and it would need a test,
+    /// which today there is nothing to write one against.
     fn abandon(&self, key: &Path, policy: Option<RetentionPolicy>, budget: Option<CacheBudget>) {
         let Ok(mut streams) = self.streams.lock() else {
             return;
