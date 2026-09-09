@@ -702,6 +702,22 @@ impl CachePasses {
     /// The claim and the publication are one call so that there is nowhere
     /// to publish from that does not go through the order: an unguarded
     /// `set_cache_budget` beside this one is exactly the bug.
+    ///
+    /// **One call is not one operation, and this does not totally order two
+    /// publications.** Two passes numbered five and six can each win the
+    /// claim -- five takes it while `published` is nought, six takes it
+    /// while `published` is five -- and then run their closures the other
+    /// way round, so six's cap lands first and five's stale one lands over
+    /// it. What the claim removes is the *long* window: the reading used to
+    /// be published after a walk of sixteen thousand files, and the race is
+    /// now the few instructions between the `fetch_max` and the call. It is
+    /// not nothing, and the cost when it is lost is what [`CachePasses`]
+    /// describes -- a cap nobody has read the volume for, standing until the
+    /// next pass republishes. Closing it means holding the claim across the
+    /// closure under a mutex, which is a small change and an untestable one:
+    /// the interleaving is a few instructions wide, so no deterministic test
+    /// distinguishes the two. It is written down here rather than implied
+    /// away.
     pub fn publish(&self, pass: CachePass, publish: impl FnOnce()) {
         if self
             .published
@@ -715,6 +731,17 @@ impl CachePasses {
 
 /// The report of the last pass, kept for a reader that wants to know what
 /// the cache occupies without walking it (see [`LastEviction::get`]).
+///
+/// "Last" is the last pass to *read the volume*, not the last to finish
+/// walking it: this is recorded under the same claim as the cap
+/// ([`CachePasses`]), so a pass that started its walk earlier and finished
+/// later publishes neither. The figures here can therefore come from a walk
+/// that ended before one whose report was dropped, and the age
+/// [`LastEviction::get`] reports is measured from when the surviving report
+/// was published rather than from the newest walk there was. That is the
+/// price of having one rule for both numbers: an occupancy figure a little
+/// older is a diagnostic that is slightly behind, while a cap from the
+/// wrong reading is a stream that is not bounded at all.
 ///
 /// The memory sampler is that reader. It used to walk the whole download
 /// dir itself, synchronously, on the runtime, every thirty seconds -- twice
