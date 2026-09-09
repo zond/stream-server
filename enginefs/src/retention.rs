@@ -652,7 +652,7 @@ pub enum TorrentGate {
     /// so there is no live have-set for a deletion to disagree with, and
     /// the next start rebuilds it by asking the storage. Every piece may
     /// go, and before any other cache: nothing will ever read these bytes.
-    Nothing { first: bool },
+    Nothing,
     /// A policy governs `pieces` of it. Inside that range only what the
     /// policy has committed is announced; outside it the torrent still
     /// announces everything it has.
@@ -666,7 +666,7 @@ impl TorrentGate {
     /// Whether this torrent will give the piece up.
     pub fn releases(&self, piece: u32) -> bool {
         match self {
-            Self::Nothing { .. } => true,
+            Self::Nothing => true,
             Self::Announced => false,
             Self::Policy { pieces, committed } => {
                 pieces.contains(&piece) && !committed.contains(&piece)
@@ -677,7 +677,7 @@ impl TorrentGate {
     /// Whether this torrent's pieces sort to the front of the size rule:
     /// bytes nothing will ever read or resume into.
     pub fn goes_first(&self) -> bool {
-        matches!(self, Self::Nothing { first: true })
+        matches!(self, Self::Nothing)
     }
 }
 
@@ -694,7 +694,7 @@ impl ReclaimGate {
 
     /// This torrent announces nothing at all, and its bytes go first.
     pub fn insert_dead(&mut self, info_hash: String) {
-        self.insert(info_hash, TorrentGate::Nothing { first: true });
+        self.insert(info_hash, TorrentGate::Nothing);
     }
 
     /// A policy governs `pieces` of this torrent and has committed
