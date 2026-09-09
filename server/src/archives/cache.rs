@@ -260,6 +260,13 @@ impl CacheWriter {
     /// EOF on bytes it cannot yet see and silently truncate the stream. Flushing
     /// before completion guarantees every counted byte is physically visible by
     /// the time `is_complete` is published.
+    ///
+    /// The reader leans on that guarantee rather than only on the
+    /// notification below: a zero-byte read taken after completion can only
+    /// be a stale answer, so it retries instead of waiting -- see
+    /// `ProgressiveReader::poll_read`, and
+    /// `a_reader_promised_invisible_bytes_waits_on_the_disk_not_on_the_writer`
+    /// for what waiting costs once this notification has been sent.
     pub async fn finish(&mut self) {
         if let Err(e) = self.file.flush().await {
             self.state_tx.send_modify(|state| {
@@ -442,9 +449,36 @@ impl AsyncRead for ProgressiveReader {
                         unsafe { buf.assume_init(bytes_read) };
                         buf.advance(bytes_read);
                         if bytes_read == 0 && needed > 0 {
-                            // The state said data was available but the file
-                            // returned EOF (e.g. write not yet visible). Fall
-                            // through to the completion check / waiter below.
+                            // The state said data was available and the file
+                            // gave nothing. That zero is not a statement
+                            // about the file: the read behind it can have
+                            // been issued before the writer's buffered bytes
+                            // landed and be answered from that operation
+                            // now, so it describes a file that no longer
+                            // exists.
+                            //
+                            // Once the writer is complete, retry rather than
+                            // wait. `finish` flushes before it publishes
+                            // completion, so every counted byte is
+                            // physically there and one fresh read finds it
+                            // -- while waiting is waiting for a notification
+                            // that has already been sent, since the
+                            // `notify_waiters` beside that completion is the
+                            // last word the writer ever says and a waiter
+                            // armed after it hears nothing again. That is a
+                            // permanent hang, and it is what
+                            // `finish_right_after_buffered_write_reads_full_tail`
+                            // saw once in 250 workspace runs as a reader
+                            // that timed out.
+                            if current_state.is_complete {
+                                continue;
+                            }
+                            // While the writer is still going there is
+                            // always another notification coming -- its next
+                            // write, its finish, or its error -- so the wait
+                            // below is answered, and retrying instead would
+                            // only spin against the disk until the buffered
+                            // write lands.
                         } else {
                             self.pos += bytes_read as u64;
                             return Poll::Ready(Ok(()));
@@ -527,7 +561,7 @@ impl AsyncSeek for ProgressiveReader {
 mod tests {
     use super::ProgressiveCache;
     use std::io::SeekFrom;
-    use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
     #[tokio::test]
     async fn reads_all_written_bytes_in_order() {
@@ -585,16 +619,33 @@ mod tests {
                 writer.finish().await;
             });
 
-            let mut out = Vec::new();
-            let read_res = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                reader.read_to_end(&mut out),
-            )
-            .await;
+            let reading = tokio::spawn(async move {
+                let mut out = Vec::new();
+                reader.read_to_end(&mut out).await.map(|_| out)
+            });
 
+            // The writer runs to its own end and not to a clock. It is the
+            // only thing that can still produce a byte or a completion, and
+            // how long it takes on a loaded machine says nothing about the
+            // race under test.
             writer_task.await.unwrap();
-            read_res
-                .unwrap_or_else(|_| panic!("iteration {iter}: reader timed out"))
+
+            // So whatever the reader is still waiting for is a wake-up and
+            // nothing else. The bound below guards against one that never
+            // comes -- which is a real thing this reader could do, and did:
+            // see
+            // `a_reader_promised_invisible_bytes_waits_on_the_disk_not_on_the_writer`.
+            // It is not a measure of how long the machine took, and the
+            // assertions are the payload.
+            let out = tokio::time::timeout(std::time::Duration::from_secs(10), reading)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "iteration {iter}: the writer has finished and the reader is still \
+                         waiting, so it is waiting for a wake-up that is not coming"
+                    )
+                })
+                .unwrap()
                 .unwrap_or_else(|e| panic!("iteration {iter}: read failed: {e}"));
 
             assert_eq!(
@@ -604,6 +655,125 @@ mod tests {
                 out.len(),
             );
             assert_eq!(out, payload, "iteration {iter}: content mismatch");
+        }
+    }
+
+    /// A waker a test can wait on, so "parked on something that will fire"
+    /// can be told from "parked for ever". `notify_one` and not
+    /// `notify_waiters`, because a wake that lands before the test gets
+    /// round to waiting has to keep.
+    #[derive(Default)]
+    struct Woken(tokio::sync::Notify);
+
+    impl std::task::Wake for Woken {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.notify_one();
+        }
+
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            self.0.notify_one();
+        }
+    }
+
+    /// **A reader promised bytes it cannot see yet waits on the disk, not on
+    /// the writer.**
+    ///
+    /// `written_bytes` counts a write the moment tokio *buffers* it, so a
+    /// reader is routinely promised bytes its own handle cannot see -- once
+    /// per iteration of the tail test above, measured. The read it issues
+    /// for them can be answered with zero bytes by an operation that was
+    /// spawned before those bytes landed, and that zero is not a statement
+    /// about the file: it is an observation from before the flush.
+    ///
+    /// Treating it as a reason to wait for the writer's next notification is
+    /// only safe while there is going to be one. `finish` flushes and then
+    /// publishes completion, and its `notify_waiters` is the last word the
+    /// writer ever says -- a waiter armed after it hears nothing, ever, and
+    /// the read hangs for as long as the process lives. That is what the
+    /// tail test above caught once in 250 workspace runs as "reader timed
+    /// out", ten seconds into a read whose worst honest time in the same
+    /// binary is ten milliseconds.
+    ///
+    /// The state is built by hand because the interleaving that produces it
+    /// is a few instructions wide -- the writer's flush landing between the
+    /// reader consuming its last notification and the reader consuming the
+    /// stale zero -- and no scheduler can be asked for it.
+    #[tokio::test]
+    async fn a_reader_promised_invisible_bytes_waits_on_the_disk_not_on_the_writer() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (cache, writer) = ProgressiveCache::new_in_dir(dir.path(), None)
+            .await
+            .unwrap();
+        let mut reader = cache.reader().await.unwrap();
+
+        // The writer's last word: five bytes counted, the stream complete,
+        // and the notification for both already sent -- to nobody, since no
+        // reader has armed a waiter yet. The bytes are not on the disk,
+        // which is exactly what a counted-but-buffered write looks like from
+        // the reader's side.
+        writer.state_tx.send_modify(|state| {
+            state.written_bytes = 5;
+            state.is_complete = true;
+        });
+        writer.notify.notify_waiters();
+
+        let woken = std::sync::Arc::new(Woken::default());
+        let waker = std::task::Waker::from(woken.clone());
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut dst = [0u8; 5];
+
+        // The first read goes to the disk and finds nothing there.
+        let mut buf = tokio::io::ReadBuf::new(&mut dst);
+        assert!(
+            std::pin::Pin::new(&mut reader)
+                .poll_read(&mut cx, &mut buf)
+                .is_pending(),
+            "there is nothing on the disk to read yet"
+        );
+        woken.0.notified().await;
+
+        // And the second consumes its answer: zero bytes, for a file the
+        // writer says has five in it.
+        let mut buf = tokio::io::ReadBuf::new(&mut dst);
+        assert!(
+            std::pin::Pin::new(&mut reader)
+                .poll_read(&mut cx, &mut buf)
+                .is_pending(),
+            "a stale zero is not the end of a stream that has five bytes in it"
+        );
+
+        // The bytes land, with no notification at all -- which is what a
+        // flush completing after the writer's last `notify_waiters` looks
+        // like from here.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&cache.temp_path)
+            .unwrap()
+            .write_all(b"hello")
+            .unwrap();
+
+        // A reader parked on the writer would never hear about them. This
+        // one is parked on a read of its own, so every wake is one it asked
+        // for and it gets the tail it was promised. Bounded because the
+        // failure being guarded against is a wake that never comes, and the
+        // wait is the only way to see one; the assertion is the five bytes.
+        loop {
+            tokio::time::timeout(std::time::Duration::from_secs(10), woken.0.notified())
+                .await
+                .expect(
+                    "the reader is parked on a notification the writer has already sent, \
+                     so nothing will ever wake it again",
+                );
+            let mut buf = tokio::io::ReadBuf::new(&mut dst);
+            if let std::task::Poll::Ready(res) =
+                std::pin::Pin::new(&mut reader).poll_read(&mut cx, &mut buf)
+            {
+                res.unwrap();
+                assert_eq!(buf.filled(), b"hello", "the promised tail, in full");
+                break;
+            }
         }
     }
 
