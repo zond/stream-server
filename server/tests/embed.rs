@@ -2840,6 +2840,70 @@ fn content_range_total(response: &reqwest::blocking::Response) -> u64 {
         .expect("the total is a number")
 }
 
+/// **A pass hands the process the count it made, and it is the only thing
+/// that ever does.**
+///
+/// The cap a pass states is one publisher's answer among several
+/// (`server::cache_budget`), and an older reading of the volume is dropped
+/// rather than published over a newer one -- the minute timer takes one
+/// `statvfs` and publishes microseconds later, so it overtakes any walk
+/// longer than a minute, which on a device with sixteen thousand cache
+/// files is every walk. The *count* cannot be dropped with it: nothing
+/// else in the process walks the tree, so a count nobody kept is not stale,
+/// it is absent, and the publisher that reads it then sizes every cap from
+/// an occupancy of nought -- free space alone, on a device whose cache is
+/// most of what is on the volume.
+///
+/// So this asks for a pass and then asks the process what the cache holds.
+/// The cleaner is off, which makes the pass here the only walk there has
+/// been: before it, nothing has counted, and that is a different answer
+/// from zero.
+#[test]
+fn a_pass_that_walked_the_cache_leaves_the_process_its_count() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let cache_root = resolved(&cache_dir.path().join("cache"));
+    // Ordinary cache from a torrent nothing is tracking any more, so the
+    // walk has something to count.
+    let leftover = cache_root
+        .join("rqbit-downloads")
+        .join("Leftover")
+        .join("old.mkv");
+    std::fs::create_dir_all(leftover.parent().unwrap())?;
+    write_payload(&leftover, 64 * 1024);
+
+    let handle = stream_server::start(ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_root.clone()),
+        // Off, so the pass below is the only walk in this process: with the
+        // scheduled sweep running there is no moment at which nothing has
+        // counted.
+        enable_cache_cleaner: false,
+        ..offline_config()
+    })?;
+    assert_eq!(
+        handle.last_counted_cache_bytes(),
+        None,
+        "nothing has walked the cache yet, which is not the same as its \
+         holding nothing"
+    );
+
+    let report = handle.clean_cache_now()?;
+    assert!(
+        report.total >= 64 * 1024,
+        "the pass counted the cache it walked: {report:?}"
+    );
+    assert_eq!(
+        handle.last_counted_cache_bytes(),
+        Some(report.total),
+        "and the count it made is the count the process holds"
+    );
+
+    handle.shutdown()?;
+    Ok(())
+}
+
 /// `GET /cache.json` and `POST /cache/clean` share their functions with
 /// `ServerHandle::{cache_usage, clean_cache_now}` -- the replacement for a
 /// client restarting the server just to make the cache cleaner's start-up

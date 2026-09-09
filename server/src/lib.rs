@@ -530,6 +530,24 @@ impl ServerHandle {
         self.block_on_server(async move { routes::cache::cache_usage(&state).await })
     }
 
+    /// What the last pass to walk the cache counted it as holding, or
+    /// `None` before any pass has finished a walk.
+    ///
+    /// **The process's only reading of the cache's size that nobody walked
+    /// for.** A pass is the one thing that produces it, and two readers take
+    /// it on trust rather than touching the disk: the budget publisher sizes
+    /// its cap from it (`cache_budget::occupancy_last_counted`), which is
+    /// what lets a cap be stated between walks at all, and the memory
+    /// sampler logs it instead of walking the download root itself. That is
+    /// why a pass hands this over even when its cap is dropped as stale --
+    /// nothing else would refill it.
+    pub fn last_counted_cache_bytes(&self) -> Option<u64> {
+        self.state
+            .last_eviction
+            .get()
+            .map(|(_, report)| report.total)
+    }
+
     /// Run one eviction pass immediately and report what it freed, exactly
     /// what `POST /cache/clean` answers (see `routes::cache::clean_cache_now`).
     /// Respects exactly the protections the scheduled sweep does -- a pinned
@@ -1202,7 +1220,10 @@ pub async fn run(
     // still relays streams into the proxy cache, and a process that has
     // published no budget holds no retention policy over them at all. See
     // `cache_budget`.
-    background_tasks.push(cache_budget::start(Arc::new(state.clone())));
+    // Awaited, not merely spawned: `start` states the budget before it
+    // returns, so it exists before the router below can serve a request
+    // into the proxy cache rather than a moment after.
+    background_tasks.push(cache_budget::start(Arc::new(state.clone())).await);
     if cfg.enable_cache_cleaner {
         background_tasks.push(cache_cleaner::start(Arc::new(state.clone())));
     }

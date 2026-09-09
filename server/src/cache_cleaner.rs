@@ -503,16 +503,19 @@ async fn clean_cache_with_headroom(
         .await?
     };
     // This pass is one publisher of the budget among others
-    // (`crate::cache_budget`), distinguished only by having just counted
-    // the cache rather than taking the last count on trust -- so it states
-    // the cap through the same writer, in the same order, and its report
-    // stands or falls with the cap it goes with.
-    crate::cache_budget::publish(
+    // (`crate::cache_budget`), distinguished by having just counted the
+    // cache rather than taking the last count on trust -- so it states the
+    // cap through the same writer, in the same order. The count itself is
+    // not the cap's to lose: the walk above is the only thing in the
+    // process that produces one, and the publisher likeliest to overtake it
+    // is the minute timer, which walked nothing. See
+    // `cache_budget::publish_counted`.
+    crate::cache_budget::publish_counted(
         &state.cache_passes,
         &state.engine.cache_budget(),
+        &state.last_eviction,
         pass,
-        report.limit,
-        || state.last_eviction.record(&report),
+        &report,
     );
     Ok(report)
 }
@@ -520,16 +523,21 @@ async fn clean_cache_with_headroom(
 /// The report of the last pass, kept for a reader that wants to know what
 /// the cache occupies without walking it (see [`LastEviction::get`]).
 ///
-/// "Last" is the last pass to *read the volume*, not the last to finish
-/// walking it: this is recorded under the same claim as the cap
-/// ([`CachePasses`]), so a pass that started its walk earlier and finished
-/// later publishes neither. The figures here can therefore come from a walk
-/// that ended before one whose report was dropped, and the age
-/// [`LastEviction::get`] reports is measured from when the surviving report
-/// was published rather than from the newest walk there was. That is the
-/// price of having one rule for both numbers: an occupancy figure a little
-/// older is a diagnostic that is slightly behind, while a cap from the
-/// wrong reading is a stream that is not bounded at all.
+/// "Last" is the last pass to *finish walking*, which is not the last to
+/// have read the volume: the cap and the count are ordered by different
+/// keys on purpose (`cache_budget::publish_counted`). A cap is an answer
+/// about the volume and the newest reading of it wins; a count is an answer
+/// about the tree, taken over the whole length of a walk, so the fresher of
+/// two is the one that ended later. Recording it under the cap's claim
+/// instead made this the tighter of the two rules and starved it: a walk
+/// overtaken by the minute timer -- every walk longer than a minute, which
+/// on the device the header describes is every walk -- recorded nothing,
+/// and nothing else in the process counts, so the figure stayed absent for
+/// good.
+///
+/// What that costs is a report here whose `limit` may not be the cap in
+/// force, because the pass that walked can be overtaken between the two.
+/// It describes the walk it came from, which is what this is read for.
 ///
 /// The memory sampler is that reader. It used to walk the whole download
 /// dir itself, synchronously, on the runtime, every thirty seconds -- twice

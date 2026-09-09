@@ -1720,6 +1720,124 @@ fn a_proxied_stream_past_the_cache_budget_stays_under_it_and_still_plays() -> an
     Ok(())
 }
 
+/// **A stream relayed before anything has walked the cache is still
+/// bounded.**
+///
+/// Every other test here states the budget by changing a setting, which is
+/// a client acting on a running server. This one has no client and no pass:
+/// the `cacheSize` is on the disk before the process starts, the cleaner is
+/// switched off, and nothing calls `POST /settings`. So the only thing that
+/// can have stated a budget is the process's own publisher
+/// (`server::cache_budget::start`), and if it has not, the budget is
+/// `CacheBudget::Unknown`, which installs no retention policy at all -- and
+/// all 32 MiB of the origin stays on the disk.
+///
+/// That window is the reason the publisher exists. It used to be the tail
+/// of an eviction pass, so a device with sixteen thousand cache files on
+/// eMMC had no budget until the first walk of the root finished, minutes
+/// in, and a player is inside the first stream long before that.
+#[test]
+fn a_stream_relayed_before_anything_has_walked_the_cache_is_still_bounded() -> anyhow::Result<()> {
+    use std::io::Read;
+
+    // Before the first request, as `fixture_with` does: this test starts its
+    // own server, so it is the ordering point for its own binary.
+    enginefs::http_client::trust_roots_for_tests(vec![TEST_CA.pem.clone()]);
+    let origin = Origin::start_sized(RETENTION_ORIGIN)?;
+    let config_dir = tempfile::tempdir()?;
+    let cache_root = tempfile::tempdir()?;
+    let config = config_dir.path().join("config");
+    std::fs::create_dir_all(&config)?;
+    // Configuration the process reads at start, not a change made to a
+    // running one. `cacheRoot` is left empty on purpose: the loader fills an
+    // empty one in from `ServerConfig::cache_dir`, whereas the default is
+    // this machine's real cache directory, which no test may write to.
+    let settings = stream_server::ServerSettings {
+        cache_root: String::new(),
+        cache_size: Some(RETENTION_BUDGET as f64),
+        ..Default::default()
+    };
+    std::fs::write(config.join("settings.json"), serde_json::to_vec(&settings)?)?;
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config),
+        cache_dir: Some(cache_root.path().join("cache")),
+        // The cleaner's start-up sweep publishes a budget of its own, and
+        // this test is about the budget a process has before anything has
+        // walked anything.
+        enable_cache_cleaner: false,
+        ..offline_config()
+    })?;
+    let fixture = Fixture {
+        base: format!("http://{}", handle.http_addr()),
+        handle,
+        origin,
+        cache_root,
+        _config_dir: config_dir,
+    };
+    // The same guard `published_budget` makes: the arithmetic, not an
+    // eviction, so a volume too full to give the configured cap fails the
+    // test loudly instead of quietly making it prove nothing.
+    assert_eq!(
+        fixture.handle.cache_usage()?.limit_bytes,
+        Some(RETENTION_BUDGET),
+        "a different cap is in force than the one in the settings file; \
+         the volume this test runs on cannot give {RETENTION_BUDGET} bytes"
+    );
+
+    let origin_url = format!("http://{}", fixture.origin.addr);
+    let url = format!("{}/proxy/d={}/movie.mp4", fixture.base, encode(&origin_url));
+    let mut response = reqwest::blocking::Client::new()
+        .get(&url)
+        .header(reqwest::header::RANGE, "bytes=0-")
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+
+    // Twice the budget, for the overshoot a pass that runs every twentieth
+    // of a window leaves behind -- and still an order under the 32 MiB going
+    // past.
+    let bound = (2 * RETENTION_BUDGET / CHUNK) as usize;
+    let mut read = 0usize;
+    let mut worst = 0usize;
+    let mut measured_at = 0usize;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = response.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        for (i, byte) in buf[..n].iter().enumerate() {
+            assert_eq!(
+                *byte,
+                byte_at(read + i),
+                "the byte at {} is not the origin's",
+                read + i
+            );
+        }
+        read += n;
+        if read - measured_at >= 1024 * 1024 {
+            measured_at = read;
+            let held = cached_chunks(&fixture).len();
+            worst = worst.max(held);
+            assert!(
+                held <= bound,
+                "{held} chunks on disk after {read} bytes, with nothing having \
+                 walked the cache; the budget is {} chunks",
+                RETENTION_BUDGET / CHUNK
+            );
+        }
+    }
+    assert_eq!(read, RETENTION_ORIGIN, "and it played to the end");
+    // And the cache really filled, or the bound above proves nothing.
+    assert!(
+        worst as u64 * CHUNK > RETENTION_BUDGET / 2,
+        "the cache never filled ({worst} chunks at most)"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
 /// **What a playback panel is told about a proxied stream, end to end.**
 ///
 /// A client holding the URL it handed its player asks one question and gets
