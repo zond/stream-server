@@ -72,8 +72,11 @@ impl CleanSchedule {
 }
 
 /// How many rings of the doorbell below may be in flight before the rest are
-/// dropped. Anything above one is slack, not capacity: see [`ring_doorbell`].
-const DOORBELL_DEPTH: usize = 100;
+/// dropped: one. A second ring carries the same message as the first, and
+/// the receiver coalesces however many it finds into one debounced pass, so
+/// anything above one would be slack, not capacity -- see [`ring_doorbell`].
+/// It was a hundred, and the hundred made the doorbell look like a queue.
+const DOORBELL_DEPTH: usize = 1;
 
 /// What the filesystem watcher does with an event: ring the cleaner's
 /// doorbell, once, for anything that changed the cache.
@@ -81,23 +84,27 @@ const DOORBELL_DEPTH: usize = 100;
 /// **It must never block, whatever the doorbell's state.** This runs on
 /// notify's own event-loop thread, and that is the thread
 /// [`Watcher::watch`] hands a registration to and then waits for an answer
-/// from. The cleaner calls `watch` from inside its `select!` -- to re-arm a
-/// watch that was lost -- so blocking here on a full channel stops both
-/// sides at once: the event-loop thread waits for the cleaner to drain the
-/// doorbell, the cleaner waits for the event-loop thread to acknowledge a
-/// watch, and neither is ever going to move. The runtime worker the cleaner
-/// was polled on is then held for the life of the process, which is a
-/// server that never finishes shutting down (dropping the runtime waits its
-/// blocking pool out) and, long before that, a cache limit nothing enforces
-/// any more. A hundred piece files written into a fresh cache is enough to
-/// fill the channel and reach it.
+/// from. The cleaner awaits [`watch_tree`] from inside its `select!` -- to
+/// arm a watch that has not taken -- and does not drain the doorbell while
+/// it does, so blocking here on a full channel stops both sides at once:
+/// the event-loop thread waits for the cleaner to drain the doorbell, the
+/// cleaner waits for the event-loop thread to acknowledge a watch, and
+/// neither is ever going to move. The cache limit is then enforced by
+/// nothing, and the server never finishes shutting down (dropping the
+/// runtime waits its blocking pool out). Two piece files written into a
+/// fresh cache is enough to fill the channel and reach it.
 ///
 /// Dropping the ring is the right answer and not a compromise: this is a
 /// doorbell, not a queue. Every message on it says the same thing --
 /// something under the cache changed -- and the receiver coalesces the lot
-/// into one debounced pass ([`CleanSchedule`]). A channel already holding
-/// [`DOORBELL_DEPTH`] of them is carrying that message a hundred times over,
-/// so the hundred-and-first adds nothing a pass would do differently.
+/// into one debounced pass ([`CleanSchedule`]). A channel already holding a
+/// ring is carrying that message, and a second adds nothing a pass would do
+/// differently.
+///
+/// **And only for a change.** notify reports reads as well, and a player is
+/// nothing but reads: every chunk a body serves is an `Access` event under
+/// the cache, and a doorbell that rang for those would keep the cleaner's
+/// debounce armed for as long as anything played.
 fn ring_doorbell(doorbell: &mpsc::Sender<()>, res: Result<Event, notify::Error>) {
     match res {
         Ok(event) => {
@@ -2763,14 +2770,13 @@ mod tests {
     /// The handler runs on notify's event-loop thread, and that is the
     /// thread `Watcher::watch` posts a registration to and then waits for
     /// an answer from -- while the cleaner, the doorbell's only reader,
-    /// calls `watch` from inside its own `select!` to re-arm a lost watch.
-    /// So a handler that parks on a full doorbell parks the cleaner with
-    /// it, for the life of the process: the cache limit stops being
-    /// enforced, and the runtime worker the cleaner was polled on is never
-    /// given back, so dropping the server's runtime -- which waits its
-    /// blocking pool out -- never finishes and `ServerHandle::join` never
-    /// returns. Seeding a hundred piece files into a fresh cache is enough
-    /// to fill the doorbell, which is an ordinary torrent.
+    /// awaits `watch_tree` from inside its own `select!` to arm a watch
+    /// that has not taken, and drains nothing meanwhile. So a handler that
+    /// parks on a full doorbell parks the cleaner with it, for the life of
+    /// the process: the cache limit stops being enforced, and dropping the
+    /// server's runtime -- which waits its blocking pool out -- never
+    /// finishes and `ServerHandle::join` never returns. Two piece files
+    /// written into a fresh cache fill the doorbell.
     #[test]
     fn a_doorbell_nobody_is_answering_is_rung_past_rather_than_waited_on() {
         /// A bound so a regression fails instead of hanging the suite, not
@@ -2809,6 +2815,20 @@ mod tests {
         assert!(
             cleaner.try_recv().is_ok(),
             "a piece file appearing under the cache rings the cleaner"
+        );
+
+        // And a read is not a change. A player is nothing but reads, and a
+        // doorbell that rang for them would hold the cleaner's debounce
+        // armed for as long as anything played.
+        ring_doorbell(
+            &doorbell,
+            Ok(Event::new(EventKind::Access(
+                notify::event::AccessKind::Read,
+            ))),
+        );
+        assert!(
+            cleaner.try_recv().is_err(),
+            "a chunk being read under the cache is not a change and rings nothing"
         );
     }
 
