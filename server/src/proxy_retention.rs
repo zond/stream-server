@@ -595,7 +595,14 @@ impl ProxyRetention {
             while let Some(claim) = next {
                 #[cfg(test)]
                 retention.passes.fetch_add(1, Ordering::Relaxed);
-                let outcome = retention.owner.pass(&key, &(), claim).await;
+                // Always the live pass until the proxy has a writer for
+                // the liveness cell: what makes a proxied entity slack is
+                // another entity being opened, and nothing here tells it
+                // yet. Until then the grace below is what ends one.
+                let outcome = retention
+                    .owner
+                    .pass(&key, &(), claim, enginefs::retention::owner::Mode::Live)
+                    .await;
                 if let Some(conclusion) = &outcome.concluded
                     && conclusion.reclaimed > 0
                 {
@@ -1865,7 +1872,11 @@ mod tests {
             let owner = retention.owner.clone();
             let pass = tokio::spawn({
                 let key = key.clone();
-                async move { owner.pass(&key, &(), claim).await }
+                async move {
+                    owner
+                        .pass(&key, &(), claim, enginefs::retention::owner::Mode::Live)
+                        .await
+                }
             });
             // The pass runs to its listing, which queues behind the occupied
             // thread, and parks there. Bounded so a pass that never gets

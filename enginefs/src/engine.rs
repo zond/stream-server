@@ -4,15 +4,16 @@ use crate::backend::{
 };
 use crate::cache::DataCache;
 use crate::piece_store::{RetentionPolicy, Share, StoreRegistry};
+use crate::retention::live::{Live, Reading};
 use crate::retention::owner::{
-    Backing, Door, Install, InstalledView, Liveness, Retention, Trigger,
+    Backing, Door, Install, InstalledView, Liveness, Mode, Retention, Trigger,
 };
 use anyhow::Context;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::files::FileHandle;
 use regex::Regex;
@@ -250,34 +251,6 @@ impl GetFileError {
     }
 }
 
-/// [`Engine::last_active_at`] for a torrent nothing has been seen using.
-///
-/// **Not a time, and deliberately not `0`.** [`crate::Clock::now_secs`] is
-/// `epoch.elapsed().as_secs()` from an instant taken when *this process*
-/// started, so `0` on that clock does not mean "long ago", it means "now, at
-/// boot" -- and it is a reading a torrent really can have, for the whole of
-/// the first second. Giving a restored torrent any reading at all says it
-/// was active a moment ago, which hands it a fresh grace period on every
-/// restart -- so an app that restarts often never idle-pauses anything. That
-/// was the third time this design stored a value the process invented at
-/// startup and then read it back as an observation; the first two were
-/// `idle_paused` and `last_accessed`.
-///
-/// "Nothing has used this since I started" and "the last use was at my start"
-/// are not the same statement: the first is about this process's knowledge,
-/// the second is a claim about the world. So the absence of a reading is
-/// carried as an absence -- [`Engine::quiet_for`] answers `None` -- and the
-/// idle arm reads `None` as quiet, because a torrent nobody is watching is
-/// eligible to be paused whether or not we can say for how long. The grace
-/// period exists to protect a stream that *just* stopped and might resume;
-/// after a restart there is no such recency to protect.
-///
-/// A wall clock would make `0` mean 1970 and read correctly, but wall clocks
-/// jump -- NTP, timezones, a television whose time is wrong until the network
-/// is up -- and this is a duration measurement, which is what the monotonic
-/// clock is for.
-const NEVER_ACTIVE: u64 = u64::MAX;
-
 /// [`Engine::last_transition_at`] for a torrent the reconciler has never
 /// started or stopped.
 ///
@@ -330,6 +303,12 @@ pub(crate) struct FileStanding {
     pub file_idx: usize,
     /// The policy itself.
     pub view: InstalledView,
+    /// What the next pass over this file will be, from the reading taken
+    /// when this standing was built. A [`Mode::Slack`] policy protects
+    /// nothing it committed: its pieces are on their way off the disk
+    /// whole, so telling the cleaner they are announced would leave them
+    /// for a deleter that is already deleting them.
+    pub mode: Mode,
 }
 
 /// The file whose standing policy governs `piece`: the lowest-numbered of
@@ -375,6 +354,10 @@ pub(crate) struct FileDomain {
 pub(crate) struct TorrentBacking<H: TorrentHandle> {
     handle: H,
     info_hash: String,
+    /// Which entity the server is playing, shared with the whole process
+    /// ([`crate::retention::live`]). Read at a slack reclaim's door, so a
+    /// file the user opened again mid-delete keeps what is left of it.
+    live: Arc<Live>,
     /// [`Engine::pinned_files`], the same `Arc`: a pin is a retention
     /// property, and the owner asks about it before every pass and at every
     /// door.
@@ -485,6 +468,13 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
     /// for those bytes, and they are shared like any other bytes we keep.
     fn keeps_everything(&self, _file_idx: &usize) -> bool {
         !self.pinned.read().is_empty()
+    }
+
+    /// Whether this file is the one being played, at this instant. One
+    /// borrow of the liveness cell, nothing cloned: it is asked once per
+    /// run of a slack reclaim, from a blocking thread.
+    fn is_live(&self, file_idx: &usize) -> bool {
+        self.live.is_torrent_file(&self.info_hash, *file_idx)
     }
 
     /// The registered store's held set inside this file's extent -- a copy
@@ -773,7 +763,7 @@ pub struct Engine<H: TorrentHandle> {
     /// activity registers separately before it removes anything, so a
     /// playing torrent is never dropped on this field's word alone.
     ///
-    /// **Nothing that decides whether a torrent is idle may read it.** Its
+    /// **Nothing that decides whether a torrent runs may read it.** Its
     /// writers are every lookup (`get_engine`/`lookup_engine`,
     /// `register_engine`) and every `Engine::get_statistics`, so a client
     /// polling `GET /{infoHash}/stats.json` -- which reaches its engine
@@ -781,17 +771,17 @@ pub struct Engine<H: TorrentHandle> {
     /// every few seconds. The reconciler's idle arm used to measure its
     /// grace from here, which made "somebody is asking about this torrent"
     /// mean "somebody is watching it" and kept a torrent nobody was
-    /// watching downloading all night with seeding off. The idle arm has
-    /// `Self::last_active_at` instead, which moves only where activity is
-    /// actually observed.
+    /// watching downloading all night with seeding off. What decides that
+    /// now is the liveness cell ([`crate::retention::live`]), which is
+    /// written where a stream really opens and nowhere else.
     ///
     /// It is also initialised to the clock rather than left unset, which
     /// for an engine made for a torrent the *previous* process left behind
     /// is a claim about a past this process never saw. That is harmless for
     /// eviction -- it only buys a restored engine one inactivity window
     /// before the sweep may drop it, which is the right way round -- and
-    /// would not be harmless for a policy that pauses, which is the other
-    /// half of why the idle arm does not read it.
+    /// would not be harmless for anything that pauses, which is the other
+    /// half of why nothing else reads it.
     pub last_accessed: AtomicU64,
     pub active_streams: Arc<AtomicUsize>,
     pub data_cache: DataCache,
@@ -815,51 +805,6 @@ pub struct Engine<H: TorrentHandle> {
     ///
     /// [`crate::BackendEngineFS::start_if_stopped`]: crate::BackendEngineFS
     last_transition_at: AtomicU64,
-    /// The clock reading at the last moment something was **using** this
-    /// torrent -- the instant `Conditions::playing` last read true. The
-    /// idle arm of the ladder measures its grace from here
-    /// ([`Self::quiet_for`]), and it is the only timestamp that policy
-    /// keeps.
-    ///
-    /// Deliberately not [`Self::last_accessed`], which is the registry's
-    /// idle-eviction clock and counts *lookups*: every
-    /// `GET /{infoHash}/stats.json` reaches its engine through
-    /// `BackendEngineFS::get_engine`, so a client that polls the statistics
-    /// resets that one. Read by the ladder, it made "somebody is asking
-    /// about this torrent" mean "somebody is watching it", and a poll every
-    /// few seconds -- which is what a Stremio client does while its details
-    /// page is open -- kept a torrent nobody was watching downloading for
-    /// ever with seeding turned off. This one moves only when
-    /// `BackendEngineFS::torrent_is_active` actually reads true, so looking
-    /// is not using.
-    ///
-    /// **There are two seeds, because the two kinds of engine can vouch for
-    /// different things**, and the whole of the defect this field replaced
-    /// was one value being wrong for half its callers.
-    ///
-    /// * An engine this process *made* is seeded with the creation instant
-    ///   (`clock.now_secs()`), and that is a real observation: nothing can
-    ///   have used a torrent in an interval that did not exist. Seeding it
-    ///   with an absence instead paused a freshly added torrent on its
-    ///   first tick with seeding off, dropping the swarm it had just
-    ///   dialled and paying a re-announce at the start of playback.
-    /// * An engine built over a torrent a *previous* process left behind is
-    ///   given [`NEVER_ACTIVE`] by [`Self::forget_last_active`], because
-    ///   this process has no reading at all. Stamping `now` there would be
-    ///   the claim this design keeps having to delete -- "used at boot" for
-    ///   something nobody has touched in a week -- which hands every
-    ///   restored torrent a fresh grace period on every restart, so an app
-    ///   that restarts often idle-pauses nothing.
-    ///
-    /// So the absence is carried as an absence: [`Self::quiet_for`] answers
-    /// `Option`, `None` where there is no reading, and the idle arm reads
-    /// `None` as quiet -- a torrent nobody is watching is eligible to be
-    /// paused whether or not we can say for how long. `0` is not the seed
-    /// and is not a sentinel: it is an ordinary reading meaning something
-    /// used the torrent inside this process's first second.
-    ///
-    /// [`Self::settled`]: Engine::settled
-    last_active_at: AtomicU64,
     /// Files pinned as offline downloads (`BackendEngineFS::pin_download`).
     /// While non-empty the engine is exempt from idle removal and the
     /// seeding-disabled pause; the handle keeps its own copy for the
@@ -892,6 +837,17 @@ pub struct Engine<H: TorrentHandle> {
     /// [`Retention::install`], which clears every other file first and runs
     /// one at a time over the torrent, as `announce` made it.
     pub(crate) retention: Arc<Retention<TorrentBacking<H>>>,
+    /// Which entity the server is playing, shared with the whole process.
+    /// Read for a fresh copy where a caller needs one of its own -- the
+    /// cleaner's standing, the switch task -- and handed to the pass by the
+    /// tick, which takes one reading for the ladder and the pass together.
+    live: Arc<Live>,
+    /// The turn for the pieces no entity's extent covers: the files of this
+    /// torrent nothing has opened in this process, which have no entity and
+    /// so no turn of their own. One reclaim of them at a time per engine --
+    /// the tick and the switch task both ask -- so two of them cannot offer
+    /// librqbit the same run and unlink the second's bytes twice.
+    rest: tokio::sync::Mutex<()>,
     /// Where a test puts what playback does while a pass runs.
     ///
     /// Called twice per pass -- before the held reading, and again after
@@ -932,6 +888,7 @@ impl<H: TorrentHandle> Engine<H> {
         let backing = TorrentBacking {
             handle: self.handle.clone(),
             info_hash: self.info_hash.clone(),
+            live: self.live.clone(),
             pinned: self.pinned_files.clone(),
             refused: self.refused_reclaims.clone(),
         };
@@ -945,6 +902,7 @@ impl<H: TorrentHandle> Engine<H> {
         clock: crate::Clock,
         volumes: Arc<crate::reconcile::Volumes>,
         budget: Arc<crate::retention::RetentionBudget>,
+        live: Arc<Live>,
     ) -> Self {
         let pinned_files = Arc::new(parking_lot::RwLock::new(BTreeSet::new()));
         #[cfg(test)]
@@ -953,6 +911,7 @@ impl<H: TorrentHandle> Engine<H> {
             Arc::new(TorrentBacking {
                 handle: handle.clone(),
                 info_hash: info_hash.to_string(),
+                live: live.clone(),
                 pinned: pinned_files.clone(),
                 #[cfg(test)]
                 refused: refused_reclaims.clone(),
@@ -982,13 +941,14 @@ impl<H: TorrentHandle> Engine<H> {
                 .build(),
             settled: AtomicBool::new(true),
             last_transition_at: AtomicU64::new(NEVER_MOVED),
-            last_active_at: AtomicU64::new(clock.now_secs()),
             pinned_files,
             volumes,
             reads_refused: AtomicBool::new(false),
             read_wakers: parking_lot::Mutex::new(HashMap::new()),
             next_reader_id: AtomicU64::new(1),
             retention,
+            live,
+            rest: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             interleave,
             #[cfg(test)]
@@ -1000,26 +960,6 @@ impl<H: TorrentHandle> Engine<H> {
     /// (see the field).
     pub(crate) fn is_settled(&self) -> bool {
         self.settled.load(Ordering::Relaxed)
-    }
-
-    /// Forget when this torrent was last used, for an engine built over a
-    /// torrent a *previous* process left behind.
-    ///
-    /// The constructor stamps the creation instant, and for an engine this
-    /// process made that is a real observation: nothing can have used a
-    /// torrent in an interval that did not exist. Stamping it for a
-    /// *restored* one would be the claim this design keeps having to
-    /// delete -- "used at boot" for something nobody has touched in a week,
-    /// which hands it a fresh grace on every restart.
-    ///
-    /// The two need opposite seeds, so the difference is said here rather
-    /// than folded into one value that is wrong for half its callers. It
-    /// cost a real bug in the other direction first: seeding every engine
-    /// with the absence paused a freshly added torrent on its first tick
-    /// with seeding off, dropping the swarm it had just dialled and paying
-    /// a re-announce at the start of playback.
-    pub(crate) fn forget_last_active(&self) {
-        self.last_active_at.store(NEVER_ACTIVE, Ordering::SeqCst);
     }
 
     /// Mark the want-set as not yet re-applied -- a restored torrent on a
@@ -1046,23 +986,6 @@ impl<H: TorrentHandle> Engine<H> {
     /// Record that the reconciler has just started or stopped this torrent.
     pub(crate) fn record_transition(&self, now: u64) {
         self.last_transition_at.store(now, Ordering::Relaxed);
-    }
-
-    /// Something is using this torrent right now (see [`Self::last_active_at`]).
-    pub(crate) fn mark_active(&self, now: u64) {
-        self.last_active_at.store(now, Ordering::SeqCst);
-    }
-
-    /// How long since anything was seen using this torrent, or `None` if
-    /// nothing has been -- which is not the same as "nothing has used it for
-    /// zero seconds". See [`NEVER_ACTIVE`] for why the absence is carried
-    /// rather than filled in, and `reconcile::desired` for the idle arm
-    /// reading `None` as quiet.
-    pub(crate) fn quiet_for(&self, now: u64) -> Option<Duration> {
-        match self.last_active_at.load(Ordering::SeqCst) {
-            NEVER_ACTIVE => None,
-            at => Some(Duration::from_secs(now.saturating_sub(at))),
-        }
     }
 
     /// Whether the reconciler is holding this torrent stopped for want of
@@ -1329,45 +1252,70 @@ impl<H: TorrentHandle> Engine<H> {
     /// the map listed answered for a different file from one call to the
     /// next, called the other file's held-back pieces announced, and had
     /// the delete take that one file's turn for a request about both.
-    fn standing_policies(&self) -> Vec<FileStanding> {
+    fn standing_policies(&self, live: &Reading) -> Vec<FileStanding> {
         let mut policies: Vec<FileStanding> = self
             .retention
             .holdings()
             .into_iter()
             .filter_map(|(file_idx, holding)| {
-                holding
-                    .installed
-                    .map(|view| FileStanding { file_idx, view })
+                holding.installed.map(|view| FileStanding {
+                    file_idx,
+                    view,
+                    mode: self.mode_of(live, file_idx),
+                })
             })
             .collect();
         policies.sort_by_key(|policy| policy.file_idx);
         policies
     }
 
-    /// The files this tick's passes run on: every file with a policy
-    /// standing, in file order. One copy-out under the owner's locks, no
-    /// I/O; empty while nothing bounds the torrent.
+    /// What a pass over `file_idx` would be for, from `live`.
     ///
-    /// Every one, because each has a head of its own. A pass measures from
-    /// its file's head, and with two policies standing -- the viewer went on
-    /// to the next episode and the backend would not give the file left
-    /// back -- both files have one: the file being played where its reader
-    /// is, the file left where its reader last was. A pick of one file per
-    /// tick, whichever rule picked it, left the other's window unmeasured
-    /// for as long as both stood: nothing committed for sharing, nothing
-    /// outside its window reclaimed, its want-set never trimmed. Each pass
-    /// concludes on its own file's head, and a file with none concludes
-    /// nothing.
-    fn files_to_pass(&self) -> Vec<usize> {
-        let mut standing: Vec<usize> = self
-            .retention
-            .holdings()
-            .into_iter()
-            .filter(|(_, holding)| holding.installed.is_some())
-            .map(|(file_idx, _)| file_idx)
-            .collect();
-        standing.sort_unstable();
-        standing
+    /// [`Mode::Live`] for the file the server is playing, and for a file
+    /// some read is still delivering. **An open read is not liveness**: it
+    /// is an in-flight response, and taking the bytes out from under one is
+    /// a broken read for a player and a fetch the origin is paid for twice.
+    /// It keeps that file's window for as long as the body lasts and no
+    /// longer -- which is what makes the aside rule cheap, since a subtitle
+    /// read while a film plays is a second entity with a reader of its own.
+    ///
+    /// Everything else is [`Mode::Slack`]: nobody is playing it, nobody is
+    /// reading it, and its bytes go. Not a clock anywhere -- a stream that
+    /// stopped is not a stream that has been replaced, and pausing for an
+    /// hour changes nothing here.
+    fn mode_of(&self, live: &Reading, file_idx: usize) -> Mode {
+        if live.file_of(&self.info_hash) == Some(file_idx)
+            || self.retention.readers_of(&file_idx) > 0
+        {
+            Mode::Live
+        } else {
+            Mode::Slack
+        }
+    }
+
+    /// The files this tick's passes run on and what each pass is for: every
+    /// file with an entity, in file order, with its [`Mode`] from the one
+    /// reading the tick took.
+    ///
+    /// Every entity, not only the ones with a policy standing. A file the
+    /// viewer left has no policy after its first slack pass and still holds
+    /// whatever that pass could not take -- a delete refused under a hash
+    /// check -- so the entity is what has to be walked, and it is forgotten
+    /// once it holds nothing ([`Retention::forget_empty`]).
+    ///
+    /// Each has a head of its own, and so a window of its own: the file
+    /// being played where its reader is, a file with an open read where
+    /// that read is. A pick of one file per tick, whichever rule picked it,
+    /// left the other's window unmeasured for as long as both stood.
+    fn files_to_pass(&self, live: &Reading) -> Vec<(usize, Mode)> {
+        let mut keys = self.retention.keys();
+        keys.sort_unstable();
+        keys.into_iter()
+            .map(|file_idx| {
+                let mode = self.mode_of(live, file_idx);
+                (file_idx, mode)
+            })
+            .collect()
     }
 
     /// One retention pass per file with a policy standing, in file order,
@@ -1397,6 +1345,7 @@ impl<H: TorrentHandle> Engine<H> {
     pub(crate) async fn retain(
         &self,
         store: &Arc<StoreRegistry>,
+        live: &Reading,
     ) -> Option<crate::retention::RetentionPass> {
         if matches!(
             self.handle.run_state(),
@@ -1404,12 +1353,77 @@ impl<H: TorrentHandle> Engine<H> {
         ) {
             return None;
         }
+        let mut total = self.pass_over(store, &self.files_to_pass(live)).await;
+        // And the files nothing has opened in this process. They have no
+        // entity, so no pass walks them and no window is drawn round them;
+        // on a torrent nobody is playing and nobody has pinned, every byte
+        // of them is slack -- the twelve other episodes the swarm filled
+        // while one was watched.
+        if !self.is_pinned() && !live.is_torrent(&self.info_hash) {
+            let freed = self.reclaim_rest(store).await;
+            if freed > 0 {
+                total.get_or_insert_default().reclaimed += freed;
+            }
+        }
+        total
+    }
+
+    /// A slack pass over every entity of this torrent that is neither being
+    /// played nor being read, and the pieces outside every entity if the
+    /// torrent itself is neither played nor pinned.
+    ///
+    /// What the switch, the running-low bell and `POST /cache/clean` call:
+    /// the same passes the tick would run two seconds later, run now,
+    /// because the moment a viewer starts something else is the moment the
+    /// old film became disposable. It takes its own reading of what is
+    /// being played -- it is not inside a tick -- and every door below asks
+    /// again at the unlink.
+    pub(crate) async fn drop_slack(
+        &self,
+        store: &Arc<StoreRegistry>,
+    ) -> Option<crate::retention::RetentionPass> {
+        if matches!(
+            self.handle.run_state(),
+            crate::backend::RunState::Initializing { .. }
+        ) {
+            return None;
+        }
+        let live = self.live.reading();
+        let slack: Vec<(usize, Mode)> = self
+            .files_to_pass(&live)
+            .into_iter()
+            .filter(|(_, mode)| *mode == Mode::Slack)
+            .collect();
+        let mut total = self.pass_over(store, &slack).await;
+        if !self.is_pinned() && !live.is_torrent(&self.info_hash) {
+            let freed = self.reclaim_rest(store).await;
+            if freed > 0 {
+                total.get_or_insert_default().reclaimed += freed;
+            }
+        }
+        total
+    }
+
+    /// One pass per file, in the order given, each under its own turn.
+    ///
+    /// The file's turn from the first line of its pass to the last
+    /// ([`Retention::turn`] then [`Retention::pass`]), and released before
+    /// the next file's is taken (rule 4 of the owner: no two turns at once).
+    async fn pass_over(
+        &self,
+        store: &Arc<StoreRegistry>,
+        files: &[(usize, Mode)],
+    ) -> Option<crate::retention::RetentionPass> {
         let mut total: Option<crate::retention::RetentionPass> = None;
-        for file_idx in self.files_to_pass() {
-            let Some(claim) = self.retention.turn(&file_idx).await else {
+        for (file_idx, mode) in files {
+            let Some(claim) = self.retention.turn(file_idx).await else {
                 continue;
             };
-            let Some(concluded) = self.retention.pass(&file_idx, store, claim).await.concluded
+            let Some(concluded) = self
+                .retention
+                .pass(file_idx, store, claim, *mode)
+                .await
+                .concluded
             else {
                 continue;
             };
@@ -1419,6 +1433,68 @@ impl<H: TorrentHandle> Engine<H> {
             total.withdrawn += concluded.withdrawn;
         }
         total
+    }
+
+    /// Take the pieces no entity's extent covers off the disk, and say how
+    /// many went.
+    ///
+    /// The pass walks entities, and an entity exists for a file something
+    /// opened. What a torrent holds of the files nothing ever opened -- a
+    /// season the swarm filled around the one episode that was watched, a
+    /// resume bitfield's worth of a restored torrent -- is in no pass's
+    /// extent and so in no pass's reclaim, and on a torrent nobody is
+    /// playing and nobody has pinned there is nothing that would ever want
+    /// it again.
+    ///
+    /// Held back before it is unlinked, run by run, like every other
+    /// deletion here: there is no un-Have. And the liveness cell is read
+    /// again before every run rather than carried in from the caller's
+    /// reading -- a viewer who opens this torrent again mid-delete stops it
+    /// where it stands, and the entity their open installs keeps the rest.
+    ///
+    /// One at a time per engine (`rest`): the tick and the switch task both
+    /// call it, and two of them offering librqbit the same run would have
+    /// the second unlink what the first had already claimed.
+    async fn reclaim_rest(&self, store: &Arc<StoreRegistry>) -> usize {
+        let _rest = self.rest.lock().await;
+        if !matches!(
+            self.handle.run_state(),
+            crate::backend::RunState::Live | crate::backend::RunState::Paused
+        ) {
+            return 0;
+        }
+        let Some(held) = store.held(&self.info_hash) else {
+            return 0;
+        };
+        let extents: Vec<Range<u32>> = self
+            .retention
+            .holdings()
+            .into_iter()
+            .map(|(_, holding)| holding.extent)
+            .collect();
+        let outside: Vec<u32> = held
+            .all()
+            .into_iter()
+            .filter(|piece| !extents.iter().any(|extent| extent.contains(piece)))
+            .collect();
+        let mut freed = 0;
+        for run in crate::retention::runs(&outside) {
+            if self.live.is_torrent(&self.info_hash) || self.is_pinned() {
+                break;
+            }
+            if let Err(error) = self.handle.set_pieces_advertised(run.clone(), false).await {
+                tracing::warn!(
+                    info_hash = %self.info_hash,
+                    first = run.start,
+                    end = run.end,
+                    error = %format!("{error:#}"),
+                    "could not hold a slack torrent's pieces back from what we announce; leaving their bytes"
+                );
+                continue;
+            }
+            freed += crate::retention::release(&self.handle, store, &self.info_hash, run).await;
+        }
+        freed
     }
 
     /// What this engine tells the cache cleaner it may take -- **asked by
@@ -1456,10 +1532,11 @@ impl<H: TorrentHandle> Engine<H> {
     /// the answer, in file order, so two callers reading the same cells get
     /// the same gate and the same files.
     pub(crate) async fn standing(&self) -> Standing {
-        // One copy-out for the gate and the files: a gate built from one
-        // reading and files listed from another could name a turn the gate
-        // was not built under.
-        let policies = self.standing_policies();
+        // One copy-out for the gate and the files, and one reading of what
+        // is being played for both: a gate built from one reading and files
+        // listed from another could name a turn the gate was not built
+        // under.
+        let policies = self.standing_policies(&self.live.reading());
         if self.is_pinned() {
             return Standing {
                 gate: crate::retention::TorrentGate::Announced,
@@ -1486,7 +1563,7 @@ impl<H: TorrentHandle> Engine<H> {
                         file_idx: policy.file_idx,
                         pieces: policy.view.pieces.clone(),
                         committed: policy.view.committed.clone(),
-                        live: true,
+                        live: policy.mode == Mode::Live,
                     })
                     .collect(),
             )

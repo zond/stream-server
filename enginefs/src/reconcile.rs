@@ -1,11 +1,11 @@
 //! Whether a torrent should be running, recomputed from what is true now.
 //!
 //! There is one persisted pause bit in the backend and there are two
-//! policies that pause: the idle one (nothing playing and seeding turned
-//! off) and the free-space one (the volume the torrent writes to is under
-//! [`CACHE_FREE_SPACE_FLOOR`]). A starting playback must lift the first and
-//! must not lift the second, so every earlier round of this code kept an
-//! in-memory record of *why* a torrent was paused -- `Engine::idle_paused`,
+//! reasons to pause: nothing is playing it and nobody pinned it, and the
+//! volume the torrent writes to is under [`CACHE_FREE_SPACE_FLOOR`]. A
+//! starting playback must lift the first and must not lift the second, so
+//! every earlier round of this code kept an in-memory record of *why* a
+//! torrent was paused -- `Engine::idle_paused`,
 //! `Engine::stopped_for_space`, the backend's own set of the hashes it
 //! idle-paused -- and asked that record before acting.
 //!
@@ -51,14 +51,19 @@ pub enum Decision {
     Leave,
 }
 
-/// What made a decision be taken now. It changes three things -- which
-/// free-space line the volume is measured against ([`line`]), whether the
-/// anti-flap dwell applies, and whether the idle arm is walked at all
-/// ([`verdict`]) -- and all three differences are the same difference: a
-/// decision taken because *somebody is waiting for it* is answering a
-/// person, while a decision taken by the timer is answering nobody. The
-/// third is the one that is not a concession but a correctness rule: the
-/// idle arm reads registers the asker may still be writing.
+/// What made a decision be taken now. It changes two things -- which
+/// free-space line the volume is measured against ([`line`]) and whether
+/// the anti-flap dwell applies -- and both differences are the same
+/// difference: a decision taken because *somebody is waiting for it* is
+/// answering a person, while a decision taken by the timer is answering
+/// nobody.
+///
+/// It changed a third thing until the idle arm went: whether that arm was
+/// walked at all, which was a correctness rule rather than a concession,
+/// because the arm read registers the asker was still writing. Nothing
+/// below the free-space arm reads the trigger now -- what is playing is a
+/// value written before anything asks ([`crate::retention::live`]) -- so
+/// the ladder answers the same question to everyone.
 ///
 /// [`line`]: line
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,8 +112,16 @@ pub struct Conditions {
     /// [`Self::run_state`], which is about the backend's state machine and
     /// nothing to do with this process: see [`desired`]'s first two arms.
     pub settled: bool,
-    /// A stream, a file read or a multi-file selection is live on this
-    /// torrent.
+    /// This torrent is the one being played
+    /// ([`crate::retention::live`]), or a read is still delivering bytes
+    /// off it.
+    ///
+    /// A value with one writer and no expiry, and not a clock: a viewer who
+    /// pauses for an hour is still watching this torrent, and what says
+    /// otherwise is their opening something else. The reads are here
+    /// because stopping a torrent under a body still being delivered
+    /// stalls it -- an in-flight response is not what a viewer is watching,
+    /// but it is a reason not to take the torrent away.
     pub playing: bool,
     /// Some file of it is pinned as an offline download.
     pub pinned: bool,
@@ -122,27 +135,6 @@ pub struct Conditions {
     /// Free bytes on the volume the torrent writes to, or `None` when the
     /// probe failed. `None` is "unknown", never "full".
     pub available: Option<u64>,
-    /// How long since anything was **using** this torrent -- a stream, a
-    /// file read, a multi-file selection.
-    ///
-    /// `None` for a torrent nothing has been seen using at all -- a
-    /// restored one, most often, since a torrent a previous process left
-    /// behind comes back with no reading this process can vouch for
-    /// (`Engine::forget_last_active`). That is an absence, not a zero and
-    /// not a fresh `now`: filling it in would claim the torrent was active
-    /// at boot and hand it a whole grace period on every restart, which is
-    /// the same claim every record this design deleted was making. A
-    /// torrent *this* process added is stamped with its creation instant,
-    /// which is a real observation -- nothing can have used it in an
-    /// interval that did not exist.
-    ///
-    /// It is **not** the registry's idle-eviction clock, which counts
-    /// lookups: see `Engine::last_active_at`.
-    ///
-    /// The idle arm reads `None` as quiet: a torrent nobody is watching may
-    /// be paused whether or not we can say for how long, and after a restart
-    /// there is no recent stream for the grace to protect.
-    pub idle_for: Option<Duration>,
 }
 
 /// Whether this torrent should be running, from the conditions alone.
@@ -191,20 +183,24 @@ pub struct Conditions {
 ///    volume to zero. A finished torrent writes nothing and so is never
 ///    stopped by this arm. Which line, and what an unreadable probe means,
 ///    is `line` and [`volume_is_short`].
-/// 6. **Playing or pinned -> [`Decision::Run`].** Someone is watching it,
-///    or someone asked for it offline.
-/// 7. **Seeding off and idle, on a [`Trigger::Timer`] -> [`Decision::Stop`].**
-///    The idle policy: with seeding disabled and nothing playing, what a
-///    running torrent is doing is fetching a film nobody is watching while
-///    we have promised to upload nothing. `crate::INACTIVE_TORRENT_PAUSE_GRACE`
-///    of quiet first, so a player that stops one segment and starts the next
-///    does not stop and start the torrent with it -- and a torrent nothing
-///    has been seen using at all ([`Conditions::idle_for`] `None`, a restored
-///    one) counts as quiet, because there is no recent stream for the grace
-///    to protect. The only arm the trigger can switch off, and the reason is
-///    that this is the only arm whose inputs the *asker* is still writing:
-///    see the comment on it.
-/// 8. Otherwise **[`Decision::Run`]**.
+/// 6. **Playing or pinned -> [`Decision::Run`], otherwise
+///    [`Decision::Stop`].** Someone is watching it, or someone asked for it
+///    offline; and if neither, a running torrent is fetching a film nobody
+///    is watching, into a cache whose next pass will delete every byte of
+///    it. So it is stopped, seeding on or off.
+///
+///    There was a seventh arm here -- the idle one -- with a grace period,
+///    a `last_active_at` stamp per engine and a [`Trigger`] gate to keep it
+///    from reading registers its own asker was still writing. All three
+///    were scaffolding round a clock that was standing in for a fact, and
+///    the fact is now readable: [`Conditions::playing`] is the liveness
+///    value ([`crate::retention::live`]), written once when the server sees
+///    a stream open and not by anything a request leaves behind. A viewer
+///    who pauses keeps their torrent running and their window intact for as
+///    long as they like; a viewer who opens something else loses both at
+///    the next tick. Seeding is what a *pinned* torrent does, and pins are
+///    kept: with nothing playing and nothing pinned there is nothing to
+///    seed from, because the bytes are going.
 pub fn desired(conditions: &Conditions, trigger: Trigger) -> Decision {
     verdict(conditions, trigger).decision
 }
@@ -269,35 +265,19 @@ pub fn verdict(conditions: &Conditions, trigger: Trigger) -> Verdict {
             Trigger::PlaybackStart => Decision::Run,
         });
     }
-    if conditions.playing || conditions.pinned {
-        return arm(Decision::Run);
-    }
-    // `None` is quiet: nothing has been seen using this torrent, so there is
-    // no recent stream for the grace period to protect.
-    let quiet = conditions
-        .idle_for
-        .is_none_or(|idle| idle >= crate::INACTIVE_TORRENT_PAUSE_GRACE);
-    // And the idle policy is the timer's alone. `PlaybackStart` means
-    // somebody is about to open a reader on *this* torrent, and "nothing
-    // is playing" is never an answer to that: `playing` is read from
-    // registers the caller may still be in the middle of writing, so a
-    // caller that asks before it has finished registering gets the very
-    // torrent it named stopped under it. `BackendEngineFS::focus_torrent`
-    // is such a caller -- it writes no register at all -- and was safe
-    // only because the one production call site happens to run
-    // `on_stream_start` two lines earlier.
-    //
-    // The alternative was to let that caller stamp `Engine::last_active_at`
-    // for itself, which buys the same answer by *inventing* the reading the
-    // idle arm then treats as an observation, and buys it for a whole
-    // `crate::INACTIVE_TORRENT_PAUSE_GRACE`. This costs one tick instead: a
-    // torrent started for a reader that never comes is stopped by the next
-    // `Timer` pass, `RECONCILE_INTERVAL` later, from registers that were
-    // actually read.
-    if trigger == Trigger::Timer && !conditions.seeding_enabled && quiet {
-        return arm(Decision::Stop);
-    }
-    arm(Decision::Run)
+    // Nothing below reads the trigger. A `PlaybackStart` is a caller
+    // saying somebody is about to open a reader on this torrent, and it
+    // used to have to switch the idle arm off, because that arm read
+    // registers the caller was still in the middle of writing. The liveness
+    // cell is written by `on_stream_start` before it asks anything, so the
+    // answer is the same whoever is asking, and `focus_torrent` -- which
+    // registers nothing at all -- is safe on its own account rather than by
+    // running two lines after something else.
+    arm(if conditions.playing || conditions.pinned {
+        Decision::Run
+    } else {
+        Decision::Stop
+    })
 }
 
 /// The free-space arm of [`desired`] on its own: whether the volume this
@@ -491,7 +471,7 @@ fn resume_line() -> u64 {
 /// guarded is `Session::pause`, which flushes the session's persistence
 /// file before it returns, so every torrent's decision waited on every
 /// other torrent's disk write. A playback starting on one hash could sit
-/// behind the idle arm's slow stop of an unrelated one.
+/// behind a slow stop of an unrelated one.
 ///
 /// Entries live only while a caller holds or waits for one, exactly as
 /// `BackendEngineFS::pin_locks` does, so an engine that reconciles a
@@ -558,7 +538,6 @@ impl Drop for HashLockGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::INACTIVE_TORRENT_PAUSE_GRACE;
 
     const TEST_HASH: &str = "0123456789abcdef0123456789abcdef01234567";
     const OTHER_HASH: &str = "fedcba9876543210fedcba9876543210fedcba98";
@@ -688,21 +667,71 @@ mod tests {
         assert_eq!(volumes.data_folder(), Path::new("/downloads/.pieces"));
     }
 
-    /// A torrent with nothing wrong with it: running, alive, watched by
-    /// nobody, on a roomy volume, with seeding on. Every test below changes
-    /// the one condition it is about.
+    /// A torrent with nothing wrong with it: running, alive, being played,
+    /// on a roomy volume, with seeding on. Every test below changes the one
+    /// condition it is about.
+    ///
+    /// `playing` is part of "nothing wrong with it" now. A torrent nobody
+    /// is playing and nobody has pinned is one the ladder stops -- its
+    /// bytes are the retention owner's to delete, so there is nothing for
+    /// it to fetch and nothing to seed from.
     fn healthy() -> Conditions {
         Conditions {
             run_state: RunState::Live,
             settled: true,
-            playing: false,
+            playing: true,
             pinned: false,
             seeding_enabled: true,
             has_metadata: true,
             finished: false,
             available: Some(u64::MAX),
-            idle_for: Some(Duration::ZERO),
         }
+    }
+
+    /// The ladder's own bottom, and the arm that replaced the idle one: a
+    /// torrent nobody is playing and nobody has pinned is stopped, seeding
+    /// on or off, whoever is asking and however recently it was watched.
+    ///
+    /// There is no grace period and no clock. A viewer who pauses is still
+    /// playing this torrent -- the liveness value says so until they open
+    /// something else -- so the wait the grace existed to cover cannot
+    /// happen: what used to look like "a player between two segment reads"
+    /// was a register going quiet, and the register is not what is read any
+    /// more.
+    #[test]
+    fn a_torrent_nobody_plays_and_nobody_pinned_is_stopped() {
+        let left = Conditions {
+            playing: false,
+            ..healthy()
+        };
+        assert_eq!(desired(&left, Trigger::Timer), Decision::Stop);
+        assert_eq!(
+            desired(&left, Trigger::PlaybackStart),
+            Decision::Stop,
+            "the trigger says why the question is asked, never that anything is playing"
+        );
+        assert_eq!(
+            desired(
+                &Conditions {
+                    seeding_enabled: false,
+                    ..left
+                },
+                Trigger::Timer
+            ),
+            Decision::Stop,
+            "and seeding is what a pinned torrent does; this one has no bytes to seed"
+        );
+        assert_eq!(
+            desired(
+                &Conditions {
+                    pinned: true,
+                    ..left
+                },
+                Trigger::Timer
+            ),
+            Decision::Run,
+            "a pin is kept until it is unpinned"
+        );
     }
 
     #[test]
@@ -773,7 +802,7 @@ mod tests {
             has_metadata: false,
             available: Some(0),
             seeding_enabled: false,
-            idle_for: Some(Duration::from_secs(86_400)),
+            playing: false,
             ..healthy()
         };
         assert_eq!(desired(&resolving, Trigger::Timer), Decision::Run);
@@ -818,147 +847,6 @@ mod tests {
         };
         assert_eq!(desired(&unreadable, Trigger::Timer), Decision::Leave);
         assert_eq!(desired(&unreadable, Trigger::PlaybackStart), Decision::Run);
-    }
-
-    /// A torrent nothing has been seen using is quiet, and quiet at once.
-    ///
-    /// This is the case a restart produces: librqbit brings the torrent back,
-    /// nothing has opened a stream on it in this process, and the clock the
-    /// idle arm measures on starts at the process, so there is no reading to
-    /// take. `None` therefore has to mean "long ago" and not "just now".
-    ///
-    /// It went the other way three times. `idle_paused` said who paused a
-    /// torrent and started empty, so a restart read "nobody". `last_accessed`
-    /// said when it was last used and was seeded to the engine's construction,
-    /// so a restart read "a moment ago" -- and a stats poll refreshed it, which
-    /// kept idle torrents downloading all night. Then the seed became the
-    /// process start, which is `0` on this clock and reads as "active at boot",
-    /// handing every restored torrent a fresh grace period on every restart.
-    ///
-    /// The grace period is there to protect a stream that *just* stopped and
-    /// might resume. After a restart there is no such stream, so there is
-    /// nothing to protect and the pause is owed immediately.
-    #[test]
-    fn a_torrent_never_seen_in_use_is_quiet_without_waiting_out_the_grace() {
-        let restored = Conditions {
-            seeding_enabled: false,
-            idle_for: None,
-            ..healthy()
-        };
-        assert_eq!(desired(&restored, Trigger::Timer), Decision::Stop);
-
-        // And the absence is doing the work: the same torrent with a reading
-        // of zero has been used, a moment ago, and keeps its grace.
-        let just_used = Conditions {
-            idle_for: Some(Duration::ZERO),
-            ..restored
-        };
-        assert_eq!(desired(&just_used, Trigger::Timer), Decision::Run);
-    }
-
-    /// Playback and pins outrank the idle policy: the whole reason the idle
-    /// pause is safe is that it never applies to a torrent someone is
-    /// using.
-    #[test]
-    fn playback_and_pins_outrank_the_idle_policy() {
-        let idle_and_unseeded = Conditions {
-            seeding_enabled: false,
-            idle_for: Some(INACTIVE_TORRENT_PAUSE_GRACE),
-            ..healthy()
-        };
-        assert_eq!(desired(&idle_and_unseeded, Trigger::Timer), Decision::Stop);
-        assert_eq!(
-            desired(
-                &Conditions {
-                    playing: true,
-                    ..idle_and_unseeded
-                },
-                Trigger::Timer
-            ),
-            Decision::Run
-        );
-        assert_eq!(
-            desired(
-                &Conditions {
-                    pinned: true,
-                    ..idle_and_unseeded
-                },
-                Trigger::Timer
-            ),
-            Decision::Run
-        );
-    }
-
-    /// The idle arm is the timer's. A `PlaybackStart` is somebody about to
-    /// open a reader on this torrent, and `playing` is read from registers
-    /// that caller may still be writing -- `BackendEngineFS::focus_torrent`
-    /// writes none at all -- so answering "nothing is playing, stop it"
-    /// would stop the very torrent the question was asked about.
-    ///
-    /// Every other arm is the trigger's equal: an unsettled reading, a
-    /// resolving magnet and a volume under the floor answer the same to
-    /// both, and that is the point -- this is the one arm whose inputs the
-    /// asker is in the middle of writing.
-    #[test]
-    fn the_idle_arm_is_the_timers_and_a_playback_start_never_takes_it() {
-        let quiet = Conditions {
-            seeding_enabled: false,
-            idle_for: Some(INACTIVE_TORRENT_PAUSE_GRACE),
-            ..healthy()
-        };
-        assert_eq!(desired(&quiet, Trigger::Timer), Decision::Stop);
-        assert_eq!(desired(&quiet, Trigger::PlaybackStart), Decision::Run);
-
-        // A torrent nothing has ever been seen using -- a restored one --
-        // is the same: quiet for the timer, owed to the asker.
-        let never_seen = Conditions {
-            idle_for: None,
-            ..quiet
-        };
-        assert_eq!(desired(&never_seen, Trigger::Timer), Decision::Stop);
-        assert_eq!(desired(&never_seen, Trigger::PlaybackStart), Decision::Run);
-
-        // The concession stops at this arm. A volume under the floor still
-        // stops the torrent the asker is waiting for.
-        let starving = Conditions {
-            available: Some(CACHE_FREE_SPACE_FLOOR - 1),
-            ..quiet
-        };
-        assert_eq!(desired(&starving, Trigger::PlaybackStart), Decision::Stop);
-    }
-
-    /// The idle arm needs both halves -- seeding off *and* quiet for the
-    /// grace -- and the grace is a real wait, not a formality: a player
-    /// between two segment reads must not stop and start the torrent.
-    #[test]
-    fn the_idle_arm_needs_seeding_off_and_the_whole_grace() {
-        let quiet = Conditions {
-            seeding_enabled: false,
-            idle_for: Some(INACTIVE_TORRENT_PAUSE_GRACE),
-            ..healthy()
-        };
-        assert_eq!(desired(&quiet, Trigger::Timer), Decision::Stop);
-        assert_eq!(
-            desired(
-                &Conditions {
-                    idle_for: Some(INACTIVE_TORRENT_PAUSE_GRACE - Duration::from_millis(1)),
-                    ..quiet
-                },
-                Trigger::Timer
-            ),
-            Decision::Run
-        );
-        assert_eq!(
-            desired(
-                &Conditions {
-                    seeding_enabled: true,
-                    idle_for: Some(Duration::from_secs(86_400)),
-                    ..quiet
-                },
-                Trigger::Timer
-            ),
-            Decision::Run
-        );
     }
 
     /// The hysteresis, from both ends. A running torrent is measured

@@ -1083,6 +1083,23 @@ async fn stream_video_with(
     // measured against (`reconcile::line`), so the gate and the ladder
     // cannot disagree about this request -- which is what the stored
     // `stopped_for_space` bit this replaced could not manage.
+    //
+    // --- Stream Lifecycle: registered before either disk gate. ---
+    // Registration and the guard that ends it, with no await between them,
+    // so a cancelled request never leaves a stream registered that nothing
+    // is holding. See `StreamLifecycleGuard::start`.
+    //
+    // **Before the gates, and that is the point.** Registering the stream
+    // is what makes the file the viewer just left slack, and a slack entity
+    // is bytes this server is about to give back. Asking "is there room?"
+    // first asked it of a volume still holding the previous film, so a
+    // switch on a full disk answered `507` for space that was already
+    // ours -- and the refusal took the registration down with it, so the
+    // next attempt asked the same stale question. A refused request still
+    // moved the live entity, which is right: the viewer really has left the
+    // old one.
+    let lifecycle =
+        StreamLifecycleGuard::start(engine_fs.clone(), info_hash.clone(), idx, stream_id).await;
     if engine.is_stopped_for_space().await {
         tracing::warn!(
             stream_id,
@@ -1140,12 +1157,6 @@ async fn stream_video_with(
         );
     }
 
-    // --- Stream Lifecycle: Notify start only after validation has succeeded. ---
-    // Registration and the guard that ends it, with no await between them,
-    // so a cancelled request never leaves a stream registered that nothing
-    // is holding. See `StreamLifecycleGuard::start`.
-    let lifecycle =
-        StreamLifecycleGuard::start(engine_fs.clone(), info_hash.clone(), idx, stream_id).await;
     if !native_lifecycle {
         engine_fs
             .activate_multifile_file_for_playback(

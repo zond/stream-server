@@ -335,6 +335,12 @@ impl HeldSnapshot {
         held
     }
 
+    /// Every held piece, ascending: what a reclaim of the files nothing
+    /// has opened this session starts from.
+    pub fn all(&self) -> BTreeSet<u32> {
+        self.in_range(0..self.layout.piece_count())
+    }
+
     /// How many pieces are held.
     pub fn count(&self) -> u32 {
         self.bits.iter().map(|w| w.count_ones()).sum()

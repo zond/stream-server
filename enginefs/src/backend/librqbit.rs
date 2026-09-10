@@ -4292,6 +4292,9 @@ mod tests {
             dir.clone(),
         );
         efs.set_free_space_probe(move |_| Ok(probe.load(Ordering::SeqCst)));
+        // Being played, so the only arm that can move it is the free-space
+        // one -- which is the arm the unsettled reading has to hold back.
+        plays(&efs, &hash);
 
         // Inside the window, on a volume with nothing free.
         assert_eq!(
@@ -4412,6 +4415,21 @@ mod tests {
         (efs, hash)
     }
 
+    /// The server saw a stream open on file 0 of this torrent: what makes
+    /// it the entity being played, and so one the ladder keeps running.
+    /// Without it a restored torrent is one nobody is watching, which the
+    /// ladder stops and the retention passes empty.
+    #[cfg(test)]
+    fn plays(efs: &crate::BackendEngineFS<LibrqbitBackend>, hash: &str) {
+        efs.live().open(
+            crate::retention::live::LiveEntity::Torrent {
+                info_hash: hash.to_lowercase(),
+                file_idx: 0,
+            },
+            false,
+        );
+    }
+
     /// What the torrent is doing, from the engine registry -- never
     /// `is_paused()`, which across an initial check is wrong in both
     /// directions.
@@ -4451,31 +4469,6 @@ mod tests {
         let (efs, hash) = restarted_over_a_stopped_torrent(&tmp.path().join("dl")).await;
 
         efs.pin_download(&hash, 0, None).await.expect("the pin");
-
-        assert_eq!(restored_run_state(&efs, &hash).await, RunState::Live);
-    }
-
-    /// The same of `focus_torrent`, the third of the three dead sites.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn focusing_after_a_restart_starts_the_stopped_torrent() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (efs, hash) = restarted_over_a_stopped_torrent(&tmp.path().join("dl")).await;
-
-        efs.focus_torrent(&hash).await;
-
-        assert_eq!(restored_run_state(&efs, &hash).await, RunState::Live);
-    }
-
-    /// And of the seeding switch. The user turns seeding back on after a
-    /// restart; every torrent the last process had stopped for want of it
-    /// must seed again, and on master none of them did.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn re_enabling_seeding_after_a_restart_starts_the_stopped_torrent() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (efs, hash) = restarted_over_a_stopped_torrent(&tmp.path().join("dl")).await;
-        efs.seeding_enabled.store(false, Ordering::Relaxed);
-
-        efs.set_seeding_enabled(true).await;
 
         assert_eq!(restored_run_state(&efs, &hash).await, RunState::Live);
     }
@@ -5007,108 +5000,6 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-    }
-
-    /// The medium finding's own scenario, end to end over a real session:
-    /// seeding is off, the stream stops, the idle grace passes -- and the
-    /// torrent must not be downloading any more.
-    ///
-    /// The policy half of this (when the idle arm decides `Stop`) is
-    /// pinned by the fake-backend tests in `lib.rs`; what those could not
-    /// see is that the call did nothing. Measured before the fix, with the
-    /// engine marked
-    /// `idle_paused` and the free-space probe pinned at zero bytes free: the
-    /// torrent went 3 MiB -> 12 MiB over the next three seconds, because the
-    /// free-space watch skips an engine that claims to be paused and nothing
-    /// else was stopping it. So this test asserts about the bytes, not about
-    /// a counter of trait calls.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn seeding_off_and_a_stream_that_ended_stops_the_torrent_fetching() {
-        /// The floor on the measurement window, as in
-        /// `the_idle_pause_stops_fetching_and_the_resume_keeps_the_pieces`.
-        const WINDOW: Duration = Duration::from_secs(2);
-        let src = tempfile::tempdir().unwrap();
-        let payload = src.path().join("payload.bin");
-        write_payload(&payload, 8 * 1024 * 1024).await;
-        let (torrent_bytes, hash) = make_torrent(&payload).await;
-        let seeder = slow_seeder(src.path(), &torrent_bytes, 128 * 1024).await;
-        let seeder_addr = seeder.listen_addr().expect("the seeder listens");
-
-        let dl = tempfile::tempdir().unwrap();
-        let backend = LibrqbitBackend::new_for_tests(dl.path().to_path_buf())
-            .await
-            .expect("hermetic session");
-        // Straight to the session, for `initial_peers` -- the only peer
-        // this session will ever know.
-        let response = backend
-            .session
-            .add_torrent(
-                librqbit::AddTorrent::from_bytes(bytes::Bytes::from(torrent_bytes.clone())),
-                Some(librqbit::AddTorrentOptions {
-                    overwrite: true,
-                    initial_peers: Some(vec![seeder_addr]),
-                    ..Default::default()
-                }),
-            )
-            .await
-            .expect("add torrent");
-        let (librqbit::AddTorrentResponse::Added(_, inner)
-        | librqbit::AddTorrentResponse::AlreadyManaged(_, inner)) = response
-        else {
-            panic!("expected the torrent to be added");
-        };
-        let handle = backend.wrap(inner);
-
-        let efs = crate::BackendEngineFS::new_with_backend(
-            backend,
-            HashMap::from([(hash.clone(), handle.clone())]),
-            dl.path().join("cache"),
-            dl.path().to_path_buf(),
-        );
-        // What the user turned off, and what the viewer just did: a stream
-        // that starts and then ends.
-        efs.seeding_enabled.store(false, Ordering::Relaxed);
-        efs.on_stream_start(&hash, 0).await;
-        efs.on_stream_end(&hash, 0).await;
-
-        // The precondition: with the stream over and the want-set it left
-        // behind, this torrent is still pulling bytes off the seeder --
-        // the state the finding describes, and without it there would be
-        // nothing here for the pause to stop. On a bound, not a fixed
-        // window, and the time it takes is also the width of the frozen
-        // window below, so a loaded runner stretches both together.
-        let window = wait_for_a_fetched_byte(&handle).await.max(WINDOW);
-
-        // Now the grace, as a clock reading rather than as wall time: this
-        // session has real sockets and real check threads, so it cannot run
-        // under a paused clock, and sitting out the shipped
-        // `INACTIVE_TORRENT_PAUSE_GRACE` would add its whole length to the
-        // suite and say nothing more.
-        efs.reconcile_tick_at(crate::INACTIVE_TORRENT_PAUSE_GRACE.as_secs() + 1)
-            .await;
-        assert_eq!(
-            handle.run_state(),
-            RunState::Paused,
-            "seeding is off, the stream is over and the grace has passed, so the \
-             reconciler must have stopped the torrent"
-        );
-
-        // And the bytes agree with the state. `progress_bytes` is the have
-        // count, which a pause keeps and a fetch grows.
-        let at_pause = handle.handle.stats().progress_bytes;
-        tokio::time::sleep(WINDOW).await;
-        let after = handle.handle.stats().progress_bytes;
-        assert_eq!(
-            after,
-            at_pause,
-            "an idle-paused torrent fetched {} more bytes across {window:?}",
-            after.saturating_sub(at_pause)
-        );
-        assert!(
-            !handle.handle.stats().finished,
-            "the torrent finished on its own; the payload is too small for this test \
-             to mean anything"
-        );
     }
 
     /// `source_info_hash` reads the same hash the add would manage, from a
@@ -7311,7 +7202,8 @@ mod tests {
         efs.set_free_space_probe(|_| Ok(u64::MAX));
 
         // Before the want-set is back: the reconciler leaves it stopped,
-        // whatever else is true of it.
+        // whatever else is true of it -- including somebody playing it.
+        plays(&efs, &hash);
         assert_eq!(
             efs.reconcile_tick().await,
             vec![(hash.clone(), crate::reconcile::Decision::Stop)],
@@ -7535,6 +7427,7 @@ mod tests {
             client_dir.clone(),
         );
         efs.set_free_space_probe(|_| Ok(u64::MAX));
+        plays(&efs, &hash);
 
         assert_eq!(
             efs.reconcile_tick().await,
@@ -7557,191 +7450,6 @@ mod tests {
         assert!(
             stats.finished && stats.progress_bytes == stats.total_bytes,
             "the restart found every piece again: {stats}"
-        );
-    }
-
-    /// The other side of that restart, and the one nothing on this branch
-    /// covered: with seeding turned off, a torrent the last process left
-    /// stopped is stopped again -- at once, because there is no reading of
-    /// when it was last used to measure a grace from.
-    ///
-    /// The reconciler starts anything the ladder says should run, the
-    /// previous process's pause included -- that is the point of it -- so
-    /// the only thing standing between "seeding is off and nobody is
-    /// watching" and a restart that leaves every torrent there is running
-    /// is the idle arm, and the idle arm's grace is measured from
-    /// `Engine::last_active_at`. Two seeds for it were wrong before this
-    /// one. Per engine at the clock read as "used a moment ago" for as long
-    /// as the engine lived, so the arm could not fire until a grace after
-    /// each engine appeared. The process's own epoch is `0` on this clock
-    /// (`Clock::now_secs` is `epoch.elapsed()`), which reads as "used at
-    /// boot" and hands every restored torrent a fresh grace on every
-    /// restart -- so an app that restarts often never idle-pauses anything.
-    ///
-    /// Both were the same mistake: a value this process invented at startup,
-    /// read back as an observation. There is no reading to take for a
-    /// torrent the last process left, so `quiet_for` answers `None` and the
-    /// idle arm treats it as quiet. The pause is owed at once, which is what
-    /// this test asserts at the epoch.
-    ///
-    /// Nothing is lost by not waiting. The grace protects a stream that just
-    /// stopped and might resume; a restart has no such stream. A viewer who
-    /// does resume gets a `PlaybackStart` reconcile, which starts the
-    /// torrent -- a moment of latency instead of a guaranteed grace of
-    /// downloading nobody asked for.
-    ///
-    /// Driven over a real persisted session because the restart is where
-    /// the defect lives, and asserted on `run_state` and on the backend's
-    /// own byte counters, never on a flag this code wrote. The clock
-    /// reading is handed in (`reconcile_tick_at`) because a real librqbit
-    /// session cannot run under a paused clock, and sitting out the grace
-    /// in wall time would put it in every run of the suite.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_restart_with_seeding_off_stops_what_the_last_process_left_without_waiting() {
-        use crate::backend::TorrentBackend;
-        let tmp = tempfile::tempdir().unwrap();
-
-        let content = tmp.path().join("content");
-        tokio::fs::create_dir_all(&content).await.unwrap();
-        write_payload(&content.join("movie.bin"), 256 * 1024).await;
-        let (torrent_bytes, _hash) = make_torrent(&content.join("movie.bin")).await;
-
-        let client_dir = tmp.path().join("client");
-        let opts = || TestSessionOptions {
-            default_storage: Some(reclaimable_storage()),
-            store_registry: None,
-            persist: true,
-            listen_loopback: true,
-        };
-
-        // First run: the torrent is added and persisted, incomplete.
-        {
-            let (backend, restored) =
-                LibrqbitBackend::new_for_tests_with(client_dir.clone(), opts())
-                    .await
-                    .unwrap();
-            assert!(restored.is_empty(), "nothing to restore yet");
-            let handle = backend
-                .add_torrent(TorrentSource::Bytes(torrent_bytes.clone()), vec![])
-                .await
-                .unwrap();
-            handle.handle.wait_until_initialized().await.unwrap();
-            let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
-            let session_json = client_dir.join("session.json");
-            while !session_json.exists() && std::time::Instant::now() < deadline {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            assert!(session_json.exists(), "the session was persisted");
-        }
-
-        // The restart, with the user's seeding switch off.
-        let (backend, restored) = LibrqbitBackend::new_for_tests_with(client_dir.clone(), opts())
-            .await
-            .unwrap();
-        assert_eq!(restored.len(), 1, "the torrent came back");
-        let hash = restored.keys().next().unwrap().clone();
-        restored[&hash]
-            .handle
-            .wait_until_initialized()
-            .await
-            .unwrap();
-        let client_addr = backend
-            .session
-            .listen_addr()
-            .expect("the client listens for the seeder");
-
-        let mut efs = crate::BackendEngineFS::new_with_backend(
-            backend,
-            restored,
-            client_dir.join("cache"),
-            client_dir.clone(),
-        );
-        efs.set_free_space_probe(|_| Ok(u64::MAX));
-        efs.set_seeding_enabled(false).await;
-
-        // The want-set is back, so `settled` is not what is holding it or
-        // letting it go: what decides is how long nothing has used it.
-        efs.restore_pinned_downloads().await;
-        let grace = crate::INACTIVE_TORRENT_PAUSE_GRACE.as_secs();
-        let engine = efs.get_engine(&hash).await.expect("the restored engine");
-
-        // At the process's own epoch, with nothing ever seen using this
-        // torrent, the idle arm already fires: there is no reading to
-        // measure a grace from, and a grace invented here would be the
-        // "active at boot" claim this seed exists to refuse.
-        assert_eq!(
-            efs.reconcile_tick_at(0).await,
-            vec![(hash.clone(), crate::reconcile::Decision::Stop)],
-            "seeding is off and nothing has ever used this torrent"
-        );
-        assert_eq!(
-            engine.handle.run_state(),
-            RunState::Paused,
-            "and the reconciler really did stop it"
-        );
-
-        // Still stopped a grace later: the decision does not depend on how
-        // long the process has been up, which is what the old seeds made it
-        // depend on.
-        assert_eq!(
-            efs.reconcile_tick_at(grace).await,
-            vec![(hash.clone(), crate::reconcile::Decision::Stop)],
-            "and it stays stopped; the decision does not turn on uptime"
-        );
-        assert_eq!(
-            engine.handle.run_state(),
-            RunState::Paused,
-            "and it really is stopped"
-        );
-
-        // A seeder with the whole file dials it, exactly as one would after
-        // a restart that announced. A started torrent would take the bytes.
-        let seeder = librqbit::Session::new_with_opts(
-            content.clone(),
-            librqbit::SessionOptions {
-                dht: None,
-                persistence: None,
-                listen: Some(librqbit::ListenerOptions {
-                    listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("seeder session");
-        seeder
-            .add_torrent(
-                librqbit::AddTorrent::from_bytes(bytes::Bytes::from(torrent_bytes.clone())),
-                Some(librqbit::AddTorrentOptions {
-                    paused: false,
-                    output_folder: Some(content.to_str().unwrap().to_owned()),
-                    overwrite: true,
-                    initial_peers: Some(vec![client_addr]),
-                    ..Default::default()
-                }),
-            )
-            .await
-            .expect("seeder add");
-
-        // Two seconds of ticks while the seeder knocks, each one a second
-        // further past the grace, as the timer's own passes would be.
-        for tick in 0..20u64 {
-            assert_eq!(
-                efs.reconcile_tick_at(grace + tick).await,
-                vec![(hash.clone(), crate::reconcile::Decision::Stop)],
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        assert_eq!(
-            engine.handle.run_state(),
-            RunState::Paused,
-            "and it stays stopped while the seeder is knocking"
-        );
-        let stats = engine.handle.handle.stats();
-        assert!(
-            !stats.finished && stats.progress_bytes == 0,
-            "a stopped torrent takes no bytes from the seeder: {stats}"
         );
     }
 
@@ -9357,6 +9065,32 @@ mod tests {
             told.len() < (RETENTION_FILE_BYTES as u64 / RETENTION_PIECE) as usize,
             "the peer was offered the whole torrent, so nothing was ever held back"
         );
+
+        // **And the switch.** The viewer opens something else, so the file
+        // they left is slack: its whole extent is held back from what we
+        // announce *before* a single unlink, and then every byte of it
+        // goes. The committed half is included -- what a switch ends is the
+        // sharing as well as the keeping -- and the order is what keeps a
+        // peer from ever asking for bytes that are no longer there.
+        efs.live().open(
+            crate::retention::live::LiveEntity::Proxy {
+                dir: tmp.path().join("elsewhere"),
+            },
+            false,
+        );
+        let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
+        loop {
+            let ours = on_disk(&store, &hash);
+            if ours.is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the file the viewer left is still on the disk: {ours:?}"
+            );
+            efs.reconcile_tick().await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// **The store the factory registers is the one the pass reads, and

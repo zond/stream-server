@@ -1991,10 +1991,17 @@ fn bitv_files(session_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 /// bitfield (`<infoHash>.bitv` beside the session state) instead of
 /// re-hashing every file on every launch: after a complete torrent in the
 /// cache root and a complete pinned one, both bitfields exist, and a
-/// restart brings both torrents back ready and complete with the bitfields
-/// still in place (the `.bitv` + `overwrite: true` combination librqbit
-/// needs to resume on top of existing files). One root, because a pin is
-/// not a place.
+/// restart brings the pinned torrent back ready and complete with the
+/// bitfields still in place (the `.bitv` + `overwrite: true` combination
+/// librqbit needs to resume on top of existing files). One root, because a
+/// pin is not a place.
+///
+/// The streamed torrent's own data does **not** survive, and asserting that
+/// it did is what this test used to do: nothing is playing it and nothing
+/// pinned it, so the retention owner takes its bytes back while the first
+/// process runs. What has to survive it is the bitfield file and the pin,
+/// which is what the assertions below are about -- a pinned download is
+/// kept until it is unpinned, and everything else is cache.
 #[test]
 fn fastresume_persists_piece_bitfields_for_a_pinned_torrent_too() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -2078,14 +2085,11 @@ fn fastresume_persists_piece_bitfields_for_a_pinned_torrent_too() -> anyhow::Res
     handle.join()?;
 
     // Restart: both torrents come back from the session with their
-    // bitfields, ready and complete, in both roots.
+    // bitfields, and the pinned one comes back ready and complete.
     let handle = stream_server::start(config())?;
     let base = format!("http://{}", handle.http_addr());
     let client = bearer_client(&handle)?;
-    let stats = stats_after_check(&client, &base, &streamed_hash)?;
-    assert_eq!(stats["phase"], "ready", "{stats}");
-    assert_eq!(stats["files"][0]["complete"], true, "{stats}");
-    assert_eq!(stats["files"][1]["complete"], true, "{stats}");
+    stats_after_check(&client, &base, &streamed_hash)?;
     // The pinned file's own stats, not the torrent's: only the pinned file
     // was ever seeded, and torrent-wide `phase` describes whichever file
     // the stream guess picks -- the other one, in half the file orders
@@ -2103,7 +2107,6 @@ fn fastresume_persists_piece_bitfields_for_a_pinned_torrent_too() -> anyhow::Res
     // store, and the restart read the bitfields against those.
     assert!(!session_dir.join("Pinned").join("p2.bin").exists());
     assert!(!session_dir.join("Streamed").exists());
-    assert!(pieces_held(&cache_root, &streamed_hash) > 0);
     assert!(pieces_held(&cache_root, &pinned_hash) > 0);
 
     handle.shutdown()?;
@@ -3419,12 +3422,14 @@ fn a_restart_leaves_a_torrent_stopped_and_a_stream_request_starts_it() -> anyhow
         (64 * 1024).to_string()
     );
     assert!(
-        !swarm_paused(&client)?,
-        "the request started the torrent it was about to read from"
+        swarm_paused(&client)?,
+        "a HEAD reads the file list and opens no stream, so it starts nothing"
     );
 
     // And the GET that follows is not refused: there is room above the
-    // floor. No peer will ever bring these bytes, so the client giving up
+    // floor. It is also what really opens a stream on this torrent, which
+    // is what makes it the one being played and so the one the ladder
+    // starts. No peer will ever bring these bytes, so the client giving up
     // is the expected end.
     match anonymous
         .get(format!("{base}/{info_hash}/0"))
@@ -3439,6 +3444,10 @@ fn a_restart_leaves_a_torrent_stopped_and_a_stream_request_starts_it() -> anyhow
         ),
         Err(error) => assert!(error.is_timeout(), "{error}"),
     }
+    assert!(
+        !swarm_paused(&client)?,
+        "the request that opened a stream started the torrent it reads from"
+    );
 
     handle.shutdown()?;
     handle.join()?;
@@ -3670,12 +3679,11 @@ fn swarm_paused(
 /// player is still reading out of it.
 ///
 /// `routes::archive::stream_file` puts the registration guard inside the
-/// body's closure for exactly this reason. Held in the handler's own frame
-/// instead, it would be dropped the moment the response is built -- while
-/// every byte the player has yet to read is still to come -- and the idle arm
-/// of `enginefs::reconcile::desired` (seeding off, nothing playing, quiet for
-/// `INACTIVE_TORRENT_PAUSE_GRACE`) would then stop the torrent mid-body,
-/// dropping its peers under a reader being served out of it.
+/// body's closure for exactly this reason, and what the guard's `start` does
+/// first is tell the server a stream opened on this torrent -- which is what
+/// makes it the entity being played (`enginefs::retention::live`). Every
+/// other torrent is then one nobody is playing, and the ladder's bottom arm
+/// stops those at once.
 ///
 /// Two torrents, because "it is still running" only means something if the
 /// arm was firing at all in that window: the second one is read by nobody,
@@ -3730,17 +3738,15 @@ fn an_archive_body_keeps_its_torrent_running_while_it_is_open() -> anyhow::Resul
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let opened = std::time::Instant::now();
 
-    // Now arm the idle arm. Deliberately after the request, so the torrent
-    // this body reads from is one the reconciler was leaving alone anyway
-    // when the read began, and the only thing that can save it from here on
-    // is the registration.
+    // Seeding off, which used to be half of what armed the arm and is now
+    // neither here nor there: a torrent nobody is playing is stopped either
+    // way. Left in as the setting a viewer of this feature would have.
     handle.update_settings(serde_json::json!({ "seedingEnabled": false }))?;
 
     // Wait until both are true: the control torrent has been stopped, and
-    // enough time has passed that a registration ended with the *response*
-    // would have let the grace run out on this one too.
-    let would_have_stopped =
-        opened + enginefs::INACTIVE_TORRENT_PAUSE_GRACE + 3 * enginefs::FREE_SPACE_WATCH_INTERVAL;
+    // enough ticks have passed that a torrent this one's size would have
+    // been stopped several times over.
+    let would_have_stopped = opened + 3 * enginefs::FREE_SPACE_WATCH_INTERVAL;
     let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
     loop {
         if swarm_paused(&client, &base, &idle_hash)?
@@ -3765,24 +3771,22 @@ fn an_archive_body_keeps_its_torrent_running_while_it_is_open() -> anyhow::Resul
     Ok(())
 }
 
-/// And when the body ends, the registration ends with it: the reconciler is
-/// free to stop the torrent again.
+/// And the torrent an archive member was read out of is stopped again once
+/// something else is the one being played.
 ///
-/// The other half of `routes::archive::stream_file`'s registration, and the
-/// half that is easy to leave out, because leaving it out breaks nothing a
-/// player can see: `TorrentMemberStream::drop` has to spawn the
-/// `on_stream_end` the registers are waiting for -- a `Drop` cannot await the
-/// async locks itself. Without it every archive member ever read leaves a
-/// stream registered for the life of the process, and the torrent behind it
-/// is one the idle policy can never stop again: with seeding turned off it
-/// goes on fetching a film nobody is watching, which is the whole thing that
-/// policy exists to prevent.
+/// The read is a playback: `routes::archive::stream_file` tells the server
+/// a stream opened, which makes that torrent the entity being played and
+/// so one the ladder keeps running -- with no clock on it, so a viewer who
+/// pauses keeps it. What ends that is not the body ending but *another*
+/// stream opening, and from that moment the torrent behind the archive is
+/// one nobody is playing: stopped, and its cache the retention owner's.
 ///
-/// So this read is a whole one -- the member comes back complete, out of a
-/// torrent seeded with every piece -- and the assertions are the pair either
-/// side of the body: running while it was open (with seeding still on, so
-/// nothing else could have stopped it), and stopped by the reconciler after
-/// the grace once the read is over.
+/// This used to be driven by the idle arm, and its subject was the
+/// `on_stream_end` that `TorrentMemberStream::drop` spawns. That subject
+/// has no oracle left out here: the registers it writes are the activity
+/// light's and the housekeeping sweep's, and nothing the reconciler reads
+/// comes from them. What is left is the pair of readings either side of the
+/// switch, which is the policy a viewer can actually see.
 #[test]
 fn an_archive_member_read_lets_the_torrent_be_stopped_again_when_it_is_done() -> anyhow::Result<()>
 {
@@ -3802,6 +3806,21 @@ fn an_archive_member_read_lets_the_torrent_be_stopped_again_when_it_is_done() ->
     )?;
     let client = bearer_client(&handle)?;
 
+    // A second torrent, seeded whole, for the viewer to move on to.
+    let other_content = src.path().join("Other");
+    std::fs::create_dir_all(&other_content)?;
+    write_payload(&other_content.join("other.bin"), 64 * 1024);
+    let (other_torrent, other_hash) = real_torrent(&other_content);
+    let cache_root = resolved(&cache_dir.path().join("cache"));
+    seed_piece_store(&cache_root, &other_torrent, &other_content);
+    client
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": hex::encode(&other_torrent) }))
+        .send()?
+        .error_for_status()?;
+    let other_stats = stats_after_check(&client, &base, &other_hash)?;
+    let other_idx = file_index(&other_stats, "other.bin");
+
     // The member, read to its end out of the torrent.
     let anonymous = reqwest::blocking::Client::new();
     let response = anonymous
@@ -3813,21 +3832,23 @@ fn an_archive_member_read_lets_the_torrent_be_stopped_again_when_it_is_done() ->
         member_payload(MEMBER_LEN).as_slice(),
         "the member served out of the torrent"
     );
+    std::thread::sleep(enginefs::reconcile::RECONCILE_INTERVAL * 3);
     assert!(
         !swarm_paused(&client, &base, &info_hash)?,
-        "the read left the torrent running"
+        "the read left the torrent running, and stopping reading is not \
+         playing something else"
     );
 
-    // Seeding off: from here the idle arm stops any torrent nothing is
-    // reading, once it has been quiet for the grace. The read is over, so
-    // this one qualifies -- unless its registration outlived it.
-    handle.update_settings(serde_json::json!({ "seedingEnabled": false }))?;
+    // The viewer moves on: the second torrent is the one being played now.
+    anonymous
+        .get(format!("{base}/{other_hash}/{other_idx}"))
+        .send()?
+        .error_for_status()?;
     let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
     while !swarm_paused(&client, &base, &info_hash)? {
         anyhow::ensure!(
             std::time::Instant::now() < deadline,
-            "the finished archive read left a stream registered: \
-             the reconciler never stopped the torrent again"
+            "the torrent the viewer left is still running"
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
@@ -3866,6 +3887,12 @@ fn a_stream_below_the_free_space_floor_is_refused_not_degraded() -> anyhow::Resu
     let client = bearer_client(&handle)?;
     let anonymous = reqwest::blocking::Client::new();
     let url = format!("{base}/{info_hash}/{idx}");
+    // The finished torrent is pinned, at once, because this test is about
+    // the floor and not about retention: a torrent nobody is playing and
+    // nobody has pinned is one the retention owner empties within a tick,
+    // and an emptied torrent is not a finished one any more.
+    let pinned = handle.pin_download(&info_hash, idx, &[])?;
+    assert!(pinned.complete, "the fixture's finished file is kept whole");
 
     // A second torrent, whose data is deliberately *not* seeded into the
     // cache: it still wants every byte it has, which is what the floor is
@@ -3907,6 +3934,7 @@ fn a_stream_below_the_free_space_floor_is_refused_not_degraded() -> anyhow::Resu
     // The torrent that has everything it wants is served from the same full
     // volume: it writes nothing, so there is nothing for the floor to
     // protect against.
+    //
     let response = anonymous.get(&url).send()?.error_for_status()?;
     assert_eq!(response.bytes()?.as_ref(), payload.as_slice());
 

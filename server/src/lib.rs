@@ -1214,6 +1214,25 @@ pub async fn run(
     // starting it again when there is room. One, for the one engine (a
     // second would only race the first for the same torrents).
     background_tasks.push(state.engine.start_reconciler());
+    // And the switch task: the moment a viewer opens something else, what
+    // they left is disposable, and this is what takes it off the disk
+    // without waiting for the next tick. Two seconds does not sound like
+    // much until the thing waiting for the room is the stream that caused
+    // the switch. It watches the one liveness cell
+    // (`enginefs::retention::live`) and calls the same slack passes the
+    // tick would have run.
+    background_tasks.push({
+        let engine = state.engine.clone();
+        let mut changed = engine.live().changed();
+        tokio::spawn(async move {
+            // The value as it is now is not a change; the first `changed`
+            // is the first switch after this task started.
+            changed.mark_unchanged();
+            while changed.changed().await.is_ok() {
+                engine.drop_slack().await;
+            }
+        })
+    });
     // And the cache budget, which is not the cleaner's even though the
     // cleaner used to be the only thing that ever stated one. Unconditional
     // like the DHT health check: a server whose cleaner is switched off

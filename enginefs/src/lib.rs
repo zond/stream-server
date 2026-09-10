@@ -146,34 +146,27 @@ const _: () = assert!(
     METADATA_RESOLVE_TIMEOUT.as_secs() < INACTIVE_TORRENT_REMOVE_TIMEOUT.as_secs(),
     "a waiting magnet add must time out before it can be swept as idle"
 );
-/// How long a torrent must be quiet before the idle arm of
-/// [`crate::reconcile::desired`] stops it (with seeding off).
-///
-/// Public because it is the wait an end-to-end test of that arm has to sit
-/// out: `server`'s embed suite drives the whole loop through a running
-/// server and cannot ask the ladder anything, so it measures its own waits
-/// from here rather than from a copy of the number.
-pub const INACTIVE_TORRENT_PAUSE_GRACE: Duration = Duration::from_secs(15);
-
 /// How long after the reconciler last moved a torrent its *timer* will
 /// leave it stopped -- the anti-flap dwell, applied in
 /// [`BackendEngineFS::start_if_stopped`] and nowhere else.
 ///
-/// The ladder's own lines already carry most of the hysteresis: the
-/// free-space arm measures a stopped torrent against a higher line than a
-/// running one, and the idle arm wants [`INACTIVE_TORRENT_PAUSE_GRACE`] of
-/// quiet. What is left over is an input that moves for reasons of its own
-/// around one of those lines -- a lease that expires and is renewed, a
-/// metadata slot that is briefly unreadable -- and each crossing of it
-/// costs a swarm: a stop drops every peer and a start re-announces to
-/// trackers that enforce a minimum announce interval.
+/// The ladder's own line carries most of the hysteresis: the free-space arm
+/// measures a stopped torrent against a higher line than a running one.
+/// What is left over is an input that moves for reasons of its own around
+/// that line -- a volume a neighbouring process is writing to, a probe that
+/// is briefly unreadable -- and each crossing of it costs a swarm: a stop
+/// drops every peer and a start re-announces to trackers that enforce a
+/// minimum announce interval.
 ///
-/// A whole [`INACTIVE_TORRENT_PAUSE_GRACE`], reusing that number rather
-/// than inventing a second one, because it is the same judgement: how long
-/// this server waits before believing that a torrent's activity has really
-/// changed. Neither a stop nor a playback start goes through it -- see
-/// [`BackendEngineFS::start_if_stopped`] for why each is exempt.
-pub(crate) const RECONCILE_MIN_DWELL: Duration = INACTIVE_TORRENT_PAUSE_GRACE;
+/// Fifteen seconds, which is how long this server waits before believing
+/// that a torrent's conditions have really changed. It used to be spelt as
+/// the idle arm's grace, because it was the same judgement; the idle arm is
+/// gone -- what is playing is a value now
+/// ([`crate::retention::live`]) and not a clock -- and the dwell keeps the
+/// number under its own name. Neither a stop nor a playback start goes
+/// through it: see [`BackendEngineFS::start_if_stopped`] for why each is
+/// exempt.
+pub(crate) const RECONCILE_MIN_DWELL: Duration = Duration::from_secs(15);
 
 /// Instance-relative clock for the idle bookkeeping (engine `last_accessed`,
 /// magnet-add polls). Seconds since the owning
@@ -594,9 +587,19 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     active_streams: Arc<RwLock<HashMap<String, usize>>>,
     /// Track active requests per specific streamed file so cleanup does not race probe retries.
     active_file_streams: Arc<RwLock<HashMap<(String, usize), usize>>>,
-    /// Tracks the most recently active streamed file for legacy diagnostics.
-    /// Active scheduling is driven by active_file_streams so several torrents can stream at once.
-    active_file: Arc<RwLock<Option<(String, usize)>>>,
+    /// Which entity the server is playing: one cell, written by
+    /// [`Self::on_stream_start`] and by the proxy's reader, read by the
+    /// reconciler's ladder, by every retention pass and by the task that
+    /// drops the predecessor's slack. See [`crate::retention::live`].
+    ///
+    /// It replaced a `Option<(String, usize)>` cell of the same shape that
+    /// was written by four callers, cleared by three, rolled back by a
+    /// `Drop` and read by a diagnostics field: a *record* of the last file
+    /// anything selected. This is the same shape used as a *decision* --
+    /// one writer, no rollback, no clearer -- because a stream the server
+    /// saw opened really did leave the previous one behind, whether or not
+    /// the request that opened it survived.
+    live: Arc<crate::retention::live::Live>,
     /// For multi-file torrents, only the latest requested file is allowed to be
     /// wanted at a time. Single-file torrents bypass this selector.
     active_multifile_files: Arc<RwLock<HashMap<String, MultiFileActiveSelection>>>,
@@ -672,6 +675,7 @@ struct EngineParts {
     clock: Clock,
     volumes: Arc<crate::reconcile::Volumes>,
     budget: Arc<crate::retention::RetentionBudget>,
+    live: Arc<crate::retention::live::Live>,
 }
 
 #[derive(Debug, Clone)]
@@ -689,6 +693,9 @@ pub struct ActiveFileStreamSnapshot {
     pub count: usize,
 }
 
+/// The one file the server is playing, as the diagnostics report it. Read
+/// off the liveness cell ([`crate::retention::live`]), which is where that
+/// fact lives.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ActiveFileSnapshot {
     pub info_hash: String,
@@ -804,6 +811,11 @@ pub type EngineFS = BackendEngineFS<LibrqbitBackend>;
 /// multi-file selection only when the file it names has no stream left at
 /// all.
 ///
+/// **It does not un-switch the liveness cell**, and there is nothing here
+/// to roll back: the server saw a stream open on this file, so the file
+/// that was playing before really is the one nobody is playing now, and a
+/// request that died on its way to the disk gate does not bring it back.
+///
 /// **Exactly one of this and the caller's guard ever fires**: returning
 /// from `on_stream_start` is what disarms this, and the caller has no
 /// registration to end until `on_stream_start` has returned. Two owners
@@ -813,7 +825,6 @@ struct StreamStartRollback {
     active_streams: Arc<RwLock<HashMap<String, usize>>>,
     active_file_streams: Arc<RwLock<HashMap<(String, usize), usize>>>,
     active_multifile_files: Arc<RwLock<HashMap<String, MultiFileActiveSelection>>>,
-    active_file: Arc<RwLock<Option<(String, usize)>>>,
     key: (String, usize),
     counted_stream: bool,
     counted_file_stream: bool,
@@ -830,7 +841,6 @@ impl StreamStartRollback {
             active_streams: efs.active_streams.clone(),
             active_file_streams: efs.active_file_streams.clone(),
             active_multifile_files: efs.active_multifile_files.clone(),
-            active_file: efs.active_file.clone(),
             key: (info_hash, file_idx),
             counted_stream: false,
             counted_file_stream: false,
@@ -862,7 +872,6 @@ impl Drop for StreamStartRollback {
         let active_streams = self.active_streams.clone();
         let active_file_streams = self.active_file_streams.clone();
         let active_multifile_files = self.active_multifile_files.clone();
-        let active_file = self.active_file.clone();
         let key = std::mem::take(&mut self.key);
         let counted_stream = self.counted_stream;
         let counted_file_stream = self.counted_file_stream;
@@ -893,18 +902,12 @@ impl Drop for StreamStartRollback {
             // A stream that is still reading this file owns the selection;
             // only a file nothing is left reading gives it up.
             if !file_streams_remain {
+                let mut selections = active_multifile_files.write().await;
+                if selections
+                    .get(&key.0)
+                    .is_some_and(|selection| selection.file_idx == key.1)
                 {
-                    let mut selections = active_multifile_files.write().await;
-                    if selections
-                        .get(&key.0)
-                        .is_some_and(|selection| selection.file_idx == key.1)
-                    {
-                        selections.remove(&key.0);
-                    }
-                }
-                let mut active = active_file.write().await;
-                if active.as_ref() == Some(&key) {
-                    *active = None;
+                    selections.remove(&key.0);
                 }
             }
             tracing::debug!(
@@ -949,6 +952,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         // an add, which carries its want-set with it.
         let restored_unsettled = backend.sets_piece_reclaim();
         let budget = Arc::new(crate::retention::RetentionBudget::default());
+        // Nothing is playing in a process that has served nothing, and that
+        // is what makes the first tick after a restart stop every unpinned
+        // torrent the session restored.
+        let live = Arc::new(crate::retention::live::Live::new());
         let registry = backend.store_registry().unwrap_or_else(|| {
             Arc::new(crate::piece_store::StoreRegistry::new(
                 crate::piece_store::StoreRoot::in_download_dir(&download_dir),
@@ -956,13 +963,14 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         });
         let mut engines_map = HashMap::new();
         for (hash, handle) in restored_handles {
-            let engine =
-                Engine::new_with_handle(handle, &hash, clock, volumes.clone(), budget.clone());
-            // Nothing in this process has used it, and the last one's
-            // reading did not survive -- so there is no reading, which is
-            // not the same as a reading of now. See
-            // `Engine::forget_last_active`.
-            engine.forget_last_active();
+            let engine = Engine::new_with_handle(
+                handle,
+                &hash,
+                clock,
+                volumes.clone(),
+                budget.clone(),
+                live.clone(),
+            );
             if restored_unsettled {
                 engine.mark_unsettled();
             }
@@ -985,7 +993,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             download_dir: download_dir.clone(),
             active_streams: Arc::new(RwLock::new(HashMap::new())),
             active_file_streams: Arc::new(RwLock::new(HashMap::new())),
-            active_file: Arc::new(RwLock::new(None)),
+            live: live.clone(),
             active_multifile_files: Arc::new(RwLock::new(HashMap::new())),
             priority_generation: Arc::new(AtomicU64::new(0)),
             disk_cache: None,
@@ -1010,7 +1018,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let backend_clone = efs.backend.clone();
         let active_streams_clone = efs.active_streams.clone();
         let active_file_streams_clone = efs.active_file_streams.clone();
-        let active_file_clone = efs.active_file.clone();
+        let live_clone = efs.live.clone();
         let active_multifile_files_clone = efs.active_multifile_files.clone();
         let magnet_adds_clone = efs.magnet_adds.clone();
         let clock = efs.clock;
@@ -1084,13 +1092,13 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                                 .map(|(_, count)| *count)
                                 .sum::<usize>()
                         };
-                        let active_file_matches = {
-                            let active = active_file_clone.read().await;
-                            active
-                                .as_ref()
-                                .map(|(stream_hash, _)| stream_hash == hash)
-                                .unwrap_or(false)
-                        };
+                        // The torrent being played is never removed, and
+                        // this is asked of the same cell the reconciler and
+                        // the passes read rather than of a register a
+                        // request happened to leave behind: removing the
+                        // live torrent's engine takes the entity its window
+                        // is drawn round out of the map with it.
+                        let live_here = live_clone.is_torrent(hash);
                         let active_multifile_matches = {
                             let selections = active_multifile_files_clone.read().await;
                             selections.contains_key(hash)
@@ -1108,8 +1116,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                             Some("active_streams")
                         } else if active_file_stream_count > 0 {
                             Some("active_file_streams")
-                        } else if active_file_matches {
-                            Some("active_file")
+                        } else if live_here {
+                            Some("playing")
                         } else if active_multifile_matches {
                             Some("active_multifile_file")
                         } else {
@@ -1152,9 +1160,14 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     }
                     drop(write);
 
-                    // Actually stop the torrents in the backend session
+                    // Actually stop the torrents in the backend session,
+                    // and take their bytes with them: an engine nothing has
+                    // asked about for five minutes is one whose entities
+                    // the slack passes have already emptied, and what it
+                    // leaves behind is a directory nothing in this process
+                    // has a deleter for once its store is gone.
                     for hash in to_remove {
-                        if let Err(e) = backend_clone.remove_torrent(&hash).await {
+                        if let Err(e) = backend_clone.remove_torrent_and_files(&hash).await {
                             tracing::warn!(
                                 info_hash = %hash,
                                 error = %e,
@@ -1249,6 +1262,12 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// once, whatever it stopped and however many: the cache cleaner it
     /// wakes walks every root anyway, so a second ring would only make it
     /// walk them twice.
+    ///
+    /// **One reading of what is being played, for the whole pass.** The
+    /// ladder and the retention pass both consult it, and a value that
+    /// moved between the two would have the reconciler start a torrent that
+    /// the pass then emptied, or stop one whose window the pass had just
+    /// measured. See [`crate::retention::live::Reading`].
     pub async fn reconcile_tick(&self) -> Vec<(String, crate::reconcile::Decision)> {
         self.reconcile_tick_at(self.clock.now_secs()).await
     }
@@ -1270,12 +1289,17 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let mut probed = false;
         let mut decisions = Vec::with_capacity(engines.len());
         let mut stopped_any = false;
+        // Taken once, before the first engine, and handed to both consumers
+        // of every engine: what the ladder calls playing and what the pass
+        // calls live are one reading.
+        let live = self.live.reading();
         for engine in engines {
             if let Some(decision) = self
                 .reconcile_engine(
                     &engine,
                     crate::reconcile::Trigger::Timer,
                     now,
+                    &live,
                     &mut probed,
                     &mut stopped_any,
                 )
@@ -1287,7 +1311,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             // own: it is the same interval, over the same engines, and it
             // costs a copy of the store's held bits for a torrent something
             // is actually reading and a `None` for every other.
-            self.retain_engine(&engine).await;
+            self.retain_engine(&engine, &live).await;
         }
         if stopped_any {
             self.out_of_space_notify.notify_one();
@@ -1319,8 +1343,9 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let now = self.clock.now_secs();
         let mut probed = false;
         let mut stopped_any = false;
+        let live = self.live.reading();
         let decision = self
-            .reconcile_engine(&engine, trigger, now, &mut probed, &mut stopped_any)
+            .reconcile_engine(&engine, trigger, now, &live, &mut probed, &mut stopped_any)
             .await;
         if stopped_any {
             self.out_of_space_notify.notify_one();
@@ -1354,6 +1379,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         engine: &Arc<Engine<B::Handle>>,
         trigger: crate::reconcile::Trigger,
         now: u64,
+        live: &crate::retention::live::Reading,
         probed: &mut bool,
         stopped_any: &mut bool,
     ) -> Option<crate::reconcile::Decision> {
@@ -1372,13 +1398,17 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let conditions = crate::reconcile::Conditions {
             run_state: engine.handle.run_state(),
             settled: engine.is_settled(),
-            playing: self.torrent_is_active(&engine.info_hash, engine, now).await,
+            // Playing is the liveness value, plus the reads still being
+            // delivered off this torrent: a body mid-flight is not what a
+            // viewer is watching, but stopping the torrent under one stalls
+            // it. Neither is a clock, and neither is an activity register a
+            // request left behind.
+            playing: live.is_torrent(&engine.info_hash) || engine.retention.readers() > 0,
             pinned: engine.is_pinned(),
             seeding_enabled: self.seeding_enabled.load(Ordering::Relaxed),
             has_metadata: engine.handle.has_metadata().await,
             finished: engine.handle.is_finished().await,
             available: self.volumes.available(),
-            idle_for: engine.quiet_for(now),
         };
         let verdict = crate::reconcile::verdict(&conditions, trigger);
         // Every input, so a field log answers *why* on its own: a decision
@@ -1395,7 +1425,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             has_metadata = conditions.has_metadata,
             finished = conditions.finished,
             available = ?conditions.available,
-            idle_secs = conditions.idle_for.map(|d| d.as_secs()),
             settled = conditions.settled,
             "torrent_reconciled"
         );
@@ -1473,7 +1502,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     playing = conditions.playing,
                     pinned = conditions.pinned,
                     seeding_enabled = conditions.seeding_enabled,
-                    idle_secs = conditions.idle_for.map(|d| d.as_secs()),
                     "torrent_stopped_by_reconciler"
                 );
                 true
@@ -1671,29 +1699,14 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// grace-period task and this -- and the first two are gone: the
     /// ladder is the only thing that asks.
     ///
-    /// A `true` answer is stamped on the engine ([`Engine::mark_active`]),
-    /// and that stamp is the whole of the idle arm's grace clock. It is
-    /// written here, where the registers are actually read, rather than
-    /// taken from `Engine::last_accessed`: that one is the registry's
-    /// idle-eviction clock and counts every lookup, so every `stats.json`
-    /// poll -- which reaches its engine through [`Self::get_engine`] --
-    /// reset it, and a client with a details page open kept a torrent
-    /// nobody was watching downloading for ever with seeding off.
-    async fn torrent_is_active(
-        &self,
-        info_hash: &str,
-        engine: &Engine<B::Handle>,
-        now: u64,
-    ) -> bool {
-        let active = self.torrent_activity_registers(info_hash, engine).await;
-        if active {
-            engine.mark_active(now);
-        }
-        active
-    }
-
-    /// [`Self::torrent_is_active`] without the stamp: the four registers
-    /// and nothing else.
+    /// **Nothing that decides whether a torrent runs reads them.** That was
+    /// the reconciler's idle arm, and it is gone: a register is written by
+    /// a request and ended by the request's guard, so one that outlived its
+    /// request read as "playing" for the life of the process, and one that
+    /// was ended too early stopped a torrent under a body still being
+    /// delivered. What is playing is a value with one writer and no expiry
+    /// ([`crate::retention::live`]); these count responses, for the
+    /// activity light and the housekeeping sweep.
     async fn torrent_activity_registers(
         &self,
         info_hash: &str,
@@ -1757,6 +1770,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             clock: self.clock,
             volumes: self.volumes.clone(),
             budget: self.budget.clone(),
+            live: self.live.clone(),
         }
     }
 
@@ -1779,6 +1793,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             parts.clock,
             parts.volumes,
             parts.budget,
+            parts.live,
         ));
         engines.insert(info_hash, engine.clone());
         engine
@@ -2205,8 +2220,44 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// playing at 20 MB/s writes a gigabyte in that time. This runs on the
     /// reconciler's two-second tick, asks the policy where the playhead has
     /// left us, and gives back what the window no longer covers.
-    async fn retain_engine(&self, engine: &Arc<Engine<B::Handle>>) {
-        let Some(pass) = engine.retain(&self.registry).await else {
+    ///
+    /// A torrent the backend stopped with an **error** is removed with its
+    /// files instead, when nobody is playing it and nobody has pinned it.
+    /// An errored torrent holds no storage for a `drop_pieces` to edit, so
+    /// the slack pass cannot delete a byte of it: `drop_pieces` bails, the
+    /// pieces stay, and every later pass offers them again. Nothing else
+    /// will ever come for them either -- the torrent announces nothing and
+    /// the next start would rebuild its have-set from exactly those files.
+    /// So this is their opportunity, and it is taken whole.
+    async fn retain_engine(
+        &self,
+        engine: &Arc<Engine<B::Handle>>,
+        live: &crate::retention::live::Reading,
+    ) {
+        if engine.handle.run_state() == RunState::Error
+            && !engine.is_pinned()
+            && !live.is_torrent(&engine.info_hash)
+        {
+            tracing::info!(
+                info_hash = %engine.info_hash,
+                "removing an errored torrent nobody is playing and nobody pinned, with its files"
+            );
+            if let Err(error) = self
+                .backend
+                .remove_torrent_and_files(&engine.info_hash)
+                .await
+            {
+                tracing::warn!(
+                    info_hash = %engine.info_hash,
+                    error = %format!("{error:#}"),
+                    "could not remove an errored torrent; its bytes stay until the next tick"
+                );
+                return;
+            }
+            self.remove_engine_if_current(engine).await;
+            return;
+        }
+        let Some(pass) = engine.retain(&self.registry, live).await else {
             return;
         };
         if pass != crate::retention::RetentionPass::default() {
@@ -2218,6 +2269,38 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 "retention pass"
             );
         }
+    }
+
+    /// Every entity nobody is playing and nobody is reading, taken off the
+    /// disk now rather than at the next tick.
+    ///
+    /// Called where the answer is wanted at once: the moment a viewer opens
+    /// something else (the switch task), the moment the volume runs low,
+    /// and `POST /cache/clean`. It is the same pass the tick would run, so
+    /// there is nothing here a tick would not have done -- what it buys is
+    /// the two seconds between them, which on a switch is the difference
+    /// between a stream that fits and a `507`.
+    pub async fn drop_slack(&self) {
+        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
+        for engine in engines {
+            if let Some(pass) = engine.drop_slack(&self.registry).await
+                && pass != crate::retention::RetentionPass::default()
+            {
+                debug!(
+                    info_hash = %engine.info_hash,
+                    reclaimed = pass.reclaimed,
+                    "slack dropped"
+                );
+            }
+        }
+    }
+
+    /// The liveness cell: which entity this server is playing. Handed to
+    /// the proxy cache, which writes it for a proxied body, and read by the
+    /// task that drops the predecessor's slack. See
+    /// [`crate::retention::live`].
+    pub fn live(&self) -> &Arc<crate::retention::live::Live> {
+        &self.live
     }
 
     /// Take the bytes behind `pieces` of one torrent off the disk, have-set
@@ -2687,15 +2770,14 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 count: *count,
             })
             .collect();
-        let active_file = self
-            .active_file
-            .read()
-            .await
-            .as_ref()
-            .map(|(info_hash, file_idx)| ActiveFileSnapshot {
-                info_hash: info_hash.clone(),
-                file_idx: *file_idx,
-            });
+        let active_file =
+            self.live
+                .reading()
+                .torrent()
+                .map(|(info_hash, file_idx)| ActiveFileSnapshot {
+                    info_hash: info_hash.to_string(),
+                    file_idx,
+                });
         let now = self.clock.now_secs();
         let active_multifile_selections = self
             .active_multifile_files
@@ -2778,6 +2860,13 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// fire, because returning is what disarms the rollback.
     pub async fn on_stream_start(&self, info_hash: &str, file_idx: usize) {
         let info_hash = info_hash.to_lowercase();
+        // First, before anything this call could fail at: **the server saw
+        // a stream open**, and that is the event the liveness cell records.
+        // What was playing before is what nobody is playing now, whatever
+        // becomes of this request -- the disk gate that refuses it for want
+        // of space is refusing it *after* the predecessor became slack,
+        // which is what gives it room to be admitted at all.
+        self.switch_to(&info_hash, file_idx).await;
         let mut rollback = StreamStartRollback::armed(self, info_hash.clone(), file_idx);
         let native_lifecycle = self
             .get_engine(&info_hash)
@@ -2787,7 +2876,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             if let Some(engine) = self.get_engine(&info_hash).await {
                 engine.touch();
             }
-            *self.active_file.write().await = Some((info_hash.clone(), file_idx));
         } else {
             self.activate_file(&info_hash, file_idx, "stream").await;
         }
@@ -2831,6 +2919,46 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
 
         // Handed over: from here the caller's guard owns the registration.
         rollback.handed_over();
+    }
+
+    /// Move the liveness cell onto `file_idx` of `info_hash`, unless this
+    /// open is an aside.
+    ///
+    /// **The aside rule.** An open on another file of the torrent being
+    /// played, while some read of the playing file is still open, is a
+    /// subtitle or a side file fetched during playback -- not a viewer
+    /// moving on. Without it every subtitle fetch would make the film slack
+    /// and the next tick would delete it out from under the player, and
+    /// there is no signal in the request to tell the two apart. Once no
+    /// read of the playing file is left, the same open *is* a move: the
+    /// viewer went to the next episode.
+    ///
+    /// The two readings it is made of are taken here, before the cell is
+    /// written, because the cell's writer may not read a second lock under
+    /// it ([`crate::retention::live::Live::open`]).
+    async fn switch_to(&self, info_hash: &str, file_idx: usize) {
+        let keep_current = match self.live.reading().file_of(info_hash) {
+            Some(playing) if playing != file_idx => self
+                .peek_engine(info_hash)
+                .await
+                .is_some_and(|engine| engine.retention.readers_of(&playing) > 0),
+            _ => false,
+        };
+        let switch = self.live.open(
+            crate::retention::live::LiveEntity::Torrent {
+                info_hash: info_hash.to_string(),
+                file_idx,
+            },
+            keep_current,
+        );
+        if let Some(switch) = switch {
+            tracing::debug!(
+                info_hash = %info_hash,
+                file_idx,
+                from = ?switch.from,
+                "the live entity moved"
+            );
+        }
     }
 
     /// Mark the torrent as active: librqbit has no session-wide streaming
@@ -2880,7 +3008,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         if let Some(engine) = self.get_engine(info_hash).await {
             engine.touch();
             if engine.handle.manages_playback_lifecycle() {
-                *self.active_file.write().await = Some((info_hash.to_string(), file_idx));
                 return;
             }
             is_multifile = engine.handle.file_count().await > 1;
@@ -2890,11 +3017,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             // activity this call is part of is registered, or it reads a
             // torrent nobody is watching: the caller therefore asks it
             // itself once it has finished registering (`on_stream_start`).
-        }
-
-        {
-            let mut active = self.active_file.write().await;
-            *active = Some((info_hash.to_string(), file_idx));
         }
 
         if is_multifile {
@@ -2957,10 +3079,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         {
             let mut streams = self.active_file_streams.write().await;
             streams.retain(|(hash, idx), _| hash.as_str() != info_hash || *idx == file_idx);
-        }
-        {
-            let mut active = self.active_file.write().await;
-            *active = Some((info_hash.to_string(), file_idx));
         }
 
         engine.touch();
@@ -3968,12 +4086,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
         let key = (info_hash.to_string(), file_idx);
         self.active_file_streams.write().await.remove(&key);
-        {
-            let mut active = self.active_file.write().await;
-            if active.as_ref() == Some(&key) {
-                *active = None;
-            }
-        }
     }
 
     /// Re-plan the engine's want-set from whatever multi-file selection is
@@ -4088,7 +4200,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             return None;
         }
         let engines = self.engines.clone();
-        let active_file = self.active_file.clone();
         let active_file_streams = self.active_file_streams.clone();
         let active_multifile_files = self.active_multifile_files.clone();
         let scheduled_generation = {
@@ -4146,23 +4257,12 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 }
             };
 
-            {
-                let mut active = active_file.write().await;
-                if let Some((ref h, idx)) = *active
-                    && h == &info_hash
-                    && idx == file_idx
-                {
-                    tracing::info!(
-                        "Delayed cleanup: clearing active file for {} file_idx={}",
-                        info_hash,
-                        file_idx
-                    );
-                    *active = active_selection
-                        .as_ref()
-                        .map(|selection| (info_hash.clone(), selection.file_idx));
-                }
-            }
-
+            // Nothing here touches what is being played. The delayed
+            // cleanup is about the want-set -- which file librqbit should
+            // prioritise five seconds after a body ended -- and a body that
+            // ended is not a stream that has been replaced: the viewer who
+            // paused is still watching this file, and what says otherwise
+            // is their opening something else.
             let engine = {
                 let engines = engines.read().await;
                 engines.get(&info_hash).cloned()
@@ -5170,60 +5270,6 @@ mod tests {
         test_enginefs_with_file_count(1)
     }
 
-    /// The two seeds, and why they are two.
-    ///
-    /// A torrent added a moment ago has been used by nothing -- but that is
-    /// a fact about an interval that did not exist, not about a past this
-    /// process failed to see, so it has a reading and the grace applies to
-    /// it. A restored one has no reading at all, and reading `now` there is
-    /// the claim this design keeps having to delete.
-    ///
-    /// Folding them into one seed breaks one of the two. Seeding everything
-    /// with the absence stops a freshly added torrent on its first tick with
-    /// seeding off, dropping the swarm it has just dialled and paying a
-    /// re-announce at the start of playback. Seeding everything with `now`
-    /// is the "used at boot" claim that hands every restored torrent a fresh
-    /// grace on every restart -- see
-    /// `backend::librqbit::tests::a_restart_with_seeding_off_stops_what_the_last_process_left_without_waiting`
-    /// for that half, over a real persisted session.
-    #[tokio::test]
-    async fn an_added_engine_has_a_reading_where_a_restored_one_has_none() {
-        let (enginefs, _counters) = test_enginefs();
-
-        // The fixture registers its torrent through the restored map, which
-        // is the half with no reading to take.
-        let restored = enginefs.get_engine(TEST_HASH).await.unwrap();
-        assert_eq!(
-            restored.quiet_for(0),
-            None,
-            "nothing in this process has used a torrent it inherited"
-        );
-        assert_eq!(
-            enginefs.reconcile_tick_at(0).await,
-            vec![(TEST_HASH.to_string(), crate::reconcile::Decision::Run)],
-            "and with seeding on it runs regardless"
-        );
-
-        // An engine this process built has one, and it is zero: no interval
-        // has passed in which anything could have used it.
-        let fresh = Engine::new_with_handle(
-            restored.handle.clone(),
-            TEST_HASH,
-            enginefs.clock,
-            enginefs.volumes.clone(),
-            enginefs.budget.clone(),
-        );
-        assert_eq!(
-            fresh.quiet_for(0),
-            Some(Duration::ZERO),
-            "a torrent added this instant has been idle for no time at all"
-        );
-        assert!(
-            Duration::ZERO < INACTIVE_TORRENT_PAUSE_GRACE,
-            "so the idle arm cannot reach it yet"
-        );
-    }
-
     /// An observer -- the per-stream progress logger, a diagnostics sweep --
     /// must be able to read an engine without that being what keeps its
     /// torrent out of the idle sweep. `get_engine` counts as a poll on
@@ -5368,6 +5414,19 @@ mod tests {
             root.join("cache"),
             root.join("downloads"),
         );
+        // File 0 of the fixture's torrent is the one being played, which is
+        // what a stream open writes (`on_stream_start`) and what every pass
+        // and every gate reads. Without it the fixture's torrent is one
+        // nobody is watching, and the honest thing to do with those is
+        // delete them -- so a test that drove a pass by hand would be
+        // measuring the delete rather than the window. See `playing`.
+        enginefs.live().open(
+            crate::retention::live::LiveEntity::Torrent {
+                info_hash: TEST_HASH.to_string(),
+                file_idx: 0,
+            },
+            false,
+        );
         (enginefs, counters, init)
     }
 
@@ -5405,7 +5464,7 @@ mod tests {
             (OTHER_HASH.to_string(), b.clone()),
         ]);
         let backend = FakeBackend::new(vec![a, b]);
-        let removed = backend.removed.clone();
+        let removed = backend.removed_with_files.clone();
         let root = fake_engine_root();
         let enginefs = BackendEngineFS::new_with_backend(
             backend,
@@ -6192,121 +6251,6 @@ mod tests {
         );
     }
 
-    /// The idle arm does not stop a torrent whose multi-file selection is
-    /// still live, however long ago the HTTP stream that made it ended.
-    ///
-    /// This used to be a test of the grace-period task, which read the same
-    /// five activity registers the sweep read and the reconciler now reads.
-    /// Three readers of one question is what the reconciler replaced; the
-    /// question itself is unchanged.
-    #[tokio::test(start_paused = true)]
-    async fn the_idle_arm_leaves_a_live_multifile_selection_alone() {
-        let (mut enginefs, _counters) = test_enginefs_for_reconciler(3);
-        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
-        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
-
-        enginefs.on_stream_start(TEST_HASH, 1).await;
-        // The HTTP stream goes; the selection it made stays.
-        enginefs.active_streams.write().await.clear();
-        enginefs.active_file_streams.write().await.clear();
-        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE * 2).await;
-
-        enginefs.reconcile_tick().await;
-        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
-    }
-
-    /// Seeding off, nothing active, quiet for the grace: stopped. The
-    /// positive case the two above are the exceptions to.
-    #[tokio::test(start_paused = true)]
-    async fn the_idle_arm_stops_a_torrent_with_nothing_left_on_it() {
-        let (mut enginefs, _counters) = test_enginefs_for_reconciler(3);
-        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
-        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
-        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE).await;
-
-        enginefs.reconcile_tick().await;
-        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
-    }
-
-    /// An engine made late has a reading, and the grace applies to it.
-    ///
-    /// This asserted the opposite until the seed was split, on the argument
-    /// that "a server that adds a torrent every few minutes has an idle arm
-    /// that never fires". That argument is arithmetically wrong: the grace
-    /// is `INACTIVE_TORRENT_PAUSE_GRACE`, so an engine that starts its clock
-    /// at its own creation escapes the arm for exactly that long and no
-    /// longer -- the arm fires on the next tick after it.
-    ///
-    /// What it cost was the mirror of the bug it was written against. An add
-    /// with seeding off was stopped on its first tick, dropping the swarm it
-    /// had just dialled, and started again at the first byte of playback --
-    /// a pause, an unpause and a re-announce, which is the churn the dwell
-    /// exists to prevent.
-    ///
-    /// The distinction the old seed could not draw: a torrent this process
-    /// added has been used by nothing over an interval that did not exist,
-    /// which is a reading of zero; a torrent it *restored* has no reading at
-    /// all. Only the second may be read as quiet. The restart half is
-    /// `backend::librqbit::tests::a_restart_with_seeding_off_stops_what_the_last_process_left_without_waiting`.
-    ///
-    /// The engine is made through the ordinary add, and what is asserted is
-    /// what the torrent then does.
-    #[tokio::test(start_paused = true)]
-    async fn an_engine_made_late_keeps_its_grace_and_loses_it_on_time() {
-        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
-        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
-        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
-
-        // Nothing is registered, and the process runs on for graces.
-        enginefs.remove_engine(TEST_HASH).await;
-        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE * 4).await;
-
-        let engine = enginefs
-            .add_torrent(TorrentSource::Bytes(b"a .torrent blob".to_vec()), None)
-            .await
-            .expect("the add publishes an engine");
-        assert_eq!(
-            engine.handle.run_state(),
-            RunState::Live,
-            "a freshly added torrent is running, as a real backend's is"
-        );
-
-        // Its own clock starts here, however long the process has run.
-        assert_eq!(
-            enginefs.reconcile_tick().await,
-            vec![(TEST_HASH.to_string(), Decision::Run)],
-            "an add is not idle the instant it is made"
-        );
-        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
-        assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), 0);
-
-        // And a grace later, with nothing having played it, the arm fires --
-        // so the grace is deferred, not spent.
-        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE).await;
-        assert_eq!(
-            enginefs.reconcile_tick().await,
-            vec![(TEST_HASH.to_string(), Decision::Stop)],
-            "nothing has played it for a whole grace"
-        );
-        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
-        assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), 1);
-    }
-
-    /// A magnet that has not resolved its info dictionary keeps running
-    /// whatever the idle arm would say: what it is fetching is the
-    /// dictionary, it writes no file data while it does, and stopping it is
-    /// how a magnet comes never to resolve.
-    #[tokio::test(start_paused = true)]
-    async fn the_idle_arm_leaves_a_torrent_still_fetching_its_metadata_alone() {
-        let (mut enginefs, _counters) = test_enginefs_for_reconciler(0);
-        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
-        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
-        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE).await;
-
-        enginefs.reconcile_tick().await;
-        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
-    }
-
     #[tokio::test]
     async fn single_file_bypasses_multifile_selector() {
         let (enginefs, counters) = test_enginefs();
@@ -6729,7 +6673,33 @@ mod tests {
         if let Some(sweep) = enginefs.take_sweep_task() {
             sweep.abort();
         }
+        // The fixture's torrent is the one being played, which is what a
+        // stream open writes (`on_stream_start`) and what the ladder's
+        // bottom arm reads. Almost every test below is about the
+        // free-space arm -- a volume filling under a torrent somebody is
+        // watching -- and without this every one of them would be
+        // measuring the arm that stops a torrent nobody is watching. The
+        // few that are about *that* say so by opening something else.
+        enginefs.live().open(
+            crate::retention::live::LiveEntity::Torrent {
+                info_hash: TEST_HASH.to_string(),
+                file_idx: 0,
+            },
+            false,
+        );
         (enginefs, counters)
+    }
+
+    /// Nothing is playing this server's torrents any more: a proxied body
+    /// is. What a viewer opening something else does to every torrent at
+    /// once.
+    fn nothing_torrent_is_playing(enginefs: &BackendEngineFS<FakeBackend>) {
+        enginefs.live().open(
+            crate::retention::live::LiveEntity::Proxy {
+                dir: "/elsewhere".into(),
+            },
+            false,
+        );
     }
 
     /// Every call the reconciler could make and does not, in one place.
@@ -6737,6 +6707,18 @@ mod tests {
         assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), 0);
         assert_eq!(counters.start_torrent.load(Ordering::SeqCst), 0);
         assert_eq!(counters.restart_from_error.load(Ordering::SeqCst), 0);
+    }
+
+    /// The liveness reading a test's own pass runs under: the file it is
+    /// about is the one being played, which is what the stream open the
+    /// production path always makes first would have written
+    /// (`on_stream_start`). Without it every entity is slack and every pass
+    /// is a delete, which is exactly the point of the value.
+    fn playing(file_idx: usize) -> crate::retention::live::Reading {
+        crate::retention::live::Reading::of(crate::retention::live::LiveEntity::Torrent {
+            info_hash: TEST_HASH.to_string(),
+            file_idx,
+        })
     }
 
     /// What the torrent is actually doing, which is the only thing any of
@@ -6751,42 +6733,6 @@ mod tests {
             .run_state()
     }
 
-    /// The idle arm, acted on: seeding off, nothing playing, quiet for the
-    /// whole grace, and a volume with room to spare -- so the torrent is
-    /// stopped, by the reconciler, on the pass that decided it.
-    ///
-    /// Stopped **once**, not once per pass. The backend refuses a second
-    /// pause, so a reconciler that asked every tick would log a failure
-    /// every two seconds for every stopped torrent there is; the counter
-    /// counts the asking rather than the succeeding, which is what makes
-    /// that visible.
-    #[tokio::test(start_paused = true)]
-    async fn the_idle_arm_stops_the_torrent_and_asks_only_once() {
-        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
-        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
-        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
-        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE).await;
-
-        assert_eq!(
-            enginefs.reconcile_tick().await,
-            vec![(TEST_HASH.to_string(), Decision::Stop)]
-        );
-        assert_eq!(
-            run_state_of(&enginefs, TEST_HASH).await,
-            RunState::Paused,
-            "the idle arm decided Stop and the reconciler made it so"
-        );
-        assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), 1);
-
-        enginefs.reconcile_tick().await;
-        enginefs.reconcile_tick().await;
-        assert_eq!(
-            counters.stop_torrent.load(Ordering::SeqCst),
-            1,
-            "a torrent that is already stopped is not asked to stop again"
-        );
-    }
-
     /// The anti-flap dwell, and both halves of its asymmetry.
     ///
     /// A condition that oscillates around one of the ladder's lines costs
@@ -6799,18 +6745,20 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_timer_waits_out_a_dwell_after_moving_a_torrent_and_a_playback_does_not() {
         let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
+        // The torrent is the one being played, so the only arm that moves
+        // it is the free-space one -- which is what the dwell is now
+        // driven by: nothing else in the ladder oscillates.
         enginefs.set_free_space_probe(|_| Ok(u64::MAX));
-        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
-        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE).await;
+        enginefs.on_stream_start(TEST_HASH, 0).await;
+        counters.start_torrent.store(0, Ordering::SeqCst);
 
-        // The idle arm stops it, which is the transition the dwell runs from.
+        // The volume falls under the floor: the stop the dwell runs from.
+        enginefs.set_free_space_probe(|_| Ok(0));
         enginefs.reconcile_tick().await;
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
 
-        // The condition that stopped it goes away at once. Written to the
-        // flag rather than through `set_seeding_enabled`, which would
-        // reconcile for itself with the trigger that is exempt.
-        enginefs.seeding_enabled.store(true, Ordering::Relaxed);
+        // And clears, well over the resume margin, at once.
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
         assert_eq!(
             enginefs.reconcile_tick().await,
             vec![(TEST_HASH.to_string(), Decision::Run)],
@@ -6835,12 +6783,14 @@ mod tests {
     async fn the_timer_starts_the_torrent_once_the_dwell_is_out() {
         let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
         enginefs.set_free_space_probe(|_| Ok(u64::MAX));
-        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
-        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE).await;
+        enginefs.on_stream_start(TEST_HASH, 0).await;
+        counters.start_torrent.store(0, Ordering::SeqCst);
+
+        enginefs.set_free_space_probe(|_| Ok(0));
         enginefs.reconcile_tick().await;
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
 
-        enginefs.seeding_enabled.store(true, Ordering::Relaxed);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
         tokio::time::advance(RECONCILE_MIN_DWELL + Duration::from_secs(1)).await;
 
         enginefs.reconcile_tick().await;
@@ -6903,133 +6853,65 @@ mod tests {
         assert_eq!(counters.start_torrent.load(Ordering::SeqCst), 1);
     }
 
-    /// The activity inputs, both ways round: a torrent with a stream open
-    /// on it runs however long it has been since anything asked it for a
-    /// byte, and the same torrent with the stream gone is stopped.
-    #[tokio::test(start_paused = true)]
-    async fn a_stream_open_on_a_torrent_keeps_it_running() {
-        let (mut enginefs, _counters) = test_enginefs_for_reconciler(1);
-        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
-        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
-
-        enginefs.on_stream_start(TEST_HASH, 0).await;
-        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE).await;
-        assert_eq!(
-            enginefs.reconcile_tick().await,
-            vec![(TEST_HASH.to_string(), Decision::Run)]
-        );
-
-        // The stream goes, without going through `on_stream_end` -- which
-        // would stamp the engine itself, and this test is about the
-        // reconciler's own reading.
-        enginefs.active_streams.write().await.clear();
-        enginefs.active_file_streams.write().await.clear();
-
-        // The grace runs from the last time the torrent was *used*, which
-        // the tick above observed, so it starts again here rather than
-        // being already spent: a torrent watched until a second ago has not
-        // been idle for the grace, whatever the clock said before the
-        // stream opened.
-        assert_eq!(
-            enginefs.reconcile_tick().await,
-            vec![(TEST_HASH.to_string(), Decision::Run)]
-        );
-        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE).await;
-        assert_eq!(
-            enginefs.reconcile_tick().await,
-            vec![(TEST_HASH.to_string(), Decision::Stop)]
-        );
-    }
-
-    /// A stream that begins and ends between two ticks still spends the
-    /// grace.
+    /// **Nothing but a stream opening writes the liveness cell.**
     ///
-    /// The idle arm's clock is written where activity is *observed*, and
-    /// for a stream longer than a [`RECONCILE_INTERVAL`] that is the
-    /// reconciler's own pass. A short one -- an HLS segment, a player's
-    /// probe read -- can be opened and closed without any timer pass seeing
-    /// it; what stamps the engine for it is the reconcile
-    /// [`Self::on_stream_start`] awaits for itself, which is taken after
-    /// the registers are set and so reads them true. Without that stamp the
-    /// very next tick stops the torrent the player is about to ask for the
-    /// next segment of: peers dropped and re-announced between two
-    /// segments, which is the flapping [`INACTIVE_TORRENT_PAUSE_GRACE`]
-    /// exists to prevent.
-    #[tokio::test(start_paused = true)]
-    async fn a_stream_shorter_than_a_tick_still_spends_the_grace() {
-        let (mut enginefs, _counters) = test_enginefs_for_reconciler(1);
-        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
-        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
-
-        // Opened and closed without a single pass in between.
-        enginefs.on_stream_start(TEST_HASH, 0).await;
-        enginefs.on_stream_end(TEST_HASH, 0).await;
-
-        assert_eq!(
-            enginefs.reconcile_tick().await,
-            vec![(TEST_HASH.to_string(), Decision::Run)],
-            "the player is between two segments, not gone"
-        );
-        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE).await;
-        assert_eq!(
-            enginefs.reconcile_tick().await,
-            vec![(TEST_HASH.to_string(), Decision::Stop)],
-            "and once the grace is out it really is gone"
-        );
-    }
-
     /// A client polling the statistics is *looking at* a torrent, not
-    /// watching it, and the idle arm must not confuse the two.
+    /// watching it; so is a details page asking what a magnet resolved to,
+    /// and so is `focus_torrent`, which names a torrent and registers
+    /// nothing at all. Each of them used to be able to hold a torrent
+    /// running: the grace the idle arm measured came off `last_accessed`,
+    /// which every `get_engine` writes, so a details page left open --
+    /// which polls every few seconds -- reset it before it could ever run
+    /// out, and the torrent downloaded all night with seeding off.
     ///
-    /// `GET /{infoHash}/stats.json` reaches its engine through
-    /// [`BackendEngineFS::get_engine`], which counts as a poll for the
-    /// registry's idle eviction -- rightly: nothing may drop an engine a
-    /// client is still asking about. The idle arm's grace used to be
-    /// measured from that same `last_accessed`, and it was the arm's only
-    /// quiet test, so a details page left open in the client -- which polls
-    /// every few seconds -- reset the grace before it could ever run out.
-    /// Seeding off, nobody watching, and the torrent downloading all night.
-    ///
-    /// Master's sweep read the five activity registers and never
-    /// `last_accessed`, so it had no such hole; the reconciler has to keep
-    /// that guarantee, which is the whole point of the seeding-off policy.
-    ///
-    /// The torrent is used first, so what is under test is the grace
-    /// running out rather than the "nothing has ever used this" answer.
+    /// The cell has one writer now, so the question is not "how long since
+    /// something touched this engine" but "did the server see a stream
+    /// open". Every reader below is asked whether it moved the cell, and
+    /// none of them did.
     #[tokio::test(start_paused = true)]
-    async fn polling_the_statistics_does_not_keep_an_idle_torrent_running() {
+    async fn looking_at_a_torrent_is_not_playing_it() {
         let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
         enginefs.set_free_space_probe(|_| Ok(u64::MAX));
-        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
 
-        // Watched once, then not: the registers are cleared by hand so that
-        // the only thing touching this engine afterwards is the poll.
+        // A stream really opens, so there is a reading to be wrongly kept.
         enginefs.on_stream_start(TEST_HASH, 0).await;
+        assert_eq!(enginefs.live().reading().file_of(TEST_HASH), Some(0));
         enginefs.reconcile_tick().await;
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
-        enginefs.active_streams.write().await.clear();
-        enginefs.active_file_streams.write().await.clear();
+
+        // And is replaced by another entity: from here nothing is playing
+        // this torrent, whatever anything asks about it.
+        enginefs.live().open(
+            crate::retention::live::LiveEntity::Proxy {
+                dir: "/elsewhere".into(),
+            },
+            false,
+        );
 
         // Five minutes of a details page polling every ten seconds. Both
         // halves of what the route does to the engine, because both write
         // `last_accessed`: `routes::system::stats_target` finds it with
         // `get_engine`, and then `engine.get_statistics()` builds the body.
-        // Either one alone, read as activity, is enough to hold the grace
-        // open for ever.
         for _ in 0..30 {
             let engine = enginefs
                 .get_engine(TEST_HASH)
                 .await
                 .expect("the statistics route reaches its engine this way");
             engine.get_statistics().await;
+            enginefs.focus_torrent(TEST_HASH).await;
+            enginefs.peek_engine(TEST_HASH).await;
             tokio::time::advance(Duration::from_secs(10)).await;
             enginefs.reconcile_tick().await;
         }
 
+        assert!(
+            !enginefs.live().is_torrent(TEST_HASH),
+            "looking at a torrent did not make it the one being played"
+        );
         assert_eq!(
             run_state_of(&enginefs, TEST_HASH).await,
             RunState::Paused,
-            "nobody is watching it, and we have promised to upload nothing"
+            "nobody is watching it, so there is nothing for it to fetch"
         );
         assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), 1);
     }
@@ -7101,14 +6983,13 @@ mod tests {
     }
 
     /// A magnet still fetching its info dictionary keeps its swarm, whatever
-    /// else is true: seeding off, idle for the whole grace, and a volume
-    /// with nothing left on it.
+    /// else is true: seeding off, nobody playing it, and a volume with
+    /// nothing left on it.
     #[tokio::test(start_paused = true)]
     async fn a_torrent_without_metadata_is_decided_to_run() {
         let (mut enginefs, _counters) = test_enginefs_for_reconciler(0);
         enginefs.set_free_space_probe(|_| Ok(0));
         enginefs.seeding_enabled.store(false, Ordering::Relaxed);
-        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE).await;
 
         assert_eq!(
             enginefs.reconcile_tick().await,
@@ -7165,43 +7046,22 @@ mod tests {
         );
     }
 
-    /// Looking at a torrent is not using it. The reconciler polls every
-    /// engine every two seconds, so an eye that counted as a poll would
-    /// keep every torrent this server has ever seen from ever being idle --
-    /// including for the idle arm of its own decision.
-    #[tokio::test(start_paused = true)]
-    async fn reconciling_a_torrent_does_not_count_as_using_it() {
-        let (mut enginefs, _counters) = test_enginefs_for_reconciler(1);
-        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
-        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
-        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE).await;
-
-        assert_eq!(
-            enginefs.reconcile_hash(TEST_HASH, Trigger::Timer).await,
-            Some(Decision::Stop)
-        );
-        assert_eq!(
-            enginefs.reconcile_tick().await,
-            vec![(TEST_HASH.to_string(), Decision::Stop)],
-            "the torrent is still as idle as it was before it was looked at"
-        );
-        assert_eq!(
-            enginefs.reconcile_tick().await,
-            vec![(TEST_HASH.to_string(), Decision::Stop)],
-            "and stays so however often it is looked at"
-        );
-    }
-
-    /// A pin is a promise to have the file offline, so the idle policy does
-    /// not apply to the torrent holding it -- with seeding off and nothing
-    /// playing, the pinned torrent still runs.
+    /// A pin is a promise to have the file offline, so the ladder's bottom
+    /// arm does not reach the torrent holding it -- with seeding off and
+    /// nothing playing, the pinned torrent still runs while an unpinned one
+    /// beside it is stopped.
     #[tokio::test(start_paused = true)]
     async fn a_pinned_torrent_is_decided_to_run() {
         let (mut enginefs, _counters) = test_enginefs_for_reconciler(1);
         enginefs.set_free_space_probe(|_| Ok(u64::MAX));
         enginefs.seeding_enabled.store(false, Ordering::Relaxed);
+        nothing_torrent_is_playing(&enginefs);
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), Decision::Stop)],
+            "unpinned and unplayed, it is stopped"
+        );
         enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
-        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE).await;
 
         assert_eq!(
             enginefs.reconcile_tick().await,
@@ -7218,7 +7078,6 @@ mod tests {
         enginefs.set_free_space_probe(|_| Ok(0));
         enginefs.seeding_enabled.store(false, Ordering::Relaxed);
         counters.native_lifecycle.store(true, Ordering::SeqCst);
-        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE).await;
 
         assert!(enginefs.reconcile_tick().await.is_empty());
         assert_eq!(
@@ -7247,6 +7106,18 @@ mod tests {
             counted.fetch_add(1, Ordering::SeqCst);
             Ok(u64::MAX)
         });
+        // Both pinned, because only one entity can be the one being played
+        // and this test is about every torrent getting a decision. A pin is
+        // the other way a torrent is owed one.
+        for hash in [TEST_HASH, OTHER_HASH] {
+            enginefs
+                .get_engine(hash)
+                .await
+                .expect("the fixture's engine")
+                .pinned_files
+                .write()
+                .insert(0);
+        }
 
         let mut decided: Vec<String> = enginefs
             .reconcile_tick()
@@ -8100,6 +7971,17 @@ mod tests {
             enginefs.get_engine(TEST_HASH).await.unwrap(),
             enginefs.get_engine(OTHER_HASH).await.unwrap(),
         ];
+        // One is being played and the other is pinned, so the only arm that
+        // can move either is the free-space one -- which is what the bound
+        // is measured under.
+        enginefs.live().open(
+            crate::retention::live::LiveEntity::Torrent {
+                info_hash: TEST_HASH.to_string(),
+                file_idx: 0,
+            },
+            false,
+        );
+        engines[1].pinned_files.write().insert(0);
         enginefs.reconcile_tick().await;
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
         assert_eq!(
@@ -8226,17 +8108,18 @@ mod tests {
 
     /// The same refusal, lifted by the arm that starts nothing at all.
     ///
-    /// The cleaner makes room while the torrent is still the idle policy's,
-    /// so the pass that follows answers the idle arm's `Stop`: no start, no
+    /// The volume gains room while nobody is playing the torrent, so the
+    /// pass that follows answers the ladder's bottom `Stop`: no start, no
     /// call of any kind. The refusal still has to go -- it says the device
     /// has no room, and the device has room.
     #[tokio::test(start_paused = true)]
-    async fn a_volume_with_room_lifts_the_refusal_of_a_torrent_the_idle_policy_holds() {
+    async fn a_volume_with_room_lifts_the_refusal_of_a_torrent_nobody_plays() {
         let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
         let available = Arc::new(AtomicU64::new(0));
         let probe_available = available.clone();
         enginefs.set_free_space_probe(move |_| Ok(probe_available.load(Ordering::SeqCst)));
         enginefs.seeding_enabled.store(false, Ordering::Relaxed);
+        nothing_torrent_is_playing(&enginefs);
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
         stop_torrent(&enginefs, TEST_HASH).await;
 
@@ -8255,7 +8138,7 @@ mod tests {
         assert_eq!(
             enginefs.reconcile_tick().await,
             vec![(TEST_HASH.to_string(), Decision::Stop)],
-            "nothing is playing, so this pass is the idle arm's"
+            "nothing is playing it and nothing pinned it, so it stays stopped"
         );
         assert_eq!(
             run_state_of(&enginefs, TEST_HASH).await,
@@ -8292,7 +8175,6 @@ mod tests {
         enginefs.seeding_enabled.store(false, Ordering::Relaxed);
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
         stop_torrent(&enginefs, TEST_HASH).await;
-        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE).await;
 
         // The pass takes the volume's reading; the volume never went under
         // the floor at all.
@@ -8338,21 +8220,36 @@ mod tests {
         assert!(!engine.is_stopped_for_space().await);
     }
 
-    /// Re-enabling seeding starts the torrents the idle arm stopped, and it
-    /// does not hold the engine registry while it waits for the backend to
-    /// do it.
+    /// The seeding switch reconciles every torrent there is, and does not
+    /// hold the engine registry while it waits for the backend.
     ///
     /// `engines` is a write-preferring `RwLock`: a read guard held across
     /// an await parks every later reader behind any writer that queues
     /// meanwhile, and the await here is `Session::unpause`, which flushes
     /// librqbit's persistence file. One torrent's disk write would stall
     /// every route that wants to look an engine up.
+    ///
+    /// The torrent that starts is a **pinned** one. Seeding has no
+    /// consequence of its own on the ladder any more -- what a torrent
+    /// nobody is playing does with seeding on is fetch a film nobody is
+    /// watching into a cache whose next pass deletes it -- so the switch's
+    /// reconcile is what is under test here and the pin is what gives it
+    /// something to do. Written straight into the pin set, because
+    /// `pin_download` reconciles for itself and would record a transition
+    /// for the dwell to hold.
     #[tokio::test]
-    async fn re_enabling_seeding_starts_without_holding_the_engine_registry() {
+    async fn the_seeding_switch_reconciles_without_holding_the_engine_registry() {
         let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
         enginefs.set_free_space_probe(|_| Ok(u64::MAX));
         let enginefs = Arc::new(enginefs);
         enginefs.seeding_enabled.store(false, Ordering::Relaxed);
+        enginefs
+            .get_engine(TEST_HASH)
+            .await
+            .expect("the fixture's engine")
+            .pinned_files
+            .write()
+            .insert(0);
         stop_torrent(&enginefs, TEST_HASH).await;
 
         counters.hold_start.store(true, Ordering::SeqCst);
@@ -8547,26 +8444,24 @@ mod tests {
     /// see.
     ///
     /// Two independent reasons, both of which left the other half of the
-    /// rollback -- the per-file counter, the multi-file selection and the
-    /// active-file slot -- covered by nothing. `playback_is_live` is a
-    /// deliberately narrow oracle: it reads `engine_active_streams` and
-    /// `active_streams` and nothing else, because `active_file` and the
-    /// selections outlive the stream on purpose (the want-set is planned
-    /// from them). But `playing` -- what the ladder actually reads -- comes
-    /// from `torrent_activity_registers`, which reads four registers,
-    /// `active_file_streams` and a bare `active_multifile_files.contains_key`
-    /// among them. And the test above runs over a single-file torrent, so
-    /// `activate_file` never reaches `activate_multifile_file` and the
-    /// selection branch is not entered at all.
+    /// rollback -- the per-file counter and the multi-file selection --
+    /// covered by nothing. `playback_is_live` is a deliberately narrow
+    /// oracle: it reads `engine_active_streams` and `active_streams` and
+    /// nothing else, because the selections outlive the stream on purpose
+    /// (the want-set is planned from them). And the test above runs over a
+    /// single-file torrent, so `activate_file` never reaches
+    /// `activate_multifile_file` and the selection branch is not entered at
+    /// all.
     ///
-    /// So this one is multi-file, and asserts through the reconciler: with
-    /// seeding off and the grace elapsed, a torrent nothing is using is
-    /// stopped. A count or a selection left behind by the abandoned request
-    /// is left behind for the life of the process -- nothing ages either
-    /// out, and the `on_stream_end` that would clear them belongs to a
-    /// guard that was never built -- so `playing` reads true for ever, the
-    /// idle arm can never fire, and with seeding off the torrent downloads
-    /// a film nobody is watching until the server restarts.
+    /// So this one is multi-file, and reads the two registers directly.
+    /// They used to be read through the reconciler -- a count left behind
+    /// made `playing` true for ever, so the idle arm could never fire --
+    /// and that oracle is gone with the arm: what the ladder reads now is
+    /// the liveness cell, which this rollback deliberately does not touch.
+    /// The registers still have to be undone, because nothing ages one out
+    /// and the want-set is planned from them: a file still registered as
+    /// the active one is unioned back into `only_files` on every later
+    /// reconcile of the torrent.
     #[tokio::test]
     async fn a_stream_start_whose_caller_walked_away_gives_up_the_file_it_selected() {
         let (mut enginefs, counters) = test_enginefs_for_reconciler(2);
@@ -8595,79 +8490,85 @@ mod tests {
         counters.hold_start.store(false, Ordering::SeqCst);
         counters.start_gate.notify_one();
 
-        // The undo is a spawned task, so the ladder is asked until it
-        // answers rather than once: each pass advances past the grace and
-        // reads the registers for itself. Bounded, so a register left
-        // behind fails instead of hanging -- and it fails on every pass,
-        // since nothing ever clears one.
-        tokio::time::pause();
-        let idle_stop = vec![(TEST_HASH.to_string(), Decision::Stop)];
-        let mut decided = Vec::new();
-        for _ in 0..100 {
-            tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE + Duration::from_secs(1)).await;
-            decided = enginefs.reconcile_tick().await;
-            if decided == idle_stop {
+        // The undo is a spawned task, so the registers are read until they
+        // are empty rather than once. Bounded, so a register left behind
+        // fails instead of hanging -- and nothing ages one out, so a
+        // failure here is for the life of the process.
+        let key = (TEST_HASH.to_string(), 1);
+        let deadline = tokio::time::Instant::now() + TEST_WAIT_BOUND;
+        loop {
+            let file_stream = enginefs
+                .active_file_streams
+                .read()
+                .await
+                .get(&key)
+                .copied()
+                .unwrap_or(0);
+            let selection = enginefs
+                .active_multifile_files
+                .read()
+                .await
+                .contains_key(TEST_HASH);
+            if file_stream == 0 && !selection {
                 break;
             }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the file the abandoned request selected is still registered:                  stream={file_stream} selection={selection}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
+
+        // What the rollback does *not* undo, deliberately: the server saw a
+        // stream open on file 1, so file 1 is the entity being played and
+        // the one the viewer left is slack. A request that died on its way
+        // to the disk does not bring the previous film back.
         assert_eq!(
-            decided, idle_stop,
-            "the file the abandoned request selected still reads as playback"
+            enginefs.live().reading().file_of(TEST_HASH),
+            Some(1),
+            "the switch stands"
+        );
+    }
+
+    /// **`focus_torrent` names a torrent; it does not play one.**
+    ///
+    /// It writes no register and now no liveness either, so on the ladder's
+    /// own conditions the torrent it names is one nobody is watching, and
+    /// the answer is `Stop` however loudly the caller asked. That is the
+    /// right answer and it used to be the dangerous one: the arm that would
+    /// have given it was the timer's alone, precisely because `playing` was
+    /// read from registers the caller might still be writing, and the one
+    /// production call site was safe only because it runs `on_stream_start`
+    /// two lines earlier (`routes::stream`).
+    ///
+    /// The ordering no longer matters for a different reason: what starts
+    /// the torrent is the stream open, and the stream open is what writes
+    /// the cell. Focus is a want-set hint that follows it.
+    #[tokio::test(start_paused = true)]
+    async fn focusing_a_torrent_neither_plays_it_nor_starts_it() {
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        nothing_torrent_is_playing(&enginefs);
+        stop_torrent(&enginefs, TEST_HASH).await;
+
+        enginefs.focus_torrent(TEST_HASH).await;
+
+        assert!(
+            !enginefs.live().is_torrent(TEST_HASH),
+            "focusing a torrent is not the server seeing a stream open on it"
         );
         assert_eq!(
             run_state_of(&enginefs, TEST_HASH).await,
             RunState::Paused,
-            "and the torrent it was starting is running for nobody"
+            "so there is nothing for it to fetch and it stays stopped"
         );
-    }
+        assert_eq!(counters.start_torrent.load(Ordering::SeqCst), 0);
 
-    /// A torrent asked to be focused runs, with nothing else registered
-    /// anywhere.
-    ///
-    /// Every condition here says stop: seeding is off, no stream, file
-    /// stream or multi-file selection names this torrent, and it has been
-    /// quiet for the whole grace. `Trigger::PlaybackStart` does not change
-    /// any of that -- it says why the question is being asked, not that
-    /// anything is playing -- so the idle arm being the `Timer`'s alone is
-    /// the only thing between this reading and `Decision::Stop` on the very
-    /// torrent the caller named.
-    ///
-    /// It was latent rather than absent because the one production caller
-    /// runs `on_stream_start` two lines earlier (`routes::stream`), which
-    /// does register a stream; a reordering there would have made it live.
-    /// This test is the reason that ordering no longer matters.
-    ///
-    /// Note what is *not* asserted: nothing here reads `last_active_at`.
-    /// `focus_torrent` stamps nothing, so after this call the torrent is
-    /// still one nothing has been seen using -- and the next `Timer` pass
-    /// stops it again, two seconds later, which is the whole cost of the
-    /// arm being trigger-gated.
-    #[tokio::test(start_paused = true)]
-    async fn focusing_a_torrent_starts_it_with_nothing_else_registered() {
-        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
-        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
-        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
-        stop_torrent(&enginefs, TEST_HASH).await;
-        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE + Duration::from_secs(1)).await;
-
-        enginefs.focus_torrent(TEST_HASH).await;
-
-        assert_eq!(
-            run_state_of(&enginefs, TEST_HASH).await,
-            RunState::Live,
-            "the torrent the caller asked to focus is the one the ladder stopped"
-        );
+        // And the call that really does open a stream starts it, from the
+        // same conditions, with the same trigger.
+        enginefs.on_stream_start(TEST_HASH, 0).await;
+        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
         assert_eq!(counters.start_torrent.load(Ordering::SeqCst), 1);
-
-        // And the concession is one tick wide, not a grace period: nothing
-        // registered a stream and nothing stamped a clock, so the timer --
-        // which reads the same conditions and is the owner of the idle
-        // policy -- stops it again on its very next pass.
-        assert_eq!(
-            enginefs.reconcile_tick().await,
-            vec![(TEST_HASH.to_string(), Decision::Stop)]
-        );
-        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
     }
 
     /// The statistics snapshot's list of stopped torrents is an
@@ -10411,7 +10312,7 @@ mod tests {
         engine.begin_retention(0).await;
         engine.note_playhead(0, 0);
         engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass");
         let settled = enginefs
@@ -10432,7 +10333,7 @@ mod tests {
         let running = tokio::spawn({
             let engine = engine.clone();
             let registry = enginefs.store_registry().clone();
-            async move { engine.retain(&registry).await }
+            async move { engine.retain(&registry, &playing(0)).await }
         });
         tokio::time::timeout(Duration::from_secs(10), entered_rx)
             .await
@@ -10498,7 +10399,7 @@ mod tests {
         engine.note_playhead(0, 0);
 
         let first = engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass ran");
         assert!(
@@ -10507,7 +10408,7 @@ mod tests {
         );
         engine.note_playhead(0, 75);
         for _ in 0..49 {
-            engine.retain(enginefs.store_registry()).await;
+            engine.retain(enginefs.store_registry(), &playing(0)).await;
         }
         assert_eq!(
             listings(),
@@ -10663,7 +10564,7 @@ mod tests {
         };
 
         engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass");
         assert_eq!(
@@ -10681,7 +10582,7 @@ mod tests {
         store.init_for_tests().unwrap();
         engine.note_playhead(0, 50);
         let pass = engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass");
         assert_eq!(pass.committed, 2, "{pass:?}");
@@ -10735,7 +10636,7 @@ mod tests {
         }));
 
         let pass = engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass");
         assert_eq!(
@@ -10803,7 +10704,7 @@ mod tests {
         }));
 
         let pass = engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass");
         assert_eq!(pass.reclaimed, 0, "{pass:?}");
@@ -10832,7 +10733,7 @@ mod tests {
 
         // The pin's pass wants every piece of the file: the one the backend
         // forgot under the pin is fetched again over the bytes it kept.
-        engine.retain(enginefs.store_registry()).await;
+        engine.retain(enginefs.store_registry(), &playing(0)).await;
         assert_eq!(counters.reselected.lock().unwrap().last(), Some(&(0..4)));
     }
 
@@ -10870,7 +10771,7 @@ mod tests {
         }));
 
         engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass");
         assert!(
@@ -10931,7 +10832,7 @@ mod tests {
         }));
 
         engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass");
         assert!(
@@ -10983,7 +10884,7 @@ mod tests {
         engine.note_playhead(0, 0);
 
         let pass = engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass ran");
         assert_eq!(pass.reclaimed, 3, "the three outside the window: {pass:?}");
@@ -11004,7 +10905,7 @@ mod tests {
         );
 
         let pass = engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass ran");
         assert_eq!(
@@ -11119,7 +11020,7 @@ mod tests {
         assert_eq!(engine.handle.run_state(), RunState::Paused);
 
         let pass = engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass");
         assert_eq!(
@@ -11247,7 +11148,10 @@ mod tests {
         // what is on the disk -- and the tick finds the torrent initializing.
         init.ready.store(false, Ordering::SeqCst);
         assert!(
-            engine.retain(enginefs.store_registry()).await.is_none(),
+            engine
+                .retain(enginefs.store_registry(), &playing(0))
+                .await
+                .is_none(),
             "a torrent under its check has no pass to make"
         );
         assert!(
@@ -11262,7 +11166,7 @@ mod tests {
         init.ready.store(true, Ordering::SeqCst);
         counters.in_error_state.store(true, Ordering::SeqCst);
         let pass = engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass over a registered set runs");
         assert_eq!(pass.reclaimed, 0, "nothing reclaimed in error: {pass:?}");
@@ -11274,7 +11178,7 @@ mod tests {
         // Settled again, the same decision goes through.
         counters.in_error_state.store(false, Ordering::SeqCst);
         let pass = engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass");
         assert_eq!(
@@ -11313,7 +11217,7 @@ mod tests {
 
         counters.in_error_state.store(true, Ordering::SeqCst);
         engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass over a registered set runs");
         assert!(
@@ -11324,7 +11228,7 @@ mod tests {
 
         counters.in_error_state.store(false, Ordering::SeqCst);
         engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass");
         assert_eq!(*counters.reselected.lock().unwrap(), vec![0..1]);
@@ -11337,7 +11241,7 @@ mod tests {
         // torrent restarted out of error rebuilds its want-set whole.
         counters.in_error_state.store(true, Ordering::SeqCst);
         engine.pinned_files.write().insert(0);
-        engine.retain(enginefs.store_registry()).await;
+        engine.retain(enginefs.store_registry(), &playing(0)).await;
         assert_eq!(*counters.reselected.lock().unwrap(), vec![0..1]);
     }
 
@@ -11363,7 +11267,7 @@ mod tests {
         engine.note_playhead(0, 0);
         counters.paused.store(true, Ordering::SeqCst);
         engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass runs on a paused torrent");
         assert_eq!(*counters.reselected.lock().unwrap(), vec![0..1]);
@@ -11389,7 +11293,10 @@ mod tests {
         engine.begin_retention(0).await;
         engine.note_playhead(0, 0);
         assert!(
-            engine.retain(enginefs.store_registry()).await.is_none(),
+            engine
+                .retain(enginefs.store_registry(), &playing(0))
+                .await
+                .is_none(),
             "a torrent under its check has no pass"
         );
         assert!(
@@ -11399,7 +11306,7 @@ mod tests {
         );
         init.mark_ready();
         engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass, once the check is over");
         assert_eq!(*counters.reselected.lock().unwrap(), vec![0..1]);
@@ -11409,10 +11316,10 @@ mod tests {
     /// is not.** The policy's passes stopped wanting the file beyond the
     /// window, and only an entity that ends with no policy at all wants the
     /// rest again: the budget gone, or a pin. The file a reader has just
-    /// left is neither -- retiring it gives its range back to the swarm and
-    /// leaves its want-set as the passes left it, or the second episode
-    /// would have the first downloading whole behind it, a file nobody is
-    /// reading filling the disk at the swarm's pace for the cleaner to walk.
+    /// left is neither -- it is slack, and its want-set is left as the
+    /// passes left it, or the second episode would have the first
+    /// downloading whole behind it, a file nobody is reading filling the
+    /// disk at the swarm's pace.
     #[tokio::test]
     async fn a_file_left_unbounded_is_wanted_whole_and_a_retired_sibling_is_not() {
         let (enginefs, counters) = test_enginefs_with_files(vec![
@@ -11433,7 +11340,7 @@ mod tests {
         engine.begin_retention(0).await;
         engine.note_playhead(0, 0);
         engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass");
         assert_eq!(*counters.reselected.lock().unwrap(), vec![0..1]);
@@ -11442,13 +11349,16 @@ mod tests {
             vec![(1..4, crate::backend::AfterRelease::LeaveDropped)]
         );
 
-        // The reader moves on to episode two: the first is retired -- its
-        // range given back -- and not wanted again.
+        // The reader moves on to episode two: episode two is held back, and
+        // episode one is touched not at all. Its range is **not** given
+        // back -- it is a file nobody is playing, so its pieces are on
+        // their way off the disk, and announcing them first would be a Have
+        // for bytes that go seconds later (issue (a)).
         engine.begin_retention(1).await;
         assert_eq!(
             *counters.advertised.lock().unwrap(),
-            vec![(0..4, false), (0..4, true), (4..8, false)],
-            "episode one is retired and episode two held back"
+            vec![(0..4, false), (4..8, false)],
+            "episode two is held back and episode one is left alone"
         );
         assert_eq!(
             *counters.reselected.lock().unwrap(),
@@ -11531,7 +11441,7 @@ mod tests {
         }));
 
         let pass = engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass ran");
         assert!(pass.reclaimed > 0, "the pass gave pieces back: {pass:?}");
@@ -11581,14 +11491,14 @@ mod tests {
         engine.begin_retention(0).await;
         engine.note_playhead(0, 0);
         engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass");
         std::fs::write(bucket.join("1"), [7u8; 25]).unwrap();
         store.init_for_tests().unwrap();
         engine.note_playhead(0, 25);
         let pass = engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass");
         assert_eq!(
@@ -11606,7 +11516,10 @@ mod tests {
         );
 
         assert!(
-            engine.retain(enginefs.store_registry()).await.is_none(),
+            engine
+                .retain(enginefs.store_registry(), &playing(0))
+                .await
+                .is_none(),
             "a pass with no store concludes nothing"
         );
         assert!(
@@ -11660,7 +11573,7 @@ mod tests {
         }));
 
         let pass = engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a byte of another file stopped this file's pass");
         assert_eq!(
@@ -11731,7 +11644,7 @@ mod tests {
         engine.begin_retention(0).await;
         engine.note_playhead(0, 0);
         engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass");
 
@@ -11749,7 +11662,7 @@ mod tests {
         let running = tokio::spawn({
             let engine = engine.clone();
             let registry = enginefs.store_registry().clone();
-            async move { engine.retain(&registry).await }
+            async move { engine.retain(&registry, &playing(0)).await }
         });
         tokio::time::timeout(Duration::from_secs(10), entered_rx)
             .await
@@ -11784,7 +11697,7 @@ mod tests {
         // The pass that runs under the pin clears the policy, and with it
         // wants the whole file again: what the first pass stopped wanting is
         // fetched for the download the user asked for.
-        engine.retain(enginefs.store_registry()).await;
+        engine.retain(enginefs.store_registry(), &playing(0)).await;
         assert_eq!(
             counters.reselected.lock().unwrap().last(),
             Some(&(0..4)),
@@ -11835,7 +11748,7 @@ mod tests {
         engine.begin_retention(0).await;
         engine.note_playhead(0, 0);
         engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass");
 
@@ -11853,7 +11766,7 @@ mod tests {
         let running = tokio::spawn({
             let engine = engine.clone();
             let registry = enginefs.store_registry().clone();
-            async move { engine.retain(&registry).await }
+            async move { engine.retain(&registry, &playing(0)).await }
         });
         tokio::time::timeout(Duration::from_secs(10), entered_rx)
             .await
@@ -11919,7 +11832,7 @@ mod tests {
         engine.begin_retention(0).await;
         engine.note_playhead(0, 0);
         engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass");
 
@@ -11944,7 +11857,7 @@ mod tests {
         let running = tokio::spawn({
             let engine = engine.clone();
             let registry = enginefs.store_registry().clone();
-            async move { engine.retain(&registry).await }
+            async move { engine.retain(&registry, &playing(0)).await }
         });
         tokio::time::timeout(Duration::from_secs(10), entered_rx)
             .await
@@ -12020,7 +11933,7 @@ mod tests {
         engine.begin_retention(0).await;
         engine.note_playhead(0, 0);
         let pass = engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass ran");
         assert!(pass.reclaimed > 0, "the pass gave pieces back: {pass:?}");
@@ -12090,76 +12003,6 @@ mod tests {
         assert_eq!((numbers.window, numbers.committed_bytes), (None, None));
     }
 
-    /// **The file the panel named is the file the numbers have to be
-    /// about.**
-    ///
-    /// There is one policy per torrent, so opening a reader on a second
-    /// file of the same torrent moves what is bounding this torrent to that
-    /// file -- and the playhead does not move with it: it is written as
-    /// reads return, so until the first byte of the new file goes out it
-    /// still names the old one. In that interval the playhead and the
-    /// bounds name different files, and answering from the bounds anyway
-    /// would take the second file's piece span and piece length and apply
-    /// them to an offset in the first: a window and a committed set
-    /// measured over somebody else's pieces, handed to a panel that asked
-    /// about this file. There is nothing to say about a file nothing is
-    /// bounding, so nothing is said.
-    #[tokio::test]
-    async fn a_policy_that_has_moved_to_another_file_says_nothing_about_this_one() {
-        let (enginefs, counters) = test_enginefs_with_files(vec![
-            ("Show.S01E01.mkv".into(), 100),
-            ("Show.S01E02.mkv".into(), 100),
-        ]);
-        // Four twenty-five byte pieces per file: episode one is pieces
-        // 0..4, episode two 4..8.
-        counters.pieces_per_file.store(4, Ordering::SeqCst);
-        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
-        enginefs.set_cache_budget(Some(50));
-
-        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
-        std::fs::create_dir_all(&bucket).unwrap();
-        // Two pieces of each episode, so the other file's span has numbers
-        // of its own to report if anything lets it.
-        for piece in [0u32, 1, 4, 5] {
-            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
-        }
-
-        // A reader twenty-five bytes into the first episode, which is what
-        // the policy is bounding.
-        engine.begin_retention(0).await;
-        engine.note_playhead(0, 25);
-        let _store = seeded_store(&enginefs, &engine);
-        let numbers = enginefs
-            .torrent_stream_numbers(TEST_HASH, 0)
-            .await
-            .expect("the engine exists");
-        assert_eq!(
-            numbers.window,
-            Some(crate::retention::CacheWindow {
-                behind_bytes: 25,
-                ahead_bytes: 25,
-            }),
-            "the file being read is bounded, and these are its pieces"
-        );
-
-        // A second reader opens on the next episode. That is what installs
-        // a policy, so the bounds are the other file's from here on -- and
-        // no byte of it has been read yet, so the playhead is still in this
-        // one.
-        engine.begin_retention(1).await;
-        let numbers = enginefs
-            .torrent_stream_numbers(TEST_HASH, 0)
-            .await
-            .expect("the engine exists");
-        assert_eq!(
-            (numbers.window, numbers.committed_bytes),
-            (None, None),
-            "nothing bounds this file any more, and the other file's span \
-             over this file's offset is not a window: it is a reading of \
-             somebody else's pieces"
-        );
-    }
-
     /// **A stream stops being bounded, and the panel has to hear that.**
     ///
     /// The panel's numbers are a reading *of* the policy, and a policy that
@@ -12215,7 +12058,10 @@ mod tests {
         // other bytes we keep -- so the pass drops the policy.
         engine.pinned_files.write().insert(0);
         assert!(
-            engine.retain(enginefs.store_registry()).await.is_none(),
+            engine
+                .retain(enginefs.store_registry(), &playing(0))
+                .await
+                .is_none(),
             "a pinned torrent has no retention pass to make"
         );
         assert_eq!(
@@ -12270,7 +12116,7 @@ mod tests {
         engine.begin_retention(0).await;
         engine.note_playhead(0, 0);
         engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass");
         assert_eq!(
@@ -12286,7 +12132,7 @@ mod tests {
         // Playback walks on to the second piece, which releases the first.
         engine.note_playhead(0, 25);
         engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass");
         assert_eq!(
@@ -12344,7 +12190,7 @@ mod tests {
         engine.note_playhead(1, 0);
         let _store = seeded_store(&enginefs, &engine);
         let pass = engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(1))
             .await
             .expect("a pass");
 
@@ -12401,7 +12247,7 @@ mod tests {
         engine.note_playhead(1, 0);
         let _store = seeded_store(&enginefs, &engine);
         engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(1))
             .await
             .expect("a pass");
 
@@ -12457,7 +12303,7 @@ mod tests {
         engine.note_playhead(1, 0);
         let _store = seeded_store(&enginefs, &engine);
         let pass = engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(1))
             .await
             .expect("a pass");
 
@@ -12536,12 +12382,12 @@ mod tests {
     ///
     /// The cleaner's gate is collected before a blocking directory walk and
     /// before every delete ahead of this one, so by the time a delete
-    /// happens the reading can be minutes old. Two things make a piece
-    /// announced on the happy path, both of them ordinary: a retention pass
-    /// commits and advertises pieces every couple of seconds, and a reader
-    /// moving to another file puts the first file's whole range back. So
-    /// the question is asked a second time, against the live policy, inside
-    /// the same lock those two take -- `Engine::release_reclaimable`.
+    /// happens the reading can be minutes old. What makes a piece announced
+    /// on the happy path is ordinary and constant: a retention pass commits
+    /// and advertises the pieces its window has moved off, every couple of
+    /// seconds. So the question is asked a second time, against the live
+    /// policy, inside the same turn that pass holds --
+    /// `Engine::release_reclaimable`.
     ///
     /// Without that, the invariant the whole design rests on is a
     /// likelihood rather than a rule: we would delete a piece we had told a
@@ -12549,19 +12395,25 @@ mod tests {
     #[tokio::test]
     async fn a_piece_announced_since_the_cleaner_looked_is_left_alone() {
         let (enginefs, counters) = test_enginefs_with_file_count(2);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
         let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
         std::fs::create_dir_all(&bucket).unwrap();
-        std::fs::write(bucket.join("0"), [7u8; 4096]).unwrap();
-        *counters.drops_pieces.lock().unwrap() = vec![0];
-        // A policy is installed only where the budget does not cover the
-        // file, so the fixture needs one that does not.
-        enginefs.set_cache_budget(Some(1));
+        std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
+        let store = seeded_store(&enginefs, &engine);
 
-        // A policy over file 0 that would give piece 0 up: this is the
-        // reading the cleaner takes.
+        // A policy over file 0 with piece 0 under the playhead: in the
+        // window, committed to nobody, and so the cleaner's to take.
         engine.begin_retention(0).await;
         engine.note_playhead(0, 0);
+        engine
+            .retain(enginefs.store_registry(), &playing(0))
+            .await
+            .expect("a pass");
         let mut gate = crate::retention::ReclaimGate::default();
         gate.insert_verdict(TEST_HASH.to_lowercase(), engine.standing().await.gate);
         assert!(
@@ -12569,11 +12421,16 @@ mod tests {
             "the cleaner's reading says this piece may go"
         );
 
-        // Then the reader moves to the other file, which puts file 0's
-        // range back into what we announce -- exactly what happens when a
-        // viewer skips to the next episode while a clean pass is walking.
-        engine.begin_retention(1).await;
-        engine.note_playhead(1, 0);
+        // Then playback moves on a piece, and the pass that follows commits
+        // piece 0 and announces it -- exactly what happens while a clean
+        // pass is walking.
+        std::fs::write(bucket.join("1"), [7u8; 25]).unwrap();
+        store.init_for_tests().unwrap();
+        engine.note_playhead(0, 25);
+        engine
+            .retain(enginefs.store_registry(), &playing(0))
+            .await
+            .expect("a pass");
 
         assert_eq!(
             enginefs.release_pieces(TEST_HASH, &[0]).await,
@@ -12619,7 +12476,10 @@ mod tests {
         engine.pinned_files.write().insert(0);
 
         assert!(
-            engine.retain(enginefs.store_registry()).await.is_none(),
+            engine
+                .retain(enginefs.store_registry(), &playing(0))
+                .await
+                .is_none(),
             "a pinned torrent has no retention pass to make"
         );
         assert!(
@@ -12662,7 +12522,7 @@ mod tests {
         engine.begin_retention(0).await;
         engine.note_playhead(0, 0);
         engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass");
         for piece in [1u32, 2, 3] {
@@ -12676,7 +12536,7 @@ mod tests {
         let running = tokio::spawn({
             let engine = engine.clone();
             let registry = enginefs.store_registry().clone();
-            async move { engine.retain(&registry).await }
+            async move { engine.retain(&registry, &playing(0)).await }
         });
         tokio::time::timeout(Duration::from_secs(10), entered_rx)
             .await
@@ -12701,7 +12561,7 @@ mod tests {
             "the policy is still bounding the file: it never left its cell"
         );
         let pass = engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("the next tick's pass runs: the dead one dropped the file's turn");
         assert_eq!(
@@ -12746,7 +12606,10 @@ mod tests {
         engine.pinned_files.write().insert(0);
         counters.refuses_advertise.store(true, Ordering::SeqCst);
         assert!(
-            engine.retain(enginefs.store_registry()).await.is_none(),
+            engine
+                .retain(enginefs.store_registry(), &playing(0))
+                .await
+                .is_none(),
             "a pinned torrent has no pass to make"
         );
         assert!(
@@ -12774,7 +12637,12 @@ mod tests {
 
         // The backend can again, and the next pass under the pin retries.
         counters.refuses_advertise.store(false, Ordering::SeqCst);
-        assert!(engine.retain(enginefs.store_registry()).await.is_none());
+        assert!(
+            engine
+                .retain(enginefs.store_registry(), &playing(0))
+                .await
+                .is_none()
+        );
         assert!(
             engine
                 .retention
@@ -12822,7 +12690,7 @@ mod tests {
         engine.begin_retention(0).await;
         engine.note_playhead(0, 0);
         engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass");
         for piece in [1u32, 2, 3] {
@@ -12836,7 +12704,7 @@ mod tests {
         let running = tokio::spawn({
             let engine = engine.clone();
             let registry = enginefs.store_registry().clone();
-            async move { engine.retain(&registry).await }
+            async move { engine.retain(&registry, &playing(0)).await }
         });
         tokio::time::timeout(Duration::from_secs(10), entered_rx)
             .await
@@ -12947,7 +12815,7 @@ mod tests {
         let (enginefs, engine, bucket, _store, _at_start, _seek) = two_streams_on_one_file().await;
         assert_eq!(engine.retention.readers_of(&0), 2);
         let pass = engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass");
         assert_eq!(
@@ -12982,7 +12850,7 @@ mod tests {
         let (enginefs, engine, bucket, _store, mut at_start, seek) =
             two_streams_on_one_file().await;
         engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass");
         assert!(bucket.join("6").is_file());
@@ -12996,7 +12864,7 @@ mod tests {
         let mut byte = [0u8; 1];
         at_start.read_exact(&mut byte).await.expect("a byte at 1");
         let pass = engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass");
         assert_eq!(
@@ -13101,151 +12969,24 @@ mod tests {
         );
     }
 
-    /// A stream that moves to another file of the same torrent puts the
-    /// first file's range back into what we announce before it holds the
-    /// second one's back.
-    ///
-    /// One policy per torrent, so opening a reader on another file replaces
-    /// it -- and the range it was holding back would otherwise stay
-    /// announced to nobody for the life of the engine, while the cache
-    /// cleaner's gate, which reads "no policy for this piece" as "we
-    /// announce it", went on calling those same pieces protected. Held back
-    /// and protected at once is the one combination that is never right:
-    /// bytes we will not share and will not reclaim either.
-    #[tokio::test]
-    async fn a_reader_moving_to_another_file_gives_the_first_one_back_to_the_swarm() {
-        let (enginefs, counters) = test_enginefs_with_file_count(2);
-        // Smaller than either file, so both get a real policy rather than
-        // `Shape::Whole` -- which installs nothing and holds nothing back.
-        enginefs.set_cache_budget(Some(40));
-        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
-
-        let hash = TEST_HASH.to_lowercase();
-        engine.begin_retention(0).await;
-        let gate = enginefs.reclaim_verdicts().await.gate;
-        assert!(
-            gate.releases(&hash, 0),
-            "file 0's piece is inside the window and uncommitted, so it may go"
-        );
-
-        engine.begin_retention(1).await;
-        assert_eq!(
-            *counters.advertised.lock().unwrap(),
-            vec![(0..1, false), (0..1, true), (1..2, false)],
-            "file 0 held back, then given back, and only then file 1 held back"
-        );
-
-        // And the gate says the same thing from the other side: the piece
-        // we announce again is one nothing may take, and the piece we are
-        // now holding back is one a pass may.
-        let gate = enginefs.reclaim_verdicts().await.gate;
-        assert!(!gate.releases(&hash, 0), "announced again, so protected");
-        assert!(gate.releases(&hash, 1), "held back, so reclaimable");
-    }
-
-    /// **Two files opened at once still leave one policy standing, in
-    /// order.**
-    ///
-    /// A player opening the video while the client fetches the `.srt` of
-    /// the same torrent is two `begin_retention`s on different files at
-    /// once, and each clears the other's policy only if it can see it.
-    /// `Engine::announce` used to hold the two apart for the whole torrent;
-    /// with the turn per file, an install that has resolved its file and is
-    /// inside the backend call holding its range back has installed nothing
-    /// yet, so a second install on another file found no sibling to retire
-    /// and ran straight through. Both then installed: two ranges held back,
-    /// the gate answering for whichever the map listed first, and the other
-    /// file's pieces neither shared nor reclaimable until the next seek --
-    /// held back and protected at once, the combination that is never right.
-    /// The owner orders its installs now, and this is the second one
-    /// waiting on the first.
-    #[tokio::test]
-    async fn two_files_opened_at_once_still_leave_one_policy_standing() {
-        let (enginefs, counters) = test_enginefs_with_file_count(2);
-        enginefs.set_cache_budget(Some(40));
-        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
-
-        // The first file's install is parked inside the call that holds its
-        // range back: resolved, its turn taken, nothing installed yet.
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        *counters.advertise_gate.lock().unwrap() = Some((entered_tx, release_rx));
-        let first = tokio::spawn({
-            let engine = engine.clone();
-            async move { engine.begin_retention(0).await }
-        });
-        tokio::time::timeout(Duration::from_secs(10), entered_rx)
-            .await
-            .expect("the first install reached the call that holds its range back")
-            .expect("the fake said so");
-
-        // The second file's install arrives while the first is in there. On
-        // this single-threaded runtime it has run as far as it can once the
-        // test has yielded to it, and as far as it can is the wait.
-        let second = tokio::spawn({
-            let engine = engine.clone();
-            async move { engine.begin_retention(1).await }
-        });
-        for _ in 0..16 {
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            !second.is_finished(),
-            "the second install ran to the end while the first was still installing: \
-             two installs on one torrent do not run at once"
-        );
-
-        release_tx
-            .send(())
-            .expect("the first install is waiting on this");
-        first.await.expect("the first install's task");
-        second.await.expect("the second install's task");
-
-        assert_eq!(
-            *counters.advertised.lock().unwrap(),
-            vec![(0..1, false), (0..1, true), (1..2, false)],
-            "file 0 held back, then given back, and only then file 1 held back"
-        );
-        let installed: Vec<usize> = engine
-            .retention
-            .holdings()
-            .into_iter()
-            .filter(|(_, holding)| holding.installed.is_some())
-            .map(|(file_idx, _)| file_idx)
-            .collect();
-        assert_eq!(
-            installed,
-            vec![1],
-            "one policy stands, and it is the last file opened"
-        );
-        let hash = TEST_HASH.to_lowercase();
-        let gate = enginefs.reclaim_verdicts().await.gate;
-        assert!(!gate.releases(&hash, 0), "announced again, so protected");
-        assert!(gate.releases(&hash, 1), "held back, so reclaimable");
-    }
-
     /// **Two policies standing, and the cleaner is told about both -- the
     /// same both, every time it asks -- and its delete holds the right
     /// file's turn.**
     ///
-    /// One policy stands at most while the owner orders its installs, and
-    /// the one way two can is a sibling whose range the backend would not
-    /// take back at its retiring: the install warns and goes on, and holds
-    /// the new file's range back beside the old one's. The engine's answer
-    /// to the cleaner was then read off whichever holding the owner's map
-    /// listed first -- the other file's held-back pieces called announced
-    /// and never reclaimed, and which file that was a property of the map's
-    /// order at that call. And the delete took that one file's turn for a
-    /// request about both files' pieces (issue c). Every standing policy is
-    /// in the answer now, in file order,
-    /// and the delete groups its pieces by the policy that holds them and
-    /// takes each file's own turn.
+    /// Two policies on one torrent are ordinary now: each file is its own
+    /// entity with its own head, and an install on the next episode retires
+    /// nothing. The engine's answer to the cleaner used to be read off
+    /// whichever holding the owner's map listed first -- the other file's
+    /// held-back pieces called announced and never reclaimed, and which
+    /// file that was a property of the map's order at that call. And the
+    /// delete took that one file's turn for a request about both files'
+    /// pieces (issue c). Every standing policy is in the answer now, in
+    /// file order, and the delete groups its pieces by the policy that
+    /// holds them and takes each file's own turn.
     ///
-    /// The refusal is staged: the sibling's re-advertise is parked, refused
-    /// on release, and the new file's hold-back -- the next call -- parked
-    /// and allowed. The turn half holds file 1's turn from the test: the
-    /// delete frees file 0's piece under file 0's free turn and waits for
-    /// file 1's, and takes file 1's piece only once it is let go.
+    /// File 0 is the one being played here, so file 1's policy is a slack
+    /// one -- which is the other half of what the gate has to say: a policy
+    /// whose bytes are on their way out protects nothing it committed.
     #[tokio::test]
     async fn two_standing_policies_are_both_reported_and_each_is_deleted_under_its_own_turn() {
         let (enginefs, counters) = test_enginefs_with_file_count(2);
@@ -13266,14 +13007,14 @@ mod tests {
         engine.begin_retention(0).await;
         engine.note_playhead(0, 0);
         engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass");
         std::fs::write(bucket.join("1"), [7u8; 25]).unwrap();
         store.init_for_tests().unwrap();
         engine.note_playhead(0, 25);
         engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass");
         assert_eq!(
@@ -13288,38 +13029,14 @@ mod tests {
             "the second pass committed the piece the window moved off"
         );
 
-        // The viewer opens file 1. The backend will not have file 0's range
-        // back when the install asks, and will hold file 1's back a moment
-        // later: two policies stand.
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        *counters.advertise_gate.lock().unwrap() = Some((entered_tx, release_rx));
-        let install = tokio::spawn({
-            let engine = engine.clone();
-            async move { engine.begin_retention(1).await }
-        });
-        tokio::time::timeout(Duration::from_secs(10), entered_rx)
-            .await
-            .expect("the install reached the call that gives file 0's range back")
-            .expect("the fake said so");
-        counters.refuses_advertise.store(true, Ordering::SeqCst);
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-        let (release_again_tx, release_rx) = tokio::sync::oneshot::channel();
-        *counters.advertise_gate.lock().unwrap() = Some((entered_tx, release_rx));
-        release_tx.send(()).expect("the install is waiting on this");
-        tokio::time::timeout(Duration::from_secs(10), entered_rx)
-            .await
-            .expect("the install went on to the call that holds file 1's range back")
-            .expect("the fake said so");
-        counters.refuses_advertise.store(false, Ordering::SeqCst);
-        release_again_tx
-            .send(())
-            .expect("the install is waiting on this");
-        install.await.expect("the install's task");
+        // The viewer opens file 1, and nothing retires file 0: each file is
+        // its own entity with its own head and window, so two policies
+        // stand from here on.
+        engine.begin_retention(1).await;
         assert_eq!(
             *counters.advertised.lock().unwrap(),
             vec![(0..4, false), (0..1, true), (4..8, false)],
-            "file 0 held back and its piece 0 committed; its retiring refused; file 1 held back"
+            "file 0 held back and its piece 0 committed; file 1 held back;              nothing of file 0 put back"
         );
 
         // Both are reported, in file order, and the same way every time.
@@ -13448,46 +13165,25 @@ mod tests {
         engine.begin_retention(0).await;
         engine.note_playhead(0, 0);
         engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass");
         std::fs::write(bucket.join("1"), [7u8; 25]).unwrap();
         store.init_for_tests().unwrap();
         engine.note_playhead(0, 25);
         engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass");
 
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        *counters.advertise_gate.lock().unwrap() = Some((entered_tx, release_rx));
-        let install = tokio::spawn({
-            let engine = engine.clone();
-            async move { engine.begin_retention(1).await }
-        });
-        tokio::time::timeout(Duration::from_secs(10), entered_rx)
-            .await
-            .expect("the install reached the call that gives file 0's range back")
-            .expect("the fake said so");
-        counters.refuses_advertise.store(true, Ordering::SeqCst);
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-        let (release_again_tx, release_rx) = tokio::sync::oneshot::channel();
-        *counters.advertise_gate.lock().unwrap() = Some((entered_tx, release_rx));
-        release_tx.send(()).expect("the install is waiting on this");
-        tokio::time::timeout(Duration::from_secs(10), entered_rx)
-            .await
-            .expect("the install went on to the call that holds file 1's range back")
-            .expect("the fake said so");
-        counters.refuses_advertise.store(false, Ordering::SeqCst);
-        release_again_tx
-            .send(())
-            .expect("the install is waiting on this");
-        install.await.expect("the install's task");
+        // The viewer opens file 1. Nothing is retired: each file is its own
+        // entity with its own head and its own window, so both policies
+        // stand from here on.
+        engine.begin_retention(1).await;
         assert_eq!(
             *counters.advertised.lock().unwrap(),
             vec![(0..4, false), (0..1, true), (4..8, false)],
-            "file 0 held back and its piece 0 committed; its retiring refused; file 1 held back"
+            "file 0 held back and its piece 0 committed; file 1 held back;              nothing of file 0 put back"
         );
         assert_eq!(
             engine
@@ -13503,112 +13199,654 @@ mod tests {
         (enginefs, counters, engine, bucket, store)
     }
 
-    /// **Two policies standing, and the tick's pass runs on the file the
-    /// head is in.**
+    /// **A switch to the next episode makes the first file slack: its
+    /// bytes go and its range is never announced again.**
     ///
-    /// The torrent has one head, told to every entity, and a pass on an
-    /// entity whose domain does not hold it concludes nothing. In the one
-    /// state with two standing the viewer has gone on to another file --
-    /// the next episode, the higher-numbered one -- and a pass that picked
-    /// the lowest file standing ran on the file left every tick: the file
-    /// being played had nothing committed for sharing, nothing outside its
-    /// window reclaimed, its want-set never trimmed, for as long as the
-    /// stale policy stood. The pass runs on the file the head is in; the
-    /// stale policy stays as it was.
+    /// This is issue (a), and it is what the liveness value is for. What
+    /// used to happen when a viewer opened the next episode was that the
+    /// install retired the first file -- which put its whole range *back*
+    /// into what we announce -- and then nothing deleted the bytes until a
+    /// cleaner walk got round to them. A Have per switch for pieces that
+    /// were about to go, and a disk that kept every film anybody had opened
+    /// this session.
     ///
-    /// And what that pass commits is refused to the cleaner through
-    /// `standing` and `release_reclaimable`, while file 0's uncommitted piece
-    /// is ordered under file 0's own turn -- both files' committed sets, and
-    /// each file's turn, through the engine and not the gate alone.
+    /// Now the file the viewer left is [`Mode::Slack`] at the very next
+    /// tick: its extent is held back before a single unlink, every piece it
+    /// holds is taken, its policy and windows go, its entity is forgotten,
+    /// and nothing of it is ever announced again. The file being played
+    /// keeps its window through the same tick and commits what the window
+    /// releases, as it always did.
+    ///
+    /// [`Mode::Slack`]: crate::retention::owner::Mode::Slack
     #[tokio::test]
-    async fn retain_passes_over_the_file_the_head_is_in_when_two_policies_stand() {
+    async fn a_switch_to_the_next_file_makes_the_first_slack_and_takes_its_bytes() {
         let (enginefs, counters, engine, bucket, store) = two_policies_standing().await;
-        let committed_of = |file_idx: usize| -> std::collections::BTreeSet<u32> {
-            engine
-                .retention
-                .holding(&file_idx)
-                .expect("the file has an entity")
-                .installed
-                .expect("and a policy")
-                .committed
-        };
+        // The server sees a stream open on file 1: the switch.
+        assert!(
+            !engine.standing().await.gate.releases(0),
+            "while file 0 is being played, the cleaner is refused its committed piece"
+        );
+        enginefs.on_stream_start(TEST_HASH, 1).await;
+        assert_eq!(enginefs.live().reading().file_of(TEST_HASH), Some(1));
+        assert!(
+            engine.standing().await.gate.releases(0),
+            "and the moment it is slack the same piece is releasable: a policy on \
+             its way out protects nothing it committed"
+        );
+        counters.advertised.lock().unwrap().clear();
 
-        // The viewer reads file 1: piece 4, then piece 5.
+        // The viewer reads file 1: piece 4.
         std::fs::write(bucket.join("4"), [7u8; 25]).unwrap();
         store.init_for_tests().unwrap();
         engine.note_playhead(1, 0);
-        engine
-            .retain(enginefs.store_registry())
+        let live = enginefs.live().reading();
+        let pass = engine
+            .retain(enginefs.store_registry(), &live)
             .await
-            .expect("a pass on file 1, where the head is");
+            .expect("a pass");
+
+        assert_eq!(
+            pass.reclaimed, 2,
+            "every held piece of the file left behind: {pass:?}"
+        );
+        assert!(
+            !bucket.join("0").exists() && !bucket.join("1").exists(),
+            "including the one it had committed for sharing"
+        );
+        assert!(
+            bucket.join("4").is_file(),
+            "and the file being played keeps its window"
+        );
+        assert!(
+            engine.retention.holding(&0).is_none(),
+            "the entity that holds nothing and nobody reads is forgotten"
+        );
+        assert_eq!(
+            *counters.advertised.lock().unwrap(),
+            vec![(0..4, false)],
+            "held back before a byte of it was unlinked, and never put back"
+        );
+
+        // And the file being played goes on committing what its window
+        // releases.
         std::fs::write(bucket.join("5"), [7u8; 25]).unwrap();
         store.init_for_tests().unwrap();
         engine.note_playhead(1, 25);
         let pass = engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &live)
             .await
             .expect("a pass");
         assert_eq!(pass.committed, 1, "{pass:?}");
-        assert_eq!(
-            committed_of(1),
-            [4].into_iter().collect(),
-            "the piece file 1's window moved off is committed"
-        );
-        assert_eq!(
-            committed_of(0),
-            [0].into_iter().collect(),
-            "and the stale policy is as it was"
-        );
         assert_eq!(
             counters.advertised.lock().unwrap().last(),
             Some(&(4..5, true)),
             "file 1's committed piece is announced"
         );
+    }
 
-        // The cleaner: file 1's committed piece is refused, and file 0's
-        // uncommitted piece waits on file 0's turn.
-        let standing = engine.standing().await;
-        assert!(!standing.gate.releases(4), "committed by file 1's policy");
-        assert!(!standing.gate.releases(0), "committed by file 0's");
-        assert!(
-            standing.gate.releases(1),
-            "file 0's uncommitted piece may go"
-        );
-        let holding_file_0 = engine
-            .retention
-            .turn(&0)
-            .await
-            .expect("file 0 has an entity");
-        let mut delete = tokio::spawn({
-            let engine = engine.clone();
-            let registry = enginefs.store_registry().clone();
-            async move { engine.release_reclaimable(&registry, &[1, 4]).await }
+    /// **One reading of what is being played, for the whole tick.**
+    ///
+    /// The ladder and the retention pass both consult it, and they are
+    /// asked one after the other over the same engine. A value read twice
+    /// could differ between the two readings, and the two decisions it
+    /// feeds are opposites: the ladder would keep the torrent running for a
+    /// viewer while the pass deleted the window they are inside, or stop it
+    /// under a window the pass had just measured and kept. So the tick
+    /// takes one copy before its first engine and hands it to both.
+    ///
+    /// The hook is inside the pass, which is after the ladder: a write
+    /// there is a write in the exact gap the two readings would straddle,
+    /// and neither may see it.
+    #[tokio::test]
+    async fn a_live_write_racing_the_tick_is_seen_by_both_halves_or_by_neither() {
+        let (mut enginefs, counters) = test_enginefs_with_file_count(1);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        if let Some(sweep) = enginefs.take_sweep_task() {
+            sweep.abort();
+        }
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
+        let _store = seeded_store(&enginefs, &engine);
+        engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
+        // Stopped, so the ladder's own `Run` has a call to make -- and that
+        // call is what the tick can be parked in, which is the gap between
+        // its two halves.
+        stop_torrent(&enginefs, TEST_HASH).await;
+        let enginefs = Arc::new(enginefs);
+
+        counters.hold_start.store(true, Ordering::SeqCst);
+        let tick = tokio::spawn({
+            let enginefs = enginefs.clone();
+            async move { enginefs.reconcile_tick().await }
         });
         assert!(
-            tokio::time::timeout(Duration::from_millis(200), &mut delete)
-                .await
-                .is_err(),
-            "the delete waits: file 0's piece is ordered by file 0's turn"
+            wait_until(TEST_WAIT_BOUND, || counters
+                .start_torrent
+                .load(Ordering::SeqCst)
+                == 1)
+            .await,
+            "the ladder decided Run and its start is inside the backend"
         );
-        assert!(bucket.join("1").is_file());
-        drop(holding_file_0);
+
+        // The viewer opens something else, in the gap: after the ladder has
+        // read, before the pass has.
+        enginefs.live().open(
+            crate::retention::live::LiveEntity::Proxy {
+                dir: "/elsewhere".into(),
+            },
+            false,
+        );
+        counters.hold_start.store(false, Ordering::SeqCst);
+        counters.start_gate.notify_one();
+
         assert_eq!(
-            delete.await.expect("the delete task"),
-            1,
-            "file 0's uncommitted piece went, and file 1's committed one did not"
+            tick.await.expect("the tick"),
+            vec![(TEST_HASH.to_string(), Decision::Run)],
+            "the ladder read the torrent as the one being played"
         );
-        assert!(!bucket.join("1").exists());
-        assert!(bucket.join("4").is_file());
-        let asked: Vec<std::ops::Range<u32>> = counters
-            .dropped_ranges
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(range, _)| range.clone())
-            .collect();
         assert!(
-            !asked.contains(&(4..5)),
-            "the backend was never asked to forget file 1's committed piece: {asked:?}"
+            bucket.join("0").is_file(),
+            "and so did the pass: a live pass keeps the window"
+        );
+        assert!(
+            engine
+                .retention
+                .holding(&0)
+                .expect("file 0's entity")
+                .installed
+                .is_some(),
+            "the policy stands, which a slack pass would have dropped"
+        );
+
+        // And the next tick sees the new value in both halves.
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), Decision::Stop)]
+        );
+        assert!(!bucket.join("0").exists(), "and its bytes go");
+    }
+
+    /// **The aside rule: a subtitle read during playback is not a switch.**
+    ///
+    /// A player fetching a side file of the torrent it is playing opens a
+    /// stream on another file of that torrent, and there is nothing in the
+    /// request to tell that apart from a viewer skipping to the next
+    /// episode. What tells them apart is whether anything is still reading
+    /// the file that is playing: while a read of it is open the open on the
+    /// other file is an aside and the live file does not move, and the
+    /// video is not deleted out from under the player at the next tick.
+    /// Once no read of it is left, the same open *is* the viewer moving on.
+    #[tokio::test]
+    async fn an_open_on_another_file_while_the_first_is_being_read_is_not_a_switch() {
+        let (enginefs, _counters) = test_enginefs_with_file_count(2);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        engine.begin_retention(0).await;
+        assert_eq!(enginefs.live().reading().file_of(TEST_HASH), Some(0));
+
+        // A response is still delivering file 0.
+        let reader = engine
+            .retention
+            .reader_on(&0)
+            .expect("file 0 has an entity");
+        reader.promises(0..1);
+
+        enginefs.on_stream_start(TEST_HASH, 1).await;
+        assert_eq!(
+            enginefs.live().reading().file_of(TEST_HASH),
+            Some(0),
+            "an open on a side file while the video is still being read is an aside"
+        );
+
+        // The response ends, and the same open moves the live file.
+        drop(reader);
+        enginefs.on_stream_start(TEST_HASH, 1).await;
+        assert_eq!(
+            enginefs.live().reading().file_of(TEST_HASH),
+            Some(1),
+            "with nothing left reading file 0, this is the viewer moving on"
+        );
+    }
+
+    /// **A body still being delivered keeps its torrent running and its
+    /// file's window whole, even once something else is being played.**
+    ///
+    /// An open read is not liveness -- it is not what a viewer is watching,
+    /// and it buys the torrent nothing once it has ended -- but it is an
+    /// in-flight response, and taking its bytes out from under it is a
+    /// broken read for the player and a fetch the swarm is paid for twice.
+    /// So the ladder keeps such a torrent running and the file being read
+    /// runs the live pass, however long its own turn was ago.
+    #[tokio::test(start_paused = true)]
+    async fn a_body_still_being_delivered_keeps_its_torrent_running_and_its_window() {
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
+        let _store = seeded_store(&enginefs, &engine);
+        engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
+
+        // The viewer opens something else, and a response is still
+        // delivering this file.
+        let reader = engine
+            .retention
+            .reader_on(&0)
+            .expect("file 0 has an entity");
+        reader.promises(0..1);
+        nothing_torrent_is_playing(&enginefs);
+
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), Decision::Run)],
+            "the torrent a body is still being delivered out of keeps running"
+        );
+        assert!(
+            bucket.join("0").is_file(),
+            "and the file being read keeps its window"
+        );
+
+        // The response ends.
+        drop(reader);
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), Decision::Stop)]
+        );
+        assert!(!bucket.join("0").exists(), "and its bytes go");
+    }
+
+    /// **A stopped playback keeps its window, for as long as it is stopped.**
+    ///
+    /// There is no clock anywhere in what decides this. A viewer who pauses
+    /// -- or closes the player and comes back in an hour -- is still the
+    /// one playing this file until they open something else, so the window
+    /// round where they got to is kept and resuming inside it plays off the
+    /// disk. A hundred ticks pass here and nothing moves; the install a
+    /// resume makes finds the policy already describing this file under
+    /// this budget and keeps it untouched, which is what makes the resume
+    /// free rather than a fresh hold-back.
+    #[tokio::test]
+    async fn a_stopped_playback_keeps_its_window_and_a_resume_keeps_the_policy() {
+        let (enginefs, counters) = test_enginefs_with_file_count(1);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
+        let _store = seeded_store(&enginefs, &engine);
+        engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
+        let windows = || {
+            engine
+                .retention
+                .holding(&0)
+                .expect("file 0's entity")
+                .windows
+        };
+
+        engine
+            .retain(enginefs.store_registry(), &playing(0))
+            .await
+            .expect("a pass");
+        let first = windows();
+        assert!(!first.is_empty(), "the pass measured a window");
+
+        for _ in 0..100 {
+            engine.retain(enginefs.store_registry(), &playing(0)).await;
+        }
+        assert!(
+            bucket.join("0").is_file(),
+            "the piece under the head is still here a hundred ticks later"
+        );
+        assert_eq!(windows(), first, "and the window is the one it was");
+        assert_eq!(
+            engine.retention.install(0, 0).await,
+            crate::retention::owner::InstallOutcome::Kept,
+            "the resume keeps the policy: nothing is re-held-back"
+        );
+    }
+
+    /// **A torrent nobody is playing loses the files nothing ever opened**,
+    /// and the delete stops where it is if the viewer comes back.
+    ///
+    /// A pass walks entities, and an entity exists for a file something
+    /// opened. What a torrent holds of the files nothing ever opened -- the
+    /// twelve other episodes the swarm filled around the one that was
+    /// watched -- is in no pass's extent, and on a torrent nobody is
+    /// playing and nobody has pinned there is nothing that will ever want
+    /// it again.
+    ///
+    /// The second half is the door: the liveness cell is read again before
+    /// every run rather than carried in from the tick's reading, so an open
+    /// that lands mid-delete stops it at the run it is on and the entity
+    /// that open installs keeps the rest.
+    #[tokio::test]
+    async fn a_torrent_nobody_plays_loses_the_files_nothing_opened() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        // Two runs, so the door is asked twice: pieces 0 and 1 of file 0,
+        // and 5 and 6 of file 1. Nothing has opened either file.
+        for piece in [0u32, 1, 5, 6] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let _store = seeded_store(&enginefs, &engine);
+        nothing_torrent_is_playing(&enginefs);
+
+        // The first run's hold-back is parked, and the viewer opens the
+        // torrent again while it is.
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *counters.advertise_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        let running = tokio::spawn({
+            let engine = engine.clone();
+            let registry = enginefs.store_registry().clone();
+            let live = enginefs.live().reading();
+            async move { engine.retain(&registry, &live).await }
+        });
+        tokio::time::timeout(Duration::from_secs(10), entered_rx)
+            .await
+            .expect("the reclaim reached the call that holds its first run back")
+            .expect("the fake said so");
+        enginefs.live().open(
+            crate::retention::live::LiveEntity::Torrent {
+                info_hash: TEST_HASH.to_string(),
+                file_idx: 0,
+            },
+            false,
+        );
+        release_tx.send(()).expect("the reclaim is waiting on this");
+        let pass = running.await.expect("the task").expect("a pass");
+
+        assert_eq!(pass.reclaimed, 2, "the first run went: {pass:?}");
+        assert!(!bucket.join("0").exists() && !bucket.join("1").exists());
+        assert!(
+            bucket.join("5").is_file() && bucket.join("6").is_file(),
+            "and the run after the viewer came back was never asked for"
+        );
+
+        // With nobody playing it again, the rest goes.
+        nothing_torrent_is_playing(&enginefs);
+        let pass = engine
+            .retain(enginefs.store_registry(), &enginefs.live().reading())
+            .await
+            .expect("a pass");
+        assert_eq!(pass.reclaimed, 2, "{pass:?}");
+        assert!(!bucket.join("5").exists() && !bucket.join("6").exists());
+    }
+
+    /// **The switch does not wait for the tick.**
+    ///
+    /// Two seconds is nothing until the thing waiting for the room is the
+    /// stream that caused the switch, so the moment a viewer opens
+    /// something else the server runs the same slack passes the tick would
+    /// have run. `EngineFS::drop_slack` is what the task watching the
+    /// liveness cell calls, and what the running-low bell and
+    /// `POST /cache/clean` will call after it.
+    #[tokio::test]
+    async fn dropping_slack_empties_what_nobody_is_playing_without_a_tick() {
+        let (enginefs, counters) = test_enginefs_with_file_count(1);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
+        let _store = seeded_store(&enginefs, &engine);
+        engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
+
+        enginefs.drop_slack().await;
+        assert!(
+            bucket.join("0").is_file(),
+            "the file being played is not slack"
+        );
+
+        nothing_torrent_is_playing(&enginefs);
+        enginefs.drop_slack().await;
+        assert!(
+            !bucket.join("0").exists(),
+            "and the moment something else is played, its bytes go"
+        );
+    }
+
+    /// **A slack pass stops where it is if the viewer comes back to the
+    /// file it is emptying.**
+    ///
+    /// The mode a pass runs in is decided once, by its driver, from one
+    /// reading of what is being played -- and the pass then spends seconds
+    /// unlinking. A viewer who opens the file again in that window is
+    /// inside the window a new policy is about to draw, and the run the
+    /// pass is on may be the one their playback is reading. So the door
+    /// asks the liveness cell again before every run rather than trusting
+    /// the mode it started under, and what is left is what the returning
+    /// stream finds.
+    #[tokio::test]
+    async fn a_slack_pass_stops_when_the_file_is_played_again() {
+        let (enginefs, counters) = test_enginefs_with_file_count(1);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        // Two runs: pieces 0 and 1, then piece 3.
+        for piece in [0u32, 1, 3] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let _store = seeded_store(&enginefs, &engine);
+        engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
+
+        // The viewer opens something else, and comes back while the first
+        // run of the pass that follows is being unlinked.
+        nothing_torrent_is_playing(&enginefs);
+        *counters.on_first_drop.lock().unwrap() = Some(Box::new({
+            let live = enginefs.live().clone();
+            move || {
+                live.open(
+                    crate::retention::live::LiveEntity::Torrent {
+                        info_hash: TEST_HASH.to_string(),
+                        file_idx: 0,
+                    },
+                    false,
+                );
+            }
+        }));
+
+        let pass = engine
+            .retain(enginefs.store_registry(), &enginefs.live().reading())
+            .await
+            .expect("a pass");
+
+        assert_eq!(pass.reclaimed, 2, "the run it was already on: {pass:?}");
+        assert!(!bucket.join("0").exists() && !bucket.join("1").exists());
+        assert!(
+            bucket.join("3").is_file(),
+            "and the run after the viewer came back was never asked for"
+        );
+        assert_eq!(
+            *counters.advertised.lock().unwrap().last().unwrap(),
+            (0..4, false),
+            "the whole extent was held back before a byte of it went"
+        );
+
+        // And the entity the stopped pass left behind has no policy any
+        // more -- a slack pass drops it -- yet still holds a piece. The
+        // next tick has to walk it all the same, or what a refused delete
+        // leaves is left for good.
+        assert!(
+            engine
+                .retention
+                .holding(&0)
+                .expect("the entity is still here: it holds something")
+                .installed
+                .is_none(),
+            "the slack pass dropped the policy"
+        );
+        nothing_torrent_is_playing(&enginefs);
+        let pass = engine
+            .retain(enginefs.store_registry(), &enginefs.live().reading())
+            .await
+            .expect("a pass");
+        assert_eq!(pass.reclaimed, 1, "{pass:?}");
+        assert!(!bucket.join("3").exists());
+        assert!(
+            engine.retention.holding(&0).is_none(),
+            "and now it holds nothing, so the entity goes"
+        );
+    }
+
+    /// **An unpinned torrent in error that nobody is playing is removed
+    /// with its files.**
+    ///
+    /// An errored torrent holds no storage for a `drop_pieces` to edit, so
+    /// no slack pass can take a byte of it: the drop bails, the pieces
+    /// stay, and every later pass offers them again. Nothing else will ever
+    /// come for them either -- the torrent announces nothing, and the next
+    /// start would rebuild its have-set from exactly those files. So the
+    /// tick that finds it is its opportunity, and it is taken whole.
+    ///
+    /// A pinned one is not: a pin is kept until it is unpinned, and an
+    /// error is the reconciler's to recover from.
+    #[tokio::test(start_paused = true)]
+    async fn an_errored_torrent_nobody_plays_is_removed_with_its_files() {
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        nothing_torrent_is_playing(&enginefs);
+        counters.in_error_state.store(true, Ordering::SeqCst);
+        enginefs
+            .get_engine(TEST_HASH)
+            .await
+            .expect("the fixture's engine")
+            .pinned_files
+            .write()
+            .insert(0);
+
+        enginefs.reconcile_tick().await;
+        assert!(
+            enginefs
+                .backend
+                .removed_with_files
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "a pinned torrent is kept, error or no error"
+        );
+        assert!(enginefs.peek_engine(TEST_HASH).await.is_some());
+
+        enginefs
+            .get_engine(TEST_HASH)
+            .await
+            .expect("the fixture's engine")
+            .pinned_files
+            .write()
+            .clear();
+        enginefs.reconcile_tick().await;
+        assert_eq!(
+            *enginefs.backend.removed_with_files.lock().unwrap(),
+            vec![TEST_HASH.to_string()],
+            "and an unpinned one goes with its bytes"
+        );
+        assert!(
+            enginefs.peek_engine(TEST_HASH).await.is_none(),
+            "the engine goes with it"
+        );
+    }
+
+    /// **The housekeeping sweep never removes the live torrent's engine.**
+    ///
+    /// The sweep drops an engine nothing has asked about for five minutes,
+    /// and it now takes the torrent's files with it. The entity every
+    /// window is drawn round lives in that engine's retention owner, so
+    /// removing the one being played would take the window out of the map
+    /// under the player -- and the files it is reading with it.
+    #[tokio::test(start_paused = true)]
+    async fn the_housekeeping_sweep_never_removes_the_live_torrents_engine() {
+        let TwoEngines {
+            enginefs, removed, ..
+        } = test_enginefs_with_two_engines();
+        enginefs.live().open(
+            crate::retention::live::LiveEntity::Torrent {
+                info_hash: TEST_HASH.to_string(),
+                file_idx: 0,
+            },
+            false,
+        );
+        let present = |hash: &str| {
+            let engines = enginefs.engines.clone();
+            let hash = hash.to_string();
+            async move { engines.read().await.contains_key(&hash) }
+        };
+
+        tokio::time::sleep(INACTIVE_TORRENT_REMOVE_TIMEOUT + Duration::from_secs(30)).await;
+        assert!(
+            present(TEST_HASH).await,
+            "the engine of the torrent being played must survive"
+        );
+        assert!(!present(OTHER_HASH).await, "the idle one is removed");
+        assert_eq!(*removed.lock().unwrap(), vec![OTHER_HASH.to_string()]);
+    }
+
+    /// **A restart leaves nothing playing, and the first tick stops every
+    /// unpinned torrent the session restored.**
+    ///
+    /// The liveness cell starts empty, and that is the honest reading: a
+    /// process that has served nothing is playing nothing. Everything the
+    /// last one left is therefore cache with nobody to speak for it, which
+    /// is what the boot sweep and the passes are about -- and what a
+    /// running torrent would be fetching into.
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_leaves_nothing_playing_and_stops_every_restored_torrent() {
+        let TwoEngines { mut enginefs, .. } = test_enginefs_with_two_engines();
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        if let Some(sweep) = enginefs.take_sweep_task() {
+            sweep.abort();
+        }
+        assert_eq!(
+            enginefs.live().reading(),
+            crate::retention::live::Reading::nothing(),
+            "nothing is playing in a process that has served nothing"
+        );
+
+        let mut decided = enginefs.reconcile_tick().await;
+        decided.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            decided,
+            vec![
+                (TEST_HASH.to_string(), Decision::Stop),
+                (OTHER_HASH.to_string(), Decision::Stop),
+            ],
+            "every restored torrent is one nobody is playing"
         );
     }
 
@@ -13645,7 +13883,7 @@ mod tests {
         engine.begin_retention(0).await;
         engine.note_playhead(0, 0);
         engine
-            .retain(enginefs.store_registry())
+            .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass");
         std::fs::write(bucket.join("1"), [7u8; 25]).unwrap();
@@ -13668,7 +13906,7 @@ mod tests {
         let running = tokio::spawn({
             let engine = engine.clone();
             let registry = enginefs.store_registry().clone();
-            async move { engine.retain(&registry).await }
+            async move { engine.retain(&registry, &playing(0)).await }
         });
         tokio::time::timeout(Duration::from_secs(10), entered_rx)
             .await
@@ -13794,7 +14032,6 @@ mod tests {
             !enginefs.active_file_streams.read().await.contains_key(&key),
             "and its stream count"
         );
-        assert_eq!(*enginefs.active_file.read().await, None);
         assert!(!file(0).exists());
         assert!(file(2).is_file(), "the pinned file is untouched");
 
@@ -14389,6 +14626,12 @@ mod tests {
     /// torrent from the session would stop the offline download -- while
     /// still removing an idle unpinned one; once unpinned, the engine is
     /// ordinary again and the next window removes it.
+    ///
+    /// **With its files.** An engine nothing has asked about for five
+    /// minutes is one whose entities the slack passes have already emptied;
+    /// whatever the removal leaves under the root has no deleter left in
+    /// this process, because the store that would answer for it goes with
+    /// the torrent.
     #[tokio::test(start_paused = true)]
     async fn idle_sweeper_keeps_pinned_engine_and_removes_unpinned() {
         let TwoEngines {
@@ -14429,39 +14672,6 @@ mod tests {
         assert_eq!(
             *removed.lock().unwrap(),
             vec![OTHER_HASH.to_string(), TEST_HASH.to_string()]
-        );
-    }
-
-    /// With seeding off the idle arm stops what nobody is watching -- and a
-    /// pinned torrent is not that: somebody asked for it offline, and it
-    /// keeps downloading.
-    ///
-    /// Two engines under one tick, so the assertion is a difference rather
-    /// than a claim about a machine that had not got round to it: the
-    /// unpinned one is stopped on the same pass that leaves the pinned one
-    /// running.
-    #[tokio::test(start_paused = true)]
-    async fn the_idle_arm_stops_the_unpinned_torrent_and_leaves_the_pinned_one() {
-        let TwoEngines { mut enginefs, .. } = test_enginefs_with_two_engines();
-        if let Some(sweep) = enginefs.take_sweep_task() {
-            sweep.abort();
-        }
-        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
-        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
-        enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
-        tokio::time::advance(INACTIVE_TORRENT_PAUSE_GRACE * 2).await;
-
-        enginefs.reconcile_tick().await;
-
-        assert_eq!(
-            run_state_of(&enginefs, TEST_HASH).await,
-            RunState::Live,
-            "the pinned torrent keeps downloading"
-        );
-        assert_eq!(
-            run_state_of(&enginefs, OTHER_HASH).await,
-            RunState::Paused,
-            "and the one nobody asked for is stopped on the same pass"
         );
     }
 

@@ -48,6 +48,7 @@ use std::sync::Arc;
 use crate::backend::{AfterRelease, FilePieceSpan, TorrentHandle};
 use crate::piece_store::{DeleteOutcome, HeldSnapshot, StoreRegistry};
 
+pub mod live;
 pub mod owner;
 
 /// What the cache cleaner says the torrent-data volume may hold.
