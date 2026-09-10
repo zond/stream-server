@@ -43,27 +43,36 @@
 //! * **X** -- locks outside the owner: `pinned_files`, [`RetentionBudget`],
 //!   librqbit's own, the filesystem.
 //!
-//! 1. L1 → L2 only, and only inside [`Retention::holdings`] and
-//!    [`Retention::readers`], which copy every entity out; never L2 → L1.
-//!    An entity holds its own `Arc` and never reaches the map.
+//! 1. L1 → L2 only, and only inside [`Retention::holdings_at`], which
+//!    prunes and copies every entity out under L1; never L2 → L1. An entity
+//!    holds its own `Arc` and never reaches the map. (Every other reader of
+//!    the map -- [`Retention::readers`], `lookup`, `entity` -- copies the
+//!    `Arc`s out and releases L1 before touching any L2.)
 //! 2. No L1 or L2 guard is ever live across an await, a tracing macro, a
-//!    [`Backing`] call or any X. [`Backing::policy`] returns its `Err` as a
-//!    value and the caller logs after unlock (today's one exception, the
-//!    proxy's `decide` logging under its map lock, is gone).
-//!    [`Backing::keeps_everything`] (`pinned_files.read()`) is asked before
-//!    L2 is taken, in the [`Door`] and in the pass.
+//!    `&self` method of [`Backing`] or any X. The pure associated functions
+//!    of [`Backing`] -- `governs`, `extent`, `policy`, `index_of` -- ARE
+//!    called under L2 (`policy` from [`Reader::note`]'s decide, `index_of`
+//!    from the [`Door`] and every head reading) and must take no lock and do
+//!    no I/O. [`Backing::policy`] returns its `Err` as a value and the
+//!    caller logs after unlock (today's one exception, the proxy's `decide`
+//!    logging under its map lock, is gone). [`Backing::keeps_everything`]
+//!    (`pinned_files.read()`) is asked before L2 is taken, in the [`Door`]
+//!    and in the pass.
 //! 3. T is awaited (`lock().await`) only with NO owner lock held:
 //!    [`Retention::pass`]'s callers, [`Retention::install`],
 //!    [`Retention::clear`] and the cleaner's delete take it first. T → L2
 //!    briefly is allowed. `try_lock` on T IS allowed under L2 -- deliberately:
 //!    "is a pass running" and "is this byte due" must be one reading (today
-//!    `running` and `moved` are read under one map lock), and the pass's
-//!    conclusion must decide `again` and either hand the claim on or drop it
-//!    INSIDE its L2 block (today `running = false` and `arms_another_pass`
-//!    run under one lock). Releasing L2 before the `try_lock` reopens the
-//!    swallowed-last-byte hole: a byte delivered between the conclusion and
-//!    the release finds a pass "running", starts none, and nothing
-//!    remembers that it wanted one.
+//!    `running` and `moved` are read under one map lock), and **every exit
+//!    of the pass** must decide `again` and either hand the claim on or drop
+//!    it INSIDE its L2 block (today `running = false` and
+//!    `arms_another_pass` run under one lock). Releasing L2 before the
+//!    `try_lock`, or the claim after L2, reopens the swallowed-last-byte
+//!    hole: a byte delivered between the conclusion and the release finds a
+//!    pass "running", starts none, and nothing remembers that it wanted
+//!    one. The one `try_lock` under L2 is [`Reader::note`]'s, on an entity
+//!    it already holds; [`Retention::try_turn`] looks its entity up under
+//!    L1 and is for callers holding nothing.
 //! 4. T is per entity and never nested: [`Retention::install`]'s
 //!    `retire_siblings` clears each sibling under that sibling's own turn
 //!    and releases it before taking the new key's. No two turns are ever
@@ -71,12 +80,14 @@
 //! 5. Writes to `installed`, `windows`, `stride` and the in-place advance of
 //!    the policy require `&mut Turn`, so "written only under the turn" is a
 //!    type -- with one documented exception: [`State::install_now`]
-//!    ([`Install::OnDeliveredByte`]) writes `installed` and `decided` under
-//!    L2 alone from [`Reader::note`] while a pass may hold T. Legal only
-//!    because [`Share::Nothing`] holds nothing back (no foreign state to keep
-//!    in step; const-asserted in [`Retention::new`]), and it is why the pass
-//!    re-checks budget and domain at the post-listing re-read and before
-//!    writing its windows.
+//!    ([`Install::OnDeliveredByte`]) writes `installed`, `decided` and
+//!    `stride` and resets every reader's `passed_at` under L2 alone from
+//!    [`Reader::note`] while a pass may hold T (the writes today's `decide`
+//!    makes). Legal only because [`Share::Nothing`] holds nothing back (no
+//!    foreign state to keep in step; const-asserted in [`Retention::new`]),
+//!    and it is why the pass re-checks budget and domain at the post-listing
+//!    re-read and before writing its windows. `decided` has no turn-writer:
+//!    it is written by `install_now` and cleared with the policy.
 //!
 //! **Why it is deadlock-free.** L1 and L2 form a strict two-level order with
 //! no awaits inside, so they wait only on each other and in one direction.
@@ -107,12 +118,55 @@
 //! 7. Test hook.
 //! 8. [`Backing::reclaim`] with a [`Door`] that answers both
 //!    [`Door::window_now`] and [`Door::refuses`] from one reading of L2.
-//! 9. Conclude under L2: `passed_at`, the windows only if the budget is
-//!    still the one measured, and `again` decided from the same `head` the
-//!    pass measured from, with the SAME claim handed back to the driver.
+//! 9. Conclude under L2: `passed_at` and the windows only if the budget and
+//!    domain are still the ones measured, and `again` decided from the same
+//!    `head` the pass measured from, with the SAME claim handed back to the
+//!    driver.
 //!
-//! Every early return leaves the policy exactly where it is. There is no
-//! `abandon` and no `put_back`, because nothing was taken out.
+//! Every early return leaves the policy exactly where it is, and every one
+//! of them -- the pin, nothing installed, the failed listing, the refused
+//! re-read -- decides `again` under L2 the way step 9 does, with the claim
+//! dropped or handed on inside that block ([`State::owes_a_pass`]). There
+//! is no `abandon` and no `put_back`, because nothing was taken out.
+//!
+//! # Departures from the design
+//!
+//! Where this file differs from the approved synthesis, on purpose:
+//!
+//! * The design's `try_turn` comment says "never waits; legal under L2". It
+//!   looks its entity up under L1, so it is NOT legal under L2 (L2 → L1
+//!   inverts rule 1); the `try_lock` rule 3 allows under L2 is
+//!   [`Reader::note`]'s on an entity it already holds.
+//! * `again` is decided on every exit of the pass, not only at step 9, and a
+//!   pass refused at its re-read (or overtaken during its reclaim) hands the
+//!   claim on outright rather than asking the stride rule of a head it never
+//!   measured. The design's step 9 alone reopened the swallowed-last-byte
+//!   hole for a last byte delivered under a budget change; see
+//!   [`Retention::pass`].
+//! * `passed_at` is written only when the windows are (budget and domain
+//!   unchanged). Today's `finish` writes it regardless, which undoes the
+//!   "every reader is due again" its own `decide` promises.
+//! * `clear` forgets `decided` with the policy (design A's step 1; the
+//!   synthesis dropped the words). Without it a cleared
+//!   [`Install::OnDeliveredByte`] entity is never decided again until the
+//!   budget's value changes.
+//! * The windows are written only if budget AND domain are unchanged (the
+//!   synthesis says budget). Strictly more conservative; the domain check is
+//!   dead today because only `install`, under the turn, writes the domain.
+//! * Step 2 snapshots `{domain, budget}` and the head's piece, and reads
+//!   heads and promises afresh at step 5 with no fallback to a step-2 copy:
+//!   an entity cannot vanish under a pass, because the pass holds its `Arc`.
+//! * [`Backing`] has a `Sized` bound (RPITIT with `Door<Self>` needs it),
+//!   and [`Retention::holdings_at`] is `pub` (the proxy's grace test needs a
+//!   clock it supplies).
+//! * `install` creates the entity for a fresh key before its checks, so an
+//!   install that answers `Unbounded` (a pin, a budget that covers the
+//!   file) leaves an entity with nothing installed in the map for
+//!   [`Liveness::UntilReplaced`]'s life -- one small struct per file ever
+//!   installed on, and gate-equivalent to today's missing slot. And
+//!   `retire_siblings` runs for every [`Install`] mode: an `install` on a
+//!   proxy-shaped owner would clear every other entity. Nothing calls it
+//!   there.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Debug;
@@ -176,9 +230,12 @@ pub enum Liveness {
 /// holds, hold pieces back from what we advertise and put them back, and
 /// reclaim a set of runs through a [`Door`] the owner supplies. The owner
 /// does the arithmetic, the two re-readings, the door, the throttle, the
-/// grace and the budget comparison. **No method is ever called with an owner
-/// lock held**, so an implementation may take any lock it likes, including
-/// the entity's own state lock through a [`Reader`].
+/// grace and the budget comparison. **No `&self` method is ever called with
+/// an owner lock held**, so an implementation may take any lock it likes in
+/// them, including the entity's own state lock through a [`Reader`]. The
+/// pure associated functions -- [`Self::governs`], [`Self::extent`],
+/// [`Self::policy`], [`Self::index_of`] -- ARE called under L2 and must take
+/// no lock and do no I/O (rule 2).
 ///
 /// The `async` methods return `Send` futures because the proxy's driver
 /// spawns the pass as a task; an implementation writes them as `async fn`
@@ -413,6 +470,24 @@ pub enum InstallOutcome {
 /// What one pass did.
 #[derive(Debug)]
 pub struct Outcome {
+    /// What the pass concluded, or `None` for a pass that concluded nothing
+    /// -- a pin, nothing installed, no head in this domain before or after
+    /// the listing, a listing we do not have, or a decide that ran under it.
+    /// Every one of those leaves the policy exactly where it was.
+    pub concluded: Option<Conclusion>,
+    /// The same claim, handed back because a byte delivered while the pass
+    /// held the turn started nothing and is owed a pass: the head this pass
+    /// measured has moved a stride since, or the policy was replaced under
+    /// the pass by a byte that was due and found the turn taken. `None` is
+    /// the turn released. Decided under L2 on **every** exit of the pass
+    /// and never re-acquired; see rule 3 in the module docs.
+    pub again: Option<Claim>,
+}
+
+/// What a pass that ran concluded. Zeroed counts are a pass that found
+/// nothing to do, which is a conclusion.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Conclusion {
     /// Pieces that joined the committed set and are now advertised.
     pub committed: usize,
     /// Pieces we had advertised and no longer hold, so no longer announce.
@@ -420,14 +495,9 @@ pub struct Outcome {
     /// Pieces the backing reports really left the disk.
     pub reclaimed: usize,
     /// The windows this pass concluded, one per playhead live at its
-    /// re-read.
+    /// re-read. Written to the entity only if the budget was still the one
+    /// measured; [`Holding::windows`] says what stands.
     pub windows: Vec<Range<u32>>,
-    /// The same claim, handed back because the head this pass measured has
-    /// moved a stride since -- a byte delivered while the pass held the turn
-    /// started nothing and is owed a pass. `None` is the turn released. See
-    /// rule 3 in the module docs for why this is decided under L2 and never
-    /// re-acquired.
-    pub again: Option<Claim>,
 }
 
 /// What one entity holds, as a value: everything a gate or a panel derives
@@ -468,10 +538,14 @@ pub struct InstalledView {
 }
 
 /// What a pass snapshots under L2 before the listing, and compares against
-/// after it.
+/// after it. Only which domain and which budget; the head is read again at
+/// the re-read, and `at` -- the piece it stood on before the listing -- is
+/// what a listing that fails is measured against when the pass asks whether
+/// it owes another.
 struct Begin<B: Backing> {
     domain: B::Domain,
     budget: CacheBudget,
+    at: u32,
 }
 
 impl<B: Backing> Retention<B> {
@@ -802,13 +876,34 @@ impl<B: Backing> Retention<B> {
     }
 
     /// One pass over `key`, with its turn in hand. See the module docs for
-    /// the steps. `None` is a pass that concluded nothing -- a pin, nothing
-    /// installed, no head in this domain before or after the listing, a
-    /// listing we do not have, or a decide that ran under us -- and every
-    /// one of them leaves the policy exactly where it was. `Some` with
-    /// zeroed counts is a pass that ran and found nothing to do.
-    pub async fn pass(&self, key: &B::Key, store: &B::Store, mut claim: Claim) -> Option<Outcome> {
-        let entity = self.lookup(key)?;
+    /// the steps. A pass that concluded nothing -- a pin, nothing installed,
+    /// no head in this domain before or after the listing, a listing we do
+    /// not have, or a decide that ran under us -- answers with no
+    /// [`Conclusion`], and every one of them leaves the policy exactly where
+    /// it was; a pass that ran and found nothing to do answers with zeroed
+    /// counts.
+    ///
+    /// **Every exit decides `again`**, under L2, with the claim dropped or
+    /// handed on inside the same block (rule 3). A byte delivered while the
+    /// pass held the turn started nothing; if it was the last of its body,
+    /// this decision is the only thing that remembers it wanted a pass, and
+    /// that is as true of a pass that refused at its re-read as of one that
+    /// concluded. Today's proxy re-arms from every finish and from no
+    /// abandon; here the rule is one: a pass that measured something owes
+    /// another if the head moved a stride from what it measured, and a pass
+    /// that measured nothing because the policy was replaced under it owes
+    /// one outright, because the byte that replaced it was due and could not
+    /// start one.
+    pub async fn pass(&self, key: &B::Key, store: &B::Store, mut claim: Claim) -> Outcome {
+        let Some(entity) = self.lookup(key) else {
+            // No entity: no L2 to decide under, and no note that could race
+            // the release, because a note is made on an entity.
+            drop(claim);
+            return Outcome {
+                concluded: None,
+                again: None,
+            };
+        };
         let about = claim.about;
         // 1. A pin taken while the entity was already playing leaves the
         // policy installed: `install` is the only other place that asks,
@@ -819,18 +914,17 @@ impl<B: Backing> Retention<B> {
         // announced to nobody while librqbit re-fetches it in a loop.
         if self.backing.keeps_everything(key) {
             self.clear_under(&entity, &mut claim).await;
-            return None;
+            let state = entity.state.lock();
+            return Self::nothing(&state, claim, about, None);
         }
         // 2. Only which domain and which budget, and the head as a filter:
         // an entity whose reader has moved on must not pay a listing per
         // tick to discover it has nothing to say.
         let begin = {
             let state = entity.state.lock();
-            let installed = state.installed.as_ref()?;
-            B::index_of(&state.domain, state.head(about)?)?;
-            Begin::<B> {
-                domain: state.domain.clone(),
-                budget: installed.budget,
+            match state.begin(about) {
+                Some(begin) => begin,
+                None => return Self::nothing(&state, claim, about, None),
             }
         };
         // 3. Where a test puts what playback does while the listing runs.
@@ -843,7 +937,13 @@ impl<B: Backing> Retention<B> {
                 key = ?key,
                 "the retention pass could not list the disk; this pass concludes nothing"
             );
-            return None;
+            // Nothing measured, so nothing to write -- but a byte that moved
+            // the head a stride while the listing failed is owed its pass,
+            // and asking that of the head this pass started from is what
+            // keeps a disk that will not list from being asked once per
+            // byte rather than once per stride.
+            let state = entity.state.lock();
+            return Self::nothing(&state, claim, about, Some(begin.at));
         };
         // 5. **The deciding reading, taken after the listing.** Read before
         // the walk the head is the older half of the pair: the window is
@@ -858,16 +958,20 @@ impl<B: Backing> Retention<B> {
         // delivered byte, which is legal under L2 alone -- is a different
         // shape, and this listing was measured for the old one. It concludes
         // nothing rather than advance the new policy over a reading it never
-        // asked for, or the old one that no longer exists.
+        // asked for, or the old one that no longer exists. The byte that
+        // decided it is owed the pass it could not start: `nothing` with no
+        // measurement hands the claim on while something is installed.
         let (decision, windows, promised, door_policy, at) = {
             let mut state = entity.state.lock();
-            {
-                let installed = state.installed.as_ref()?;
-                if installed.budget != begin.budget || state.domain != begin.domain {
-                    return None;
-                }
+            if !state.still(&begin) {
+                return Self::nothing(&state, claim, about, None);
             }
-            let at = B::index_of(&state.domain, state.head(about)?)?;
+            let Some(at) = state
+                .head(about)
+                .and_then(|head| B::index_of(&state.domain, head))
+            else {
+                return Self::nothing(&state, claim, about, None);
+            };
             let others: Vec<u32> = state
                 .readers
                 .iter()
@@ -881,8 +985,9 @@ impl<B: Backing> Retention<B> {
                 .map(|reader| reader.promised.clone())
                 .filter(|range| !range.is_empty())
                 .collect();
-            let decision = state.advance(&mut claim.guard, at, &held);
-            let installed = state.installed.as_ref()?;
+            let Some((decision, policy)) = state.advance(&mut claim.guard, at, &held) else {
+                return Self::nothing(&state, claim, about, None);
+            };
             // One window per live playhead. The policy answers for one
             // playhead at a time -- that is what a window is about -- and an
             // entity two players are inside has two of them. `window_at` and
@@ -894,24 +999,21 @@ impl<B: Backing> Retention<B> {
             // whose byte was the entity's last.
             let mut windows = vec![decision.window.clone()];
             for other in others {
-                let window = installed.policy.window_at(other);
+                let window = policy.window_at(other);
                 if !windows.contains(&window) {
                     windows.push(window);
                 }
             }
-            (decision, windows, promised, installed.policy.clone(), at)
+            (decision, windows, promised, policy, at)
         };
         // 6. Advertise what is committed before reclaiming: the two sets are
         // disjoint and the commit is what takes a piece out of reach of the
         // reclaim. No owner lock held. Under `Share::Nothing` the committed
         // set has capacity zero, so both lists are empty and the backing is
         // never asked.
-        let mut outcome = Outcome {
-            committed: 0,
-            withdrawn: 0,
-            reclaimed: 0,
+        let mut conclusion = Conclusion {
             windows: windows.clone(),
-            again: None,
+            ..Conclusion::default()
         };
         if B::SHARE == Share::Nothing {
             debug_assert!(
@@ -928,14 +1030,14 @@ impl<B: Backing> Retention<B> {
                     );
                     break;
                 }
-                outcome.committed += (run.end - run.start) as usize;
+                conclusion.committed += (run.end - run.start) as usize;
             }
             // A committed piece the disk has lost behind our back cannot stay
             // announced: that is the advertise-then-refuse this exists to
             // avoid, wearing the other sign.
             for run in runs(&decision.withdrawn) {
                 if self.backing.advertise(run.clone(), false).await.is_ok() {
-                    outcome.withdrawn += (run.end - run.start) as usize;
+                    conclusion.withdrawn += (run.end - run.start) as usize;
                 }
             }
         }
@@ -955,49 +1057,75 @@ impl<B: Backing> Retention<B> {
             windows,
             promised,
         };
-        outcome.reclaimed = self
+        conclusion.reclaimed = self
             .backing
             .reclaim(store, &begin.domain, runs(&alone), door)
             .await;
         // 9. Conclude, under L2, with the claim released or handed on inside
         // the same block (rule 3).
-        {
-            let mut state = entity.state.lock();
+        let mut state = entity.state.lock();
+        // A budget published while this pass ran has already rebuilt the
+        // policy for the shape it makes and made every reader due under it;
+        // this pass measured the old one, and its conclusion is not the
+        // current one. Neither the windows nor `passed_at` are written then:
+        // the windows would be a measurement against a cap nobody holds, and
+        // `passed_at` would keep a reader the new shape made due from being
+        // due until it had travelled a whole *new* stride. The policy needs
+        // no guard of its own: it was never out.
+        let current = state.still(&begin);
+        if current {
             if let Some(reader) = about.and_then(|about| state.readers.get_mut(&about)) {
                 reader.passed_at = Some(at);
             }
-            // A budget published while this pass ran has already rebuilt the
-            // policy for the shape it makes; this pass measured the old one,
-            // and its conclusion is not the current one. The policy needs no
-            // guard of its own: it was never out.
-            if state
-                .installed
-                .as_ref()
-                .is_some_and(|installed| installed.budget == begin.budget)
-                && state.domain == begin.domain
-            {
-                state.conclude(&mut claim.guard, outcome.windows.clone());
-            }
-            // Whether this pass swallowed the trigger for the next one. A
-            // delivered byte while a pass is running starts none and does
-            // not remember that it wanted one -- right for every byte but
-            // the last of a body, which brings nothing after it. So the pass
-            // asks the same `head` it measured from: the distance is zero
-            // unless a byte really went out in between, and each arming is
-            // paid for by one such byte, so the chain terminates.
-            let again = matches!(B::TRIGGER, Trigger::OnMove { .. })
-                && state.installed.is_some()
-                && state
-                    .head(about)
-                    .and_then(|head| B::index_of(&state.domain, head))
-                    .is_some_and(|to| to.abs_diff(at) >= state.stride);
-            if again {
-                outcome.again = Some(claim);
-            } else {
-                drop(claim);
-            }
+            state.conclude(&mut claim.guard, conclusion.windows.clone());
         }
-        Some(outcome)
+        // Whether this pass swallowed the trigger for the next one. A
+        // delivered byte while a pass is running starts none and does not
+        // remember that it wanted one -- right for every byte but the last
+        // of a body, which brings nothing after it. So the pass asks the
+        // same `head` it measured from: the distance is zero unless a byte
+        // really went out in between, and each arming is paid for by one
+        // such byte, so the chain terminates. A pass whose measurement was
+        // refused measured nothing this question can be asked of, and the
+        // byte that refused it is owed a pass outright.
+        let again = Self::release(&state, claim, about, current.then_some(at));
+        Outcome {
+            concluded: Some(conclusion),
+            again,
+        }
+    }
+
+    /// The end of a pass that concluded nothing: `again` decided under the
+    /// L2 guard the caller holds, and the claim dropped or handed on before
+    /// that guard goes (rule 3). `measured` as for [`State::owes_a_pass`].
+    fn nothing(
+        state: &State<B>,
+        claim: Claim,
+        about: Option<ReaderId>,
+        measured: Option<u32>,
+    ) -> Outcome {
+        Outcome {
+            concluded: None,
+            again: Self::release(state, claim, about, measured),
+        }
+    }
+
+    /// Drop the claim or hand it on, under the L2 guard the caller holds.
+    /// The one place a pass lets go of its turn: a byte that lands after
+    /// this and before the guard goes finds the turn free, and one that
+    /// landed before it was counted by `owes_a_pass`.
+    fn release(
+        state: &State<B>,
+        claim: Claim,
+        about: Option<ReaderId>,
+        measured: Option<u32>,
+    ) -> Option<Claim> {
+        if state.owes_a_pass(about, measured) {
+            Some(claim)
+        } else {
+            drop(claim);
+            None
+        }
     }
 
     /// Every entity's holding, as of `Instant::now()`. Prunes
@@ -1066,6 +1194,58 @@ impl<B: Backing> State<B> {
             .or(self.last_position)
     }
 
+    /// What a pass snapshots at its start, or `None` when there is nothing
+    /// to pass over: nothing installed, no head yet, or a head that is not
+    /// in this domain (the torrent's reader has moved to another file).
+    fn begin(&self, about: Option<ReaderId>) -> Option<Begin<B>> {
+        let installed = self.installed.as_ref()?;
+        let at = B::index_of(&self.domain, self.head(about)?)?;
+        Some(Begin {
+            domain: self.domain.clone(),
+            budget: installed.budget,
+            at,
+        })
+    }
+
+    /// Whether the policy a pass began over is still the one installed: the
+    /// same budget and the same domain. `false` is a decide that ran under
+    /// the pass, and the pass's measurement is of a shape that no longer
+    /// exists.
+    fn still(&self, begin: &Begin<B>) -> bool {
+        self.installed
+            .as_ref()
+            .is_some_and(|installed| installed.budget == begin.budget)
+            && self.domain == begin.domain
+    }
+
+    /// Whether the head a pass was about owes another pass; asked under L2
+    /// at the end of every pass, and the only way one pass starts the next.
+    ///
+    /// `measured` is the piece the pass measured from, and the head has to
+    /// have moved a stride from it since: nothing a pass does moves a
+    /// playhead, so the distance is zero unless a byte really went out
+    /// while the pass held the turn, each arming is paid for by one such
+    /// byte, and the chain terminates. `None` is a pass that measured
+    /// nothing because the policy was replaced under it: the byte that
+    /// replaced it was due (`install_now` makes every reader due), found the
+    /// turn taken and started nothing, and if it was the last of its body
+    /// nothing else remembers it -- so a pass is owed as long as something
+    /// is installed and the head is in the domain. That terminates too: the
+    /// successor measures under the new policy and is back on the stride
+    /// rule. Only under [`Trigger::OnMove`]; the tick has its own clock.
+    fn owes_a_pass(&self, about: Option<ReaderId>, measured: Option<u32>) -> bool {
+        if !matches!(B::TRIGGER, Trigger::OnMove { .. }) || self.installed.is_none() {
+            return false;
+        }
+        let Some(to) = self
+            .head(about)
+            .and_then(|head| B::index_of(&self.domain, head))
+        else {
+            return false;
+        };
+        measured.is_none_or(|at| to.abs_diff(at) >= self.stride)
+    }
+
     /// Decide the entity under `budget`, under L2 alone: **the one write to
     /// the policy cell that does not require the turn** (rule 5). Sound only
     /// because [`Share::Nothing`] held nothing back for the policy this
@@ -1118,18 +1298,35 @@ impl<B: Backing> State<B> {
         self.installed = Some(Installed { budget, policy });
     }
 
-    /// Forget the policy. Under the turn, and only after its range has been
-    /// given back: see [`Retention::clear_under`].
+    /// Forget the policy, and that the entity was decided at all. Under the
+    /// turn, and only after its range has been given back: see
+    /// [`Retention::clear_under`].
+    ///
+    /// `decided` goes with the policy. Left standing, the next delivered
+    /// byte finds it equal to the published budget, skips `install_now`,
+    /// and the entity is unbounded until the budget's *value* changes --
+    /// the hole this module exists to close, reopened by its own clear.
+    /// Under a pin that makes each delivered byte a decide, a claim and a
+    /// pass that clears again at its first step; cheap (no listing, and
+    /// under [`Share::Nothing`] no backend call), and on a combination --
+    /// pins and [`Install::OnDeliveredByte`] -- no backing has.
     fn forget_policy(&mut self, _turn: &mut Turn) {
         self.installed = None;
+        self.decided = None;
     }
 
-    /// Advance the resident policy in place. Under the turn.
-    fn advance(&mut self, _turn: &mut Turn, at: u32, held: &BTreeSet<u32>) -> Decision {
-        match self.installed.as_mut() {
-            Some(installed) => installed.policy.advance(at, held),
-            None => Decision::default(),
-        }
+    /// Advance the resident policy in place, and hand back a copy of it as
+    /// advanced, for the door. Under the turn. `None` is nothing installed,
+    /// which the caller has already ruled out under the same lock.
+    fn advance(
+        &mut self,
+        _turn: &mut Turn,
+        at: u32,
+        held: &BTreeSet<u32>,
+    ) -> Option<(Decision, RetentionPolicy)> {
+        let installed = self.installed.as_mut()?;
+        let decision = installed.policy.advance(at, held);
+        Some((decision, installed.policy.clone()))
     }
 
     /// Write what a pass concluded. Under the turn.
@@ -1387,10 +1584,24 @@ mod tests {
     struct FakeDomain {
         file: usize,
         pieces: Range<u32>,
+        /// A domain no policy can be sized for: `policy` returns the error
+        /// the owner has to carry out from under L2.
+        broken: bool,
     }
 
     fn domain(file: usize, pieces: Range<u32>) -> FakeDomain {
-        FakeDomain { file, pieces }
+        FakeDomain {
+            file,
+            pieces,
+            broken: false,
+        }
+    }
+
+    fn broken(file: usize, pieces: Range<u32>) -> FakeDomain {
+        FakeDomain {
+            broken: true,
+            ..domain(file, pieces)
+        }
     }
 
     /// A position in the fake's coordinates: which file, and the byte
@@ -1401,8 +1612,8 @@ mod tests {
 
     /// An in-memory backing with the knobs the tests need: the disk as a
     /// set, recorders for every advertise and reclaim call, a park inside
-    /// `held` and `reclaim` (a oneshot the test releases, and one it is
-    /// told through when the park begins), a settable
+    /// `held`, `advertise` and `reclaim` (a oneshot the test releases, and
+    /// one it is told through when the park begins), a settable
     /// `keeps_everything`, an `advertise` that can fail and a `reclaim`
     /// whose blocking closure can die.
     struct FakeBacking<S: Side> {
@@ -1421,6 +1632,7 @@ mod tests {
         asked: parking_lot::Mutex<Vec<Vec<Range<u32>>>>,
         reclaim_panics: AtomicBool,
         park_held: parking_lot::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        park_advertise: parking_lot::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
         park_reclaim: parking_lot::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
         entered: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
         /// Run inside `advertise`, with whatever the test wants to try
@@ -1449,6 +1661,7 @@ mod tests {
                 asked: parking_lot::Mutex::new(Vec::new()),
                 reclaim_panics: AtomicBool::new(false),
                 park_held: parking_lot::Mutex::new(None),
+                park_advertise: parking_lot::Mutex::new(None),
                 park_reclaim: parking_lot::Mutex::new(None),
                 entered: parking_lot::Mutex::new(None),
                 on_advertise: parking_lot::Mutex::new(None),
@@ -1500,6 +1713,15 @@ mod tests {
             Self::park(&self.park_reclaim, &self.entered)
         }
 
+        fn park_advertise(
+            &self,
+        ) -> (
+            tokio::sync::oneshot::Receiver<()>,
+            tokio::sync::oneshot::Sender<()>,
+        ) {
+            Self::park(&self.park_advertise, &self.entered)
+        }
+
         async fn parked(
             slot: &parking_lot::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
             entered: &parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
@@ -1538,6 +1760,9 @@ mod tests {
         }
 
         fn policy(domain: &FakeDomain, budget: u64) -> anyhow::Result<RetentionPolicy> {
+            if domain.broken {
+                anyhow::bail!("a domain nothing can be sized for");
+            }
             let count = u64::from(domain.pieces.end - domain.pieces.start);
             RetentionPolicy::new(
                 budget,
@@ -1573,6 +1798,7 @@ mod tests {
             if let Some(hook) = self.on_advertise.lock().as_ref() {
                 hook();
             }
+            Self::parked(&self.park_advertise, &self.entered).await;
             if self.fail_advertise.load(Ordering::SeqCst) {
                 anyhow::bail!("the backend would not change what it advertises");
             }
@@ -1661,7 +1887,7 @@ mod tests {
         owner: &Arc<Retention<FakeBacking<S>>>,
         key: usize,
         claim: Claim,
-    ) -> tokio::task::JoinHandle<Option<Outcome>> {
+    ) -> tokio::task::JoinHandle<Outcome> {
         let owner = owner.clone();
         tokio::spawn(async move { owner.pass(&key, &(), claim).await })
     }
@@ -1697,8 +1923,8 @@ mod tests {
         // Turn free, policy in its cell: the next pass reclaims round the
         // head at piece 0, which is the window 0..4.
         let claim = owner.try_turn(&0).expect("the dead pass released the turn");
-        let outcome = owner.pass(&0, &(), claim).await.expect("a pass that ran");
-        assert_eq!(outcome.reclaimed, 4);
+        let outcome = owner.pass(&0, &(), claim).await;
+        assert_eq!(outcome.concluded.expect("a pass that ran").reclaimed, 4);
         assert_eq!(backing.on_disk(), vec![0, 1, 2, 3]);
     }
 
@@ -1718,7 +1944,7 @@ mod tests {
         drop(second.note((0, 6 * PIECE)));
         let reader = owner.reader(0, domain(0, 0..8));
         let claim = reader.note((0, 3 * PIECE)).expect("due");
-        let first = owner.pass(&0, &(), claim).await.expect("a pass");
+        let first = owner.pass(&0, &(), claim).await.concluded.expect("a pass");
         // One window per live playhead: 7 is inside the second player's.
         assert_eq!(first.windows, vec![3..7, 4..8]);
         assert_eq!(first.reclaimed, 3);
@@ -1727,8 +1953,13 @@ mod tests {
 
         backing.reclaim_panics.store(true, Ordering::SeqCst);
         let claim = owner.try_turn(&0).expect("the turn");
-        let outcome = owner.pass(&0, &(), claim).await.expect("a pass that ran");
-        assert_eq!(outcome.reclaimed, 0, "a dead closure vouched for a number");
+        let outcome = owner.pass(&0, &(), claim).await;
+        assert_eq!(
+            outcome.concluded.expect("a pass that ran").reclaimed,
+            0,
+            "a dead closure vouched for a number"
+        );
+        assert!(outcome.again.is_none());
         let after = owner.holding(&0).expect("the entity");
         assert_eq!(after.installed, before.installed);
         assert_eq!(after.decided, before.decided);
@@ -1761,7 +1992,8 @@ mod tests {
             "a note during a pass took the turn"
         );
         release.send(()).expect("the parked pass");
-        let outcome = pass.await.expect("joined").expect("a pass that ran");
+        let outcome = pass.await.expect("joined");
+        assert!(outcome.concluded.is_some(), "a pass that ran");
         let again = outcome.again.expect("the swallowed byte is owed a pass");
         assert!(
             owner.try_turn(&0).is_none(),
@@ -1769,7 +2001,8 @@ mod tests {
         );
         // The successor measures from where the head is now, and the head
         // has not moved since: nothing further is owed.
-        let outcome = owner.pass(&0, &(), again).await.expect("the successor");
+        let outcome = owner.pass(&0, &(), again).await;
+        assert!(outcome.concluded.is_some(), "the successor");
         assert!(
             outcome.again.is_none(),
             "a pass armed itself off a head that did not move"
@@ -1791,7 +2024,8 @@ mod tests {
         entered.await.expect("parked");
         assert!(reader.note((0, 2 * PIECE + 1)).is_none());
         release.send(()).expect("the parked pass");
-        let outcome = pass.await.expect("joined").expect("a pass that ran");
+        let outcome = pass.await.expect("joined");
+        assert!(outcome.concluded.is_some(), "a pass that ran");
         assert!(
             outcome.again.is_none(),
             "a byte inside the stride armed a pass"
@@ -1819,6 +2053,29 @@ mod tests {
         }
     }
 
+    /// A queued `lock_owned` on an entity's turn.
+    type Waiter =
+        std::pin::Pin<Box<dyn Future<Output = tokio::sync::OwnedMutexGuard<Turn>> + Send>>;
+
+    /// A waiter queued on the entity's turn, polled once so it is in the
+    /// queue, whose waker records whether L2 was held at the instant the
+    /// claim dropped. Every exit of the pass is held to that.
+    fn watch_release<B: Backing>(entity: &Entity<B>) -> (Arc<WokenUnder<B>>, Waiter) {
+        let probe = Arc::new(WokenUnder {
+            state: entity.state.clone(),
+            woken: AtomicBool::new(false),
+            under_state: AtomicBool::new(false),
+        });
+        let waker = std::task::Waker::from(probe.clone());
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut waiter: Waiter = Box::pin(entity.turn.clone().lock_owned());
+        assert!(
+            waiter.as_mut().poll(&mut context).is_pending(),
+            "the turn was free while a claim stood"
+        );
+        (probe, waiter)
+    }
+
     /// **THE RACE: the conclusion and the release of the turn are one step
     /// under the state lock, so a byte that lands between them cannot find
     /// a pass running and start none.**
@@ -1843,20 +2100,9 @@ mod tests {
         let (_backing, owner, _budget) = proxy();
         let reader = owner.reader(0, domain(0, 0..8));
         let claim = reader.note((0, 0)).expect("due");
-        let entity = owner.lookup(&0).expect("the entity");
-        let probe = Arc::new(WokenUnder {
-            state: entity.state.clone(),
-            woken: AtomicBool::new(false),
-            under_state: AtomicBool::new(false),
-        });
-        let waker = std::task::Waker::from(probe.clone());
-        let mut context = std::task::Context::from_waker(&waker);
-        let mut waiter = Box::pin(entity.turn.clone().lock_owned());
-        assert!(
-            waiter.as_mut().poll(&mut context).is_pending(),
-            "the turn was free while a claim stood"
-        );
-        let outcome = owner.pass(&0, &(), claim).await.expect("a pass");
+        let (probe, waiter) = watch_release(&owner.lookup(&0).expect("the entity"));
+        let outcome = owner.pass(&0, &(), claim).await;
+        assert!(outcome.concluded.is_some(), "a pass");
         assert!(outcome.again.is_none(), "the head did not move");
         assert!(
             probe.woken.load(Ordering::SeqCst),
@@ -1872,8 +2118,11 @@ mod tests {
         let claim = reader
             .note((0, 3 * PIECE))
             .expect("a byte that moved a stride after the conclusion is owed a pass");
-        let outcome = owner.pass(&0, &(), claim).await.expect("a pass that ran");
-        assert_eq!(outcome.windows, vec![3..7]);
+        let outcome = owner.pass(&0, &(), claim).await;
+        assert_eq!(
+            outcome.concluded.expect("a pass that ran").windows,
+            vec![3..7]
+        );
     }
 
     /// **A pass that hands its claim on does not release the turn in
@@ -1884,22 +2133,13 @@ mod tests {
         let (backing, owner, _budget) = proxy();
         let reader = owner.reader(0, domain(0, 0..8));
         let claim = reader.note((0, 0)).expect("due");
-        let entity = owner.lookup(&0).expect("the entity");
-        let probe = Arc::new(WokenUnder {
-            state: entity.state.clone(),
-            woken: AtomicBool::new(false),
-            under_state: AtomicBool::new(false),
-        });
-        let waker = std::task::Waker::from(probe.clone());
-        let mut context = std::task::Context::from_waker(&waker);
-        let mut waiter = Box::pin(entity.turn.clone().lock_owned());
-        assert!(waiter.as_mut().poll(&mut context).is_pending());
+        let (probe, _waiter) = watch_release(&owner.lookup(&0).expect("the entity"));
         let (entered, release) = backing.park_reclaim();
         let pass = spawn_pass(&owner, 0, claim);
         entered.await.expect("parked");
         assert!(reader.note((0, 2 * PIECE)).is_none());
         release.send(()).expect("the parked pass");
-        let outcome = pass.await.expect("joined").expect("a pass");
+        let outcome = pass.await.expect("joined");
         let again = outcome.again.expect("owed");
         assert!(
             !probe.woken.load(Ordering::SeqCst),
@@ -2039,7 +2279,7 @@ mod tests {
             }
         });
         *backing.on_reclaim.lock() = Some(hook);
-        let outcome = owner.pass(&0, &(), claim).await.expect("a pass");
+        let outcome = owner.pass(&0, &(), claim).await.concluded.expect("a pass");
         assert_eq!(
             *answers.lock(),
             vec![
@@ -2076,7 +2316,7 @@ mod tests {
             move || backing.keeps_everything.store(true, Ordering::SeqCst)
         }));
         let claim = owner.turn(&0).await.expect("the turn");
-        let outcome = owner.pass(&0, &(), claim).await.expect("a pass");
+        let outcome = owner.pass(&0, &(), claim).await.concluded.expect("a pass");
         assert_eq!(*backing.reclaims.lock(), vec![vec![0..3, 6..8]]);
         assert_eq!(
             *backing.asked.lock(),
@@ -2086,9 +2326,16 @@ mod tests {
         assert_eq!(outcome.reclaimed, 3);
         assert_eq!(backing.on_disk(), vec![6, 7]);
         // The next pass finds the pin first: the policy goes, the range
-        // goes back to the swarm, nothing is listed.
+        // goes back to the swarm, nothing is listed, and the claim is
+        // released under the state lock like any other exit's.
         let claim = owner.turn(&0).await.expect("the turn");
-        assert!(owner.pass(&0, &(), claim).await.is_none());
+        let (probe, waiter) = watch_release(&owner.lookup(&0).unwrap());
+        assert!(owner.pass(&0, &(), claim).await.concluded.is_none());
+        assert!(
+            probe.under_state.load(Ordering::SeqCst),
+            "a pass under a pin released its claim outside the state lock"
+        );
+        drop(waiter);
         assert!(owner.holding(&0).unwrap().installed.is_none());
         assert_eq!(
             *backing.advertised.lock(),
@@ -2105,7 +2352,7 @@ mod tests {
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         owner.note_position(&0, (1, 0));
         let claim = owner.turn(&0).await.expect("the turn");
-        assert!(owner.pass(&0, &(), claim).await.is_none());
+        assert!(owner.pass(&0, &(), claim).await.concluded.is_none());
         assert!(backing.reclaims.lock().is_empty());
         assert_eq!(
             backing.listings.load(Ordering::SeqCst),
@@ -2121,14 +2368,14 @@ mod tests {
         entered.await.expect("parked at the listing");
         owner.note_position(&0, (1, 0));
         release.send(()).expect("the parked pass");
-        assert!(pass.await.expect("joined").is_none());
+        assert!(pass.await.expect("joined").concluded.is_none());
         assert!(backing.reclaims.lock().is_empty());
         // And a listing the disk would not give: nothing concluded, nothing
         // withdrawn, the policy standing.
         owner.note_position(&0, (0, 0));
         backing.fail_held.store(true, Ordering::SeqCst);
         let claim = owner.turn(&0).await.expect("the turn");
-        assert!(owner.pass(&0, &(), claim).await.is_none());
+        assert!(owner.pass(&0, &(), claim).await.concluded.is_none());
         assert!(backing.reclaims.lock().is_empty());
         let holding = owner.holding(&0).unwrap();
         assert!(holding.installed.is_some());
@@ -2145,7 +2392,7 @@ mod tests {
         let (backing, owner, budget) = proxy();
         let reader = owner.reader(0, domain(0, 0..8));
         let claim = reader.note((0, 0)).expect("due");
-        let first = owner.pass(&0, &(), claim).await.expect("a pass");
+        let first = owner.pass(&0, &(), claim).await.concluded.expect("a pass");
         assert_eq!(first.reclaimed, 4);
         let windows_before = owner.holding(&0).unwrap().windows.clone();
         assert_eq!(backing.reclaims.lock().len(), 1);
@@ -2165,8 +2412,9 @@ mod tests {
             Some(CacheBudget::Bytes(2 * PIECE))
         );
         release.send(()).expect("the parked pass");
+        let overtaken = pass.await.expect("joined");
         assert!(
-            pass.await.expect("joined").is_none(),
+            overtaken.concluded.is_none(),
             "a pass measured under the old budget concluded something"
         );
         assert_eq!(
@@ -2181,6 +2429,20 @@ mod tests {
             Some(CacheBudget::Bytes(2 * PIECE)),
             "the overtaken pass wrote its policy back over the new one"
         );
+        // The byte that decided the new budget was due and found the turn
+        // taken: the refused pass hands its claim on, and the successor
+        // measures under the new policy from where that byte left the head.
+        let again = overtaken
+            .again
+            .expect("the byte that replaced the policy is owed a pass");
+        let successor = owner.pass(&0, &(), again).await;
+        assert_eq!(
+            successor.concluded.expect("the successor").windows,
+            vec![2..4]
+        );
+        assert!(successor.again.is_none());
+        assert_eq!(owner.holding(&0).unwrap().windows, vec![2..4]);
+        assert_eq!(backing.on_disk(), vec![2, 3]);
 
         // The same publish landing during the unlinks rather than the
         // listing: the re-read has passed, the unlinks stand as refetch cost
@@ -2191,7 +2453,7 @@ mod tests {
         let claim = reader
             .note((0, 2 * PIECE))
             .expect("a budget change makes a paused reader due");
-        let settled = owner.pass(&0, &(), claim).await.expect("a pass");
+        let settled = owner.pass(&0, &(), claim).await.concluded.expect("a pass");
         let windows_before = settled.windows;
         assert_eq!(windows_before, vec![2..6]);
         let claim = reader.note((0, 5 * PIECE)).expect("moved a stride");
@@ -2201,9 +2463,12 @@ mod tests {
         budget.set(Some(2 * PIECE));
         assert!(reader.note((0, 5 * PIECE)).is_none());
         release.send(()).expect("the parked pass");
-        let outcome = pass.await.expect("joined").expect("a pass that ran");
-        assert_eq!(outcome.windows, vec![4..8]);
-        assert_eq!(backing.reclaims.lock().len(), 3, "the unlinks were made");
+        let outcome = pass.await.expect("joined");
+        assert_eq!(
+            outcome.concluded.expect("a pass that ran").windows,
+            vec![4..8]
+        );
+        assert_eq!(backing.reclaims.lock().len(), 4, "the unlinks were made");
         let after = owner.holding(&0).unwrap();
         assert_eq!(
             after.windows, windows_before,
@@ -2213,6 +2478,13 @@ mod tests {
             after.installed.as_ref().map(|i| i.budget),
             Some(CacheBudget::Bytes(2 * PIECE))
         );
+        // And this one too owes the pass its overtaking byte could not
+        // start; the successor writes the first conclusion under the new
+        // budget.
+        let again = outcome.again.expect("owed");
+        let successor = owner.pass(&0, &(), again).await;
+        assert!(successor.again.is_none());
+        assert_eq!(owner.holding(&0).unwrap().windows, vec![5..7]);
 
         // A proxy entity has held nothing back, so clearing it asks the
         // backing for nothing -- and neither does installing on one.
@@ -2239,6 +2511,497 @@ mod tests {
         );
         assert_eq!(holding.decided, None);
         assert_eq!(holding.last_position, Some((0, 2 * PIECE)));
+    }
+
+    /// **A last byte delivered under a new budget while a pass is at its
+    /// listing gets its pass.**
+    ///
+    /// The interleaving: the reader's byte at piece 2 claims the turn and
+    /// its pass parks at the listing; the cleaner publishes a smaller
+    /// budget; the body's last byte, piece 6, lands -- it decides the new
+    /// policy under L2, is due (every reader is), tries the turn, finds it
+    /// taken, and the body ends. The pass resumes and refuses at its
+    /// re-read, correctly: it measured for a budget nobody holds. Dropped
+    /// there with no `again`, the claim takes the last byte's pass with it,
+    /// and the tail the fill wrote stays over budget until the grace prunes
+    /// the entity. Today's proxy re-arms from every finish; the owner hands
+    /// the claim on from the refusal too.
+    #[tokio::test]
+    async fn the_last_byte_under_a_new_budget_during_a_refused_pass_gets_its_pass() {
+        let (backing, owner, budget) = proxy();
+        let reader = owner.reader(0, domain(0, 0..8));
+        let claim = reader.note((0, 0)).expect("due");
+        let first = owner.pass(&0, &(), claim).await.concluded.expect("a pass");
+        assert_eq!(first.windows, vec![0..4]);
+        let claim = reader.note((0, 2 * PIECE)).expect("moved a stride");
+        let (entered, release) = backing.park_held();
+        let pass = spawn_pass(&owner, 0, claim);
+        entered.await.expect("parked at the listing");
+        // The fill writes ahead while the pass waits on the disk.
+        backing.holds(4..8);
+        budget.set(Some(2 * PIECE));
+        assert!(
+            reader.note((0, 6 * PIECE)).is_none(),
+            "a note during a pass took the turn"
+        );
+        release.send(()).expect("the parked pass");
+        let refused = pass.await.expect("joined");
+        assert!(
+            refused.concluded.is_none(),
+            "a pass measured under the old budget concluded something"
+        );
+        assert_eq!(backing.reclaims.lock().len(), 1);
+        assert_eq!(owner.holding(&0).unwrap().windows, vec![0..4]);
+        let again = refused
+            .again
+            .expect("the last byte, delivered under the new budget, is owed a pass");
+        let successor = owner.pass(&0, &(), again).await;
+        assert_eq!(
+            successor.concluded.expect("the successor").windows,
+            vec![6..8]
+        );
+        assert!(successor.again.is_none());
+        assert_eq!(owner.holding(&0).unwrap().windows, vec![6..8]);
+        assert_eq!(backing.on_disk(), vec![6, 7]);
+        assert!(owner.try_turn(&0).is_some(), "the turn was not released");
+    }
+
+    /// **A listing that fails owes a pass only for a byte that moved a
+    /// stride while it failed**, and leaves the reader due where it stood.
+    ///
+    /// Nothing was measured, so nothing is written -- not the windows and
+    /// not `passed_at`. But a byte that moved the head a stride during the
+    /// failure is the same swallowed byte as during any pass, and is owed
+    /// the same. Asked of the head the pass started from, not of nothing:
+    /// a disk that will not list is asked once per stride, not once per
+    /// byte, and never in a loop.
+    #[tokio::test]
+    async fn a_failed_listing_owes_a_pass_only_for_a_byte_that_moved_a_stride() {
+        let (backing, owner, _budget) = proxy();
+        let reader = owner.reader(0, domain(0, 0..8));
+        backing.fail_held.store(true, Ordering::SeqCst);
+        let claim = reader.note((0, 0)).expect("due");
+        let (probe, waiter) = watch_release(&owner.lookup(&0).unwrap());
+        let outcome = owner.pass(&0, &(), claim).await;
+        assert!(outcome.concluded.is_none());
+        assert!(
+            outcome.again.is_none(),
+            "a failed listing armed a pass off a head that did not move"
+        );
+        assert!(
+            probe.under_state.load(Ordering::SeqCst),
+            "a failed listing released its claim outside the state lock"
+        );
+        drop(waiter);
+        let claim = reader
+            .note((0, 0))
+            .expect("a pass that measured nothing left the reader due where it stood");
+        let (entered, release) = backing.park_held();
+        let pass = spawn_pass(&owner, 0, claim);
+        entered.await.expect("parked at the listing");
+        assert!(reader.note((0, 3 * PIECE)).is_none());
+        release.send(()).expect("the parked pass");
+        let outcome = pass.await.expect("joined");
+        assert!(outcome.concluded.is_none());
+        let again = outcome
+            .again
+            .expect("the byte that moved a stride during the failed listing is owed a pass");
+        backing.fail_held.store(false, Ordering::SeqCst);
+        let successor = owner.pass(&0, &(), again).await;
+        assert_eq!(
+            successor.concluded.expect("the successor").windows,
+            vec![3..7]
+        );
+        assert_eq!(backing.listings.load(Ordering::SeqCst), 3);
+    }
+
+    /// **An entity nothing bounds is never due, and a pass over it lists
+    /// nothing**: no budget, a budget that covers it, a domain no policy can
+    /// be sized for. A key with no entity remembers no byte and has nothing
+    /// to pass over, and an entity keeps the domain it was made with.
+    #[tokio::test]
+    async fn an_unbounded_entity_is_never_due_and_a_pass_over_it_lists_nothing() {
+        let (backing, owner, budget) = proxy();
+        budget.set(None);
+        let reader = owner.reader(0, domain(0, 0..8));
+        assert!(
+            reader.note((0, 0)).is_none(),
+            "a byte of an unbounded entity was due"
+        );
+        let holding = owner.holding(&0).unwrap();
+        assert_eq!(holding.decided, Some(CacheBudget::Unbounded));
+        assert!(holding.installed.is_none());
+        let claim = owner.try_turn(&0).expect("the turn");
+        let (probe, waiter) = watch_release(&owner.lookup(&0).unwrap());
+        let outcome = owner.pass(&0, &(), claim).await;
+        assert!(outcome.concluded.is_none() && outcome.again.is_none());
+        assert!(
+            probe.under_state.load(Ordering::SeqCst),
+            "a pass over nothing installed released its claim outside the state lock"
+        );
+        drop(waiter);
+        assert_eq!(
+            backing.listings.load(Ordering::SeqCst),
+            0,
+            "a pass over nothing paid a listing"
+        );
+        owner.note_position(&9, (0, PIECE));
+        assert!(
+            owner.holding(&9).is_none(),
+            "a byte nothing bounds was remembered"
+        );
+        let claim = owner.try_turn(&0).expect("the turn");
+        let outcome = owner.pass(&9, &(), claim).await;
+        assert!(outcome.concluded.is_none() && outcome.again.is_none());
+        assert!(
+            owner.try_turn(&0).is_some(),
+            "a pass over no entity kept the turn"
+        );
+        owner.entity(0, domain(0, 0..4));
+        assert_eq!(owner.holding(&0).unwrap().domain, domain(0, 0..8));
+        // The budget covers the file: decided, and nothing installed.
+        budget.set(Some(8 * PIECE));
+        assert!(reader.note((0, PIECE)).is_none());
+        let holding = owner.holding(&0).unwrap();
+        assert_eq!(holding.decided, Some(CacheBudget::Bytes(8 * PIECE)));
+        assert!(holding.installed.is_none());
+        // A domain no policy can be sized for: decided, nothing installed,
+        // and the error carried out from under the lock.
+        let owner = Retention::new(Proxy::new([broken(0, 0..8)]), budget.clone());
+        budget.set(Some(4 * PIECE));
+        let reader = owner.reader(0, broken(0, 0..8));
+        assert!(reader.note((0, 0)).is_none());
+        let holding = owner.holding(&0).unwrap();
+        assert_eq!(holding.decided, Some(CacheBudget::Bytes(4 * PIECE)));
+        assert!(holding.installed.is_none());
+    }
+
+    /// **What `install` answers when it installs nothing, and when the old
+    /// policy will not go**: no budget, a budget that covers the file, a
+    /// want that resolves to nothing, a pin; `Kept` only under the same
+    /// budget; the domain resolved afresh under the turn; and `OldStands`
+    /// from both of its sites -- a refused clear under a new budget, and
+    /// under a pin.
+    #[tokio::test]
+    async fn an_install_that_bounds_nothing_says_so_and_a_policy_that_will_not_go_stands() {
+        let (backing, owner, budget) = torrent();
+        budget.set(None);
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Unbounded);
+        budget.set(Some(8 * PIECE));
+        assert_eq!(
+            owner.install(0, 0).await,
+            InstallOutcome::Unbounded,
+            "a budget that covers the file installed a policy"
+        );
+        assert!(owner.holding(&0).unwrap().installed.is_none());
+        budget.set(Some(4 * PIECE));
+        assert_eq!(
+            owner.install(2, 2).await,
+            InstallOutcome::Unbounded,
+            "a want that resolves to nothing was installed"
+        );
+        assert!(owner.holding(&2).is_none());
+        assert!(backing.advertised.lock().is_empty());
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        // A pin clears, and gives the range back.
+        backing.keeps_everything.store(true, Ordering::SeqCst);
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Unbounded);
+        assert!(owner.holding(&0).unwrap().installed.is_none());
+        assert_eq!(
+            *backing.advertised.lock(),
+            vec![(0..8, false), (0..8, true)]
+        );
+        backing.keeps_everything.store(false, Ordering::SeqCst);
+        // The same key under a new budget is not kept: given back, and
+        // held back afresh.
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        budget.set(Some(6 * PIECE));
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        assert_eq!(
+            owner.holding(&0).unwrap().installed.map(|i| i.budget),
+            Some(CacheBudget::Bytes(6 * PIECE))
+        );
+        assert_eq!(
+            *backing.advertised.lock(),
+            vec![
+                (0..8, false),
+                (0..8, true),
+                (0..8, false),
+                (0..8, true),
+                (0..8, false)
+            ]
+        );
+        // The domain is what the backend says the file is now.
+        backing.domains.lock().insert(0, domain(0, 0..6));
+        budget.set(Some(4 * PIECE));
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        assert_eq!(owner.holding(&0).unwrap().domain, domain(0, 0..6));
+        // The old policy will not go: nothing new is installed and the old
+        // one stands, under a new budget and under a pin alike.
+        backing.fail_advertise.store(true, Ordering::SeqCst);
+        budget.set(Some(2 * PIECE));
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::OldStands);
+        assert_eq!(
+            owner.holding(&0).unwrap().installed.map(|i| i.budget),
+            Some(CacheBudget::Bytes(4 * PIECE))
+        );
+        backing.keeps_everything.store(true, Ordering::SeqCst);
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::OldStands);
+        assert!(owner.holding(&0).unwrap().installed.is_some());
+    }
+
+    /// **A pass advertises what the window released and withdraws what the
+    /// disk lost**, and a refused announce stops the announcing without
+    /// stopping the pass.
+    ///
+    /// The torrent's share: a second pass whose playhead walked past a
+    /// piece the first window covered commits it, and it is advertised
+    /// before the reclaim; a committed piece the disk no longer holds is
+    /// un-advertised. The tick is the torrent's trigger, so a head that
+    /// moved during the reclaim arms nothing.
+    #[tokio::test]
+    async fn a_pass_advertises_the_pieces_it_committed_and_withdraws_the_ones_the_disk_lost() {
+        let (backing, owner, _budget) = torrent();
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        owner.note_position(&0, (0, 0));
+        let claim = owner.turn(&0).await.expect("the turn");
+        let first = owner.pass(&0, &(), claim).await.concluded.expect("a pass");
+        assert_eq!(
+            (first.committed, first.withdrawn, first.reclaimed),
+            (0, 0, 6)
+        );
+        // Playback walks to piece 1: piece 0 is behind it, was covered, and
+        // is committed.
+        owner.note_position(&0, (0, PIECE));
+        *backing.between_runs.lock() = Some(Box::new({
+            let owner = owner.clone();
+            move || owner.note_position(&0, (0, 3 * PIECE))
+        }));
+        let claim = owner.turn(&0).await.expect("the turn");
+        let second = owner.pass(&0, &(), claim).await;
+        let conclusion = second.concluded.expect("a pass");
+        assert_eq!((conclusion.committed, conclusion.withdrawn), (1, 0));
+        assert!(second.again.is_none(), "the tick armed a pass");
+        assert_eq!(
+            *backing.advertised.lock(),
+            vec![(0..8, false), (0..1, true)]
+        );
+        assert_eq!(
+            owner.holding(&0).unwrap().installed.unwrap().committed,
+            [0].into_iter().collect()
+        );
+        // The disk loses the committed piece behind our back.
+        backing.held.lock().remove(&0);
+        let claim = owner.turn(&0).await.expect("the turn");
+        let third = owner.pass(&0, &(), claim).await.concluded.expect("a pass");
+        assert_eq!((third.committed, third.withdrawn), (0, 1));
+        assert_eq!(
+            *backing.advertised.lock(),
+            vec![(0..8, false), (0..1, true), (0..1, false)]
+        );
+        // A refused announce: the pass counts nothing committed and goes
+        // on to its reclaim.
+        let (backing, owner, _budget) = torrent();
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        owner.note_position(&0, (0, 0));
+        let claim = owner.turn(&0).await.expect("the turn");
+        owner.pass(&0, &(), claim).await;
+        owner.note_position(&0, (0, PIECE));
+        backing.fail_advertise.store(true, Ordering::SeqCst);
+        let claim = owner.turn(&0).await.expect("the turn");
+        let outcome = owner.pass(&0, &(), claim).await.concluded.expect("a pass");
+        assert_eq!(outcome.committed, 0, "a refused announce was counted");
+        assert_eq!(
+            backing.reclaims.lock().len(),
+            2,
+            "a refused announce stopped the pass"
+        );
+        assert_eq!(*backing.advertised.lock(), vec![(0..8, false)]);
+    }
+
+    /// **A reader reports what it holds**: its promise shrinks from the
+    /// front as bytes go out and an empty promise records nothing; a seek
+    /// back a stride is as due as playing on; the holding says what is
+    /// promised, whether a playhead is live, the extent, and when a byte
+    /// last went out.
+    #[tokio::test]
+    async fn a_reader_reports_what_it_holds() {
+        let (_backing, owner, _budget) = proxy();
+        let reader = owner.reader(0, domain(0, 0..8));
+        reader.promises(0..0);
+        assert_eq!(owner.readers(), 0, "an empty promise was recorded");
+        let made = owner.holding(&0).unwrap().last_seen;
+        reader.promises(2..6);
+        let holding = owner.holding(&0).unwrap();
+        assert_eq!(holding.promised, vec![2..6]);
+        assert_eq!(holding.extent, 0..8);
+        assert!(!holding.live_playhead, "a promise is not a delivered byte");
+        assert_eq!(owner.readers(), 1);
+        while Instant::now() == made {}
+        let claim = reader.note((0, 3 * PIECE)).expect("due");
+        let holding = owner.holding(&0).unwrap();
+        assert_eq!(
+            holding.promised,
+            vec![4..6],
+            "the delivered piece is still promised"
+        );
+        assert!(holding.live_playhead);
+        assert!(
+            holding.last_seen > made,
+            "a delivered byte did not move last_seen"
+        );
+        assert_eq!(holding.last_position, Some((0, 3 * PIECE)));
+        let outcome = owner.pass(&0, &(), claim).await;
+        assert!(outcome.concluded.is_some() && outcome.again.is_none());
+        assert!(
+            reader.note((0, PIECE)).is_some(),
+            "a seek back a stride was not due"
+        );
+        drop(reader);
+        let holding = owner.holding(&0).unwrap();
+        assert!(holding.promised.is_empty() && !holding.live_playhead);
+    }
+
+    /// **A head that leaves the file between two runs stops the reclaim**:
+    /// `window_now` answers `None` for a head not in this domain, and the
+    /// second run is never asked about.
+    #[tokio::test]
+    async fn a_head_that_leaves_the_file_between_the_runs_of_a_reclaim_stops_it() {
+        let (backing, owner, _budget) = torrent();
+        *backing.held.lock() = [0, 1, 2, 6, 7].into_iter().collect();
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        owner.note_position(&0, (0, 4 * PIECE));
+        *backing.between_runs.lock() = Some(Box::new({
+            let owner = owner.clone();
+            move || owner.note_position(&0, (1, 0))
+        }));
+        let claim = owner.turn(&0).await.expect("the turn");
+        let outcome = owner.pass(&0, &(), claim).await.concluded.expect("a pass");
+        assert_eq!(*backing.asked.lock(), vec![vec![0..3]]);
+        assert_eq!(outcome.reclaimed, 3);
+        assert_eq!(backing.on_disk(), vec![6, 7]);
+    }
+
+    /// **The test hook runs twice per pass, with the turn held and no owner
+    /// lock**: a note inside it finds the pass running, and a holding can
+    /// be read.
+    #[tokio::test]
+    async fn the_hook_runs_before_the_listing_and_before_the_reclaim_with_no_owner_lock() {
+        let (_backing, owner, _budget) = proxy();
+        let reader = Arc::new(owner.reader(0, domain(0, 0..8)));
+        let fired = Arc::new(AtomicU64::new(0));
+        owner.hook({
+            let owner = owner.clone();
+            let reader = reader.clone();
+            let fired = fired.clone();
+            move || {
+                fired.fetch_add(1, Ordering::SeqCst);
+                assert!(
+                    reader.note((0, 2 * PIECE)).is_none(),
+                    "a note inside the hook found the turn free"
+                );
+                assert!(owner.holding(&0).is_some());
+            }
+        });
+        let claim = reader.note((0, 0)).expect("due");
+        let outcome = owner.pass(&0, &(), claim).await;
+        assert_eq!(fired.load(Ordering::SeqCst), 2);
+        // The hook's byte landed before the re-read, so this pass measured
+        // from it and owes nothing for it.
+        assert_eq!(
+            outcome.concluded.expect("a pass").windows,
+            vec![2..6],
+            "a byte delivered before the re-read was not measured"
+        );
+        assert!(outcome.again.is_none());
+    }
+
+    /// **An install parked inside `advertise` under the turn blocks
+    /// nothing that must not wait on it**: a note, a note_position, a pin
+    /// and a holding all land while the backend is being asked, which is
+    /// the module doc's witness for deadlock-freedom, at the owner.
+    #[tokio::test]
+    async fn a_pass_parked_inside_advertise_blocks_no_note_pin_or_holding() {
+        let (backing, owner, _budget) = torrent();
+        let (entered, release) = backing.park_advertise();
+        let install = {
+            let owner = owner.clone();
+            tokio::spawn(async move { owner.install(0, 0).await })
+        };
+        entered.await.expect("the install to reach its hold-back");
+        assert!(
+            owner.try_turn(&0).is_none(),
+            "the turn was free during the hold-back"
+        );
+        let reader = owner.reader(0, domain(0, 0..8));
+        assert!(reader.note((0, PIECE)).is_none());
+        owner.note_position(&0, (0, 2 * PIECE));
+        backing.keeps_everything.store(true, Ordering::SeqCst);
+        let holding = owner.holding(&0).expect("the entity");
+        assert_eq!(holding.last_position, Some((0, 2 * PIECE)));
+        assert!(
+            holding.installed.is_none(),
+            "installed before the hold-back was made"
+        );
+        release.send(()).expect("the parked install");
+        assert_eq!(install.await.expect("joined"), InstallOutcome::Installed);
+        assert!(owner.holding(&0).unwrap().installed.is_some());
+    }
+
+    /// **A cleared entity is decided afresh on its next delivered byte.**
+    ///
+    /// `clear` forgets the policy; had it left `decided` standing, every
+    /// later note would find it equal to the published budget, skip the
+    /// decide, and the entity would be unbounded until the budget's *value*
+    /// changed -- the hole this module exists to close, reopened by its own
+    /// clear.
+    #[tokio::test]
+    async fn a_cleared_entity_is_decided_afresh_on_the_next_delivered_byte() {
+        let (_backing, owner, _budget) = proxy();
+        let reader = owner.reader(0, domain(0, 0..8));
+        let claim = reader.note((0, 0)).expect("due");
+        drop(claim);
+        owner.clear(&0).await;
+        let cleared = owner.holding(&0).unwrap();
+        assert!(cleared.installed.is_none());
+        assert_eq!(
+            cleared.decided, None,
+            "a cleared entity still says it was decided"
+        );
+        let claim = reader
+            .note((0, PIECE))
+            .expect("the byte after a clear is due under a fresh decision");
+        assert!(owner.holding(&0).unwrap().installed.is_some());
+        drop(claim);
+    }
+
+    /// **A pass overtaken at its reclaim leaves the reader due.**
+    ///
+    /// The byte that replaced the policy under the pass reset `passed_at`
+    /// so every reader is due under the new shape; the pass's conclusion
+    /// must not write the old measurement back over that, or a reader that
+    /// has not travelled a whole *new* stride is never due and the new
+    /// budget is never measured.
+    #[tokio::test]
+    async fn a_pass_overtaken_at_its_reclaim_leaves_the_reader_due() {
+        let (backing, owner, budget) = proxy();
+        let reader = owner.reader(0, domain(0, 0..8));
+        let claim = reader.note((0, 5 * PIECE)).expect("due");
+        let (entered, release) = backing.park_reclaim();
+        let pass = spawn_pass(&owner, 0, claim);
+        entered.await.expect("parked at the reclaim");
+        budget.set(Some(2 * PIECE));
+        assert!(reader.note((0, 5 * PIECE)).is_none());
+        release.send(()).expect("the parked pass");
+        let outcome = pass.await.expect("joined");
+        // The pass hands its claim on (the replaced policy is owed a pass);
+        // dropped unused here, the reader itself must still be due on the
+        // byte it delivered under the new budget.
+        drop(outcome);
+        assert!(
+            reader.note((0, 5 * PIECE)).is_some(),
+            "the overtaken pass wrote its measurement over a reader the new budget made due"
+        );
     }
 
     /// An entity nobody holds and nobody has delivered to for the grace is
@@ -2276,7 +3039,7 @@ mod tests {
             key: &'a B::Key,
             store: &'a B::Store,
             claim: Claim,
-        ) -> impl Future<Output = Option<Outcome>> + Send + 'a {
+        ) -> impl Future<Output = Outcome> + Send + 'a {
             owner.pass(key, store, claim)
         }
         fn send<T: Send + 'static>() {}
