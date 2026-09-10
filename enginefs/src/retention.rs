@@ -406,9 +406,14 @@ pub struct RetentionPass {
 /// this either way, so nothing about what the pass excludes moves: what
 /// leaves the reactor is the waiting, not the exclusion.
 ///
-/// `None` is a pool that will not answer -- shutting down, or the task
-/// panicked -- which is a pass that measured nothing: it commits nothing
-/// and reclaims nothing rather than acting on a listing it does not have.
+/// `None` is a listing we do not have: a pool that will not answer --
+/// shutting down, or the task panicked -- or a directory the filesystem
+/// would not list. Either is a pass that measured nothing, and it commits
+/// nothing, withdraws nothing and reclaims nothing rather than act on a
+/// listing it does not have. The second used to arrive here as an empty
+/// set, and an empty set is a very definite measurement: every committed
+/// piece withdrawn from what we announce on one tick, and reclaimed on the
+/// next. See [`crate::chunk_store::ChunkDir::held_in_bucket`].
 ///
 /// Listing is the caller's and not [`advance`]'s because it is the pass's
 /// long suspension, and the playhead the decision is built from has to be
@@ -416,9 +421,17 @@ pub struct RetentionPass {
 pub(crate) async fn listing(store: &StoreRoot, info_hash: &str) -> Option<BTreeSet<u32>> {
     let store = store.clone();
     let info_hash = info_hash.to_string();
-    tokio::task::spawn_blocking(move || store.held(&info_hash))
-        .await
-        .ok()
+    match tokio::task::spawn_blocking(move || store.held(&info_hash)).await {
+        Ok(Ok(held)) => Some(held),
+        Ok(Err(error)) => {
+            tracing::warn!(
+                error = %error,
+                "the piece store could not be listed; this pass concludes nothing"
+            );
+            None
+        }
+        Err(_) => None,
+    }
 }
 
 /// One pass: ask the policy where the playhead has left us, then make its

@@ -2616,8 +2616,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         // it -- see `retention::PolicyReading`.
         let store = self.piece_store();
         let hash = info_hash.to_string();
+        // A listing we do not have -- the pool would not answer, or the
+        // directory would not list -- is no numbers, not a window of zero.
         let held = tokio::task::spawn_blocking(move || store.held(&hash))
             .await
+            .ok()?
             .ok()?;
         Some(crate::retention::TorrentStreamNumbers {
             window: Some(reading.window(&held)),
@@ -10446,6 +10449,64 @@ mod tests {
         assert!(
             !bucket.join("0").exists(),
             "and what playback has left behind is"
+        );
+    }
+
+    /// **A disk that would not list is not an empty disk.**
+    ///
+    /// `ChunkDir::held` used to answer a failed `read_dir` with an empty set,
+    /// and an empty set is a very definite measurement: the policy's
+    /// `advance` keeps only the committed pieces the listing found, so one
+    /// tick on which the directory would not list withdrew every committed
+    /// piece from what we announce -- after peers had been told, and there
+    /// is no un-Have -- and the next tick, listing again, found them outside
+    /// the window and no longer committed and reclaimed them. One transient
+    /// `EIO` or `EMFILE`, and the promise the whole design rests on -- what
+    /// we announce is what nothing will ever reclaim -- was broken for the
+    /// file. Now a listing error is a pass that concludes nothing.
+    ///
+    /// The fixture is the two-pass one above: a second pass commits piece 0.
+    /// Then the torrent's directory is replaced by a file, so the third
+    /// pass's `read_dir` fails with something other than not-found.
+    #[tokio::test]
+    async fn a_pass_that_cannot_list_the_disk_withdraws_nothing() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let store = enginefs.piece_store();
+
+        let torrent_dir = store.torrent_dir(TEST_HASH);
+        let bucket = torrent_dir.join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
+        engine.note_playhead(0, 0);
+        engine.begin_retention(0).await;
+        engine.retain(&store).await.expect("a pass");
+        std::fs::write(bucket.join("1"), [7u8; 25]).unwrap();
+        engine.note_playhead(0, 25);
+        let pass = engine.retain(&store).await.expect("a pass");
+        assert_eq!(
+            pass.committed, 1,
+            "piece 0 is committed and announced: {pass:?}"
+        );
+        counters.advertised.lock().unwrap().clear();
+
+        // The directory will not list.
+        std::fs::remove_dir_all(&torrent_dir).unwrap();
+        std::fs::write(&torrent_dir, b"not a directory").unwrap();
+
+        assert!(
+            engine.retain(&store).await.is_none(),
+            "a pass with no listing concludes nothing"
+        );
+        assert!(
+            counters.advertised.lock().unwrap().is_empty(),
+            "and in particular it withdraws nothing from what we announce: {:?}",
+            counters.advertised.lock().unwrap()
         );
     }
 

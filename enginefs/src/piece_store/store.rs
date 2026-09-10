@@ -584,12 +584,16 @@ impl StoreRoot {
     /// piece is only reported when both halves of its address are spelled
     /// the way a delete will spell them, or the answer would promise bytes
     /// no delete could take.
-    pub fn held(&self, info_hash: &str) -> std::collections::BTreeSet<u32> {
-        self.chunks(info_hash)
-            .held()
+    ///
+    /// `Err` is a directory that would not list, which is no answer at all
+    /// -- not an empty one. See [`crate::chunk_store::ChunkDir::held`].
+    pub fn held(&self, info_hash: &str) -> std::io::Result<std::collections::BTreeSet<u32>> {
+        Ok(self
+            .chunks(info_hash)
+            .held()?
             .into_iter()
             .filter_map(|index| u32::try_from(index).ok())
-            .collect()
+            .collect())
     }
 
     /// Reclaim pieces: both copies of each.
@@ -1513,13 +1517,13 @@ mod tests {
         std::fs::write(usurper.join("inside"), b"not ours").unwrap();
 
         assert_eq!(
-            root.held(HASH),
+            root.held(HASH).unwrap(),
             BTreeSet::from([0, 2, 3]),
             "a directory is not a held piece"
         );
         // The path the retention pass takes: what `held` said, offered to
         // the delete.
-        let held = root.held(HASH);
+        let held = root.held(HASH).unwrap();
         assert_eq!(
             root.delete_pieces(HASH, held),
             3,
@@ -1557,7 +1561,7 @@ mod tests {
         std::fs::create_dir(&usurper).unwrap();
         std::fs::write(usurper.join("inside"), b"not ours").unwrap();
 
-        let held = root.held(HASH);
+        let held = root.held(HASH).unwrap();
         assert_eq!(
             held,
             BTreeSet::from([0, 1, 2, 3]),

@@ -498,21 +498,38 @@ impl ProxyRetention {
             tokio::task::spawn_blocking(move || {
                 #[cfg(test)]
                 retention.note_disk_thread();
-                dir.held()
-                    .into_iter()
-                    .filter_map(|index| u32::try_from(index).ok())
-                    .collect::<BTreeSet<u32>>()
+                dir.held().map(|held| {
+                    held.into_iter()
+                        .filter_map(|index| u32::try_from(index).ok())
+                        .collect::<BTreeSet<u32>>()
+                })
             })
         };
-        let Ok(held) = listing.await else {
-            // The pool would not answer, so this pass has no listing -- and
-            // a pass with no listing has nothing to conclude, in the same
-            // way `enginefs::retention::unlink` reports nothing freed when
-            // it cannot reach the disk. It gives the policy back and takes
-            // no decision, rather than advancing one over an empty reading
-            // of a directory that is not empty.
-            self.abandon(key, Some(policy), budget);
-            return;
+        let held = match listing.await {
+            Ok(Ok(held)) => held,
+            // The pool would not answer, or the directory would not list:
+            // this pass has no listing -- and a pass with no listing has
+            // nothing to conclude, in the same way
+            // `enginefs::retention::unlink` reports nothing freed when it
+            // cannot reach the disk. It gives the policy back and takes no
+            // decision, rather than advancing one over an empty reading of
+            // a directory that is not empty -- which is what a listing
+            // error used to arrive here as, and what had the policy withdraw
+            // every committed chunk on one tick and reclaim them on the
+            // next (see `ChunkDir::held_in_bucket`).
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    dir = %dir.path().display(),
+                    error = %error,
+                    "the chunk directory could not be listed; this pass concludes nothing"
+                );
+                self.abandon(key, Some(policy), budget);
+                return;
+            }
+            Err(_) => {
+                self.abandon(key, Some(policy), budget);
+                return;
+            }
         };
         // **The playheads again, now that the disk has been listed.**
         //
@@ -921,7 +938,9 @@ impl ProxyRetention {
         };
         let at = playhead / CHUNK_BYTES;
         let mut window = enginefs::retention::CacheWindow::default();
-        for index in dir.held() {
+        // No listing, no window: a panel shown an empty window would be
+        // shown a measurement nobody made.
+        for index in dir.held().ok()? {
             // The chunk the playhead is in counts as ahead: it is the one a
             // player is reading out of, not one it has passed.
             let half = if index < at {
@@ -1632,7 +1651,7 @@ mod tests {
             !gate.releases_file(&dir.chunk_path(15)),
             "and neither is the read-ahead: all of it fits, so all of it is the window"
         );
-        assert_eq!(dir.held().len(), 16, "and nothing was reclaimed");
+        assert_eq!(dir.held().unwrap().len(), 16, "and nothing was reclaimed");
     }
 
     /// A budget nobody has published is not a budget of nothing.
@@ -1654,7 +1673,7 @@ mod tests {
         reader.note(15 * CHUNK_BYTES);
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        assert_eq!(dir.held().len(), 16, "every chunk is still here");
+        assert_eq!(dir.held().unwrap().len(), 16, "every chunk is still here");
         let mut gate = ReclaimGate::default();
         retention.fill_gate(&mut gate);
         assert!(
@@ -1975,7 +1994,7 @@ mod tests {
         let reader = retention.reader(&dir, TOTAL, TARGET.into());
         reader.note(0);
         settled(&retention, "the published cap was applied", |_| {
-            dir.held().len() <= 12
+            dir.held().unwrap().len() <= 12
         })
         .await;
         // Playback fills what it passes over, as it does.
@@ -1998,10 +2017,10 @@ mod tests {
         reader.note(2 * CHUNK_BYTES);
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(
-            dir.held().len(),
+            dir.held().unwrap().len(),
             16,
             "a cap nobody has published is not a cap to evict against: {:?}",
-            dir.held()
+            dir.held().unwrap()
         );
     }
 
@@ -2083,7 +2102,7 @@ mod tests {
         )
         .await;
 
-        let held = dir.held();
+        let held = dir.held().unwrap();
         assert_eq!(
             held,
             (20..28).collect::<BTreeSet<u64>>(),

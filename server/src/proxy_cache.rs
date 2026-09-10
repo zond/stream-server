@@ -513,7 +513,12 @@ impl Entry {
                 .as_ref()
                 .is_none_or(|(listed, _)| *listed != in_bucket)
             {
-                bucket = Some((in_bucket, dir.held_in_bucket(in_bucket)));
+                // A bucket that would not list holds, for this walk,
+                // nothing: the run ends here and the reader fetches on from
+                // the origin. The safe side of that mistake -- a byte
+                // fetched again -- is the one this walk can afford; the
+                // retention pass, which cannot, refuses to run on it.
+                bucket = Some((in_bucket, dir.held_in_bucket(in_bucket).unwrap_or_default()));
             }
             if !bucket
                 .as_ref()
@@ -1041,7 +1046,7 @@ mod tests {
     }
 
     fn committed_chunks(dir: &Path, bucket: u64) -> HashSet<u64> {
-        chunks(dir).held_in_bucket(bucket)
+        chunks(dir).held_in_bucket(bucket).unwrap()
     }
 
     fn cache() -> (tempfile::TempDir, ProxyCache) {
@@ -1398,9 +1403,9 @@ mod tests {
             "the chunk the read ended in is still here"
         );
         assert!(
-            chunks(&dir).held().len() <= 5,
+            chunks(&dir).held().unwrap().len() <= 5,
             "and what is left is a window, not sixteen chunks: {:?}",
-            chunks(&dir).held()
+            chunks(&dir).held().unwrap()
         );
     }
 

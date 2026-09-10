@@ -2560,6 +2560,7 @@ fn a_panels_numbers_are_about_the_file_the_url_resolved_to() -> anyhow::Result<(
     let held_in = |pieces: &std::ops::Range<u32>| -> u64 {
         piece_store(&cache_root)
             .held(&info_hash)
+            .expect("the store lists")
             .iter()
             .filter(|piece| pieces.contains(piece))
             .count() as u64

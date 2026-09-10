@@ -8530,7 +8530,7 @@ mod tests {
             // this test can reach.
             if read.len() % (1024 * 1024) < n {
                 efs.reconcile_tick().await;
-                let held = store.held(&hash).len();
+                let held = store.held(&hash).unwrap().len();
                 worst = worst.max(held);
                 assert!(
                     held <= budget_pieces,
@@ -8643,7 +8643,7 @@ mod tests {
 
         let pieces = (RETENTION_FILE_BYTES as u64 / RETENTION_PIECE) as usize;
         assert_eq!(
-            store.held(&hash).len(),
+            store.held(&hash).unwrap().len(),
             pieces,
             "every piece is still here: an unknown budget bounds nothing"
         );
@@ -8750,7 +8750,7 @@ mod tests {
             done += n;
             if done % (1024 * 1024) < n {
                 efs.reconcile_tick().await;
-                told.extend(leecher_store.held(&hash));
+                told.extend(leecher_store.held(&hash).unwrap());
             }
         }
         // Then let the peer take what it is still being offered. The
@@ -8763,7 +8763,7 @@ mod tests {
         while told.len() < committed_pieces && std::time::Instant::now() < settle {
             tokio::time::sleep(Duration::from_millis(50)).await;
             efs.reconcile_tick().await;
-            told.extend(leecher_store.held(&hash));
+            told.extend(leecher_store.held(&hash).unwrap());
         }
         drop(reader);
 
@@ -8773,7 +8773,7 @@ mod tests {
              for this to say anything about what we announce",
             told.len()
         );
-        let ours = store.held(&hash);
+        let ours = store.held(&hash).unwrap();
         let broken: Vec<u32> = told.iter().copied().filter(|p| !ours.contains(p)).collect();
         assert!(
             broken.is_empty(),

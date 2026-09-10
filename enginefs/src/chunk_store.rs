@@ -436,12 +436,29 @@ impl ChunkDir {
     /// promise bytes a delete could not take. A staged copy carries a suffix
     /// and so spells no index, which is how a chunk still being written stays
     /// invisible to a read.
-    pub fn held_in_bucket(&self, bucket: u64) -> HashSet<u64> {
+    ///
+    /// **A bucket that cannot be read is not an empty bucket.** A bucket
+    /// that does not exist is one nothing has been written to, and it is
+    /// empty; a bucket the filesystem would not list -- `EIO`, an
+    /// `EMFILE` on a television that has run out of descriptors, a
+    /// permission it lost -- holds whatever it held, and the answer is that
+    /// there is no answer. Reported as empty, one such tick told the
+    /// retention policy that every committed piece of a file had left the
+    /// disk: it withdrew the lot from what we announce -- after peers had
+    /// been told, and there is no un-Have -- and, the next tick, with the
+    /// listing back and the pieces outside the window and no longer
+    /// committed, reclaimed them. One transient directory error, and the
+    /// promise the whole design rests on -- what we announce is what nothing
+    /// will ever reclaim -- was broken for every piece of the file.
+    pub fn held_in_bucket(&self, bucket: u64) -> io::Result<HashSet<u64>> {
         let mut held = HashSet::new();
-        let Ok(entries) = std::fs::read_dir(self.dir.join(bucket.to_string())) else {
-            return held;
+        let entries = match std::fs::read_dir(self.dir.join(bucket.to_string())) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(held),
+            Err(error) => return Err(error),
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = entry?;
             let name = entry.file_name();
             let Some(index) = name.to_str().and_then(canonical_index) else {
                 continue;
@@ -459,7 +476,7 @@ impl ChunkDir {
             }
             held.insert(index);
         }
-        held
+        Ok(held)
     }
 
     /// Which chunks are **complete** on disk, across every bucket.
@@ -469,12 +486,20 @@ impl ChunkDir {
     /// file, and the retention pass asks this of a streaming torrent every
     /// couple of seconds -- some 6,750 `statx` calls a pass for a 27 GB
     /// torrent, for two numbers it does not want.
-    pub fn held(&self) -> BTreeSet<u64> {
+    ///
+    /// `Err` is a directory that could not be listed, and it is the whole
+    /// answer: a listing with one bucket missing from it would be an
+    /// account of the disk that is wrong about that bucket's every chunk.
+    /// See [`Self::held_in_bucket`] for what treating it as empty cost.
+    pub fn held(&self) -> io::Result<BTreeSet<u64>> {
         let mut held = BTreeSet::new();
-        let Ok(buckets) = std::fs::read_dir(&self.dir) else {
-            return held;
+        let buckets = match std::fs::read_dir(&self.dir) {
+            Ok(buckets) => buckets,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(held),
+            Err(error) => return Err(error),
         };
-        for bucket in buckets.flatten() {
+        for bucket in buckets {
+            let bucket = bucket?;
             if !bucket.file_type().is_ok_and(|t| t.is_dir()) {
                 continue;
             }
@@ -485,9 +510,9 @@ impl ChunkDir {
             let Some(bucket) = name.to_str().and_then(canonical_index) else {
                 continue;
             };
-            held.extend(self.held_in_bucket(bucket));
+            held.extend(self.held_in_bucket(bucket)?);
         }
-        held
+        Ok(held)
     }
 
     /// Every chunk under this directory with the metadata of both its
@@ -832,7 +857,38 @@ mod tests {
 
         chunks.write_whole(8, b"efgh", Some(4)).unwrap();
         assert_eq!(std::fs::read(chunks.chunk_path(8)).unwrap(), b"efgh");
-        assert_eq!(chunks.held(), BTreeSet::from([7, 8]));
+        assert_eq!(chunks.held().unwrap(), BTreeSet::from([7, 8]));
+    }
+
+    /// **A directory that is not there is empty; one that cannot be read is
+    /// unknown.** The two used to be one answer, and the second read as the
+    /// first cost every committed piece of a file its announcement -- see
+    /// `held_in_bucket`.
+    #[test]
+    fn a_directory_that_cannot_be_listed_is_not_an_empty_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let chunks = ChunkDir::new(tmp.path().join("entity"));
+        assert_eq!(
+            chunks.held().unwrap(),
+            BTreeSet::new(),
+            "nothing has been written here, so nothing is held"
+        );
+        assert_eq!(chunks.held_in_bucket(3).unwrap(), HashSet::new());
+
+        // A bucket that is a file: `read_dir` fails with something other
+        // than not-found, and that is not an empty bucket.
+        std::fs::create_dir_all(chunks.path()).unwrap();
+        std::fs::write(chunks.path().join("3"), b"not a bucket").unwrap();
+        assert!(chunks.held_in_bucket(3).is_err());
+        // The tree listing skips a file where a bucket should be -- it is
+        // not a bucket -- so it still answers for the buckets that are.
+        chunks.write_whole(7, b"abcd", Some(4)).unwrap();
+        assert_eq!(chunks.held().unwrap(), BTreeSet::from([7]));
+
+        // And an entity directory that is a file cannot be listed at all.
+        let file = ChunkDir::new(tmp.path().join("file"));
+        std::fs::write(file.path(), b"not a directory").unwrap();
+        assert!(file.held().is_err());
     }
 
     /// `expected_len` is the commit criterion, and it refuses.
