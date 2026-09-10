@@ -4366,6 +4366,11 @@ mod tests {
         /// removes a byte, and the per-file delete must ask for the
         /// re-select its still-pinned neighbour needs.
         dropped_ranges: Mutex<Vec<(std::ops::Range<u32>, crate::backend::AfterRelease)>>,
+        /// What happens on the first `drop_pieces` of a test, from inside
+        /// the call: where a test puts what a user or a reader does while
+        /// the pass has one part of a run released and the next still to
+        /// ask about. Runs once and is gone.
+        on_first_drop: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         /// Test knob: the backend keeps a have-set and will not give the
         /// pieces up -- a torrent added without piece reclaim, or one whose
         /// state has no chunk tracker to edit.
@@ -4904,6 +4909,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((pieces, after));
+            if let Some(hook) = self.counters.on_first_drop.lock().unwrap().take() {
+                hook();
+            }
             if self.counters.refuses_drop.load(Ordering::SeqCst) {
                 anyhow::bail!("this fake will not forget a piece it has");
             }
@@ -10534,6 +10542,103 @@ mod tests {
             "and the run is narrowed rather than refused whole: what playback \
              has left behind still goes"
         );
+    }
+
+    /// **And the door is asked before every part of a run, not once for
+    /// the run.**
+    ///
+    /// The window at the door can fall inside a run and cut it in two.
+    /// The two parts are released one after the other, and `release` is a
+    /// `drop_pieces` plus an unlink batch -- long enough for the pin above
+    /// to land between them. Asked once for the run, the pass would give the
+    /// second part back against an answer a whole release old: the pieces
+    /// of a download the user has just asked to keep, dropped and unlinked
+    /// with nothing to fetch them again. This is the door's own defect
+    /// shape, a reading trusted one call later, re-created one level down
+    /// inside the door.
+    ///
+    /// Eight pieces and a one-piece window. Parked in the commit, the reader
+    /// seeks to piece 4, so the door splits the reclaim run 2..8 round the
+    /// window into 2..4 and 5..8. The pin lands from inside the backend
+    /// call that drops 2..4. Pieces 5 to 7 must not follow.
+    #[tokio::test]
+    async fn a_pin_taken_between_the_parts_of_a_split_run_keeps_the_rest() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 200)]);
+        counters.pieces_per_file.store(8, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        // Two pieces of budget over eight 25-byte pieces: one committed,
+        // one window, as in the two tests above.
+        enginefs.set_cache_budget(Some(50));
+        let store = enginefs.piece_store();
+
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
+        engine.note_playhead(0, 0);
+        engine.begin_retention(0).await;
+        engine.retain(&store).await.expect("a pass");
+
+        // The whole file is on the disk and playback has walked on to piece
+        // 1: piece 0 commits, piece 1 is the window, and the reclaim the
+        // pass decides on is the one run 2..8.
+        for piece in 1u32..8 {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *counters.advertise_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        // The user pins from inside the first drop -- between the parts.
+        *counters.on_first_drop.lock().unwrap() = Some(Box::new({
+            let engine = engine.clone();
+            move || {
+                engine.pinned_files.write().insert(0);
+            }
+        }));
+        engine.note_playhead(0, 25);
+        let running = tokio::spawn({
+            let engine = engine.clone();
+            let store = store.clone();
+            async move { engine.retain(&store).await }
+        });
+        tokio::time::timeout(Duration::from_secs(10), entered_rx)
+            .await
+            .expect("the pass reached the call it makes to announce a committed piece")
+            .expect("the fake said so");
+        // A seek to piece 4 while the pass is parked: the window at the door
+        // is now inside the run 2..8.
+        engine.note_playhead(0, 4 * 25);
+
+        release_tx.send(()).expect("the pass is waiting on this");
+        let pass = running
+            .await
+            .expect("the pass task")
+            .expect("a pass ran to the end");
+        let dropped: Vec<std::ops::Range<u32>> = counters
+            .dropped_ranges
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(range, _)| range.clone())
+            .collect();
+        assert_eq!(
+            dropped,
+            vec![2..4],
+            "the part before the window went, the pin landed inside that drop, \
+             and nothing was asked for after it: {pass:?}"
+        );
+        assert!(
+            !bucket.join("2").exists() && !bucket.join("3").exists(),
+            "the part released before the pin is gone"
+        );
+        for piece in [5u32, 6, 7] {
+            assert!(
+                bucket.join(piece.to_string()).is_file(),
+                "piece {piece} of the file the user asked to keep is still here"
+            );
+        }
     }
 
     /// And the other half of a pass that is not the reactor's to do: the

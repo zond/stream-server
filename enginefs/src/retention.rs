@@ -521,13 +521,36 @@ pub(crate) async fn advance<H: TorrentHandle, D: Fn() -> Option<u64>>(
     // claim across the unlink, and `runs` exists so that two hundred
     // consecutive pieces are one call and not two hundred locks on the
     // torrent.
-    for run in runs(&this_files_alone(handle, retention.file_idx, &decision.reclaim).await) {
+    //
+    // And asked again before every *part* of a run, not once per run. The
+    // window at the door can fall inside a run and cut it in two, and the
+    // second part is then given back only after the first has been
+    // released -- a `drop_pieces` and an unlink batch later, "a syscall
+    // loop of no bounded length" on the flash of a television. Handing the
+    // second part to `release` on the same answer is the reading the door
+    // exists to refuse, one level down: a pin taken during the first
+    // part's unlink would have the second part's pieces dropped and
+    // unlinked out of a download the user has just asked to keep, and a
+    // reader that walked on during it would lose the window in front of
+    // it. So a run the window has narrowed or split goes back on the list
+    // in its parts, and each part is asked about in its own turn; only a
+    // run the door lets through whole is released.
+    let mut pending: std::collections::VecDeque<Range<u32>> =
+        runs(&this_files_alone(handle, retention.file_idx, &decision.reclaim).await).into();
+    while let Some(run) = pending.pop_front() {
         let Some(offset) = at_the_door() else {
             break;
         };
         let window = retention.policy.window_at(retention.playhead(offset));
-        for run in outside(run, &window) {
+        let parts = outside(run.clone(), &window);
+        if parts.len() == 1 && parts[0] == run {
             pass.reclaimed += release(handle, store, info_hash, run).await;
+        } else {
+            // Strictly fewer pieces than `run`, so this converges: a part
+            // is released or shrinks again on every turn through the loop.
+            for part in parts.into_iter().rev() {
+                pending.push_front(part);
+            }
         }
     }
     pass
