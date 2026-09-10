@@ -187,6 +187,14 @@ pub struct StoredChunks {
     pub strays: Vec<Metadata>,
 }
 
+/// One thing a [`ChunkDir::walk`] found.
+pub enum Entry {
+    /// A complete chunk, spelled the way a delete would spell it.
+    Complete(u64),
+    /// A staged file, addressable or not.
+    Staged(StagedFile),
+}
+
 /// One staged file a walk found.
 pub struct StagedFile {
     /// The index its name spells, or `None` for an anonymous staged copy
@@ -592,7 +600,9 @@ impl ChunkDir {
         stored
     }
 
-    /// Every staged file under this directory.
+    /// Everything under this directory that is a chunk of ours: every
+    /// complete chunk by index, every staged file by name. One `read_dir`
+    /// per bucket, names and types only, no `stat` of a chunk file.
     ///
     /// The one place a staged file is *recognised*, so that what a staged
     /// file is called stays one decision taken by [`Self::staging_path`] and
@@ -601,38 +611,70 @@ impl ChunkDir {
     /// finding anything -- and the stale shadow such a pass exists to delete
     /// is exactly what gets a half-written chunk served as a complete one.
     ///
-    /// Not a listing, so not lenient at the top: a directory that exists and
-    /// cannot be read is a failure, because the caller of this is
-    /// reconciling and an empty answer would read as "there is nothing
-    /// staged" -- which is the stale shadow surviving. A directory that does
-    /// not exist yet is the ordinary state before the first write and walks
-    /// empty. One bucket that cannot be read is skipped, as it always was.
-    pub fn walk_staged(&self, mut visit: impl FnMut(StagedFile)) -> io::Result<()> {
+    /// A complete chunk is reported under the same rules as
+    /// [`Self::held_in_bucket`]: the name re-spells ([`canonical_index`]),
+    /// the index belongs to the bucket it was found in, and the entry is a
+    /// file -- a *directory* wearing a chunk's name is not a chunk, and
+    /// offered as one it would meet the delete as `EISDIR`. Anything else is
+    /// passed over: a walk must never name a chunk a delete could not
+    /// address.
+    ///
+    /// **Strict, in every bucket.** A directory that does not exist yet is
+    /// the ordinary state before the first write and walks empty; anything
+    /// that exists and will not list -- the directory itself, a bucket, an
+    /// entry whose kind cannot be read -- is an `Err`, and the whole walk is.
+    /// The caller is seeding what it knows about the disk from this, and
+    /// there is no later event that adds a chunk already complete: a bucket
+    /// skipped here would be a set short of that bucket's every chunk for
+    /// the rest of the process. The earlier form of this walk skipped a
+    /// bucket it could not read, which was tolerable while it fed only the
+    /// advisory staged set.
+    pub fn walk(&self) -> io::Result<Vec<Entry>> {
+        let mut found = Vec::new();
         let buckets = match std::fs::read_dir(&self.dir) {
             Ok(buckets) => buckets,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(found),
             Err(e) => return Err(e),
         };
-        for bucket in buckets.flatten() {
-            let Ok(entries) = std::fs::read_dir(bucket.path()) else {
+        for bucket in buckets {
+            let bucket = bucket?;
+            // Anything but a directory at this level is debris an
+            // interrupted write left, and holds no chunk.
+            if !bucket.file_type()?.is_dir() {
                 continue;
-            };
-            for entry in entries.flatten() {
+            }
+            let bucket_name = bucket.file_name();
+            let bucket_index = bucket_name.to_str().and_then(canonical_index);
+            for entry in std::fs::read_dir(bucket.path())? {
+                let entry = entry?;
                 let name = entry.file_name();
-                let Some(stem) = name.to_str().and_then(staged_stem) else {
+                let Some(name) = name.to_str() else {
                     continue;
                 };
-                let staged = entry.path();
-                let index = canonical_index(stem);
-                let complete = index.map(|_| staged.with_file_name(stem));
-                visit(StagedFile {
-                    index,
-                    staged,
-                    complete,
-                });
+                if let Some(stem) = staged_stem(name) {
+                    let staged = entry.path();
+                    let index = canonical_index(stem);
+                    let complete = index.map(|_| staged.with_file_name(stem));
+                    found.push(Entry::Staged(StagedFile {
+                        index,
+                        staged,
+                        complete,
+                    }));
+                    continue;
+                }
+                let Some(index) = canonical_index(name) else {
+                    continue;
+                };
+                if bucket_index != Some(index / CHUNKS_PER_DIRECTORY) {
+                    continue;
+                }
+                if !entry.file_type()?.is_file() {
+                    continue;
+                }
+                found.push(Entry::Complete(index));
             }
         }
-        Ok(())
+        Ok(found)
     }
 }
 
@@ -889,6 +931,16 @@ mod tests {
         let file = ChunkDir::new(tmp.path().join("file"));
         std::fs::write(file.path(), b"not a directory").unwrap();
         assert!(file.held().is_err());
+
+        // The walk that seeds the piece store answers the same way: a file
+        // where a bucket should be is no bucket and holds nothing, and a
+        // directory that will not list is no answer.
+        let walked = chunks.walk().unwrap();
+        assert!(
+            matches!(walked.as_slice(), [Entry::Complete(7)]),
+            "the one chunk, in the one bucket that is one"
+        );
+        assert!(file.walk().is_err());
     }
 
     /// `expected_len` is the commit criterion, and it refuses.

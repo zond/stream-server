@@ -186,7 +186,8 @@ pub use crate::chunk_store::StoredChunk as StoredPiece;
 pub use layout::{FileSpec, PieceLayout, Segment};
 pub use policy::{Decision, RetentionPolicy, Shape, Share};
 pub use store::{
-    MissingPiece, PieceStore, PieceStoreFactory, StoreContents, StoreRoot, StoredTorrent, layout_of,
+    HeldSnapshot, MissingPiece, PieceStore, PieceStoreFactory, StoreContents, StoreRoot,
+    StoredTorrent, layout_of,
 };
 pub use sweep::{SweepReport, session_recorded_hashes, sweep_unadopted};
 

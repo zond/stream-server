@@ -4,17 +4,18 @@
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::Context;
 use librqbit::storage::{StorageFactory, TorrentStorage};
 use parking_lot::Mutex;
 
-use crate::chunk_store::{ChunkDir, ChunkError, OpenChunks, StoredChunk, collect_strays};
+use crate::chunk_store::{ChunkDir, ChunkError, Entry, OpenChunks, StoredChunk, collect_strays};
 
 use super::layout::{FileSpec, PieceLayout};
 
@@ -58,6 +59,37 @@ pub struct MissingPiece {
 /// range of the torrent's global bytes, and two files that share a piece share
 /// its file -- which is what [`Self::remove_file`] has to be careful about.
 ///
+/// # One store, several handles
+///
+/// This type is a handle. Everything a torrent's store knows lives in one
+/// shared [`Inner`], and librqbit's [`TorrentStorage::take`] -- how it
+/// pauses a torrent, and how the initial check hands over to the paused
+/// state -- makes a second handle over the same `Inner` rather than a copy.
+/// The first version copied: the successor got a clone of the staged set and
+/// the removed-file set, and from then on the two could disagree about the
+/// same directory. That was tolerable while both sets were advisory. The
+/// held set below is not, and a completion landing on one handle while the
+/// other is about to become the live one would have been a piece the store
+/// held and never knew it held. What a handle owns alone is whether it is
+/// still the data path ([`Self::live`]): the taken handle refuses reads and
+/// writes, and everything addressed by path keeps working on it, because
+/// `Session::delete` deletes through the storage it took.
+///
+/// # The held set
+///
+/// Which pieces are complete on disk, one bit each, kept in memory and kept
+/// exact: seeded once by `init` from the walk it already performs, set the
+/// moment a piece's rename lands, cleared by the unlink that removes it.
+/// Every one of those passes through this store, so the set can be exact
+/// without asking the disk, which is what lets whoever decides retention
+/// stop listing directories every couple of seconds. The disk is still the
+/// record -- a bit here is a claim about a file, never a substitute for it --
+/// and the two must not drift: a bit standing over a file that has gone is a
+/// delete of nothing, a file with no bit is a piece no policy ever sees,
+/// never commits, never reclaims, and no event ever adds it back. That last
+/// failure is why the seed is strict: a bucket the filesystem would not list
+/// fails `init` rather than seeding the torrent short for its whole life.
+///
 /// # Open handles
 ///
 /// librqbit writes a piece 16 KiB at a time and a stream reads it in 8 KiB
@@ -78,12 +110,26 @@ pub struct MissingPiece {
 /// the staged one. A handle still in a reader's hands survives that -- it
 /// is an `Arc` -- and keeps reading the bytes it had, which is the same
 /// thing a read that had already begun would do.
+///
+/// [`OPEN_HANDLES`]: crate::chunk_store::OPEN_HANDLES
 pub struct PieceStore {
+    inner: Arc<Inner>,
+    /// False once [`TorrentStorage::take`] has handed the data path to a
+    /// successor. Per handle, not shared: the taken handle and its successor
+    /// are the same store, and this is the one thing that tells them apart.
+    /// The path-based operations keep working on a taken store, exactly as
+    /// the filesystem backend's do: `Session::delete` calls `remove_file` on
+    /// the storage it took.
+    live: AtomicBool,
+}
+
+/// What every handle over one torrent's store shares.
+struct Inner {
     /// `<root>/<info hash>`, as a directory of bucketed chunks.
     chunks: ChunkDir,
     layout: Arc<PieceLayout>,
-    /// File ids [`Self::remove_file`] has been asked to drop. A piece may
-    /// only go when every file that owns bytes in it is in here.
+    /// File ids [`PieceStore::remove_file`] has been asked to drop. A piece
+    /// may only go when every file that owns bytes in it is in here.
     removed_files: Mutex<BTreeSet<usize>>,
     /// Pieces that have a staged copy, as far as this process knows: added
     /// by the first write to one, removed when it is completed or deleted,
@@ -94,14 +140,31 @@ pub struct PieceStore {
     /// there is one falls through to the complete copy -- so a stale entry
     /// costs one probe, never a wrong answer.
     staged: Mutex<BTreeSet<u32>>,
+    /// Which pieces are complete on disk -- see the type doc. Not advisory:
+    /// a bit is set only after the rename that made the piece ours and
+    /// cleared only by an unlink that removed it, so a reader of this set
+    /// need not ask the disk.
+    held: HeldBits,
+    /// True once `init`'s walk has landed in `held`. Before that the set is
+    /// not empty, it is *unknown*, and [`PieceStore::held`] says so with
+    /// `None`: a store nothing has seeded -- one built to delete through,
+    /// one a test made -- must never read as a torrent holding nothing.
+    seeded: AtomicBool,
+    /// True from `init` until the first [`TorrentStorage::take`], which is
+    /// how librqbit ends its initial hash check (the initializing state
+    /// takes the storage into the paused one). While it is set, the check
+    /// is reading every piece it means to claim, and nothing outside this
+    /// store may unlink one.
+    checking: AtomicBool,
+    /// Moved by every `init`. A torrent restarted out of an error runs
+    /// `init` again on a fresh store and librqbit rebuilds its chunk tracker
+    /// behind it, forgetting every hold-back it was told; a reader that
+    /// remembers the epoch it asserted under can tell that this has
+    /// happened.
+    epoch: AtomicU64,
     /// The handles most recently opened -- see the type doc. Empty on a
     /// store that has just been created or taken.
     handles: OpenChunks,
-    /// False once [`TorrentStorage::take`] has handed the data path to a
-    /// successor. The path-based operations keep working on a taken store,
-    /// exactly as the filesystem backend's do: `Session::delete` calls
-    /// `remove_file` on the storage it took.
-    live: AtomicBool,
     /// Files opened, and staging names probed and found absent, for the
     /// tests that pin the open count -- the whole reason the cache exists.
     #[cfg(test)]
@@ -110,43 +173,187 @@ pub struct PieceStore {
     staging_probes: AtomicUsize,
 }
 
+/// One bit per piece: set when the piece's rename lands, cleared when its
+/// file is unlinked.
+///
+/// Atomic words and nothing else, because the set is written from every
+/// peer's task at once: librqbit runs `on_piece_completed` inside the peer
+/// connection's `block_in_place`, concurrent across peers up to its spawner
+/// semaphore, and a mutex here would serialise every peer's completion
+/// behind whoever is reading the set. The critical section is the flip --
+/// one `fetch_or` or `fetch_and` -- and a reader takes a copy of the words
+/// ([`HeldSnapshot`]) rather than a lock.
+struct HeldBits {
+    words: Box<[AtomicU64]>,
+}
+
+impl HeldBits {
+    fn for_pieces(count: u32) -> Self {
+        let words = (0..(count as usize).div_ceil(64))
+            .map(|_| AtomicU64::new(0))
+            .collect();
+        Self { words }
+    }
+
+    fn slot(piece: u32) -> (usize, u64) {
+        ((piece / 64) as usize, 1u64 << (piece % 64))
+    }
+
+    /// A piece the layout does not name is ignored, not a panic: this runs
+    /// on librqbit's storage path, where a panic is fatal to the torrent,
+    /// and a caller's stray index is not the torrent's fault.
+    fn set(&self, piece: u32) {
+        let (word, bit) = Self::slot(piece);
+        if let Some(word) = self.words.get(word) {
+            word.fetch_or(bit, Ordering::AcqRel);
+        }
+    }
+
+    fn clear(&self, piece: u32) {
+        let (word, bit) = Self::slot(piece);
+        if let Some(word) = self.words.get(word) {
+            word.fetch_and(!bit, Ordering::AcqRel);
+        }
+    }
+
+    /// Replace the whole set with `pieces`. The seed, and only the seed: a
+    /// store is seeded before any read or write reaches it, so nothing can
+    /// flip a bit while the words are being written.
+    fn seed(&self, pieces: impl IntoIterator<Item = u32>) {
+        let mut words = vec![0u64; self.words.len()];
+        for piece in pieces {
+            let (word, bit) = Self::slot(piece);
+            if let Some(word) = words.get_mut(word) {
+                *word |= bit;
+            }
+        }
+        for (slot, word) in self.words.iter().zip(words) {
+            slot.store(word, Ordering::Release);
+        }
+    }
+
+    fn snapshot(&self) -> Vec<u64> {
+        self.words
+            .iter()
+            .map(|word| word.load(Ordering::Acquire))
+            .collect()
+    }
+}
+
+/// A copy of the held set at one instant, with the layout that gives each
+/// bit its size.
+///
+/// A copy and not a view: the set moves under every completion and every
+/// unlink, and a policy deciding over it has to reason about one reading.
+/// Ascending-ordered answers, because [`super::policy::RetentionPolicy`]'s
+/// advance offers the first pieces it is given first and that order is what
+/// it commits by.
+#[derive(Clone, Debug)]
+pub struct HeldSnapshot {
+    bits: Vec<u64>,
+    layout: Arc<PieceLayout>,
+}
+
+impl HeldSnapshot {
+    /// Whether this piece was held when the snapshot was taken.
+    pub fn contains(&self, piece: u32) -> bool {
+        let (word, bit) = HeldBits::slot(piece);
+        self.bits.get(word).is_some_and(|w| w & bit != 0)
+    }
+
+    /// The held pieces inside `range`, ascending -- the shape the retention
+    /// policy advances over.
+    pub fn in_range(&self, range: Range<u32>) -> BTreeSet<u32> {
+        let mut held = BTreeSet::new();
+        if range.is_empty() {
+            return held;
+        }
+        let first_word = (range.start / 64) as usize;
+        let last_word = ((range.end - 1) / 64) as usize;
+        for (index, word) in self
+            .bits
+            .iter()
+            .enumerate()
+            .take(last_word + 1)
+            .skip(first_word)
+        {
+            let mut word = *word;
+            while word != 0 {
+                let bit = word.trailing_zeros();
+                let piece = (index as u32) * 64 + bit;
+                if range.contains(&piece) {
+                    held.insert(piece);
+                }
+                word &= word - 1;
+            }
+        }
+        held
+    }
+
+    /// How many pieces are held.
+    pub fn count(&self) -> u32 {
+        self.bits.iter().map(|w| w.count_ones()).sum()
+    }
+
+    /// What the held pieces occupy, by the layout's lengths: every piece is
+    /// the default length except the last, which is whatever the total
+    /// leaves. What a budget or a usage figure adds up without a `stat`.
+    pub fn bytes(&self) -> u64 {
+        let count = u64::from(self.count());
+        let last = self.layout.piece_count() - 1;
+        let short_by = if self.contains(last) {
+            self.layout.default_piece_length() - self.layout.piece_length_of(last)
+        } else {
+            0
+        };
+        count * self.layout.default_piece_length() - short_by
+    }
+}
+
 impl PieceStore {
     /// A store for one torrent. Creates nothing -- `init` does that, and
     /// librqbit has a path (`Session::delete` with no live storage to
     /// recover) that constructs a storage purely to delete through it.
     pub fn new(dir: PathBuf, layout: Arc<PieceLayout>) -> Self {
+        let held = HeldBits::for_pieces(layout.piece_count());
         Self {
-            chunks: ChunkDir::new(dir),
-            layout,
-            removed_files: Mutex::new(BTreeSet::new()),
-            staged: Mutex::new(BTreeSet::new()),
-            handles: OpenChunks::new(),
+            inner: Arc::new(Inner {
+                chunks: ChunkDir::new(dir),
+                layout,
+                removed_files: Mutex::new(BTreeSet::new()),
+                staged: Mutex::new(BTreeSet::new()),
+                held,
+                seeded: AtomicBool::new(false),
+                checking: AtomicBool::new(false),
+                epoch: AtomicU64::new(0),
+                handles: OpenChunks::new(),
+                #[cfg(test)]
+                opens: AtomicUsize::new(0),
+                #[cfg(test)]
+                staging_probes: AtomicUsize::new(0),
+            }),
             live: AtomicBool::new(true),
-            #[cfg(test)]
-            opens: AtomicUsize::new(0),
-            #[cfg(test)]
-            staging_probes: AtomicUsize::new(0),
         }
     }
 
     /// The directory this torrent's pieces live in.
     pub fn dir(&self) -> &Path {
-        self.chunks.path()
+        self.inner.chunks.path()
     }
 
     pub fn layout(&self) -> &Arc<PieceLayout> {
-        &self.layout
+        &self.inner.layout
     }
 
     /// Where one piece is stored once it is whole.
     pub fn piece_path(&self, piece: u32) -> PathBuf {
-        self.chunks.chunk_path(u64::from(piece))
+        self.inner.chunks.chunk_path(u64::from(piece))
     }
 
     /// Where its bytes go while it is being written -- see
     /// [`crate::chunk_store::STAGING_SUFFIX`].
     pub fn staging_path(&self, piece: u32) -> PathBuf {
-        self.chunks.staging_path(u64::from(piece))
+        self.inner.chunks.staging_path(u64::from(piece))
     }
 
     /// Whether this piece is on disk, **complete**. A piece halfway through
@@ -160,7 +367,37 @@ impl PieceStore {
     /// [`TorrentStorage::has_piece`] answers a different question and does not
     /// have that hole -- see there.
     pub fn has_piece(&self, piece: u32) -> bool {
-        self.chunks.has_chunk(u64::from(piece))
+        self.inner.chunks.has_chunk(u64::from(piece))
+    }
+
+    /// The held set as this store knows it, or `None` for a store `init`
+    /// has not seeded.
+    ///
+    /// `None` and not an empty set, on purpose: a store built to delete
+    /// through, or one whose seed failed, holds *unknown*, and a reader
+    /// that took unknown for empty would conclude that every piece of the
+    /// torrent had left the disk -- withdraw the lot from what is announced
+    /// and reclaim it next time round. That is the incident
+    /// [`crate::chunk_store::ChunkDir::held_in_bucket`] records for a
+    /// listing, carried into memory.
+    pub fn held(&self) -> Option<HeldSnapshot> {
+        self.inner.held()
+    }
+
+    /// Whether librqbit's initial hash check may still be reading this
+    /// store: true from `init` until the first [`TorrentStorage::take`],
+    /// which is how the initializing state hands the storage to the paused
+    /// one. A piece unlinked under a running check is a piece the check has
+    /// just claimed and the torrent then advertises without having.
+    pub fn is_checking(&self) -> bool {
+        self.inner.checking.load(Ordering::Acquire)
+    }
+
+    /// How many times `init` has seeded this store. Moves on a restart out
+    /// of error, which is when librqbit forgets every hold-back it was told
+    /// -- see [`Inner::epoch`].
+    pub fn epoch(&self) -> u64 {
+        self.inner.epoch.load(Ordering::Acquire)
     }
 
     /// Promote a written piece to a complete one. Nothing may read it as ours
@@ -171,6 +408,95 @@ impl PieceStore {
     /// place with nothing staged, it says so rather than failing, because
     /// librqbit logs a failure here at debug and marks the piece have anyway.
     pub fn complete_piece(&self, piece: u32) -> anyhow::Result<()> {
+        self.inner.complete_piece(piece)
+    }
+
+    /// Reclaim one piece. This is the entry point the policy layer drives;
+    /// it is deliberately not on the storage trait, because librqbit has no
+    /// concept of giving a verified piece back.
+    ///
+    /// Takes the staged copy with it. A piece being downloaded again over one
+    /// the caller is releasing has both, and half of a piece nobody wants is
+    /// worth exactly as little as the whole of it.
+    ///
+    /// Returns whether a file was actually removed, so a caller counting what
+    /// it freed does not have to stat first.
+    pub fn delete_piece(&self, piece: u32) -> anyhow::Result<bool> {
+        self.inner.delete_piece(piece)
+    }
+
+    /// Whether any file of the torrent owns payload bytes in this piece.
+    ///
+    /// False only for a piece lying entirely inside padding or zero-length
+    /// files, which nothing transfers and nothing ever writes.
+    #[cfg(test)]
+    fn piece_has_an_owner(&self, piece: u32) -> bool {
+        self.inner.piece_has_an_owner(piece)
+    }
+
+    /// Learn what a previous process left on the disk: the one walk of the
+    /// torrent's directory, and what `init` does after making it.
+    ///
+    /// From one listing of every bucket, three things. Staged bytes that
+    /// shadow a piece we already have whole are thrown away: a read prefers
+    /// the staged copy, because the one time both exist within a session is
+    /// a piece being downloaded again over one the policy layer dropped but
+    /// has not deleted yet, and it is the new bytes the hash check has to
+    /// see -- but a process that dies mid-re-download leaves that pair
+    /// behind with the bookkeeping that explained it gone, and the stale
+    /// half would then shadow a verified piece for reads *and* for peers,
+    /// since the complete file still standing is what makes it ours. A
+    /// staged piece with no complete copy is left alone and becomes
+    /// [`Inner::staged`]: it shadows nothing, [`PieceStore::has_piece`] is
+    /// false for it, and a pause is allowed to keep its in-flight work. And
+    /// every complete piece the walk names becomes the held set, under the
+    /// same spelling rules a delete addresses a piece by.
+    ///
+    /// Strict: a bucket the filesystem would not list fails this, and with
+    /// it `init`, and the torrent goes to Error exactly as it does when its
+    /// directory cannot be made. A lenient walk would seed the torrent short
+    /// of that bucket's every piece for the rest of its life -- there is no
+    /// event that adds a piece already complete -- and a policy reading the
+    /// set would hold none of them, share none, and never miss them. A
+    /// directory that does not exist yet is the ordinary state before the
+    /// first write and seeds empty.
+    ///
+    /// Safe on a store that has been used, not only a fresh one: a handle
+    /// cached on a shadow that went is forgotten with it, and the held set
+    /// is replaced, not added to.
+    fn seed_from_disk(&self) -> anyhow::Result<()> {
+        self.inner.seed_from_disk()
+    }
+
+    fn ensure_live(&self) -> anyhow::Result<()> {
+        if self.live.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            anyhow::bail!("this storage was taken; the torrent is paused or gone")
+        }
+    }
+}
+
+impl Inner {
+    fn held(&self) -> Option<HeldSnapshot> {
+        if !self.seeded.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(HeldSnapshot {
+            bits: self.held.snapshot(),
+            layout: Arc::clone(&self.layout),
+        })
+    }
+
+    fn piece_path(&self, piece: u32) -> PathBuf {
+        self.chunks.chunk_path(u64::from(piece))
+    }
+
+    fn staging_path(&self, piece: u32) -> PathBuf {
+        self.chunks.staging_path(u64::from(piece))
+    }
+
+    fn complete_piece(&self, piece: u32) -> anyhow::Result<()> {
         // Before the rename: the staged handle names a file about to become
         // the complete one, and a cached complete handle -- the old copy a
         // re-download is replacing -- names bytes about to be unlinked.
@@ -190,78 +516,88 @@ impl PieceStore {
         });
         if completed.is_ok() {
             self.staged.lock().remove(&piece);
+            // After the rename and before returning: librqbit sets its
+            // have-bit only once this has returned `Ok`, so this is the one
+            // instant at which the held set can agree with both the disk
+            // and the have-set. Set before the rename, a failed rename
+            // would leave a bit over staged bytes; set by the caller
+            // afterwards, a pass between the two would see a piece on disk
+            // the store denied.
+            self.held.set(piece);
         }
         completed
     }
 
-    /// Reclaim one piece. This is the entry point the policy layer drives;
-    /// it is deliberately not on the storage trait, because librqbit has no
-    /// concept of giving a verified piece back.
-    ///
-    /// Takes the staged copy with it. A piece being downloaded again over one
-    /// the caller is releasing has both, and half of a piece nobody wants is
-    /// worth exactly as little as the whole of it.
-    ///
-    /// Returns whether a file was actually removed, so a caller counting what
-    /// it freed does not have to stat first.
-    pub fn delete_piece(&self, piece: u32) -> anyhow::Result<bool> {
+    fn delete_piece(&self, piece: u32) -> anyhow::Result<bool> {
         // Before the unlink, or a later read of the same piece would be
         // served the deleted bytes through the handle that outlived them.
         self.forget_handles(piece);
         self.staged.lock().remove(&piece);
-        self.chunks
+        let removed = self
+            .chunks
             .remove(u64::from(piece))
-            .with_context(|| format!("could not delete piece {piece}"))
+            .with_context(|| format!("could not delete piece {piece}"));
+        // Only once the unlink has gone through. An unlink that failed for
+        // any reason but "not there" left the file where it was, and a bit
+        // cleared over a file still standing is a piece no pass is ever
+        // offered again: nothing re-finds it, because nothing lists any
+        // more. "Not there" is not a failure of the unlink, so the bit goes
+        // with it, which is what makes a delete idempotent here.
+        if removed.is_ok() {
+            self.held.clear(piece);
+        }
+        removed
     }
 
-    /// Whether any file of the torrent owns payload bytes in this piece.
-    ///
-    /// False only for a piece lying entirely inside padding or zero-length
-    /// files, which nothing transfers and nothing ever writes.
     fn piece_has_an_owner(&self, piece: u32) -> bool {
         self.layout
             .files_overlapping_piece(piece)
             .any(|file| self.layout.owns_bytes(file))
     }
 
-    /// Throw away staged bytes that shadow a piece we already have whole.
-    ///
-    /// A read prefers the staged copy, because the one time both exist within
-    /// a session is a piece being downloaded again over one the policy layer
-    /// dropped but has not deleted yet, and it is the new bytes the hash check
-    /// has to see. A process that dies mid-re-download leaves that pair behind
-    /// with the chunk bookkeeping that explained it gone, and the stale half
-    /// would then shadow a verified piece for reads *and* for peers, since the
-    /// complete file still standing is what makes it ours.
-    ///
-    /// A staged piece with no complete copy is left alone: it shadows nothing,
-    /// [`Self::has_piece`] is false for it, and a pause is allowed to keep its
-    /// in-flight work. Those become [`Self::staged`] -- the walk has just
-    /// seen every staged file there is -- and a handle cached on a shadow
-    /// that went is forgotten with it, so this is safe to run on a store
-    /// that has been used, not only on a fresh one.
-    fn discard_shadowing_staged(&self) -> anyhow::Result<()> {
+    fn seed_from_disk(&self) -> anyhow::Result<()> {
+        // What a staged file is *called*, and what a complete one is, are
+        // the chunk store's decisions, and this walk asks it rather than
+        // spelling either a second time: a second copy of the suffix here
+        // would let the constant change while this pass silently stopped
+        // finding anything -- which is not a cosmetic failure, since the
+        // stale shadow it exists to delete is exactly what gets a
+        // half-written piece served as a verified one.
+        let entries = self.chunks.walk().with_context(|| {
+            format!(
+                "could not read piece directory {}",
+                self.chunks.path().display()
+            )
+        })?;
         let mut kept = BTreeSet::new();
-        // What a staged file is *called* is the chunk store's one decision,
-        // and this walk asks it rather than spelling the suffix a second
-        // time: a second copy of it here would let the constant change while
-        // this pass silently stopped finding anything -- which is not a
-        // cosmetic failure, since the stale shadow it exists to delete is
-        // exactly what gets a half-written piece served as a verified one.
-        self.chunks
-            .walk_staged(|staged| {
-                let piece = staged.index.and_then(|index| u32::try_from(index).ok());
-                if staged.complete.as_ref().is_some_and(|c| c.is_file()) {
-                    if let Some(piece) = piece {
-                        self.forget_handles(piece);
+        let mut complete = Vec::new();
+        for entry in entries {
+            match entry {
+                Entry::Complete(index) => {
+                    // A name a `u32` could not hold names no piece of this
+                    // torrent; it is a stray for the sweep, not a bit.
+                    if let Ok(piece) = u32::try_from(index) {
+                        complete.push(piece);
                     }
-                    let _ = std::fs::remove_file(&staged.staged);
-                } else if let Some(piece) = piece {
-                    kept.insert(piece);
                 }
-            })
-            .with_context(|| format!("could not read piece directory {}", self.dir().display()))?;
+                Entry::Staged(staged) => {
+                    let piece = staged.index.and_then(|index| u32::try_from(index).ok());
+                    if staged.complete.as_ref().is_some_and(|c| c.is_file()) {
+                        if let Some(piece) = piece {
+                            self.forget_handles(piece);
+                        }
+                        let _ = std::fs::remove_file(&staged.staged);
+                    } else if let Some(piece) = piece {
+                        kept.insert(piece);
+                    }
+                }
+            }
+        }
         *self.staged.lock() = kept;
+        self.held.seed(complete);
+        self.seeded.store(true, Ordering::Release);
+        self.checking.store(true, Ordering::Release);
+        self.epoch.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
@@ -286,14 +622,6 @@ impl PieceStore {
 
     #[cfg(not(test))]
     fn count_staging_probe(&self) {}
-
-    fn ensure_live(&self) -> anyhow::Result<()> {
-        if self.live.load(Ordering::Acquire) {
-            Ok(())
-        } else {
-            anyhow::bail!("this storage was taken; the torrent is paused or gone")
-        }
-    }
 
     /// The staged copy of a piece, open for writing -- the cached handle
     /// when there is one, otherwise the file, created along with its bucket
@@ -721,9 +1049,15 @@ impl StoreRoot {
 impl TorrentStorage for PieceStore {
     /// Nothing to open and nothing to pre-allocate -- just the torrent's own
     /// directory, so the first write does not have to race to create it, and
-    /// the one piece of reconciliation the store owes a fresh process
-    /// (`Self::discard_shadowing_staged`). The bucket directories are made on
-    /// demand.
+    /// the one walk the store owes a fresh process (`Self::seed_from_disk`):
+    /// the staged reconciliation and the seed of the held set, from the same
+    /// listing. The bucket directories are made on demand.
+    ///
+    /// Once per torrent start, and that is every place the seed happens: on
+    /// an add and on the session's restore inside librqbit's `block_in_place`,
+    /// and on a restart out of error on the reactor under the torrent's own
+    /// lock -- where the walk already ran before the seed rode on it, so it
+    /// costs that path nothing it was not paying.
     fn init(
         &mut self,
         _shared: &librqbit::ManagedTorrentShared,
@@ -732,15 +1066,19 @@ impl TorrentStorage for PieceStore {
         std::fs::create_dir_all(self.dir()).with_context(|| {
             format!("could not create piece directory {}", self.dir().display())
         })?;
-        self.discard_shadowing_staged()
+        self.seed_from_disk()
     }
 
     fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
         self.ensure_live()?;
         let mut filled = 0usize;
-        for segment in self.layout.segments(file_id, offset, buf.len() as u64)? {
+        for segment in self
+            .inner
+            .layout
+            .segments(file_id, offset, buf.len() as u64)?
+        {
             let len = segment.len as usize;
-            let file = self.open_for_read(segment.piece)?;
+            let file = self.inner.open_for_read(segment.piece)?;
             pread_exact_at(
                 &file,
                 segment.offset_in_piece,
@@ -760,9 +1098,13 @@ impl TorrentStorage for PieceStore {
     fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
         self.ensure_live()?;
         let mut written = 0usize;
-        for segment in self.layout.segments(file_id, offset, buf.len() as u64)? {
+        for segment in self
+            .inner
+            .layout
+            .segments(file_id, offset, buf.len() as u64)?
+        {
             let len = segment.len as usize;
-            let file = self.open_for_write(segment.piece)?;
+            let file = self.inner.open_for_write(segment.piece)?;
             pwrite_all_at(&file, segment.offset_in_piece, &buf[written..written + len]).map_err(
                 |e| {
                     anyhow::Error::new(e).context(format!(
@@ -788,18 +1130,18 @@ impl TorrentStorage for PieceStore {
     /// Whatever is left of a boundary piece after the last remove is picked up
     /// by [`super::sweep`] at the next launch, if the torrent is gone.
     fn remove_file(&self, file_id: usize, _filename: &Path) -> anyhow::Result<()> {
-        let pieces = self.layout.pieces_overlapping_file(file_id)?;
+        let layout = &self.inner.layout;
+        let pieces = layout.pieces_overlapping_file(file_id)?;
         let removed = {
-            let mut removed = self.removed_files.lock();
+            let mut removed = self.inner.removed_files.lock();
             removed.insert(file_id);
             removed.clone()
         };
         let mut first_error = None;
         for piece in pieces {
-            let still_wanted = self
-                .layout
+            let still_wanted = layout
                 .files_overlapping_piece(piece)
-                .any(|other| self.layout.owns_bytes(other) && !removed.contains(&other));
+                .any(|other| layout.owns_bytes(other) && !removed.contains(&other));
             if still_wanted {
                 continue;
             }
@@ -825,7 +1167,8 @@ impl TorrentStorage for PieceStore {
         if path != Path::new("") && path != Path::new(".") {
             return Ok(());
         }
-        self.chunks
+        self.inner
+            .chunks
             .remove_if_empty()
             .with_context(|| format!("could not read piece directory {}", self.dir().display()))
     }
@@ -883,35 +1226,35 @@ impl TorrentStorage for PieceStore {
         piece_index: librqbit_core::lengths::ValidPieceIndex,
     ) -> anyhow::Result<bool> {
         let piece = piece_index.get();
-        Ok(self.has_piece(piece) || !self.piece_has_an_owner(piece))
+        Ok(self.has_piece(piece) || !self.inner.piece_has_an_owner(piece))
     }
 
     /// Hand the data path to a successor and go dead, which is how librqbit
-    /// pauses a torrent.
+    /// pauses a torrent, and how its initial check hands over to the paused
+    /// state when it is done.
     ///
-    /// The successor keeps the directory, the layout and the record of which
-    /// files have been removed -- `Session::delete` takes the storage and then
-    /// deletes *through what it got back*, so a successor that had forgotten
-    /// where the pieces are would delete nothing.
+    /// The successor is another handle over the same [`Inner`]: it keeps the
+    /// directory, the layout, the record of which files have been removed --
+    /// `Session::delete` takes the storage and then deletes *through what it
+    /// got back*, so a successor that had forgotten where the pieces are
+    /// would delete nothing -- and the staged and held sets, which it does
+    /// not copy but shares, so a completion or a removal on either handle is
+    /// the same event to both. The open handles are closed: a paused torrent
+    /// holds no descriptors.
+    ///
+    /// A take is also the end of whatever check was running. The one that
+    /// matters is the initializing state's: it has read every piece it means
+    /// to claim by the time it takes the storage, so from here a piece may be
+    /// unlinked again. A pause from the live state and a delete take too,
+    /// and neither had a check to end.
     fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
         let successor = PieceStore {
-            chunks: self.chunks.clone(),
-            layout: self.layout.clone(),
-            removed_files: Mutex::new(self.removed_files.lock().clone()),
-            // The successor keeps knowing which pieces are staged -- a
-            // paused torrent resumes writing them -- and opens its own
-            // handles; the dead store's are closed, so a paused torrent
-            // holds no descriptors.
-            staged: Mutex::new(self.staged.lock().clone()),
-            handles: OpenChunks::new(),
+            inner: Arc::clone(&self.inner),
             live: AtomicBool::new(true),
-            #[cfg(test)]
-            opens: AtomicUsize::new(0),
-            #[cfg(test)]
-            staging_probes: AtomicUsize::new(0),
         };
         self.live.store(false, Ordering::Release);
-        self.handles.clear();
+        self.inner.handles.clear();
+        self.inner.checking.store(false, Ordering::Release);
         Ok(Box::new(successor))
     }
 }
@@ -1510,7 +1853,8 @@ mod tests {
     /// `delete_pieces` that follows calls `remove_file` on a directory,
     /// which fails with `EISDIR`. That is not `NotFound`, so the whole run
     /// of pieces is abandoned at it: every later piece in the run stays on a
-    /// disk the caller has been told it freed.
+    /// disk the caller has been told it freed. The seed a store takes at
+    /// `init` is a listing of the same kind and answers under the same rule.
     #[test]
     fn a_directory_wearing_a_pieces_name_is_never_offered_as_one() {
         const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -1532,6 +1876,13 @@ mod tests {
             root.held(HASH).unwrap(),
             BTreeSet::from([0, 2, 3]),
             "a directory is not a held piece"
+        );
+        let fresh = PieceStore::new(root.torrent_dir(HASH), Arc::new(layout_for(4)));
+        fresh.seed_from_disk().unwrap();
+        assert_eq!(
+            fresh.held().unwrap().in_range(0..4),
+            BTreeSet::from([0, 2, 3]),
+            "and is not in the seed"
         );
         // The path the retention pass takes: what `held` said, offered to
         // the delete.
@@ -1704,6 +2055,18 @@ mod tests {
         );
     }
 
+    /// A piece index as the storage trait spells it, which needs the
+    /// torrent's `Lengths`.
+    fn piece_index(store: &PieceStore, piece: u32) -> librqbit_core::lengths::ValidPieceIndex {
+        librqbit_core::lengths::Lengths::new(
+            store.layout().total_length(),
+            store.layout().default_piece_length() as u32,
+        )
+        .expect("lengths")
+        .validate_piece_index(piece)
+        .expect("in range")
+    }
+
     /// Ask the storage trait's own question, which needs a `ValidPieceIndex`
     /// and therefore the torrent's `Lengths`.
     fn storage_has_piece(store: &PieceStore, piece: u32) -> bool {
@@ -1835,7 +2198,7 @@ mod tests {
             store.pwrite_all(0, (n * 16 * 1024) as u64, chunk).unwrap();
         }
         assert_eq!(
-            store.opens.load(Ordering::Relaxed),
+            store.inner.opens.load(Ordering::Relaxed),
             pieces as usize,
             "one open per piece written, not per chunk"
         );
@@ -1843,7 +2206,7 @@ mod tests {
             store.complete_piece(piece).unwrap();
         }
 
-        store.opens.store(0, Ordering::Relaxed);
+        store.inner.opens.store(0, Ordering::Relaxed);
         let mut buf = vec![0u8; 8 * 1024];
         for n in 0..(payload.len() / buf.len()) {
             let at = n * buf.len();
@@ -1851,12 +2214,12 @@ mod tests {
             assert_eq!(buf, payload[at..at + buf.len()]);
         }
         assert_eq!(
-            store.opens.load(Ordering::Relaxed),
+            store.inner.opens.load(Ordering::Relaxed),
             pieces as usize,
             "one open per piece streamed, not per read"
         );
         assert_eq!(
-            store.staging_probes.load(Ordering::Relaxed),
+            store.inner.staging_probes.load(Ordering::Relaxed),
             0,
             "a complete piece nothing is re-writing is never probed for a staged copy"
         );
@@ -1904,12 +2267,12 @@ mod tests {
 
         let fresh = open_store(tmp.path(), PIECE_LENGTH, &SPECS);
         assert!(
-            fresh.staged.lock().is_empty(),
+            fresh.inner.staged.lock().is_empty(),
             "a store that has not run init knows nothing yet"
         );
-        fresh.discard_shadowing_staged().unwrap();
+        fresh.seed_from_disk().unwrap();
         assert_eq!(
-            *fresh.staged.lock(),
+            *fresh.inner.staged.lock(),
             BTreeSet::from([0]),
             "the lone staged piece is known; the shadow was discarded, not recorded"
         );
@@ -1961,7 +2324,7 @@ mod tests {
 
         // What `init` does on the next launch, which is the only place a
         // half-written piece can be told apart from one being written now.
-        store.discard_shadowing_staged().unwrap();
+        store.seed_from_disk().unwrap();
 
         assert!(!store.staging_path(2).exists(), "the shadow went");
         let mut buf = [0u8; 8];
@@ -1972,6 +2335,272 @@ mod tests {
             "a staged piece with nothing behind it shadows nothing and stays"
         );
         assert!(!store.has_piece(0));
+    }
+
+    /// The held set has to start *unknown*, not empty, and become exactly
+    /// what the walk found: a reader that took an unseeded store for a
+    /// torrent holding nothing would conclude every piece had left the disk,
+    /// and a staged copy counted as held would be a piece offered to peers
+    /// before its hash check. From there the events keep it -- a completion
+    /// adds its bit, a delete removes it, a write adds nothing -- and the
+    /// arithmetic over it is the layout's: a short last piece is short.
+    #[test]
+    fn a_store_holds_nothing_until_init_and_then_exactly_the_complete_pieces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path(), PIECE_LENGTH, &SPECS);
+        let global = global_bytes(store.layout().total_length());
+        // Piece 0 staged only; pieces 2 and 3 complete, 2 with a stale shadow.
+        store.pwrite_all(0, 0, &global[0..8]).unwrap();
+        fill_piece(&store, &global, 2);
+        fill_piece(&store, &global, 3);
+        store.pwrite_all(2, 0, &[0u8; 3]).unwrap();
+        // Debris that parses as a piece and is spelled as none: piece 0's
+        // name in the wrong bucket, a zero-padded 0 in the right one, and
+        // a number no piece index can hold in the bucket it would belong
+        // to. A seed that read any of them would hold a piece that is not
+        // there -- the first two as piece 0, the last as whatever it
+        // truncates to.
+        for path in [
+            tmp.path().join("1").join("0"),
+            tmp.path().join("0").join("00"),
+            tmp.path().join("4294967").join("4294967296"),
+        ] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"xxxxxxxx").unwrap();
+        }
+
+        let fresh = open_store(tmp.path(), PIECE_LENGTH, &SPECS);
+        assert!(
+            fresh.held().is_none(),
+            "a store that has not run init holds unknown, which is not nothing"
+        );
+        fresh.seed_from_disk().unwrap();
+        let held = fresh.held().expect("seeded");
+        assert_eq!(
+            held.in_range(0..4),
+            BTreeSet::from([2, 3]),
+            "exactly the complete names, not the staged one"
+        );
+        assert_eq!(held.count(), 2);
+        assert_eq!(
+            held.bytes(),
+            8 + 6,
+            "the last piece is six bytes, not a piece length"
+        );
+        assert_eq!(
+            held.in_range(3..4),
+            BTreeSet::from([3]),
+            "a range narrows it"
+        );
+        assert_eq!(held.in_range(0..0), BTreeSet::new());
+        assert!(held.contains(2) && !held.contains(0));
+
+        fresh.complete_piece(0).unwrap();
+        assert_eq!(
+            fresh.held().unwrap().in_range(0..4),
+            BTreeSet::from([0, 2, 3]),
+            "a completion adds its bit"
+        );
+        assert!(fresh.delete_piece(3).unwrap());
+        assert_eq!(
+            fresh.held().unwrap().in_range(0..4),
+            BTreeSet::from([0, 2]),
+            "a delete removes it"
+        );
+        fresh.pwrite_all(3, 0, &global[29..30]).unwrap();
+        assert!(
+            fresh.staging_path(3).is_file() && !fresh.held().unwrap().contains(3),
+            "and a write stages bytes without holding a piece"
+        );
+        assert_eq!(fresh.held().unwrap().bytes(), 16);
+    }
+
+    /// **A bucket that cannot be listed is not an empty bucket**, at the
+    /// seed as it was at the listing. Seeded past it, the torrent would run
+    /// short of that bucket's every piece for as long as the process lives
+    /// -- no event adds a piece that is already complete -- so `init` fails
+    /// instead, as it does when the directory cannot be made, and seeds
+    /// nothing at all: not the held set, not the staged one.
+    #[cfg(unix)]
+    #[test]
+    fn an_unlistable_bucket_at_init_fails_init_and_seeds_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("t");
+        let store = PieceStore::new(dir.clone(), Arc::new(layout_for(2001)));
+        // One piece per bucket, so the middle one's directory can be the
+        // only one that refuses, and a staged copy beside the first.
+        for piece in [0, 1000, 2000] {
+            let path = store.piece_path(piece);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"0123456789").unwrap();
+        }
+        std::fs::write(store.staging_path(1), b"01234").unwrap();
+        let refuses = dir.join("1");
+        std::fs::set_permissions(&refuses, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // A process that ignores the mode (root, and some CI containers)
+        // cannot be shown this, and would see a whole seed.
+        let unstoppable = std::fs::read_dir(&refuses).is_ok();
+        if unstoppable {
+            std::fs::set_permissions(&refuses, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+
+        let seeded = store.seed_from_disk();
+        std::fs::set_permissions(&refuses, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            seeded.is_err(),
+            "one bucket that would not list fails the seed"
+        );
+        assert!(
+            store.held().is_none(),
+            "and what the store holds is still unknown, not the two buckets that listed"
+        );
+        assert!(
+            store.inner.staged.lock().is_empty(),
+            "nor did the staged half of the walk land"
+        );
+
+        store.seed_from_disk().unwrap();
+        assert_eq!(
+            store.held().unwrap().in_range(0..2001),
+            BTreeSet::from([0, 1000, 2000]),
+            "with the bucket readable again, the seed is whole"
+        );
+        assert_eq!(*store.inner.staged.lock(), BTreeSet::from([1]));
+    }
+
+    /// The bit is a claim about a file, and it is made after the rename and
+    /// not before: librqbit sets its have-bit only once this returns `Ok`,
+    /// so a bit set over a rename that then failed would be a piece the
+    /// store held and the torrent did not -- and a pass reading the set
+    /// would offer peers bytes the hash check never promoted.
+    #[test]
+    fn complete_piece_sets_the_bit_only_after_the_rename_succeeded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path(), PIECE_LENGTH, &SPECS);
+        store.seed_from_disk().unwrap();
+        let global = global_bytes(store.layout().total_length());
+        // Piece 2 is file 2's alone, and file 2 starts there: staged whole.
+        store.pwrite_all(2, 0, &global[16..24]).unwrap();
+        // Somebody else's directory wearing piece 2's name, so the rename
+        // into place cannot land.
+        let usurper = store.piece_path(2);
+        std::fs::create_dir(&usurper).unwrap();
+        std::fs::write(usurper.join("inside"), b"not ours").unwrap();
+
+        assert!(store.complete_piece(2).is_err());
+        assert!(
+            !store.held().unwrap().contains(2),
+            "no bit over bytes that are still staged"
+        );
+        assert!(
+            store.staging_path(2).is_file(),
+            "and the staged copy is where it was"
+        );
+        assert!(store.inner.staged.lock().contains(&2));
+
+        std::fs::remove_dir_all(&usurper).unwrap();
+        store.complete_piece(2).unwrap();
+        assert!(
+            store.held().unwrap().contains(2),
+            "the rename landed, so the bit is set"
+        );
+        assert!(!store.inner.staged.lock().contains(&2));
+        assert!(store.has_piece(2));
+    }
+
+    /// The other direction of the same rule: a bit goes when the file goes.
+    /// An unlink the volume refused left the file where it was, and a bit
+    /// cleared over it would be a piece nothing lists any more and no pass
+    /// is ever offered again -- the disk would hold it until the sweep at a
+    /// launch that no longer knows the torrent. "Not there" is not a
+    /// refusal, so a delete stays idempotent.
+    #[cfg(unix)]
+    #[test]
+    fn delete_piece_clears_the_bit_unless_the_unlink_was_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("t");
+        let store = PieceStore::new(dir.clone(), Arc::new(layout_for(2001)));
+        for piece in [0, 1000, 2000] {
+            let path = store.piece_path(piece);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"0123456789").unwrap();
+        }
+        store.seed_from_disk().unwrap();
+        assert_eq!(
+            store.held().unwrap().in_range(0..2001),
+            BTreeSet::from([0, 1000, 2000])
+        );
+        let refuses = dir.join("1");
+        let probe = refuses.join("probe");
+        std::fs::write(&probe, b"x").unwrap();
+        std::fs::set_permissions(&refuses, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // A process that ignores the mode (root, and some CI containers)
+        // cannot be shown this, and would see the piece go.
+        let unstoppable = std::fs::remove_file(&probe).is_ok();
+        if unstoppable {
+            std::fs::set_permissions(&refuses, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+
+        let refused = store.delete_piece(1000);
+        std::fs::set_permissions(&refuses, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(refused.is_err(), "the volume refused the unlink");
+        assert!(
+            store.piece_path(1000).is_file() && store.held().unwrap().contains(1000),
+            "the file is still there, and so is its bit"
+        );
+
+        assert!(store.delete_piece(1000).unwrap());
+        assert!(
+            !store.held().unwrap().contains(1000),
+            "an unlink that went through takes the bit with it"
+        );
+        assert!(
+            !store.delete_piece(1000).unwrap(),
+            "not there is not a refusal"
+        );
+        assert_eq!(
+            store.held().unwrap().in_range(0..2001),
+            BTreeSet::from([0, 2000])
+        );
+    }
+
+    /// `init` is where a check begins and `take` is where it ends -- the
+    /// initializing state takes the storage into the paused one when it has
+    /// read everything it means to claim -- and every `init` moves the
+    /// epoch, which is how a reader that held pieces back can tell that
+    /// librqbit has rebuilt its tracker and forgotten the hold-back.
+    #[test]
+    fn init_begins_a_check_that_take_ends_and_moves_the_epoch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path(), PIECE_LENGTH, &SPECS);
+        assert!(
+            !store.is_checking(),
+            "nothing checks a store nothing has seeded"
+        );
+        assert_eq!(store.epoch(), 0);
+
+        store.seed_from_disk().unwrap();
+        assert!(store.is_checking(), "from init the check may be reading");
+        assert_eq!(store.epoch(), 1);
+
+        let successor = store.take().unwrap();
+        assert!(
+            !store.is_checking(),
+            "the take that ends the initial check ends it for the one store both handles are"
+        );
+        drop(successor);
+
+        // A restart out of error seeds again -- on a fresh store in
+        // production; here the same one, so the epoch can be seen to move.
+        store.seed_from_disk().unwrap();
+        assert_eq!(store.epoch(), 2, "every seed moves the epoch");
+        assert!(store.is_checking());
     }
 
     /// Deleting a piece takes both copies. Half of a piece nobody wants is
@@ -2029,10 +2658,19 @@ mod tests {
         );
     }
 
+    /// The taken handle and its successor are one store. What the successor
+    /// has to know -- which copy of a piece is newest, which files are
+    /// already gone -- it knows because it is looking at the same state,
+    /// and the same is true the other way round: an event on either handle
+    /// is the same event to both. The first version copied that state into
+    /// the successor, and a completion landing on the old handle between
+    /// the copy and librqbit swapping the box was a piece the store held
+    /// and never knew it held.
     #[test]
     fn taking_the_storage_moves_the_data_path_and_keeps_the_paths() {
         let tmp = tempfile::tempdir().unwrap();
         let store = open_store(tmp.path(), PIECE_LENGTH, &SPECS);
+        store.seed_from_disk().unwrap();
         let global = global_bytes(store.layout().total_length());
         fill(&store, &global, 8);
         store.remove_file(2, Path::new("f2")).unwrap();
@@ -2042,7 +2680,7 @@ mod tests {
         let again: Vec<u8> = global[0..8].iter().map(|b| !b).collect();
         store.pwrite_all(0, 0, &again).unwrap();
         store.pread_exact(0, 0, &mut [0u8; 4]).unwrap();
-        assert!(!store.handles.is_empty(), "handles are open");
+        assert!(!store.inner.handles.is_empty(), "handles are open");
 
         let successor = store.take().unwrap();
         assert!(
@@ -2051,7 +2689,7 @@ mod tests {
         );
         assert!(store.pwrite_all(0, 0, &[0u8; 4]).is_err());
         assert!(
-            store.handles.is_empty(),
+            store.inner.handles.is_empty(),
             "and holds no descriptors: a paused torrent keeps no files open"
         );
         let mut buf = [0u8; 4];
@@ -2065,8 +2703,30 @@ mod tests {
         // `Session::delete` deletes through what `take` gave it, so the
         // successor has to remember that file 2 is already gone -- otherwise
         // piece 3 would outlive every one of its owners.
+        let held = store.held().expect("seeded before the take");
+        assert_eq!(held.in_range(0..4), BTreeSet::from([0, 1, 3]));
         successor.remove_file(3, Path::new("f3")).unwrap();
         assert!(!tmp.path().join("0").join("3").exists());
+
+        // And the other way: what happens on either handle is one store's
+        // event. The removal the successor performed is gone from the held
+        // set the taken handle reads, and a piece completed through the
+        // successor -- file 2 downloading again -- is held there too.
+        let held = store.held().expect("still seeded");
+        assert_eq!(
+            held.in_range(0..4),
+            BTreeSet::from([0, 1]),
+            "a removal on the successor is seen by the predecessor"
+        );
+        successor.pwrite_all(2, 0, &global[16..24]).unwrap();
+        successor
+            .on_piece_completed(piece_index(&store, 2))
+            .unwrap();
+        assert_eq!(
+            store.held().unwrap().in_range(0..4),
+            BTreeSet::from([0, 1, 2]),
+            "a completion on the successor is seen by the predecessor"
+        );
     }
 
     #[test]
