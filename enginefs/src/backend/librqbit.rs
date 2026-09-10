@@ -793,6 +793,12 @@ pub struct LibrqbitBackend {
     /// a torrent added during a change ends up with the cap that won, never
     /// with the loser's.
     caps: Mutex<PeerCaps>,
+    /// The registry the session's default storage's stores report to
+    /// ([`session_storage_factory`]), handed up through
+    /// [`TorrentBackend::store_registry`] so the retention pass reads the
+    /// held set of the store librqbit is writing to. `None` only for a test
+    /// session opened over a storage that is not the piece store.
+    store_registry: Option<Arc<crate::piece_store::StoreRegistry>>,
 }
 
 /// The session's default storage: the piece store
@@ -822,12 +828,12 @@ pub struct LibrqbitBackend {
 /// nothing else, so nothing above this backend chooses an output folder or
 /// reads one: `EngineFS` protects, measures and deletes by the piece
 /// directory alone.
-fn session_storage_factory(download_dir: &std::path::Path) -> librqbit::storage::BoxStorageFactory {
-    use librqbit::storage::StorageFactoryExt;
+fn session_storage_factory(
+    download_dir: &std::path::Path,
+) -> crate::piece_store::PieceStoreFactory {
     crate::piece_store::PieceStoreFactory::new(crate::piece_store::StoreRoot::in_download_dir(
         download_dir,
     ))
-    .boxed()
 }
 
 /// Whether the storage the session gives a torrent that names none can
@@ -917,8 +923,14 @@ impl LibrqbitBackend {
         let mut tuning = tuning;
         // Built once and handed to every attempt, so the factory the
         // session actually opened with is the same object
-        // `session_can_release_pieces` is asked about below.
-        let storage = session_storage_factory(&download_dir);
+        // `session_can_release_pieces` is asked about below -- and the one
+        // whose registry the engine layer reads.
+        let factory = session_storage_factory(&download_dir);
+        let store_registry = Some(factory.registry());
+        let storage = {
+            use librqbit::storage::StorageFactoryExt;
+            factory.boxed()
+        };
         let session = loop {
             match Self::open_session(
                 &download_dir,
@@ -1034,6 +1046,7 @@ impl LibrqbitBackend {
                 swarm_scraper,
                 piece_reclaim,
                 caps: Mutex::new(caps),
+                store_registry,
             },
             restored_handles,
         ))
@@ -1294,6 +1307,7 @@ impl LibrqbitBackend {
                 swarm_scraper,
                 piece_reclaim,
                 caps: Mutex::new(caps),
+                store_registry: opts.store_registry,
             },
             restored_handles,
         ))
@@ -1309,6 +1323,13 @@ pub struct TestSessionOptions {
     /// piece store (`session_storage_factory`); a test that means to
     /// exercise the shipped storage has to name it.
     pub default_storage: Option<librqbit::storage::BoxStorageFactory>,
+    /// The registry the stores of `default_storage` report to, when it is a
+    /// piece store factory ([`crate::piece_store::PieceStoreFactory::registry`]):
+    /// what the backend answers [`TorrentBackend::store_registry`] with, as
+    /// `new_with_settings` answers with its own factory's. A boxed factory
+    /// cannot be asked for it, so a test that means the retention pass to
+    /// read the session's stores hands it over beside the factory.
+    pub store_registry: Option<Arc<crate::piece_store::StoreRegistry>>,
     /// Persist the session (`session.json`, the `.bitv` bitfields) under
     /// the download dir, so a second backend opened over the same dir
     /// restores its torrents -- a restart.
@@ -1926,6 +1947,10 @@ impl TorrentBackend for LibrqbitBackend {
 
     fn sets_piece_reclaim(&self) -> bool {
         self.piece_reclaim
+    }
+
+    fn store_registry(&self) -> Option<Arc<crate::piece_store::StoreRegistry>> {
+        self.store_registry.clone()
     }
 
     /// The hash a source names, without adding it -- for the
@@ -6875,6 +6900,7 @@ mod tests {
         let client_dir = tmp.path().join("client");
         let opts = || TestSessionOptions {
             default_storage: Some(reclaimable_storage()),
+            store_registry: None,
             persist: true,
             listen_loopback: true,
         };
@@ -7057,12 +7083,14 @@ mod tests {
         // both processes build a store over the same directory -- which is
         // the other half of what makes the promise keepable.
         let pieces = crate::piece_store::StoreRoot::in_download_dir(&client_dir);
-        let opts = || TestSessionOptions {
-            default_storage: Some(
-                crate::piece_store::PieceStoreFactory::new(pieces.clone()).boxed(),
-            ),
-            persist: true,
-            listen_loopback: true,
+        let opts = || {
+            let factory = crate::piece_store::PieceStoreFactory::new(pieces.clone());
+            TestSessionOptions {
+                store_registry: Some(factory.registry()),
+                default_storage: Some(factory.boxed()),
+                persist: true,
+                listen_loopback: true,
+            }
         };
 
         // First run: fetch the whole torrent from a seeder into the store.
@@ -7236,6 +7264,7 @@ mod tests {
         let client_dir = tmp.path().join("client");
         let opts = || TestSessionOptions {
             default_storage: Some(reclaimable_storage()),
+            store_registry: None,
             persist: true,
             listen_loopback: true,
         };
@@ -8413,10 +8442,12 @@ mod tests {
     ) {
         use librqbit::storage::StorageFactoryExt;
         let pieces = crate::piece_store::StoreRoot::in_download_dir(client_dir);
+        let factory = crate::piece_store::PieceStoreFactory::new(pieces);
         let (backend, restored) = LibrqbitBackend::new_for_tests_with(
             client_dir.to_path_buf(),
             TestSessionOptions {
-                default_storage: Some(crate::piece_store::PieceStoreFactory::new(pieces).boxed()),
+                store_registry: Some(factory.registry()),
+                default_storage: Some(factory.boxed()),
                 persist: false,
                 listen_loopback: true,
             },
@@ -8436,6 +8467,22 @@ mod tests {
         );
         efs.set_free_space_probe(|_| Ok(u64::MAX));
         (efs, addr)
+    }
+
+    /// Which pieces of a torrent are complete **on the disk**: a listing of
+    /// its directory, names only, as the retention pass used to take one.
+    /// For the tests whose claim is about the disk rather than about what a
+    /// store knows -- what a peer received, what an unbounded stream left.
+    fn on_disk(
+        root: &crate::piece_store::StoreRoot,
+        hash: &str,
+    ) -> std::collections::BTreeSet<u32> {
+        crate::chunk_store::ChunkDir::new(root.torrent_dir(hash))
+            .held()
+            .expect("the torrent's directory lists")
+            .into_iter()
+            .filter_map(|index| u32::try_from(index).ok())
+            .collect()
     }
 
     /// 256 KiB pieces: big enough that a 32 MiB file is 128 of them rather
@@ -8467,9 +8514,12 @@ mod tests {
     /// the television this was written for the filesystem got there first
     /// and killed the torrent with ENOSPC ninety minutes into a film.
     ///
-    /// Measured, not asserted about: the occupancy is `StoreRoot::held`,
-    /// which is the piece files that are actually on the disk, taken after
-    /// every retention pass -- not a counter this code keeps.
+    /// Measured after every retention pass, through the registry the pass
+    /// itself reads: the held set of the store librqbit is writing to, one
+    /// bit per piece file that is on the disk, kept exact by the rename
+    /// that makes a piece ours and the unlink that takes it away. It is a
+    /// count this code keeps, and that is now the point -- the pass reads
+    /// no directory, so the bound has to hold on what the store knows.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_stream_past_the_cache_budget_stays_under_it_and_still_plays() {
         use tokio::io::AsyncReadExt;
@@ -8485,7 +8535,6 @@ mod tests {
 
         let client_dir = tmp.path().join("client");
         let (efs, client_addr) = streaming_engine_fs(&client_dir).await;
-        let store = efs.piece_store();
 
         // The cleaner's number, pushed in before anything opens a reader:
         // the policy is sized once, when the stream starts.
@@ -8530,7 +8579,11 @@ mod tests {
             // this test can reach.
             if read.len() % (1024 * 1024) < n {
                 efs.reconcile_tick().await;
-                let held = store.held(&hash).unwrap().len();
+                let held = efs
+                    .store_registry()
+                    .held(&hash)
+                    .expect("the running torrent's store is registered")
+                    .count() as usize;
                 worst = worst.max(held);
                 assert!(
                     held <= budget_pieces,
@@ -8643,7 +8696,7 @@ mod tests {
 
         let pieces = (RETENTION_FILE_BYTES as u64 / RETENTION_PIECE) as usize;
         assert_eq!(
-            store.held(&hash).unwrap().len(),
+            on_disk(&store, &hash).len(),
             pieces,
             "every piece is still here: an unknown budget bounds nothing"
         );
@@ -8750,7 +8803,7 @@ mod tests {
             done += n;
             if done % (1024 * 1024) < n {
                 efs.reconcile_tick().await;
-                told.extend(leecher_store.held(&hash).unwrap());
+                told.extend(on_disk(&leecher_store, &hash));
             }
         }
         // Then let the peer take what it is still being offered. The
@@ -8763,7 +8816,7 @@ mod tests {
         while told.len() < committed_pieces && std::time::Instant::now() < settle {
             tokio::time::sleep(Duration::from_millis(50)).await;
             efs.reconcile_tick().await;
-            told.extend(leecher_store.held(&hash).unwrap());
+            told.extend(on_disk(&leecher_store, &hash));
         }
         drop(reader);
 
@@ -8773,7 +8826,7 @@ mod tests {
              for this to say anything about what we announce",
             told.len()
         );
-        let ours = store.held(&hash).unwrap();
+        let ours = on_disk(&store, &hash);
         let broken: Vec<u32> = told.iter().copied().filter(|p| !ours.contains(p)).collect();
         assert!(
             broken.is_empty(),
@@ -8783,6 +8836,233 @@ mod tests {
         assert!(
             told.len() < (RETENTION_FILE_BYTES as u64 / RETENTION_PIECE) as usize,
             "the peer was offered the whole torrent, so nothing was ever held back"
+        );
+    }
+
+    /// **The store the factory registers is the one the pass reads, and
+    /// the pass lists nothing.**
+    ///
+    /// The session's default factory makes the store librqbit writes to and
+    /// registers it when its `init` has seeded it; every completion after
+    /// that sets a bit in the same set the pass reads through the registry.
+    /// So after a stream has run and been reclaimed behind, the set the
+    /// registry answers is the directory to the piece -- with the torrent's
+    /// directory walked exactly once, at the seed, however many passes ran.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_pass_reads_the_store_the_session_writes_to_and_walks_nothing() {
+        use tokio::io::AsyncReadExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let content = tmp.path().join("content");
+        tokio::fs::create_dir_all(&content).await.unwrap();
+        let payload = content.join("movie.bin");
+        write_payload(&payload, RETENTION_FILE_BYTES).await;
+        let (torrent_bytes, _) =
+            make_torrent_with_piece_length(&payload, RETENTION_PIECE as u32).await;
+
+        let client_dir = tmp.path().join("client");
+        let (efs, client_addr) = streaming_engine_fs(&client_dir).await;
+        let store = efs.piece_store();
+        efs.set_cache_budget(Some(RETENTION_BUDGET));
+
+        let engine = efs
+            .add_torrent(TorrentSource::Bytes(torrent_bytes.clone()), None)
+            .await
+            .expect("add");
+        let hash = engine.info_hash.clone();
+        engine.handle.handle.wait_until_initialized().await.unwrap();
+        let dir = store.torrent_dir(&hash);
+        let walks = || {
+            crate::chunk_store::WALKS
+                .lock()
+                .get(&dir)
+                .copied()
+                .unwrap_or(0)
+        };
+        assert_eq!(walks(), 1, "the session's init walked the directory once");
+        assert_eq!(
+            efs.store_registry()
+                .held(&hash)
+                .expect("seeded, so registered")
+                .count(),
+            0,
+            "and seeded an empty set: nothing has been fetched"
+        );
+        let _seeder = seeder_dialling(&content, &torrent_bytes, client_addr).await;
+
+        let mut reader = engine
+            .try_get_file_with_intent(
+                0,
+                0,
+                255,
+                crate::backend::priorities::PlaybackIntent::DirectInitial,
+                crate::backend::priorities::BufferProfile::Normal,
+            )
+            .await
+            .expect("reader");
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut done = 0usize;
+        let mut passes = 0usize;
+        let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
+        while done < RETENTION_FILE_BYTES {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stream stalled at {done} bytes"
+            );
+            let n = reader.read(&mut buf).await.expect("read");
+            assert_ne!(n, 0, "the stream ended early at {done}");
+            done += n;
+            if done % (1024 * 1024) < n {
+                efs.reconcile_tick().await;
+                passes += 1;
+            }
+        }
+        drop(reader);
+
+        let pieces = (RETENTION_FILE_BYTES as u64 / RETENTION_PIECE) as u32;
+        let held = efs
+            .store_registry()
+            .held(&hash)
+            .expect("the running torrent's store is registered")
+            .in_range(0..pieces);
+        assert_eq!(
+            held,
+            on_disk(&store, &hash),
+            "what the registry answers is what the directory holds, to the piece"
+        );
+        assert!(
+            !held.is_empty() && held.len() < pieces as usize,
+            "completions landed in the set and the passes reclaimed from it: {} of {pieces}",
+            held.len()
+        );
+        assert!(passes >= 8, "the stream ran through {passes} passes");
+        assert_eq!(
+            walks(),
+            1,
+            "and none of them walked the directory: the one walk is the seed's"
+        );
+    }
+
+    /// **A torrent in Error has no registered store; a restart out of
+    /// error registers a fresh one.**
+    ///
+    /// librqbit answers a fatal storage error by pausing the torrent -- a
+    /// take -- and dropping what it took, so the Error state holds no
+    /// storage at all; the store's last handle goes, and its registration
+    /// with it. The registry then answers "no store" for the hash, which a
+    /// pass concludes nothing over -- never an empty set, which would
+    /// withdraw every committed piece from what we announce. The restart is
+    /// `Session::unpause`'s Error arm: `create_and_init` again, on the
+    /// reactor under the torrent's own lock, and the fresh store's seed
+    /// registers there -- one map insert, no call back into the torrent --
+    /// with everything the re-check found.
+    ///
+    /// The error is a bucket directory made unwritable under a download:
+    /// the next piece's staged file cannot be created, `pwrite_all` fails,
+    /// and librqbit stops the torrent with it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_torrent_in_error_has_no_store_and_a_restart_registers_a_fresh_one() {
+        use crate::backend::TorrentHandle;
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::AsyncReadExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let content = tmp.path().join("content");
+        tokio::fs::create_dir_all(&content).await.unwrap();
+        let payload = content.join("movie.bin");
+        write_payload(&payload, RETENTION_FILE_BYTES).await;
+        let (torrent_bytes, _) =
+            make_torrent_with_piece_length(&payload, RETENTION_PIECE as u32).await;
+
+        let client_dir = tmp.path().join("client");
+        let (efs, client_addr) = streaming_engine_fs(&client_dir).await;
+        let store = efs.piece_store();
+        let registry = efs.store_registry().clone();
+
+        let engine = efs
+            .add_torrent(TorrentSource::Bytes(torrent_bytes.clone()), None)
+            .await
+            .expect("add");
+        let hash = engine.info_hash.clone();
+        engine.handle.handle.wait_until_initialized().await.unwrap();
+        assert_eq!(registry.epoch(&hash), Some(1), "one init, one seed");
+        let _seeder = seeder_dialling(&content, &torrent_bytes, client_addr).await;
+
+        // Fetch the first megabyte, so the bucket exists and holds pieces.
+        let mut reader = engine
+            .try_get_file_with_intent(
+                0,
+                0,
+                255,
+                crate::backend::priorities::PlaybackIntent::DirectInitial,
+                crate::backend::priorities::BufferProfile::Normal,
+            )
+            .await
+            .expect("reader");
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut done = 0usize;
+        let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
+        while done < 1024 * 1024 {
+            assert!(std::time::Instant::now() < deadline, "stalled at {done}");
+            let n = reader.read(&mut buf).await.expect("read");
+            assert_ne!(n, 0);
+            done += n;
+        }
+        drop(reader);
+        let before = on_disk(&store, &hash);
+        assert!(!before.is_empty());
+
+        // The bucket will take no new file. A process that ignores the mode
+        // (root, and some CI containers) cannot be shown this.
+        let bucket = store.torrent_dir(&hash).join("0");
+        std::fs::set_permissions(&bucket, std::fs::Permissions::from_mode(0o500)).unwrap();
+        if std::fs::File::create(bucket.join("probe")).is_ok() {
+            let _ = std::fs::remove_file(bucket.join("probe"));
+            std::fs::set_permissions(&bucket, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+        let errored = std::time::Instant::now() + TEST_WAIT_BOUND;
+        while engine.handle.run_state() != RunState::Error {
+            assert!(
+                std::time::Instant::now() < errored,
+                "the download never hit the unwritable bucket: {:?}",
+                engine.handle.run_state()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        std::fs::set_permissions(&bucket, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            registry.held(&hash).is_none(),
+            "a torrent in Error holds no storage, so the hash has no store: unknown, not empty"
+        );
+        assert_eq!(registry.epoch(&hash), None);
+        assert!(
+            !on_disk(&store, &hash).is_empty(),
+            "while the pieces themselves are still on the disk"
+        );
+
+        // The restart out of error: a fresh store, seeded and registered
+        // under librqbit's lock.
+        engine
+            .handle
+            .restart_from_error()
+            .await
+            .expect("restart from error");
+        engine.handle.handle.wait_until_initialized().await.unwrap();
+        let held = registry
+            .held(&hash)
+            .expect("the restarted torrent's store is registered");
+        let pieces = (RETENTION_FILE_BYTES as u64 / RETENTION_PIECE) as u32;
+        assert_eq!(
+            held.in_range(0..pieces),
+            on_disk(&store, &hash),
+            "and its seed is what the re-check found on the disk"
+        );
+        assert!(held.count() > 0);
+        assert_eq!(
+            registry.epoch(&hash),
+            Some(1),
+            "the fresh store's first seed: a new Inner counts from nothing"
         );
     }
 }

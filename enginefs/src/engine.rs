@@ -3,7 +3,7 @@ use crate::backend::{
     priorities::{BufferProfile, PlaybackIntent},
 };
 use crate::cache::DataCache;
-use crate::piece_store::{RetentionPolicy, Share, StoreRoot};
+use crate::piece_store::{RetentionPolicy, Share, StoreRegistry};
 use crate::retention::owner::{
     Backing, Door, Install, InstalledView, Liveness, Retention, Trigger,
 };
@@ -357,7 +357,9 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
     type Position = (usize, u64);
     type Domain = FileDomain;
     type Want = usize;
-    type Store = StoreRoot;
+    /// The registry the session's stores report to: where the held set is
+    /// read and where every unlink of a registered torrent's piece goes.
+    type Store = Arc<StoreRegistry>;
     /// A torrent's half of the budget is committed for sharing: its pieces
     /// are what a peer asks us for. That is the whole of what differs from
     /// the proxy cache's policy, and it is this constant rather than a
@@ -418,8 +420,15 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         !self.pinned.read().is_empty()
     }
 
-    async fn held(&self, store: &StoreRoot, _domain: &FileDomain) -> Option<BTreeSet<u32>> {
-        crate::retention::listing(store, &self.info_hash).await
+    /// The registered store's held set inside this file's extent -- a copy
+    /// of the store's atomic words, no listing and no suspension. `None`
+    /// is a torrent with no registered store: one the session holds in
+    /// Error (librqbit drops its storage), or one whose `init` has not run
+    /// -- unknown, which the pass concludes nothing over, and never empty.
+    async fn held(&self, store: &Arc<StoreRegistry>, domain: &FileDomain) -> Option<BTreeSet<u32>> {
+        store
+            .held(&self.info_hash)
+            .map(|held| held.in_range(Self::extent(domain)))
     }
 
     async fn advertise(&self, pieces: Range<u32>, on: bool) -> anyhow::Result<()> {
@@ -476,9 +485,19 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
     /// split goes back on the list in its parts, and each part is asked
     /// about in its own turn; only a run the door lets through whole is
     /// released.
+    ///
+    /// And before every one of those, the torrent's run state, read at the
+    /// instant and not carried in from the decision: a torrent under its
+    /// initial hash check (`Initializing`) is reading every piece it means
+    /// to claim, and a piece dropped from under it is a have-bit over
+    /// nothing; one in `Error` or `Gone` holds no storage for a drop to
+    /// edit. librqbit's own `drop_pieces` bails in all three, so this
+    /// changes what is asked rather than what happens -- but a bail per run
+    /// is a warning per run per tick, and the reading belongs here, where
+    /// the unlink is decided.
     async fn reclaim(
         &self,
-        store: &StoreRoot,
+        store: &Arc<StoreRegistry>,
         _domain: &FileDomain,
         runs: Vec<Range<u32>>,
         door: Door<Self>,
@@ -489,6 +508,18 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
             let Some(window) = door.window_now() else {
                 break;
             };
+            let run_state = self.handle.run_state();
+            if !matches!(
+                run_state,
+                crate::backend::RunState::Live | crate::backend::RunState::Paused
+            ) {
+                tracing::debug!(
+                    info_hash = %self.info_hash,
+                    ?run_state,
+                    "the torrent is not settled, so nothing of it is reclaimed this pass"
+                );
+                break;
+            }
             let parts = crate::retention::outside(run.clone(), &window);
             if parts.len() == 1 && parts[0] == run {
                 reclaimed +=
@@ -1030,10 +1061,10 @@ impl<H: TorrentHandle> Engine<H> {
     /// One retention pass: what the policy makes of where the playhead is
     /// now, and the calls that make it so. `None` when there is nothing to
     /// do -- no policy, no reader has been anywhere yet, the reader is in
-    /// another file than the policy governs before or after the walk, a
-    /// pin, or a disk that would not list. Every one of those leaves the
-    /// policy where it was; none of them is a pass that ran and found
-    /// nothing, which is `Some` with a zeroed count.
+    /// another file than the policy governs before or after the reading, a
+    /// pin, or a torrent with no registered store. Every one of those
+    /// leaves the policy where it was; none of them is a pass that ran and
+    /// found nothing, which is `Some` with a zeroed count.
     ///
     /// The file's turn from the first line to the last
     /// ([`Retention::turn`] then [`Retention::pass`]): a second pass queues
@@ -1041,10 +1072,23 @@ impl<H: TorrentHandle> Engine<H> {
     /// waits its turn, and the cleaner's delete waits behind both. The
     /// policy stays in its cell throughout; a pass that dies at an await
     /// drops the turn like any other local and the next tick's pass runs.
+    ///
+    /// Not while the torrent is under its initial hash check. The check is
+    /// reading every piece it means to claim, and the pass would only be
+    /// refused at every door below -- the reclaim's run-state reading, the
+    /// registry's own refusal -- one warning per run per tick for as long
+    /// as the check takes. `None`, as for any torrent with nothing to pass
+    /// over.
     pub(crate) async fn retain(
         &self,
-        store: &StoreRoot,
+        store: &Arc<StoreRegistry>,
     ) -> Option<crate::retention::RetentionPass> {
+        if matches!(
+            self.handle.run_state(),
+            crate::backend::RunState::Initializing { .. }
+        ) {
+            return None;
+        }
         let (file_idx, _) = self.bounded()?;
         let claim = self.retention.turn(&file_idx).await?;
         let concluded = self
@@ -1151,7 +1195,11 @@ impl<H: TorrentHandle> Engine<H> {
     /// [`crate::retention::this_files_alone`] is asked here as well as in
     /// the pass, and for the same reason: unlinking a piece a still-wanted
     /// neighbour owns is a refetch loop, whichever caller does it.
-    pub(crate) async fn release_reclaimable(&self, store: &StoreRoot, pieces: &[u32]) -> usize {
+    pub(crate) async fn release_reclaimable(
+        &self,
+        store: &Arc<StoreRegistry>,
+        pieces: &[u32],
+    ) -> usize {
         // The turn is per file, and the file is the one whose policy will
         // answer. Taken before the asking, held across the unlink: a pass
         // on that file cannot commit a piece between this reading and its

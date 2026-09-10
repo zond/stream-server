@@ -18,6 +18,7 @@ use parking_lot::Mutex;
 use crate::chunk_store::{ChunkDir, ChunkError, Entry, OpenChunks, StoredChunk, collect_strays};
 
 use super::layout::{FileSpec, PieceLayout};
+use super::registry::StoreRegistry;
 
 /// A read asked for a piece that is not on disk.
 ///
@@ -90,6 +91,16 @@ pub struct MissingPiece {
 /// failure is why the seed is strict: a bucket the filesystem would not list
 /// fails `init` rather than seeding the torrent short for its whole life.
 ///
+/// The live store of a running torrent is librqbit's, so the set is reached
+/// through the [`StoreRegistry`] the factory's stores register in once
+/// `init` has seeded them ([`Self::under`]): the pass reads it there, and
+/// every unlink of a registered torrent's piece goes through the registered
+/// store's [`Self::delete_piece`], which is how the bit and the cached handle
+/// go with the file. A store made by [`Self::new`] registers nowhere -- it is
+/// a test's, or one built to delete through -- and a store whose `init` has
+/// not run is not registered either, so a registration always carries a
+/// seeded set.
+///
 /// # Open handles
 ///
 /// librqbit writes a piece 16 KiB at a time and a stream reads it in 8 KiB
@@ -124,10 +135,16 @@ pub struct PieceStore {
 }
 
 /// What every handle over one torrent's store shares.
-struct Inner {
+pub(super) struct Inner {
     /// `<root>/<info hash>`, as a directory of bucketed chunks.
     chunks: ChunkDir,
     layout: Arc<PieceLayout>,
+    /// Where this store registers when `init` seeds it, and under which
+    /// hash, or `None` for a store that registers nowhere. The registration
+    /// goes when the last handle does ([`Drop`] below), and only if it is
+    /// still this store's: a restart out of error builds a fresh store
+    /// while the old one may not have been dropped yet.
+    registration: Option<Registration>,
     /// File ids [`PieceStore::remove_file`] has been asked to drop. A piece
     /// may only go when every file that owns bytes in it is in here.
     removed_files: Mutex<BTreeSet<usize>>,
@@ -171,6 +188,24 @@ struct Inner {
     opens: AtomicUsize,
     #[cfg(test)]
     staging_probes: AtomicUsize,
+}
+
+/// The registry a store reports to and the key it reports under.
+struct Registration {
+    registry: Arc<StoreRegistry>,
+    /// Lowercase, as librqbit spells an info hash and as
+    /// [`StoreRoot::torrent_dir`] names the directory.
+    info_hash: String,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        if let Some(registration) = &self.registration {
+            registration
+                .registry
+                .forget(&registration.info_hash, self as *const Inner);
+        }
+    }
 }
 
 /// One bit per piece: set when the piece's rename lands, cleared when its
@@ -321,15 +356,39 @@ impl HeldSnapshot {
 }
 
 impl PieceStore {
-    /// A store for one torrent. Creates nothing -- `init` does that, and
-    /// librqbit has a path (`Session::delete` with no live storage to
-    /// recover) that constructs a storage purely to delete through it.
+    /// A store for one torrent that registers nowhere: a test's, or one
+    /// built beside a session's over the same directory. Creates nothing --
+    /// `init` does that, and librqbit has a path (`Session::delete` with no
+    /// live storage to recover) that constructs a storage purely to delete
+    /// through it.
     pub fn new(dir: PathBuf, layout: Arc<PieceLayout>) -> Self {
+        Self::build(dir, layout, None)
+    }
+
+    /// The store the factory makes: over `registry`'s root under
+    /// `info_hash`, and registered there once `init` has seeded it -- not
+    /// before, so the store `Session::delete` builds to delete through,
+    /// which never runs `init`, is never the one the registry answers for.
+    pub fn under(registry: Arc<StoreRegistry>, info_hash: &str, layout: Arc<PieceLayout>) -> Self {
+        let info_hash = info_hash.to_ascii_lowercase();
+        let dir = registry.root().torrent_dir(&info_hash);
+        Self::build(
+            dir,
+            layout,
+            Some(Registration {
+                registry,
+                info_hash,
+            }),
+        )
+    }
+
+    fn build(dir: PathBuf, layout: Arc<PieceLayout>, registration: Option<Registration>) -> Self {
         let held = HeldBits::for_pieces(layout.piece_count());
         Self {
             inner: Arc::new(Inner {
                 chunks: ChunkDir::new(dir),
                 layout,
+                registration,
                 removed_files: Mutex::new(BTreeSet::new()),
                 staged: Mutex::new(BTreeSet::new()),
                 held,
@@ -389,7 +448,9 @@ impl PieceStore {
     /// torrent had left the disk -- withdraw the lot from what is announced
     /// and reclaim it next time round. That is the incident
     /// [`crate::chunk_store::ChunkDir::held_in_bucket`] records for a
-    /// listing, carried into memory.
+    /// listing, carried into memory -- and into the [`StoreRegistry`],
+    /// which answers `None` for a hash with no seeded store for the same
+    /// reason.
     pub fn held(&self) -> Option<HeldSnapshot> {
         self.inner.held()
     }
@@ -400,14 +461,14 @@ impl PieceStore {
     /// one. A piece unlinked under a running check is a piece the check has
     /// just claimed and the torrent then advertises without having.
     pub fn is_checking(&self) -> bool {
-        self.inner.checking.load(Ordering::Acquire)
+        self.inner.is_checking()
     }
 
     /// How many times `init` has seeded this store. Moves on a restart out
     /// of error, which is when librqbit forgets every hold-back it was told
     /// -- see [`Inner::epoch`].
     pub fn epoch(&self) -> u64 {
-        self.inner.epoch.load(Ordering::Acquire)
+        self.inner.epoch()
     }
 
     /// Promote a written piece to a complete one. Nothing may read it as ours
@@ -474,8 +535,46 @@ impl PieceStore {
     /// Safe on a store that has been used, not only a fresh one: a handle
     /// cached on a shadow that went is forgotten with it, and the held set
     /// is replaced, not added to.
-    fn seed_from_disk(&self) -> anyhow::Result<()> {
-        self.inner.seed_from_disk()
+    ///
+    /// And then, for a store made by [`Self::under`], the registration --
+    /// after the seed has landed and never before it, so the registry never
+    /// answers for a store whose set is still unknown. Newest wins: a
+    /// restart out of error runs this on a fresh store while the one that
+    /// errored may still be about, and the fresh one is what librqbit reads
+    /// and writes. One map insert under a `parking_lot` lock and nothing
+    /// else, because on that restart path this runs on the reactor under
+    /// librqbit's own torrent lock, where a callback into the torrent would
+    /// deadlock.
+    pub(super) fn seed_from_disk(&self) -> anyhow::Result<()> {
+        self.inner.seed_from_disk()?;
+        if let Some(registration) = &self.inner.registration {
+            registration
+                .registry
+                .insert(&registration.info_hash, &self.inner);
+        }
+        Ok(())
+    }
+
+    /// What `init` does, for a store no librqbit session drives -- the
+    /// directory, the seed, the registration -- and then the take that
+    /// ends the initial check, because a store a test registers is one
+    /// nothing is checking. Called again after the test has written more
+    /// piece files by hand, it re-seeds, as a re-check would.
+    #[cfg(test)]
+    pub fn init_for_tests(&self) -> anyhow::Result<()> {
+        std::fs::create_dir_all(self.dir())?;
+        self.seed_from_disk()?;
+        self.inner.checking.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// `init` as librqbit runs it, for a test that wants the check it
+    /// begins: the seed and the registration, and the store left checking
+    /// until a take ends it.
+    #[cfg(test)]
+    pub fn init_begins_check_for_tests(&self) -> anyhow::Result<()> {
+        std::fs::create_dir_all(self.dir())?;
+        self.seed_from_disk()
     }
 
     fn ensure_live(&self) -> anyhow::Result<()> {
@@ -503,7 +602,7 @@ impl PieceStore {
 }
 
 impl Inner {
-    fn held(&self) -> Option<HeldSnapshot> {
+    pub(super) fn held(&self) -> Option<HeldSnapshot> {
         if !self.seeded.load(Ordering::Acquire) {
             return None;
         }
@@ -511,6 +610,19 @@ impl Inner {
             bits: self.held.snapshot(),
             layout: Arc::clone(&self.layout),
         })
+    }
+
+    pub(super) fn is_checking(&self) -> bool {
+        self.checking.load(Ordering::Acquire)
+    }
+
+    pub(super) fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(super) fn dir(&self) -> &Path {
+        self.chunks.path()
     }
 
     fn piece_path(&self, piece: u32) -> PathBuf {
@@ -553,7 +665,7 @@ impl Inner {
         completed
     }
 
-    fn delete_piece(&self, piece: u32) -> anyhow::Result<bool> {
+    pub(super) fn delete_piece(&self, piece: u32) -> anyhow::Result<bool> {
         // Before the unlink, or a later read of the same piece would be
         // served the deleted bytes through the handle that outlived them.
         self.forget_handles(piece);
@@ -744,10 +856,11 @@ impl Inner {
     }
 }
 
-/// Which thread last ran [`StoreRoot::delete_pieces`] for each torrent
-/// directory: the probe for the tests that pin a delete to the blocking
-/// pool, keyed by directory so that tests running in parallel, each in a
-/// scratch root of its own, do not read one another's answer.
+/// Which thread last deleted pieces of each torrent directory -- through
+/// [`StoreRoot::delete_pieces`] or the registered store's delete
+/// ([`StoreRegistry::delete`]): the probe for the tests that pin a delete to
+/// the blocking pool, keyed by directory so that tests running in parallel,
+/// each in a scratch root of its own, do not read one another's answer.
 #[cfg(test)]
 pub(crate) static DELETED_ON: Mutex<std::collections::BTreeMap<PathBuf, std::thread::ThreadId>> =
     Mutex::new(std::collections::BTreeMap::new());
@@ -929,34 +1042,6 @@ impl StoreRoot {
         ChunkDir::new(self.torrent_dir(info_hash))
     }
 
-    /// Which pieces of one torrent are **complete** on disk, which under
-    /// this design is the have-set: presence means complete, because the
-    /// bytes are written under a staging name and renamed into place only
-    /// once librqbit's hash check has passed.
-    ///
-    /// [`Self::stat`] answers the same question and more, and the more is
-    /// what makes it the wrong call here: it costs a `metadata` per file,
-    /// and the retention pass asks this of a streaming torrent every couple
-    /// of seconds -- some 6,750 `statx` calls a pass for a 27 GB torrent,
-    /// for two numbers it does not want. This reads directory *names* and
-    /// nothing else: one `read_dir` per bucket, no `stat` at all.
-    ///
-    /// Same spelling rules as [`Self::stat`], and for the same reason: a
-    /// piece is only reported when both halves of its address are spelled
-    /// the way a delete will spell them, or the answer would promise bytes
-    /// no delete could take.
-    ///
-    /// `Err` is a directory that would not list, which is no answer at all
-    /// -- not an empty one. See [`crate::chunk_store::ChunkDir::held`].
-    pub fn held(&self, info_hash: &str) -> std::io::Result<std::collections::BTreeSet<u32>> {
-        Ok(self
-            .chunks(info_hash)
-            .held()?
-            .into_iter()
-            .filter_map(|index| u32::try_from(index).ok())
-            .collect())
-    }
-
     /// Reclaim pieces: both copies of each.
     ///
     /// **Only for a caller that has already had the backend forget it has
@@ -975,19 +1060,20 @@ impl StoreRoot {
     /// second door into the unlink is a second place the interlock can be
     /// forgotten.
     ///
-    /// Not [`PieceStore::delete_piece`], and it cannot be: the live
-    /// `PieceStore` of a running torrent is librqbit's, built by the factory
-    /// and handed to a torrent state this crate has no reference to. What
-    /// that costs is the store's open-handle cache -- a piece deleted from
-    /// out here may still have a cached handle in the live store, and the
-    /// filesystem keeps an unlinked inode's blocks until the last descriptor
-    /// on it goes. It is bounded by [`OPEN_HANDLES`] and the handle leaves
-    /// as soon as another piece takes its slot. It costs nothing in
-    /// *correctness*: [`PieceStore::has_piece`] asks the filesystem and not
-    /// the cache, so the store never claims a piece whose file has gone, and
-    /// nothing reads a piece the backend has just been told it does not have
-    /// -- a re-download of one writes under the staging name, which the
-    /// cache keys separately and which a read prefers.
+    /// **For a hash no store is registered for**, and for that alone. The
+    /// live `PieceStore` of a running torrent is librqbit's, built by the
+    /// factory and handed to a torrent state this crate has no reference
+    /// to, and this used to be the only way to reach its files: by path,
+    /// behind its back. That left the store's open-handle cache holding an
+    /// unlinked inode's blocks until another piece took the slot, and it
+    /// would leave a held set the store keeps standing over files that have
+    /// gone. So a torrent with a registered store is deleted through it
+    /// ([`StoreRegistry::delete`], which is what `crate::retention::unlink`
+    /// asks first), and this is the door for the rest: a torrent the
+    /// session does not hold, or holds in Error, whose pieces are files
+    /// nothing has a handle on or a bit for.
+    ///
+    /// [`OPEN_HANDLES`]: crate::chunk_store::OPEN_HANDLES
     ///
     /// Returns for how many pieces a file really left the disk -- **either
     /// copy**, not the complete one alone. A piece the caller was offered
@@ -1285,20 +1371,34 @@ impl TorrentStorage for PieceStore {
 /// and nothing else. That is no loss -- the store wants one root of its own,
 /// with a directory per info hash, and not the human-readable tree librqbit
 /// would have written.
+///
+/// Every store it makes registers in one [`StoreRegistry`] when its `init`
+/// seeds it, and the registry is the factory's to hand out
+/// ([`Self::registry`]): the session's backend gives it to whoever decides
+/// retention, so the pass reads the held set of the store librqbit is
+/// writing to, and the unlink goes through it.
 #[derive(Clone)]
 pub struct PieceStoreFactory {
-    root: StoreRoot,
+    registry: Arc<StoreRegistry>,
 }
 
 impl PieceStoreFactory {
     /// Over one [`StoreRoot`] -- the same type everything else asks about
-    /// the store, so there is one way to say where it is.
+    /// the store, so there is one way to say where it is -- with a fresh
+    /// registry for the stores under it.
     pub fn new(root: StoreRoot) -> Self {
-        Self { root }
+        Self {
+            registry: Arc::new(StoreRegistry::new(root)),
+        }
     }
 
     pub fn root(&self) -> &Path {
-        self.root.path()
+        self.registry.root().path()
+    }
+
+    /// The registry the stores this factory makes report to.
+    pub fn registry(&self) -> Arc<StoreRegistry> {
+        Arc::clone(&self.registry)
     }
 }
 
@@ -1327,8 +1427,9 @@ impl StorageFactory for PieceStoreFactory {
         metadata: &librqbit::TorrentMetadata,
     ) -> anyhow::Result<PieceStore> {
         let layout = layout_of(metadata)?;
-        Ok(PieceStore::new(
-            self.root.torrent_dir(&shared.info_hash.as_string()),
+        Ok(PieceStore::under(
+            Arc::clone(&self.registry),
+            &shared.info_hash.as_string(),
             Arc::new(layout),
         ))
     }
@@ -1863,16 +1964,17 @@ mod tests {
         assert!(!store.piece_path(4).exists());
     }
 
-    /// The hot listing and the delete have to be one predicate about one
-    /// kind of thing.
+    /// The seed and the delete have to be one predicate about one kind of
+    /// thing.
     ///
     /// A *directory* named like a piece is not a piece, and the retention
-    /// pass reaches the disk through `held` -- so if `held` reports it, the
-    /// `delete_pieces` that follows calls `remove_file` on a directory,
-    /// which fails with `EISDIR`. That is not `NotFound`, so the whole run
-    /// of pieces is abandoned at it: every later piece in the run stays on a
-    /// disk the caller has been told it freed. The seed a store takes at
-    /// `init` is a listing of the same kind and answers under the same rule.
+    /// pass reaches the disk through the held set the seed built -- so if
+    /// the seed reports it, the delete that follows calls `remove_file` on
+    /// a directory, which fails with `EISDIR`. That is not `NotFound`, so
+    /// the whole run of pieces is abandoned at it: every later piece in the
+    /// run stays on a disk the caller has been told it freed. The hot
+    /// listing the pass used to take answered under this rule before the
+    /// seed replaced it.
     #[test]
     fn a_directory_wearing_a_pieces_name_is_never_offered_as_one() {
         const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -1890,25 +1992,20 @@ mod tests {
         std::fs::create_dir(&usurper).unwrap();
         std::fs::write(usurper.join("inside"), b"not ours").unwrap();
 
-        assert_eq!(
-            root.held(HASH).unwrap(),
-            BTreeSet::from([0, 2, 3]),
-            "a directory is not a held piece"
-        );
         let fresh = PieceStore::new(root.torrent_dir(HASH), Arc::new(layout_for(4)));
         fresh.seed_from_disk().unwrap();
+        let held = fresh.held().unwrap().in_range(0..4);
         assert_eq!(
-            fresh.held().unwrap().in_range(0..4),
+            held,
             BTreeSet::from([0, 2, 3]),
-            "and is not in the seed"
+            "a directory is not a held piece, so it is not in the seed"
         );
-        // The path the retention pass takes: what `held` said, offered to
-        // the delete.
-        let held = root.held(HASH).unwrap();
+        // The path the retention pass takes: what the held set said,
+        // offered to the delete.
         assert_eq!(
             root.delete_pieces(HASH, held),
             3,
-            "and every piece the listing named really goes"
+            "and every piece the set named really goes"
         );
         assert!(!store.has_piece(0) && !store.has_piece(2) && !store.has_piece(3));
         assert!(usurper.is_dir(), "what is not ours is left where it is");
@@ -1917,7 +2014,7 @@ mod tests {
     /// The other half of that one predicate: the *staged* name, which no
     /// listing can filter because it spells no piece at all.
     ///
-    /// `held` names a piece by its complete file, so a directory wearing
+    /// The seed names a piece by its complete file, so a directory wearing
     /// `<piece>.part` is invisible to it -- the run it offers is entirely
     /// right -- and the delete meets the directory anyway, because it takes
     /// both copies of every piece it is given. `remove_file` answers
@@ -1942,15 +2039,17 @@ mod tests {
         std::fs::create_dir(&usurper).unwrap();
         std::fs::write(usurper.join("inside"), b"not ours").unwrap();
 
-        let held = root.held(HASH).unwrap();
+        let fresh = PieceStore::new(root.torrent_dir(HASH), Arc::new(layout_for(4)));
+        fresh.seed_from_disk().unwrap();
+        let held = fresh.held().unwrap().in_range(0..4);
         assert_eq!(
             held,
             BTreeSet::from([0, 1, 2, 3]),
             "all four pieces are complete on the disk, and a `.part` name is no piece"
         );
         // The path the retention pass takes, once the backend has dropped
-        // the have-bits for the whole run: what `held` said, offered to the
-        // delete.
+        // the have-bits for the whole run: what the held set said, offered
+        // to the delete.
         let freed = root.delete_pieces(HASH, held);
         for piece in 0..4 {
             assert!(

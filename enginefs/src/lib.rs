@@ -650,6 +650,13 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     /// with every [`Engine`] this instance makes. Unknown until a pass has
     /// run: see [`crate::retention`].
     budget: Arc<crate::retention::RetentionBudget>,
+    /// Where the backend's piece stores register once their `init` has
+    /// seeded them, and so where a torrent's held set is read and every
+    /// unlink of a registered torrent's piece goes: the backend's own
+    /// ([`TorrentBackend::store_registry`]), or an empty one over the
+    /// download root for a backend that keeps none, so that a hash nothing
+    /// registered answers "no store" -- unknown, never empty.
+    registry: Arc<crate::piece_store::StoreRegistry>,
 }
 
 /// What an [`Engine`] needs besides its backend handle: the epoch its
@@ -942,6 +949,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         // an add, which carries its want-set with it.
         let restored_unsettled = backend.sets_piece_reclaim();
         let budget = Arc::new(crate::retention::RetentionBudget::default());
+        let registry = backend.store_registry().unwrap_or_else(|| {
+            Arc::new(crate::piece_store::StoreRegistry::new(
+                crate::piece_store::StoreRoot::in_download_dir(&download_dir),
+            ))
+        });
         let mut engines_map = HashMap::new();
         for (hash, handle) in restored_handles {
             let engine =
@@ -991,6 +1003,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             reconcile_locks: Default::default(),
             volumes,
             budget,
+            registry,
         };
 
         let engines_clone = engines.clone();
@@ -1257,7 +1270,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let mut probed = false;
         let mut decisions = Vec::with_capacity(engines.len());
         let mut stopped_any = false;
-        let store = self.piece_store();
         for engine in engines {
             if let Some(decision) = self
                 .reconcile_engine(
@@ -1273,9 +1285,9 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             }
             // The retention pass rides this tick rather than a timer of its
             // own: it is the same interval, over the same engines, and it
-            // costs one `read_dir` per bucket for a torrent something is
-            // actually reading and a `None` for every other.
-            self.retain_engine(&engine, &store).await;
+            // costs a copy of the store's held bits for a torrent something
+            // is actually reading and a `None` for every other.
+            self.retain_engine(&engine).await;
         }
         if stopped_any {
             self.out_of_space_notify.notify_one();
@@ -2193,12 +2205,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// playing at 20 MB/s writes a gigabyte in that time. This runs on the
     /// reconciler's two-second tick, asks the policy where the playhead has
     /// left us, and gives back what the window no longer covers.
-    async fn retain_engine(
-        &self,
-        engine: &Arc<Engine<B::Handle>>,
-        store: &crate::piece_store::StoreRoot,
-    ) {
-        let Some(pass) = engine.retain(store).await else {
+    async fn retain_engine(&self, engine: &Arc<Engine<B::Handle>>) {
+        let Some(pass) = engine.retain(&self.registry).await else {
             return;
         };
         if pass != crate::retention::RetentionPass::default() {
@@ -2231,7 +2239,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// the next start rebuilds it by asking the storage, which under this
     /// design *is* the piece files. Those go straight to the store.
     pub async fn release_pieces(&self, info_hash: &str, pieces: &[u32]) -> usize {
-        let store = self.piece_store();
         let handle = self.backend.get_torrent(info_hash).await;
         let live = handle.filter(|handle| {
             !matches!(
@@ -2244,7 +2251,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             // this one piece at a time from a task on the runtime, and a
             // torrent nobody holds can still be tens of thousands of
             // files on the flash of a television.
-            return crate::retention::unlink(&store, info_hash, pieces.to_vec(), None).await;
+            return crate::retention::unlink(&self.registry, info_hash, pieces.to_vec(), None)
+                .await;
         };
         // Through the engine, so the question the cleaner asked before its
         // walk is asked again against the live policy -- see
@@ -2258,7 +2266,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             );
             return 0;
         };
-        engine.release_reclaimable(&store, pieces).await
+        engine.release_reclaimable(&self.registry, pieces).await
     }
 
     /// What the cache cleaner says the torrent-data volume may hold, as of
@@ -2360,6 +2368,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// same one for a streamed torrent and an offline download.
     pub fn piece_store(&self) -> crate::piece_store::StoreRoot {
         crate::piece_store::StoreRoot::in_download_dir(&self.download_dir)
+    }
+
+    /// The registry the session's piece stores report to -- see the field.
+    pub fn store_registry(&self) -> &Arc<crate::piece_store::StoreRegistry> {
+        &self.registry
     }
 
     /// Info hashes of torrents the backend stopped because the volume they
@@ -2597,10 +2610,9 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// It creates nothing -- no engine, no magnet add, so it never goes near
     /// `get_or_begin_add_magnet` -- and it does not count as a poll, so a
     /// panel that asks every second cannot hold a torrent out of the idle
-    /// sweep just by looking at it. It is *not* free, though: the window is
-    /// counted from a listing of the torrent's piece directories, which is
-    /// a `getdents` per thousand pieces on the blocking pool. Ask it while
-    /// a panel is open, not for the life of the process.
+    /// sweep just by looking at it. The window is counted off the held set
+    /// the torrent's registered store keeps -- a copy of its bits, no
+    /// listing.
     pub async fn torrent_stream_numbers(
         &self,
         info_hash: &str,
@@ -2615,17 +2627,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 transfer,
             });
         };
-        // Off the reactor: `held` lists one directory per thousand pieces.
-        // The policy reading is already a value, so nothing is held across
-        // it -- see `retention::PolicyReading`.
-        let store = self.piece_store();
-        let hash = info_hash.to_string();
-        // A listing we do not have -- the pool would not answer, or the
-        // directory would not list -- is no numbers, not a window of zero.
-        let held = tokio::task::spawn_blocking(move || store.held(&hash))
-            .await
-            .ok()?
-            .ok()?;
+        // A torrent with no registered store -- one in Error, or one whose
+        // `init` has not seeded it -- has no held set to count, and that is
+        // no numbers, not a window of zero.
+        let held = self.registry.held(info_hash)?;
         Some(crate::retention::TorrentStreamNumbers {
             window: Some(reading.window(&held)),
             committed_bytes: Some(reading.committed_bytes()),
@@ -3599,8 +3604,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 // ([`crate::retention::take_claimed`]) -- and is released
                 // there, once the bytes are gone.
                 Some(claim) => {
-                    crate::retention::take_claimed(&self.piece_store(), &engine.info_hash, claim)
-                        .await
+                    crate::retention::take_claimed(&self.registry, &engine.info_hash, claim).await
                 }
                 // No claim, so no list of pieces to take and no right to
                 // take them: the backend still believes it has them.
@@ -5237,6 +5241,32 @@ mod tests {
         let (enginefs, counters, _init) =
             test_enginefs_with_init(files, FakeInit::new(true, Duration::from_secs(60)));
         (enginefs, counters)
+    }
+
+    /// The fake torrent's piece store: over the directory the test writes
+    /// piece files into, seeded from what is there and registered where the
+    /// pass reads, as a real torrent's `init` registers the store librqbit
+    /// writes to. The pass reads the registry and nothing else -- no
+    /// listing -- so a test that writes piece files by hand tells the
+    /// registry about them through this, and again through
+    /// `init_for_tests` after any later write. The store has to outlive the
+    /// passes: the registry holds a `Weak`.
+    fn seeded_store(
+        enginefs: &BackendEngineFS<FakeBackend>,
+        engine: &Engine<FakeHandle>,
+    ) -> crate::piece_store::PieceStore {
+        let store = crate::piece_store::PieceStore::under(
+            enginefs.store_registry().clone(),
+            &engine.info_hash,
+            engine
+                .handle
+                .layout()
+                .expect("the fake torrent has a layout"),
+        );
+        store
+            .init_for_tests()
+            .expect("seed and register the fake torrent's store");
+        store
     }
 
     /// A scratch root of its own for one fake-engine fixture.
@@ -10198,6 +10228,7 @@ mod tests {
         // A reader sixty bytes into the file: piece two.
         engine.note_playhead(0, 60);
         engine.begin_retention(0).await;
+        let _store = seeded_store(&enginefs, &engine);
 
         let numbers = enginefs
             .torrent_stream_numbers(TEST_HASH, 0)
@@ -10302,6 +10333,7 @@ mod tests {
         // A reader twenty-five bytes into the second episode: piece five.
         engine.note_playhead(1, 25);
         engine.begin_retention(1).await;
+        let _store = seeded_store(&enginefs, &engine);
 
         let numbers = enginefs
             .torrent_stream_numbers(TEST_HASH, 1)
@@ -10341,10 +10373,13 @@ mod tests {
             std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
         }
 
-        let store = enginefs.piece_store();
+        let _store = seeded_store(&enginefs, &engine);
         engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
-        engine.retain(&store).await.expect("a pass");
+        engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass");
         let settled = enginefs
             .torrent_stream_numbers(TEST_HASH, 0)
             .await
@@ -10362,8 +10397,8 @@ mod tests {
         engine.note_playhead(0, 25);
         let running = tokio::spawn({
             let engine = engine.clone();
-            let store = store.clone();
-            async move { engine.retain(&store).await }
+            let registry = enginefs.store_registry().clone();
+            async move { engine.retain(&registry).await }
         });
         tokio::time::timeout(Duration::from_secs(10), entered_rx)
             .await
@@ -10386,53 +10421,256 @@ mod tests {
             .expect("a pass ran to the end");
     }
 
-    /// A retention pass walks the torrent's piece directories, and it does
-    /// that walk while holding the file's turn -- the lock the stream-open
-    /// path takes to hold a new file's window back. Doing the
-    /// walk on the reactor thread therefore stops request handling for as
-    /// long as the disk takes to answer, which on the flash of a television
-    /// is not a bounded time.
+    /// **A retention pass lists no directory.**
     ///
-    /// The pass here has nothing else to do: the store is empty, so the
-    /// policy commits nothing, withdraws nothing and reclaims nothing, and
-    /// the listing is the only thing in it. On the single-threaded runtime
-    /// a `#[tokio::test]` runs on, a task queued before the pass can only
-    /// have run if the pass gave the runtime back -- which is the whole of
-    /// the claim.
+    /// It used to walk the torrent's piece directories on every tick -- one
+    /// `read_dir` per thousand pieces, on the blocking pool, holding the
+    /// file's turn across it -- to learn what the store already knew. The
+    /// store's directory is walked once, when `init` seeds its held set,
+    /// and every pass after that reads the set the store keeps: fifty
+    /// passes over a store with pieces to commit and reclaim leave the walk
+    /// count where the seed put it.
     #[tokio::test]
-    async fn a_retention_pass_hands_the_runtime_back_while_it_walks_the_disk() {
+    async fn a_retention_pass_walks_no_directory() {
         let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
         counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
         // Two pieces of budget over a four-piece file: a split, so a policy
         // is installed and a pass has something to ask.
         enginefs.set_cache_budget(Some(50));
-        let store = enginefs.piece_store();
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in [0u32, 1, 2, 3] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let store = seeded_store(&enginefs, &engine);
+        let walks = || {
+            crate::chunk_store::WALKS
+                .lock()
+                .get(store.dir())
+                .copied()
+                .unwrap_or(0)
+        };
+        assert_eq!(walks(), 1, "the seed is the one walk");
         engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
 
-        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let queued = tokio::spawn({
-            let ran = ran.clone();
-            async move { ran.store(true, Ordering::SeqCst) }
-        });
+        let first = engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass ran");
         assert!(
-            !ran.load(Ordering::SeqCst),
-            "the task is queued and nothing has yielded to it yet"
+            first.reclaimed > 0,
+            "the pass read the seeded set and gave the far pieces back: {first:?}"
+        );
+        engine.note_playhead(0, 75);
+        for _ in 0..49 {
+            engine.retain(enginefs.store_registry()).await;
+        }
+        assert_eq!(
+            walks(),
+            1,
+            "fifty passes, and the directory was walked exactly once: at the seed"
+        );
+    }
+
+    /// **A reclaim unlinks through the registered store, so the pieces leave
+    /// the held set with their files.**
+    ///
+    /// The pass reads the set and never the directory, so an unlink that
+    /// went round the store -- by path, as every reclaim used to -- would
+    /// leave the bits standing over files that had gone: the next pass
+    /// would offer the same pieces again, ask the backend to forget them
+    /// again, and count a delete of nothing, every tick for the rest of the
+    /// session. Through the store, the set is the disk after the reclaim as
+    /// it was before it, and the next pass has nothing to ask.
+    #[tokio::test]
+    async fn a_reclaim_takes_the_pieces_out_of_the_held_set_with_their_files() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in [0u32, 1, 2, 3] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let _store = seeded_store(&enginefs, &engine);
+        engine.note_playhead(0, 0);
+        engine.begin_retention(0).await;
+
+        let pass = engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass ran");
+        assert_eq!(pass.reclaimed, 3, "the three outside the window: {pass:?}");
+        assert_eq!(
+            enginefs
+                .store_registry()
+                .held(TEST_HASH)
+                .expect("registered")
+                .in_range(0..4),
+            std::collections::BTreeSet::from([0]),
+            "the set is the disk: the reclaimed pieces left it with their files"
+        );
+        assert!(bucket.join("0").is_file() && !bucket.join("1").exists());
+        assert_eq!(
+            counters.dropped_ranges.lock().unwrap().len(),
+            1,
+            "one drop, for the one run"
         );
 
-        let pass = engine.retain(&store).await.expect("a pass ran");
+        let pass = engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass ran");
         assert_eq!(
             pass,
             crate::retention::RetentionPass::default(),
-            "an empty store leaves the pass nothing to do but list it"
+            "and the next pass finds nothing to give back: {pass:?}"
+        );
+        assert_eq!(
+            counters.dropped_ranges.lock().unwrap().len(),
+            1,
+            "so it asked the backend for nothing"
+        );
+    }
+
+    /// **The claimless door refuses a store under its check too.** A torrent
+    /// the session holds in Error or not at all is unlinked with no claim,
+    /// straight at the store; asked of a hash whose registered store has
+    /// been seeded and not yet taken -- the check may be reading it -- the
+    /// door takes nothing. The real backend cannot present this pair (an
+    /// Error torrent holds no storage), and that is the point of asking at
+    /// the unlink rather than trusting the state read to pick the door.
+    #[tokio::test]
+    async fn a_claimless_delete_of_a_store_under_its_check_is_refused() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("2"), [7u8; 25]).unwrap();
+        let store = seeded_store(&enginefs, &engine);
+        // `init`'s own seed, which begins the check the test seed had ended.
+        store.init_begins_check_for_tests().unwrap();
+        assert!(enginefs.store_registry().checking(TEST_HASH));
+        counters.in_error_state.store(true, Ordering::SeqCst);
+
+        assert_eq!(
+            enginefs.release_pieces(TEST_HASH, &[2]).await,
+            0,
+            "nothing is unlinked from under a check"
+        );
+        assert!(bucket.join("2").is_file(), "the file stays");
+        assert!(
+            enginefs
+                .store_registry()
+                .held(TEST_HASH)
+                .expect("registered")
+                .contains(2),
+            "and so does its bit"
+        );
+
+        // The check over, the same delete goes through the store.
+        let _successor = librqbit::storage::TorrentStorage::take(&store).unwrap();
+        assert!(!enginefs.store_registry().checking(TEST_HASH));
+        assert_eq!(enginefs.release_pieces(TEST_HASH, &[2]).await, 1);
+        assert!(!bucket.join("2").exists());
+        assert!(
+            !enginefs
+                .store_registry()
+                .held(TEST_HASH)
+                .expect("registered")
+                .contains(2)
+        );
+    }
+
+    /// **Nothing of a torrent is dropped or unlinked while it is checking
+    /// or in error.**
+    ///
+    /// The pass decides its reclaim from a held set and a window, and
+    /// neither says what the torrent is doing. A torrent under its initial
+    /// hash check is reading every piece it means to claim, and a piece
+    /// dropped from under it is a have-bit over nothing; one in Error holds
+    /// no storage for a drop to edit. So the run state is read where the
+    /// drop is decided and not before: `retain` steps aside for a check
+    /// before it takes the turn, and the reclaim reads it before every run,
+    /// so a torrent that errors between the decision and the unlink loses
+    /// nothing. The fake keeps its storage registered through the error,
+    /// which the real backend would not -- that is exactly what makes the
+    /// reclaim's own reading the one under test here.
+    #[tokio::test]
+    async fn nothing_is_dropped_or_unlinked_while_the_torrent_is_checking_or_in_error() {
+        let (enginefs, counters, init) = test_enginefs_with_init(
+            vec![("film.mkv".into(), 100)],
+            FakeInit::new(true, Duration::from_secs(60)),
+        );
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in [0u32, 1, 2, 3] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let _store = seeded_store(&enginefs, &engine);
+        engine.note_playhead(0, 0);
+        engine.begin_retention(0).await;
+        let all_here = || (0..4).all(|piece| bucket.join(piece.to_string()).is_file());
+
+        // The check is running again -- a restart out of error re-checks
+        // what is on the disk -- and the tick finds the torrent initializing.
+        init.ready.store(false, Ordering::SeqCst);
+        assert!(
+            engine.retain(enginefs.store_registry()).await.is_none(),
+            "a torrent under its check has no pass to make"
         );
         assert!(
-            ran.load(Ordering::SeqCst),
-            "the listing left the reactor, so the runtime ran the queued task \
-             while the pass was walking the disk"
+            counters.dropped_ranges.lock().unwrap().is_empty() && all_here(),
+            "and nothing was asked of the backend or the disk"
         );
-        queued.await.expect("the queued task");
+
+        // In error at the instant of the reclaim: the pass ran -- the set is
+        // still registered -- and decided on the three pieces outside the
+        // one-piece window, and the reclaim read the state before its first
+        // run and took nothing.
+        init.ready.store(true, Ordering::SeqCst);
+        counters.in_error_state.store(true, Ordering::SeqCst);
+        let pass = engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass over a registered set runs");
+        assert_eq!(pass.reclaimed, 0, "nothing reclaimed in error: {pass:?}");
+        assert!(
+            counters.dropped_ranges.lock().unwrap().is_empty() && all_here(),
+            "no drop was asked and no file went"
+        );
+
+        // Settled again, the same decision goes through.
+        counters.in_error_state.store(false, Ordering::SeqCst);
+        let pass = engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass");
+        assert_eq!(
+            pass.reclaimed, 3,
+            "the three outside the window go: {pass:?}"
+        );
+        assert!((1..4).all(|piece| !bucket.join(piece.to_string()).exists()));
+        assert!(
+            bucket.join("0").is_file(),
+            "the piece under the playhead stays"
+        );
     }
 
     /// **A pass measures against where playback is now, not where it was
@@ -10472,7 +10710,7 @@ mod tests {
             std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
         }
 
-        let store = enginefs.piece_store();
+        let _store = seeded_store(&enginefs, &engine);
         engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
 
@@ -10484,7 +10722,10 @@ mod tests {
             move || engine.note_playhead(0, 75)
         }));
 
-        let pass = engine.retain(&store).await.expect("a pass ran");
+        let pass = engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass ran");
         assert!(pass.reclaimed > 0, "the pass gave pieces back: {pass:?}");
         assert!(
             bucket.join("3").is_file(),
@@ -10496,24 +10737,27 @@ mod tests {
         );
     }
 
-    /// **A disk that would not list is not an empty disk.**
+    /// **A torrent with no registered store holds unknown, not nothing.**
     ///
-    /// `ChunkDir::held` used to answer a failed `read_dir` with an empty set,
-    /// and an empty set is a very definite measurement: the policy's
-    /// `advance` keeps only the committed pieces the listing found, so one
-    /// tick on which the directory would not list withdrew every committed
-    /// piece from what we announce -- after peers had been told, and there
-    /// is no un-Have -- and the next tick, listing again, found them outside
-    /// the window and no longer committed and reclaimed them. One transient
-    /// `EIO` or `EMFILE`, and the promise the whole design rests on -- what
-    /// we announce is what nothing will ever reclaim -- was broken for the
-    /// file. Now a listing error is a pass that concludes nothing.
+    /// The pass reads the held set of the store registered for the hash,
+    /// and a torrent in Error has none: librqbit drops its storage, and the
+    /// registration goes with it. The answer is then "no store", and an
+    /// empty set would have been a very definite measurement instead: the
+    /// policy's `advance` keeps only the committed pieces the set names, so
+    /// one pass over an empty answer would withdraw every committed piece
+    /// from what we announce -- after peers had been told, and there is no
+    /// un-Have -- and the next, with the store back, would find them outside
+    /// the window and no longer committed and reclaim them. That is what a
+    /// directory that would not list once did through the listing this
+    /// replaced, and the promise the whole design rests on -- what we
+    /// announce is what nothing will ever reclaim -- was broken for the
+    /// file. A pass with no store concludes nothing.
     ///
     /// The fixture is the two-pass one above: a second pass commits piece 0.
-    /// Then the torrent's directory is replaced by a file, so the third
-    /// pass's `read_dir` fails with something other than not-found.
+    /// Then the store goes -- the torrent errored and librqbit dropped its
+    /// storage -- and the third pass finds no registration.
     #[tokio::test]
-    async fn a_pass_that_cannot_list_the_disk_withdraws_nothing() {
+    async fn a_pass_over_a_torrent_with_no_registered_store_withdraws_nothing() {
         let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
         counters.pieces_per_file.store(4, Ordering::SeqCst);
         counters
@@ -10521,36 +10765,50 @@ mod tests {
             .store(true, Ordering::SeqCst);
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
         enginefs.set_cache_budget(Some(50));
-        let store = enginefs.piece_store();
 
-        let torrent_dir = store.torrent_dir(TEST_HASH);
-        let bucket = torrent_dir.join("0");
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
         std::fs::create_dir_all(&bucket).unwrap();
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
+        let store = seeded_store(&enginefs, &engine);
         engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
-        engine.retain(&store).await.expect("a pass");
+        engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass");
         std::fs::write(bucket.join("1"), [7u8; 25]).unwrap();
+        store.init_for_tests().unwrap();
         engine.note_playhead(0, 25);
-        let pass = engine.retain(&store).await.expect("a pass");
+        let pass = engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass");
         assert_eq!(
             pass.committed, 1,
             "piece 0 is committed and announced: {pass:?}"
         );
         counters.advertised.lock().unwrap().clear();
 
-        // The directory will not list.
-        std::fs::remove_dir_all(&torrent_dir).unwrap();
-        std::fs::write(&torrent_dir, b"not a directory").unwrap();
+        // The torrent's storage is gone: the last handle over the store is
+        // dropped, and the registration with it.
+        drop(store);
+        assert!(
+            enginefs.store_registry().held(TEST_HASH).is_none(),
+            "no store is registered for the hash"
+        );
 
         assert!(
-            engine.retain(&store).await.is_none(),
-            "a pass with no listing concludes nothing"
+            engine.retain(enginefs.store_registry()).await.is_none(),
+            "a pass with no store concludes nothing"
         );
         assert!(
             counters.advertised.lock().unwrap().is_empty(),
             "and in particular it withdraws nothing from what we announce: {:?}",
             counters.advertised.lock().unwrap()
+        );
+        assert!(
+            bucket.join("0").is_file() && bucket.join("1").is_file(),
+            "and reclaims nothing"
         );
     }
 
@@ -10584,7 +10842,7 @@ mod tests {
         for piece in [0u32, 1, 2, 3] {
             std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
         }
-        let store = enginefs.piece_store();
+        let _store = seeded_store(&enginefs, &engine);
         engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
 
@@ -10595,7 +10853,7 @@ mod tests {
         }));
 
         assert!(
-            engine.retain(&store).await.is_none(),
+            engine.retain(enginefs.store_registry()).await.is_none(),
             "a pass with no playhead in the file its policy governs has nothing to conclude"
         );
         assert!(
@@ -10645,7 +10903,6 @@ mod tests {
         // Two pieces of budget over four 25-byte pieces, half of which is
         // the committed set: a one-piece window.
         enginefs.set_cache_budget(Some(50));
-        let store = enginefs.piece_store();
 
         // A first pass with nothing on the disk but the piece under the
         // playhead: it takes nothing, and leaves behind the record that its
@@ -10655,9 +10912,13 @@ mod tests {
         let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
         std::fs::create_dir_all(&bucket).unwrap();
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
+        let store = seeded_store(&enginefs, &engine);
         engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
-        engine.retain(&store).await.expect("a pass");
+        engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass");
 
         // Now the rest of the file is on the disk and playback has walked
         // on to piece 1: piece 0 commits, piece 1 is the window, and pieces
@@ -10665,14 +10926,15 @@ mod tests {
         for piece in [1u32, 2, 3] {
             std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
         }
+        store.init_for_tests().unwrap();
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         *counters.advertise_gate.lock().unwrap() = Some((entered_tx, release_rx));
         engine.note_playhead(0, 25);
         let running = tokio::spawn({
             let engine = engine.clone();
-            let store = store.clone();
-            async move { engine.retain(&store).await }
+            let registry = enginefs.store_registry().clone();
+            async move { engine.retain(&registry).await }
         });
         tokio::time::timeout(Duration::from_secs(10), entered_rx)
             .await
@@ -10736,7 +10998,6 @@ mod tests {
         // Two pieces of budget over four 25-byte pieces, half of which is
         // the committed set: a one-piece window.
         enginefs.set_cache_budget(Some(50));
-        let store = enginefs.piece_store();
 
         // A first pass with nothing on the disk but the piece under the
         // playhead: it takes nothing, and leaves behind the record that its
@@ -10746,9 +11007,13 @@ mod tests {
         let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
         std::fs::create_dir_all(&bucket).unwrap();
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
+        let store = seeded_store(&enginefs, &engine);
         engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
-        engine.retain(&store).await.expect("a pass");
+        engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass");
 
         // Now the rest of the file is on the disk and playback has walked
         // on to piece 1: piece 0 commits, piece 1 is the window, and pieces
@@ -10756,14 +11021,15 @@ mod tests {
         for piece in [1u32, 2, 3] {
             std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
         }
+        store.init_for_tests().unwrap();
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         *counters.advertise_gate.lock().unwrap() = Some((entered_tx, release_rx));
         engine.note_playhead(0, 25);
         let running = tokio::spawn({
             let engine = engine.clone();
-            let store = store.clone();
-            async move { engine.retain(&store).await }
+            let registry = enginefs.store_registry().clone();
+            async move { engine.retain(&registry).await }
         });
         tokio::time::timeout(Duration::from_secs(10), entered_rx)
             .await
@@ -10821,14 +11087,17 @@ mod tests {
         // Two pieces of budget over eight 25-byte pieces: one committed,
         // one window, as in the two tests above.
         enginefs.set_cache_budget(Some(50));
-        let store = enginefs.piece_store();
 
         let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
         std::fs::create_dir_all(&bucket).unwrap();
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
+        let store = seeded_store(&enginefs, &engine);
         engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
-        engine.retain(&store).await.expect("a pass");
+        engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass");
 
         // The whole file is on the disk and playback has walked on to piece
         // 1: piece 0 commits, piece 1 is the window, and the reclaim the
@@ -10836,6 +11105,7 @@ mod tests {
         for piece in 1u32..8 {
             std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
         }
+        store.init_for_tests().unwrap();
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         *counters.advertise_gate.lock().unwrap() = Some((entered_tx, release_rx));
@@ -10849,8 +11119,8 @@ mod tests {
         engine.note_playhead(0, 25);
         let running = tokio::spawn({
             let engine = engine.clone();
-            let store = store.clone();
-            async move { engine.retain(&store).await }
+            let registry = enginefs.store_registry().clone();
+            async move { engine.retain(&registry).await }
         });
         tokio::time::timeout(Duration::from_secs(10), entered_rx)
             .await
@@ -10921,10 +11191,13 @@ mod tests {
             std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
         }
 
-        let store = enginefs.piece_store();
+        let _store = seeded_store(&enginefs, &engine);
         engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
-        let pass = engine.retain(&store).await.expect("a pass ran");
+        let pass = engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass ran");
         assert!(pass.reclaimed > 0, "the pass gave pieces back: {pass:?}");
 
         let released_on = *counters.claim_released_on.lock().unwrap();
@@ -11030,6 +11303,7 @@ mod tests {
         // the policy is bounding.
         engine.note_playhead(0, 25);
         engine.begin_retention(0).await;
+        let _store = seeded_store(&enginefs, &engine);
         let numbers = enginefs
             .torrent_stream_numbers(TEST_HASH, 0)
             .await
@@ -11083,19 +11357,20 @@ mod tests {
                 .expect("the engine exists");
             (numbers.window, numbers.committed_bytes)
         }
-        let seeded = |enginefs: &BackendEngineFS<FakeBackend>| {
+        let seeded = |enginefs: &BackendEngineFS<FakeBackend>, engine: &Engine<FakeHandle>| {
             let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
             std::fs::create_dir_all(&bucket).unwrap();
             for piece in [0u32, 1, 2, 3] {
                 std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
             }
+            seeded_store(enginefs, engine)
         };
 
         let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
         counters.pieces_per_file.store(4, Ordering::SeqCst);
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
         enginefs.set_cache_budget(Some(50));
-        seeded(&enginefs);
+        let _store = seeded(&enginefs, &engine);
         engine.note_playhead(0, 25);
         engine.begin_retention(0).await;
         assert_eq!(
@@ -11114,9 +11389,8 @@ mod tests {
         // property -- those bytes were asked for and are shared like any
         // other bytes we keep -- so the pass drops the policy.
         engine.pinned_files.write().insert(0);
-        let store = enginefs.piece_store();
         assert!(
-            engine.retain(&store).await.is_none(),
+            engine.retain(enginefs.store_registry()).await.is_none(),
             "a pinned torrent has no retention pass to make"
         );
         assert_eq!(
@@ -11132,7 +11406,7 @@ mod tests {
         counters.pieces_per_file.store(4, Ordering::SeqCst);
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
         enginefs.set_cache_budget(Some(50));
-        seeded(&enginefs);
+        let _store = seeded(&enginefs, &engine);
         engine.note_playhead(0, 25);
         engine.begin_retention(0).await;
         assert!(
@@ -11167,10 +11441,13 @@ mod tests {
             std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
         }
 
-        let store = enginefs.piece_store();
+        let _store = seeded_store(&enginefs, &engine);
         engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
-        engine.retain(&store).await.expect("a pass");
+        engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass");
         assert_eq!(
             enginefs
                 .torrent_stream_numbers(TEST_HASH, 0)
@@ -11183,7 +11460,10 @@ mod tests {
 
         // Playback walks on to the second piece, which releases the first.
         engine.note_playhead(0, 25);
-        engine.retain(&store).await.expect("a pass");
+        engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass");
         assert_eq!(
             enginefs
                 .torrent_stream_numbers(TEST_HASH, 0)
@@ -11237,8 +11517,11 @@ mod tests {
         // pieces five and eight are outside it.
         engine.note_playhead(1, 0);
         engine.begin_retention(1).await;
-        let store = enginefs.piece_store();
-        let pass = engine.retain(&store).await.expect("a pass");
+        let _store = seeded_store(&enginefs, &engine);
+        let pass = engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass");
 
         assert!(
             bucket.join("8").is_file(),
@@ -11292,8 +11575,11 @@ mod tests {
 
         engine.note_playhead(1, 0);
         engine.begin_retention(1).await;
-        let store = enginefs.piece_store();
-        let pass = engine.retain(&store).await.expect("a pass");
+        let _store = seeded_store(&enginefs, &engine);
+        let pass = engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass");
 
         assert!(
             !bucket.join("8").exists(),
@@ -11452,9 +11738,8 @@ mod tests {
         // The user pins the file they are watching.
         engine.pinned_files.write().insert(0);
 
-        let store = enginefs.piece_store();
         assert!(
-            engine.retain(&store).await.is_none(),
+            engine.retain(enginefs.store_registry()).await.is_none(),
             "a pinned torrent has no retention pass to make"
         );
         assert!(
@@ -11487,27 +11772,31 @@ mod tests {
             .store(true, Ordering::SeqCst);
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
         enginefs.set_cache_budget(Some(50));
-        let store = enginefs.piece_store();
 
         // The first pass records that the window covered piece 0, so the
         // second commits it and parks in the call that announces it.
         let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
         std::fs::create_dir_all(&bucket).unwrap();
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
+        let store = seeded_store(&enginefs, &engine);
         engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
-        engine.retain(&store).await.expect("a pass");
+        engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass");
         for piece in [1u32, 2, 3] {
             std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
         }
+        store.init_for_tests().unwrap();
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (_release_tx, release_rx) = tokio::sync::oneshot::channel();
         *counters.advertise_gate.lock().unwrap() = Some((entered_tx, release_rx));
         engine.note_playhead(0, 25);
         let running = tokio::spawn({
             let engine = engine.clone();
-            let store = store.clone();
-            async move { engine.retain(&store).await }
+            let registry = enginefs.store_registry().clone();
+            async move { engine.retain(&registry).await }
         });
         tokio::time::timeout(Duration::from_secs(10), entered_rx)
             .await
@@ -11532,7 +11821,7 @@ mod tests {
             "the policy is still bounding the file: it never left its cell"
         );
         let pass = engine
-            .retain(&store)
+            .retain(enginefs.store_registry())
             .await
             .expect("the next tick's pass runs: the dead one dropped the file's turn");
         assert_eq!(
@@ -11564,7 +11853,6 @@ mod tests {
         counters.pieces_per_file.store(4, Ordering::SeqCst);
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
         enginefs.set_cache_budget(Some(50));
-        let store = enginefs.piece_store();
         engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
         assert_eq!(
@@ -11578,7 +11866,7 @@ mod tests {
         engine.pinned_files.write().insert(0);
         counters.refuses_advertise.store(true, Ordering::SeqCst);
         assert!(
-            engine.retain(&store).await.is_none(),
+            engine.retain(enginefs.store_registry()).await.is_none(),
             "a pinned torrent has no pass to make"
         );
         assert!(
@@ -11606,7 +11894,7 @@ mod tests {
 
         // The backend can again, and the next pass under the pin retries.
         counters.refuses_advertise.store(false, Ordering::SeqCst);
-        assert!(engine.retain(&store).await.is_none());
+        assert!(engine.retain(enginefs.store_registry()).await.is_none());
         assert!(
             engine
                 .retention
@@ -11646,25 +11934,29 @@ mod tests {
             .store(true, Ordering::SeqCst);
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
         enginefs.set_cache_budget(Some(50));
-        let store = enginefs.piece_store();
 
         let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
         std::fs::create_dir_all(&bucket).unwrap();
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
+        let store = seeded_store(&enginefs, &engine);
         engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
-        engine.retain(&store).await.expect("a pass");
+        engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass");
         for piece in [1u32, 2, 3] {
             std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
         }
+        store.init_for_tests().unwrap();
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         *counters.advertise_gate.lock().unwrap() = Some((entered_tx, release_rx));
         engine.note_playhead(0, 25);
         let running = tokio::spawn({
             let engine = engine.clone();
-            let store = store.clone();
-            async move { engine.retain(&store).await }
+            let registry = enginefs.store_registry().clone();
+            async move { engine.retain(&registry).await }
         });
         tokio::time::timeout(Duration::from_secs(10), entered_rx)
             .await
@@ -11674,8 +11966,8 @@ mod tests {
         // The cleaner's delete arrives while the pass is parked.
         let mut delete = tokio::spawn({
             let engine = engine.clone();
-            let store = store.clone();
-            async move { engine.release_reclaimable(&store, &[2]).await }
+            let registry = enginefs.store_registry().clone();
+            async move { engine.release_reclaimable(&registry, &[2]).await }
         });
         assert!(
             tokio::time::timeout(Duration::from_millis(200), &mut delete)

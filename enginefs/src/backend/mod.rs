@@ -123,6 +123,17 @@ pub trait TorrentBackend: Send + Sync {
     fn sets_piece_reclaim(&self) -> bool {
         false
     }
+
+    /// The registry the backend's piece stores report to, for whoever
+    /// decides retention: the held set of a running torrent is read there,
+    /// and every unlink of a registered torrent's piece goes through it.
+    /// `None` for a backend whose storage keeps no such registry -- the
+    /// filesystem storage, the tests' fakes -- and the engine layer then
+    /// keeps an empty one of its own over the download root, so a hash it
+    /// asks about answers "no store" rather than a listing.
+    fn store_registry(&self) -> Option<std::sync::Arc<crate::piece_store::StoreRegistry>> {
+        None
+    }
 }
 
 /// What one torrent has moved over the connection: bytes received from peers

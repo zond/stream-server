@@ -630,6 +630,7 @@ impl ChunkDir {
     /// bucket it could not read, which was tolerable while it fed only the
     /// advisory staged set.
     pub fn walk(&self) -> io::Result<Vec<Entry>> {
+        self.count_walk();
         let mut found = Vec::new();
         let buckets = match std::fs::read_dir(&self.dir) {
             Ok(buckets) => buckets,
@@ -677,6 +678,24 @@ impl ChunkDir {
         Ok(found)
     }
 }
+
+impl ChunkDir {
+    #[cfg(test)]
+    fn count_walk(&self) {
+        *WALKS.lock().entry(self.dir.clone()).or_insert(0) += 1;
+    }
+
+    #[cfg(not(test))]
+    fn count_walk(&self) {}
+}
+
+/// How many times [`ChunkDir::walk`] has run over each directory: the probe
+/// for the tests that pin "the pass lists nothing" -- one walk per torrent
+/// start, and not one more however many passes run. Keyed by directory so
+/// that tests running in parallel, each in a scratch root of its own, do not
+/// read one another's count.
+#[cfg(test)]
+pub static WALKS: Mutex<BTreeMap<PathBuf, usize>> = Mutex::new(BTreeMap::new());
 
 /// What a staged file's name says before [`STAGING_SUFFIX`], or `None` for a
 /// name that is not a staged one at all.

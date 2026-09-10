@@ -305,10 +305,12 @@ pub trait Backing: Sized + Send + Sync + 'static {
     /// A copy-out read of a lock outside the owner, asked with no owner lock
     /// held, before L2 wherever the two meet.
     fn keeps_everything(&self, key: &Self::Key) -> bool;
-    /// What the disk holds of the entity, listed off the reactor. `None` is
-    /// a listing we do not have -- the pool would not answer, the directory
-    /// would not list -- and the pass concludes nothing rather than advance
-    /// over an empty reading of a directory that is not empty.
+    /// What the disk holds of the entity: the torrent's registered store's
+    /// held set, read in memory; the proxy's directory, listed off the
+    /// reactor. `None` is a set we do not have -- no store is registered
+    /// for the torrent, the pool would not answer, the directory would not
+    /// list -- and the pass concludes nothing rather than advance over an
+    /// empty reading of an entity that is not empty.
     fn held(
         &self,
         store: &Self::Store,
@@ -1017,13 +1019,14 @@ impl<B: Backing> Retention<B> {
         };
         // 3. Where a test puts what playback does while the listing runs.
         self.run_hook();
-        // 4. The listing, off the reactor inside the backing. The long
-        // suspension of the pass, and the reason the deciding reading below
-        // is taken on the far side of it.
+        // 4. What the disk holds, from the backing: a memory read for the
+        // torrent, a listing off the reactor for the proxy. Where it
+        // suspends, it is the long suspension of the pass, and the reason
+        // the deciding reading below is taken on the far side of it.
         let Some(held) = self.backing.held(store, &begin.domain).await else {
             tracing::warn!(
                 key = ?key,
-                "the retention pass could not list the disk; this pass concludes nothing"
+                "the retention pass has no reading of the disk; this pass concludes nothing"
             );
             // Nothing measured, so nothing to write -- but a byte that moved
             // the head a stride while the listing failed is owed its pass,

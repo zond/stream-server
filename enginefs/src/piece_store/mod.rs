@@ -62,8 +62,12 @@
 //! [`librqbit::storage::TorrentStorage`] adapter over the first: the piece
 //! and file-table arithmetic, BEP-47 padding, info-hash keying and its
 //! spelling rule, and the have-set interlock -- everything a chunk store
-//! cannot know. [`sweep`] reconciles the store against the session at
-//! launch. What drives [`policy`] against a real torrent -- the playhead, the
+//! cannot know. [`registry`] is how the rest of the process reaches the
+//! store librqbit holds: a store registers there once `init` has seeded its
+//! held set, the retention pass reads the set through it instead of listing
+//! the directory, and every unlink of a registered torrent's piece goes
+//! through the registered store. [`sweep`] reconciles the store against the
+//! session at launch. What drives [`policy`] against a real torrent -- the playhead, the
 //! hold-back, the reclaim, and the claim that keeps a delete atomic with the
 //! have-set -- is [`crate::retention`], which is also what answers the cache
 //! cleaner.
@@ -179,12 +183,14 @@
 
 pub mod layout;
 pub mod policy;
+pub mod registry;
 pub mod store;
 pub mod sweep;
 
 pub use crate::chunk_store::StoredChunk as StoredPiece;
 pub use layout::{FileSpec, PieceLayout, Segment};
 pub use policy::{Decision, RetentionPolicy, Shape, Share};
+pub use registry::{DeleteOutcome, StoreRegistry};
 pub use store::{
     HeldSnapshot, MissingPiece, PieceStore, PieceStoreFactory, StoreContents, StoreRoot,
     StoredTorrent, layout_of,

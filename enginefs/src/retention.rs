@@ -6,8 +6,8 @@
 //! owner: it keeps one policy per file, resident and never taken out, and
 //! runs the pass that feeds it the playhead a reader actually reached. This
 //! module is the torrent's half of the wiring under both -- the budget cell
-//! the cleaner publishes into, the store listing, the three calls that make
-//! a policy's answers true, and the gate the cache cleaner reads --
+//! the cleaner publishes into, the three calls that make a policy's answers
+//! true, and the gate the cache cleaner reads --
 //!
 //! * the window is **held back** from what we announce
 //!   ([`crate::backend::TorrentHandle::set_pieces_advertised`]), before the
@@ -43,9 +43,10 @@
 
 use std::collections::BTreeSet;
 use std::ops::Range;
+use std::sync::Arc;
 
 use crate::backend::{AfterRelease, FilePieceSpan, TorrentHandle};
-use crate::piece_store::StoreRoot;
+use crate::piece_store::{DeleteOutcome, HeldSnapshot, StoreRegistry};
 
 pub mod owner;
 
@@ -112,9 +113,8 @@ pub(crate) fn playhead_piece(span: &FilePieceSpan, piece_length: u64, offset_in_
 /// range the policy governs, and how much of it is committed.
 ///
 /// A value rather than a borrow of the policy, because the question it
-/// exists to answer -- [`Self::window`] -- is finished against a listing of
-/// the disk, and that listing must not happen under the lock the policy
-/// lives behind.
+/// exists to answer -- [`Self::window`] -- is finished against the store's
+/// held set, read outside the lock the policy lives behind.
 ///
 /// **Every number here is an observation and none of them survives the
 /// call.** The playhead is where a reader really got to (`None` for a
@@ -160,8 +160,8 @@ impl PolicyReading {
 
     /// What the store holds of this file, split at the playhead.
     ///
-    /// `held` is the pieces on the disk now -- the store's own listing,
-    /// taken by the caller. **Neither half is a promise**: `ahead` is
+    /// `held` is the pieces on the disk now -- the store's own held set,
+    /// read by the caller. **Neither half is a promise**: `ahead` is
     /// read-ahead that has arrived, not read-ahead that is planned, and a
     /// stream that has fetched nothing yet has a window of zero rather than
     /// the extent the policy intends to fill. The piece under the playhead
@@ -170,10 +170,10 @@ impl PolicyReading {
     ///
     /// Pieces outside this file are not this policy's and are skipped --
     /// `held` is the whole torrent's.
-    pub fn window(&self, held: &BTreeSet<u32>) -> CacheWindow {
+    pub fn window(&self, held: &HeldSnapshot) -> CacheWindow {
         let mut window = CacheWindow::default();
-        for piece in held.range(self.pieces.clone()) {
-            let half = if *piece < self.playhead {
+        for piece in held.in_range(self.pieces.clone()) {
+            let half = if piece < self.playhead {
                 &mut window.behind_bytes
             } else {
                 &mut window.ahead_bytes
@@ -247,43 +247,6 @@ pub struct RetentionPass {
     pub withdrawn: usize,
 }
 
-/// What the store holds of this torrent, off the reactor.
-///
-/// `held` lists one directory per thousand pieces, and the pass that asks
-/// holds the file's turn for the whole of itself -- the turn the stream-open
-/// path takes too. Blocking the reactor thread here therefore stalls request
-/// handling as well as the pass, and the turn is held across this either
-/// way, so nothing about what the pass excludes moves: what leaves the
-/// reactor is the waiting, not the exclusion.
-///
-/// `None` is a listing we do not have: a pool that will not answer --
-/// shutting down, or the task panicked -- or a directory the filesystem
-/// would not list. Either is a pass that measured nothing, and it commits
-/// nothing, withdraws nothing and reclaims nothing rather than act on a
-/// listing it does not have. The second used to arrive here as an empty
-/// set, and an empty set is a very definite measurement: every committed
-/// piece withdrawn from what we announce on one tick, and reclaimed on the
-/// next. See [`crate::chunk_store::ChunkDir::held_in_bucket`].
-///
-/// This is [`owner::Backing::held`] for the torrent
-/// (`engine::TorrentBacking`): the pass's long suspension, and the playhead
-/// the decision is built from is read on the far side of it.
-pub(crate) async fn listing(store: &StoreRoot, info_hash: &str) -> Option<BTreeSet<u32>> {
-    let store = store.clone();
-    let info_hash = info_hash.to_string();
-    match tokio::task::spawn_blocking(move || store.held(&info_hash)).await {
-        Ok(Ok(held)) => Some(held),
-        Ok(Err(error)) => {
-            tracing::warn!(
-                error = %error,
-                "the piece store could not be listed; this pass concludes nothing"
-            );
-            None
-        }
-        Err(_) => None,
-    }
-}
-
 /// The pieces of `reclaim` no other file the torrent still wants has a byte
 /// in.
 ///
@@ -350,7 +313,7 @@ pub(crate) async fn this_files_alone<H: TorrentHandle>(
 /// otherwise delete out from under.
 pub(crate) async fn release<H: TorrentHandle>(
     handle: &H,
-    store: &StoreRoot,
+    store: &Arc<StoreRegistry>,
     info_hash: &str,
     pieces: Range<u32>,
 ) -> usize {
@@ -403,7 +366,7 @@ pub(crate) async fn release<H: TorrentHandle>(
 /// cleared already, and the claim that would let a caller retry is released
 /// on the way out of here.
 pub(crate) async fn take_claimed(
-    store: &StoreRoot,
+    store: &Arc<StoreRegistry>,
     info_hash: &str,
     dropped: crate::backend::DroppedFilePieces,
 ) -> usize {
@@ -440,16 +403,40 @@ pub(crate) async fn take_claimed(
 /// error -- which is `EngineFS::release_pieces`'s other branch, and would
 /// also be a backend that keeps no have-set, which nothing in this workspace
 /// is.
+///
+/// **Through the registered store where there is one.** The live store of a
+/// running torrent keeps the held set the pass reads and a cache of open
+/// handles, and an unlink by path behind its back leaves both wrong: a bit
+/// over a file that has gone, and an unlinked inode kept alive by a cached
+/// descriptor until another piece takes its slot. So the registry is asked
+/// first ([`StoreRegistry::delete`]), and it refuses outright while the
+/// store is under its initial hash check -- asked here, at the unlink, and
+/// not from a state read earlier: a piece taken from under the check is a
+/// have-bit over nothing. Refused pieces stay on the disk and in the held
+/// set, and the next pass offers them again. A hash with no registered
+/// store -- one the session does not hold, or holds in Error -- is deleted
+/// by path, as everything was.
 pub(crate) async fn unlink(
-    store: &StoreRoot,
+    store: &Arc<StoreRegistry>,
     info_hash: &str,
     pieces: Vec<u32>,
     claim: Option<crate::backend::DroppedFilePieces>,
 ) -> usize {
-    let store = store.clone();
+    let store = Arc::clone(store);
     let hash = info_hash.to_string();
     tokio::task::spawn_blocking(move || {
-        let freed = store.delete_pieces(&hash, pieces);
+        let freed = match store.delete(&hash, &pieces) {
+            DeleteOutcome::Registered { unlinked } => unlinked,
+            DeleteOutcome::Refused => {
+                tracing::warn!(
+                    info_hash = %hash,
+                    pieces = pieces.len(),
+                    "not deleting under a running hash check; the pieces stay held"
+                );
+                0
+            }
+            DeleteOutcome::Unregistered => store.root().delete_pieces(&hash, pieces),
+        };
         // Released only now that the bytes are gone.
         drop(claim);
         freed

@@ -2556,13 +2556,15 @@ fn a_panels_numbers_are_about_the_file_the_url_resolved_to() -> anyhow::Result<(
         anyhow::ensure!(response.bytes()?.len() == 16, "the player read its bytes");
         Ok(total)
     };
-    // What this torrent holds of one file, taken off the store itself.
+    // What this torrent holds of one file, taken off the store's directory
+    // itself: the complete piece files, never a count anything keeps.
     let held_in = |pieces: &std::ops::Range<u32>| -> u64 {
         piece_store(&cache_root)
-            .held(&info_hash)
-            .expect("the store lists")
+            .stat(&info_hash)
+            .pieces
             .iter()
-            .filter(|piece| pieces.contains(piece))
+            .filter(|piece| piece.complete.is_some())
+            .filter(|piece| u32::try_from(piece.index).is_ok_and(|index| pieces.contains(&index)))
             .count() as u64
             * PIECE
     };
