@@ -8966,7 +8966,10 @@ mod tests {
     ///
     /// The error is a bucket directory made unwritable under a download:
     /// the next piece's staged file cannot be created, `pwrite_all` fails,
-    /// and librqbit stops the torrent with it.
+    /// and librqbit stops the torrent with it. Unix only: the mode bits
+    /// are how the directory is made unwritable, and Windows has no
+    /// equivalent a test could set without an ACL.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_torrent_in_error_has_no_store_and_a_restart_registers_a_fresh_one() {
         use crate::backend::TorrentHandle;
