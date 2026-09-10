@@ -418,7 +418,7 @@ impl ChunkDir {
     /// Prune the bucket directories that have gone empty, then the directory
     /// itself. "Empty" therefore means "holds no chunks".
     pub fn remove_if_empty(&self) -> io::Result<()> {
-        let entries = match std::fs::read_dir(&self.dir) {
+        let entries = match self.read_dir(&self.dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e),
@@ -460,7 +460,7 @@ impl ChunkDir {
     /// will ever reclaim -- was broken for every piece of the file.
     pub fn held_in_bucket(&self, bucket: u64) -> io::Result<HashSet<u64>> {
         let mut held = HashSet::new();
-        let entries = match std::fs::read_dir(self.dir.join(bucket.to_string())) {
+        let entries = match self.read_dir(&self.dir.join(bucket.to_string())) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(held),
             Err(error) => return Err(error),
@@ -501,7 +501,7 @@ impl ChunkDir {
     /// See [`Self::held_in_bucket`] for what treating it as empty cost.
     pub fn held(&self) -> io::Result<BTreeSet<u64>> {
         let mut held = BTreeSet::new();
-        let buckets = match std::fs::read_dir(&self.dir) {
+        let buckets = match self.read_dir(&self.dir) {
             Ok(buckets) => buckets,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(held),
             Err(error) => return Err(error),
@@ -537,7 +537,7 @@ impl ChunkDir {
     /// exist stats empty, which is the ordinary state before the first write.
     pub fn stat(&self) -> StoredChunks {
         let mut stored = StoredChunks::default();
-        let Ok(buckets) = std::fs::read_dir(&self.dir) else {
+        let Ok(buckets) = self.read_dir(&self.dir) else {
             return stored;
         };
         // Both copies of a chunk are one entry, so they are counted, aged and
@@ -556,7 +556,7 @@ impl ChunkDir {
             }
             let bucket_name = bucket.file_name();
             let bucket_index = bucket_name.to_str().and_then(canonical_index);
-            let Ok(entries) = std::fs::read_dir(bucket.path()) else {
+            let Ok(entries) = self.read_dir(&bucket.path()) else {
                 continue;
             };
             for entry in entries.flatten() {
@@ -630,9 +630,8 @@ impl ChunkDir {
     /// bucket it could not read, which was tolerable while it fed only the
     /// advisory staged set.
     pub fn walk(&self) -> io::Result<Vec<Entry>> {
-        self.count_walk();
         let mut found = Vec::new();
-        let buckets = match std::fs::read_dir(&self.dir) {
+        let buckets = match self.read_dir(&self.dir) {
             Ok(buckets) => buckets,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(found),
             Err(e) => return Err(e),
@@ -646,7 +645,7 @@ impl ChunkDir {
             }
             let bucket_name = bucket.file_name();
             let bucket_index = bucket_name.to_str().and_then(canonical_index);
-            for entry in std::fs::read_dir(bucket.path())? {
+            for entry in self.read_dir(&bucket.path())? {
                 let entry = entry?;
                 let name = entry.file_name();
                 let Some(name) = name.to_str() else {
@@ -680,22 +679,38 @@ impl ChunkDir {
 }
 
 impl ChunkDir {
+    /// **Every `read_dir` this type makes of its directory or a bucket goes
+    /// through here**, so that [`LISTINGS`] counts all of them. The tests
+    /// that pin "the pass lists nothing" read that counter, and a listing
+    /// that reached the disk by any door this type has -- [`Self::held`],
+    /// [`Self::stat`], [`Self::walk`], a bucket on its own -- has to move
+    /// it: a counter on one door alone let a per-tick listing through
+    /// another pass for no listing at all. ([`collect_strays`] lists the
+    /// debris trees `stat` finds below a bucket, which hold no chunk, and
+    /// is not counted.)
+    fn read_dir(&self, path: &Path) -> io::Result<std::fs::ReadDir> {
+        self.count_listing();
+        std::fs::read_dir(path)
+    }
+
     #[cfg(test)]
-    fn count_walk(&self) {
-        *WALKS.lock().entry(self.dir.clone()).or_insert(0) += 1;
+    fn count_listing(&self) {
+        *LISTINGS.lock().entry(self.dir.clone()).or_insert(0) += 1;
     }
 
     #[cfg(not(test))]
-    fn count_walk(&self) {}
+    fn count_listing(&self) {}
 }
 
-/// How many times [`ChunkDir::walk`] has run over each directory: the probe
-/// for the tests that pin "the pass lists nothing" -- one walk per torrent
-/// start, and not one more however many passes run. Keyed by directory so
-/// that tests running in parallel, each in a scratch root of its own, do not
-/// read one another's count.
+/// How many times a [`ChunkDir`] has listed its directory or one of its
+/// buckets -- every `read_dir` it makes, by whichever of its methods: the
+/// probe for the tests that pin "the pass lists nothing". A test reads it
+/// once the seed has walked and expects the same number after every pass,
+/// rather than a count it knows, because the seed lists the directory and
+/// then each bucket. Keyed by directory so that tests running in parallel,
+/// each in a scratch root of its own, do not read one another's count.
 #[cfg(test)]
-pub static WALKS: Mutex<BTreeMap<PathBuf, usize>> = Mutex::new(BTreeMap::new());
+pub static LISTINGS: Mutex<BTreeMap<PathBuf, usize>> = Mutex::new(BTreeMap::new());
 
 /// What a staged file's name says before [`STAGING_SUFFIX`], or `None` for a
 /// name that is not a staged one at all.

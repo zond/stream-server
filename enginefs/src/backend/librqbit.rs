@@ -8847,7 +8847,8 @@ mod tests {
     /// that sets a bit in the same set the pass reads through the registry.
     /// So after a stream has run and been reclaimed behind, the set the
     /// registry answers is the directory to the piece -- with the torrent's
-    /// directory walked exactly once, at the seed, however many passes ran.
+    /// directory listed only at the seed, by any door the chunk store has,
+    /// however many passes ran.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_pass_reads_the_store_the_session_writes_to_and_walks_nothing() {
         use tokio::io::AsyncReadExt;
@@ -8872,14 +8873,15 @@ mod tests {
         let hash = engine.info_hash.clone();
         engine.handle.handle.wait_until_initialized().await.unwrap();
         let dir = store.torrent_dir(&hash);
-        let walks = || {
-            crate::chunk_store::WALKS
+        let listings = || {
+            crate::chunk_store::LISTINGS
                 .lock()
                 .get(&dir)
                 .copied()
                 .unwrap_or(0)
         };
-        assert_eq!(walks(), 1, "the session's init walked the directory once");
+        let seeded = listings();
+        assert!(seeded > 0, "the session's init listed the directory");
         assert_eq!(
             efs.store_registry()
                 .held(&hash)
@@ -8918,6 +8920,8 @@ mod tests {
             }
         }
         drop(reader);
+        // Read before `on_disk` below, which is itself a listing.
+        let after_passes = listings();
 
         let pieces = (RETENTION_FILE_BYTES as u64 / RETENTION_PIECE) as u32;
         let held = efs
@@ -8937,9 +8941,8 @@ mod tests {
         );
         assert!(passes >= 8, "the stream ran through {passes} passes");
         assert_eq!(
-            walks(),
-            1,
-            "and none of them walked the directory: the one walk is the seed's"
+            after_passes, seeded,
+            "and none of them listed the directory: the seed's listing is the only one"
         );
     }
 
@@ -8948,8 +8951,12 @@ mod tests {
     ///
     /// librqbit answers a fatal storage error by pausing the torrent -- a
     /// take -- and dropping what it took, so the Error state holds no
-    /// storage at all; the store's last handle goes, and its registration
-    /// with it. The registry then answers "no store" for the hash, which a
+    /// storage; the store's last handle goes, and its registration with
+    /// it. Goes, not "has gone": the errored live state keeps its handle
+    /// until the peer tasks its pause cancelled have exited, which is
+    /// after `run_state` says Error by however long they take, so the test
+    /// waits for the registration rather than reading it at the state
+    /// change. The registry then answers "no store" for the hash, which a
     /// pass concludes nothing over -- never an empty set, which would
     /// withdraw every committed piece from what we announce. The restart is
     /// `Session::unpause`'s Error arm: `create_and_init` again, on the
@@ -9031,6 +9038,14 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         std::fs::set_permissions(&bucket, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let unregistered = std::time::Instant::now() + TEST_WAIT_BOUND;
+        while registry.is_registered(&hash) {
+            assert!(
+                std::time::Instant::now() < unregistered,
+                "the errored torrent's store never went: a handle to it is still held"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert!(
             registry.held(&hash).is_none(),
             "a torrent in Error holds no storage, so the hash has no store: unknown, not empty"

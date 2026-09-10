@@ -413,9 +413,25 @@ pub(crate) async fn take_claimed(
 /// store is under its initial hash check -- asked here, at the unlink, and
 /// not from a state read earlier: a piece taken from under the check is a
 /// have-bit over nothing. Refused pieces stay on the disk and in the held
-/// set, and the next pass offers them again. A hash with no registered
-/// store -- one the session does not hold, or holds in Error -- is deleted
-/// by path, as everything was.
+/// set, and the next pass offers them again.
+///
+/// **The claimless door never goes through a registered store.** Its caller
+/// read the torrent as one with no have-set -- not in the session, or in
+/// Error -- and that reading is older than this unlink by a `spawn_blocking`
+/// at least. A store registered now is a torrent librqbit holds now, with a
+/// have-set over these pieces that nobody has edited: the torrent restarted
+/// out of its error and its check finished, or its old store has not yet
+/// gone (the errored state's handle outlives the state change by the time
+/// its peer tasks take to exit). Either way the pieces are not this door's
+/// to take, so it takes nothing and says so; a hash with no registered
+/// store is deleted by path, as everything was.
+///
+/// What the path fallback does not close: "no store" is read once and the
+/// paths are unlinked after it, and a restart out of error can register a
+/// fresh store and begin its check between the two. The unlink under the
+/// registry's lock that would close it is the unlink `init` would then wait
+/// on, on the reactor, under librqbit's lock; the door goes when every
+/// unlink in the process has a registered store to go through.
 pub(crate) async fn unlink(
     store: &Arc<StoreRegistry>,
     info_hash: &str,
@@ -425,17 +441,26 @@ pub(crate) async fn unlink(
     let store = Arc::clone(store);
     let hash = info_hash.to_string();
     tokio::task::spawn_blocking(move || {
-        let freed = match store.delete(&hash, &pieces) {
-            DeleteOutcome::Registered { unlinked } => unlinked,
-            DeleteOutcome::Refused => {
-                tracing::warn!(
-                    info_hash = %hash,
-                    pieces = pieces.len(),
-                    "not deleting under a running hash check; the pieces stay held"
-                );
-                0
+        let freed = if claim.is_none() && store.is_registered(&hash) {
+            tracing::warn!(
+                info_hash = %hash,
+                pieces = pieces.len(),
+                "a store is registered for a torrent read as holding none; not deleting without a claim"
+            );
+            0
+        } else {
+            match store.delete(&hash, &pieces) {
+                DeleteOutcome::Registered { unlinked } => unlinked,
+                DeleteOutcome::Refused => {
+                    tracing::warn!(
+                        info_hash = %hash,
+                        pieces = pieces.len(),
+                        "not deleting under a running hash check; the pieces stay held"
+                    );
+                    0
+                }
+                DeleteOutcome::Unregistered => store.root().delete_pieces(&hash, pieces),
             }
-            DeleteOutcome::Unregistered => store.root().delete_pieces(&hash, pieces),
         };
         // Released only now that the bytes are gone.
         drop(claim);

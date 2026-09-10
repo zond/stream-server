@@ -678,13 +678,14 @@ pub struct Engine<H: TorrentHandle> {
     pub(crate) retention: Arc<Retention<TorrentBacking<H>>>,
     /// Where a test puts what playback does while a pass runs.
     ///
-    /// Called twice per pass -- before the listing, and again after the
-    /// decision and before the unlinks -- with the file's turn held and no
-    /// owner lock, and nowhere in a shipped build. A test that instead
-    /// queued a task and trusted the listing's await to yield to it would
-    /// be betting on the blocking pool being slower than the reactor: a
-    /// blocking task that finishes before its handle is first polled yields
-    /// nothing, and the test then measures the ordering it meant to break.
+    /// Called twice per pass -- before the held reading, and again after
+    /// the decision and before the unlinks -- with the file's turn held and
+    /// no owner lock, and nowhere in a shipped build. A test that instead
+    /// queued a task and trusted an await in the pass to yield to it would
+    /// be betting on scheduling: the held reading is a memory read now and
+    /// suspends nowhere, and when it was a listing a blocking task that
+    /// finished before its handle was first polled yielded nothing either,
+    /// so the test measured the ordering it meant to break.
     /// The cell is the engine's, where the tests write it; the owner is
     /// handed a runner that reads it ([`Retention::hook`]).
     #[cfg(test)]
@@ -697,6 +698,25 @@ pub struct Engine<H: TorrentHandle> {
 pub(crate) type Interleave = Arc<parking_lot::Mutex<Option<Box<dyn Fn() + Send + Sync>>>>;
 
 impl<H: TorrentHandle> Engine<H> {
+    /// What the backing hands a pass over `file_idx` as the held set: the
+    /// registry's answer for the torrent, narrowed to the file. A probe for
+    /// the test that pins the narrowing; the pass reaches it through the
+    /// owner.
+    #[cfg(test)]
+    pub(crate) async fn held_in_file(
+        &self,
+        store: &Arc<StoreRegistry>,
+        file_idx: usize,
+    ) -> Option<BTreeSet<u32>> {
+        let backing = TorrentBacking {
+            handle: self.handle.clone(),
+            info_hash: self.info_hash.clone(),
+            pinned: self.pinned_files.clone(),
+        };
+        let domain = backing.resolve(file_idx).await?;
+        backing.held(store, &domain).await
+    }
+
     pub fn new_with_handle(
         handle: H,
         info_hash: &str,

@@ -15,11 +15,17 @@
 //! store's own delete.
 //!
 //! A registration is a `Weak`, and the live store is whichever `Inner` the
-//! entry points at. A torrent in Error holds no storage at all -- librqbit
-//! pauses (a take) and drops the successor -- so its `Inner` goes, takes
-//! its registration with it, and the registry answers "no store" for the
-//! hash. That is the answer the pass concludes nothing over; it is never
-//! an empty set, for the reason [`PieceStore::held`] gives.
+//! entry points at. A torrent in Error holds no storage -- librqbit pauses
+//! (a take) and drops the successor -- so its `Inner` goes, takes its
+//! registration with it, and the registry answers "no store" for the hash.
+//! That is the answer the pass concludes nothing over; it is never an empty
+//! set, for the reason [`PieceStore::held`] gives. It is an answer the
+//! registry reaches *after* the state does: the `Inner` lives as long as
+//! its last handle, and the errored live state's handle goes when the peer
+//! tasks it cancelled have exited -- milliseconds after `run_state` says
+//! Error. In that gap the hash still answers a set and a delete through it
+//! still goes; nothing here reads the run state, and nothing that reads it
+//! may trust one reading across an unlink.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
@@ -103,6 +109,15 @@ impl StoreRegistry {
     /// returned: by the time this is called the backend has forgotten every
     /// piece in the run, so there is no retry a caller could make, and the
     /// count of what did go is what `ENOSPC` recovery reads.
+    ///
+    /// What this does not close: the check is asked of the store registered
+    /// at entry and the run is unlinked through that store. A restart out
+    /// of error that registers a fresh store over the same directory while
+    /// the run is still being unlinked has that store's check reading files
+    /// this loop is removing -- a window the length of one run's unlinks,
+    /// open only for a torrent that errored between the claim and here.
+    /// Closing it means an unlink under the registry's lock, which `init`
+    /// takes on the reactor under librqbit's own; it is left open and named.
     pub fn delete(&self, info_hash: &str, pieces: &[u32]) -> DeleteOutcome {
         let Some(inner) = self.live(info_hash) else {
             return DeleteOutcome::Unregistered;
@@ -127,6 +142,19 @@ impl StoreRegistry {
             }
         }
         DeleteOutcome::Registered { unlinked }
+    }
+
+    /// Whether a live store is registered for `info_hash` at all -- the
+    /// question a delete **with no claim** asks before it touches anything.
+    /// A registered store is one `init` seeded for a torrent librqbit
+    /// holds, and that torrent keeps a have-set over the same pieces; an
+    /// unlink nobody had the backend forget first leaves that have-set
+    /// standing over nothing. So the claimless door goes by path only where
+    /// this is false, and steps back where it is true -- whatever state the
+    /// caller read the torrent in earlier, because the read and the unlink
+    /// are two instants and a restart fits between them.
+    pub fn is_registered(&self, info_hash: &str) -> bool {
+        self.live(info_hash).is_some()
     }
 
     /// What every registered store holds, in bytes, by the held bits and
@@ -271,6 +299,7 @@ mod tests {
         );
         assert_eq!(registry.delete(HASH, &[0]), DeleteOutcome::Unregistered);
         assert!(!registry.checking(HASH));
+        assert!(!registry.is_registered(HASH));
         assert_eq!(registry.epoch(HASH), None);
 
         std::fs::create_dir_all(store.dir()).unwrap();
@@ -281,6 +310,7 @@ mod tests {
             Some(BTreeSet::from([1])),
             "seeded, and so registered, with what the seed found"
         );
+        assert!(registry.is_registered(HASH));
         assert_eq!(registry.epoch(HASH), Some(1));
 
         // The delete fallback: a fresh store over the same hash, no init.
@@ -431,6 +461,33 @@ mod tests {
         assert!(!store.piece_path(1).exists());
         assert_eq!(held_of(&registry), Some(BTreeSet::new()));
         drop(successor);
+    }
+
+    /// A hash is one store however it is spelled. librqbit and
+    /// `StoreRoot::torrent_dir` spell it lowercase and the server lowercases
+    /// before it asks, but the registry is the meeting point of every
+    /// caller, and one that spelled the hash as the user typed it would
+    /// otherwise be told the torrent it is looking at has no store.
+    #[test]
+    fn a_hash_answers_the_same_store_however_it_is_spelled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = registry(tmp.path());
+        let store = store_under(&registry);
+        std::fs::create_dir_all(store.dir()).unwrap();
+        write_piece(&store, 2);
+        store.init_for_tests().unwrap();
+        let upper = HASH.to_ascii_uppercase();
+        assert_eq!(
+            registry.held(&upper).map(|held| held.in_range(0..4)),
+            Some(BTreeSet::from([2]))
+        );
+        assert!(registry.is_registered(&upper));
+        assert_eq!(registry.epoch(&upper), Some(1));
+        assert_eq!(
+            registry.delete(&upper, &[2]),
+            DeleteOutcome::Registered { unlinked: 1 }
+        );
+        assert_eq!(held_of(&registry), Some(BTreeSet::new()));
     }
 
     /// Occupancy is the registered stores' held bits priced by their

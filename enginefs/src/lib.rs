@@ -2237,7 +2237,12 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// A hash the session holds nothing for, or holds a torrent its own
     /// error stopped, has no live have-set for a deletion to disagree with:
     /// the next start rebuilds it by asking the storage, which under this
-    /// design *is* the piece files. Those go straight to the store.
+    /// design *is* the piece files. Those go straight to the store -- where
+    /// the door asks again, at the unlink, whether that is still so: the
+    /// run state is read here and the unlink runs on the blocking pool
+    /// later, and a torrent that restarted out of its error in between has
+    /// a registered store and a have-set again, which the claimless door
+    /// then leaves alone (`retention::unlink`).
     pub async fn release_pieces(&self, info_hash: &str, pieces: &[u32]) -> usize {
         let handle = self.backend.get_torrent(info_hash).await;
         let live = handle.filter(|handle| {
@@ -10428,8 +10433,12 @@ mod tests {
     /// file's turn across it -- to learn what the store already knew. The
     /// store's directory is walked once, when `init` seeds its held set,
     /// and every pass after that reads the set the store keeps: fifty
-    /// passes over a store with pieces to commit and reclaim leave the walk
-    /// count where the seed put it.
+    /// passes over a store with pieces to commit and reclaim leave the
+    /// listing count where the seed put it. The count is every `read_dir`
+    /// the chunk store makes under the torrent's directory, by any of its
+    /// doors -- the listing the pass used to take went through
+    /// `ChunkDir::held`, and a counter on the seed's walk alone would not
+    /// have seen it come back.
     #[tokio::test]
     async fn a_retention_pass_walks_no_directory() {
         let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
@@ -10447,14 +10456,15 @@ mod tests {
             std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
         }
         let store = seeded_store(&enginefs, &engine);
-        let walks = || {
-            crate::chunk_store::WALKS
+        let listings = || {
+            crate::chunk_store::LISTINGS
                 .lock()
                 .get(store.dir())
                 .copied()
                 .unwrap_or(0)
         };
-        assert_eq!(walks(), 1, "the seed is the one walk");
+        let seeded = listings();
+        assert!(seeded > 0, "the seed listed the directory");
         engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
 
@@ -10471,9 +10481,9 @@ mod tests {
             engine.retain(enginefs.store_registry()).await;
         }
         assert_eq!(
-            walks(),
-            1,
-            "fifty passes, and the directory was walked exactly once: at the seed"
+            listings(),
+            seeded,
+            "fifty passes, and nothing listed the directory after the seed"
         );
     }
 
@@ -10542,15 +10552,19 @@ mod tests {
         );
     }
 
-    /// **The claimless door refuses a store under its check too.** A torrent
-    /// the session holds in Error or not at all is unlinked with no claim,
-    /// straight at the store; asked of a hash whose registered store has
-    /// been seeded and not yet taken -- the check may be reading it -- the
-    /// door takes nothing. The real backend cannot present this pair (an
-    /// Error torrent holds no storage), and that is the point of asking at
-    /// the unlink rather than trusting the state read to pick the door.
+    /// **The claimless door never goes through a registered store.** A
+    /// torrent the session holds in Error or not at all is unlinked with no
+    /// claim, straight at the store -- but the state was read on the
+    /// runtime and the unlink runs on the blocking pool, and the real
+    /// backend can have restarted the torrent between the two: the fresh
+    /// store registers under its check, and once the check hands over it
+    /// is a live have-set nobody edited. Asked of a registered store in
+    /// either state, the door takes nothing; only once the store is gone --
+    /// the torrent really does hold no storage -- does the path delete go.
+    /// The fake keeps its store registered through the error, which stands
+    /// in for exactly that restart.
     #[tokio::test]
-    async fn a_claimless_delete_of_a_store_under_its_check_is_refused() {
+    async fn a_claimless_delete_never_goes_through_a_registered_store() {
         let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
         counters.pieces_per_file.store(4, Ordering::SeqCst);
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
@@ -10578,17 +10592,146 @@ mod tests {
             "and so does its bit"
         );
 
-        // The check over, the same delete goes through the store.
-        let _successor = librqbit::storage::TorrentStorage::take(&store).unwrap();
+        // The check over, the store is a live one whose have-set this door
+        // never edited: still nothing.
+        let successor = librqbit::storage::TorrentStorage::take(&store).unwrap();
         assert!(!enginefs.store_registry().checking(TEST_HASH));
-        assert_eq!(enginefs.release_pieces(TEST_HASH, &[2]).await, 1);
-        assert!(!bucket.join("2").exists());
+        assert_eq!(
+            enginefs.release_pieces(TEST_HASH, &[2]).await,
+            0,
+            "a registered store is a torrent with a have-set, claim or no claim"
+        );
+        assert!(bucket.join("2").is_file());
         assert!(
-            !enginefs
+            enginefs
                 .store_registry()
                 .held(TEST_HASH)
                 .expect("registered")
                 .contains(2)
+        );
+
+        // The storage really gone -- what Error is once librqbit's handles
+        // have dropped -- the same delete goes by path.
+        drop(successor);
+        drop(store);
+        assert!(!enginefs.store_registry().is_registered(TEST_HASH));
+        assert_eq!(enginefs.release_pieces(TEST_HASH, &[2]).await, 1);
+        assert!(!bucket.join("2").exists());
+    }
+
+    /// **A reclaim from a paused torrent goes through.** Paused is a settled
+    /// state: librqbit's `drop_pieces` edits a paused torrent's have-set as
+    /// it edits a live one's, and the design's slack pass drops from exactly
+    /// such a torrent. Only a check in progress and a torrent with no
+    /// storage stop the reclaim; a guard that let only Live through would
+    /// leave a paused torrent's disk where it is for as long as it stays
+    /// paused.
+    #[tokio::test]
+    async fn a_reclaim_from_a_paused_torrent_goes_through() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in [0u32, 1, 2, 3] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let _store = seeded_store(&enginefs, &engine);
+        engine.note_playhead(0, 0);
+        engine.begin_retention(0).await;
+        counters.paused.store(true, Ordering::SeqCst);
+        assert_eq!(engine.handle.run_state(), RunState::Paused);
+
+        let pass = engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass");
+        assert_eq!(
+            pass.reclaimed, 3,
+            "the three outside the window go from a paused torrent: {pass:?}"
+        );
+        assert!((1..4).all(|piece| !bucket.join(piece.to_string()).exists()));
+        assert!(bucket.join("0").is_file());
+    }
+
+    /// **The held set the pass is handed is this file's, not the torrent's.**
+    /// The registry answers for the whole torrent; the backing narrows it to
+    /// the file's extent before the owner sees it, so a policy over one
+    /// episode of a pack is never handed the other episodes' pieces to
+    /// decide about.
+    #[tokio::test]
+    async fn the_held_set_the_backing_hands_the_pass_is_the_files_own() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![
+            ("Show.S01E01.mkv".into(), 100),
+            ("Show.S01E02.mkv".into(), 100),
+        ]);
+        // Four pieces per file: episode one is 0..4, episode two 4..8.
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in 0..8u32 {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let _store = seeded_store(&enginefs, &engine);
+        assert_eq!(
+            enginefs
+                .store_registry()
+                .held(TEST_HASH)
+                .expect("registered")
+                .count(),
+            8,
+            "the registry holds the whole torrent"
+        );
+        assert_eq!(
+            engine.held_in_file(enginefs.store_registry(), 1).await,
+            Some(std::collections::BTreeSet::from([4, 5, 6, 7])),
+            "and the backing hands the pass the second episode's four"
+        );
+        assert_eq!(
+            engine.held_in_file(enginefs.store_registry(), 0).await,
+            Some(std::collections::BTreeSet::from([0, 1, 2, 3]))
+        );
+    }
+
+    /// **The panel's numbers for a torrent with no registered store are no
+    /// numbers.** A policy stands and a reader is inside the file, but the
+    /// torrent is in Error and its store has gone with its storage: there
+    /// is no held set to count a window off, and a window of zero would say
+    /// the disk holds nothing of the stream, which is a measurement nobody
+    /// took. The whole row is absent instead, as it was for a directory
+    /// that would not list.
+    #[tokio::test]
+    async fn the_panels_numbers_are_absent_for_a_torrent_with_no_registered_store() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        engine.note_playhead(0, 25);
+        engine.begin_retention(0).await;
+        assert!(
+            engine.policy_reading(0).is_some(),
+            "a policy stands and the reader is inside the file"
+        );
+        assert!(
+            enginefs
+                .torrent_stream_numbers(TEST_HASH, 0)
+                .await
+                .is_none(),
+            "no store, so no numbers -- not a window of zero"
+        );
+
+        let _store = seeded_store(&enginefs, &engine);
+        assert!(
+            enginefs
+                .torrent_stream_numbers(TEST_HASH, 0)
+                .await
+                .is_some_and(|numbers| numbers.window.is_some()),
+            "with a store registered the same question has a window"
         );
     }
 
@@ -10676,13 +10819,14 @@ mod tests {
     /// **A pass measures against where playback is now, not where it was
     /// when the pass began.**
     ///
-    /// The listing is a directory walk on the blocking pool and the pass is
-    /// suspended across it -- which is the whole of what the test above
-    /// asserts, and is what makes the interleaving here a queued task
-    /// rather than a sleep. `note_playhead` takes none of the locks the
-    /// pass holds, so a byte delivered in that gap moves the playhead while
-    /// the fill writes the read-ahead the player is about to want. A pass
-    /// that read the playhead before the walk draws its window round where
+    /// The pass reads the held set and then the playhead, and between the
+    /// two it holds none of the locks `note_playhead` takes -- the reading
+    /// used to be a directory walk on the blocking pool with the pass
+    /// suspended across it, and it is a memory read now, but the gap is
+    /// the same gap and the owner's hook puts playback inside it. A byte
+    /// delivered there moves the playhead while the fill writes the
+    /// read-ahead the player is about to want. A pass that read the
+    /// playhead before the held set draws its window round where
     /// playback *was*: everything written ahead of that is outside the
     /// window, on the disk, and reclaimed, and `AfterRelease::LeaveDropped`
     /// means nothing fetches it back until the player arrives at the hole
@@ -10815,9 +10959,9 @@ mod tests {
     /// **And a reader that left the file while the pass listed leaves the
     /// policy exactly as it was.**
     ///
-    /// The playhead the pass re-reads after its listing can name another
-    /// file: the reader opened the next episode of the pack while the walk
-    /// ran. A window drawn from that offset on this file's policy is a
+    /// The playhead the pass re-reads after its held reading can name
+    /// another file: the reader opened the next episode of the pack while
+    /// the pass ran. A window drawn from that offset on this file's policy is a
     /// window round the wrong piece, and everything else on the disk goes.
     /// So the pass concludes nothing -- and puts the policy back rather than
     /// clearing or dropping it. Cleared, it would re-announce a range the
