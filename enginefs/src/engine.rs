@@ -942,10 +942,15 @@ impl<H: TorrentHandle> Engine<H> {
     /// a pass that ran and found nothing, which is `Some` with a zeroed
     /// count.
     ///
-    /// Takes the policy out of its slot for the length of the pass rather
-    /// than holding the lock across the backend calls, so a second pass
-    /// that overlaps this one does nothing instead of queueing behind it,
-    /// and a [`Self::begin_retention`] that lands meanwhile wins.
+    /// Holds [`Self::announce`] from its first line to its last, so a second
+    /// pass queues behind this one and a [`Self::begin_retention`] that
+    /// arrives meanwhile waits its turn: nothing installs, clears or takes
+    /// the policy while a pass has it. The policy still comes *out* of its
+    /// slot for the length of the pass, but for a different reason than it
+    /// once did -- a panel asking what bounds this stream is answered from
+    /// `bounds` beside the slot, not from the slot, precisely so
+    /// that an empty slot during a pass does not read as "nothing bounds
+    /// this stream" (see [`crate::retention::PolicyBounds`]).
     pub(crate) async fn retain(
         &self,
         store: &crate::piece_store::StoreRoot,
