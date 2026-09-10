@@ -107,9 +107,13 @@
 //!
 //! Two passes, and which one runs is the driver's, from one reading of what
 //! is being played ([`Mode`]). [`Mode::Slack`] is the short one, written
-//! out on [`Retention::slack_pass`]: hold the whole extent back, drop the
-//! policy and the windows, take every byte off the disk, forget the entity
-//! if nothing is left. What follows is [`Mode::Live`].
+//! out on [`Retention::slack_pass`]: re-establish that it really is slack
+//! under the turn, hold the whole extent back, drop the policy and the
+//! windows, take every byte off the disk, forget the entity if nothing is
+//! left. The re-establishing is the first step and not a formality -- the
+//! driver's reading is older than the turn by every unlink it has done
+//! since, and this is the pass that deletes an entity whole. What follows
+//! is [`Mode::Live`].
 //!
 //! One body with two entries. [`Retention::turn`] queues on T for the
 //! torrent's tick and the cleaner's delete; [`Reader::note`] claims T with a
@@ -255,7 +259,18 @@ pub enum Mode {
     /// whole extent back from what we announce and then takes every byte of
     /// it off the disk. Nothing is kept and nothing is re-announced: an
     /// entity that has been left is not a small cache, it is disposable.
-    Slack,
+    ///
+    /// `opens` is [`Retention::opens_of`] as the driver read it when it
+    /// decided this, and it travels with the mode so the pass can find out
+    /// whether the decision is still true. A stream opening on the entity
+    /// is [`Retention::install`], which takes the entity's turn -- so an
+    /// open that lands after this reading and before the pass takes that
+    /// turn is one the pass would otherwise delete under, and one that
+    /// arrives later cannot get in at all. The count is compared and not
+    /// re-read: asking "is it live now?" again answers about a moment that
+    /// has already passed, and comparing two readings answers about the gap
+    /// between them, which is the thing that can hurt.
+    Slack { opens: u64 },
 }
 
 /// How long an entity nobody is reading keeps what its last pass concluded.
@@ -342,12 +357,15 @@ pub trait Backing: Sized + Send + Sync + 'static {
     /// Whether `key` is the entity being played **at this instant**
     /// ([`crate::retention::live`]).
     ///
-    /// Asked only by the [`Door`] of a [`Mode::Slack`] reclaim, once per
-    /// run, and asked there rather than carried in from the pass's mode: a
-    /// player can open the file again while its bytes are going, and the
-    /// run has to stop at the piece it is on rather than empty the window
-    /// the new stream is already reading. A copy-out read like
-    /// [`Self::keeps_everything`], with no owner lock held.
+    /// Asked twice on a [`Mode::Slack`] pass, and by nothing else. Once at
+    /// the top, under the turn, before the pass destroys anything: the mode
+    /// was decided from a reading taken before the driver's first entity,
+    /// and a viewer can have started this file since. Then once per run of
+    /// the reclaim, at the [`Door`]: a player can open the file again while
+    /// its bytes are going, and the run has to stop at the piece it is on
+    /// rather than empty the window the new stream is already reading. A
+    /// copy-out read like [`Self::keeps_everything`], with no owner lock
+    /// held.
     ///
     /// The default is `false`: a backing with no liveness of its own has
     /// nothing that could interrupt a slack run.
@@ -543,6 +561,18 @@ struct State<B: Backing> {
     /// It lives exactly as long as the policy that made it: written at the
     /// pass's decision, cleared when a policy is installed or forgotten.
     doomed: Vec<Range<u32>>,
+    /// How many streams have ever been opened on this entity: every
+    /// [`Retention::install`] that reached the turn, whatever it decided
+    /// there.
+    ///
+    /// Counted rather than remembered as a flag because the question it
+    /// answers is about a *gap*: a [`Mode::Slack`] pass carries the reading
+    /// its driver took, and an open that landed between that reading and
+    /// the turn is the one that would have its policy and its bytes deleted
+    /// under it. Every open goes through `install` and `install` takes this
+    /// turn, so an open the pass does not see in this number is one that
+    /// cannot start until the pass has finished.
+    opens: u64,
 }
 
 /// The policy in its cell, with the budget it was built for beside it.
@@ -750,6 +780,7 @@ impl<B: Backing> Retention<B> {
                         last_position: None,
                         last_seen: Instant::now(),
                         doomed: Vec::new(),
+                        opens: 0,
                     })),
                 })
             })
@@ -847,6 +878,13 @@ impl<B: Backing> Retention<B> {
             guard: entity.turn.clone().lock_owned().await,
             about: None,
         };
+        // Counted here, under the turn and before anything is decided,
+        // because what a [`Mode::Slack`] pass has to know is that a stream
+        // opened -- not what the install made of it. An open that finds the
+        // policy already right (`Kept`), or that cannot be bounded, is
+        // still a viewer starting this file, and a pass that deleted the
+        // entity under one would take the bytes it is about to read.
+        entity.state.lock().opened(&mut claim.guard);
         let budget = self.budget.get();
         if self.backing.keeps_everything(&key) {
             // A pin is a retention property: the user asked for those
@@ -1074,7 +1112,7 @@ impl<B: Backing> Retention<B> {
     pub async fn pass(&self, key: &B::Key, store: &B::Store, claim: Claim, mode: Mode) -> Outcome {
         match mode {
             Mode::Live => self.live_pass(key, store, claim).await,
-            Mode::Slack => self.slack_pass(key, store, claim).await,
+            Mode::Slack { opens } => self.slack_pass(key, store, claim, opens).await,
         }
     }
 
@@ -1101,7 +1139,30 @@ impl<B: Backing> Retention<B> {
     /// forgotten ([`Self::forget_empty`]). Pieces a delete refused -- a
     /// hash check running -- stay held and unadvertised, the entity stays,
     /// and the next tick offers them again.
-    async fn slack_pass(&self, key: &B::Key, store: &B::Store, mut claim: Claim) -> Outcome {
+    ///
+    /// **Slack is re-established under the turn before anything is
+    /// destroyed, and the whole of the pass hangs on that.** The driver
+    /// decided this mode from a reading of the liveness cell taken before
+    /// its first entity, and between that reading and this turn a viewer
+    /// can have started exactly this file: the cell moved, `install` put a
+    /// policy in, a reader opened on it. Carried through, the mode would
+    /// have the pass hold the window they are inside back from the swarm,
+    /// throw the policy away and unlink the bytes they are reading -- and
+    /// the door below, which does ask again, gates only the unlinks and by
+    /// then the policy is already gone. So the three facts the driver read
+    /// are read again here, under the turn that every open must take:
+    /// [`Backing::is_live`], the open reads, and [`State::opens`] against
+    /// the count the mode carries. `opens` is the one that closes the gap
+    /// rather than narrowing it -- the other two are instants, and an
+    /// install that has completed but whose reader is not open yet is
+    /// neither.
+    async fn slack_pass(
+        &self,
+        key: &B::Key,
+        store: &B::Store,
+        mut claim: Claim,
+        opens: u64,
+    ) -> Outcome {
         let Some(entity) = self.lookup(key) else {
             drop(claim);
             return Outcome {
@@ -1113,9 +1174,23 @@ impl<B: Backing> Retention<B> {
         // A pin is a retention property and outranks the slack: the user
         // asked for those bytes. Nothing is taken and nothing is given
         // back -- the pin's own install is what clears the policy.
-        if self.backing.keeps_everything(key) {
+        //
+        // Asked before L2, like every copy-out of a lock outside the owner
+        // (rule 1), and so is the liveness cell beside it.
+        if self.backing.keeps_everything(key) || self.backing.is_live(key) {
             let state = entity.state.lock();
             return Self::nothing(&state, claim, about, None);
+        }
+        {
+            let state = entity.state.lock();
+            if state.opens != opens || !state.readers.is_empty() {
+                tracing::debug!(
+                    key = ?key,
+                    "a stream opened on this entity since its mode was decided; \
+                     the slack pass takes nothing"
+                );
+                return Self::nothing(&state, claim, about, None);
+            }
         }
         let domain = entity.state.lock().domain.clone();
         let extent = B::extent(&domain);
@@ -1146,7 +1221,7 @@ impl<B: Backing> Retention<B> {
         }
         let promised: Vec<Range<u32>> = {
             let mut state = entity.state.lock();
-            state.go_slack(&mut claim.guard, &held);
+            state.go_slack(&mut claim.guard);
             state
                 .readers
                 .values()
@@ -1159,7 +1234,7 @@ impl<B: Backing> Retention<B> {
             backing: self.backing.clone(),
             key: key.clone(),
             domain: domain.clone(),
-            mode: Mode::Slack,
+            mode: Mode::Slack { opens },
             policy: None,
             windows: Vec::new(),
             promised,
@@ -1550,6 +1625,15 @@ impl<B: Backing> Retention<B> {
             .map(|entity| entity.state.lock().readers.len())
             .unwrap_or(0)
     }
+
+    /// How many streams have been opened on `key` ([`State::opens`]), for a
+    /// driver about to decide a [`Mode`]. `0` for a key with no entity,
+    /// which is also what its first open will have counted from.
+    pub fn opens_of(&self, key: &B::Key) -> u64 {
+        self.lookup(key)
+            .map(|entity| entity.state.lock().opens)
+            .unwrap_or(0)
+    }
 }
 
 impl<B: Backing> State<B> {
@@ -1721,6 +1805,12 @@ impl<B: Backing> State<B> {
         self.doomed = runs;
     }
 
+    /// A stream has been opened on this entity. Under the turn, from
+    /// [`Retention::install`] alone; see [`Self::opens`].
+    fn opened(&mut self, _turn: &mut Turn) {
+        self.opens += 1;
+    }
+
     /// Nothing bounds this entity any more and everything it holds is on
     /// its way off the disk. Under the turn, after the extent has been held
     /// back from what we announce.
@@ -1731,11 +1821,19 @@ impl<B: Backing> State<B> {
     /// that a left file's pieces are protected, which is how a switch used
     /// to leave the previous film on the disk under two owners' protection
     /// and neither one's deleter.
-    fn go_slack(&mut self, _turn: &mut Turn, held: &BTreeSet<u32>) {
+    ///
+    /// Nothing is doomed here, though the pass is about to unlink
+    /// everything. [`Self::doomed`] exists so that a re-advertise cannot
+    /// put back what a reclaim is taking, and the only re-advertise the
+    /// owner makes is [`Retention::clear_under`]'s, which returns at once
+    /// when nothing is installed -- which is the line above. A slack pass
+    /// has already held its whole extent back before it takes a byte, so
+    /// there is nothing left for a doomed list to keep from being
+    /// announced again.
+    fn go_slack(&mut self, _turn: &mut Turn) {
         self.installed = None;
         self.decided = None;
         self.windows = Vec::new();
-        self.doomed = runs(&held.iter().copied().collect::<Vec<u32>>());
     }
 
     fn holding(&self) -> Holding<B> {
@@ -1946,7 +2044,7 @@ impl<B: Backing> Door<B> {
         if self.backing.keeps_everything(&self.key) {
             return None;
         }
-        if self.mode == Mode::Slack {
+        if matches!(self.mode, Mode::Slack { .. }) {
             // A slack entity keeps nothing, so an empty window cuts nothing
             // out of a run -- unless a player opened it again while its
             // bytes were going, and then the run stops where it is rather
@@ -1995,7 +2093,7 @@ impl<B: Backing> Door<B> {
         {
             return true;
         }
-        if self.mode == Mode::Slack {
+        if matches!(self.mode, Mode::Slack { .. }) {
             // Nothing of a slack entity is kept for what somebody might
             // read; what is kept is what an open read was already promised,
             // and it is served every byte of it. And the entity being
@@ -2113,6 +2211,9 @@ mod tests {
         /// How many listings were asked for.
         listings: AtomicU64,
         keeps_everything: AtomicBool,
+        /// What [`Backing::is_live`] answers: the entity the fake is
+        /// playing right now.
+        is_live: AtomicBool,
         /// The runs each `reclaim` call was handed.
         reclaims: parking_lot::Mutex<Vec<Vec<Range<u32>>>>,
         /// The runs each `reclaim` call really asked the door about, which
@@ -2145,6 +2246,7 @@ mod tests {
                 fail_held: AtomicBool::new(false),
                 listings: AtomicU64::new(0),
                 keeps_everything: AtomicBool::new(false),
+                is_live: AtomicBool::new(false),
                 reclaims: parking_lot::Mutex::new(Vec::new()),
                 asked: parking_lot::Mutex::new(Vec::new()),
                 reclaim_panics: AtomicBool::new(false),
@@ -2271,6 +2373,10 @@ mod tests {
 
         fn keeps_everything(&self, _key: &usize) -> bool {
             self.keeps_everything.load(Ordering::SeqCst)
+        }
+
+        fn is_live(&self, _key: &usize) -> bool {
+            self.is_live.load(Ordering::SeqCst)
         }
 
         async fn held(&self, _store: &(), _domain: &FakeDomain) -> Option<BTreeSet<u32>> {
@@ -2837,6 +2943,266 @@ mod tests {
             vec![(0..8, false), (3..6, true)]
         );
         assert_eq!(backing.reclaims.lock().len(), 1);
+    }
+
+    /// **A slack pass asks again, under the turn, whether the entity is
+    /// still slack -- and a viewer who started this file in the meantime
+    /// keeps everything.**
+    ///
+    /// The mode is decided by the driver from a reading taken before its
+    /// first entity, and the pass runs seconds later. What can happen in
+    /// between is a viewer starting exactly this file: the liveness cell
+    /// moves first, the install follows. A pass that carried its mode
+    /// through would hold the window they are inside back from the swarm,
+    /// throw the fresh policy away and unlink what they are reading -- and
+    /// the door below would gate none of it, because the door is asked at
+    /// the unlink and the policy is gone before the first one.
+    #[tokio::test]
+    async fn a_slack_pass_takes_nothing_from_a_file_being_played_again() {
+        let (backing, owner, _budget) = torrent();
+        *backing.held.lock() = [0, 1, 2].into_iter().collect();
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        owner.note_position(&0, (0, 0));
+        // What the driver read when it decided, and then the viewer.
+        let opens = owner.opens_of(&0);
+        backing.is_live.store(true, Ordering::SeqCst);
+        backing.advertised.lock().clear();
+
+        let claim = owner.turn(&0).await.expect("the turn");
+        let outcome = owner.pass(&0, &(), claim, Mode::Slack { opens }).await;
+
+        assert!(outcome.concluded.is_none(), "nothing was concluded");
+        assert_eq!(backing.on_disk(), vec![0, 1, 2], "and nothing was taken");
+        assert!(
+            backing.advertised.lock().is_empty(),
+            "the extent was never held back from the swarm"
+        );
+        assert!(
+            owner
+                .holding(&0)
+                .expect("the entity stands")
+                .installed
+                .is_some(),
+            "the policy the open installed stands"
+        );
+    }
+
+    /// **And so does a viewer who opened it before the cell could say so.**
+    ///
+    /// The liveness cell moves for the file being *played*; an open on
+    /// another file of the same torrent while the film is still being read
+    /// is an aside -- a subtitle -- and deliberately moves nothing. There
+    /// is no instant to ask about for one of those: the install has
+    /// finished and the reader is not open yet, so "is it live?" and "is
+    /// anything reading it?" both answer no while a stream is being handed
+    /// out on it.
+    ///
+    /// So the pass compares counts instead of asking again. Every open
+    /// takes this entity's turn ([`Retention::install`]), so an open the
+    /// driver did not see is either in this number or still waiting behind
+    /// the pass -- including one that found the policy already right and
+    /// installed nothing.
+    #[tokio::test]
+    async fn a_slack_pass_takes_nothing_from_an_entity_a_stream_opened_since() {
+        let (backing, owner, _budget) = torrent();
+        *backing.held.lock() = [0, 1, 2].into_iter().collect();
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        owner.note_position(&0, (0, 0));
+        let opens = owner.opens_of(&0);
+        // The aside: an open that changes nothing anybody can ask about.
+        assert_eq!(
+            owner.install(0, 0).await,
+            InstallOutcome::Kept,
+            "the policy was already right for this file and this budget"
+        );
+        assert!(!backing.is_live.load(Ordering::SeqCst));
+        assert_eq!(owner.readers_of(&0), 0);
+        backing.advertised.lock().clear();
+
+        let claim = owner.turn(&0).await.expect("the turn");
+        let outcome = owner.pass(&0, &(), claim, Mode::Slack { opens }).await;
+
+        assert!(outcome.concluded.is_none());
+        assert_eq!(backing.on_disk(), vec![0, 1, 2]);
+        assert!(backing.advertised.lock().is_empty());
+        assert!(owner.holding(&0).unwrap().installed.is_some());
+
+        // With the count the driver read now the current one, the same pass
+        // empties it.
+        let opens = owner.opens_of(&0);
+        let claim = owner.turn(&0).await.expect("the turn");
+        let outcome = owner
+            .pass(&0, &(), claim, Mode::Slack { opens })
+            .await
+            .concluded
+            .expect("a pass that ran");
+        assert_eq!(outcome.reclaimed, 3);
+        assert!(backing.on_disk().is_empty());
+    }
+
+    /// **And a read that opened on it in the same gap.**
+    ///
+    /// An open read is not what makes an entity live, but it is a response
+    /// being delivered out of these bytes, and [`Mode::Slack`] means nobody
+    /// is reading it either. The reader can arrive after the driver counted
+    /// the readers and before the pass takes the turn -- the install and the
+    /// reader are two steps with a backend call between them -- so the
+    /// readers are counted again here.
+    #[tokio::test]
+    async fn a_slack_pass_takes_nothing_from_an_entity_with_a_read_open() {
+        let (backing, owner, _budget) = torrent();
+        *backing.held.lock() = [0, 1, 2].into_iter().collect();
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        let opens = owner.opens_of(&0);
+        let reader = owner.reader_on(&0).expect("the entity the install made");
+        assert!(
+            reader.note((0, 0)).is_none(),
+            "the tick is the torrent's trigger"
+        );
+        backing.advertised.lock().clear();
+
+        let claim = owner.turn(&0).await.expect("the turn");
+        let outcome = owner.pass(&0, &(), claim, Mode::Slack { opens }).await;
+
+        assert!(outcome.concluded.is_none());
+        assert_eq!(backing.on_disk(), vec![0, 1, 2]);
+        assert!(backing.advertised.lock().is_empty());
+
+        // The body ends, and the file nobody is playing is slack again.
+        drop(reader);
+        let claim = owner.turn(&0).await.expect("the turn");
+        assert_eq!(
+            owner
+                .pass(&0, &(), claim, Mode::Slack { opens })
+                .await
+                .concluded
+                .expect("a pass that ran")
+                .reclaimed,
+            3
+        );
+    }
+
+    /// **A pin outranks the slack: nothing of a pinned entity is taken and
+    /// nothing of it is held back.**
+    ///
+    /// A pin is a retention property -- the user asked for those bytes --
+    /// and the slack pass is the one delete in this owner that would take a
+    /// whole extent, so it is also the one that would empty a pinned
+    /// download. Asked before the extent is held back, because the hold-back
+    /// is what a pinned file must not have: a pinned download is shared
+    /// whole.
+    #[tokio::test]
+    async fn a_pinned_entity_is_never_slack() {
+        let (backing, owner, _budget) = torrent();
+        *backing.held.lock() = [0, 1, 2].into_iter().collect();
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        owner.note_position(&0, (0, 0));
+        let opens = owner.opens_of(&0);
+        backing.keeps_everything.store(true, Ordering::SeqCst);
+        backing.advertised.lock().clear();
+
+        let claim = owner.turn(&0).await.expect("the turn");
+        let outcome = owner.pass(&0, &(), claim, Mode::Slack { opens }).await;
+
+        assert!(outcome.concluded.is_none());
+        assert_eq!(backing.on_disk(), vec![0, 1, 2]);
+        assert!(
+            backing.advertised.lock().is_empty(),
+            "a pinned file's pieces are not held back from the swarm"
+        );
+        assert_eq!(
+            backing.listings.load(Ordering::SeqCst),
+            0,
+            "and the pin was found before the disk was read"
+        );
+    }
+
+    /// **A slack pass that could take nothing leaves no window standing.**
+    ///
+    /// The pass drops the policy under the turn whether or not the unlinks
+    /// that follow succeed, and the windows go with it. A window is what
+    /// some pass measured round a head somebody was at; left standing on an
+    /// entity nobody is playing it tells the cleaner's gate that the left
+    /// file's pieces are protected -- which is a piece with two owners'
+    /// protection and neither one's deleter, the shape this slice exists to
+    /// remove.
+    #[tokio::test]
+    async fn a_slack_pass_that_took_nothing_leaves_no_window_standing() {
+        let (backing, owner, _budget) = torrent();
+        *backing.held.lock() = [0, 1, 2].into_iter().collect();
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        owner.note_position(&0, (0, 0));
+        let claim = owner.turn(&0).await.expect("the turn");
+        owner
+            .pass(&0, &(), claim, Mode::Live)
+            .await
+            .concluded
+            .expect("a live pass");
+        assert!(
+            !owner.holding(&0).unwrap().windows.is_empty(),
+            "the live pass concluded a window"
+        );
+
+        // The unlinks die, so the entity survives its own slack pass and
+        // the next tick has to walk it again.
+        backing.reclaim_panics.store(true, Ordering::SeqCst);
+        let opens = owner.opens_of(&0);
+        let claim = owner.turn(&0).await.expect("the turn");
+        assert_eq!(
+            owner
+                .pass(&0, &(), claim, Mode::Slack { opens })
+                .await
+                .concluded
+                .expect("a pass that ran")
+                .reclaimed,
+            0
+        );
+        let holding = owner.holding(&0).expect("the entity still holds its bytes");
+        assert!(holding.installed.is_none(), "the policy went");
+        assert!(
+            holding.windows.is_empty(),
+            "and so did the window it had measured"
+        );
+    }
+
+    /// **An entity a reader is open on is never forgotten, even emptied.**
+    ///
+    /// [`Retention::forget_empty`] prunes on a fact -- it holds nothing and
+    /// nobody is reading it -- and both halves are asked under L1 after the
+    /// pass has let go of its own `Arc`. A [`Reader`] that has delivered
+    /// nothing yet is not in the state's reader map at all: it is a stream
+    /// handed out a moment ago, whose first byte has not gone out, and
+    /// forgetting the entity under it would leave the read with no head and
+    /// so no window for the pass that follows.
+    #[tokio::test]
+    async fn an_emptied_entity_a_reader_holds_is_not_forgotten() {
+        let (backing, owner, _budget) = torrent();
+        *backing.held.lock() = [0, 1, 2].into_iter().collect();
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        let opens = owner.opens_of(&0);
+        let reader = owner.reader_on(&0).expect("the entity the install made");
+        assert_eq!(owner.readers_of(&0), 0, "it has delivered nothing");
+
+        let claim = owner.turn(&0).await.expect("the turn");
+        assert_eq!(
+            owner
+                .pass(&0, &(), claim, Mode::Slack { opens })
+                .await
+                .concluded
+                .expect("a pass that ran")
+                .reclaimed,
+            3
+        );
+        assert!(
+            owner.holding(&0).is_some(),
+            "the entity a stream is being read out of stays"
+        );
+
+        // Once that read is over, the next pass forgets it.
+        drop(reader);
+        let claim = owner.turn(&0).await.expect("the turn");
+        owner.pass(&0, &(), claim, Mode::Slack { opens }).await;
+        assert!(owner.holding(&0).is_none());
     }
 
     /// **A byte of another key moves nothing here, and a listing we do not

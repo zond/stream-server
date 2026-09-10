@@ -9067,11 +9067,19 @@ mod tests {
         );
 
         // **And the switch.** The viewer opens something else, so the file
-        // they left is slack: its whole extent is held back from what we
-        // announce *before* a single unlink, and then every byte of it
-        // goes. The committed half is included -- what a switch ends is the
-        // sharing as well as the keeping -- and the order is what keeps a
-        // peer from ever asking for bytes that are no longer there.
+        // they left is slack and every byte of it goes -- the committed
+        // half included, because what a switch ends is the sharing as well
+        // as the keeping.
+        //
+        // What is asserted here is that end state, in a real session. The
+        // *order* it happens in -- the whole extent held back from what we
+        // announce before a single unlink -- cannot be read from out here,
+        // because a peer cannot take a piece we have already deleted
+        // whichever way round the two calls go: the hold-back's absence
+        // would show as a peer's *request* failing, not as a piece it
+        // gains. That ordering is asserted where it is visible, on the
+        // recorder, by `a_switch_to_the_next_file_makes_the_first_slack_
+        // and_takes_its_bytes`.
         efs.live().open(
             crate::retention::live::LiveEntity::Proxy {
                 dir: tmp.path().join("elsewhere"),
@@ -9091,6 +9099,15 @@ mod tests {
             efs.reconcile_tick().await;
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        // And this is why the order matters: the peer still holds what we
+        // told it about, and there is no un-Have. Every one of those pieces
+        // is one we have now deleted, so from here what protects the peer
+        // from asking us for bytes we do not have is the withdrawal that
+        // went out before the first unlink.
+        assert!(
+            !on_disk(&leecher_store, &hash).is_empty(),
+            "the peer kept what we announced to it, as a peer does"
+        );
     }
 
     /// **The store the factory registers is the one the pass reads, and

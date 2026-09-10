@@ -1289,7 +1289,13 @@ impl<H: TorrentHandle> Engine<H> {
         {
             Mode::Live
         } else {
-            Mode::Slack
+            // The count of opens this reading was taken beside, so the pass
+            // can tell a file nobody has opened from one a viewer started
+            // while this tick was walking the file before it. See
+            // [`Mode::Slack`].
+            Mode::Slack {
+                opens: self.retention.opens_of(&file_idx),
+            }
         }
     }
 
@@ -1392,7 +1398,7 @@ impl<H: TorrentHandle> Engine<H> {
         let slack: Vec<(usize, Mode)> = self
             .files_to_pass(&live)
             .into_iter()
-            .filter(|(_, mode)| *mode == Mode::Slack)
+            .filter(|(_, mode)| matches!(mode, Mode::Slack { .. }))
             .collect();
         let mut total = self.pass_over(store, &slack).await;
         if !self.is_pinned() && !live.is_torrent(&self.info_hash) {

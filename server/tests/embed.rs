@@ -1989,19 +1989,20 @@ fn bitv_files(session_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 
 /// With fastresume on, librqbit persists each torrent's verified-piece
 /// bitfield (`<infoHash>.bitv` beside the session state) instead of
-/// re-hashing every file on every launch: after a complete torrent in the
-/// cache root and a complete pinned one, both bitfields exist, and a
-/// restart brings the pinned torrent back ready and complete with the
-/// bitfields still in place (the `.bitv` + `overwrite: true` combination
-/// librqbit needs to resume on top of existing files). One root, because a
-/// pin is not a place.
+/// re-hashing every file on every launch: after two complete torrents,
+/// both bitfields exist, and a restart brings both back ready and complete
+/// with the bitfields still in place (the `.bitv` + `overwrite: true`
+/// combination librqbit needs to resume on top of existing files). One
+/// root, because a pin is not a place: one torrent is pinned by the file
+/// the user asked for, the other whole, and neither moves a byte.
 ///
-/// The streamed torrent's own data does **not** survive, and asserting that
-/// it did is what this test used to do: nothing is playing it and nothing
-/// pinned it, so the retention owner takes its bytes back while the first
-/// process runs. What has to survive it is the bitfield file and the pin,
-/// which is what the assertions below are about -- a pinned download is
-/// kept until it is unpinned, and everything else is cache.
+/// Both are pinned, and the second one is pinned *for the fixture*: this
+/// test is about fastresume and not about retention, and a torrent nobody
+/// is playing and nobody has pinned is one the owner empties within a tick
+/// -- an emptied torrent is not a complete one, and a bitfield read back
+/// against no data says nothing about fastresume. What is being kept
+/// apart here is the pin's shape, not the pin: pinned per file, and pinned
+/// whole.
 #[test]
 fn fastresume_persists_piece_bitfields_for_a_pinned_torrent_too() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -2048,6 +2049,10 @@ fn fastresume_persists_piece_bitfields_for_a_pinned_torrent_too() -> anyhow::Res
     let stats = stats_after_check(&client, &base, &streamed_hash)?;
     assert_eq!(stats["files"][0]["complete"], true, "{stats}");
     assert_eq!(stats["files"][1]["complete"], true, "{stats}");
+    // Every file of it, so the whole torrent is kept: see the note above.
+    for idx in 0..2 {
+        handle.pin_download(&streamed_hash, idx, &[])?;
+    }
 
     // A pin by hash needs the metadata: /create supplies it. Nothing about
     // the pin is a location -- the torrent stays where librqbit has it and
@@ -2085,11 +2090,14 @@ fn fastresume_persists_piece_bitfields_for_a_pinned_torrent_too() -> anyhow::Res
     handle.join()?;
 
     // Restart: both torrents come back from the session with their
-    // bitfields, and the pinned one comes back ready and complete.
+    // bitfields, ready and complete.
     let handle = stream_server::start(config())?;
     let base = format!("http://{}", handle.http_addr());
     let client = bearer_client(&handle)?;
-    stats_after_check(&client, &base, &streamed_hash)?;
+    let stats = stats_after_check(&client, &base, &streamed_hash)?;
+    assert_eq!(stats["phase"], "ready", "{stats}");
+    assert_eq!(stats["files"][0]["complete"], true, "{stats}");
+    assert_eq!(stats["files"][1]["complete"], true, "{stats}");
     // The pinned file's own stats, not the torrent's: only the pinned file
     // was ever seeded, and torrent-wide `phase` describes whichever file
     // the stream guess picks -- the other one, in half the file orders
@@ -2107,6 +2115,7 @@ fn fastresume_persists_piece_bitfields_for_a_pinned_torrent_too() -> anyhow::Res
     // store, and the restart read the bitfields against those.
     assert!(!session_dir.join("Pinned").join("p2.bin").exists());
     assert!(!session_dir.join("Streamed").exists());
+    assert!(pieces_held(&cache_root, &streamed_hash) > 0);
     assert!(pieces_held(&cache_root, &pinned_hash) > 0);
 
     handle.shutdown()?;
@@ -3781,12 +3790,19 @@ fn an_archive_body_keeps_its_torrent_running_while_it_is_open() -> anyhow::Resul
 /// stream opening, and from that moment the torrent behind the archive is
 /// one nobody is playing: stopped, and its cache the retention owner's.
 ///
-/// This used to be driven by the idle arm, and its subject was the
-/// `on_stream_end` that `TorrentMemberStream::drop` spawns. That subject
-/// has no oracle left out here: the registers it writes are the activity
-/// light's and the housekeeping sweep's, and nothing the reconciler reads
-/// comes from them. What is left is the pair of readings either side of the
-/// switch, which is the policy a viewer can actually see.
+/// So there are two claims here, and the second is the one that is easy to
+/// leave out of the code. The first is the switch: the pair of readings
+/// either side of it, which is the policy a viewer can see. The second is
+/// still `TorrentMemberStream::drop`'s spawned `on_stream_end` -- a `Drop`
+/// cannot await the async locks itself -- and without it every archive
+/// member ever read leaves a stream registered for the life of the process.
+/// That no longer stops the reconciler from doing anything (what it reads
+/// is the cell), so the oracle for it is the register itself, on the wire
+/// the embedder reads it off: `background_traffic().playing` is
+/// `enginefs::EngineFS::playback_is_live`, which is the open file readers
+/// **or** the stream registrations. The reader goes with the body either
+/// way, so a light that goes out when the body ends is one where the
+/// registration was ended too.
 #[test]
 fn an_archive_member_read_lets_the_torrent_be_stopped_again_when_it_is_done() -> anyhow::Result<()>
 {
@@ -3838,6 +3854,19 @@ fn an_archive_member_read_lets_the_torrent_be_stopped_again_when_it_is_done() ->
         "the read left the torrent running, and stopping reading is not \
          playing something else"
     );
+
+    // The body is over, so the registration it made is over: the drop
+    // spawns the `on_stream_end` that ends it, and nothing else ever will.
+    // Bounded rather than immediate because that end is spawned.
+    let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
+    while handle.background_traffic()?.playing {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the finished archive read left a stream registered: this \
+             server still says a player is reading from it"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 
     // The viewer moves on: the second torrent is the one being played now.
     anonymous

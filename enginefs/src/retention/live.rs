@@ -170,11 +170,6 @@ impl Reading {
         Self(Some(entity))
     }
 
-    /// Whether the entity being played is this one.
-    pub fn is(&self, entity: &LiveEntity) -> bool {
-        self.0.as_ref() == Some(entity)
-    }
-
     /// Whether some file of `info_hash` is the entity being played.
     pub fn is_torrent(&self, info_hash: &str) -> bool {
         self.file_of(info_hash).is_some()
