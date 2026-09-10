@@ -312,14 +312,34 @@ pub const STOPPED_FOR_SPACE_MESSAGE: &str =
 /// see [`Engine::standing`], which is the one place it is computed.
 pub(crate) struct Standing {
     pub gate: crate::retention::TorrentGate,
-    /// The file whose policy answered, if a policy did: the boundary
-    /// narrowing ([`crate::retention::this_files_alone`]) needs a file to
-    /// narrow by, and the cleaner's delete needs a turn to take.
-    pub policy_file: Option<usize>,
+    /// Every policy standing on this torrent, in file order, from the one
+    /// copy-out the gate was built from -- whatever the gate's shape, so a
+    /// delete can find the turn a piece is ordered under even where the pin
+    /// or the error state answered for the torrent. Empty when none stands.
+    pub policies: Vec<FileStanding>,
     /// The backend stopped this torrent for want of space, or the
     /// reconciler did before the backend could: the cleaner has bytes to
     /// find for it.
     pub stopped_for_space: bool,
+}
+
+/// One file's standing policy, as a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileStanding {
+    /// The file the policy is over -- the key its turn is taken under.
+    pub file_idx: usize,
+    /// The policy itself.
+    pub view: InstalledView,
+}
+
+/// The file whose standing policy governs `piece`: the lowest-numbered of
+/// those whose range holds it, so the boundary piece two files share is
+/// always the first file's to order. `None` when no policy's range holds it.
+fn file_governing(policies: &[FileStanding], piece: u32) -> Option<usize> {
+    policies
+        .iter()
+        .find(|policy| policy.view.pieces.contains(&piece))
+        .map(|policy| policy.file_idx)
 }
 
 /// How far ahead of its opening offset a reader may fetch, as
@@ -1271,22 +1291,32 @@ impl<H: TorrentHandle> Engine<H> {
         RetentionBound { forward_bytes }
     }
 
-    /// The file whose policy bounds this torrent right now, and the policy
-    /// as a value, or `None` while nothing bounds it.
+    /// Every policy standing on this torrent, in file order, from one
+    /// copy-out under the owner's locks; no I/O. Empty while nothing bounds
+    /// it.
     ///
     /// One file at most has a policy installed -- [`Retention::install`]
     /// clears every other before it installs, and installs are ordered over
     /// the owner so two opens on different files cannot each miss the
-    /// other -- so the first holding with one is the torrent's. The one way
-    /// two can stand is a sibling whose range the backend would not take
-    /// back at its retiring (`retire_siblings` warns and goes on); the map's
-    /// first answers then, until a later install can retire it. A copy-out
-    /// under the owner's locks, no I/O.
-    fn bounded(&self) -> Option<(usize, InstalledView)> {
-        self.retention
+    /// other. The one way two can stand is a sibling whose range the
+    /// backend would not take back at its retiring (`retire_siblings` warns
+    /// and goes on), and then both are here: a reading that kept the first
+    /// the map listed answered for a different file from one call to the
+    /// next, called the other file's held-back pieces announced, and had
+    /// the delete take that one file's turn for a request about both.
+    fn standing_policies(&self) -> Vec<FileStanding> {
+        let mut policies: Vec<FileStanding> = self
+            .retention
             .holdings()
             .into_iter()
-            .find_map(|(file_idx, holding)| holding.installed.map(|view| (file_idx, view)))
+            .filter_map(|(file_idx, holding)| {
+                holding
+                    .installed
+                    .map(|view| FileStanding { file_idx, view })
+            })
+            .collect();
+        policies.sort_by_key(|policy| policy.file_idx);
+        policies
     }
 
     /// One retention pass: what the policy makes of where the playhead is
@@ -1320,7 +1350,10 @@ impl<H: TorrentHandle> Engine<H> {
         ) {
             return None;
         }
-        let (file_idx, _) = self.bounded()?;
+        // The lowest-numbered file with a policy standing: the one there is,
+        // or the same one of two on every tick rather than whichever the
+        // map listed first that time.
+        let file_idx = self.standing_policies().first()?.file_idx;
         let claim = self.retention.turn(&file_idx).await?;
         let concluded = self
             .retention
@@ -1363,14 +1396,20 @@ impl<H: TorrentHandle> Engine<H> {
     /// policy's protection meanwhile and is named to the cleaner separately
     /// ([`Standing::stopped_for_space`]).
     ///
-    /// The policy's half is read off the owner's live cell, so a pass in
+    /// The policies' half is read off the owner's live cells, so a pass in
     /// flight answers `Policy` with the committed set as the pass has
-    /// advanced it, never "no policy".
+    /// advanced it, never "no policy" -- and every standing policy is in
+    /// the answer, in file order, so two callers reading the same cells get
+    /// the same gate and the same files.
     pub(crate) async fn standing(&self) -> Standing {
+        // One copy-out for the gate and the files: a gate built from one
+        // reading and files listed from another could name a turn the gate
+        // was not built under.
+        let policies = self.standing_policies();
         if self.is_pinned() {
             return Standing {
                 gate: crate::retention::TorrentGate::Announced,
-                policy_file: None,
+                policies,
                 stopped_for_space: false,
             };
         }
@@ -1379,27 +1418,28 @@ impl<H: TorrentHandle> Engine<H> {
         if !stopped_for_space && self.handle.is_in_error_state().await {
             return Standing {
                 gate: crate::retention::TorrentGate::Nothing,
-                policy_file: None,
+                policies,
                 stopped_for_space,
             };
         }
-        // The two come out of one copy-out because they are one policy's: a
-        // caller that asked twice could find itself narrowing one file's
-        // reclaim by the boundaries of the file a `begin_retention` in
-        // between had moved to.
-        let (gate, policy_file) = match self.bounded() {
-            Some((file_idx, installed)) => (
-                crate::retention::TorrentGate::Policy {
-                    pieces: installed.pieces,
-                    committed: installed.committed,
-                },
-                Some(file_idx),
-            ),
-            None => (crate::retention::TorrentGate::Announced, None),
+        let gate = if policies.is_empty() {
+            crate::retention::TorrentGate::Announced
+        } else {
+            crate::retention::TorrentGate::Policy(
+                policies
+                    .iter()
+                    .map(|policy| crate::retention::FilePolicy {
+                        file_idx: policy.file_idx,
+                        pieces: policy.view.pieces.clone(),
+                        committed: policy.view.committed.clone(),
+                        live: true,
+                    })
+                    .collect(),
+            )
         };
         Standing {
             gate,
-            policy_file,
+            policies,
             stopped_for_space,
         }
     }
@@ -1426,66 +1466,94 @@ impl<H: TorrentHandle> Engine<H> {
     /// [`crate::retention::this_files_alone`] is asked here as well as in
     /// the pass, and for the same reason: unlinking a piece a still-wanted
     /// neighbour owns is a refetch loop, whichever caller does it.
+    ///
+    /// **One turn per file, and the file is the piece's.** The pieces are
+    /// grouped by the policy whose range holds them, and each group is
+    /// released under that file's turn, one file after another, with the
+    /// question asked again under each. Taking one turn for the whole
+    /// request was the value read once and trusted later: with two policies
+    /// standing the turn held was one file's and the gate answered for
+    /// whichever the map listed, so the other file's held-back pieces were
+    /// refused as announced -- and which file's, by the map's order.
+    /// A piece no policy's range holds is released under no turn, because
+    /// nothing orders it: only the error state's gate gives such a piece up.
     pub(crate) async fn release_reclaimable(
         &self,
         store: &Arc<StoreRegistry>,
         pieces: &[u32],
     ) -> usize {
-        // The turn is per file, and the file is the one whose policy will
-        // answer. Taken before the asking, held across the unlink: a pass
-        // on that file cannot commit a piece between this reading and its
-        // release. A torrent with no policy has no turn to take and nothing
-        // that could advertise under it but an install, whose hold-back
-        // makes a piece less announced, not more.
-        let key = self.bounded().map(|(file_idx, _)| file_idx);
-        let _turn = match key {
-            Some(file_idx) => self.retention.turn(&file_idx).await,
-            None => None,
-        };
-        // The cleaner's question, asked again at the door: what the walk
-        // collected was a reading, and this is the asking that decides.
-        //
-        // The same question, from `standing`, and not a narrower one. This
-        // used to filter only where a policy was in the slot and take
-        // everything the cleaner named otherwise, on the argument that a
-        // torrent with no policy had no opinion the cleaner did not already
-        // have. But the cleaner's own rule already refuses every piece of a
-        // torrent that announces everything, so the only way it comes to
-        // ask for one is a reading that went stale on the way here: a reader
-        // opened on the torrent since the walk (which found no engine and
-        // called its bytes cache), a pin was taken since, or the policy
-        // that released the piece was cleared since. Taking the piece then
-        // was the advertise-then-refuse the gate exists to prevent, on
-        // exactly the torrents a reader has just opened -- and the delete
-        // of a download the user had just pinned.
-        //
-        // The case a policy narrows still lands inside this: the reader
-        // moving to another file installs a policy for *that* file, and
-        // piece 0 of the file it left is outside the new range, so the
-        // verdict refuses it. So does a piece the pass has committed since.
-        let standing = self.standing().await;
-        if let Some(file_idx) = standing.policy_file
-            && Some(file_idx) != key
-        {
-            // The policy moved to another file between the reading the turn
-            // was taken on and this one, so the turn in hand is not the one
-            // that orders that file's passes: nothing is taken on a policy
-            // whose turn we do not hold. The cleaner's next walk asks again.
-            tracing::debug!(
-                info_hash = %self.info_hash,
-                file_idx,
-                "the policy moved to another file under the cleaner's delete; taking nothing"
-            );
-            return 0;
+        // The grouping reading. It decides which turns are taken and
+        // nothing else; what is taken is decided under each.
+        let policies = self.standing().await.policies;
+        let mut by_file: std::collections::BTreeMap<Option<usize>, Vec<u32>> =
+            std::collections::BTreeMap::new();
+        for piece in pieces {
+            by_file
+                .entry(file_governing(&policies, *piece))
+                .or_default()
+                .push(*piece);
         }
+        let mut freed = 0;
+        for (file, group) in by_file {
+            // The turn is per file, and the file is the one whose policy
+            // holds the piece. Taken before the asking, held across the
+            // unlink: a pass on that file cannot commit a piece between
+            // this reading and its release. A piece in no policy's range
+            // has no turn to take and nothing that could advertise it but
+            // an install, whose hold-back makes a piece less announced, not
+            // more.
+            let _turn = match file {
+                Some(file_idx) => self.retention.turn(&file_idx).await,
+                None => None,
+            };
+            freed += self.release_under_turn(store, file, &group).await;
+        }
+        freed
+    }
+
+    /// The cleaner's question, asked again at the door for one group of
+    /// pieces, with the turn of `file` (the policy whose range held them at
+    /// the grouping) in hand; `None` is the group no policy held.
+    ///
+    /// The same question as `standing`, and not a narrower one. This used to
+    /// filter only where a policy was in the slot and take everything the
+    /// cleaner named otherwise, on the argument that a torrent with no
+    /// policy had no opinion the cleaner did not already have. But the
+    /// cleaner's own rule already refuses every piece of a torrent that
+    /// announces everything, so the only way it comes to ask for one is a
+    /// reading that went stale on the way here: a reader opened on the
+    /// torrent since the walk (which found no engine and called its bytes
+    /// cache), a pin was taken since, or the policy that released the piece
+    /// was cleared since. Taking the piece then was the advertise-then-refuse
+    /// the gate exists to prevent, on exactly the torrents a reader has just
+    /// opened -- and the delete of a download the user had just pinned.
+    ///
+    /// And a piece the gate still releases is taken only if the policy that
+    /// holds it now is the one whose turn this is: a policy that moved to
+    /// another file between the grouping and this turn -- the reader went
+    /// to the next episode, and its boundary piece is in the new range --
+    /// is ordered by a turn not held here, and nothing is taken on it. The
+    /// cleaner's next walk asks again.
+    async fn release_under_turn(
+        &self,
+        store: &Arc<StoreRegistry>,
+        file: Option<usize>,
+        pieces: &[u32],
+    ) -> usize {
+        let standing = self.standing().await;
         let mut still: Vec<u32> = pieces
             .iter()
             .copied()
-            .filter(|piece| standing.gate.releases(*piece))
+            .filter(|piece| {
+                standing.gate.releases(*piece)
+                    && (matches!(standing.gate, crate::retention::TorrentGate::Nothing)
+                        || file_governing(&standing.policies, *piece) == file)
+            })
             .collect();
         if still.len() != pieces.len() {
             tracing::debug!(
                 info_hash = %self.info_hash,
+                file,
                 asked = pieces.len(),
                 taking = still.len(),
                 "the cleaner's reading of this torrent went stale before its delete"
@@ -1499,7 +1567,7 @@ impl<H: TorrentHandle> Engine<H> {
         // cleaner's delete starts the refetch loop the pass no longer
         // starts. Only a policy has a file to narrow by; where there is
         // none this engine already has no opinion.
-        if let Some(file_idx) = standing.policy_file {
+        if let (Some(file_idx), crate::retention::TorrentGate::Policy(_)) = (file, &standing.gate) {
             still = crate::retention::this_files_alone(&self.handle, file_idx, &still).await;
         }
         let mut freed = 0;

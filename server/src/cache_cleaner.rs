@@ -2224,7 +2224,15 @@ mod tests {
         // and 3. Everything else of it is window or read-ahead: held,
         // readable, announced to nobody.
         let mut gate = ReclaimGate::default();
-        gate.insert_policy(HASH.to_string(), 0..6, [2, 3].into_iter().collect());
+        gate.insert_policy(
+            HASH.to_string(),
+            vec![enginefs::retention::FilePolicy {
+                file_idx: 0,
+                pieces: 0..6,
+                committed: [2, 3].into_iter().collect(),
+                live: true,
+            }],
+        );
 
         // Room for two pieces, so the size rule wants four gone and the
         // only thing deciding *which* four is the gate.

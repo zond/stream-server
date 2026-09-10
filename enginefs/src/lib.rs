@@ -12968,6 +12968,201 @@ mod tests {
         assert!(gate.releases(&hash, 1), "held back, so reclaimable");
     }
 
+    /// **Two policies standing, and the cleaner is told about both -- the
+    /// same both, every time it asks -- and its delete holds the right
+    /// file's turn.**
+    ///
+    /// One policy stands at most while the owner orders its installs, and
+    /// the one way two can is a sibling whose range the backend would not
+    /// take back at its retiring: the install warns and goes on, and holds
+    /// the new file's range back beside the old one's. The engine's answer
+    /// to the cleaner was then read off whichever holding the owner's map
+    /// listed first -- the other file's held-back pieces called announced
+    /// and never reclaimed, and which file that was a property of the map's
+    /// order at that call. And the delete took that one file's turn for a
+    /// request about both files' pieces (issue c). Every standing policy is
+    /// in the answer now, in file order,
+    /// and the delete groups its pieces by the policy that holds them and
+    /// takes each file's own turn.
+    ///
+    /// The refusal is staged: the sibling's re-advertise is parked, refused
+    /// on release, and the new file's hold-back -- the next call -- parked
+    /// and allowed. The turn half holds file 1's turn from the test: the
+    /// delete frees file 0's piece under file 0's free turn and waits for
+    /// file 1's, and takes file 1's piece only once it is let go.
+    #[tokio::test]
+    async fn two_standing_policies_are_both_reported_and_each_is_deleted_under_its_own_turn() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        // Twenty-five byte pieces: file 0 is pieces 0..4, file 1 is 4..8.
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+
+        // File 0 plays, and two passes commit its piece 0 (the fixture of
+        // `a_pass_aborted_in_flight_leaves_the_policy_standing_and_the_next_pass_runs`).
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
+        let store = seeded_store(&enginefs, &engine);
+        engine.note_playhead(0, 0);
+        engine.begin_retention(0).await;
+        engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass");
+        std::fs::write(bucket.join("1"), [7u8; 25]).unwrap();
+        store.init_for_tests().unwrap();
+        engine.note_playhead(0, 25);
+        engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass");
+        assert_eq!(
+            engine
+                .retention
+                .holding(&0)
+                .expect("file 0 has an entity")
+                .installed
+                .expect("and a policy")
+                .committed,
+            [0].into_iter().collect::<std::collections::BTreeSet<u32>>(),
+            "the second pass committed the piece the window moved off"
+        );
+
+        // The viewer opens file 1. The backend will not have file 0's range
+        // back when the install asks, and will hold file 1's back a moment
+        // later: two policies stand.
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *counters.advertise_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        let install = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.begin_retention(1).await }
+        });
+        tokio::time::timeout(Duration::from_secs(10), entered_rx)
+            .await
+            .expect("the install reached the call that gives file 0's range back")
+            .expect("the fake said so");
+        counters.refuses_advertise.store(true, Ordering::SeqCst);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_again_tx, release_rx) = tokio::sync::oneshot::channel();
+        *counters.advertise_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        release_tx.send(()).expect("the install is waiting on this");
+        tokio::time::timeout(Duration::from_secs(10), entered_rx)
+            .await
+            .expect("the install went on to the call that holds file 1's range back")
+            .expect("the fake said so");
+        counters.refuses_advertise.store(false, Ordering::SeqCst);
+        release_again_tx
+            .send(())
+            .expect("the install is waiting on this");
+        install.await.expect("the install's task");
+        assert_eq!(
+            *counters.advertised.lock().unwrap(),
+            vec![(0..4, false), (0..1, true), (4..8, false)],
+            "file 0 held back and its piece 0 committed; its retiring refused; file 1 held back"
+        );
+
+        // Both are reported, in file order, and the same way every time.
+        let first = engine.standing().await;
+        let files = |standing: &crate::engine::Standing| -> Vec<usize> {
+            standing
+                .policies
+                .iter()
+                .map(|policy| policy.file_idx)
+                .collect()
+        };
+        let policies = |standing: &crate::engine::Standing| -> Vec<crate::retention::FilePolicy> {
+            match &standing.gate {
+                crate::retention::TorrentGate::Policy(policies) => policies.clone(),
+                other => panic!("two policies stand, and the gate says {other:?}"),
+            }
+        };
+        assert_eq!(
+            files(&first),
+            vec![0, 1],
+            "every standing policy, in file order"
+        );
+        assert_eq!(
+            policies(&first)
+                .iter()
+                .map(|policy| (policy.file_idx, policy.pieces.clone()))
+                .collect::<Vec<_>>(),
+            vec![(0, 0..4), (1, 4..8)]
+        );
+        for _ in 0..20 {
+            let again = engine.standing().await;
+            assert_eq!(files(&again), files(&first));
+            assert_eq!(policies(&again), policies(&first));
+        }
+        assert!(
+            !first.gate.releases(0),
+            "file 0's committed piece is refused, whatever else stands"
+        );
+        assert!(first.gate.releases(1), "file 0's uncommitted piece may go");
+        assert!(first.gate.releases(5), "and so may file 1's");
+
+        // The cleaner's delete asks for a piece of each file and the
+        // committed one, while a pass holds file 1's turn.
+        std::fs::write(bucket.join("5"), [7u8; 25]).unwrap();
+        store.init_for_tests().unwrap();
+        let holding_file_1 = engine
+            .retention
+            .turn(&1)
+            .await
+            .expect("file 1 has an entity");
+        let mut delete = tokio::spawn({
+            let engine = engine.clone();
+            let registry = enginefs.store_registry().clone();
+            async move { engine.release_reclaimable(&registry, &[0, 1, 5]).await }
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while bucket.join("1").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("file 0's piece went under file 0's own turn, which nothing holds");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut delete)
+                .await
+                .is_err(),
+            "the delete waits: file 1's piece is ordered by file 1's turn"
+        );
+        assert!(
+            bucket.join("5").is_file(),
+            "and file 1's piece stays until that turn is had"
+        );
+        assert!(bucket.join("0").is_file(), "the committed piece stays");
+
+        drop(holding_file_1);
+        assert_eq!(
+            delete.await.expect("the delete task"),
+            2,
+            "one piece of each file went, and the committed one did not"
+        );
+        assert!(!bucket.join("5").exists());
+        assert!(bucket.join("0").is_file());
+        let asked: Vec<std::ops::Range<u32>> = counters
+            .dropped_ranges
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(range, _)| range.clone())
+            .collect();
+        assert!(
+            !asked.contains(&(0..1)),
+            "the backend was never asked to forget the committed piece: {asked:?}"
+        );
+        assert!(
+            asked.contains(&(1..2)) && asked.contains(&(5..6)),
+            "{asked:?}"
+        );
+    }
+
     /// A hash the session runs no torrent for has no have-set for a
     /// deletion to disagree with, so its pieces go straight to the store.
     ///

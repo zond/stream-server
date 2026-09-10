@@ -577,13 +577,34 @@ pub enum TorrentGate {
     /// the next start rebuilds it by asking the storage. Every piece may
     /// go, and before any other cache: nothing will ever read these bytes.
     Nothing,
-    /// A policy governs `pieces` of it. Inside that range only what the
-    /// policy has committed is announced; outside it the torrent still
-    /// announces everything it has.
-    Policy {
-        pieces: Range<u32>,
-        committed: BTreeSet<u32>,
-    },
+    /// Policies govern some of its files -- every one that stands, in file
+    /// order. Inside a policy's range only what a live policy has committed
+    /// is announced; a piece in no policy's range the torrent still
+    /// announces.
+    ///
+    /// Every standing policy, not the first the owner's map happened to
+    /// list: two can stand on one torrent (a sibling whose range the
+    /// backend would not take back at its retiring), and a gate built from
+    /// one of them called the other file's held-back pieces announced --
+    /// protected and shared with nobody, the one combination that is never
+    /// right -- which file depending on the map's order at that call.
+    Policy(Vec<FilePolicy>),
+}
+
+/// One file's standing policy, as the gate reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilePolicy {
+    /// The file the policy is over.
+    pub file_idx: usize,
+    /// The pieces it governs.
+    pub pieces: Range<u32>,
+    /// What it has committed: advertised, and never to be reclaimed while
+    /// the policy is live.
+    pub committed: BTreeSet<u32>,
+    /// Whether the policy is a live one, whose committed pieces are
+    /// announced and so refused. A policy that is not live commits nothing
+    /// the gate need protect: its pieces are on their way out whole.
+    pub live: bool,
 }
 
 impl TorrentGate {
@@ -592,8 +613,18 @@ impl TorrentGate {
         match self {
             Self::Nothing => true,
             Self::Announced => false,
-            Self::Policy { pieces, committed } => {
-                pieces.contains(&piece) && !committed.contains(&piece)
+            Self::Policy(policies) => {
+                let governed = policies
+                    .iter()
+                    .filter(|policy| policy.pieces.contains(&piece))
+                    .collect::<Vec<_>>();
+                // In no policy's range it is announced like any piece of a
+                // torrent with no policy. In some, every live policy that
+                // committed it has told a peer about it.
+                !governed.is_empty()
+                    && !governed
+                        .iter()
+                        .any(|policy| policy.live && policy.committed.contains(&piece))
             }
         }
     }
@@ -627,16 +658,11 @@ impl ReclaimGate {
         self.insert(info_hash, TorrentGate::Nothing);
     }
 
-    /// A policy governs `pieces` of this torrent and has committed
-    /// `committed` of them; the rest of that range may go, and everything
-    /// outside it is still announced.
-    pub fn insert_policy(
-        &mut self,
-        info_hash: String,
-        pieces: Range<u32>,
-        committed: BTreeSet<u32>,
-    ) {
-        self.insert(info_hash, TorrentGate::Policy { pieces, committed });
+    /// The policies standing on this torrent's files, every one of them:
+    /// inside their ranges what a live one has committed stays, the rest
+    /// may go, and everything outside every range is still announced.
+    pub fn insert_policy(&mut self, info_hash: String, policies: Vec<FilePolicy>) {
+        self.insert(info_hash, TorrentGate::Policy(policies));
     }
 
     /// Whether the policy will give this piece up.
@@ -765,7 +791,15 @@ mod tests {
         let mut gate = ReclaimGate::default();
         gate.insert_announced("aa".into());
         gate.insert_dead("bb".into());
-        gate.insert_policy("cc".into(), 10..20, [12, 13].into_iter().collect());
+        gate.insert_policy(
+            "cc".into(),
+            vec![FilePolicy {
+                file_idx: 0,
+                pieces: 10..20,
+                committed: [12, 13].into_iter().collect(),
+                live: true,
+            }],
+        );
 
         assert!(gate.releases("nobody", 0), "cache with no owner goes");
         assert!(!gate.releases("aa", 0), "what we announce stays");
@@ -778,6 +812,73 @@ mod tests {
         assert!(
             !gate.releases("cc", 25),
             "outside the policy's file, so still announced whole"
+        );
+    }
+
+    /// Two policies on one torrent, and the gate answers for both.
+    ///
+    /// The gate used to carry one policy per torrent -- whichever holding
+    /// the owner's map listed first -- so with two standing, one file's
+    /// committed pieces were cache and the other file's held-back pieces
+    /// were announced, and which file got which answer changed from one
+    /// call to the next (issue c). Every standing policy is in the gate
+    /// now, and a piece is refused if any live one committed it, including
+    /// the boundary piece two files share.
+    #[test]
+    fn a_gate_over_two_policies_protects_what_either_committed() {
+        let mut gate = ReclaimGate::default();
+        gate.insert_policy(
+            "cc".into(),
+            vec![
+                FilePolicy {
+                    file_idx: 0,
+                    pieces: 0..5,
+                    committed: [1].into_iter().collect(),
+                    live: true,
+                },
+                FilePolicy {
+                    file_idx: 1,
+                    pieces: 4..9,
+                    committed: [4, 7].into_iter().collect(),
+                    live: true,
+                },
+            ],
+        );
+        assert!(
+            !gate.releases("cc", 1),
+            "committed by the first file's policy"
+        );
+        assert!(!gate.releases("cc", 7), "committed by the second file's");
+        assert!(
+            !gate.releases("cc", 4),
+            "the piece both govern is refused because the second committed it"
+        );
+        assert!(gate.releases("cc", 0), "in the first's range, uncommitted");
+        assert!(gate.releases("cc", 8), "in the second's range, uncommitted");
+        assert!(
+            gate.releases("cc", 3),
+            "and so is the shared boundary nobody committed"
+        );
+        assert!(
+            !gate.releases("cc", 9),
+            "in neither range, so announced like a torrent with no policy"
+        );
+
+        // A policy that is not live protects nothing it committed: its
+        // pieces are on their way out whole.
+        let mut gate = ReclaimGate::default();
+        gate.insert_policy(
+            "dd".into(),
+            vec![FilePolicy {
+                file_idx: 0,
+                pieces: 0..5,
+                committed: [1].into_iter().collect(),
+                live: false,
+            }],
+        );
+        assert!(
+            gate.releases("dd", 1),
+            "committed, but by a policy that is not live"
         );
     }
 
