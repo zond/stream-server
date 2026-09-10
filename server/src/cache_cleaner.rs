@@ -115,6 +115,46 @@ fn ring_doorbell(doorbell: &mpsc::Sender<()>, res: Result<Event, notify::Error>)
     }
 }
 
+/// Which thread last ran [`watch_tree`]'s walk: the probe for the test
+/// that pins it to the blocking pool.
+#[cfg(test)]
+static WATCHED_ON: std::sync::Mutex<Option<std::thread::ThreadId>> = std::sync::Mutex::new(None);
+
+/// Watch `dir` and everything under it, from the blocking pool.
+///
+/// notify's recursive `watch` is a walk of the whole tree with one
+/// `inotify_add_watch` per directory -- a bucket per thousand pieces of
+/// every torrent in the cache, plus every proxy entity -- and it ran on the
+/// runtime thread, at startup, which is when the app is opening its first
+/// stream against the same reactor. The watcher moves into the pool for the
+/// walk and comes back out; `None` means the pool would not answer (the
+/// walk panicked) and the watcher is gone with it, which leaves the fallback
+/// poll as the only trigger. The `bool` is whether the watch took.
+async fn watch_tree(
+    mut watcher: RecommendedWatcher,
+    dir: std::path::PathBuf,
+) -> (Option<RecommendedWatcher>, bool) {
+    let walked = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        {
+            *WATCHED_ON.lock().unwrap() = Some(std::thread::current().id());
+        }
+        let took = match watcher.watch(&dir, RecursiveMode::Recursive) {
+            Ok(()) => true,
+            Err(e) => {
+                debug!("Could not watch {:?}: {}", dir, e);
+                false
+            }
+        };
+        (watcher, took)
+    })
+    .await;
+    match walked {
+        Ok((watcher, took)) => (Some(watcher), took),
+        Err(_) => (None, false),
+    }
+}
+
 pub fn start(state: Arc<AppState>) -> JoinHandle<()> {
     tokio::spawn(async move {
         debug!("Cache cleaner started");
@@ -125,7 +165,7 @@ pub fn start(state: Arc<AppState>) -> JoinHandle<()> {
         // Setup Watcher
         // We use a sync watcher bridge to async channel
         let tx_clone = tx.clone();
-        let mut watcher = match RecommendedWatcher::new(
+        let watcher = match RecommendedWatcher::new(
             move |res: Result<Event, notify::Error>| ring_doorbell(&tx_clone, res),
             notify::Config::default(),
         ) {
@@ -136,12 +176,15 @@ pub fn start(state: Arc<AppState>) -> JoinHandle<()> {
             }
         };
 
-        // Initial watch
-        // We might need to retry if directory doesn't exist yet
+        // Initial watch. The directory may not exist yet, in which case the
+        // fallback tick below tries again.
         let download_dir = state.engine.download_dir.clone();
-        if let Err(e) = watcher.watch(&download_dir, RecursiveMode::Recursive) {
-            warn!("Failed to watch download dir {:?}: {}", download_dir, e);
-            // We will try to re-watch inside the loop if needed (omitted for brevity, relying on fallback poll)
+        let (mut watcher, mut watching) = watch_tree(watcher, download_dir.clone()).await;
+        if !watching {
+            warn!(
+                "Failed to watch download dir {:?}; relying on the fallback poll",
+                download_dir
+            );
         }
 
         // Fallback poll for a cache nothing is writing to (the first tick
@@ -165,9 +208,13 @@ pub fn start(state: Arc<AppState>) -> JoinHandle<()> {
                     if let Err(e) = clean_cache(&state).await {
                         error!("Cache cleaner error: {}", e);
                     }
-                    // Re-ensure watch if needed
-                    if let Err(e) = watcher.watch(&download_dir, RecursiveMode::Recursive) {
-                        debug!("Retry watch {:?}: {}", download_dir, e);
+                    // A watch that never took -- the directory was not there
+                    // at startup -- is tried again. One that took is left
+                    // alone: notify's `watch` walks the whole tree to add
+                    // one inotify watch per directory, and that walk was
+                    // repeated on every tick for no change.
+                    if !watching && let Some(taken) = watcher.take() {
+                        (watcher, watching) = watch_tree(taken, download_dir.clone()).await;
                     }
                 }
 
@@ -1407,8 +1454,8 @@ async fn remove_empty_parents(mut dir: &std::path::Path, keep: &std::path::Path)
 mod tests {
     use super::{
         CACHE_FREE_SPACE_FLOOR, CacheLimit, CleanSchedule, DiskFullRecovery, Event, EvictionReport,
-        LastEviction, WALKED_ON_THIS_THREAD, WalkInputs, evict, is_session_artifact, mpsc,
-        occupied_bytes, remove_empty_parents, ring_doorbell, scan_usage,
+        LastEviction, WALKED_ON_THIS_THREAD, WATCHED_ON, WalkInputs, evict, is_session_artifact,
+        mpsc, occupied_bytes, remove_empty_parents, ring_doorbell, scan_usage, watch_tree,
     };
     use enginefs::piece_store::{FileSpec, PieceLayout, PieceStore, StoreRoot};
     use enginefs::retention::ReclaimGate;
@@ -3102,6 +3149,38 @@ mod tests {
             last.get().map(|(_, kept)| kept.total),
             Some(2048),
             "the latest pass wins"
+        );
+    }
+
+    /// **The inotify walk runs on the blocking pool, and the watcher comes
+    /// back from it.**
+    ///
+    /// A missing directory is a watch that did not take, and the watcher
+    /// survives to try again on the fallback tick; a present one takes.
+    #[tokio::test]
+    async fn the_watch_walk_is_made_off_the_reactor_and_hands_the_watcher_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let watcher = <notify::RecommendedWatcher as notify::Watcher>::new(
+            |_res: Result<Event, notify::Error>| {},
+            notify::Config::default(),
+        )
+        .unwrap();
+
+        let (watcher, took) = watch_tree(watcher, tmp.path().join("not-yet")).await;
+        assert!(!took, "a directory that is not there cannot be watched");
+        let watcher = watcher.expect("the watcher survives a watch that did not take");
+
+        let (watcher, took) = watch_tree(watcher, tmp.path().to_path_buf()).await;
+        assert!(took);
+        assert!(watcher.is_some());
+        let walked_on = WATCHED_ON
+            .lock()
+            .unwrap()
+            .expect("the walk recorded its thread");
+        assert_ne!(
+            walked_on,
+            std::thread::current().id(),
+            "the walk ran on the runtime thread"
         );
     }
 }
