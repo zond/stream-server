@@ -549,6 +549,15 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
         self.drop_pieces(span.pieces, AfterRelease::Reselect).await
     }
 
+    /// Want `pieces` again after a [`Self::drop_pieces`] left them dropped:
+    /// the retention window has moved onto them. Pieces that were never
+    /// dropped, and pieces of a file the user has deselected, are left as
+    /// they are. Returns how many pieces stopped being dropped. `Ok(0)` for
+    /// a backend with no want-set of its own to edit.
+    async fn reselect_pieces(&self, _pieces: std::ops::Range<u32>) -> Result<usize> {
+        Ok(0)
+    }
+
     /// Hold `pieces` back from what we announce to peers, or put them back.
     ///
     /// A held-back piece is one we have, read and serve but tell nobody
@@ -590,17 +599,22 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
     fn piece_length(&self) -> Option<u64> {
         None
     }
-    /// `buffer` is the viewer's read-ahead choice (the `bufferProfile`
-    /// setting or the stream request's `buffer=` override); it scales the
-    /// playback windows this reader is opened with, never the startup one.
+    /// Open a reader on `file_idx` at `start_offset` that asks the backend
+    /// to fetch `lookahead_bytes` ahead of wherever it reads, and no more.
+    ///
+    /// The number is the caller's: the smaller of the intent's cap
+    /// ([`priorities::librqbit_stream_lookahead_bytes`]) and the retention
+    /// window's reach ahead of the reader, which is what keeps the pieces a
+    /// stream pulls in inside the pieces the next pass keeps. Fixed for the
+    /// reader's life -- a seek is a new reader with a fresh number. Must be
+    /// positive; a backend that opens streams refuses zero.
     async fn get_file_reader(
         &self,
         file_idx: usize,
         start_offset: u64,
         priority: u8,
         bitrate: Option<u64>,
-        intent: priorities::PlaybackIntent,
-        buffer: priorities::BufferProfile,
+        lookahead_bytes: u64,
     ) -> Result<Box<dyn FileStreamTrait>>;
     async fn get_files(&self) -> Vec<BackendFileInfo>;
     async fn file_count(&self) -> usize {
@@ -620,13 +634,15 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
     /// Called when switching to a different file to ensure exclusive downloading.
     async fn clear_file_streaming(&self, file_idx: usize) -> Result<()>;
     /// Wait until the first piece needed for the requested offset is readable.
+    /// `lookahead_bytes` sizes the probe's temporary stream exactly as
+    /// [`Self::get_file_reader`]'s does the real one, so the pieces the probe
+    /// pulls in are the ones the read that follows it will want.
     async fn wait_for_piece_ready(
         &self,
         file_idx: usize,
         offset: u64,
         timeout: Duration,
-        intent: priorities::PlaybackIntent,
-        buffer: priorities::BufferProfile,
+        lookahead_bytes: u64,
     ) -> Result<PieceReadiness>;
 }
 

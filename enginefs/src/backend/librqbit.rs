@@ -214,16 +214,29 @@ type PinnedFiles = Arc<Mutex<HashMap<String, BTreeSet<usize>>>>;
 /// per poll (see `LibrqbitHandle::client_torrent_error`).
 type ReportedErrors = Arc<Mutex<HashMap<String, String>>>;
 
-/// Where each open reader is positioned, keyed by `(info hash, file index)`
-/// and shared by every handle clone like [`PinnedFiles`].
+/// Where each open reader is positioned and how far ahead it fetches,
+/// keyed by `(info hash, file index)` and shared by every handle clone like
+/// [`PinnedFiles`].
 ///
 /// The startup-window progress a client renders has to describe the bytes
 /// somebody is actually waiting for. Computed from the file head it
 /// described, after a seek, a region nobody was fetching -- so it sat at 0%
-/// while the seek region streamed perfectly. `get_file_reader` records the
-/// offset it was opened at (a `Range` request, a seek and a re-open all
-/// arrive as a fresh reader at the new offset), and `stats` reads it back.
-type StreamPositions = Arc<Mutex<HashMap<(String, usize), u64>>>;
+/// while the seek region streamed perfectly; and computed over the 4 MiB
+/// startup cap alone it described, under a retention window narrower than
+/// that, bytes the reader will never ask the swarm for. `get_file_reader`
+/// records the offset it was opened at and the lookahead it was opened
+/// with (a `Range` request, a seek and a re-open all arrive as a fresh
+/// reader), and `stats` reads both back.
+type StreamPositions = Arc<Mutex<HashMap<(String, usize), StreamPosition>>>;
+
+/// One reader's opening: see [`StreamPositions`].
+#[derive(Debug, Clone, Copy)]
+struct StreamPosition {
+    /// The offset in the file the reader was opened at.
+    offset: u64,
+    /// How far ahead of itself the reader fetches.
+    lookahead_bytes: u64,
+}
 
 /// What a client is told about a torrent librqbit put in an error state.
 /// librqbit's `TorrentStats.error` is the `{e:?}` of an anyhow chain
@@ -2283,8 +2296,10 @@ impl TorrentHandle for LibrqbitHandle {
             _ => None,
         };
         // The startup window is the same for every buffer profile (see
-        // `BufferProfile`), so the reported readiness is too.
-        let startup_window = crate::backend::priorities::librqbit_stream_lookahead_bytes(
+        // `BufferProfile`), so the reported readiness is too -- cut, per
+        // file, to the lookahead its reader was really opened with, which is
+        // narrower under a retention window smaller than the cap.
+        let startup_cap = crate::backend::priorities::librqbit_stream_lookahead_bytes(
             crate::backend::priorities::PlaybackIntent::DirectInitial,
             crate::backend::priorities::BufferProfile::Normal,
         );
@@ -2318,7 +2333,11 @@ impl TorrentHandle for LibrqbitHandle {
                 // without a piece map yet (empty file_progress) reports 0
                 // and so never claims completion of a non-empty file.
                 let complete = file_downloaded == f.len;
-                let read_from = positions.get(&(self.info_hash.clone(), i)).copied();
+                let opened = positions.get(&(self.info_hash.clone(), i)).copied();
+                let read_from = opened.map(|position| position.offset);
+                let startup_window = opened.map_or(startup_cap, |position| {
+                    startup_cap.min(position.lookahead_bytes)
+                });
                 let window = haves.as_ref().map(|bf| {
                     crate::backend::priorities::initial_window_progress(
                         offset,
@@ -2647,28 +2666,27 @@ impl TorrentHandle for LibrqbitHandle {
         start_offset: u64,
         _priority: u8,
         _bitrate: Option<u64>,
-        intent: crate::backend::priorities::PlaybackIntent,
-        buffer: crate::backend::priorities::BufferProfile,
+        lookahead_bytes: u64,
     ) -> Result<Box<dyn FileStreamTrait>> {
-        // Where the startup window is measured from now on. A `Range`
-        // request, a seek and a re-open all reach the backend as a fresh
-        // reader at the new offset, so this is the whole of "follow the
-        // reader" (see [`StreamPositions`]).
-        self.stream_positions
-            .lock()
-            .insert((self.info_hash.clone(), file_idx), start_offset);
+        // Where the startup window is measured from now on, and how far
+        // ahead of it this reader fetches. A `Range` request, a seek and a
+        // re-open all reach the backend as a fresh reader at the new offset,
+        // so this is the whole of "follow the reader" (see
+        // [`StreamPositions`]).
+        self.stream_positions.lock().insert(
+            (self.info_hash.clone(), file_idx),
+            StreamPosition {
+                offset: start_offset,
+                lookahead_bytes,
+            },
+        );
         // librqbit's FileStream requires the Paused or Live state; opening it
         // while the torrent is still Initializing fails immediately, which the
         // HTTP route would turn into a failed first play. Block here instead.
         self.await_initialized().await?;
-        // Size the per-stream lookahead window by playback intent instead of
-        // librqbit's fixed 32 MiB default: a narrow startup window verifies the
-        // head pieces faster, while seeks/sequential get generous read-ahead.
-        let opts = librqbit::FileStreamOptions {
-            lookahead_bytes: crate::backend::priorities::librqbit_stream_lookahead_bytes(
-                intent, buffer,
-            ),
-        };
+        // The caller's number, not librqbit's fixed 32 MiB default: the
+        // intent's cap, cut to the retention window's reach when one stands.
+        let opts = librqbit::FileStreamOptions { lookahead_bytes };
         let stream = self
             .handle
             .clone()
@@ -2933,6 +2951,15 @@ impl TorrentHandle for LibrqbitHandle {
         )))
     }
 
+    /// librqbit's own re-selection, on a live or paused torrent: a piece the
+    /// retention window has moved onto is queued again if its file is still
+    /// selected, and a piece that was never dropped is left alone.
+    async fn reselect_pieces(&self, pieces: std::ops::Range<u32>) -> Result<usize> {
+        self.handle
+            .reselect_pieces(pieces)
+            .context("librqbit could not want the pieces again")
+    }
+
     /// librqbit's own hold-back set, which is what makes the retention
     /// policy's "only what is committed is advertised" expressible at all:
     /// a suppression bitfield on the chunk tracker, independent of both the
@@ -2977,20 +3004,17 @@ impl TorrentHandle for LibrqbitHandle {
     ///
     /// Mechanism: open a short-lived librqbit FileStream and seek to `offset`.
     /// Registering the stream moves librqbit's per-stream lookahead window
-    /// (sized by `intent` and `buffer` via `librqbit_stream_lookahead_bytes`,
-    /// matching the
-    /// window the real read will request) to that offset and reconnects
-    /// not-needed peers --
-    /// the deadline-equivalent priority yank -- and the subsequent 1-byte read
-    /// parks on the piece waker until the piece covering `offset` verifies.
-    /// The temporary stream drops at function exit, deregistering its window.
+    /// (`lookahead_bytes`, the same number the real read is opened with) to
+    /// that offset and reconnects not-needed peers -- the deadline-equivalent
+    /// priority yank -- and the subsequent 1-byte read parks on the piece
+    /// waker until the piece covering `offset` verifies. The temporary stream
+    /// drops at function exit, deregistering its window.
     async fn wait_for_piece_ready(
         &self,
         file_idx: usize,
         offset: u64,
         timeout: Duration,
-        intent: crate::backend::priorities::PlaybackIntent,
-        buffer: crate::backend::priorities::BufferProfile,
+        lookahead_bytes: u64,
     ) -> Result<PieceReadiness> {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -3000,7 +3024,7 @@ impl TorrentHandle for LibrqbitHandle {
             file_idx,
             offset,
             timeout_ms = timeout.as_millis() as u64,
-            ?intent,
+            lookahead_bytes,
             "wait_for_piece_ready: begin"
         );
 
@@ -3043,14 +3067,10 @@ impl TorrentHandle for LibrqbitHandle {
             ));
         }
 
-        // Phase 2: open the stream. Use the same intent-sized window as the
-        // real read so the priority yank moves the lookahead exactly where
-        // playback will request it.
-        let lookahead = librqbit::FileStreamOptions {
-            lookahead_bytes: crate::backend::priorities::librqbit_stream_lookahead_bytes(
-                intent, buffer,
-            ),
-        };
+        // Phase 2: open the stream, with the window the real read will be
+        // opened with, so the priority yank moves the lookahead exactly where
+        // playback will request it and no further.
+        let lookahead = librqbit::FileStreamOptions { lookahead_bytes };
         let mut stream = match self
             .handle
             .clone()
@@ -5713,8 +5733,10 @@ mod tests {
                 seek_to,
                 0,
                 None,
-                crate::backend::priorities::PlaybackIntent::DirectSeek,
-                crate::backend::priorities::BufferProfile::Normal,
+                crate::backend::priorities::librqbit_stream_lookahead_bytes(
+                    crate::backend::priorities::PlaybackIntent::DirectSeek,
+                    crate::backend::priorities::BufferProfile::Normal,
+                ),
             )
             .await
             .unwrap();
@@ -5773,8 +5795,10 @@ mod tests {
                 0,
                 0,
                 None,
-                crate::backend::priorities::PlaybackIntent::DirectInitial,
-                crate::backend::priorities::BufferProfile::Normal,
+                crate::backend::priorities::librqbit_stream_lookahead_bytes(
+                    crate::backend::priorities::PlaybackIntent::DirectInitial,
+                    crate::backend::priorities::BufferProfile::Normal,
+                ),
             )
             .await
             .unwrap();
@@ -5797,8 +5821,10 @@ mod tests {
                 payload_len - 1,
                 0,
                 None,
-                crate::backend::priorities::PlaybackIntent::DirectSeek,
-                crate::backend::priorities::BufferProfile::Normal,
+                crate::backend::priorities::librqbit_stream_lookahead_bytes(
+                    crate::backend::priorities::PlaybackIntent::DirectSeek,
+                    crate::backend::priorities::BufferProfile::Normal,
+                ),
             )
             .await
             .unwrap();
@@ -5836,8 +5862,10 @@ mod tests {
                 0,
                 0,
                 None,
-                crate::backend::priorities::PlaybackIntent::DirectInitial,
-                crate::backend::priorities::BufferProfile::Normal,
+                crate::backend::priorities::librqbit_stream_lookahead_bytes(
+                    crate::backend::priorities::PlaybackIntent::DirectInitial,
+                    crate::backend::priorities::BufferProfile::Normal,
+                ),
             )
             .await
             .unwrap();
@@ -5956,8 +5984,10 @@ mod tests {
                 0,
                 0,
                 TEST_WAIT_BOUND,
-                PlaybackIntent::DirectInitial,
-                BufferProfile::Normal,
+                crate::backend::priorities::librqbit_stream_lookahead_bytes(
+                    PlaybackIntent::DirectInitial,
+                    BufferProfile::Normal,
+                ),
             )
             .await
             .unwrap();
@@ -5974,8 +6004,10 @@ mod tests {
                 0,
                 offset,
                 TEST_WAIT_BOUND,
-                PlaybackIntent::DirectSeek,
-                BufferProfile::Normal,
+                crate::backend::priorities::librqbit_stream_lookahead_bytes(
+                    PlaybackIntent::DirectSeek,
+                    BufferProfile::Normal,
+                ),
             )
             .await
             .unwrap();
@@ -5983,12 +6015,15 @@ mod tests {
         assert_eq!(r.piece, (offset / 16384) as i32);
     }
 
-    // Exercises the get_file_reader -> stream_with_options wiring: every intent
-    // must produce a positive lookahead window (stream_with_options asserts
-    // lookahead_bytes > 0), so a successful open+read confirms the intent-sized
-    // window is applied rather than rejected.
+    /// **The reader is opened with exactly the lookahead it is handed.**
+    ///
+    /// The handle no longer sizes the lookahead itself: the engine hands it
+    /// the smaller of the intent's cap and the retention window's reach, and
+    /// what the stream fetches ahead is that number and nothing else. Zero
+    /// is refused by librqbit, which is how a test can see the number reach
+    /// the stream at all; one byte and the widest cap both open and read.
     #[tokio::test(flavor = "multi_thread")]
-    async fn get_file_reader_applies_intent_sized_lookahead() {
+    async fn get_file_reader_opens_the_stream_with_the_lookahead_it_is_handed() {
         use crate::backend::TorrentHandle;
         use crate::backend::priorities::{BufferProfile, PlaybackIntent};
         use tokio::io::AsyncReadExt;
@@ -6000,26 +6035,90 @@ mod tests {
         let (_backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
         handle.handle.wait_until_initialized().await.unwrap();
 
-        // A narrow-window intent (4 MiB) and a wide-window intent (128 MiB)
-        // both yield a readable stream.
-        for intent in [PlaybackIntent::DirectInitial, PlaybackIntent::DirectSeek] {
-            // Sanity: the helper the reader uses is positive for this intent.
-            assert!(
-                crate::backend::priorities::librqbit_stream_lookahead_bytes(
-                    intent,
-                    BufferProfile::Normal
-                ) > 0,
-                "lookahead must be positive for {intent:?}"
-            );
+        assert!(
+            handle.get_file_reader(0, 0, 100, None, 0).await.is_err(),
+            "a stream that reads nothing ahead is refused, so the number handed in is \
+             the one the stream is opened with"
+        );
+        let widest = crate::backend::priorities::librqbit_stream_lookahead_bytes(
+            PlaybackIntent::DirectSeek,
+            BufferProfile::Maximum,
+        );
+        for lookahead in [1, widest] {
             let mut reader = handle
-                .get_file_reader(0, 0, 100, None, intent, BufferProfile::Normal)
+                .get_file_reader(0, 0, 100, None, lookahead)
                 .await
-                .unwrap_or_else(|e| panic!("get_file_reader failed for {intent:?}: {e:#}"));
+                .unwrap_or_else(|e| panic!("get_file_reader failed at {lookahead}: {e:#}"));
             let mut buf = [0u8; 1];
             let n = reader.read(&mut buf).await.expect("read first byte");
-            assert_eq!(n, 1, "seeded file must yield a byte for {intent:?}");
+            assert_eq!(
+                n, 1,
+                "seeded file must yield a byte at lookahead {lookahead}"
+            );
             assert_eq!(buf[0], 0, "first payload byte is (0 % 251) == 0");
         }
+    }
+
+    /// The startup readiness a client is shown is measured over what the
+    /// reader was really opened to fetch: the 4 MiB cap where nothing
+    /// narrows it, and the narrower lookahead where a retention window did
+    /// -- a percentage of bytes the reader will never ask for is a
+    /// percentage of nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn startup_readiness_is_measured_over_the_lookahead_the_reader_was_opened_with() {
+        use crate::backend::TorrentHandle;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let payload = dir.join("payload.bin");
+        write_payload(&payload, 96 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+        let (_backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
+        handle.handle.wait_until_initialized().await.unwrap();
+
+        // Nobody has opened the file: the cap, which the file is smaller than.
+        let stats = TorrentHandle::stats(&handle).await;
+        assert_eq!(stats.files[0].initial_window_bytes, Some(96 * 1024));
+
+        // A reader opened to fetch one byte ahead: the window is the one
+        // piece that byte is in.
+        let _reader = handle.get_file_reader(0, 0, 100, None, 1).await.unwrap();
+        let stats = TorrentHandle::stats(&handle).await;
+        assert_eq!(stats.files[0].initial_window_bytes, Some(16 * 1024));
+        assert_eq!(stats.files[0].initial_window_ready_bytes, Some(16 * 1024));
+    }
+
+    /// The yank probe's temporary stream is bounded the same way: the number
+    /// it is handed is the one its stream is opened with, so the pieces the
+    /// probe pulls in are the ones the read after it will want.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wait_for_piece_ready_opens_its_probe_with_the_lookahead_it_is_handed() {
+        use crate::backend::TorrentHandle;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let payload = dir.join("payload.bin");
+        write_payload(&payload, 96 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+        let (_backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
+        handle.handle.wait_until_initialized().await.unwrap();
+
+        let refused = handle
+            .wait_for_piece_ready(0, 40_000, TEST_WAIT_BOUND, 0)
+            .await
+            .unwrap();
+        assert!(
+            !refused.ready && refused.reason.starts_with("stream-unavailable"),
+            "a probe that reads nothing ahead cannot open its stream: {refused:?}"
+        );
+        let ready = handle
+            .wait_for_piece_ready(0, 40_000, TEST_WAIT_BOUND, 1)
+            .await
+            .unwrap();
+        assert!(
+            ready.ready,
+            "one byte ahead opens and reads: {}",
+            ready.reason
+        );
+        assert_eq!(ready.reason, "stream-read");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -6041,8 +6140,10 @@ mod tests {
                 0,
                 0,
                 timeout,
-                PlaybackIntent::DirectInitial,
-                BufferProfile::Normal,
+                crate::backend::priorities::librqbit_stream_lookahead_bytes(
+                    PlaybackIntent::DirectInitial,
+                    BufferProfile::Normal,
+                ),
             )
             .await
             .unwrap();
@@ -6069,8 +6170,10 @@ mod tests {
                 0,
                 1_000_000,
                 Duration::from_secs(1),
-                PlaybackIntent::DirectSeek,
-                BufferProfile::Normal,
+                crate::backend::priorities::librqbit_stream_lookahead_bytes(
+                    PlaybackIntent::DirectSeek,
+                    BufferProfile::Normal,
+                ),
             )
             .await
             .unwrap();
@@ -6084,8 +6187,10 @@ mod tests {
                     7,
                     0,
                     Duration::from_secs(1),
-                    PlaybackIntent::DirectInitial,
-                    BufferProfile::Normal,
+                    crate::backend::priorities::librqbit_stream_lookahead_bytes(
+                        PlaybackIntent::DirectInitial,
+                        BufferProfile::Normal,
+                    ),
                 )
                 .await
                 .is_err()
@@ -6128,8 +6233,10 @@ mod tests {
                 0,
                 0,
                 Duration::from_secs(120),
-                PlaybackIntent::DirectInitial,
-                BufferProfile::Normal,
+                crate::backend::priorities::librqbit_stream_lookahead_bytes(
+                    PlaybackIntent::DirectInitial,
+                    BufferProfile::Normal,
+                ),
             )
             .await
             .expect("structural failure");
@@ -6395,8 +6502,10 @@ mod tests {
                 0,
                 1,
                 None,
-                PlaybackIntent::DirectInitial,
-                BufferProfile::Normal,
+                crate::backend::priorities::librqbit_stream_lookahead_bytes(
+                    PlaybackIntent::DirectInitial,
+                    BufferProfile::Normal,
+                ),
             )
             .await
             .expect("reader opens after initialization");
@@ -6768,6 +6877,47 @@ mod tests {
             "nothing will fetch the piece back now, so it is the first file's \
              to give up with the rest of them"
         );
+    }
+
+    /// Re-selecting against the real backend: exactly the pieces a drop
+    /// left dropped are wanted again and counted, a piece that was never
+    /// dropped is left alone, and a second asking finds nothing to do.
+    /// What the retention pass relies on when its window moves onto pieces
+    /// an earlier pass stopped wanting.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reselecting_wants_the_dropped_pieces_again_and_counts_only_those() {
+        use crate::backend::{AfterRelease, TorrentHandle};
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let payload = dir.join("payload.bin");
+        write_payload(&payload, 96 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+        let (_backend, handle) = reclaiming_backend_with_torrent(&dir, &torrent_bytes).await;
+        handle.handle.wait_until_initialized().await.unwrap();
+        assert!(handle.handle.stats().finished, "seeded");
+
+        let dropped = handle
+            .drop_pieces(0..2, AfterRelease::LeaveDropped)
+            .await
+            .expect("a live torrent added here can drop")
+            .expect("librqbit keeps a have-set");
+        assert_eq!(dropped.pieces(), &[0, 1]);
+        drop(dropped);
+        assert!(
+            handle.handle.stats().finished,
+            "left dropped: not had and not wanted, so nothing is missing"
+        );
+
+        assert_eq!(
+            handle.reselect_pieces(0..3).await.unwrap(),
+            2,
+            "the two dropped pieces are wanted again; the third was never dropped"
+        );
+        assert!(
+            !handle.handle.stats().finished,
+            "and wanted means missing: the torrent has something to fetch"
+        );
+        assert_eq!(handle.reselect_pieces(0..3).await.unwrap(), 0);
     }
 
     /// Forgetting a file's pieces against the real backend: the have-set
@@ -7947,8 +8097,10 @@ mod tests {
                 0,
                 0,
                 TEST_WAIT_BOUND,
-                PlaybackIntent::DirectInitial,
-                BufferProfile::Normal,
+                crate::backend::priorities::librqbit_stream_lookahead_bytes(
+                    PlaybackIntent::DirectInitial,
+                    BufferProfile::Normal,
+                ),
             )
             .await
             .unwrap();
@@ -8493,13 +8645,15 @@ mod tests {
     /// Half the file: 64 pieces, so the policy splits it into a 32-piece
     /// window and a 32-piece committed half.
     ///
-    /// The window has to be wider than librqbit's own stream lookahead
-    /// (`MAX_STARTUP_WINDOW_BYTES`, 4 MiB = 16 pieces), or the bound would
-    /// not be the policy's to keep: librqbit refuses to drop a piece a live
-    /// stream is about to read, and rightly -- deleting the read-ahead
-    /// under the player would only fetch it again. 90% of a 32-piece window
-    /// is 28 pieces ahead, so everything it protects is inside what the
-    /// policy is keeping anyway.
+    /// The window is narrower than every playback intent's lookahead cap
+    /// but the startup one (`MAX_STARTUP_WINDOW_BYTES`, 4 MiB = 16 pieces;
+    /// the seek and sequential caps are 128 MiB, four times the file), and
+    /// it does not have to be wider: the reader is opened with the smaller
+    /// of the cap and the window's reach, so what the stream is about to
+    /// read -- which librqbit rightly refuses to drop -- is inside what the
+    /// policy is keeping anyway, whatever the intent. The bound below is the
+    /// policy's to keep under either cap; `a_stream_wider_than_its_window_
+    /// is_fetched_inside_it` is the one that would not have held before.
     const RETENTION_BUDGET: u64 = 16 * 1024 * 1024;
 
     /// **The bound.** A torrent streamed end to end, well past a cache
@@ -8627,6 +8781,177 @@ mod tests {
             (read.len() as u64) >= RETENTION_BUDGET * 2,
             "and the stream ran well past the budget"
         );
+    }
+
+    /// **The bound under a lookahead wider than the window.** The same
+    /// stream, opened with the intent every request after the first carries
+    /// (`DirectSeek`, a 128 MiB cap: four times this file), never has more
+    /// on disk than the budget, and no pass is refused a piece it set out to
+    /// reclaim.
+    ///
+    /// Before the reader's lookahead was cut to the window's reach this held
+    /// only for the 4 MiB startup intent, and by luck of the constants: the
+    /// window was wider than that one cap. Under a seek's cap the stream
+    /// asked librqbit for the whole rest of the file, librqbit refused to
+    /// drop what its stream was about to read, and the disk sat over the
+    /// budget by the lookahead for the stream's life while every pass asked
+    /// for the same refused pieces again (issue b). Now the lookahead is
+    /// `min(cap, reach)`, the want-set outside the window is trimmed, and
+    /// the refused count stays at zero: through a pause, through the whole
+    /// read and for thirty passes after it.
+    ///
+    /// The pause is what makes the lookahead observable at all. A reader
+    /// that reads as fast as the one peer on the loopback delivers keeps
+    /// the swarm's front a few pieces ahead of the head whatever the
+    /// lookahead says; a player that stops reading with its body open --
+    /// paused, or buffered far ahead -- is the one the swarm gets ahead of,
+    /// by exactly the lookahead.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stream_wider_than_its_window_is_fetched_inside_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let content = tmp.path().join("content");
+        tokio::fs::create_dir_all(&content).await.unwrap();
+        let payload = content.join("movie.bin");
+        write_payload(&payload, RETENTION_FILE_BYTES).await;
+        let original = tokio::fs::read(&payload).await.unwrap();
+        let (torrent_bytes, _) =
+            make_torrent_with_piece_length(&payload, RETENTION_PIECE as u32).await;
+
+        let client_dir = tmp.path().join("client");
+        let (efs, client_addr) = streaming_engine_fs(&client_dir).await;
+        efs.set_cache_budget(Some(RETENTION_BUDGET));
+
+        let engine = efs
+            .add_torrent(TorrentSource::Bytes(torrent_bytes.clone()), None)
+            .await
+            .expect("add");
+        let hash = engine.info_hash.clone();
+        engine.handle.handle.wait_until_initialized().await.unwrap();
+        let _seeder = seeder_dialling(&content, &torrent_bytes, client_addr).await;
+
+        assert!(
+            crate::backend::priorities::librqbit_stream_lookahead_bytes(
+                crate::backend::priorities::PlaybackIntent::DirectSeek,
+                crate::backend::priorities::BufferProfile::Normal,
+            ) > RETENTION_FILE_BYTES as u64,
+            "the intent's cap has to be wider than the file, or the window is not what bounds it"
+        );
+        let mut reader = engine
+            .try_get_file_with_intent(
+                0,
+                0,
+                255,
+                crate::backend::priorities::PlaybackIntent::DirectSeek,
+                crate::backend::priorities::BufferProfile::Normal,
+            )
+            .await
+            .expect("reader");
+
+        let mut bound = BoundWatch {
+            efs: &efs,
+            engine: &engine,
+            hash: &hash,
+            budget_pieces: (RETENTION_BUDGET / RETENTION_PIECE) as usize,
+            worst: 0,
+            deadline: std::time::Instant::now() + TEST_WAIT_BOUND,
+        };
+        let mut read = Vec::with_capacity(original.len());
+
+        // The player buffers four megabytes and a bit and pauses with its
+        // body open. The swarm on the loopback has the rest of the file
+        // ready; what it hands us meanwhile is bounded by the lookahead and
+        // nothing else. "And a bit", and the passes below at the same
+        // misalignment: a reader parked or measured on a piece boundary is
+        // the one position at which a lookahead cut at the window's very
+        // edge does not round up past it, and this test is about the other
+        // three quarters of the positions.
+        bound
+            .read_until(&mut reader, &mut read, 4 * 1024 * 1024 + 64 * 1024)
+            .await;
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            bound.tick(read.len()).await;
+        }
+        // Then plays the rest through.
+        bound
+            .read_until(&mut reader, &mut read, original.len())
+            .await;
+        drop(reader);
+        assert_eq!(read, original, "and it played: every byte is the film's");
+
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            bound.tick(read.len()).await;
+        }
+        assert!(
+            bound.worst > bound.budget_pieces / 2,
+            "the cache really filled ({} pieces at most), or the bound proves nothing",
+            bound.worst
+        );
+    }
+
+    /// One retention pass at a time over a streaming engine, and the two
+    /// things every pass has to leave true: the disk under the budget, and
+    /// no piece the pass set out to reclaim refused. For
+    /// `a_stream_wider_than_its_window_is_fetched_inside_it`.
+    struct BoundWatch<'a> {
+        efs: &'a crate::BackendEngineFS<LibrqbitBackend>,
+        engine: &'a crate::engine::Engine<LibrqbitHandle>,
+        hash: &'a str,
+        budget_pieces: usize,
+        /// The most pieces any pass found on the disk.
+        worst: usize,
+        deadline: std::time::Instant,
+    }
+
+    impl BoundWatch<'_> {
+        async fn tick(&mut self, read_so_far: usize) {
+            self.efs.reconcile_tick().await;
+            let held = self
+                .efs
+                .store_registry()
+                .held(self.hash)
+                .expect("the running torrent's store is registered")
+                .count() as usize;
+            self.worst = self.worst.max(held);
+            assert!(
+                held <= self.budget_pieces,
+                "{held} pieces on disk after reading {read_so_far} bytes, budget is {}",
+                self.budget_pieces
+            );
+            assert_eq!(
+                self.engine.refused_reclaims.load(Ordering::SeqCst),
+                0,
+                "a pass was refused a piece it set out to reclaim after {read_so_far} bytes: \
+                 the stream's lookahead reached past the window"
+            );
+        }
+
+        /// Read `reader` into `read` until it holds `until` bytes, with a
+        /// pass per megabyte, measured a quarter of a piece into the piece
+        /// rather than on its boundary.
+        async fn read_until(
+            &mut self,
+            reader: &mut crate::files::FileHandle<LibrqbitHandle>,
+            read: &mut Vec<u8>,
+            until: usize,
+        ) {
+            use tokio::io::AsyncReadExt;
+            let mut buf = vec![0u8; 64 * 1024];
+            while read.len() < until {
+                assert!(
+                    std::time::Instant::now() < self.deadline,
+                    "the stream stalled at {} of {until} bytes",
+                    read.len()
+                );
+                let n = reader.read(&mut buf).await.expect("read");
+                assert_ne!(n, 0, "the stream ended early at {}", read.len());
+                read.extend_from_slice(&buf[..n]);
+                if (read.len() + 3 * 64 * 1024) % (1024 * 1024) < n {
+                    self.tick(read.len()).await;
+                }
+            }
+        }
     }
 
     /// **The freshness half of the budget.** Before any cache pass has run,

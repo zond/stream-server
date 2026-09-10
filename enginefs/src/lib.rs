@@ -4376,6 +4376,15 @@ mod tests {
         /// removes a byte, and the per-file delete must ask for the
         /// re-select its still-pinned neighbour needs.
         dropped_ranges: Mutex<Vec<(std::ops::Range<u32>, crate::backend::AfterRelease)>>,
+        /// The fake's want-set, as what is *out* of it: every piece
+        /// `drop_pieces` dropped and nothing has re-selected since. A piece
+        /// of a file is wanted unless it is here, which is librqbit's own
+        /// reading of a dropped piece.
+        dropped: Mutex<std::collections::BTreeSet<u32>>,
+        /// Every range `reselect_pieces` was asked to want again, in order.
+        reselected: Mutex<Vec<std::ops::Range<u32>>>,
+        /// The lookahead every reader was opened with, in order.
+        lookaheads: Mutex<Vec<u64>>,
         /// What happens on the first `drop_pieces` of a test, from inside
         /// the call: where a test puts what a user or a reader does while
         /// the pass has one part of a run released and the next still to
@@ -4933,17 +4942,34 @@ mod tests {
             if self.counters.refuses_drop.load(Ordering::SeqCst) {
                 anyhow::bail!("this fake will not forget a piece it has");
             }
-            let dropped = if self.counters.drops_what_it_is_asked.load(Ordering::SeqCst) {
+            let dropped: Vec<u32> = if self.counters.drops_what_it_is_asked.load(Ordering::SeqCst) {
                 asked.collect()
             } else {
                 self.counters.drops_pieces.lock().unwrap().clone()
             };
+            self.counters
+                .dropped
+                .lock()
+                .unwrap()
+                .extend(dropped.iter().copied());
             Ok(Some(crate::backend::DroppedFilePieces::new(
                 dropped,
                 ClaimProbe {
                     released_on: self.counters.claim_released_on.clone(),
                 },
             )))
+        }
+
+        /// Like librqbit: only a piece that was dropped changes, and the
+        /// count is how many did.
+        async fn reselect_pieces(&self, pieces: std::ops::Range<u32>) -> Result<usize> {
+            self.counters
+                .reselected
+                .lock()
+                .unwrap()
+                .push(pieces.clone());
+            let mut dropped = self.counters.dropped.lock().unwrap();
+            Ok(pieces.filter(|piece| dropped.remove(piece)).count())
         }
 
         /// Like the real backend: the folder the backend says it writes to
@@ -5084,11 +5110,15 @@ mod tests {
             _start_offset: u64,
             _priority: u8,
             _bitrate: Option<u64>,
-            _intent: crate::backend::priorities::PlaybackIntent,
-            _buffer: crate::backend::priorities::BufferProfile,
+            lookahead_bytes: u64,
         ) -> Result<Box<dyn FileStreamTrait>> {
             self.gate().await?;
             self.counters.get_file_reader.fetch_add(1, Ordering::SeqCst);
+            self.counters
+                .lookaheads
+                .lock()
+                .unwrap()
+                .push(lookahead_bytes);
             let len = self
                 .files
                 .get(file_idx)
@@ -5121,8 +5151,7 @@ mod tests {
             _file_idx: usize,
             _offset: u64,
             _timeout: Duration,
-            _intent: crate::backend::priorities::PlaybackIntent,
-            _buffer: crate::backend::priorities::BufferProfile,
+            _lookahead_bytes: u64,
         ) -> Result<PieceReadiness> {
             Ok(PieceReadiness {
                 ready: true,
@@ -10487,6 +10516,202 @@ mod tests {
         );
     }
 
+    /// **A reader fetches ahead by the smaller of its intent's cap and the
+    /// window's reach, and never by nothing.**
+    ///
+    /// The cap alone (128 MiB for every request after the first) had a
+    /// stream ask librqbit for the whole rest of a file the budget covered
+    /// a fraction of; librqbit refuses to drop what a stream is about to
+    /// read, so the disk sat over the budget by the lookahead for the
+    /// stream's life and every pass asked for the same refused pieces again.
+    /// The reach is the bytes from the reader's offset to the *start* of the
+    /// last piece the window reaches ahead of it -- librqbit rounds the end
+    /// of a lookahead up to a whole piece, and a reader drifts inside its
+    /// piece as it plays, so a lookahead cut at the edge itself reaches one
+    /// piece past it half the time. Forty pieces of five bytes under a
+    /// budget of twenty: a ten-piece window, one behind, nine ahead.
+    #[tokio::test]
+    async fn a_reader_fetches_ahead_by_the_smaller_of_its_cap_and_the_windows_reach() {
+        use crate::backend::priorities::{BufferProfile, PlaybackIntent};
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 200)]);
+        counters.pieces_per_file.store(40, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(100));
+        let cap = crate::backend::priorities::librqbit_stream_lookahead_bytes(
+            PlaybackIntent::DirectSeek,
+            BufferProfile::Normal,
+        );
+        assert!(
+            cap > 200,
+            "the cap is wider than the file, so the window is the bound"
+        );
+
+        // At the file's start: the reach is pieces 0..9, and the last piece
+        // it reaches starts at byte 40.
+        let _at_start = engine
+            .try_get_file_with_intent(0, 0, 255, PlaybackIntent::DirectSeek, BufferProfile::Normal)
+            .await
+            .expect("a reader");
+        // Seven bytes in, on piece 1: the reach is 1..10, byte 45, minus
+        // the seven already behind.
+        let _seven_in = engine
+            .try_get_file_with_intent(0, 7, 255, PlaybackIntent::DirectSeek, BufferProfile::Normal)
+            .await
+            .expect("a reader");
+        assert_eq!(
+            *counters.lookaheads.lock().unwrap(),
+            vec![40, 38],
+            "the window's reach, in bytes from where the reader starts"
+        );
+
+        // A window of one piece reaches no further than the piece under the
+        // reader: the bound is zero bytes, and the stream still reads one.
+        enginefs.set_cache_budget(Some(10));
+        let _one_piece = engine
+            .try_get_file_with_intent(0, 3, 255, PlaybackIntent::DirectSeek, BufferProfile::Normal)
+            .await
+            .expect("a reader");
+        assert_eq!(counters.lookaheads.lock().unwrap().last(), Some(&1));
+
+        // Nothing bounds the file: the cap is the whole of it.
+        enginefs.set_cache_budget(None);
+        let _unbounded = engine
+            .try_get_file_with_intent(0, 0, 255, PlaybackIntent::DirectSeek, BufferProfile::Normal)
+            .await
+            .expect("a reader");
+        assert_eq!(counters.lookaheads.lock().unwrap().last(), Some(&cap));
+    }
+
+    /// **A pass leaves the backend wanting the window and the committed
+    /// set, and nothing else it does not already have.**
+    ///
+    /// librqbit fetches every selected piece it is not told otherwise
+    /// about, so a pass that only reclaimed would have the swarm refill the
+    /// file behind it every two seconds. After a pass the fake's want-set --
+    /// its pieces minus what was dropped -- is the window, the committed
+    /// set and what is on the disk; moving the head re-wants exactly the
+    /// pieces the window moved onto. Eight pieces of twenty-five bytes under
+    /// a budget of four: a two-piece window and two committed.
+    #[tokio::test]
+    async fn a_pass_wants_the_window_and_the_committed_set_and_nothing_else_it_lacks() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 200)]);
+        counters.pieces_per_file.store(8, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(100));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
+        let store = seeded_store(&enginefs, &engine);
+        engine.note_playhead(0, 0);
+        engine.begin_retention(0).await;
+        let selected = || -> std::collections::BTreeSet<u32> {
+            let dropped = counters.dropped.lock().unwrap();
+            (0..8).filter(|piece| !dropped.contains(piece)).collect()
+        };
+
+        engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass");
+        assert_eq!(
+            selected(),
+            std::collections::BTreeSet::from([0, 1]),
+            "the window round piece 0; the six pieces beyond it are not wanted"
+        );
+        assert_eq!(*counters.reselected.lock().unwrap(), vec![0..2]);
+
+        // Playback walks on to piece 2 with pieces 1 and 2 arrived: 0 and 1
+        // commit, the window is 2..4.
+        for piece in [1u32, 2] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        store.init_for_tests().unwrap();
+        engine.note_playhead(0, 50);
+        let pass = engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass");
+        assert_eq!(pass.committed, 2, "{pass:?}");
+        assert_eq!(
+            selected(),
+            std::collections::BTreeSet::from([0, 1, 2, 3]),
+            "the window, the committed set and what is on the disk"
+        );
+        assert_eq!(
+            counters.reselected.lock().unwrap().last(),
+            Some(&(2..4)),
+            "the pieces the window moved onto are wanted again"
+        );
+    }
+
+    /// **A piece that arrives under the pass, outside the window, does not
+    /// outlive the drop that forgot it.**
+    ///
+    /// The pass read the held set two backend calls before it trims the
+    /// want-set, and a piece outside the window can complete in that gap.
+    /// librqbit drops it -- it is a have piece -- and a have piece dropped
+    /// and left on the disk is one the store counts and the backend has
+    /// forgotten, which no later pass can take: librqbit refuses to drop a
+    /// piece twice. So what the backend reports dropped is read against the
+    /// store now, and the piece that arrived goes with the claim. The
+    /// fixture lands the piece from inside the backend's own drop call,
+    /// which is the gap exactly.
+    #[tokio::test]
+    async fn a_piece_that_arrives_under_the_pass_is_unlinked_with_the_drop_that_forgot_it() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
+        let store = Arc::new(seeded_store(&enginefs, &engine));
+        engine.note_playhead(0, 0);
+        engine.begin_retention(0).await;
+        // Piece 2 completes while the backend is forgetting 1..4.
+        *counters.on_first_drop.lock().unwrap() = Some(Box::new({
+            let store = store.clone();
+            let bucket = bucket.clone();
+            move || {
+                std::fs::write(bucket.join("2"), [7u8; 25]).unwrap();
+                store.init_for_tests().unwrap();
+            }
+        }));
+
+        let pass = engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass");
+        assert_eq!(
+            pass.reclaimed, 0,
+            "nothing was held outside the window when the pass decided: {pass:?}"
+        );
+        assert!(
+            !bucket.join("2").exists(),
+            "the piece the backend forgot is not left on the disk"
+        );
+        assert_eq!(
+            enginefs
+                .store_registry()
+                .held(TEST_HASH)
+                .expect("registered")
+                .in_range(0..4),
+            std::collections::BTreeSet::from([0]),
+            "and the set says so"
+        );
+        assert_eq!(
+            *counters.dropped_ranges.lock().unwrap(),
+            vec![(1..4, crate::backend::AfterRelease::LeaveDropped)],
+            "one ask, the want-set's"
+        );
+    }
+
     /// **A reclaim unlinks through the registered store, so the pieces leave
     /// the held set with their files.**
     ///
@@ -10546,9 +10771,14 @@ mod tests {
             "and the next pass finds nothing to give back: {pass:?}"
         );
         assert_eq!(
-            counters.dropped_ranges.lock().unwrap().len(),
-            1,
-            "so it asked the backend for nothing"
+            *counters.dropped_ranges.lock().unwrap(),
+            vec![
+                (1..4, crate::backend::AfterRelease::LeaveDropped),
+                (1..4, crate::backend::AfterRelease::LeaveDropped),
+            ],
+            "so it asked the backend to forget nothing more: the second ask is \
+             the want-set's, for the three pieces it gave back and does not \
+             want fetched again"
         );
     }
 
@@ -10814,6 +11044,59 @@ mod tests {
             bucket.join("0").is_file(),
             "the piece under the playhead stays"
         );
+    }
+
+    /// **And the want-set is left alone in the same states.** A torrent in
+    /// error holds no chunk tracker for a re-selection or a drop to edit;
+    /// the backend bails, and a bail per run is a warning per run per tick.
+    /// The pass reads the state at the want step as the reclaim does, asks
+    /// nothing, and asks the moment the torrent is settled again.
+    #[tokio::test]
+    async fn the_want_set_is_left_alone_while_the_torrent_is_in_error() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        // Only the piece under the playhead: three pieces beyond the window
+        // for the want step to stop wanting.
+        std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
+        let _store = seeded_store(&enginefs, &engine);
+        engine.note_playhead(0, 0);
+        engine.begin_retention(0).await;
+
+        counters.in_error_state.store(true, Ordering::SeqCst);
+        engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass over a registered set runs");
+        assert!(
+            counters.reselected.lock().unwrap().is_empty()
+                && counters.dropped_ranges.lock().unwrap().is_empty(),
+            "nothing was asked of a want-set the torrent does not have"
+        );
+
+        counters.in_error_state.store(false, Ordering::SeqCst);
+        engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass");
+        assert_eq!(*counters.reselected.lock().unwrap(), vec![0..1]);
+        assert_eq!(
+            *counters.dropped_ranges.lock().unwrap(),
+            vec![(1..4, crate::backend::AfterRelease::LeaveDropped)]
+        );
+
+        // And the clear's want-everything is left unasked in error too: a
+        // torrent restarted out of error rebuilds its want-set whole.
+        counters.in_error_state.store(true, Ordering::SeqCst);
+        engine.pinned_files.write().insert(0);
+        engine.retain(enginefs.store_registry()).await;
+        assert_eq!(*counters.reselected.lock().unwrap(), vec![0..1]);
     }
 
     /// **A pass measures against where playback is now, not where it was
@@ -11100,16 +11383,24 @@ mod tests {
             bucket.join("2").is_file() && bucket.join("3").is_file(),
             "the pieces of the file the user has just asked to keep are still here"
         );
-        assert!(
-            !counters
-                .dropped_ranges
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(range, _)| range.contains(&2) || range.contains(&3)),
-            "and the backend was never asked to forget them either: a piece \
-             dropped here is left neither held nor wanted, and nothing on the \
-             pin path recomputes the want-set to fetch it again"
+        assert_eq!(
+            *counters.dropped_ranges.lock().unwrap(),
+            vec![(1..4, crate::backend::AfterRelease::LeaveDropped)],
+            "and the backend was never asked to forget them either: the one \
+             ask is the first pass's, which stopped wanting the three pieces \
+             it did not have; a piece dropped after the pin would be left \
+             neither held nor wanted, and nothing on the pin path recomputes \
+             a selection that did not change"
+        );
+        // The pass that runs under the pin clears the policy, and with it
+        // wants the whole file again: what the first pass stopped wanting is
+        // fetched for the download the user asked for.
+        engine.retain(enginefs.store_registry()).await;
+        assert_eq!(
+            counters.reselected.lock().unwrap().last(),
+            Some(&(0..4)),
+            "the pin's pass wants every piece of the file again, after the \
+             windows the two passes before it wanted"
         );
     }
 
@@ -11288,9 +11579,10 @@ mod tests {
             .collect();
         assert_eq!(
             dropped,
-            vec![2..4],
-            "the part before the window went, the pin landed inside that drop, \
-             and nothing was asked for after it: {pass:?}"
+            vec![1..8, 2..4],
+            "the first pass stopped wanting the seven pieces it did not have; \
+             then the part before the window went, the pin landed inside that \
+             drop, and nothing was asked for after it: {pass:?}"
         );
         assert!(
             !bucket.join("2").exists() && !bucket.join("3").exists(),
@@ -11679,9 +11971,64 @@ mod tests {
         assert_eq!(pass.reclaimed, 1, "one piece was this file's alone to give");
         assert_eq!(
             *counters.dropped_ranges.lock().unwrap(),
-            vec![(5..6, crate::backend::AfterRelease::LeaveDropped)],
+            vec![
+                (6..8, crate::backend::AfterRelease::LeaveDropped),
+                (5..6, crate::backend::AfterRelease::LeaveDropped),
+            ],
             "the backend is never even asked to forget the shared piece: it \
-             would agree, and the bytes would go"
+             would agree, and the bytes would go. The want-set's ask is for \
+             the two pieces of this file's own it does not have, the reclaim's \
+             for the one it gives back"
+        );
+    }
+
+    /// **And the want-set is trimmed by the same boundary rule.** A piece
+    /// the next episode also lies in, not on the disk and outside this
+    /// file's window, stays wanted: dropped, the neighbour would be a piece
+    /// short with nothing to fetch it, as it would be a piece short of the
+    /// reclaim above. Pieces of this file's own beyond the window are
+    /// dropped.
+    #[tokio::test]
+    async fn the_piece_the_next_file_shares_stays_wanted_when_the_window_leaves_it() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![
+            ("Show.S01E01.mkv".into(), 100),
+            ("Show.S01E02.mkv".into(), 110),
+            ("Show.S01E03.mkv".into(), 100),
+        ]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        // Episode two is pieces 4..9; only its first two have arrived.
+        for piece in [4u32, 5] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        engine.note_playhead(1, 0);
+        engine.begin_retention(1).await;
+        let _store = seeded_store(&enginefs, &engine);
+        engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass");
+
+        let asked: Vec<std::ops::Range<u32>> = counters
+            .dropped_ranges
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(range, _)| range.clone())
+            .collect();
+        assert_eq!(
+            asked,
+            vec![6..8, 5..6],
+            "pieces six and seven are this file's own and not wanted; piece \
+             eight is the next episode's too and is never asked about; piece \
+             five is the reclaim's"
         );
     }
 
@@ -12140,8 +12487,9 @@ mod tests {
             .collect();
         assert_eq!(
             dropped,
-            vec![2..4, 2..3],
-            "the pass asked the backend first, and the delete only after it"
+            vec![1..4, 2..4, 2..3],
+            "the first pass stopped wanting the pieces it did not have; then \
+             the pass asked the backend first, and the delete only after it"
         );
     }
 

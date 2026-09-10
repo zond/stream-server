@@ -218,12 +218,16 @@ pub fn disk_backed_forward_window_pieces_for(
     cap_pieces_by_bytes(pieces, piece_length, byte_cap)
 }
 
-/// Per-stream lookahead window (in bytes) for librqbit's `FileStreamOptions`,
-/// sized by playback intent instead of librqbit's fixed 32 MiB default. Reuses
-/// the same `MAX_*_WINDOW_BYTES` caps `disk_backed_forward_window_pieces_for`
-/// maps each intent onto, so librqbit reads ahead by the same byte budget the
-/// disk-cache path uses. `stream_with_options` rejects a zero window, so the
-/// result is clamped to at least 1 (all constants are already > 0).
+/// The most a stream reads ahead of itself, in bytes, by playback intent:
+/// the cap on librqbit's per-stream lookahead, in place of its fixed 32 MiB
+/// default.
+///
+/// **One of two inputs.** `Engine::try_get_file_with_intent` opens the
+/// reader with the smaller of this and the retention window's reach ahead of
+/// the reader (`Engine::fetch_bound`), so a stream never asks the swarm for a
+/// piece the next retention pass would reclaim; this is the whole of the
+/// lookahead only for a file nothing bounds. `stream_with_options` rejects a
+/// zero window, so the result is at least 1 (all constants are already > 0).
 ///
 /// `buffer` is the viewer's read-ahead choice and scales the playback windows
 /// only -- never the startup one, see [`BufferProfile`].

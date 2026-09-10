@@ -1,6 +1,6 @@
 use crate::backend::{
     EngineStats, FilePieceSpan, TorrentHandle,
-    priorities::{BufferProfile, PlaybackIntent},
+    priorities::{self, BufferProfile, PlaybackIntent},
 };
 use crate::cache::DataCache;
 use crate::piece_store::{RetentionPolicy, Share, StoreRegistry};
@@ -322,6 +322,17 @@ pub(crate) struct Standing {
     pub stopped_for_space: bool,
 }
 
+/// How far ahead of its opening offset a reader may fetch, as
+/// [`Engine::fetch_bound`] answers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RetentionBound {
+    /// Bytes from the opening offset to the start of the last piece the
+    /// window reaches ahead of it; `None` when nothing bounds the file --
+    /// no budget, a budget that covers it, a pin -- and the intent's cap is
+    /// the whole of the lookahead.
+    pub forward_bytes: Option<u64>,
+}
+
 /// One file of a torrent, as the thing a retention policy is over: which
 /// file, where it lies in the torrent's pieces, and how long a piece is.
 /// Fixed for the entity's life -- the owner compares it at a pass's re-read,
@@ -348,6 +359,30 @@ pub(crate) struct TorrentBacking<H: TorrentHandle> {
     /// property, and the owner asks about it before every pass and at every
     /// door.
     pinned: Arc<parking_lot::RwLock<BTreeSet<usize>>>,
+    /// Pieces a reclaim asked the backend to forget and did not get back --
+    /// a peer mid-flight on them, or a stream's lookahead over them. Shared
+    /// with [`Engine::refused_reclaims`], where a test reads it.
+    #[cfg(test)]
+    refused: Arc<AtomicUsize>,
+}
+
+impl<H: TorrentHandle> TorrentBacking<H> {
+    /// Want every piece of `ranges` again, one backend call per range; a
+    /// refusal is logged and the stream's own lookahead still pulls what it
+    /// is about to read.
+    async fn reselect(&self, ranges: &[Range<u32>]) {
+        for range in ranges {
+            if let Err(error) = self.handle.reselect_pieces(range.clone()).await {
+                tracing::warn!(
+                    info_hash = %self.info_hash,
+                    first = range.start,
+                    end = range.end,
+                    error = %format!("{error:#}"),
+                    "could not want the pieces again; the stream's lookahead still pulls what it reads"
+                );
+            }
+        }
+    }
 }
 
 impl<H: TorrentHandle> Backing for TorrentBacking<H> {
@@ -442,6 +477,126 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         crate::retention::this_files_alone(&self.handle, domain.file_idx, pieces).await
     }
 
+    /// The want-set, trimmed to the window: librqbit's picker fetches every
+    /// selected piece of the file it is not told otherwise about, and told
+    /// nothing it fills the disk past the window at the swarm's pace, for
+    /// every pass to reclaim what the last tick fetched.
+    ///
+    /// The windows are re-selected first: a piece the window has moved onto
+    /// may be one an earlier pass dropped, and a dropped piece is neither
+    /// had nor wanted until something wants it again. Then every piece of
+    /// the file in no window, not committed and not on the disk is dropped
+    /// and left dropped ([`crate::backend::AfterRelease::LeaveDropped`]): not
+    /// had, and now not wanted. What is on the disk and outside the windows
+    /// is the reclaim's ([`Self::reclaim`]), which drops it the same way
+    /// before it unlinks. A boundary piece a still-wanted neighbour owns
+    /// bytes in is left wanted, as the reclaim leaves it held: dropping it
+    /// would leave the neighbour a piece short.
+    ///
+    /// The stream's own lookahead is bounded to the same window at open
+    /// ([`Engine::fetch_bound`]), so nothing dropped here is a piece a live
+    /// stream is about to read; librqbit refuses those and would only have
+    /// them re-wanted. Not asked of a torrent that is not settled: the
+    /// backend bails for one under its check or in error, and the reading
+    /// belongs here beside the reclaim's.
+    ///
+    /// `held` is the pass's reading, taken two awaited backend calls ago,
+    /// and a piece outside the window can complete in that gap -- the store
+    /// sets its bit, then librqbit its have-bit. Asked to drop it, librqbit
+    /// does: it is a have piece, and dropping it is what the reclaim would
+    /// have done a pass later. But a have piece dropped and left on the disk
+    /// is a file the store counts and the backend has forgotten, and the
+    /// next pass cannot take it -- librqbit refuses to drop a piece twice --
+    /// so it would sit there, offered and refused every tick, until a
+    /// restart. So what librqbit reports dropped is read against the store's
+    /// set *now*, and whatever is on the disk goes under the claim, as a
+    /// reclaim's pieces do. The set is read after the drop: a piece the
+    /// store has is one librqbit had, never the reverse.
+    async fn want(
+        &self,
+        store: &Arc<StoreRegistry>,
+        domain: &FileDomain,
+        windows: &[Range<u32>],
+        committed: &BTreeSet<u32>,
+        held: &BTreeSet<u32>,
+    ) {
+        let run_state = self.handle.run_state();
+        if !matches!(
+            run_state,
+            crate::backend::RunState::Live | crate::backend::RunState::Paused
+        ) {
+            tracing::debug!(
+                info_hash = %self.info_hash,
+                ?run_state,
+                "the torrent is not settled, so its want-set is left as it is this pass"
+            );
+            return;
+        }
+        self.reselect(windows).await;
+        let unwanted: Vec<u32> = Self::extent(domain)
+            .filter(|piece| {
+                !windows.iter().any(|window| window.contains(piece))
+                    && !committed.contains(piece)
+                    && !held.contains(piece)
+            })
+            .collect();
+        let alone = self.alone(domain, &unwanted).await;
+        for run in crate::retention::runs(&alone) {
+            match self
+                .handle
+                .drop_pieces(run.clone(), crate::backend::AfterRelease::LeaveDropped)
+                .await
+            {
+                Ok(Some(claim)) => {
+                    let arrived: Vec<u32> = match store.held(&self.info_hash) {
+                        Some(now) => {
+                            let now = now.in_range(run.clone());
+                            claim
+                                .pieces()
+                                .iter()
+                                .copied()
+                                .filter(|piece| now.contains(piece))
+                                .collect()
+                        }
+                        None => Vec::new(),
+                    };
+                    if arrived.is_empty() {
+                        // Nothing of these is on the disk: released at once.
+                        drop(claim);
+                    } else {
+                        tracing::debug!(
+                            info_hash = %self.info_hash,
+                            pieces = arrived.len(),
+                            "pieces outside the window arrived under the pass; unlinking what the backend forgot"
+                        );
+                        crate::retention::unlink(store, &self.info_hash, arrived, Some(claim))
+                            .await;
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    info_hash = %self.info_hash,
+                    first = run.start,
+                    end = run.end,
+                    error = %format!("{error:#}"),
+                    "could not stop wanting the pieces outside the window; the swarm will fill them"
+                ),
+            }
+        }
+    }
+
+    /// Nothing bounds the file any more: every piece of it wanted again,
+    /// on a settled torrent. See [`Self::want`] for the drop this undoes.
+    async fn want_all(&self, domain: &FileDomain) {
+        if !matches!(
+            self.handle.run_state(),
+            crate::backend::RunState::Live | crate::backend::RunState::Paused
+        ) {
+            return;
+        }
+        self.reselect(&[Self::extent(domain)]).await;
+    }
+
     /// The reclaim, asking the door before every part of every run.
     ///
     /// **The door, asked at the instant of each unlink and not a moment
@@ -522,8 +677,14 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
             }
             let parts = crate::retention::outside(run.clone(), &window);
             if parts.len() == 1 && parts[0] == run {
-                reclaimed +=
+                #[cfg(test)]
+                let asked = (run.end - run.start) as usize;
+                let freed =
                     crate::retention::release(&self.handle, store, &self.info_hash, run).await;
+                #[cfg(test)]
+                self.refused
+                    .fetch_add(asked.saturating_sub(freed), Ordering::Relaxed);
+                reclaimed += freed;
             } else {
                 // Strictly fewer pieces than `run`, so this converges: a
                 // part is released or shrinks again on every turn through
@@ -690,6 +851,11 @@ pub struct Engine<H: TorrentHandle> {
     /// handed a runner that reads it ([`Retention::hook`]).
     #[cfg(test)]
     pub(crate) interleave: Interleave,
+    /// How many pieces the passes asked the backend to forget and were
+    /// refused, summed over the engine's life: the count the fetch-ahead
+    /// bound exists to keep at zero, read by the test that pins it.
+    #[cfg(test)]
+    pub(crate) refused_reclaims: Arc<AtomicUsize>,
 }
 
 /// The cell a test writes what playback does mid-pass into: see
@@ -712,6 +878,7 @@ impl<H: TorrentHandle> Engine<H> {
             handle: self.handle.clone(),
             info_hash: self.info_hash.clone(),
             pinned: self.pinned_files.clone(),
+            refused: self.refused_reclaims.clone(),
         };
         let domain = backing.resolve(file_idx).await?;
         backing.held(store, &domain).await
@@ -725,11 +892,15 @@ impl<H: TorrentHandle> Engine<H> {
         budget: Arc<crate::retention::RetentionBudget>,
     ) -> Self {
         let pinned_files = Arc::new(parking_lot::RwLock::new(BTreeSet::new()));
+        #[cfg(test)]
+        let refused_reclaims = Arc::new(AtomicUsize::new(0));
         let retention = Retention::new(
             Arc::new(TorrentBacking {
                 handle: handle.clone(),
                 info_hash: info_hash.to_string(),
                 pinned: pinned_files.clone(),
+                #[cfg(test)]
+                refused: refused_reclaims.clone(),
             }),
             budget,
         );
@@ -765,6 +936,8 @@ impl<H: TorrentHandle> Engine<H> {
             retention,
             #[cfg(test)]
             interleave,
+            #[cfg(test)]
+            refused_reclaims,
         }
     }
 
@@ -1058,6 +1231,34 @@ impl<H: TorrentHandle> Engine<H> {
             ?outcome,
             "retention policy for the file about to stream"
         );
+    }
+
+    /// How far ahead of `start_offset` a reader of `file_idx` opened there
+    /// may fetch, from one reading of the owner ([`Retention::reach`]) taken
+    /// after [`Self::begin_retention`]: the bytes from `start_offset` to the
+    /// start of the last piece the window reaches ahead of it, or `None`
+    /// when nothing bounds the file.
+    ///
+    /// The *start* of that piece, not its end: librqbit rounds the end of a
+    /// stream's lookahead up to a whole piece, and the reader's offset inside
+    /// its piece drifts as it plays, so a lookahead ending exactly at the
+    /// edge reaches one piece past it half the time -- a piece the next pass
+    /// would reclaim and librqbit refuse to drop. The window's last piece is
+    /// fetched by the want-set ([`TorrentBacking::want`]) rather than by the
+    /// stream, which is what fetches the rest of the window beyond the
+    /// lookahead anyway.
+    pub(crate) fn fetch_bound(&self, file_idx: usize, start_offset: u64) -> RetentionBound {
+        let forward_bytes = self
+            .retention
+            .reach(&file_idx, (file_idx, start_offset))
+            .map(|(domain, ahead)| {
+                // `ahead` is never empty (`RetentionPolicy::ahead_of`), so
+                // `end - 1` is the last piece the window reaches.
+                (u64::from(ahead.end - 1) * domain.piece_length)
+                    .saturating_sub(domain.span.offset)
+                    .saturating_sub(start_offset)
+            });
+        RetentionBound { forward_bytes }
     }
 
     /// The file whose policy bounds this torrent right now, and the policy
@@ -1459,11 +1660,23 @@ impl<H: TorrentHandle> Engine<H> {
         // only after it completes has already had its Have go out. See
         // [`Self::begin_retention`].
         self.begin_retention(file_idx).await;
+        let bound = self.fetch_bound(file_idx, start_offset);
+        // The smaller of what the intent would read ahead and what the
+        // window will keep: a stream that fetched past the window would have
+        // every pass reclaim what it just fetched, and librqbit refuses to
+        // drop a piece a stream is about to read, so the disk would sit over
+        // budget by the lookahead for the stream's life. At least one byte:
+        // librqbit refuses a stream that reads nothing ahead.
+        let lookahead_bytes = bound
+            .forward_bytes
+            .unwrap_or(u64::MAX)
+            .min(priorities::librqbit_stream_lookahead_bytes(intent, buffer))
+            .max(1);
 
         let reader_start = Instant::now();
         let reader = self
             .handle
-            .get_file_reader(file_idx, start_offset, priority, None, intent, buffer)
+            .get_file_reader(file_idx, start_offset, priority, None, lookahead_bytes)
             .await
             .context("get_file_reader")?;
         tracing::debug!(

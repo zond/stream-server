@@ -648,17 +648,22 @@ async fn stream_file(
                     TorrentMemberStream::start(state.engine.clone(), hash_part.to_lowercase(), idx)
                         .await,
                 );
-                // get_file_reader(idx, offset, priority)
+                // get_file_reader(idx, offset, priority). The intent's cap
+                // alone: this path installs no retention policy, so there is
+                // no window to cut the lookahead to.
                 let reader = handle
                     .get_file_reader(
                         idx,
                         0,
                         7,
                         None,
-                        enginefs::backend::priorities::PlaybackIntent::DirectInitial,
-                        // Archive members are read whole, sequentially, from a
-                        // session the viewer never gets a buffer choice for.
-                        enginefs::backend::priorities::BufferProfile::Normal,
+                        enginefs::backend::priorities::librqbit_stream_lookahead_bytes(
+                            enginefs::backend::priorities::PlaybackIntent::DirectInitial,
+                            // Archive members are read whole, sequentially,
+                            // from a session the viewer never gets a buffer
+                            // choice for.
+                            enginefs::backend::priorities::BufferProfile::Normal,
+                        ),
                     )
                     .await // 7 = high priority
                     .map_err(|e| {

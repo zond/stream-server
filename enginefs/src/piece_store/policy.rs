@@ -400,6 +400,31 @@ impl RetentionPolicy {
         start..start + want
     }
 
+    /// The pieces from `playhead` to the window's forward edge, as that edge
+    /// stands once nothing clamps the window against the file's start:
+    /// `playhead` and the nine tenths ahead of it, cut at the last piece.
+    ///
+    /// This is what a stream opened at `playhead` may fetch ahead of itself.
+    /// Not [`Self::window_at`]`.end`: at the start of a file the window is
+    /// clamped against piece zero, so its end is the whole window ahead of
+    /// the playhead rather than nine tenths of it, and a lookahead sized from
+    /// that end outruns the window for the first tenth of it as the playhead
+    /// moves on -- the window's end stands still while the lookahead's
+    /// advances -- fetching pieces the next pass reclaims. The reach is at
+    /// most the window's end wherever the playhead is, and it moves with the
+    /// playhead exactly as the unclamped window does.
+    pub fn ahead_of(&self, playhead: u32) -> Range<u32> {
+        let total = self.pieces.end - self.pieces.start;
+        let want = match self.shape {
+            Shape::Whole => total,
+            Shape::Split { window, .. } => window.clamp(1, total),
+        };
+        let playhead = playhead.clamp(self.pieces.start, self.pieces.end - 1);
+        let behind = (u64::from(want) * BEHIND_PERCENT / 100) as u32;
+        let end = playhead.saturating_add(want - behind).min(self.pieces.end);
+        playhead..end
+    }
+
     /// Decide, for a playhead on `playhead` over the pieces we currently
     /// `held`, what the window covers, what joins the committed set, and what
     /// to give back.
