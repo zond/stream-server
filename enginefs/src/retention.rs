@@ -494,7 +494,7 @@ pub(crate) async fn advance<H: TorrentHandle, D: Fn() -> Option<u64>>(
     // `announce`, which the pass holds throughout, so nothing can announce
     // a piece between the decision and the unlink -- that half of the
     // proxy's door is kept here by the lock, and a door built from
-    // `Engine::gate_verdict_for_file` would in any case answer
+    // `Engine::standing` would in any case answer
     // `TorrentGate::Announced` (the policy is in this pass's hand, not in
     // the slot) and reclaim nothing, ever.
     //
@@ -818,7 +818,7 @@ struct ReaderWindow {
 
 /// One torrent's answer, in the three shapes it comes in.
 ///
-/// Asked in two places and computed in one ([`crate::engine::Engine::gate_verdict`]):
+/// Asked in two places and computed in one ([`crate::engine::Engine::standing`]):
 /// the cleaner's walk collects these into a [`ReclaimGate`], and the delete
 /// the cleaner then asks for re-asks the same question of the same engine
 /// before it unlinks anything. The walk's copy is a reading taken minutes
@@ -871,6 +871,12 @@ impl ReclaimGate {
     /// This torrent announces everything it holds: nothing of it may go.
     pub fn insert_announced(&mut self, info_hash: String) {
         self.insert(info_hash, TorrentGate::Announced);
+    }
+
+    /// The verdict an engine gave ([`crate::engine::Engine::standing`]),
+    /// whichever shape it came in.
+    pub fn insert_verdict(&mut self, info_hash: String, gate: TorrentGate) {
+        self.insert(info_hash, gate);
     }
 
     /// This torrent announces nothing at all, and its bytes go first.

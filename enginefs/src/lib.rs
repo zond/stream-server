@@ -2323,19 +2323,13 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let mut verdicts = ReclaimVerdicts::default();
         for engine in engines {
             let info_hash = engine.info_hash.to_lowercase();
-            if engine.is_pinned() {
-                verdicts.gate.insert_announced(info_hash);
-                continue;
-            }
-            let out_of_space =
-                engine.is_stopped_for_space().await || engine.handle.is_out_of_space().await;
-            if out_of_space {
+            // The same asking the delete makes at the door: see
+            // `Engine::standing` for why it has to be the same one.
+            let standing = engine.standing().await;
+            if standing.stopped_for_space {
                 verdicts.stopped_for_space.push(info_hash.clone());
-            } else if engine.handle.is_in_error_state().await {
-                verdicts.gate.insert_dead(info_hash);
-                continue;
             }
-            engine.gate_entry(&mut verdicts.gate);
+            verdicts.gate.insert_verdict(info_hash, standing.gate);
         }
         // A dormant pin has no engine to speak for it -- that is what
         // dormant means -- and its bytes are its pieces exactly like a live
@@ -10004,13 +9998,26 @@ mod tests {
     /// peer is mid-flight on and the ones a live stream is about to read --
     /// and only those are taken. A backend that will not give any of them
     /// up leaves every byte where it is.
+    ///
+    /// The torrent has a policy that releases the pieces asked for: that is
+    /// what makes the cleaner's request one this door lets through to the
+    /// backend at all -- see the test after this one for the torrent that
+    /// does not.
     #[tokio::test]
     async fn a_reclaim_takes_only_the_pieces_the_backend_agreed_to_forget() {
-        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 200)]);
+        counters.pieces_per_file.store(8, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        // Two pieces of budget over eight: a policy, whose window sits on
+        // piece 0 and has committed nothing, so pieces 3 to 5 are its to
+        // give up.
+        enginefs.set_cache_budget(Some(50));
+        engine.note_playhead(0, 0);
+        engine.begin_retention(0).await;
         let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
         std::fs::create_dir_all(&bucket).unwrap();
         for piece in [3u32, 4, 5] {
-            std::fs::write(bucket.join(piece.to_string()), [7u8; 4096]).unwrap();
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
         }
         // Piece 5 is one the backend keeps -- a peer is working on it, or a
         // stream is about to read it.
@@ -10034,6 +10041,84 @@ mod tests {
         counters.refuses_drop.store(true, Ordering::SeqCst);
         assert_eq!(enginefs.release_pieces(TEST_HASH, &[5]).await, 0);
         assert!(bucket.join("5").is_file());
+    }
+
+    /// **The delete asks the walk's question again, and the same one.**
+    ///
+    /// A torrent that announces everything releases nothing at the walk,
+    /// so a delete that arrives for one of its pieces is a reading that went
+    /// stale on the way: here, a reader opened on the torrent after the walk
+    /// found no engine and called its bytes cache. The door used to take
+    /// every piece the cleaner named unless a policy was in the slot to
+    /// refuse it -- and that is the advertise-then-refuse the gate exists to
+    /// prevent, on exactly the torrent a reader has just opened.
+    #[tokio::test]
+    async fn a_torrent_a_reader_opened_since_the_cleaner_looked_keeps_its_pieces() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        // The cleaner's reading: no engine, so no entry in the gate, so
+        // cache.
+        assert!(
+            crate::retention::ReclaimGate::default().releases(TEST_HASH, 0),
+            "with nobody to speak for it the walk calls this torrent's bytes cache"
+        );
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("0"), [7u8; 4096]).unwrap();
+        *counters.drops_pieces.lock().unwrap() = vec![0];
+
+        // A reader opens on it before the delete arrives: an engine, no
+        // policy, everything it holds announced.
+        let _engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+
+        assert_eq!(enginefs.release_pieces(TEST_HASH, &[0]).await, 0);
+        assert!(
+            bucket.join("0").is_file(),
+            "an announced piece is not the cleaner's to take, whatever its walk said"
+        );
+        assert!(
+            counters.dropped_ranges.lock().unwrap().is_empty(),
+            "and the backend was not asked to forget it"
+        );
+    }
+
+    /// **And a pin taken since the walk refuses the delete as the walk
+    /// would have.**
+    ///
+    /// The walk answers `Announced` for a pinned torrent before it looks at
+    /// any policy. The delete's second asking looked only at the policy --
+    /// and a pin taken while the file was streaming leaves the policy in
+    /// the slot until the next pass clears it, so for that gap the delete
+    /// took pieces out of the download the user had just asked to keep.
+    #[tokio::test]
+    async fn a_pin_taken_since_the_cleaner_looked_keeps_its_pieces() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 200)]);
+        counters.pieces_per_file.store(8, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        engine.note_playhead(0, 0);
+        engine.begin_retention(0).await;
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("5"), [7u8; 25]).unwrap();
+        // The cleaner's reading: the policy gives piece 5 up.
+        assert!(engine.standing().await.gate.releases(5));
+
+        // The user pins the file between the walk and the delete. The
+        // policy is still in the slot: nothing on the pin path clears it.
+        engine.pinned_files.write().insert(0);
+
+        assert_eq!(enginefs.release_pieces(TEST_HASH, &[5]).await, 0);
+        assert!(
+            bucket.join("5").is_file(),
+            "the piece of a pinned download stays whatever the policy in the slot says"
+        );
+        assert!(
+            counters.dropped_ranges.lock().unwrap().is_empty(),
+            "and the backend was not asked to forget it"
+        );
     }
 
     /// **The panel's window is a reading of the disk, not of the policy's
@@ -11095,7 +11180,7 @@ mod tests {
         engine.note_playhead(1, 0);
         engine.begin_retention(1).await;
         let mut gate = crate::retention::ReclaimGate::default();
-        engine.gate_entry(&mut gate);
+        gate.insert_verdict(TEST_HASH.to_lowercase(), engine.standing().await.gate);
         assert!(
             gate.releases(TEST_HASH, 8),
             "the reading the cleaner walks with offers the shared piece,              because a gate has no way to know it is shared"
@@ -11150,7 +11235,7 @@ mod tests {
         engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
         let mut gate = crate::retention::ReclaimGate::default();
-        engine.gate_entry(&mut gate);
+        gate.insert_verdict(TEST_HASH.to_lowercase(), engine.standing().await.gate);
         assert!(
             gate.releases(TEST_HASH, 0),
             "the cleaner's reading says this piece may go"
@@ -11198,7 +11283,7 @@ mod tests {
         engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
         assert!(
-            engine.gate_verdict().releases(0),
+            engine.standing().await.gate.releases(0),
             "before the pin, the policy would give this piece up"
         );
 
@@ -11211,7 +11296,7 @@ mod tests {
             "a pinned torrent has no retention pass to make"
         );
         assert!(
-            !engine.gate_verdict().releases(0),
+            !engine.standing().await.gate.releases(0),
             "and nothing of it may be reclaimed any more"
         );
     }

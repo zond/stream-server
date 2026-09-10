@@ -299,6 +299,24 @@ const NEVER_MOVED: u64 = u64::MAX;
 pub const STOPPED_FOR_SPACE_MESSAGE: &str =
     "the torrent is stopped for want of disk space; free some space and it will resume";
 
+/// One torrent's standing with the cache cleaner: what it will give up,
+/// and whether it is one of the torrents the cleaner is evicting *for*.
+///
+/// The walk collects one of these per engine into a
+/// [`crate::retention::ReclaimGate`] and the delete asks for it again --
+/// see [`Engine::standing`], which is the one place it is computed.
+pub(crate) struct Standing {
+    pub gate: crate::retention::TorrentGate,
+    /// The file whose policy answered, if a policy did: the boundary
+    /// narrowing ([`crate::retention::this_files_alone`]) needs a file to
+    /// narrow by.
+    pub policy_file: Option<usize>,
+    /// The backend stopped this torrent for want of space, or the
+    /// reconciler did before the backend could: the cleaner has bytes to
+    /// find for it.
+    pub stopped_for_space: bool,
+}
+
 pub struct Engine<H: TorrentHandle> {
     pub info_hash: String,
     pub handle: H,
@@ -1046,19 +1064,61 @@ impl<H: TorrentHandle> Engine<H> {
         }
     }
 
-    /// What this engine will give up, right now.
+    /// What this engine tells the cache cleaner it may take -- **asked by
+    /// the walk and asked again by the delete, from this one function.**
     ///
-    /// Computed in one place and asked in two: the cleaner's walk collects
-    /// these into a [`crate::retention::ReclaimGate`], and the delete the
-    /// walk goes on to ask for re-asks it here before unlinking anything.
     /// The walk's copy is a reading taken before a blocking directory walk
-    /// and every delete before this one; this asking is the one that
-    /// decides.
-    pub(crate) fn gate_verdict(&self) -> crate::retention::TorrentGate {
-        self.gate_verdict_for_file().0
+    /// and every delete before this one, so by the time a delete arrives it
+    /// can be minutes old, and [`Self::release_reclaimable`] asks again at
+    /// the door. It has to ask the *same* question. A second asking that
+    /// answered a narrower one -- as this used to, taking every piece the
+    /// cleaner named unless a policy was in the slot to refuse it -- is not
+    /// a check on the reading but a way round it: the walk protects a
+    /// torrent that announces everything and a pinned one, and the delete
+    /// took their pieces anyway whenever its reading had gone stale in
+    /// between. So everything the walk folds into its verdict is folded in
+    /// here:
+    ///
+    /// * a **pinned** torrent announces everything and releases nothing,
+    ///   whatever policy its slot still holds -- a pin taken while the file
+    ///   was streaming leaves the policy installed until the next pass
+    ///   clears it, and the download the user asked to keep must not lose
+    ///   pieces through that gap;
+    /// * a torrent the backend stopped with an **error** announces nothing,
+    ///   and its bytes go first;
+    /// * otherwise the policy answers, or the absence of one does.
+    ///
+    /// A torrent stopped for **space** is not an error here: the cleaner is
+    /// what gets it going again, by evicting other bytes, so it keeps its
+    /// policy's protection meanwhile and is named to the cleaner separately
+    /// ([`Standing::stopped_for_space`]).
+    pub(crate) async fn standing(&self) -> Standing {
+        if self.is_pinned() {
+            return Standing {
+                gate: crate::retention::TorrentGate::Announced,
+                policy_file: None,
+                stopped_for_space: false,
+            };
+        }
+        let stopped_for_space =
+            self.is_stopped_for_space().await || self.handle.is_out_of_space().await;
+        if !stopped_for_space && self.handle.is_in_error_state().await {
+            return Standing {
+                gate: crate::retention::TorrentGate::Nothing,
+                policy_file: None,
+                stopped_for_space,
+            };
+        }
+        let (gate, policy_file) = self.gate_verdict_for_file();
+        Standing {
+            gate,
+            policy_file,
+            stopped_for_space,
+        }
     }
 
-    /// [`Self::gate_verdict`], and the file whose policy answered it.
+    /// The policy's half of [`Self::standing`], and the file whose policy
+    /// answered it.
     ///
     /// The two come out of one acquisition of the slot because they are one
     /// policy's: a caller that asked twice could find itself narrowing one
@@ -1074,18 +1134,6 @@ impl<H: TorrentHandle> Engine<H> {
                 Some(retention.file_idx),
             ),
             None => (crate::retention::TorrentGate::Announced, None),
-        }
-    }
-
-    /// What this engine tells the cache cleaner it may take, for
-    /// [`crate::retention::ReclaimGate`].
-    pub(crate) fn gate_entry(&self, gate: &mut crate::retention::ReclaimGate) {
-        let info_hash = self.info_hash.to_lowercase();
-        match self.gate_verdict() {
-            crate::retention::TorrentGate::Policy { pieces, committed } => {
-                gate.insert_policy(info_hash, pieces, committed)
-            }
-            _ => gate.insert_announced(info_hash),
         }
     }
 
@@ -1116,32 +1164,39 @@ impl<H: TorrentHandle> Engine<H> {
         pieces: &[u32],
     ) -> usize {
         let _announce = self.announce.lock().await;
-        // Only a *policy* narrows the cleaner's request. Where there is
-        // none this engine has no opinion the cleaner does not already
-        // have: it decided by its own rule -- a dead torrent's bytes go
-        // first, a live one's are protected -- and second-guessing that
-        // here would quietly make a live torrent with no reader
-        // unevictable, which is a policy change and not this fix.
+        // The cleaner's question, asked again at the door: what the walk
+        // collected was a reading, and this is the asking that decides.
         //
-        // The case this exists for still lands inside that: the reader
+        // The same question, from `standing`, and not a narrower one. This
+        // used to filter only where a policy was in the slot and take
+        // everything the cleaner named otherwise, on the argument that a
+        // torrent with no policy had no opinion the cleaner did not already
+        // have. But the cleaner's own rule already refuses every piece of a
+        // torrent that announces everything, so the only way it comes to
+        // ask for one is a reading that went stale on the way here: a reader
+        // opened on the torrent since the walk (which found no engine and
+        // called its bytes cache), a pin was taken since, or the policy
+        // that released the piece was cleared since. Taking the piece then
+        // was the advertise-then-refuse the gate exists to prevent, on
+        // exactly the torrents a reader has just opened -- and the delete
+        // of a download the user had just pinned.
+        //
+        // The case a policy narrows still lands inside this: the reader
         // moving to another file installs a policy for *that* file, and
         // piece 0 of the file it left is outside the new range, so the
         // verdict refuses it. So does a piece the pass has committed since.
-        let (verdict, policy_file) = self.gate_verdict_for_file();
-        let mut still: Vec<u32> = match &verdict {
-            crate::retention::TorrentGate::Policy { .. } => pieces
-                .iter()
-                .copied()
-                .filter(|piece| verdict.releases(*piece))
-                .collect(),
-            _ => pieces.to_vec(),
-        };
+        let standing = self.standing().await;
+        let mut still: Vec<u32> = pieces
+            .iter()
+            .copied()
+            .filter(|piece| standing.gate.releases(*piece))
+            .collect();
         if still.len() != pieces.len() {
             tracing::debug!(
                 info_hash = %self.info_hash,
                 asked = pieces.len(),
                 taking = still.len(),
-                "pieces became announced between the cleaner's reading and its delete"
+                "the cleaner's reading of this torrent went stale before its delete"
             );
         }
         // The gate has no answer about the boundary. It speaks for the
@@ -1152,7 +1207,7 @@ impl<H: TorrentHandle> Engine<H> {
         // cleaner's delete starts the refetch loop the pass no longer
         // starts. Only a policy has a file to narrow by; where there is
         // none this engine already has no opinion.
-        if let Some(file_idx) = policy_file {
+        if let Some(file_idx) = standing.policy_file {
             still = crate::retention::this_files_alone(&self.handle, file_idx, &still).await;
         }
         let mut freed = 0;
