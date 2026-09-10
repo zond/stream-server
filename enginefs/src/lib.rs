@@ -11789,6 +11789,87 @@ mod tests {
         assert!(gate.releases(&hash, 1), "held back, so reclaimable");
     }
 
+    /// **Two files opened at once still leave one policy standing, in
+    /// order.**
+    ///
+    /// A player opening the video while the client fetches the `.srt` of
+    /// the same torrent is two `begin_retention`s on different files at
+    /// once, and each clears the other's policy only if it can see it.
+    /// `Engine::announce` used to hold the two apart for the whole torrent;
+    /// with the turn per file, an install that has resolved its file and is
+    /// inside the backend call holding its range back has installed nothing
+    /// yet, so a second install on another file found no sibling to retire
+    /// and ran straight through. Both then installed: two ranges held back,
+    /// the gate answering for whichever the map listed first, and the other
+    /// file's pieces neither shared nor reclaimable until the next seek --
+    /// held back and protected at once, the combination that is never right.
+    /// The owner orders its installs now, and this is the second one
+    /// waiting on the first.
+    #[tokio::test]
+    async fn two_files_opened_at_once_still_leave_one_policy_standing() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        enginefs.set_cache_budget(Some(40));
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+
+        // The first file's install is parked inside the call that holds its
+        // range back: resolved, its turn taken, nothing installed yet.
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *counters.advertise_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        let first = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.begin_retention(0).await }
+        });
+        tokio::time::timeout(Duration::from_secs(10), entered_rx)
+            .await
+            .expect("the first install reached the call that holds its range back")
+            .expect("the fake said so");
+
+        // The second file's install arrives while the first is in there. On
+        // this single-threaded runtime it has run as far as it can once the
+        // test has yielded to it, and as far as it can is the wait.
+        let second = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.begin_retention(1).await }
+        });
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !second.is_finished(),
+            "the second install ran to the end while the first was still installing: \
+             two installs on one torrent do not run at once"
+        );
+
+        release_tx
+            .send(())
+            .expect("the first install is waiting on this");
+        first.await.expect("the first install's task");
+        second.await.expect("the second install's task");
+
+        assert_eq!(
+            *counters.advertised.lock().unwrap(),
+            vec![(0..1, false), (0..1, true), (1..2, false)],
+            "file 0 held back, then given back, and only then file 1 held back"
+        );
+        let installed: Vec<usize> = engine
+            .retention
+            .holdings()
+            .into_iter()
+            .filter(|(_, holding)| holding.installed.is_some())
+            .map(|(file_idx, _)| file_idx)
+            .collect();
+        assert_eq!(
+            installed,
+            vec![1],
+            "one policy stands, and it is the last file opened"
+        );
+        let hash = TEST_HASH.to_lowercase();
+        let gate = enginefs.reclaim_verdicts().await.gate;
+        assert!(!gate.releases(&hash, 0), "announced again, so protected");
+        assert!(gate.releases(&hash, 1), "held back, so reclaimable");
+    }
+
     /// A hash the session runs no torrent for has no have-set for a
     /// deletion to disagree with, so its pieces go straight to the store.
     ///

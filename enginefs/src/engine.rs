@@ -642,7 +642,8 @@ pub struct Engine<H: TorrentHandle> {
     /// `announce`, the policy slot, its mirror and the playhead used to be
     /// -- see [`crate::retention::owner`] for the lock rule and the pass.
     /// One active file per torrent is the owner's
-    /// [`Retention::install`], which clears every other file first.
+    /// [`Retention::install`], which clears every other file first and runs
+    /// one at a time over the torrent, as `announce` made it.
     pub(crate) retention: Arc<Retention<TorrentBacking<H>>>,
     /// Where a test puts what playback does while a pass runs.
     ///
@@ -1012,8 +1013,13 @@ impl<H: TorrentHandle> Engine<H> {
     /// as a value, or `None` while nothing bounds it.
     ///
     /// One file at most has a policy installed -- [`Retention::install`]
-    /// clears every other before it installs -- so the first holding with
-    /// one is the torrent's. A copy-out under the owner's locks, no I/O.
+    /// clears every other before it installs, and installs are ordered over
+    /// the owner so two opens on different files cannot each miss the
+    /// other -- so the first holding with one is the torrent's. The one way
+    /// two can stand is a sibling whose range the backend would not take
+    /// back at its retiring (`retire_siblings` warns and goes on); the map's
+    /// first answers then, until a later install can retire it. A copy-out
+    /// under the owner's locks, no I/O.
     fn bounded(&self) -> Option<(usize, InstalledView)> {
         self.retention
             .holdings()

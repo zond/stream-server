@@ -33,13 +33,16 @@
 //! Locks, outermost first:
 //!
 //! * **L1** [`Retention::entities`] (`parking_lot::Mutex`) -- lookup, insert,
-//!   prune, iterate-for-holdings.
+//!   prune, iterate-for-holdings, and the position last told everywhere.
 //! * **L2** [`Entity::state`] (`parking_lot::Mutex`) -- every datum,
 //!   including the resident [`RetentionPolicy`].
 //! * **T** [`Entity::turn`] (`tokio::sync::Mutex<Turn>`) -- the entity's turn.
 //!   Protects no memory; orders this process's changes to the world outside
 //!   it (what librqbit advertises, what the directory holds). The ONLY thing
 //!   ever held across an await.
+//! * **I** [`Retention::installing`] (`tokio::sync::Mutex<()>`) -- the
+//!   install order, one [`Retention::install`] at a time over the whole
+//!   owner. Protects no memory; held across the install's I/O.
 //! * **X** -- locks outside the owner: `pinned_files`, [`RetentionBudget`],
 //!   librqbit's own, the filesystem.
 //!
@@ -76,7 +79,10 @@
 //! 4. T is per entity and never nested: [`Retention::install`]'s
 //!    `retire_siblings` clears each sibling under that sibling's own turn
 //!    and releases it before taking the new key's. No two turns are ever
-//!    held at once.
+//!    held at once. What holds the siblings' turns and the new key's
+//!    together as one act is I, awaited by `install` alone, before any T
+//!    and with no owner lock held; I → T is the order, and nothing that
+//!    holds a T ever waits on I.
 //! 5. Writes to `installed`, `windows`, `stride` and the in-place advance of
 //!    the policy require `&mut Turn`, so "written only under the turn" is a
 //!    type -- with one documented exception: [`State::install_now`]
@@ -93,12 +99,15 @@
 //! no awaits inside, so they wait only on each other and in one direction.
 //! T is acquired only by tasks holding no owner lock, never nested with
 //! another T; its holder takes only L2 (which never waits) and X (from
-//! [`Backing`] calls, with no owner lock held). The two writers that must
-//! never wait on T -- [`Reader::note`] / [`Retention::note_position`] /
-//! [`Retention::note_position_everywhere`] on every delivered byte, and pin
-//! writes -- touch only L1 to copy out, L2 and X, which is what
-//! the torrent's `advertise_gate` tests exercise: a pass parked inside
-//! `set_pieces_advertised` under T while a note and a pin land.
+//! [`Backing`] calls, with no owner lock held). I is acquired only by
+//! `install`, holding nothing, and its holder takes T's one at a time, L2
+//! and X; no holder of a T, an L1 or an L2 waits on I. The two writers
+//! that must never wait on T -- [`Reader::note`] /
+//! [`Retention::note_position`] / [`Retention::note_position_everywhere`]
+//! on every delivered byte, and pin writes -- touch only L1 to copy out, L2
+//! and X, which is what the torrent's `advertise_gate` tests exercise: a
+//! pass parked inside `set_pieces_advertised` under T while a note and a
+//! pin land.
 //!
 //! # The pass
 //!
@@ -168,6 +177,12 @@
 //!   `retire_siblings` runs for every [`Install`] mode: an `install` on a
 //!   proxy-shaped owner would clear every other entity. Nothing calls it
 //!   there.
+//! * There is a fourth lock, I. The design has `retire_siblings` alone
+//!   spell "one active file per torrent", and it cannot: it retires the
+//!   siblings it can see, and an install that has resolved its key and is
+//!   inside its hold-back has nothing installed to see, so two opens on
+//!   different files of one torrent each ran through and both installed.
+//!   `Engine::announce` held those apart; I is that, for installs only.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Debug;
@@ -336,15 +351,18 @@ pub struct Retention<B: Backing> {
     /// never under it.
     budget: Arc<RetentionBudget>,
     /// L1. Held for lookup, insert, prune and iterate-for-holdings only.
-    entities: parking_lot::Mutex<HashMap<B::Key, Arc<Entity<B>>>>,
+    entities: parking_lot::Mutex<Entities<B>>,
+    /// I. The install order: one [`Self::install`] at a time over the whole
+    /// owner, taken before `retire_siblings` and held to the end. Protects
+    /// no memory. `install` is the one party that touches two entities in
+    /// sequence -- each sibling's turn, then its own -- and under
+    /// [`Install::OnOpen`] the one writer of a policy, so two of them at
+    /// once are the one way two policies could come to stand: each retires
+    /// the siblings it can see, and an install that has resolved its key
+    /// and is inside its hold-back has installed nothing yet to see.
+    installing: tokio::sync::Mutex<()>,
     /// Names the next reader; compared for equality only, so it may wrap.
     next_reader: AtomicU64,
-    /// The position every entity was last told together
-    /// ([`Self::note_position_everywhere`]): the torrent's one playhead,
-    /// kept here so an entity made after the byte went out starts from it
-    /// rather than from nothing. The proxy never writes it. Outside the
-    /// lock order: taken alone, copied out, never with L1 or L2 held.
-    everywhere: parking_lot::Mutex<Option<B::Position>>,
     /// The one place a test can be *inside* a pass: run after the snapshot
     /// and before the listing, and again after the decision and before the
     /// unlinks, with the turn held and no owner lock. Each side keeps its
@@ -352,6 +370,20 @@ pub struct Retention<B: Backing> {
     /// reads it. The shipped build has neither this nor the calls to it.
     #[cfg(any(test, feature = "test-hooks"))]
     hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+/// What L1 guards: the entities by key, and the position every one of
+/// them was last told together ([`Retention::note_position_everywhere`]) --
+/// the torrent's one playhead, kept beside the map so an entity made after
+/// the byte went out starts from it rather than from nothing. One lock for
+/// the two, because [`Retention::entity`] reads the position and inserts
+/// the entity as one act and the broadcast writes the position and copies
+/// the map out as one act: two locks, and a byte landing between the read
+/// and the insert is told to every entity but the one being made, which
+/// then starts one note stale. The proxy never writes the position.
+struct Entities<B: Backing> {
+    by_key: HashMap<B::Key, Arc<Entity<B>>>,
+    everywhere: Option<B::Position>,
 }
 
 /// One entity: its turn and its state, and nothing that reaches the map.
@@ -574,9 +606,12 @@ impl<B: Backing> Retention<B> {
         Arc::new(Self {
             backing,
             budget,
-            entities: parking_lot::Mutex::new(HashMap::new()),
+            entities: parking_lot::Mutex::new(Entities {
+                by_key: HashMap::new(),
+                everywhere: None,
+            }),
+            installing: tokio::sync::Mutex::new(()),
             next_reader: AtomicU64::new(0),
-            everywhere: parking_lot::Mutex::new(None),
             #[cfg(any(test, feature = "test-hooks"))]
             hook: parking_lot::Mutex::new(None),
         })
@@ -609,10 +644,13 @@ impl<B: Backing> Retention<B> {
     /// with: a key names one directory or one file, and a domain that has
     /// really changed is [`Retention::install`]'s to write, under the turn.
     pub fn entity(&self, key: B::Key, domain: B::Domain) -> Arc<Entity<B>> {
-        // Copied out before L1: a lock of its own, never nested.
-        let everywhere = *self.everywhere.lock();
         let mut entities = self.entities.lock();
+        // Read under the same L1 the insert is made under, so a byte told
+        // everywhere either reaches this entity through the map or is the
+        // position it starts from: see [`Entities`].
+        let everywhere = entities.everywhere;
         entities
+            .by_key
             .entry(key.clone())
             .or_insert_with(|| {
                 Arc::new(Entity {
@@ -634,7 +672,7 @@ impl<B: Backing> Retention<B> {
     }
 
     fn lookup(&self, key: &B::Key) -> Option<Arc<Entity<B>>> {
-        self.entities.lock().get(key).cloned()
+        self.entities.lock().by_key.get(key).cloned()
     }
 
     /// Open a reader on the entity. It records nothing until it promises or
@@ -674,11 +712,15 @@ impl<B: Backing> Retention<B> {
     /// before the file's entity exists -- the engine's fixtures note before
     /// they install -- would be lost to the entity made a moment later. The
     /// 2b spelling of the torrent not opening [`Reader`]s; step 4 gives each
-    /// file its own head and deletes this. L1 to copy the entities out, then
-    /// each L2 alone; never claims, never installs.
+    /// file its own head and deletes this. L1 to remember the position and
+    /// copy the entities out as one act, then each L2 alone; never claims,
+    /// never installs.
     pub fn note_position_everywhere(&self, at: B::Position) {
-        *self.everywhere.lock() = Some(at);
-        let entities: Vec<Arc<Entity<B>>> = self.entities.lock().values().cloned().collect();
+        let entities: Vec<Arc<Entity<B>>> = {
+            let mut entities = self.entities.lock();
+            entities.everywhere = Some(at);
+            entities.by_key.values().cloned().collect()
+        };
         let now = Instant::now();
         for entity in entities {
             let mut state = entity.state.lock();
@@ -694,11 +736,16 @@ impl<B: Backing> Retention<B> {
     /// turn (`retire_siblings`): the server has one active file per torrent,
     /// and a policy that moved to another file gives the whole old range
     /// back before the new one is held back -- the literal order
-    /// `[(old, true), (new, false)]` the torrent tests pin. Two installs on
-    /// different keys of one owner racing each other can each retire the
-    /// other before either has installed and leave two policies standing;
-    /// today `announce` serialises them, and per-file windows (step 4)
-    /// make it legal. Named here so it is not mistaken for a guarantee.
+    /// `[(old, true), (new, false)]` the torrent tests pin. Installs are
+    /// ordered over the whole owner (I in the module docs), and they have to
+    /// be: an install that has resolved its key and is inside the backend
+    /// call holding its range back has installed nothing yet, so a second
+    /// install on another key running meanwhile finds no sibling to retire,
+    /// and both then install -- two ranges held back, and the one the gate
+    /// does not answer for neither shared nor reclaimable until the next
+    /// install retires it. `Engine::announce` held two opens on one torrent
+    /// apart before; I does now, and per-file windows (step 4) are what
+    /// would make two policies legal.
     ///
     /// Then, under this key's turn: a pin clears; a policy that already
     /// describes this domain under this budget is kept untouched (nothing
@@ -708,6 +755,9 @@ impl<B: Backing> Retention<B> {
     /// nothing: without it every window piece would be announced and
     /// withdrawn seconds later, which is worse than bounding nothing.
     pub async fn install(&self, key: B::Key, want: B::Want) -> InstallOutcome {
+        // Held to the last line: the siblings are retired and this key
+        // installed as one act, or the second of two opens misses the first.
+        let _ordered = self.installing.lock().await;
         self.retire_siblings(&key).await;
         // A key with no entity has no turn to take and nothing installed to
         // serialise against; its domain has to be resolved before there is
@@ -813,19 +863,22 @@ impl<B: Backing> Retention<B> {
 
     /// Clear every entity of this owner but `key`, each under its own turn
     /// and none of them nested (rule 4). One active file per torrent, in
-    /// the 2b spelling; see [`Self::install`] for the race it leaves.
+    /// the 2b spelling. Under I, which is what makes the cheap reading
+    /// below sound.
     async fn retire_siblings(&self, key: &B::Key) {
         let siblings: Vec<Arc<Entity<B>>> = self
             .entities
             .lock()
+            .by_key
             .values()
             .filter(|entity| entity.key != *key)
             .cloned()
             .collect();
         for sibling in siblings {
             // A sibling with nothing installed has nothing to give back, and
-            // only `install` -- which holds no turn here -- could install
-            // on it; the cheap reading is enough to skip the turn.
+            // only `install` could install on it -- and every install is
+            // behind the I this one holds; the cheap reading is enough to
+            // skip the turn.
             if sibling.state.lock().installed.is_none() {
                 continue;
             }
@@ -1183,12 +1236,13 @@ impl<B: Backing> Retention<B> {
     pub fn holdings_at(&self, now: Instant) -> Vec<(B::Key, Holding<B>)> {
         let mut entities = self.entities.lock();
         if let Liveness::Grace(grace) = B::LIVENESS {
-            entities.retain(|_, entity| {
+            entities.by_key.retain(|_, entity| {
                 Arc::strong_count(entity) > 1
                     || now.duration_since(entity.state.lock().last_seen) < grace
             });
         }
         entities
+            .by_key
             .iter()
             .map(|(key, entity)| (key.clone(), entity.state.lock().holding()))
             .collect()
@@ -1203,7 +1257,7 @@ impl<B: Backing> Retention<B> {
     /// How many open reads have promised pieces or delivered a byte and have
     /// not ended: the gate's own reason for refusing the cleaner, counted.
     pub fn readers(&self) -> usize {
-        let entities: Vec<Arc<Entity<B>>> = self.entities.lock().values().cloned().collect();
+        let entities: Vec<Arc<Entity<B>>> = self.entities.lock().by_key.values().cloned().collect();
         entities
             .iter()
             .map(|entity| entity.state.lock().readers.len())
