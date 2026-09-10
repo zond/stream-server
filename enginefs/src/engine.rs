@@ -1319,11 +1319,49 @@ impl<H: TorrentHandle> Engine<H> {
         policies
     }
 
+    /// The file this tick's pass runs on: of the files with a policy
+    /// standing, the lowest-numbered whose domain holds the playhead, else
+    /// the lowest-numbered. One copy-out under the owner's locks, no I/O;
+    /// `None` while nothing bounds the torrent.
+    ///
+    /// By the head, not by file order. A pass measures from the head, and
+    /// an entity whose domain does not hold it concludes nothing
+    /// ([`Retention::pass`]). The torrent has one head, told to every
+    /// entity, so with two policies standing -- the viewer went on to the
+    /// next episode and the backend would not give the file left back --
+    /// exactly one of the two has anything to pass over, and a pick made
+    /// by file order ran the stale one every tick: the file being played
+    /// had nothing committed for sharing, nothing outside its window
+    /// reclaimed and its want-set never trimmed for as long as both stood.
+    /// When no standing file's domain holds the head every pick concludes
+    /// the same nothing, and the lowest keeps it the same pick each tick.
+    fn file_to_pass(&self) -> Option<usize> {
+        let mut standing: Vec<(usize, bool)> = self
+            .retention
+            .holdings()
+            .into_iter()
+            .filter(|(_, holding)| holding.installed.is_some())
+            .map(|(file_idx, holding)| {
+                let head_here = holding
+                    .last_position
+                    .and_then(|at| <TorrentBacking<H> as Backing>::index_of(&holding.domain, at))
+                    .is_some();
+                (file_idx, head_here)
+            })
+            .collect();
+        standing.sort_by_key(|(file_idx, _)| *file_idx);
+        standing
+            .iter()
+            .find(|(_, head_here)| *head_here)
+            .or(standing.first())
+            .map(|(file_idx, _)| *file_idx)
+    }
+
     /// One retention pass: what the policy makes of where the playhead is
     /// now, and the calls that make it so. `None` when there is nothing to
-    /// do -- no policy, no reader has been anywhere yet, the reader is in
-    /// another file than the policy governs before or after the reading, a
-    /// pin, or a torrent with no registered store. Every one of those
+    /// do -- no policy, no reader has been anywhere yet, the reader is in a
+    /// file no standing policy governs before or after the reading, a pin,
+    /// or a torrent with no registered store. Every one of those
     /// leaves the policy where it was; none of them is a pass that ran and
     /// found nothing, which is `Some` with a zeroed count.
     ///
@@ -1350,10 +1388,7 @@ impl<H: TorrentHandle> Engine<H> {
         ) {
             return None;
         }
-        // The lowest-numbered file with a policy standing: the one there is,
-        // or the same one of two on every tick rather than whichever the
-        // map listed first that time.
-        let file_idx = self.standing_policies().first()?.file_idx;
+        let file_idx = self.file_to_pass()?;
         let claim = self.retention.turn(&file_idx).await?;
         let concluded = self
             .retention
