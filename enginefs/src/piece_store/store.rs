@@ -184,6 +184,9 @@ struct Inner {
 /// one `fetch_or` or `fetch_and` -- and a reader takes a copy of the words
 /// ([`HeldSnapshot`]) rather than a lock.
 struct HeldBits {
+    /// The layout's piece count, which is the bound: the last word has room
+    /// for indices the torrent has no piece for.
+    count: u32,
     words: Box<[AtomicU64]>,
 }
 
@@ -192,40 +195,47 @@ impl HeldBits {
         let words = (0..(count as usize).div_ceil(64))
             .map(|_| AtomicU64::new(0))
             .collect();
-        Self { words }
+        Self { count, words }
     }
 
     fn slot(piece: u32) -> (usize, u64) {
         ((piece / 64) as usize, 1u64 << (piece % 64))
     }
 
-    /// A piece the layout does not name is ignored, not a panic: this runs
-    /// on librqbit's storage path, where a panic is fatal to the torrent,
-    /// and a caller's stray index is not the torrent's fault.
+    /// The word and bit of a piece the layout names, or `None` for an index
+    /// past its last piece -- checked against the count and not the words,
+    /// because the last word holds up to 63 indices no piece of the torrent
+    /// has. Ignored rather than a panic: this runs on librqbit's storage
+    /// path, where a panic is fatal to the torrent, and a stray index is not
+    /// the torrent's fault. It reaches here: the seed is fed every
+    /// complete-spelled file in a bucket, and a `0/5` left in a four-piece
+    /// torrent's directory would otherwise be counted -- and billed at a
+    /// piece length -- for the life of the process, since no `in_range`
+    /// ever offers it to the delete that would clear it.
+    fn slot_in_layout(&self, piece: u32) -> Option<(usize, u64)> {
+        (piece < self.count).then(|| Self::slot(piece))
+    }
+
     fn set(&self, piece: u32) {
-        let (word, bit) = Self::slot(piece);
-        if let Some(word) = self.words.get(word) {
-            word.fetch_or(bit, Ordering::AcqRel);
+        if let Some((word, bit)) = self.slot_in_layout(piece) {
+            self.words[word].fetch_or(bit, Ordering::AcqRel);
         }
     }
 
     fn clear(&self, piece: u32) {
-        let (word, bit) = Self::slot(piece);
-        if let Some(word) = self.words.get(word) {
-            word.fetch_and(!bit, Ordering::AcqRel);
+        if let Some((word, bit)) = self.slot_in_layout(piece) {
+            self.words[word].fetch_and(!bit, Ordering::AcqRel);
         }
     }
 
-    /// Replace the whole set with `pieces`. The seed, and only the seed: a
-    /// store is seeded before any read or write reaches it, so nothing can
-    /// flip a bit while the words are being written.
+    /// Replace the whole set with the pieces of `pieces` the layout names.
+    /// The seed, and only the seed: a store is seeded before any read or
+    /// write reaches it, so nothing can flip a bit while the words are being
+    /// written.
     fn seed(&self, pieces: impl IntoIterator<Item = u32>) {
         let mut words = vec![0u64; self.words.len()];
-        for piece in pieces {
-            let (word, bit) = Self::slot(piece);
-            if let Some(word) = words.get_mut(word) {
-                *word |= bit;
-            }
+        for (word, bit) in pieces.into_iter().filter_map(|p| self.slot_in_layout(p)) {
+            words[word] |= bit;
         }
         for (slot, word) in self.words.iter().zip(words) {
             slot.store(word, Ordering::Release);
@@ -474,6 +484,21 @@ impl PieceStore {
         } else {
             anyhow::bail!("this storage was taken; the torrent is paused or gone")
         }
+    }
+
+    /// What [`TorrentStorage::take`] does, with the successor as this type:
+    /// a second, live handle over the same [`Inner`], while this one goes
+    /// dead. Separate from the trait method so a test can read the
+    /// successor's held set, which the boxed trait object does not expose.
+    fn hand_over(&self) -> PieceStore {
+        let successor = PieceStore {
+            inner: Arc::clone(&self.inner),
+            live: AtomicBool::new(true),
+        };
+        self.live.store(false, Ordering::Release);
+        self.inner.handles.clear();
+        self.inner.checking.store(false, Ordering::Release);
+        successor
     }
 }
 
@@ -1248,14 +1273,7 @@ impl TorrentStorage for PieceStore {
     /// unlinked again. A pause from the live state and a delete take too,
     /// and neither had a check to end.
     fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
-        let successor = PieceStore {
-            inner: Arc::clone(&self.inner),
-            live: AtomicBool::new(true),
-        };
-        self.live.store(false, Ordering::Release);
-        self.inner.handles.clear();
-        self.inner.checking.store(false, Ordering::Release);
-        Ok(Box::new(successor))
+        Ok(Box::new(self.hand_over()))
     }
 }
 
@@ -2415,6 +2433,72 @@ mod tests {
         assert_eq!(fresh.held().unwrap().bytes(), 16);
     }
 
+    /// The bound is the layout's piece count, not the word array's: a
+    /// four-piece torrent has one word with room for sixty more indices,
+    /// and the walk reports every complete-spelled file in a bucket -- a
+    /// `0/5` or a `0/70` left in the directory is spelled right for bucket
+    /// 0 and fits a `u32`. Counted, either would be a piece the store held
+    /// and the torrent did not, billed at a piece length and for the life
+    /// of the process: no range over the torrent's pieces ever offers it
+    /// to the delete that would clear it. And past the words it would not
+    /// be counted but indexed, under librqbit's `block_in_place`.
+    #[test]
+    fn a_complete_name_past_the_layout_is_a_stray_not_a_bit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path(), PIECE_LENGTH, &SPECS);
+        let global = global_bytes(store.layout().total_length());
+        fill_piece(&store, &global, 2);
+        fill_piece(&store, &global, 3);
+        // Past the last piece inside the one word, and past the word.
+        for name in ["5", "70"] {
+            std::fs::write(tmp.path().join("0").join(name), b"xxxxxxxx").unwrap();
+        }
+
+        let fresh = open_store(tmp.path(), PIECE_LENGTH, &SPECS);
+        fresh.seed_from_disk().unwrap();
+        let held = fresh.held().expect("seeded");
+        assert_eq!(held.count(), 2, "two pieces, and neither stray");
+        assert_eq!(held.bytes(), 8 + 6, "and nothing billed for them");
+        assert_eq!(held.in_range(0..u32::MAX), BTreeSet::from([2, 3]));
+        assert!(!held.contains(5) && !held.contains(70) && !held.contains(u32::MAX));
+
+        // The same index by the completion path: the file is in place, so
+        // the rename reports the piece complete, and the bit still does not
+        // land.
+        fresh.complete_piece(5).unwrap();
+        assert_eq!(
+            fresh.held().unwrap().count(),
+            2,
+            "a completion past the layout is no bit"
+        );
+    }
+
+    /// A seed is the disk as this walk found it, not that walk added to the
+    /// last one: a piece that left between two seeds of one store -- the
+    /// restart-from-error path seeds a fresh store, but nothing forbids
+    /// seeding twice -- must leave with it.
+    #[test]
+    fn a_second_seed_replaces_the_set_rather_than_adding_to_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path(), PIECE_LENGTH, &SPECS);
+        let global = global_bytes(store.layout().total_length());
+        fill(&store, &global, 8);
+        store.seed_from_disk().unwrap();
+        assert_eq!(
+            store.held().unwrap().in_range(0..4),
+            BTreeSet::from([0, 1, 2, 3])
+        );
+
+        // Gone behind the store's back, so no event cleared its bit.
+        std::fs::remove_file(store.piece_path(1)).unwrap();
+        store.seed_from_disk().unwrap();
+        assert_eq!(
+            store.held().unwrap().in_range(0..4),
+            BTreeSet::from([0, 2, 3]),
+            "the second seed is what the disk holds now, nothing carried over"
+        );
+    }
+
     /// **A bucket that cannot be listed is not an empty bucket**, at the
     /// seed as it was at the listing. Seeded past it, the torrent would run
     /// short of that bucket's every piece for as long as the process lives
@@ -2460,6 +2544,10 @@ mod tests {
         assert!(
             store.inner.staged.lock().is_empty(),
             "nor did the staged half of the walk land"
+        );
+        assert!(
+            store.epoch() == 0 && !store.is_checking(),
+            "a seed that did not land began no check and moved no epoch"
         );
 
         store.seed_from_disk().unwrap();
@@ -2682,7 +2770,7 @@ mod tests {
         store.pread_exact(0, 0, &mut [0u8; 4]).unwrap();
         assert!(!store.inner.handles.is_empty(), "handles are open");
 
-        let successor = store.take().unwrap();
+        let successor = store.hand_over();
         assert!(
             store.pread_exact(0, 0, &mut [0u8; 4]).is_err(),
             "the taken storage is dead"
@@ -2726,6 +2814,17 @@ mod tests {
             store.held().unwrap().in_range(0..4),
             BTreeSet::from([0, 1, 2]),
             "a completion on the successor is seen by the predecessor"
+        );
+        // And the completion the copying version lost: staged through the
+        // live handle, landing on the taken one -- `on_piece_completed` has
+        // no liveness check, because a peer's completion can be in flight
+        // across the swap.
+        successor.pwrite_all(3, 0, &global[29..30]).unwrap();
+        store.complete_piece(3).unwrap();
+        assert_eq!(
+            successor.held().unwrap().in_range(0..4),
+            BTreeSet::from([0, 1, 2, 3]),
+            "a completion on the predecessor is seen by the successor"
         );
     }
 
@@ -2900,6 +2999,72 @@ mod librqbit_tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// `init` is the one place the seed runs in production, and this is the
+    /// test that goes through it rather than calling the seed itself. The
+    /// observable half of the seed is the staged reconciliation: a stale
+    /// staged copy shadowing a complete piece, left by a process killed
+    /// mid-re-download, is gone once the torrent has started -- with the
+    /// seed off `init` it would stand, and the complete file beside it
+    /// would make it ours for peers.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn init_runs_the_seed_and_a_stale_shadow_is_gone_once_the_torrent_starts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        tokio::fs::create_dir_all(&src).await.unwrap();
+        let payload: Vec<u8> = (0..40_000usize)
+            .map(|i| (i.wrapping_mul(13) + 5) as u8)
+            .collect();
+        tokio::fs::write(src.join("a.bin"), &payload).await.unwrap();
+        let torrent = librqbit::create_torrent(
+            &src,
+            librqbit::CreateTorrentOptions {
+                name: None,
+                trackers: Vec::new(),
+                piece_length: Some(16384),
+            },
+            &librqbit::spawn_utils::BlockingSpawner::new(1),
+        )
+        .await
+        .expect("create torrent");
+        let bytes = torrent.as_bytes().expect("serialize").to_vec();
+        let info_hash = torrent.info_hash().as_string();
+        let root = tmp.path().join("pieces");
+
+        // The whole torrent complete on disk, then a shadow over piece 0.
+        let layout = Arc::new(
+            PieceLayout::new(
+                16384,
+                payload.len() as u64,
+                [FileSpec {
+                    len: payload.len() as u64,
+                    padding: false,
+                }],
+            )
+            .expect("layout"),
+        );
+        let store = PieceStore::new(root.join(&info_hash), layout.clone());
+        store.pwrite_all(0, 0, &payload).expect("write");
+        for piece in 0..layout.piece_count() {
+            store.complete_piece(piece).expect("complete");
+        }
+        let shadow = store.staging_path(0);
+        std::fs::write(&shadow, vec![0u8; 16384]).unwrap();
+        drop(store);
+
+        let session = hermetic_session(tmp.path().join("s")).await;
+        let handle = add(&session, &bytes, &root).await;
+        let stats = settled(&handle).await;
+        assert_eq!(stats.error, None, "{stats}");
+        assert!(
+            !shadow.exists(),
+            "the session's init walked the directory and took the shadow"
+        );
+        assert_eq!(
+            stats.progress_bytes, stats.total_bytes,
+            "and the check found every piece: {stats}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
