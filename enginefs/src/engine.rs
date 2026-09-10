@@ -987,12 +987,18 @@ impl<H: TorrentHandle> Engine<H> {
         #[cfg(test)]
         self.interleave();
         let Some(held) = crate::retention::listing(store, &self.info_hash).await else {
-            // A listing we do not have is a pass that measured nothing, not
-            // a pass with an empty disk: it says so with a zeroed count,
-            // which is what ENOSPC recovery reads to decide whether a pass
-            // made room.
+            // A listing we do not have is a pass that measured nothing --
+            // the blocking pool would not answer, which is shutdown or a
+            // panic in the walk -- and it concludes nothing. Said with a
+            // warning rather than a bare `None`, because `None` is the
+            // shape of the ordinary reasons a pass has nothing to do and a
+            // torrent left unbounded tick after tick should not be silent.
+            tracing::warn!(
+                info_hash = %self.info_hash,
+                "the retention pass could not list the disk; this torrent is unbounded until it can"
+            );
             self.put_back(retention);
-            return Some(crate::retention::RetentionPass::default());
+            return None;
         };
         // **The deciding reading, and it is taken after the listing.**
         //
