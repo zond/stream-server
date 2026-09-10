@@ -1635,6 +1635,33 @@ fn holds_no_more_than(fixture: &Fixture, chunks: usize) {
     );
 }
 
+/// [`holds_no_more_than`], for a body that has just been read to its end.
+///
+/// **A pass is armed by a byte reaching a player**, so the chunks that land
+/// after the last pass of a play-through concluded are still on the disk
+/// when the body ends: there is no byte left to arm the pass that would take
+/// them. That tail is a real property and not a fault -- it goes at the next
+/// byte, at the next stream, or to the cleaner -- but its *size* is whatever
+/// the last pass happened to be behind by, which is a property of the
+/// machine: measured here, a run that leaves 32 chunks on Linux left 73 on a
+/// Windows runner, where the unlinks are slower and the fill outruns them
+/// further. A bound asserted on it is a bound on the runner.
+///
+/// So one byte is read first, from inside the window at the end of the film.
+/// It is served from the cache, and it arms the pass that concludes at the
+/// playhead playback really ended at; what that pass leaves is what the
+/// bound is about.
+fn holds_no_more_than_after_the_last_byte(fixture: &Fixture, url: &str, at: u64, chunks: usize) {
+    let byte = reqwest::blocking::Client::new()
+        .get(url)
+        .header(reqwest::header::RANGE, format!("bytes={at}-{at}"))
+        .send()
+        .expect("the cache answers a byte it holds");
+    assert_eq!(byte.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(byte.bytes().expect("the byte").len(), 1);
+    holds_no_more_than(fixture, chunks);
+}
+
 /// **The bound, on the other kind of stream.**
 ///
 /// A proxied response streamed end to end, well past a cache budget it does
@@ -1963,7 +1990,12 @@ fn a_seek_back_inside_the_window_is_served_from_disk_and_one_outside_it_is_not()
 
     // The reclaim has caught up: what is left is about a window, not the
     // sixteen megabytes that went past.
-    holds_no_more_than(&fixture, (2 * RETENTION_BUDGET / CHUNK) as usize);
+    holds_no_more_than_after_the_last_byte(
+        &fixture,
+        &url,
+        PLAYED_CHUNKS * CHUNK - 1,
+        (2 * RETENTION_BUDGET / CHUNK) as usize,
+    );
     assert!(
         fixture.origin.was_asked_for_nothing_more(),
         "reclaiming is not fetching"
@@ -2049,7 +2081,12 @@ fn the_run_the_window_kept_is_served_back_whole() -> anyhow::Result<()> {
     response.read_to_end(&mut played)?;
     assert_eq!(played.len(), RETENTION_ORIGIN);
     fixture.origin.next_request();
-    holds_no_more_than(&fixture, (2 * RETENTION_BUDGET / CHUNK) as usize);
+    holds_no_more_than_after_the_last_byte(
+        &fixture,
+        &url,
+        RETENTION_ORIGIN as u64 - 1,
+        (2 * RETENTION_BUDGET / CHUNK) as usize,
+    );
 
     let run = longest_cached_run(&fixture);
     assert!(
@@ -2120,7 +2157,12 @@ fn a_second_player_fetching_does_not_truncate_the_first_ones_read() -> anyhow::R
     response.read_to_end(&mut played)?;
     assert_eq!(played.len(), RETENTION_ORIGIN);
     fixture.origin.next_request();
-    holds_no_more_than(&fixture, (2 * RETENTION_BUDGET / CHUNK) as usize);
+    holds_no_more_than_after_the_last_byte(
+        &fixture,
+        &url("one"),
+        RETENTION_ORIGIN as u64 - 1,
+        (2 * RETENTION_BUDGET / CHUNK) as usize,
+    );
 
     // The first player asks for the run the window kept, and reads the first
     // chunk of it.
