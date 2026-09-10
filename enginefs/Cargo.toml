@@ -12,6 +12,11 @@ test-roots = []
 # have no engine to go through. Off in every release build, so the cleaner
 # cannot reach the unlink in production -- see `piece_store::store`.
 test-unlink = []
+# Lets a test put a closure inside a retention pass -- before its listing,
+# and again before its unlinks -- which is the one place no test can reach
+# from outside: see `retention::owner`. `server` turns it on through its
+# dev-dependency only; off in every release build.
+test-hooks = []
 
 [dependencies]
 # default-features=false + rust-tls keeps the whole crypto stack on rustls +

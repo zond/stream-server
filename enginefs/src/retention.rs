@@ -45,6 +45,8 @@ use std::ops::Range;
 use crate::backend::{AfterRelease, FilePieceSpan, TorrentHandle};
 use crate::piece_store::{RetentionPolicy, Shape, Share, StoreRoot};
 
+pub mod owner;
+
 /// What the cache cleaner says the torrent-data volume may hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CacheBudget {
