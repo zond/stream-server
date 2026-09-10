@@ -371,21 +371,38 @@ pub async fn start(state: Arc<AppState>) -> JoinHandle<()> {
         ?cap,
         "published the cache budget from a reading of the volume"
     );
-    tokio::spawn(async move {
-        let mut ticks = tokio::time::interval(BUDGET_INTERVAL);
-        // The interval's first tick is immediate and the publication above
-        // has just happened, so it is taken here rather than restating the
-        // same reading of the same volume microseconds later.
-        ticks.tick().await;
-        loop {
-            ticks.tick().await;
+    tokio::spawn(restate_every(BUDGET_INTERVAL, move || {
+        let state = state.clone();
+        async move {
             let cap = publish_now(&state).await;
             debug!(
                 ?cap,
                 "published the cache budget from a reading of the volume"
             );
         }
-    })
+    }))
+}
+
+/// The metronome under [`start`]: `restate` once every `every`, and not
+/// before the first `every` has passed.
+///
+/// A tokio interval's first tick is immediate, and [`start`] has just
+/// published before it spawns this, so that tick is taken here rather than
+/// restating the same reading of the same volume microseconds later. Apart
+/// from that this is the loop it looks like; it is a function so that the
+/// interval can be pinned with the clock paused, without an `AppState` to
+/// publish into.
+async fn restate_every<F, Fut>(every: Duration, mut restate: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let mut ticks = tokio::time::interval(every);
+    ticks.tick().await;
+    loop {
+        ticks.tick().await;
+        restate().await;
+    }
 }
 
 /// Which pass's reading of the volume is the newest.
@@ -472,11 +489,13 @@ impl CachePasses {
 #[cfg(test)]
 mod tests {
     use super::{
-        CACHE_FREE_SPACE_FLOOR, CacheLimit, CachePasses, available_space, cap_to_publish,
-        occupancy_last_counted, publish, publish_counted,
+        BUDGET_INTERVAL, CACHE_FREE_SPACE_FLOOR, CacheLimit, CachePasses, available_space,
+        cap_to_publish, occupancy_last_counted, publish, publish_counted, restate_every,
     };
     use crate::cache_cleaner::{EvictionReport, LastEviction};
     use enginefs::retention::{CacheBudget, RetentionBudget};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     const MIB: u64 = 1024 * 1024;
 
@@ -774,5 +793,56 @@ mod tests {
         // platform, which is all that can be said of the real probe here.
         let tmp = tempfile::tempdir().unwrap();
         assert!(available_space(tmp.path()).unwrap() > 0);
+    }
+
+    /// **The cap is restated on the minute, and not before the first one.**
+    ///
+    /// The interval is set by how long the cap may be wrong for -- the
+    /// number it re-reads is what the rest of the device did to the volume
+    /// -- and a walk longer than it is overtaken with certainty, which the
+    /// module doc leans on. So the value is pinned, not only the loop: a
+    /// longer interval is a cap wrong for longer, a shorter one is a
+    /// `statvfs` the device does not need.
+    #[tokio::test(start_paused = true)]
+    async fn the_budget_is_restated_once_a_minute_and_not_at_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        assert_eq!(BUDGET_INTERVAL, Duration::from_secs(60));
+
+        let restated = Arc::new(AtomicUsize::new(0));
+        let counter = restated.clone();
+        let ticking = tokio::spawn(restate_every(BUDGET_INTERVAL, move || {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+        // Let the task reach its first await.
+        tokio::task::yield_now().await;
+        assert_eq!(
+            restated.load(Ordering::SeqCst),
+            0,
+            "the publication at startup is `start`'s own; the metronome adds none"
+        );
+
+        tokio::time::advance(BUDGET_INTERVAL - Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            restated.load(Ordering::SeqCst),
+            0,
+            "not before a minute has passed"
+        );
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(restated.load(Ordering::SeqCst), 1, "once, on the minute");
+
+        tokio::time::advance(BUDGET_INTERVAL).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            restated.load(Ordering::SeqCst),
+            2,
+            "and again a minute later"
+        );
+        ticking.abort();
     }
 }
