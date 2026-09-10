@@ -1275,9 +1275,9 @@ mod tests {
     /// **A pass arms another pass off its own reader having moved, and a
     /// byte some other player delivered is not that.**
     ///
-    /// [`LiveStream::heads`] asks where the reader this pass is *about* has
-    /// got to, and falls back to the entity's last delivered byte only when
-    /// that read has ended. The arming question has to be the same question,
+    /// The owner asks where the reader this pass is *about* has got to, and
+    /// falls back to the entity's last delivered byte only when that read
+    /// has ended. The arming question has to be the same question,
     /// because a pass moves neither term of it: asked of the entity's last
     /// delivered byte while the pass measured a live reader's own playhead,
     /// the distance between them is whatever the other player is doing, no
@@ -1452,11 +1452,11 @@ mod tests {
     /// **A budget published while a pass was running is the one that
     /// holds.**
     ///
-    /// A pass has the policy out of its slot for the length of it, and the
+    /// A pass measures against one budget for the length of it, and the
     /// cleaner publishes a budget after every walk -- `min(configured,
     /// occupied + available - floor)`, which moves whenever the volume does,
     /// and which is an absence again the moment the volume cannot be read.
-    /// Putting the finishing pass's policy back over that would go on
+    /// Letting the finishing pass conclude over that would go on
     /// reclaiming to a cap nobody has published, which is the one thing
     /// [`CacheBudget::Unbounded`] says not to do -- and nothing would ever
     /// rebuild it, because `decided` already says the new budget.

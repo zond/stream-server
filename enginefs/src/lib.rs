@@ -4413,7 +4413,7 @@ mod tests {
         /// The claim is what orders the unlink against the have-set, so it
         /// has to outlive the deletion: whichever thread drops it is the
         /// thread the piece files were unlinked on. A retention pass runs
-        /// under `Engine::announce` and must not do that unlinking on the
+        /// under its file's turn and must not do that unlinking on the
         /// reactor, and this is the only thing a test can read it off --
         /// see `the_pass_unlinks_a_reclaimed_piece_off_the_reactor`.
         claim_released_on: Arc<Mutex<Option<std::thread::ThreadId>>>,
@@ -10319,14 +10319,15 @@ mod tests {
 
     /// **A retention pass must not blink the panel's rows out.**
     ///
-    /// A pass takes the policy out of its slot for a directory listing and
-    /// two awaited backend calls, and it runs on the reconciler's tick for
-    /// exactly the stream a panel is asking about. Anything that answered
-    /// from the slot itself would say "no window, no committed set" for a
-    /// second or so out of every two -- and by this server's own contract
-    /// that is not a delay but a statement: it means nothing is bounding
-    /// this stream. So the bounds are kept beside the policy and the
-    /// reading comes from there.
+    /// A pass used to take the policy out of its slot for a directory
+    /// listing and two awaited backend calls, and it runs on the
+    /// reconciler's tick for exactly the stream a panel is asking about.
+    /// Anything that answered from that slot would have said "no window, no
+    /// committed set" for a second or so out of every two -- and by this
+    /// server's own contract that is not a delay but a statement: it means
+    /// nothing is bounding this stream. The policy is resident now and the
+    /// panel reads it live; this pins that a pass in flight does not blink
+    /// it out.
     #[tokio::test]
     async fn a_pass_in_flight_still_answers_what_is_bounding_the_stream() {
         let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
@@ -10386,8 +10387,8 @@ mod tests {
     }
 
     /// A retention pass walks the torrent's piece directories, and it does
-    /// that walk while holding `Engine::announce` -- the lock the
-    /// stream-open path takes to hold a new file's window back. Doing the
+    /// that walk while holding the file's turn -- the lock the stream-open
+    /// path takes to hold a new file's window back. Doing the
     /// walk on the reactor thread therefore stops request handling for as
     /// long as the disk takes to answer, which on the flash of a television
     /// is not a bounded time.
@@ -10896,8 +10897,8 @@ mod tests {
     /// back has to outlive them -- it is what stops a stream downloading a
     /// piece back into the range being deleted -- so whichever thread
     /// releases the claim is the thread the bytes went on. The pass holds
-    /// `Engine::announce` throughout, so doing that work on the reactor
-    /// stops request handling for as long as the volume takes.
+    /// the file's turn throughout, so doing that work on the reactor stops
+    /// request handling for as long as the volume takes.
     ///
     /// A `#[tokio::test]` drives its runtime on the test's own thread, so
     /// "the reactor" here is a thread identity and not a timing.
@@ -11062,10 +11063,8 @@ mod tests {
 
     /// **A stream stops being bounded, and the panel has to hear that.**
     ///
-    /// The bounds are kept beside the policy so that a pass which has the
-    /// policy out of its slot still answers -- but they are a reading *of*
-    /// that policy, and a policy that is dropped takes its window and its
-    /// committed set with it. Two ordinary things drop one: a pin taken
+    /// The panel's numbers are a reading *of* the policy, and a policy that
+    /// is dropped takes its window and its committed set with it. Two ordinary things drop one: a pin taken
     /// while the file is playing, which hands the whole file back to the
     /// user and to the swarm, and a budget that has grown to cover the file,
     /// which is a torrent nothing needs to bound. Left standing, the bounds

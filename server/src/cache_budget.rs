@@ -55,7 +55,8 @@
 //! cache. A four-gigabyte television already holding four gigabytes with
 //! six hundred megabytes free states a cap of eighty-eight megabytes --
 //! the free space above the floor and nothing else -- and that is a real
-//! policy rather than none (`enginefs::retention::policy_for`), so pieces
+//! policy rather than none (the owner installs one wherever the budget does
+//! not cover the file), so pieces
 //! of the stream outside a window that size become reclaimable and are
 //! refetched if the player seeks back into them, and the proxy's window is
 //! the same figure. What it is not is the stored cache being thrown away:
