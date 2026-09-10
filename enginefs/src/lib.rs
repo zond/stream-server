@@ -4402,6 +4402,11 @@ mod tests {
                 tokio::sync::oneshot::Receiver<()>,
             )>,
         >,
+        /// Test knob: the backend will not change what it advertises --
+        /// librqbit's answer for a torrent whose state has gone. Every
+        /// `set_pieces_advertised` fails and records nothing while it is
+        /// set.
+        refuses_advertise: AtomicBool,
         /// Which thread released the claim `drop_pieces` handed out, and
         /// `None` until one has been released.
         ///
@@ -4883,6 +4888,9 @@ mod tests {
             if let Some((entered, release)) = gate {
                 let _ = entered.send(());
                 let _ = release.await;
+            }
+            if self.counters.refuses_advertise.load(Ordering::SeqCst) {
+                anyhow::bail!("this fake will not change what it advertises");
             }
             let count = (pieces.end - pieces.start) as usize;
             self.counters
@@ -11453,6 +11461,289 @@ mod tests {
         assert!(
             !engine.standing().await.gate.releases(0),
             "and nothing of it may be reclaimed any more"
+        );
+    }
+
+    /// **A pass that dies leaves the policy where it was, and the next one
+    /// runs.**
+    ///
+    /// The tick that drives a pass is a task, and a task is dropped at
+    /// whatever await it is parked on when the runtime shuts down. The pass
+    /// used to take the policy out of its slot for the length of itself and
+    /// put it back on the way out, and a future dropped at an await has no
+    /// way out: the policy went with it, the gate read the torrent as
+    /// announced while its window was still held back, and no later pass
+    /// had a policy to run -- the file unbounded until the next open. The
+    /// policy is resident now and what the pass holds is the file's turn, a
+    /// guard that a dropped future releases like any other local.
+    ///
+    /// Parked in the commit's backend call, as the door tests are: after the
+    /// interleave point and the listing, with the policy advanced in place.
+    #[tokio::test]
+    async fn a_pass_aborted_in_flight_leaves_the_policy_standing_and_the_next_pass_runs() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let store = enginefs.piece_store();
+
+        // The first pass records that the window covered piece 0, so the
+        // second commits it and parks in the call that announces it.
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
+        engine.note_playhead(0, 0);
+        engine.begin_retention(0).await;
+        engine.retain(&store).await.expect("a pass");
+        for piece in [1u32, 2, 3] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (_release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *counters.advertise_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        engine.note_playhead(0, 25);
+        let running = tokio::spawn({
+            let engine = engine.clone();
+            let store = store.clone();
+            async move { engine.retain(&store).await }
+        });
+        tokio::time::timeout(Duration::from_secs(10), entered_rx)
+            .await
+            .expect("the pass reached the call it makes to announce a committed piece")
+            .expect("the fake said so");
+
+        // The runtime takes the task down mid-pass.
+        running.abort();
+        assert!(
+            running
+                .await
+                .expect_err("the pass was aborted")
+                .is_cancelled(),
+            "aborted at the await it was parked on"
+        );
+
+        assert!(
+            matches!(
+                engine.standing().await.gate,
+                crate::retention::TorrentGate::Policy { .. }
+            ),
+            "the policy is still bounding the file: it never left its cell"
+        );
+        let pass = engine
+            .retain(&store)
+            .await
+            .expect("the next tick's pass runs: the dead one dropped the file's turn");
+        assert_eq!(
+            pass.reclaimed, 2,
+            "and it gives back what the dead pass had decided to and never did: {pass:?}"
+        );
+        assert!(!bucket.join("2").exists() && !bucket.join("3").exists());
+        assert!(
+            bucket.join("1").is_file(),
+            "the piece under the playhead stays"
+        );
+    }
+
+    /// **A pin whose range the backend will not take back keeps its policy
+    /// until it can.**
+    ///
+    /// The clear used to empty the slot first and re-advertise second, so a
+    /// backend that refused left the range held back beside an empty slot:
+    /// the cleaner's gate read the torrent as announced, nothing shared the
+    /// pieces and nothing would ever reclaim them -- held back and protected
+    /// at once, the one combination that is never right -- and it was
+    /// logged at debug and never retried. The range is advertised back
+    /// first now and the policy forgotten only when that succeeded, so a
+    /// refusal leaves a policy that still tells the truth about what is
+    /// held back, and the next pass under the pin retries.
+    #[tokio::test]
+    async fn a_pin_whose_range_the_backend_will_not_take_back_keeps_the_policy_until_it_can() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let store = enginefs.piece_store();
+        engine.note_playhead(0, 0);
+        engine.begin_retention(0).await;
+        assert_eq!(
+            *counters.advertised.lock().unwrap(),
+            vec![(0..4, false)],
+            "the file's range is held back"
+        );
+
+        // The user pins the file, and the backend will not have the range
+        // back.
+        engine.pinned_files.write().insert(0);
+        counters.refuses_advertise.store(true, Ordering::SeqCst);
+        assert!(
+            engine.retain(&store).await.is_none(),
+            "a pinned torrent has no pass to make"
+        );
+        assert!(
+            matches!(
+                engine.standing().await.gate,
+                crate::retention::TorrentGate::Announced
+            ),
+            "the pin answers for the torrent at the gate"
+        );
+        assert!(
+            engine
+                .retention
+                .holding(&0)
+                .expect("the file has an entity")
+                .installed
+                .is_some(),
+            "and the policy stands, because its range is still held back: a cell \
+             that said otherwise would be the held-back-and-announced combination"
+        );
+        assert_eq!(
+            *counters.advertised.lock().unwrap(),
+            vec![(0..4, false)],
+            "nothing was put back, because the backend refused"
+        );
+
+        // The backend can again, and the next pass under the pin retries.
+        counters.refuses_advertise.store(false, Ordering::SeqCst);
+        assert!(engine.retain(&store).await.is_none());
+        assert!(
+            engine
+                .retention
+                .holding(&0)
+                .expect("the file has an entity")
+                .installed
+                .is_none(),
+            "the range is back in what we announce, and only now is the policy gone"
+        );
+        assert_eq!(
+            *counters.advertised.lock().unwrap(),
+            vec![(0..4, false), (0..4, true)]
+        );
+    }
+
+    /// **The cleaner's delete queues behind the pass on the same file.**
+    ///
+    /// `release_reclaimable` asks the gate again at the door, and the door
+    /// is only as good as what cannot move between its asking and its
+    /// unlink. A pass commits a piece by advertising it, and that commit is
+    /// an awaited backend call: a delete that read the gate before the pass
+    /// advanced and unlinked after the pass had announced would take a piece
+    /// we had just told a peer about. `Engine::announce` used to hold the
+    /// two apart for the whole torrent; the file's turn does now, and this
+    /// is the delete waiting on it.
+    ///
+    /// Same park as the door tests: the pass is inside the call announcing
+    /// piece 0, about to reclaim 2 and 3. The delete asks for piece 2 while
+    /// it is parked, and gets to ask only once the pass has let go -- which
+    /// the order of the two `drop_pieces` calls records.
+    #[tokio::test]
+    async fn the_cleaners_delete_waits_for_the_pass_on_the_file() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let store = enginefs.piece_store();
+
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
+        engine.note_playhead(0, 0);
+        engine.begin_retention(0).await;
+        engine.retain(&store).await.expect("a pass");
+        for piece in [1u32, 2, 3] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *counters.advertise_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        engine.note_playhead(0, 25);
+        let running = tokio::spawn({
+            let engine = engine.clone();
+            let store = store.clone();
+            async move { engine.retain(&store).await }
+        });
+        tokio::time::timeout(Duration::from_secs(10), entered_rx)
+            .await
+            .expect("the pass reached the call it makes to announce a committed piece")
+            .expect("the fake said so");
+
+        // The cleaner's delete arrives while the pass is parked.
+        let mut delete = tokio::spawn({
+            let engine = engine.clone();
+            let store = store.clone();
+            async move { engine.release_reclaimable(&store, &[2]).await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut delete)
+                .await
+                .is_err(),
+            "the delete waits: the pass holds the file's turn"
+        );
+
+        release_tx.send(()).expect("the pass is waiting on this");
+        let pass = running
+            .await
+            .expect("the pass task")
+            .expect("a pass ran to the end");
+        assert_eq!(pass.reclaimed, 2, "the pass took pieces 2 and 3: {pass:?}");
+        let freed = delete.await.expect("the delete task");
+        assert_eq!(
+            freed, 0,
+            "by the time the delete got its turn the piece had already gone"
+        );
+        let dropped: Vec<std::ops::Range<u32>> = counters
+            .dropped_ranges
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(range, _)| range.clone())
+            .collect();
+        assert_eq!(
+            dropped,
+            vec![2..4, 2..3],
+            "the pass asked the backend first, and the delete only after it"
+        );
+    }
+
+    /// **A second reader on the same file under the same budget re-holds
+    /// nothing back.**
+    ///
+    /// Every seek is a new range request, so a new reader, so another
+    /// `begin_retention` on the file already playing. A policy that already
+    /// describes this file under this budget is kept untouched: clearing it
+    /// and installing it again would put the window back into what we
+    /// announce for the length of two backend calls, and a window piece
+    /// that has completed has its Have go out in that gap -- to be
+    /// reclaimed a pass later, with no un-Have to take it back.
+    #[tokio::test]
+    async fn a_second_reader_on_the_same_file_under_the_same_budget_re_holds_nothing_back() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        engine.note_playhead(0, 0);
+        engine.begin_retention(0).await;
+        assert_eq!(*counters.advertised.lock().unwrap(), vec![(0..4, false)]);
+
+        // The viewer seeks: a second reader opens on the same file.
+        engine.begin_retention(0).await;
+        assert_eq!(
+            *counters.advertised.lock().unwrap(),
+            vec![(0..4, false)],
+            "the policy already installed describes this file under this budget, \
+             so nothing was given back and nothing re-held-back"
+        );
+        assert!(
+            matches!(
+                engine.standing().await.gate,
+                crate::retention::TorrentGate::Policy { .. }
+            ),
+            "and it still bounds the file"
         );
     }
 

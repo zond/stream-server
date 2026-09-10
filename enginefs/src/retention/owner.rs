@@ -94,8 +94,9 @@
 //! T is acquired only by tasks holding no owner lock, never nested with
 //! another T; its holder takes only L2 (which never waits) and X (from
 //! [`Backing`] calls, with no owner lock held). The two writers that must
-//! never wait on T -- [`Reader::note`] / [`Retention::note_position`] on
-//! every delivered byte, and pin writes -- touch only L2 and X, which is what
+//! never wait on T -- [`Reader::note`] / [`Retention::note_position`] /
+//! [`Retention::note_position_everywhere`] on every delivered byte, and pin
+//! writes -- touch only L1 to copy out, L2 and X, which is what
 //! the torrent's `advertise_gate` tests exercise: a pass parked inside
 //! `set_pieces_advertised` under T while a note and a pin land.
 //!
@@ -338,6 +339,12 @@ pub struct Retention<B: Backing> {
     entities: parking_lot::Mutex<HashMap<B::Key, Arc<Entity<B>>>>,
     /// Names the next reader; compared for equality only, so it may wrap.
     next_reader: AtomicU64,
+    /// The position every entity was last told together
+    /// ([`Self::note_position_everywhere`]): the torrent's one playhead,
+    /// kept here so an entity made after the byte went out starts from it
+    /// rather than from nothing. The proxy never writes it. Outside the
+    /// lock order: taken alone, copied out, never with L1 or L2 held.
+    everywhere: parking_lot::Mutex<Option<B::Position>>,
     /// The one place a test can be *inside* a pass: run after the snapshot
     /// and before the listing, and again after the decision and before the
     /// unlinks, with the turn held and no owner lock. Each side keeps its
@@ -569,6 +576,7 @@ impl<B: Backing> Retention<B> {
             budget,
             entities: parking_lot::Mutex::new(HashMap::new()),
             next_reader: AtomicU64::new(0),
+            everywhere: parking_lot::Mutex::new(None),
             #[cfg(any(test, feature = "test-hooks"))]
             hook: parking_lot::Mutex::new(None),
         })
@@ -601,6 +609,8 @@ impl<B: Backing> Retention<B> {
     /// with: a key names one directory or one file, and a domain that has
     /// really changed is [`Retention::install`]'s to write, under the turn.
     pub fn entity(&self, key: B::Key, domain: B::Domain) -> Arc<Entity<B>> {
+        // Copied out before L1: a lock of its own, never nested.
+        let everywhere = *self.everywhere.lock();
         let mut entities = self.entities.lock();
         entities
             .entry(key.clone())
@@ -615,7 +625,7 @@ impl<B: Backing> Retention<B> {
                         stride: 1,
                         windows: Vec::new(),
                         readers: HashMap::new(),
-                        last_position: None,
+                        last_position: everywhere,
                         last_seen: Instant::now(),
                     })),
                 })
@@ -650,6 +660,31 @@ impl<B: Backing> Retention<B> {
         let mut state = entity.state.lock();
         state.last_seen = Instant::now();
         state.last_position = Some(at);
+    }
+
+    /// Where the torrent's one reader last got to, told to every entity at
+    /// once, and remembered for the entities not made yet.
+    ///
+    /// A torrent has one playhead, last writer wins, and a file whose policy
+    /// stands while the reader is in another file has to learn that from a
+    /// byte that was not its own: [`Backing::index_of`] answers `None` for
+    /// it, and the pass, the [`Door`] and the panel all read that as "no
+    /// head in this domain". Told only to the key the byte was in, the file
+    /// the reader left would keep a head it no longer has, and a byte noted
+    /// before the file's entity exists -- the engine's fixtures note before
+    /// they install -- would be lost to the entity made a moment later. The
+    /// 2b spelling of the torrent not opening [`Reader`]s; step 4 gives each
+    /// file its own head and deletes this. L1 to copy the entities out, then
+    /// each L2 alone; never claims, never installs.
+    pub fn note_position_everywhere(&self, at: B::Position) {
+        *self.everywhere.lock() = Some(at);
+        let entities: Vec<Arc<Entity<B>>> = self.entities.lock().values().cloned().collect();
+        let now = Instant::now();
+        for entity in entities {
+            let mut state = entity.state.lock();
+            state.last_seen = now;
+            state.last_position = Some(at);
+        }
     }
 
     /// Install (or keep) the policy for `key` about to be streamed, and hold

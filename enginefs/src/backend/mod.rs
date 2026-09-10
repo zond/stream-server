@@ -266,8 +266,12 @@ pub enum RunState {
     Gone,
 }
 
+// `'static` because a handle is what the retention owner's backing is built
+// over (`engine::TorrentBacking<H>`), and the owner's `Backing` is `'static`
+// so a pass can be spawned as a task. Every handle is a concrete type with
+// no borrow in it, so nothing is excluded.
 #[async_trait::async_trait]
-pub trait TorrentHandle: Send + Sync + Clone {
+pub trait TorrentHandle: Send + Sync + Clone + 'static {
     fn info_hash(&self) -> String;
     fn name(&self) -> Option<String>;
 

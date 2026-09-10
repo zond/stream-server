@@ -1,10 +1,15 @@
 use crate::backend::{
-    EngineStats, TorrentHandle,
+    EngineStats, FilePieceSpan, TorrentHandle,
     priorities::{BufferProfile, PlaybackIntent},
 };
 use crate::cache::DataCache;
+use crate::piece_store::{RetentionPolicy, Share, StoreRoot};
+use crate::retention::owner::{
+    Backing, Door, Install, InstalledView, Liveness, Retention, Trigger,
+};
 use anyhow::Context;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -309,12 +314,196 @@ pub(crate) struct Standing {
     pub gate: crate::retention::TorrentGate,
     /// The file whose policy answered, if a policy did: the boundary
     /// narrowing ([`crate::retention::this_files_alone`]) needs a file to
-    /// narrow by.
+    /// narrow by, and the cleaner's delete needs a turn to take.
     pub policy_file: Option<usize>,
     /// The backend stopped this torrent for want of space, or the
     /// reconciler did before the backend could: the cleaner has bytes to
     /// find for it.
     pub stopped_for_space: bool,
+}
+
+/// One file of a torrent, as the thing a retention policy is over: which
+/// file, where it lies in the torrent's pieces, and how long a piece is.
+/// Fixed for the entity's life -- the owner compares it at a pass's re-read,
+/// and only [`Retention::install`] writes it, under the turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileDomain {
+    file_idx: usize,
+    span: FilePieceSpan,
+    piece_length: u64,
+}
+
+/// The torrent side of the retention owner: what one torrent's handle, store
+/// and pin set are to a [`Retention`]. One per engine, keyed by file index.
+///
+/// The owner does the arithmetic, the re-readings and the door; this is the
+/// six calls onto the backend and the store that make its answers true, and
+/// the two pure readings -- piece index from a file offset, policy from a
+/// budget -- the owner makes under its state lock. Nothing here is a lock of
+/// its own: `pinned` is the engine's pin set, shared, and read as a copy-out.
+pub(crate) struct TorrentBacking<H: TorrentHandle> {
+    handle: H,
+    info_hash: String,
+    /// [`Engine::pinned_files`], the same `Arc`: a pin is a retention
+    /// property, and the owner asks about it before every pass and at every
+    /// door.
+    pinned: Arc<parking_lot::RwLock<BTreeSet<usize>>>,
+}
+
+impl<H: TorrentHandle> Backing for TorrentBacking<H> {
+    type Key = usize;
+    /// Which file, and how far into it -- the reader's own coordinates, so a
+    /// head in another file is a position this domain answers `None` for.
+    type Position = (usize, u64);
+    type Domain = FileDomain;
+    type Want = usize;
+    type Store = StoreRoot;
+    /// A torrent's half of the budget is committed for sharing: its pieces
+    /// are what a peer asks us for. That is the whole of what differs from
+    /// the proxy cache's policy, and it is this constant rather than a
+    /// second policy.
+    const SHARE: Share = Share::Half;
+    /// The swarm fills the cache whether or not anyone reads, so the pass
+    /// runs on the reconciler's tick and not on a delivered byte.
+    const TRIGGER: Trigger = Trigger::External;
+    /// Before the reader opens, so the hold-back precedes the pieces: there
+    /// is no un-Have in BitTorrent.
+    const INSTALL: Install = Install::OnOpen;
+    /// A policy lives as long as the active file: the next file's install
+    /// clears it, and nothing else does.
+    const LIVENESS: Liveness = Liveness::UntilReplaced;
+
+    /// What the backend says the file is, now. `None` is a torrent with no
+    /// metadata to name its pieces by, or a piece length of nothing, and
+    /// neither can be bounded.
+    async fn resolve(&self, file_idx: usize) -> Option<FileDomain> {
+        let span = self.handle.file_pieces(file_idx).await?;
+        let piece_length = self.handle.piece_length().filter(|length| *length > 0)?;
+        Some(FileDomain {
+            file_idx,
+            span,
+            piece_length,
+        })
+    }
+
+    fn governs(domain: &FileDomain, file_idx: usize) -> bool {
+        domain.file_idx == file_idx
+    }
+
+    fn extent(domain: &FileDomain) -> Range<u32> {
+        domain.span.pieces.clone()
+    }
+
+    fn policy(domain: &FileDomain, budget: u64) -> anyhow::Result<RetentionPolicy> {
+        RetentionPolicy::new(
+            budget,
+            domain.piece_length,
+            domain.span.pieces.clone(),
+            domain.span.bytes,
+            Self::SHARE,
+        )
+    }
+
+    /// The torrent piece a reader at `offset` of `file` is sitting on, or
+    /// `None` for a reader in another file: this policy's window is not
+    /// drawn round a byte of somebody else's pieces.
+    fn index_of(domain: &FileDomain, (file, offset): (usize, u64)) -> Option<u32> {
+        (file == domain.file_idx)
+            .then(|| crate::retention::playhead_piece(&domain.span, domain.piece_length, offset))
+    }
+
+    /// Any pin on the torrent: a pin is a retention property, the user asked
+    /// for those bytes, and they are shared like any other bytes we keep.
+    fn keeps_everything(&self, _file_idx: &usize) -> bool {
+        !self.pinned.read().is_empty()
+    }
+
+    async fn held(&self, store: &StoreRoot, _domain: &FileDomain) -> Option<BTreeSet<u32>> {
+        crate::retention::listing(store, &self.info_hash).await
+    }
+
+    async fn advertise(&self, pieces: Range<u32>, on: bool) -> anyhow::Result<()> {
+        self.handle
+            .set_pieces_advertised(pieces, on)
+            .await
+            .map(|_changed| ())
+    }
+
+    async fn alone(&self, domain: &FileDomain, pieces: &[u32]) -> Vec<u32> {
+        crate::retention::this_files_alone(&self.handle, domain.file_idx, pieces).await
+    }
+
+    /// The reclaim, asking the door before every part of every run.
+    ///
+    /// **The door, asked at the instant of each unlink and not a moment
+    /// before it.** The decision was measured before two awaited backend
+    /// calls per committed and withdrawn run and a `file_wants`, and
+    /// neither of the two things it measured against is behind a lock the
+    /// pass holds: `note_playhead` writes the playhead on every delivered
+    /// byte and `pin_download` writes the pin set, and the turn stops
+    /// neither. A piece becoming announced under the pass is not the door's
+    /// to catch: every advertise is made under this file's turn, which the
+    /// pass holds throughout.
+    ///
+    /// [`Door::window_now`] answers `None` for a pin taken since the pass
+    /// began, or a reader that has left this file, and it stops the reclaim
+    /// rather than skipping a run: a pin does not un-pin mid-loop, and there
+    /// is no window for a file nobody is reading. A pinned file's pieces are
+    /// the expensive ones to get wrong -- `AfterRelease::LeaveDropped`
+    /// leaves them neither held nor wanted, and the pin's own reconcile
+    /// short-circuits an unchanged selection, so nothing re-queues them and
+    /// the download the user asked for stays short of them until a restart
+    /// hash-checks the file off the disk.
+    ///
+    /// `Some` narrows the run by the window at the reader's *current*
+    /// position. librqbit refuses a piece its own live stream is about to
+    /// read, but that is `queue_range`, the forward lookahead alone, so it
+    /// cannot see the tenth of the window that sits behind the playhead for
+    /// a scan back, it is empty whenever no stream is open, and
+    /// `TorrentHandle::drop_pieces` promises it of no backend.
+    ///
+    /// Per run and not per piece: `release` is the unit that holds the
+    /// claim across the unlink, and `runs` exists so that two hundred
+    /// consecutive pieces are one call and not two hundred locks on the
+    /// torrent. And asked again before every *part* of a run: the window at
+    /// the door can fall inside a run and cut it in two, and the second
+    /// part is then given back only after the first has been released -- a
+    /// `drop_pieces` and an unlink batch later. Handing the second part to
+    /// `release` on the same answer is the reading the door exists to
+    /// refuse, one level down: a pin taken during the first part's unlink
+    /// would have the second part's pieces dropped out of a download the
+    /// user has just asked to keep. So a run the window has narrowed or
+    /// split goes back on the list in its parts, and each part is asked
+    /// about in its own turn; only a run the door lets through whole is
+    /// released.
+    async fn reclaim(
+        &self,
+        store: &StoreRoot,
+        _domain: &FileDomain,
+        runs: Vec<Range<u32>>,
+        door: Door<Self>,
+    ) -> usize {
+        let mut reclaimed = 0;
+        let mut pending: VecDeque<Range<u32>> = runs.into();
+        while let Some(run) = pending.pop_front() {
+            let Some(window) = door.window_now() else {
+                break;
+            };
+            let parts = crate::retention::outside(run.clone(), &window);
+            if parts.len() == 1 && parts[0] == run {
+                reclaimed +=
+                    crate::retention::release(&self.handle, store, &self.info_hash, run).await;
+            } else {
+                // Strictly fewer pieces than `run`, so this converges: a
+                // part is released or shrinks again on every turn through
+                // the loop.
+                for part in parts.into_iter().rev() {
+                    pending.push_front(part);
+                }
+            }
+        }
+        reclaimed
+    }
 }
 
 pub struct Engine<H: TorrentHandle> {
@@ -427,8 +616,10 @@ pub struct Engine<H: TorrentHandle> {
     /// Files pinned as offline downloads (`BackendEngineFS::pin_download`).
     /// While non-empty the engine is exempt from idle removal and the
     /// seeding-disabled pause; the handle keeps its own copy for the
-    /// want-set planner (`TorrentHandle::pin_file`).
-    pub pinned_files: parking_lot::RwLock<BTreeSet<usize>>,
+    /// want-set planner (`TorrentHandle::pin_file`). Shared with
+    /// [`TorrentBacking`], which is how the retention owner learns of a
+    /// pin: read as a copy-out, never under any lock of the owner's.
+    pub pinned_files: Arc<parking_lot::RwLock<BTreeSet<usize>>>,
     /// The last free-space reading of every volume, shared with the
     /// `BackendEngineFS` that made this engine and written by its
     /// reconciler. Whether this torrent is stopped for want of space is
@@ -446,82 +637,32 @@ pub struct Engine<H: TorrentHandle> {
     /// leaves its readers parked for good unless something here wakes them.
     read_wakers: parking_lot::Mutex<HashMap<u64, std::task::Waker>>,
     next_reader_id: AtomicU64,
-    /// What the cache cleaner says the torrent-data volume may hold,
-    /// shared with the `BackendEngineFS` that made this engine and written
-    /// by the cleaner through it. Read here to size the retention policy;
-    /// never recomputed (see [`crate::retention`]).
-    budget: Arc<crate::retention::RetentionBudget>,
-    /// The retention policy for the file most recently streamed on this
-    /// torrent, or `None` while nothing needs bounding -- no stream yet, no
-    /// budget yet, a budget that covers the file, or a pin, which is a
-    /// retention property and keeps everything.
+    /// The retention owner for this torrent's files, keyed by file index:
+    /// one policy per file, resident, with its turn beside it. What
+    /// `announce`, the policy slot, its mirror and the playhead used to be
+    /// -- see [`crate::retention::owner`] for the lock rule and the pass.
+    /// One active file per torrent is the owner's
+    /// [`Retention::install`], which clears every other file first.
+    pub(crate) retention: Arc<Retention<TorrentBacking<H>>>,
+    /// Where a test puts what playback does while a pass runs.
     ///
-    /// While it is `None` this torrent announces everything it holds and
-    /// nothing of it may be reclaimed, which is exactly what this server
-    /// did before the policy was wired.
-    retention: parking_lot::Mutex<Option<crate::retention::FileRetention>>,
-    /// What the policy above is bounding, written beside it and read
-    /// instead of it.
-    ///
-    /// **Kept here because a pass has the policy out of its slot.**
-    /// [`Self::retain`] takes the [`crate::retention::FileRetention`] for
-    /// the whole of a pass -- a directory listing and two awaited backend
-    /// calls -- and that pass runs on the reconciler's tick for exactly the
-    /// stream a panel is asking about. Reading the slot itself would answer
-    /// "no policy is bounding this stream" every couple of seconds for a
-    /// stream that is bounded, and no policy is a statement, not a delay:
-    /// the two rows would blink out and back. The proxy cache's
-    /// `LiveStream::bounded` and `LiveStream::windows` are the same guard
-    /// for the same reason.
-    ///
-    /// Written under [`Self::announce`] with the slot beside it, so the
-    /// pair cannot disagree except for the length of a pass, and see
-    /// [`crate::retention::PolicyBounds`] for what can move in that time.
-    /// `None` at process start, which is what a process with no policy
-    /// installed has to say.
-    bounds: parking_lot::Mutex<Option<crate::retention::PolicyBounds>>,
-    /// Serialises everything that changes what this torrent announces, and
-    /// the deletes taken under it.
-    ///
-    /// **The reason the cleaner's reclaim goes through this engine at all.**
-    /// Four operations touch the same pair of facts -- what we announce and
-    /// what is on the disk: installing a policy ([`Self::begin_retention`],
-    /// which holds a range back), dropping one ([`Self::clear_retention_locked`],
-    /// which puts a range back), a retention pass ([`Self::retain`], which
-    /// commits pieces *into* what we announce and reclaims the rest), and
-    /// the cache cleaner's delete ([`Self::release_reclaimable`]). A piece
-    /// that becomes announced between "the policy would release this" and
-    /// the unlink is a piece we have told a peer about and then thrown
-    /// away, which is the one thing this whole design exists to prevent --
-    /// and both of the other two do exactly that on the happy path, every
-    /// two seconds and on every file change. Holding this across the whole
-    /// of each is what makes "what we announce is what nothing will
-    /// reclaim" an invariant rather than a likelihood.
-    ///
-    /// A `tokio` mutex and not a `parking_lot` one because every holder
-    /// awaits the backend while it holds it.
-    announce: tokio::sync::Mutex<()>,
-    /// Where a reader last got to: which file, and how far into it.
-    ///
-    /// **An absence at process start, and it has to be**: a playhead is an
-    /// observation of a player, and a torrent restored from a previous run
-    /// has none this process can vouch for. Filling one in would have the
-    /// policy commit and advertise a window around a position nobody has
-    /// ever read from. Written by [`crate::files::FileHandle`] as reads
-    /// return, so it moves only where a byte really went out.
-    playhead: parking_lot::Mutex<Option<(usize, u64)>>,
-    /// Where a test puts what playback does while a pass lists the disk.
-    ///
-    /// Called once per pass, immediately before the listing, and nowhere in
-    /// a shipped build. A test that instead queued a task and trusted the
-    /// listing's await to yield to it would be betting on the blocking pool
-    /// being slower than the reactor: a blocking task that finishes before
-    /// its handle is first polled yields nothing, and the test then measures
-    /// the ordering it meant to break. The proxy's pass has the same hook
-    /// for the same reason.
+    /// Called twice per pass -- before the listing, and again after the
+    /// decision and before the unlinks -- with the file's turn held and no
+    /// owner lock, and nowhere in a shipped build. A test that instead
+    /// queued a task and trusted the listing's await to yield to it would
+    /// be betting on the blocking pool being slower than the reactor: a
+    /// blocking task that finishes before its handle is first polled yields
+    /// nothing, and the test then measures the ordering it meant to break.
+    /// The cell is the engine's, where the tests write it; the owner is
+    /// handed a runner that reads it ([`Retention::hook`]).
     #[cfg(test)]
-    pub(crate) interleave: parking_lot::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    pub(crate) interleave: Interleave,
 }
+
+/// The cell a test writes what playback does mid-pass into: see
+/// [`Engine::interleave`].
+#[cfg(test)]
+pub(crate) type Interleave = Arc<parking_lot::Mutex<Option<Box<dyn Fn() + Send + Sync>>>>;
 
 impl<H: TorrentHandle> Engine<H> {
     pub fn new_with_handle(
@@ -531,6 +672,26 @@ impl<H: TorrentHandle> Engine<H> {
         volumes: Arc<crate::reconcile::Volumes>,
         budget: Arc<crate::retention::RetentionBudget>,
     ) -> Self {
+        let pinned_files = Arc::new(parking_lot::RwLock::new(BTreeSet::new()));
+        let retention = Retention::new(
+            Arc::new(TorrentBacking {
+                handle: handle.clone(),
+                info_hash: info_hash.to_string(),
+                pinned: pinned_files.clone(),
+            }),
+            budget,
+        );
+        #[cfg(test)]
+        let interleave: Interleave = Arc::new(parking_lot::Mutex::new(None));
+        #[cfg(test)]
+        retention.hook({
+            let interleave = interleave.clone();
+            move || {
+                if let Some(hook) = interleave.lock().as_ref() {
+                    hook();
+                }
+            }
+        });
         Self {
             info_hash: info_hash.to_string(),
             handle,
@@ -544,18 +705,14 @@ impl<H: TorrentHandle> Engine<H> {
             settled: AtomicBool::new(true),
             last_transition_at: AtomicU64::new(NEVER_MOVED),
             last_active_at: AtomicU64::new(clock.now_secs()),
-            pinned_files: parking_lot::RwLock::new(BTreeSet::new()),
+            pinned_files,
             volumes,
             reads_refused: AtomicBool::new(false),
             read_wakers: parking_lot::Mutex::new(HashMap::new()),
             next_reader_id: AtomicU64::new(1),
-            budget,
-            retention: parking_lot::Mutex::new(None),
-            bounds: parking_lot::Mutex::new(None),
-            announce: tokio::sync::Mutex::new(()),
-            playhead: parking_lot::Mutex::new(None),
+            retention,
             #[cfg(test)]
-            interleave: parking_lot::Mutex::new(None),
+            interleave,
         }
     }
 
@@ -775,12 +932,21 @@ impl<H: TorrentHandle> Engine<H> {
         self.read_wakers.lock().remove(&id);
     }
 
-    /// Whether any file of this torrent is pinned as an offline download.
     /// Where a reader of `file_idx` has got to, in bytes from the start of
     /// the file. Called as each read returns, so it is the position bytes
     /// really reached a player from.
+    ///
+    /// **An absence at process start, and it has to be**: a playhead is an
+    /// observation of a player, and a torrent restored from a previous run
+    /// has none this process can vouch for. Filling one in would have the
+    /// policy commit and advertise a window around a position nobody has
+    /// ever read from. One playhead per torrent, told to every file's
+    /// entity ([`Retention::note_position_everywhere`]): a file whose
+    /// policy stands while the reader is in another file reads the byte as
+    /// "no head in my domain", which is what stops its pass and empties its
+    /// panel row. Takes no lock the pass holds and never waits on the turn.
     pub(crate) fn note_playhead(&self, file_idx: usize, offset: u64) {
-        *self.playhead.lock() = Some((file_idx, offset));
+        self.retention.note_position_everywhere((file_idx, offset));
     }
 
     /// What the retention policy says about `file_idx` right now, or `None`
@@ -796,28 +962,25 @@ impl<H: TorrentHandle> Engine<H> {
     /// region nobody has ever read. **A playhead in another file** is a
     /// reader that has moved on, and this file's numbers left with it.
     ///
-    /// Two locks and no I/O: the reading is finished against a listing of
-    /// the store, which the caller takes for itself (see
-    /// [`crate::retention::PolicyReading::window`]) rather than under the
-    /// policy lock.
-    ///
-    /// Read from [`Self::bounds`] and not from the policy slot, because a
-    /// pass in flight has the policy out of that slot and this is a
-    /// question a panel asks every second: see the field.
+    /// One copy-out of the owner's state and no I/O: the reading is finished
+    /// against a listing of the store, which the caller takes for itself
+    /// (see [`crate::retention::PolicyReading::window`]) rather than under
+    /// any lock. A pass in flight has the policy in its cell like any other
+    /// moment, so the committed count is the live one -- a pass parked in
+    /// its advertise has already committed the piece it is announcing.
     pub(crate) fn policy_reading(
         &self,
         file_idx: usize,
     ) -> Option<crate::retention::PolicyReading> {
-        let (at_file, offset) = (*self.playhead.lock())?;
-        if at_file != file_idx {
-            return None;
-        }
-        let bounds = self.bounds.lock();
-        let bounds = bounds.as_ref()?;
-        if bounds.file_idx != file_idx {
-            return None;
-        }
-        Some(bounds.reading(offset))
+        let holding = self.retention.holding(&file_idx)?;
+        let installed = holding.installed?;
+        let playhead = TorrentBacking::<H>::index_of(&holding.domain, holding.last_position?)?;
+        Some(crate::retention::PolicyReading::new(
+            installed.pieces,
+            holding.domain.piece_length,
+            playhead,
+            installed.committed.len(),
+        ))
     }
 
     /// Install (or keep) the retention policy for a file about to be
@@ -830,271 +993,64 @@ impl<H: TorrentHandle> Engine<H> {
     /// librqbit allows and which is what makes "we never advertise what we
     /// might reclaim" true rather than nearly true.
     ///
-    /// A pinned torrent gets no policy: a pin is a retention property, the
-    /// user asked for those bytes, and they are shared like any other bytes
-    /// we are keeping.
+    /// The owner's [`Retention::install`]: every other file's policy is
+    /// given back first, a pinned torrent gets no policy (a pin is a
+    /// retention property), a policy that already describes this file under
+    /// this budget is kept untouched, and a hold-back the backend refuses
+    /// installs nothing.
     pub(crate) async fn begin_retention(&self, file_idx: usize) {
-        let _announce = self.announce.lock().await;
-        self.begin_retention_locked(file_idx).await
-    }
-
-    /// [`Self::begin_retention`] with [`Self::announce`] already held.
-    async fn begin_retention_locked(&self, file_idx: usize) {
-        let budget = self.budget.get();
-        if self.is_pinned() {
-            self.clear_retention_locked().await;
-            return;
-        }
-        if self
-            .retention
-            .lock()
-            .as_ref()
-            .is_some_and(|held| crate::retention::still_current(held, budget, file_idx))
-        {
-            return;
-        }
-        let policy = crate::retention::policy_for(&self.handle, budget, file_idx).await;
-        // Whatever was held back for the file before this one goes back
-        // into what we announce first, whether or not a new policy is going
-        // in. Otherwise a torrent whose reader moved to another file would
-        // leave the first file's range announced to nobody for the life of
-        // the engine, while the cleaner's gate -- which reads "no policy
-        // covers this piece" as "we announce it" -- called those same pieces
-        // protected. Held back and protected at once is the one combination
-        // that is never right.
-        self.clear_retention_locked().await;
-        let Some(retention) = policy else {
-            return;
-        };
-        let pieces = retention.pieces();
-        if let Err(error) = self
-            .handle
-            .set_pieces_advertised(pieces.clone(), false)
-            .await
-        {
-            // Without the hold-back every window piece would be announced
-            // and withdrawn again seconds later, which is worse than
-            // sharing nothing: the policy is not installed, so nothing is
-            // reclaimed either, and the torrent behaves as it did before.
-            tracing::warn!(
-                info_hash = %self.info_hash,
-                file_idx,
-                error = %format!("{error:#}"),
-                "could not hold the playback window back from what we announce; this torrent is not bounded"
-            );
-            return;
-        }
+        let outcome = self.retention.install(file_idx, file_idx).await;
         tracing::debug!(
             info_hash = %self.info_hash,
             file_idx,
-            first = pieces.start,
-            end = pieces.end,
-            shape = ?retention.shape(),
-            "holding a file's pieces back and bounding it to the cache budget"
+            ?outcome,
+            "retention policy for the file about to stream"
         );
-        self.hold(retention);
     }
 
-    /// Put `retention` in its slot with [`Self::bounds`] beside it. The two
-    /// are written together, under [`Self::announce`], and nothing else may
-    /// write either.
-    fn hold(&self, retention: crate::retention::FileRetention) {
-        let mut slot = self.retention.lock();
-        *self.bounds.lock() = Some(retention.bounds());
-        *slot = Some(retention);
-    }
-
-    /// Forget the policy and put back what it was holding back.
+    /// The file whose policy bounds this torrent right now, and the policy
+    /// as a value, or `None` while nothing bounds it.
     ///
-    /// The pieces stop being reclaimable at the same moment they start
-    /// being announced again, which is the only order that keeps the rule:
-    /// what we announce is what nothing will reclaim.
-    async fn clear_retention_locked(&self) {
-        let taken = {
-            let mut slot = self.retention.lock();
-            // Unconditionally, so that "nothing is bounding this stream" is
-            // never left standing beside an empty slot: the bounds are the
-            // answer a panel gets.
-            *self.bounds.lock() = None;
-            slot.take()
-        };
-        let Some(retention) = taken else {
-            return;
-        };
-        if let Err(error) = self
-            .handle
-            .set_pieces_advertised(retention.pieces(), true)
-            .await
-        {
-            tracing::debug!(
-                info_hash = %self.info_hash,
-                error = %format!("{error:#}"),
-                "could not put a dropped policy's pieces back into what we announce"
-            );
-        }
+    /// One file at most has a policy installed -- [`Retention::install`]
+    /// clears every other before it installs -- so the first holding with
+    /// one is the torrent's. A copy-out under the owner's locks, no I/O.
+    fn bounded(&self) -> Option<(usize, InstalledView)> {
+        self.retention
+            .holdings()
+            .into_iter()
+            .find_map(|(file_idx, holding)| holding.installed.map(|view| (file_idx, view)))
     }
 
     /// One retention pass: what the policy makes of where the playhead is
     /// now, and the calls that make it so. `None` when there is nothing to
-    /// do -- no policy, no reader has been anywhere yet, or the reader is
-    /// in another file than the policy governs, before or after the walk.
-    /// Every one of those leaves the policy where it was; none of them is
-    /// a pass that ran and found nothing, which is `Some` with a zeroed
-    /// count.
+    /// do -- no policy, no reader has been anywhere yet, the reader is in
+    /// another file than the policy governs before or after the walk, a
+    /// pin, or a disk that would not list. Every one of those leaves the
+    /// policy where it was; none of them is a pass that ran and found
+    /// nothing, which is `Some` with a zeroed count.
     ///
-    /// Holds [`Self::announce`] from its first line to its last, so a second
-    /// pass queues behind this one and a [`Self::begin_retention`] that
-    /// arrives meanwhile waits its turn: nothing installs, clears or takes
-    /// the policy while a pass has it. The policy still comes *out* of its
-    /// slot for the length of the pass, but for a different reason than it
-    /// once did -- a panel asking what bounds this stream is answered from
-    /// `bounds` beside the slot, not from the slot, precisely so
-    /// that an empty slot during a pass does not read as "nothing bounds
-    /// this stream" (see [`crate::retention::PolicyBounds`]).
+    /// The file's turn from the first line to the last
+    /// ([`Retention::turn`] then [`Retention::pass`]): a second pass queues
+    /// behind this one, a [`Self::begin_retention`] that arrives meanwhile
+    /// waits its turn, and the cleaner's delete waits behind both. The
+    /// policy stays in its cell throughout; a pass that dies at an await
+    /// drops the turn like any other local and the next tick's pass runs.
     pub(crate) async fn retain(
         &self,
-        store: &crate::piece_store::StoreRoot,
+        store: &StoreRoot,
     ) -> Option<crate::retention::RetentionPass> {
-        let _announce = self.announce.lock().await;
-        // A pin taken while this file was already playing leaves the policy
-        // installed: `begin_retention` is the only other place that asks,
-        // and it ran before the pin existed. Without this a pinned file is
-        // reclaimed under its own reader -- measured, half a 32 MiB file
-        // deleted with `is_pinned()` true throughout -- and, because the
-        // policy also holds its range back, the file the user asked to keep
-        // is announced to nobody while librqbit re-fetches it in a loop.
-        if self.is_pinned() {
-            self.clear_retention_locked().await;
-            return None;
-        }
-        // Only which file, and only as a filter: a torrent whose reader has
-        // moved on must not pay a `read_dir` per thousand pieces every two
-        // seconds to discover it has nothing to say. The offset is
-        // deliberately not read here, so that no part of this reading can
-        // be mistaken for the one the decision is built from.
-        let (file_idx, _) = (*self.playhead.lock())?;
-        let mut retention = self.retention.lock().take()?;
-        if retention.file_idx != file_idx {
-            // The playhead names a different file: a reader that has just
-            // been opened on another one and has not read yet, or the last
-            // read of the file this policy replaced. Either way this pass
-            // has no playhead for the policy it is holding, so it leaves it
-            // exactly as it is -- `begin_retention` is what replaces a
-            // policy, and it puts the old range back when it does.
-            self.put_back(retention);
-            return None;
-        }
-        #[cfg(test)]
-        self.interleave();
-        let Some(held) = crate::retention::listing(store, &self.info_hash).await else {
-            // A listing we do not have is a pass that measured nothing --
-            // the blocking pool would not answer, which is shutdown or a
-            // panic in the walk -- and it concludes nothing. Said with a
-            // warning rather than a bare `None`, because `None` is the
-            // shape of the ordinary reasons a pass has nothing to do and a
-            // torrent left unbounded tick after tick should not be silent.
-            tracing::warn!(
-                info_hash = %self.info_hash,
-                "the retention pass could not list the disk; this torrent is unbounded until it can"
-            );
-            self.put_back(retention);
-            return None;
-        };
-        // **The deciding reading, and it is taken after the listing.**
-        //
-        // The listing is a directory walk on the blocking pool, so this
-        // pass is suspended across it while `note_playhead` -- which takes
-        // none of the locks held here -- runs on every delivered byte and
-        // the fill writes the read-ahead. Read before the walk, the
-        // playhead is the older half of the pair: the window is drawn round
-        // where playback *was*, and everything the fill wrote ahead of it
-        // in the meantime is outside that window, on the disk, and
-        // reclaimed. `AfterRelease::LeaveDropped` means nothing reselects
-        // it, so the player arrives at the hole a moment later and parks
-        // while the swarm refetches. Measured on the proxy's identical pass
-        // before it was reordered: a 16 MB read left an empty directory
-        // under an 8 MB budget after two passes.
-        //
-        // Read after the walk the pair is the other way round -- the
-        // decision may name pieces the listing did not find, which unlinks
-        // nothing, because the listing is the candidate set.
-        let Some((file_idx, offset)) = *self.playhead.lock() else {
-            self.put_back(retention);
-            return None;
-        };
-        if retention.file_idx != file_idx {
-            // The reader moved to another file while we walked the disk.
-            // Same answer as the asking above, for the same reason, and
-            // deliberately not a clear: the policy goes back into its slot
-            // still holding its range back from what we announce, because
-            // nothing was advertised and nothing unlinked, and a bail-out
-            // that dropped it would leave the range held back while the
-            // cleaner's gate read the torrent as announced.
-            self.put_back(retention);
-            return None;
-        }
-        let pass = crate::retention::advance(
-            &self.handle,
-            store,
-            &self.info_hash,
-            &mut retention,
-            offset,
-            &held,
-            || self.reclaim_door(file_idx),
-        )
-        .await;
-        self.put_back(retention);
-        Some(pass)
-    }
-
-    /// What a pass in flight may still reclaim of `file_idx`, asked again
-    /// at every unlink it makes.
-    ///
-    /// **The two things that move under a pass.** Everything else it
-    /// measured against is frozen by [`Self::announce`], which it holds
-    /// from its first line to its last; these two are not. `pin_download`
-    /// writes [`Self::pinned_files`] and [`Self::note_playhead`] writes
-    /// [`Self::playhead`] on every delivered byte, and neither takes a
-    /// lock the pass holds -- so the pin [`Self::retain`] asked about in
-    /// its prologue and the playhead it drew its window round are both
-    /// older than the unlink by a disk walk and two awaited backend calls
-    /// per run.
-    ///
-    /// `None` is "take nothing more": the torrent is pinned now, or the
-    /// reader has left the file this policy governs, and neither is a
-    /// state that has a window for the pass to keep. `Some` is where that
-    /// reader is at this instant, which is what the window the reclaim
-    /// spares is drawn round. See [`crate::retention::advance`]'s reclaim
-    /// loop for what is done with each.
-    ///
-    /// Both readings are copied out, so no lock guard here can reach the
-    /// await on the next line of the caller.
-    fn reclaim_door(&self, file_idx: usize) -> Option<u64> {
-        if self.is_pinned() {
-            return None;
-        }
-        match *self.playhead.lock() {
-            Some((idx, offset)) if idx == file_idx => Some(offset),
-            _ => None,
-        }
-    }
-
-    #[cfg(test)]
-    fn interleave(&self) {
-        if let Some(hook) = self.interleave.lock().as_ref() {
-            hook();
-        }
-    }
-
-    /// Put a pass's policy back where it came from, unless something has
-    /// installed another one meanwhile -- in which case this one is stale
-    /// and so are its bounds, and neither is written.
-    fn put_back(&self, retention: crate::retention::FileRetention) {
-        let mut slot = self.retention.lock();
-        if slot.is_none() {
-            *self.bounds.lock() = Some(retention.bounds());
-            *slot = Some(retention);
-        }
+        let (file_idx, _) = self.bounded()?;
+        let claim = self.retention.turn(&file_idx).await?;
+        let concluded = self
+            .retention
+            .pass(&file_idx, store, claim)
+            .await
+            .concluded?;
+        Some(crate::retention::RetentionPass {
+            committed: concluded.committed,
+            reclaimed: concluded.reclaimed,
+            withdrawn: concluded.withdrawn,
+        })
     }
 
     /// What this engine tells the cache cleaner it may take -- **asked by
@@ -1113,7 +1069,7 @@ impl<H: TorrentHandle> Engine<H> {
     /// here:
     ///
     /// * a **pinned** torrent announces everything and releases nothing,
-    ///   whatever policy its slot still holds -- a pin taken while the file
+    ///   whatever policy is still installed -- a pin taken while the file
     ///   was streaming leaves the policy installed until the next pass
     ///   clears it, and the download the user asked to keep must not lose
     ///   pieces through that gap;
@@ -1125,6 +1081,10 @@ impl<H: TorrentHandle> Engine<H> {
     /// what gets it going again, by evicting other bytes, so it keeps its
     /// policy's protection meanwhile and is named to the cleaner separately
     /// ([`Standing::stopped_for_space`]).
+    ///
+    /// The policy's half is read off the owner's live cell, so a pass in
+    /// flight answers `Policy` with the committed set as the pass has
+    /// advanced it, never "no policy".
     pub(crate) async fn standing(&self) -> Standing {
         if self.is_pinned() {
             return Standing {
@@ -1142,31 +1102,24 @@ impl<H: TorrentHandle> Engine<H> {
                 stopped_for_space,
             };
         }
-        let (gate, policy_file) = self.gate_verdict_for_file();
+        // The two come out of one copy-out because they are one policy's: a
+        // caller that asked twice could find itself narrowing one file's
+        // reclaim by the boundaries of the file a `begin_retention` in
+        // between had moved to.
+        let (gate, policy_file) = match self.bounded() {
+            Some((file_idx, installed)) => (
+                crate::retention::TorrentGate::Policy {
+                    pieces: installed.pieces,
+                    committed: installed.committed,
+                },
+                Some(file_idx),
+            ),
+            None => (crate::retention::TorrentGate::Announced, None),
+        };
         Standing {
             gate,
             policy_file,
             stopped_for_space,
-        }
-    }
-
-    /// The policy's half of [`Self::standing`], and the file whose policy
-    /// answered it.
-    ///
-    /// The two come out of one acquisition of the slot because they are one
-    /// policy's: a caller that asked twice could find itself narrowing one
-    /// file's reclaim by the boundaries of the file a `begin_retention` in
-    /// between had moved to.
-    fn gate_verdict_for_file(&self) -> (crate::retention::TorrentGate, Option<usize>) {
-        match self.retention.lock().as_ref() {
-            Some(retention) => (
-                crate::retention::TorrentGate::Policy {
-                    pieces: retention.pieces(),
-                    committed: retention.committed().clone(),
-                },
-                Some(retention.file_idx),
-            ),
-            None => (crate::retention::TorrentGate::Announced, None),
         }
     }
 
@@ -1181,8 +1134,9 @@ impl<H: TorrentHandle> Engine<H> {
     /// [`Self::begin_retention`] puts a whole range back when the reader
     /// moves to another file. Deleting a piece we have told a peer about is
     /// the one thing this design exists to prevent, so the question is
-    /// asked again here, under the lock those two also take, and the answer
-    /// taken from the live policy rather than from a copy of it.
+    /// asked again here, under the file's turn -- which those two also take
+    /// -- and the answer taken from the live policy rather than from a copy
+    /// of it.
     ///
     /// The gate is not the only narrowing the cleaner's request needs. A
     /// policy's file shares its first and last piece with its neighbours,
@@ -1191,12 +1145,18 @@ impl<H: TorrentHandle> Engine<H> {
     /// [`crate::retention::this_files_alone`] is asked here as well as in
     /// the pass, and for the same reason: unlinking a piece a still-wanted
     /// neighbour owns is a refetch loop, whichever caller does it.
-    pub(crate) async fn release_reclaimable(
-        &self,
-        store: &crate::piece_store::StoreRoot,
-        pieces: &[u32],
-    ) -> usize {
-        let _announce = self.announce.lock().await;
+    pub(crate) async fn release_reclaimable(&self, store: &StoreRoot, pieces: &[u32]) -> usize {
+        // The turn is per file, and the file is the one whose policy will
+        // answer. Taken before the asking, held across the unlink: a pass
+        // on that file cannot commit a piece between this reading and its
+        // release. A torrent with no policy has no turn to take and nothing
+        // that could advertise under it but an install, whose hold-back
+        // makes a piece less announced, not more.
+        let key = self.bounded().map(|(file_idx, _)| file_idx);
+        let _turn = match key {
+            Some(file_idx) => self.retention.turn(&file_idx).await,
+            None => None,
+        };
         // The cleaner's question, asked again at the door: what the walk
         // collected was a reading, and this is the asking that decides.
         //
@@ -1219,6 +1179,20 @@ impl<H: TorrentHandle> Engine<H> {
         // piece 0 of the file it left is outside the new range, so the
         // verdict refuses it. So does a piece the pass has committed since.
         let standing = self.standing().await;
+        if let Some(file_idx) = standing.policy_file
+            && Some(file_idx) != key
+        {
+            // The policy moved to another file between the reading the turn
+            // was taken on and this one, so the turn in hand is not the one
+            // that orders that file's passes: nothing is taken on a policy
+            // whose turn we do not hold. The cleaner's next walk asks again.
+            tracing::debug!(
+                info_hash = %self.info_hash,
+                file_idx,
+                "the policy moved to another file under the cleaner's delete; taking nothing"
+            );
+            return 0;
+        }
         let mut still: Vec<u32> = pieces
             .iter()
             .copied()
