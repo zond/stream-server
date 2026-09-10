@@ -543,6 +543,26 @@ struct State<B: Backing> {
     /// When a byte last reached a player, which is what [`Liveness::Grace`]
     /// is measured from once no reader is left.
     last_seen: Instant,
+    /// Whether this entity's range is held back from what we announce with
+    /// nothing installed to put it back.
+    ///
+    /// A slack pass holds the whole extent back before it unlinks anything,
+    /// and drops the policy in the same breath. Where its unlinks are then
+    /// refused -- a hash check running, a backend that will not forget --
+    /// the entity stands holding bytes it does not announce, and the next
+    /// tick's slack pass re-issues the hold-back and retries. That is the
+    /// intended shape, and it ends when the bytes go.
+    ///
+    /// It ends the other way too: a **pin**, which makes the entity one no
+    /// slack pass will ever walk again. [`Retention::clear_under`] is the
+    /// only thing that gives a range back, and with no policy to read the
+    /// range off it used to return at once -- leaving the pieces the user
+    /// had just asked us to keep held back from every peer while
+    /// [`crate::engine::Engine::standing`], finding no policy, told the
+    /// cleaner the torrent announces them. Held back and protected at once
+    /// is the one combination that is never right, and there was no pass
+    /// left to undo it. So the fact is recorded, and `clear_under` reads it.
+    held_back: bool,
     /// What the pass standing over this entity decided to take off the
     /// disk, and what is therefore never put back into what we announce.
     ///
@@ -779,6 +799,7 @@ impl<B: Backing> Retention<B> {
                         readers: HashMap::new(),
                         last_position: None,
                         last_seen: Instant::now(),
+                        held_back: false,
                         doomed: Vec::new(),
                         opens: 0,
                     })),
@@ -1014,6 +1035,13 @@ impl<B: Backing> Retention<B> {
             let state = entity.state.lock();
             match state.installed.as_ref() {
                 Some(installed) => (installed.policy.pieces(), state.doomed.clone()),
+                // Nothing installed, but a slack pass held the range back
+                // and could not finish taking it: see [`State::held_back`].
+                // Nothing is doomed there -- a slack pass records no runs --
+                // and a piece its reclaim did take is one the backend has
+                // already forgotten, so lifting the mask over it announces
+                // nothing.
+                None if state.held_back => (B::extent(&state.domain), Vec::new()),
                 None => return true,
             }
         };
@@ -1034,7 +1062,12 @@ impl<B: Backing> Retention<B> {
                 }
             }
         }
-        entity.state.lock().forget_policy(&mut claim.guard);
+        let mut state = entity.state.lock();
+        // The range is back in what we announce, so nothing is holding it
+        // back any more -- whether it was a policy's hold-back or a slack
+        // pass's ([`State::held_back`]).
+        state.held_back = false;
+        state.forget_policy(&mut claim.guard);
         true
     }
 
@@ -1222,6 +1255,11 @@ impl<B: Backing> Retention<B> {
         let promised: Vec<Range<u32>> = {
             let mut state = entity.state.lock();
             state.go_slack(&mut claim.guard);
+            // The hold-back above went out and the policy has just gone, so
+            // from here only `clear_under` can give this range back -- see
+            // [`State::held_back`]. Under `Share::Nothing` nothing was held
+            // back and there is nothing to give.
+            state.held_back = B::SHARE == Share::Half && !extent.is_empty();
             state
                 .readers
                 .values()
@@ -3162,6 +3200,76 @@ mod tests {
         assert!(
             holding.windows.is_empty(),
             "and so did the window it had measured"
+        );
+    }
+
+    /// **A pin on an entity whose slack pass could not finish gives its
+    /// bytes back to the swarm.**
+    ///
+    /// A slack pass holds the whole extent back before it unlinks anything,
+    /// because a delete refused under a hash check leaves pieces that must
+    /// stay unannounced. It then drops the policy. If the unlinks are
+    /// refused, what stands is an entity holding bytes with nothing
+    /// installed and its range held back -- and the next tick's slack pass
+    /// re-issues the hold-back and retries, which is the intended shape.
+    ///
+    /// But a pin lands on that state, and a pinned entity is never slack:
+    /// no further slack pass runs. [`Retention::clear_under`] is what puts a
+    /// range back, and it had nothing to put back from -- no policy, so it
+    /// returned at once. The pieces the user had just asked us to keep were
+    /// then held back from every peer while
+    /// [`crate::engine::Engine::standing`], finding no policy, told the
+    /// cleaner the torrent announces them: held back and protected at once,
+    /// which is the one combination that is never right, and with no pass
+    /// left to undo it.
+    ///
+    /// So the range goes back, exactly as a policy's would. The whole
+    /// extent, with nothing subtracted: `set_pieces_advertised(_, true)`
+    /// lifts a mask rather than claiming anything, and the fork emits a
+    /// Have only for a piece we have *and* were holding back
+    /// (`live::set_pieces_advertised`), so a piece the reclaim did take --
+    /// forgotten by the backend before it was unlinked -- announces
+    /// nothing.
+    #[tokio::test]
+    async fn a_pin_on_a_slack_entity_that_kept_its_bytes_announces_them_again() {
+        let (backing, owner, _budget) = torrent();
+        *backing.held.lock() = [0, 1, 2].into_iter().collect();
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        owner.note_position(&0, (0, 0));
+
+        // The slack pass holds the extent back and then cannot unlink.
+        backing.reclaim_panics.store(true, Ordering::SeqCst);
+        let opens = owner.opens_of(&0);
+        let claim = owner.turn(&0).await.expect("the turn");
+        owner.pass(&0, &(), claim, Mode::Slack { opens }).await;
+        assert!(
+            owner.holding(&0).expect("the entity").installed.is_none(),
+            "the slack pass dropped the policy"
+        );
+        assert!(
+            backing.advertised.lock().iter().any(|(_, on)| !on),
+            "and held its range back before trying to unlink"
+        );
+
+        // The user pins the file. Nothing will run a slack pass over it
+        // again, so this is the last chance to give the range back.
+        backing.reclaim_panics.store(false, Ordering::SeqCst);
+        backing.keeps_everything.store(true, Ordering::SeqCst);
+        let claim = owner.turn(&0).await.expect("the turn");
+        owner.pass(&0, &(), claim, Mode::Live).await;
+
+        let covered: BTreeSet<u32> = backing
+            .advertised
+            .lock()
+            .iter()
+            .filter(|(_, on)| *on)
+            .flat_map(|(range, _)| range.clone())
+            .collect();
+        assert_eq!(
+            covered,
+            (0..8).collect::<BTreeSet<u32>>(),
+            "the pinned entity's range is back in what we announce, and the \
+             pieces it holds with it"
         );
     }
 
