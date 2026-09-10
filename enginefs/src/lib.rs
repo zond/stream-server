@@ -10429,16 +10429,15 @@ mod tests {
         engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
 
-        // Playback, in the only gap this pass has: the queued task cannot
-        // run until the pass gives the runtime back, and the listing is the
-        // only thing in this pass that does.
-        let moved = tokio::spawn({
+        // Playback, in the gap this pass has: from inside the pass, as it
+        // starts its listing. See `Engine::interleave` for why not a queued
+        // task.
+        *engine.interleave.lock() = Some(Box::new({
             let engine = engine.clone();
-            async move { engine.note_playhead(0, 75) }
-        });
+            move || engine.note_playhead(0, 75)
+        }));
 
         let pass = engine.retain(&store).await.expect("a pass ran");
-        moved.await.expect("the playback task");
         assert!(pass.reclaimed > 0, "the pass gave pieces back: {pass:?}");
         assert!(
             bucket.join("3").is_file(),
@@ -10447,6 +10446,66 @@ mod tests {
         assert!(
             !bucket.join("0").exists(),
             "and what playback has left behind is"
+        );
+    }
+
+    /// **And a reader that left the file while the pass listed leaves the
+    /// policy exactly as it was.**
+    ///
+    /// The playhead the pass re-reads after its listing can name another
+    /// file: the reader opened the next episode of the pack while the walk
+    /// ran. A window drawn from that offset on this file's policy is a
+    /// window round the wrong piece, and everything else on the disk goes.
+    /// So the pass concludes nothing -- and puts the policy back rather than
+    /// clearing or dropping it. Cleared, it would re-announce a range the
+    /// budget still does not cover, for the rest of the session (only a
+    /// reader opening installs one); dropped, it would leave the range held
+    /// back while the cleaner's gate called the torrent announced, which is
+    /// the one combination that is never right. `begin_retention` is what
+    /// replaces a policy, and it gives the old range back when it does.
+    #[tokio::test]
+    async fn a_reader_that_left_the_file_while_the_pass_listed_stops_it_cold() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        // Two pieces of budget over each four-piece file.
+        enginefs.set_cache_budget(Some(50));
+
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in [0u32, 1, 2, 3] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let store = enginefs.piece_store();
+        engine.note_playhead(0, 0);
+        engine.begin_retention(0).await;
+
+        // The next episode opens while the pass lists.
+        *engine.interleave.lock() = Some(Box::new({
+            let engine = engine.clone();
+            move || engine.note_playhead(1, 0)
+        }));
+
+        assert!(
+            engine.retain(&store).await.is_none(),
+            "a pass with no playhead in the file its policy governs has nothing to conclude"
+        );
+        assert!(
+            counters.dropped_ranges.lock().unwrap().is_empty(),
+            "and it asked the backend to forget nothing"
+        );
+        for piece in [0u32, 1, 2, 3] {
+            assert!(bucket.join(piece.to_string()).is_file());
+        }
+        assert!(
+            matches!(
+                engine.standing().await.gate,
+                crate::retention::TorrentGate::Policy { .. }
+            ),
+            "the policy is back in its slot, untouched, for begin_retention to replace"
         );
     }
 

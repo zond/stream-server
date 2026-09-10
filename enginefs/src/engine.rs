@@ -510,6 +510,17 @@ pub struct Engine<H: TorrentHandle> {
     /// ever read from. Written by [`crate::files::FileHandle`] as reads
     /// return, so it moves only where a byte really went out.
     playhead: parking_lot::Mutex<Option<(usize, u64)>>,
+    /// Where a test puts what playback does while a pass lists the disk.
+    ///
+    /// Called once per pass, immediately before the listing, and nowhere in
+    /// a shipped build. A test that instead queued a task and trusted the
+    /// listing's await to yield to it would be betting on the blocking pool
+    /// being slower than the reactor: a blocking task that finishes before
+    /// its handle is first polled yields nothing, and the test then measures
+    /// the ordering it meant to break. The proxy's pass has the same hook
+    /// for the same reason.
+    #[cfg(test)]
+    pub(crate) interleave: parking_lot::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl<H: TorrentHandle> Engine<H> {
@@ -543,6 +554,8 @@ impl<H: TorrentHandle> Engine<H> {
             bounds: parking_lot::Mutex::new(None),
             announce: tokio::sync::Mutex::new(()),
             playhead: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            interleave: parking_lot::Mutex::new(None),
         }
     }
 
@@ -966,6 +979,8 @@ impl<H: TorrentHandle> Engine<H> {
             self.put_back(retention);
             return None;
         }
+        #[cfg(test)]
+        self.interleave();
         let Some(held) = crate::retention::listing(store, &self.info_hash).await else {
             // A listing we do not have is a pass that measured nothing, not
             // a pass with an empty disk: it says so with a zeroed count,
@@ -1050,6 +1065,13 @@ impl<H: TorrentHandle> Engine<H> {
         match *self.playhead.lock() {
             Some((idx, offset)) if idx == file_idx => Some(offset),
             _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn interleave(&self) {
+        if let Some(hook) = self.interleave.lock().as_ref() {
+            hook();
         }
     }
 
