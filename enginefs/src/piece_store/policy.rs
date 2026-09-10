@@ -717,6 +717,59 @@ mod tests {
         assert_eq!(sub.window_at(0), 0..1);
     }
 
+    /// The reach a stream is sized by is never empty and never past the
+    /// file: a budget of nothing reaches the piece under the playhead
+    /// (`Engine::fetch_bound` takes `end - 1`, and an empty reach would put
+    /// that a piece behind the reader, or underflow at piece zero); at the
+    /// file's tail it is cut at the last piece; a playhead the file does not
+    /// contain is read as its last piece, as `window_at` reads it; and a
+    /// policy shaped `Whole` reaches the whole rest of the file, so that a
+    /// bound computed from it bounds nothing the file has.
+    #[test]
+    fn the_reach_is_never_empty_and_never_past_the_file() {
+        let nothing = policy(0, 20);
+        assert_eq!(nothing.window_at(7), 7..8);
+        assert_eq!(
+            nothing.ahead_of(7),
+            7..8,
+            "the piece being read is reached, however small the budget"
+        );
+
+        // Ten ahead of the playhead, one behind: the reach is the nine ahead
+        // and the playhead's own, cut where the file ends.
+        let split = policy(20, 200);
+        assert_eq!(split.ahead_of(100), 100..109);
+        assert_eq!(split.ahead_of(195), 195..200, "cut at the last piece");
+        assert_eq!(split.ahead_of(199), 199..200);
+        assert_eq!(
+            split.ahead_of(250),
+            199..200,
+            "a playhead past the file reads as its last piece"
+        );
+
+        // A file that does not start at piece zero is measured in its own
+        // pieces.
+        let later = RetentionPolicy::new(2 * PIECE, PIECE, 4..12, 8 * PIECE, Share::Half)
+            .expect("a consistent file");
+        assert_eq!(later.ahead_of(4), 4..5);
+        assert_eq!(later.ahead_of(11), 11..12);
+        assert_eq!(
+            later.ahead_of(0),
+            4..5,
+            "a playhead before the file reads as its first piece"
+        );
+
+        let whole = RetentionPolicy::new(20 * PIECE, PIECE, 0..20, 20 * PIECE, Share::Half)
+            .expect("a consistent file");
+        assert_eq!(whole.shape(), Shape::Whole);
+        assert_eq!(whole.ahead_of(5), 5..20);
+        assert_eq!(
+            whole.ahead_of(0),
+            0..18,
+            "nine tenths of the whole file ahead of its start"
+        );
+    }
+
     #[test]
     fn the_window_is_ninety_percent_ahead_and_ten_behind() {
         let p = policy(20, 200);

@@ -10582,6 +10582,56 @@ mod tests {
         assert_eq!(counters.lookaheads.lock().unwrap().last(), Some(&cap));
     }
 
+    /// **The reach is measured in the reader's own file, from the reader's
+    /// own offset.** The window's pieces are the torrent's; the bytes a
+    /// reader is handed are from where it starts in its file. A file that
+    /// begins a hundred bytes into the torrent has a hundred bytes taken off
+    /// the piece arithmetic before the reader's offset is -- without that,
+    /// every reader of every file after the first would fetch its file's
+    /// offset past the window, the whole first episode for the second. And
+    /// a reader inside the file's last piece, which the reach cannot go
+    /// beyond, is bounded to the one byte the stream insists on.
+    #[tokio::test]
+    async fn a_reader_in_a_later_file_is_bounded_from_its_own_offset() {
+        use crate::backend::priorities::{BufferProfile, PlaybackIntent};
+        let (enginefs, counters) = test_enginefs_with_files(vec![
+            ("Show.S01E01.mkv".into(), 100),
+            ("Show.S01E02.mkv".into(), 200),
+        ]);
+        // Twenty-five byte pieces: episode two is pieces 4..12, from byte
+        // 100 of the torrent. A budget of a hundred over its two hundred
+        // bytes is four pieces, two of them the window.
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(100));
+
+        // At the top of episode two, on piece 4: the reach is 4..6, and
+        // piece 5 starts at torrent byte 125 -- byte 25 of the file.
+        let _at_start = engine
+            .try_get_file_with_intent(1, 0, 255, PlaybackIntent::DirectSeek, BufferProfile::Normal)
+            .await
+            .expect("a reader");
+        // Three bytes in: the same piece, three fewer bytes to it.
+        let _three_in = engine
+            .try_get_file_with_intent(1, 3, 255, PlaybackIntent::DirectSeek, BufferProfile::Normal)
+            .await
+            .expect("a reader");
+        // Inside the file's last piece, which starts at byte 175 of the
+        // file: the reach is that piece alone, and the bound cannot be
+        // measured backwards.
+        let _at_end = engine
+            .try_get_file_with_intent(
+                1,
+                197,
+                255,
+                PlaybackIntent::DirectSeek,
+                BufferProfile::Normal,
+            )
+            .await
+            .expect("a reader");
+        assert_eq!(*counters.lookaheads.lock().unwrap(), vec![25, 22, 1]);
+    }
+
     /// **A pass leaves the backend wanting the window and the committed
     /// set, and nothing else it does not already have.**
     ///
@@ -10709,6 +10759,131 @@ mod tests {
             *counters.dropped_ranges.lock().unwrap(),
             vec![(1..4, crate::backend::AfterRelease::LeaveDropped)],
             "one ask, the want-set's"
+        );
+    }
+
+    /// **And a pin taken under the want step keeps the piece that arrived
+    /// under it.**
+    ///
+    /// The unlink above is an unlink, and every unlink of this owner asks
+    /// the door at its instant: the pass read "not pinned" at its first
+    /// step, two backend calls before the drop, and a pin lands in that gap
+    /// as easily as a piece does. Same fixture as the test above with the
+    /// pin landing in the same hook: the backend forgets the piece, the door
+    /// says take nothing, the claim is released with the bytes still on the
+    /// disk and in the set -- and the pin's next pass wants the whole file
+    /// again, which downloads that one piece back over itself. A piece
+    /// fetched twice, against a piece of a pinned file deleted.
+    #[tokio::test]
+    async fn a_pin_taken_under_the_want_step_keeps_the_piece_that_arrived_under_it() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
+        let store = Arc::new(seeded_store(&enginefs, &engine));
+        engine.note_playhead(0, 0);
+        engine.begin_retention(0).await;
+        // Piece 2 completes and the user pins the file while the backend is
+        // forgetting 1..4.
+        *counters.on_first_drop.lock().unwrap() = Some(Box::new({
+            let store = store.clone();
+            let bucket = bucket.clone();
+            let engine = engine.clone();
+            move || {
+                std::fs::write(bucket.join("2"), [7u8; 25]).unwrap();
+                store.init_for_tests().unwrap();
+                engine.pinned_files.write().insert(0);
+            }
+        }));
+
+        let pass = engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass");
+        assert_eq!(pass.reclaimed, 0, "{pass:?}");
+        assert_eq!(
+            *counters.dropped_ranges.lock().unwrap(),
+            vec![(1..4, crate::backend::AfterRelease::LeaveDropped)],
+            "the want-set's one ask, and nothing after the pin"
+        );
+        assert!(
+            bucket.join("2").is_file(),
+            "the piece of the file the user has just asked to keep is still here"
+        );
+        assert_eq!(
+            enginefs
+                .store_registry()
+                .held(TEST_HASH)
+                .expect("registered")
+                .in_range(0..4),
+            std::collections::BTreeSet::from([0, 2]),
+            "and the set says so"
+        );
+        assert!(
+            counters.claim_released_on.lock().unwrap().is_some(),
+            "the backend's claim was released, not leaked"
+        );
+
+        // The pin's pass wants every piece of the file: the one the backend
+        // forgot under the pin is fetched again over the bytes it kept.
+        engine.retain(enginefs.store_registry()).await;
+        assert_eq!(counters.reselected.lock().unwrap().last(), Some(&(0..4)));
+    }
+
+    /// **And a seek onto the piece that arrived keeps it too.** The door's
+    /// window is drawn round where playback is *now*, not where the pass
+    /// decided: a reader that has moved onto a piece the backend was asked
+    /// to forget is about to read it, and the pass leaves it on the disk as
+    /// the reclaim would have left a run the window moved into.
+    #[tokio::test]
+    async fn a_seek_onto_the_piece_that_arrived_under_the_want_step_keeps_it() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
+        let store = Arc::new(seeded_store(&enginefs, &engine));
+        engine.note_playhead(0, 0);
+        engine.begin_retention(0).await;
+        // Piece 2 completes and the reader seeks onto it while the backend
+        // is forgetting 1..4.
+        *counters.on_first_drop.lock().unwrap() = Some(Box::new({
+            let store = store.clone();
+            let bucket = bucket.clone();
+            let engine = engine.clone();
+            move || {
+                std::fs::write(bucket.join("2"), [7u8; 25]).unwrap();
+                store.init_for_tests().unwrap();
+                engine.note_playhead(0, 50);
+            }
+        }));
+
+        engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass");
+        assert!(
+            bucket.join("2").is_file(),
+            "the piece under the reader's new position is not taken from under it"
+        );
+        assert_eq!(
+            enginefs
+                .store_registry()
+                .held(TEST_HASH)
+                .expect("registered")
+                .in_range(0..4),
+            std::collections::BTreeSet::from([0, 2])
         );
     }
 
@@ -11099,6 +11274,145 @@ mod tests {
         assert_eq!(*counters.reselected.lock().unwrap(), vec![0..1]);
     }
 
+    /// **The want-set is trimmed on a paused torrent, and left alone on one
+    /// still checking.** A paused torrent keeps its chunk tracker, and the
+    /// window it is left wanting is what a restart fetches first; a torrent
+    /// under its initial check has nothing settled to edit, and the pass on
+    /// it concludes nothing at all.
+    #[tokio::test]
+    async fn the_want_set_is_trimmed_on_a_paused_torrent_and_left_alone_on_one_still_checking() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
+        let _store = seeded_store(&enginefs, &engine);
+        engine.note_playhead(0, 0);
+        engine.begin_retention(0).await;
+        counters.paused.store(true, Ordering::SeqCst);
+        engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass runs on a paused torrent");
+        assert_eq!(*counters.reselected.lock().unwrap(), vec![0..1]);
+        assert_eq!(
+            *counters.dropped_ranges.lock().unwrap(),
+            vec![(1..4, crate::backend::AfterRelease::LeaveDropped)]
+        );
+
+        let (enginefs, counters, init) = test_enginefs_with_init(
+            vec![("film.mkv".into(), 100)],
+            FakeInit::new(false, Duration::from_secs(60)),
+        );
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
+        let _store = seeded_store(&enginefs, &engine);
+        engine.note_playhead(0, 0);
+        engine.begin_retention(0).await;
+        assert!(
+            engine.retain(enginefs.store_registry()).await.is_none(),
+            "a torrent under its check has no pass"
+        );
+        assert!(
+            counters.reselected.lock().unwrap().is_empty()
+                && counters.dropped_ranges.lock().unwrap().is_empty(),
+            "and nothing was asked of its want-set"
+        );
+        init.mark_ready();
+        engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass, once the check is over");
+        assert_eq!(*counters.reselected.lock().unwrap(), vec![0..1]);
+    }
+
+    /// **A file left unbounded is wanted whole; a sibling an install retires
+    /// is not.** The policy's passes stopped wanting the file beyond the
+    /// window, and only an entity that ends with no policy at all wants the
+    /// rest again: the budget gone, or a pin. The file a reader has just
+    /// left is neither -- retiring it gives its range back to the swarm and
+    /// leaves its want-set as the passes left it, or the second episode
+    /// would have the first downloading whole behind it, a file nobody is
+    /// reading filling the disk at the swarm's pace for the cleaner to walk.
+    #[tokio::test]
+    async fn a_file_left_unbounded_is_wanted_whole_and_a_retired_sibling_is_not() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![
+            ("Show.S01E01.mkv".into(), 100),
+            ("Show.S01E02.mkv".into(), 100),
+        ]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        // Half of either file: a one-piece window and one committed.
+        enginefs.set_cache_budget(Some(50));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
+        let _store = seeded_store(&enginefs, &engine);
+        engine.note_playhead(0, 0);
+        engine.begin_retention(0).await;
+        engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass");
+        assert_eq!(*counters.reselected.lock().unwrap(), vec![0..1]);
+        assert_eq!(
+            *counters.dropped_ranges.lock().unwrap(),
+            vec![(1..4, crate::backend::AfterRelease::LeaveDropped)]
+        );
+
+        // The reader moves on to episode two: the first is retired -- its
+        // range given back -- and not wanted again.
+        engine.begin_retention(1).await;
+        assert_eq!(
+            *counters.advertised.lock().unwrap(),
+            vec![(0..4, false), (0..4, true), (4..8, false)],
+            "episode one is retired and episode two held back"
+        );
+        assert_eq!(
+            *counters.reselected.lock().unwrap(),
+            vec![0..1],
+            "the file the reader left is not wanted whole"
+        );
+
+        // The budget goes: the next install on episode two ends with
+        // nothing installed, and the file is wanted whole.
+        enginefs.set_cache_budget(None);
+        engine.begin_retention(1).await;
+        assert_eq!(
+            counters.advertised.lock().unwrap().last(),
+            Some(&(4..8, true))
+        );
+        assert_eq!(*counters.reselected.lock().unwrap(), vec![0..1, 4..8]);
+
+        // A pin on a bounded file: its install clears the policy and wants
+        // the file whole.
+        enginefs.set_cache_budget(Some(50));
+        engine.begin_retention(0).await;
+        assert_eq!(*counters.reselected.lock().unwrap(), vec![0..1, 4..8]);
+        engine.pinned_files.write().insert(0);
+        engine.begin_retention(0).await;
+        assert_eq!(
+            *counters.reselected.lock().unwrap(),
+            vec![0..1, 4..8, 0..4],
+            "the pinned file is wanted whole"
+        );
+    }
+
     /// **A pass measures against where playback is now, not where it was
     /// when the pass began.**
     ///
@@ -11386,11 +11700,12 @@ mod tests {
         assert_eq!(
             *counters.dropped_ranges.lock().unwrap(),
             vec![(1..4, crate::backend::AfterRelease::LeaveDropped)],
-            "and the backend was never asked to forget them either: the one \
-             ask is the first pass's, which stopped wanting the three pieces \
-             it did not have; a piece dropped after the pin would be left \
-             neither held nor wanted, and nothing on the pin path recomputes \
-             a selection that did not change"
+            "and the pass the pin landed in asked the backend to forget \
+             nothing: the one ask is the first pass's, which stopped wanting \
+             the three pieces it did not have. A pin on a single-file torrent \
+             changes no selection of librqbit's own, so a piece dropped under \
+             it would have stayed unwanted until the pass below wants the \
+             file whole"
         );
         // The pass that runs under the pin clears the policy, and with it
         // wants the whole file again: what the first pass stopped wanting is

@@ -2271,7 +2271,8 @@ impl TorrentHandle for LibrqbitHandle {
             .unwrap_or(0);
 
         let has_metadata = self.handle.metadata.load().is_some();
-        let phase = startup_phase(has_metadata, &stats.state, stats.finished);
+        let wanted = self.wanted_on_disk(&stats);
+        let phase = startup_phase(has_metadata, &stats.state, wanted.whole);
         // Hash-check progress straight from the Initializing state (the same
         // counter librqbit mirrors into `progress_bytes` while initializing).
         let checked_bytes = match phase {
@@ -2480,8 +2481,8 @@ impl TorrentHandle for LibrqbitHandle {
             peer_search_running: true,
             stream_len: total_size,
             stream_name: "".to_string(),
-            stream_progress: if stats.total_bytes > 0 {
-                stats.progress_bytes as f64 / stats.total_bytes as f64
+            stream_progress: if wanted.total > 0 {
+                wanted.have as f64 / wanted.total as f64
             } else {
                 0.0
             },
@@ -2501,7 +2502,7 @@ impl TorrentHandle for LibrqbitHandle {
             swarm_seeders: swarm.seeders,
             swarm_leechers: swarm.leechers,
             swarm_scrape_age_secs: swarm.age_secs,
-            is_finished: stats.finished,
+            is_finished: wanted.whole,
             has_metadata,
             phase,
             checked_bytes,
@@ -2514,10 +2515,12 @@ impl TorrentHandle for LibrqbitHandle {
         }
     }
 
-    /// Cheap: librqbit's TorrentStats.finished is precomputed from the chunk
-    /// tracker's have/needed counters (no per-piece walk here).
+    /// Every file the torrent wants is whole on the disk
+    /// ([`Self::wanted_on_disk`]). One stats snapshot and a walk of the file
+    /// table, no per-piece work: the per-file have-bytes come precomputed
+    /// from the chunk tracker.
     async fn is_finished(&self) -> bool {
-        self.handle.stats().finished
+        self.wanted_on_disk(&self.handle.stats()).whole
     }
 
     /// One `ArcSwap` load of the slot librqbit fills when a torrent's info
@@ -3121,14 +3124,15 @@ impl TorrentHandle for LibrqbitHandle {
 
 /// Map librqbit's torrent state onto the client-facing startup phase.
 /// `Initializing` is the on-disk hash check; `Live`/`Paused` both have a piece
-/// map and are `Ready` only when the whole torrent is finished -- otherwise
+/// map and are `Ready` only when every wanted file is whole on the disk
+/// (`whole`, from [`LibrqbitHandle::wanted_on_disk`]) -- otherwise
 /// `Buffering` until [`EngineStats::focus_stream_file`] judges the stream
 /// file's initial window. Missing metadata wins over everything (a resolving
 /// magnet has no pieces to check or buffer).
 fn startup_phase(
     has_metadata: bool,
     state: &librqbit::TorrentStatsState,
-    finished: bool,
+    whole: bool,
 ) -> StartupPhase {
     use librqbit::TorrentStatsState as S;
     if !has_metadata {
@@ -3136,16 +3140,79 @@ fn startup_phase(
     }
     match state {
         S::Initializing { .. } => StartupPhase::Checking,
-        S::Live | S::Paused if finished => StartupPhase::Ready,
+        S::Live | S::Paused if whole => StartupPhase::Ready,
         S::Live | S::Paused => StartupPhase::Buffering,
         S::Error => StartupPhase::Error,
     }
+}
+
+/// What the torrent has of the files it wants, in bytes, read off the disk's
+/// record and not librqbit's: see [`LibrqbitHandle::wanted_on_disk`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WantedOnDisk {
+    /// Verified bytes of the selected files that are on the disk now.
+    have: u64,
+    /// The selected files' lengths, summed.
+    total: u64,
+    /// Every selected file is whole on the disk. `false` without a piece
+    /// map (a torrent still checking, or in error), whatever the sums say.
+    whole: bool,
 }
 
 impl LibrqbitHandle {
     /// File count from resolved metadata; None while a magnet is resolving.
     fn file_count_from_metadata(&self) -> Option<usize> {
         self.handle.metadata.load_full().map(|m| m.file_infos.len())
+    }
+
+    /// How much of what this torrent wants is on the disk, and whether all
+    /// of it is: the selected files' lengths against the chunk tracker's
+    /// per-file have-bytes, which a drop keeps honest.
+    ///
+    /// **Not librqbit's `finished`.** That is `needed_bytes == 0`, and the
+    /// retention pass makes it true of a torrent with only its window on the
+    /// disk: it stops wanting every piece of the file outside the window
+    /// through `drop_pieces`, and a piece we do not have and stop wanting is
+    /// one librqbit no longer needs. Read as "the torrent is complete", that
+    /// exempted such a torrent from the free-space stop as one that writes
+    /// nothing, let a seek outside the window past the disk-space gate onto a
+    /// full volume, and showed a client 100% of a file it had a sixteenth of
+    /// -- and it flapped: the head advancing re-wants a piece, `finished`
+    /// drops, the torrent is stopped for space, and its passes keep the piece
+    /// wanted. `have == total` is the question every one of those readers
+    /// asks, and it moves only when bytes do: down when a reclaim takes a
+    /// piece, which is right, because a seek back into that range writes.
+    fn wanted_on_disk(&self, stats: &librqbit::TorrentStats) -> WantedOnDisk {
+        use librqbit::TorrentStatsState as S;
+        let Some(metadata) = self.handle.metadata.load_full() else {
+            return WantedOnDisk {
+                have: 0,
+                total: 0,
+                whole: false,
+            };
+        };
+        // `None` is librqbit for "every file".
+        let selected = self.handle.only_files();
+        let (mut have, mut total) = (0u64, 0u64);
+        for (idx, file) in metadata.file_infos.iter().enumerate() {
+            if selected.as_ref().is_some_and(|files| !files.contains(&idx)) {
+                continue;
+            }
+            total += file.len;
+            // Empty until the chunk tracker exists (Paused/Live); the
+            // last piece's rounding can put the count over the length.
+            have += stats
+                .file_progress
+                .get(idx)
+                .copied()
+                .unwrap_or(0)
+                .min(file.len);
+        }
+        WantedOnDisk {
+            have,
+            total,
+            whole: matches!(stats.state, S::Live | S::Paused) && have == total,
+        }
     }
 
     /// What a client may be told about librqbit's `TorrentStats.error`:
@@ -6087,6 +6154,41 @@ mod tests {
         assert_eq!(stats.files[0].initial_window_ready_bytes, Some(16 * 1024));
     }
 
+    /// And the other half of that measure: a reader opened to fetch further
+    /// ahead than the startup window -- every request after the first
+    /// carries a 128 MiB cap -- is still judged over the 4 MiB startup
+    /// window, which is what every buffer profile is shown. Five megabytes
+    /// of file, so the two can be told apart.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn startup_readiness_is_capped_at_the_startup_window_however_far_the_reader_fetches() {
+        use crate::backend::TorrentHandle;
+        use crate::backend::priorities::{BufferProfile, PlaybackIntent};
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let payload = dir.join("payload.bin");
+        write_payload(&payload, 5 * 1024 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+        let (_backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
+        handle.handle.wait_until_initialized().await.unwrap();
+
+        let startup = crate::backend::priorities::librqbit_stream_lookahead_bytes(
+            PlaybackIntent::DirectInitial,
+            BufferProfile::Normal,
+        );
+        let seek = crate::backend::priorities::librqbit_stream_lookahead_bytes(
+            PlaybackIntent::DirectSeek,
+            BufferProfile::Normal,
+        );
+        assert!(startup < 5 * 1024 * 1024 && seek > 5 * 1024 * 1024);
+        let _reader = handle.get_file_reader(0, 0, 100, None, seek).await.unwrap();
+        let stats = TorrentHandle::stats(&handle).await;
+        assert_eq!(
+            stats.files[0].initial_window_bytes,
+            Some(startup),
+            "the startup window, not the seek's lookahead"
+        );
+    }
+
     /// The yank probe's temporary stream is bounded the same way: the number
     /// it is handed is the one its stream is opened with, so the pieces the
     /// probe pulls in are the ones the read after it will want.
@@ -6918,6 +7020,99 @@ mod tests {
             "and wanted means missing: the torrent has something to fetch"
         );
         assert_eq!(handle.reselect_pieces(0..3).await.unwrap(), 0);
+    }
+
+    /// **A torrent that wants nothing more is not finished until its files
+    /// are whole on the disk.**
+    ///
+    /// librqbit's `finished` is `needed_bytes == 0`, and the retention pass
+    /// makes that true of a torrent holding only its window: the pieces it
+    /// stops wanting through `drop_pieces` are pieces librqbit no longer
+    /// needs. Every reader of `is_finished` in this crate asks "is the
+    /// torrent complete" -- the reconciler exempts a finished torrent from
+    /// the free-space stop, the stream route lets one past the disk-space
+    /// gate, the client is shown `ready` and 100% -- so the answer is
+    /// measured on the disk: the selected files' lengths against their
+    /// have-bytes. Both directions: pieces never had and no longer wanted
+    /// leave librqbit finished and this torrent not; pieces had and then
+    /// reclaimed leave librqbit finished and this torrent not, because a
+    /// seek back into them fetches and writes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_torrent_wanting_nothing_more_is_not_finished_until_its_files_are_whole() {
+        use crate::backend::{AfterRelease, StartupPhase, TorrentHandle};
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        tokio::fs::create_dir_all(&src).await.unwrap();
+        let payload = src.join("payload.bin");
+        write_payload(&payload, 64 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+
+        // Nothing on the disk, no peers: four pieces wanted and none had.
+        let (_backend, handle) =
+            reclaiming_backend_with_torrent(&tmp.path().join("dl"), &torrent_bytes).await;
+        handle.handle.wait_until_initialized().await.unwrap();
+        assert!(!handle.handle.stats().finished);
+        assert!(!TorrentHandle::is_finished(&handle).await);
+
+        // The pass stops wanting every piece: librqbit needs nothing more.
+        let claim = handle
+            .drop_pieces(0..4, AfterRelease::LeaveDropped)
+            .await
+            .expect("a live torrent added here can drop")
+            .expect("librqbit keeps a have-set");
+        assert_eq!(claim.pieces(), &[0, 1, 2, 3]);
+        drop(claim);
+        let theirs = handle.handle.stats();
+        assert!(
+            theirs.finished && theirs.progress_bytes == theirs.total_bytes,
+            "librqbit calls a torrent that wants nothing finished: {theirs}"
+        );
+        assert!(
+            !TorrentHandle::is_finished(&handle).await,
+            "and it is not: not a byte of the file is on the disk"
+        );
+        let ours = TorrentHandle::stats(&handle).await;
+        assert!(!ours.is_finished);
+        assert_eq!(ours.phase, StartupPhase::Buffering);
+        assert_eq!(ours.stream_progress, 0.0, "{ours:?}");
+
+        // The other direction: a seeded torrent whose pass reclaimed two of
+        // its six pieces. librqbit keeps it finished -- a had piece was not
+        // needed and still is not -- and it is not: a seek into those two
+        // pieces downloads and writes them again.
+        let dir = tmp.path().join("seeded");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let payload = dir.join("payload.bin");
+        write_payload(&payload, 96 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+        let (_backend, handle) = reclaiming_backend_with_torrent(&dir, &torrent_bytes).await;
+        handle.handle.wait_until_initialized().await.unwrap();
+        assert!(TorrentHandle::is_finished(&handle).await, "seeded");
+        assert_eq!(
+            TorrentHandle::stats(&handle).await.phase,
+            StartupPhase::Ready
+        );
+        let claim = handle
+            .drop_pieces(0..2, AfterRelease::LeaveDropped)
+            .await
+            .expect("a live torrent added here can drop")
+            .expect("librqbit keeps a have-set");
+        assert_eq!(claim.pieces(), &[0, 1]);
+        drop(claim);
+        assert!(
+            handle.handle.stats().finished,
+            "librqbit: {}",
+            handle.handle.stats()
+        );
+        assert!(!TorrentHandle::is_finished(&handle).await);
+        let ours = TorrentHandle::stats(&handle).await;
+        assert!(!ours.is_finished);
+        assert_eq!(ours.phase, StartupPhase::Buffering);
+        assert!(
+            (ours.stream_progress - 4.0 / 6.0).abs() < f64::EPSILON,
+            "four of six pieces: {}",
+            ours.stream_progress
+        );
     }
 
     /// Forgetting a file's pieces against the real backend: the have-set

@@ -485,13 +485,13 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
     /// The windows are re-selected first: a piece the window has moved onto
     /// may be one an earlier pass dropped, and a dropped piece is neither
     /// had nor wanted until something wants it again. Then every piece of
-    /// the file in no window, not committed and not on the disk is dropped
-    /// and left dropped ([`crate::backend::AfterRelease::LeaveDropped`]): not
-    /// had, and now not wanted. What is on the disk and outside the windows
-    /// is the reclaim's ([`Self::reclaim`]), which drops it the same way
-    /// before it unlinks. A boundary piece a still-wanted neighbour owns
-    /// bytes in is left wanted, as the reclaim leaves it held: dropping it
-    /// would leave the neighbour a piece short.
+    /// the file in no window and not on the disk is dropped and left dropped
+    /// ([`crate::backend::AfterRelease::LeaveDropped`]): not had, and now not
+    /// wanted. What is on the disk and outside the windows is the reclaim's
+    /// ([`Self::reclaim`]), which drops it the same way before it unlinks. A
+    /// boundary piece a still-wanted neighbour owns bytes in is left wanted,
+    /// as the reclaim leaves it held: dropping it would leave the neighbour a
+    /// piece short.
     ///
     /// The stream's own lookahead is bounded to the same window at open
     /// ([`Engine::fetch_bound`]), so nothing dropped here is a piece a live
@@ -512,13 +512,22 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
     /// set *now*, and whatever is on the disk goes under the claim, as a
     /// reclaim's pieces do. The set is read after the drop: a piece the
     /// store has is one librqbit had, never the reverse.
+    ///
+    /// **And that unlink asks the door first**, as the reclaim asks it
+    /// before every part of every run: the pass read "not pinned" at its
+    /// first step, and a pin lands in the gap as easily as a piece does. A
+    /// door that answers "take nothing" -- pinned now, or the head has left
+    /// the file -- releases the claim with the piece on the disk; librqbit
+    /// has forgotten the piece, and the pin's next pass wants the whole file
+    /// again and downloads it back over the same bytes. One piece fetched
+    /// twice, against a piece of a pinned file deleted.
     async fn want(
         &self,
         store: &Arc<StoreRegistry>,
         domain: &FileDomain,
         windows: &[Range<u32>],
-        committed: &BTreeSet<u32>,
         held: &BTreeSet<u32>,
+        door: &Door<Self>,
     ) {
         let run_state = self.handle.run_state();
         if !matches!(
@@ -535,9 +544,7 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         self.reselect(windows).await;
         let unwanted: Vec<u32> = Self::extent(domain)
             .filter(|piece| {
-                !windows.iter().any(|window| window.contains(piece))
-                    && !committed.contains(piece)
-                    && !held.contains(piece)
+                !windows.iter().any(|window| window.contains(piece)) && !held.contains(piece)
             })
             .collect();
         let alone = self.alone(domain, &unwanted).await;
@@ -548,20 +555,23 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
                 .await
             {
                 Ok(Some(claim)) => {
-                    let arrived: Vec<u32> = match store.held(&self.info_hash) {
-                        Some(now) => {
+                    let arrived: Vec<u32> = match (store.held(&self.info_hash), door.window_now()) {
+                        (Some(now), Some(window)) => {
                             let now = now.in_range(run.clone());
                             claim
                                 .pieces()
                                 .iter()
                                 .copied()
-                                .filter(|piece| now.contains(piece))
+                                .filter(|piece| now.contains(piece) && !window.contains(piece))
                                 .collect()
                         }
-                        None => Vec::new(),
+                        // No store to read, or a door that says take
+                        // nothing: whatever arrived stays.
+                        _ => Vec::new(),
                     };
                     if arrived.is_empty() {
-                        // Nothing of these is on the disk: released at once.
+                        // Nothing of these is ours to take off the disk:
+                        // released at once.
                         drop(claim);
                     } else {
                         tracing::debug!(

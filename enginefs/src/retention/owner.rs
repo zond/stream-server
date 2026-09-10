@@ -126,7 +126,8 @@
 //! 6. Advertise committed runs, withdraw lost runs, no L2 held (both lists
 //!    empty by construction under [`Share::Nothing`]); then
 //!    [`Backing::want`], which trims what the backend fetches to the windows
-//!    and the committed set.
+//!    and what is on the disk, asking the same [`Door`] the reclaim asks
+//!    before it unlinks anything that arrived under the pass.
 //! 7. Test hook.
 //! 8. [`Backing::reclaim`] with a [`Door`] that answers both
 //!    [`Door::window_now`] and [`Door::refuses`] from one reading of L2.
@@ -179,12 +180,17 @@
 //!   `retire_siblings` runs for every [`Install`] mode: an `install` on a
 //!   proxy-shaped owner would clear every other entity. Nothing calls it
 //!   there.
-//! * A clear wants the whole extent again ([`Backing::want_all`]), which
-//!   the design's step 3 does not say. Its passes trim the backend's
-//!   want-set to the window ([`Backing::want`] at step 6), and a dropped
-//!   piece stays dropped until something wants it; a pin on a single-file
-//!   torrent changes no selection, so without this the download the user
-//!   asked to keep would stop at the window's edge.
+//! * An entity left unbounded wants its whole extent again
+//!   ([`Backing::want_all`]), which the design's step 3 does not say. Its
+//!   passes trim the backend's want-set to the window ([`Backing::want`] at
+//!   step 6), and a dropped piece stays dropped until something wants it; a
+//!   pin on a single-file torrent changes no selection, so without this the
+//!   download the user asked to keep would stop at the window's edge. It is
+//!   asked by the pass under a pin and by an install that ends with nothing
+//!   installed -- not by every clear: an install that replaces one policy
+//!   with another has a window to trim to at its next pass, and a sibling
+//!   `retire_siblings` clears is the file the reader left, whose pieces
+//!   nothing here should fetch whole.
 //! * There is a fourth lock, I. The design has `retire_siblings` alone
 //!   spell "one active file per torrent", and it cannot: it retires the
 //!   siblings it can see, and an install that has resolved its key and is
@@ -338,7 +344,9 @@ pub trait Backing: Sized + Send + Sync + 'static {
     -> impl Future<Output = Vec<u32>> + Send;
     /// Trim what the backend fetches to what the pass decided to keep: want
     /// every piece of `windows` again, and stop wanting every piece of the
-    /// entity that is in no window, not `committed` and not `held`.
+    /// entity that is in no window and not `held`. The committed set needs
+    /// no clause of its own: [`RetentionPolicy::advance`] keeps it inside
+    /// the held set it was handed, and `held` is that reading.
     ///
     /// The torrent: librqbit's picker fetches every selected piece of a file
     /// it is not told otherwise about, so without this the swarm fills the
@@ -349,27 +357,29 @@ pub trait Backing: Sized + Send + Sync + 'static {
     /// outside the window are the reclaim's (step 8) and are not touched
     /// here. `held` is the pass's reading, and a piece that arrived since is
     /// the backing's to notice: what it stops wanting it must not leave on
-    /// the disk, which is what `store` is for. The proxy: a proxied body is
-    /// fetched by its own response, and there is no picker to trim, so the
-    /// default does nothing. Called at pass step 6 with the turn held and no
-    /// owner lock.
+    /// the disk, which is what `store` is for -- and an unlink there is an
+    /// unlink, asked of `door` at its instant like every other one this
+    /// owner makes. The proxy: a proxied body is fetched by its own response,
+    /// and there is no picker to trim, so the default does nothing. Called
+    /// at pass step 6 with the turn held and no owner lock.
     fn want(
         &self,
         _store: &Self::Store,
         _domain: &Self::Domain,
         _windows: &[Range<u32>],
-        _committed: &BTreeSet<u32>,
         _held: &BTreeSet<u32>,
+        _door: &Door<Self>,
     ) -> impl Future<Output = ()> + Send {
         async {}
     }
     /// Want every piece of the entity again: nothing bounds it now. The
-    /// counterpart of [`Self::want`] for a clear, which has no store in hand
-    /// and nothing to drop -- a policy's passes stopped wanting pieces
-    /// outside its window, and a policy that goes takes that with it as it
-    /// takes its hold-back: a pin wants the whole file, a budget that covers
-    /// the file wants all of it. Default: nothing, for the same reason as
-    /// [`Self::want`]'s. Called with the turn held and no owner lock.
+    /// counterpart of [`Self::want`] for an entity left with no policy --
+    /// a policy's passes stopped wanting pieces outside its window, and a
+    /// pin or a budget that covers the file wants all of it. Not asked when
+    /// one policy replaces another (the next pass trims to the new window)
+    /// nor for a sibling an install retires (the file the reader left).
+    /// Default: nothing, for the same reason as [`Self::want`]'s. Called
+    /// with the turn held and no owner lock.
     fn want_all(&self, _domain: &Self::Domain) -> impl Future<Output = ()> + Send {
         async {}
     }
@@ -827,8 +837,11 @@ impl<B: Backing> Retention<B> {
         let budget = self.budget.get();
         if self.backing.keeps_everything(&key) {
             // A pin is a retention property: the user asked for those
-            // bytes, and they are shared like any other bytes we keep.
+            // bytes, and they are shared like any other bytes we keep --
+            // and fetched whole, which the policy's passes stopped asking
+            // for beyond the window.
             return if self.clear_under(&entity, &mut claim).await {
+                self.want_whole(&entity).await;
                 InstallOutcome::Unbounded
             } else {
                 InstallOutcome::OldStands
@@ -880,7 +893,12 @@ impl<B: Backing> Retention<B> {
         if !self.clear_under(&entity, &mut claim).await {
             return InstallOutcome::OldStands;
         }
+        // Nothing installed after this point leaves the entity unbounded,
+        // and an unbounded entity is fetched whole: what the old policy's
+        // passes stopped wanting is wanted again. A new policy going in
+        // wants nothing here -- its first pass trims to its own window.
         let (Some(domain), Some(policy)) = (resolved, policy) else {
+            self.want_whole(&entity).await;
             return InstallOutcome::Unbounded;
         };
         let pieces = policy.pieces();
@@ -892,6 +910,7 @@ impl<B: Backing> Retention<B> {
                 error = %format!("{error:#}"),
                 "could not hold the playback window back from what we announce; the entity is not bounded"
             );
+            self.want_whole(&entity).await;
             return InstallOutcome::Unbounded;
         }
         tracing::debug!(
@@ -964,20 +983,15 @@ impl<B: Backing> Retention<B> {
     /// next install -- retries. Under [`Share::Nothing`] nothing was held
     /// back and there is nothing to put back.
     ///
-    /// **And the whole extent is wanted again** ([`Backing::want_all`]).
-    /// The policy's passes trim the backend's want-set to the window
-    /// ([`Backing::want`]), and a piece they left unwanted stays unwanted
-    /// until something wants it: nothing on the pin path recomputes a
-    /// selection that did not change, so a pinned single-file torrent would
-    /// download to the window's edge and stop there, short of the file the
-    /// user asked to keep. What the policy held back it gives back here, and
-    /// what it stopped wanting it wants again -- the two halves of "nothing
-    /// bounds this entity now".
+    /// What the policy stopped wanting is not wanted again here: that is
+    /// [`Self::want_whole`], asked by the callers that leave the entity with
+    /// nothing installed, and not by the ones that replace the policy or
+    /// retire a sibling.
     async fn clear_under(&self, entity: &Entity<B>, claim: &mut Claim) -> bool {
-        let (domain, extent) = {
+        let extent = {
             let state = entity.state.lock();
             match state.installed.as_ref() {
-                Some(installed) => (state.domain.clone(), installed.policy.pieces()),
+                Some(installed) => installed.policy.pieces(),
                 None => return true,
             }
         };
@@ -992,8 +1006,20 @@ impl<B: Backing> Retention<B> {
             return false;
         }
         entity.state.lock().forget_policy(&mut claim.guard);
-        self.backing.want_all(&domain).await;
         true
+    }
+
+    /// Nothing bounds `entity` now: every piece of it wanted again
+    /// ([`Backing::want_all`]). The policy's passes trimmed the backend's
+    /// want-set to the window ([`Backing::want`]), and a piece they left
+    /// unwanted stays unwanted until something wants it: nothing on the pin
+    /// path recomputes a selection that did not change, so a pinned
+    /// single-file torrent would download to the window's edge and stop
+    /// there, short of the file the user asked to keep. Under the turn, after
+    /// a [`Self::clear_under`] that succeeded.
+    async fn want_whole(&self, entity: &Entity<B>) {
+        let domain = entity.state.lock().domain.clone();
+        self.backing.want_all(&domain).await;
     }
 
     /// The entity's turn, awaited: the torrent's tick and the cleaner's
@@ -1059,7 +1085,9 @@ impl<B: Backing> Retention<B> {
         // also holds its range back, the file the user asked to keep is
         // announced to nobody while librqbit re-fetches it in a loop.
         if self.backing.keeps_everything(key) {
-            self.clear_under(&entity, &mut claim).await;
+            if self.clear_under(&entity, &mut claim).await {
+                self.want_whole(&entity).await;
+            }
             let state = entity.state.lock();
             return Self::nothing(&state, claim, about, None);
         }
@@ -1188,35 +1216,30 @@ impl<B: Backing> Retention<B> {
                 }
             }
         }
-        // And the want-set, trimmed to what this pass keeps: the windows
-        // wanted, everything of the entity outside them that is neither
-        // committed nor on the disk not wanted. What is on the disk and
-        // outside them is the reclaim's, below.
-        self.backing
-            .want(
-                store,
-                &begin.domain,
-                &windows,
-                door_policy.advertised(),
-                &held,
-            )
-            .await;
-        // 7. And what playback does while the unlinks run.
-        self.run_hook();
-        // 8. The reclaim, asking the door at every unlink. What the door
-        // answers is not for the owner to know about a piece becoming
-        // announced under the pass: every advertise is made under this
-        // entity's turn, which the pass holds throughout.
-        let alone = self.backing.alone(&begin.domain, &decision.reclaim).await;
+        // The door every unlink of this pass asks, the want-set's included.
+        // What the door answers is not for the owner to know about a piece
+        // becoming announced under the pass: every advertise is made under
+        // this entity's turn, which the pass holds throughout.
         let door = Door {
             state: entity.state.clone(),
             backing: self.backing.clone(),
             key: key.clone(),
             domain: begin.domain.clone(),
             policy: door_policy,
-            windows,
+            windows: windows.clone(),
             promised,
         };
+        // And the want-set, trimmed to what this pass keeps: the windows
+        // wanted, everything of the entity outside them and not on the disk
+        // not wanted. What is on the disk and outside them is the reclaim's,
+        // below.
+        self.backing
+            .want(store, &begin.domain, &windows, &held, &door)
+            .await;
+        // 7. And what playback does while the unlinks run.
+        self.run_hook();
+        // 8. The reclaim, asking the door at every unlink.
+        let alone = self.backing.alone(&begin.domain, &decision.reclaim).await;
         conclusion.reclaimed = self
             .backing
             .reclaim(store, &begin.domain, runs(&alone), door)

@@ -304,10 +304,14 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
     /// totals themselves must pass the absence on.
     fn transfer_totals(&self) -> Option<TransferTotals>;
     async fn add_trackers(&self, trackers: Vec<String>) -> Result<()>;
-    /// Cheap check for whether the torrent has finished downloading its wanted
-    /// data. Unlike `stats()`, this must not rebuild the full statistics or walk
-    /// every piece -- it is called on the hot stream-start path. Defaults to
-    /// `false` (treat as still needing the swarm) for backends that cannot tell.
+    /// Cheap check for whether every file the torrent wants is whole on the
+    /// disk -- [`EngineStats::is_finished`] without the rest of the
+    /// statistics. Unlike `stats()`, this must not rebuild the full statistics
+    /// or walk every piece -- it is called on the hot stream-start path, and
+    /// the reconciler asks it of every torrent on every tick: a torrent that
+    /// answers `true` writes nothing and is left running on a full volume,
+    /// and a stream on it skips the disk-space gate. Defaults to `false`
+    /// (treat as still needing the swarm) for backends that cannot tell.
     async fn is_finished(&self) -> bool {
         false
     }
@@ -1434,9 +1438,12 @@ pub struct EngineStats {
     /// client can say how current they are. `None` exactly when they are.
     #[serde(default)]
     pub swarm_scrape_age_secs: Option<u64>,
-    /// All wanted pieces are downloaded (libtorrent `is_finished`). A finished
-    /// torrent is only seeding and can be paused; an unfinished one still needs
-    /// the swarm to download data or fetch metadata.
+    /// Every file the torrent wants is whole on the disk (libtorrent
+    /// `is_finished`). A finished torrent is only seeding and can be paused;
+    /// an unfinished one still needs the swarm to download data or fetch
+    /// metadata. Measured on the disk, not on what the backend still means
+    /// to fetch: a torrent whose want-set the retention pass has trimmed to
+    /// its window has nothing left to fetch and is not finished.
     pub is_finished: bool,
     /// Torrent metadata is available (false for a freshly added magnet that is
     /// still resolving its info dictionary).
