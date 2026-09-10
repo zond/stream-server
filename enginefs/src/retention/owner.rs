@@ -33,7 +33,7 @@
 //! Locks, outermost first:
 //!
 //! * **L1** [`Retention::entities`] (`parking_lot::Mutex`) -- lookup, insert,
-//!   prune, iterate-for-holdings, and the position last told everywhere.
+//!   prune and iterate-for-holdings.
 //! * **L2** [`Entity::state`] (`parking_lot::Mutex`) -- every datum,
 //!   including the resident [`RetentionPolicy`].
 //! * **T** [`Entity::turn`] (`tokio::sync::Mutex<Turn>`) -- the entity's turn.
@@ -103,11 +103,10 @@
 //! `install`, holding nothing, and its holder takes T's one at a time, L2
 //! and X; no holder of a T, an L1 or an L2 waits on I. The two writers
 //! that must never wait on T -- [`Reader::note`] /
-//! [`Retention::note_position`] / [`Retention::note_position_everywhere`]
-//! on every delivered byte, and pin writes -- touch only L1 to copy out, L2
-//! and X, which is what the torrent's `advertise_gate` tests exercise: a
-//! pass parked inside `set_pieces_advertised` under T while a note and a
-//! pin land.
+//! [`Retention::note_position`] on every delivered byte, and pin writes --
+//! touch only L1 to copy out, L2 and X, which is what the torrent's
+//! `advertise_gate` tests exercise: a pass parked inside
+//! `set_pieces_advertised` under T while a note and a pin land.
 //!
 //! # The pass
 //!
@@ -312,8 +311,11 @@ pub trait Backing: Sized + Send + Sync + 'static {
     /// entity bounds nothing and holds nothing back.
     fn policy(domain: &Self::Domain, budget: u64) -> anyhow::Result<RetentionPolicy>;
     /// The index `at` lands on under `domain`, clamped to the last, or
-    /// `None` when the position is not this domain's at all -- a reader in
-    /// another file of the torrent. Pure.
+    /// `None` when the position names nothing in this domain's index space.
+    /// An entity only ever hears its own bytes -- a [`Reader`] is opened on
+    /// one entity and a [`Retention::note_position`] names one key -- so a
+    /// backing whose positions always fall in the domain answers `Some`.
+    /// Pure.
     fn index_of(domain: &Self::Domain, at: Self::Position) -> Option<u32>;
     /// The backing refuses to give anything of `key` up right now -- a pin.
     /// A copy-out read of a lock outside the owner, asked with no owner lock
@@ -407,8 +409,9 @@ pub struct Retention<B: Backing> {
     /// The cleaner's cap, the one cell both sides read. Read before L2 and
     /// never under it.
     budget: Arc<RetentionBudget>,
-    /// L1. Held for lookup, insert, prune and iterate-for-holdings only.
-    entities: parking_lot::Mutex<Entities<B>>,
+    /// L1. The entities by key. Held for lookup, insert, prune and
+    /// iterate-for-holdings only.
+    entities: parking_lot::Mutex<HashMap<B::Key, Arc<Entity<B>>>>,
     /// I. The install order: one [`Self::install`] at a time over the whole
     /// owner, taken before `retire_siblings` and held to the end. Protects
     /// no memory. `install` is the one party that touches two entities in
@@ -427,20 +430,6 @@ pub struct Retention<B: Backing> {
     /// reads it. The shipped build has neither this nor the calls to it.
     #[cfg(any(test, feature = "test-hooks"))]
     hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-}
-
-/// What L1 guards: the entities by key, and the position every one of
-/// them was last told together ([`Retention::note_position_everywhere`]) --
-/// the torrent's one playhead, kept beside the map so an entity made after
-/// the byte went out starts from it rather than from nothing. One lock for
-/// the two, because [`Retention::entity`] reads the position and inserts
-/// the entity as one act and the broadcast writes the position and copies
-/// the map out as one act: two locks, and a byte landing between the read
-/// and the insert is told to every entity but the one being made, which
-/// then starts one note stale. The proxy never writes the position.
-struct Entities<B: Backing> {
-    by_key: HashMap<B::Key, Arc<Entity<B>>>,
-    everywhere: Option<B::Position>,
 }
 
 /// One entity: its turn and its state, and nothing that reaches the map.
@@ -502,9 +491,12 @@ struct State<B: Backing> {
     windows: Vec<Range<u32>>,
     readers: HashMap<ReaderId, ReaderState<B>>,
     /// The entity's own last delivered byte: the proxy's `last_playhead`,
-    /// and the torrent's ONE playhead. What a pass measures from once the
-    /// reader that asked has ended, and what [`Door::window_now`] draws the
-    /// window round.
+    /// and a torrent file's head. Only its own bytes ever reach it -- a
+    /// [`Reader`] is on one entity, [`Retention::note_position`] names one
+    /// key -- so a file whose reader has gone on to another file keeps the
+    /// head it last had. What a pass measures from once the reader that
+    /// asked has ended, and what [`Door::window_now`] draws the window
+    /// round.
     last_position: Option<B::Position>,
     /// When a byte last reached a player, which is what [`Liveness::Grace`]
     /// is measured from once no reader is left.
@@ -663,10 +655,7 @@ impl<B: Backing> Retention<B> {
         Arc::new(Self {
             backing,
             budget,
-            entities: parking_lot::Mutex::new(Entities {
-                by_key: HashMap::new(),
-                everywhere: None,
-            }),
+            entities: parking_lot::Mutex::new(HashMap::new()),
             installing: tokio::sync::Mutex::new(()),
             next_reader: AtomicU64::new(0),
             #[cfg(any(test, feature = "test-hooks"))]
@@ -700,14 +689,11 @@ impl<B: Backing> Retention<B> {
     /// only, no I/O. An entity that exists keeps the domain it was made
     /// with: a key names one directory or one file, and a domain that has
     /// really changed is [`Retention::install`]'s to write, under the turn.
+    /// A fresh entity has no head: a byte noted before it existed was a byte
+    /// nothing was bounding, and it is not remembered for it.
     pub fn entity(&self, key: B::Key, domain: B::Domain) -> Arc<Entity<B>> {
-        let mut entities = self.entities.lock();
-        // Read under the same L1 the insert is made under, so a byte told
-        // everywhere either reaches this entity through the map or is the
-        // position it starts from: see [`Entities`].
-        let everywhere = entities.everywhere;
-        entities
-            .by_key
+        self.entities
+            .lock()
             .entry(key.clone())
             .or_insert_with(|| {
                 Arc::new(Entity {
@@ -720,7 +706,7 @@ impl<B: Backing> Retention<B> {
                         stride: 1,
                         windows: Vec::new(),
                         readers: HashMap::new(),
-                        last_position: everywhere,
+                        last_position: None,
                         last_seen: Instant::now(),
                     })),
                 })
@@ -729,7 +715,7 @@ impl<B: Backing> Retention<B> {
     }
 
     fn lookup(&self, key: &B::Key) -> Option<Arc<Entity<B>>> {
-        self.entities.lock().by_key.get(key).cloned()
+        self.entities.lock().get(key).cloned()
     }
 
     /// Open a reader on the entity. It records nothing until it promises or
@@ -743,11 +729,26 @@ impl<B: Backing> Retention<B> {
         }
     }
 
-    /// Where a reader of `key` last got to: the torrent's `note_playhead`.
-    /// L2 only, never claims the turn, never installs -- the torrent's
-    /// trigger is the tick and its install is before the reader opens. A
-    /// key with no entity is a byte nothing is bounding, and it is not
-    /// remembered.
+    /// Open a reader on the entity `key` already has, or `None` when it has
+    /// none. The torrent's opener: its install runs before the reader opens
+    /// and made the entity if the file could be bounded at all, and a file
+    /// that could not -- no metadata to name its pieces by -- has nothing a
+    /// head would be measured against, so its bytes are not remembered. L1
+    /// only, no I/O.
+    pub fn reader_on(self: &Arc<Self>, key: &B::Key) -> Option<Reader<B>> {
+        let entity = self.lookup(key)?;
+        Some(Reader {
+            owner: self.clone(),
+            entity,
+            id: ReaderId(self.next_reader.fetch_add(1, Ordering::Relaxed)),
+        })
+    }
+
+    /// Where a reader of `key` last got to, told without a [`Reader`]: the
+    /// entity's head moves and no reader's does. L2 only, never claims the
+    /// turn, never installs. A key with no entity is a byte nothing is
+    /// bounding, and it is not remembered; a byte of another key is that
+    /// key's and moves nothing here.
     pub fn note_position(&self, key: &B::Key, at: B::Position) {
         let Some(entity) = self.lookup(key) else {
             return;
@@ -755,35 +756,6 @@ impl<B: Backing> Retention<B> {
         let mut state = entity.state.lock();
         state.last_seen = Instant::now();
         state.last_position = Some(at);
-    }
-
-    /// Where the torrent's one reader last got to, told to every entity at
-    /// once, and remembered for the entities not made yet.
-    ///
-    /// A torrent has one playhead, last writer wins, and a file whose policy
-    /// stands while the reader is in another file has to learn that from a
-    /// byte that was not its own: [`Backing::index_of`] answers `None` for
-    /// it, and the pass, the [`Door`] and the panel all read that as "no
-    /// head in this domain". Told only to the key the byte was in, the file
-    /// the reader left would keep a head it no longer has, and a byte noted
-    /// before the file's entity exists -- the engine's fixtures note before
-    /// they install -- would be lost to the entity made a moment later. The
-    /// 2b spelling of the torrent not opening [`Reader`]s; step 4 gives each
-    /// file its own head and deletes this. L1 to remember the position and
-    /// copy the entities out as one act, then each L2 alone; never claims,
-    /// never installs.
-    pub fn note_position_everywhere(&self, at: B::Position) {
-        let entities: Vec<Arc<Entity<B>>> = {
-            let mut entities = self.entities.lock();
-            entities.everywhere = Some(at);
-            entities.by_key.values().cloned().collect()
-        };
-        let now = Instant::now();
-        for entity in entities {
-            let mut state = entity.state.lock();
-            state.last_seen = now;
-            state.last_position = Some(at);
-        }
     }
 
     /// Install (or keep) the policy for `key` about to be streamed, and hold
@@ -935,7 +907,6 @@ impl<B: Backing> Retention<B> {
         let siblings: Vec<Arc<Entity<B>>> = self
             .entities
             .lock()
-            .by_key
             .values()
             .filter(|entity| entity.key != *key)
             .cloned()
@@ -1331,13 +1302,12 @@ impl<B: Backing> Retention<B> {
     pub fn holdings_at(&self, now: Instant) -> Vec<(B::Key, Holding<B>)> {
         let mut entities = self.entities.lock();
         if let Liveness::Grace(grace) = B::LIVENESS {
-            entities.by_key.retain(|_, entity| {
+            entities.retain(|_, entity| {
                 Arc::strong_count(entity) > 1
                     || now.duration_since(entity.state.lock().last_seen) < grace
             });
         }
         entities
-            .by_key
             .iter()
             .map(|(key, entity)| (key.clone(), entity.state.lock().holding()))
             .collect()
@@ -1366,11 +1336,20 @@ impl<B: Backing> Retention<B> {
     /// How many open reads have promised pieces or delivered a byte and have
     /// not ended: the gate's own reason for refusing the cleaner, counted.
     pub fn readers(&self) -> usize {
-        let entities: Vec<Arc<Entity<B>>> = self.entities.lock().by_key.values().cloned().collect();
+        let entities: Vec<Arc<Entity<B>>> = self.entities.lock().values().cloned().collect();
         entities
             .iter()
             .map(|entity| entity.state.lock().readers.len())
             .sum()
+    }
+
+    /// [`Self::readers`] for one key: how many open reads of that entity
+    /// have promised or delivered and not ended. Zero for a key with no
+    /// entity. L1 to look up, then L2.
+    pub fn readers_of(&self, key: &B::Key) -> usize {
+        self.lookup(key)
+            .map(|entity| entity.state.lock().readers.len())
+            .unwrap_or(0)
     }
 }
 
@@ -1393,8 +1372,8 @@ impl<B: Backing> State<B> {
     }
 
     /// What a pass snapshots at its start, or `None` when there is nothing
-    /// to pass over: nothing installed, no head yet, or a head that is not
-    /// in this domain (the torrent's reader has moved to another file).
+    /// to pass over: nothing installed, no head yet, or a head the domain
+    /// has no index for ([`Backing::index_of`]).
     fn begin(&self, about: Option<ReaderId>) -> Option<Begin<B>> {
         let installed = self.installed.as_ref()?;
         let at = B::index_of(&self.domain, self.head(about)?)?;
@@ -1690,19 +1669,46 @@ pub struct Door<B: Backing> {
 }
 
 impl<B: Backing> Door<B> {
-    /// The torrent's shape: the window round the entity's head at this
-    /// instant, or `None` for "take nothing more" -- the entity is pinned
-    /// now, or its head is not in this domain (the reader has left the
-    /// file). Neither is a state that has a window for the pass to keep, so
-    /// the reclaim stops rather than skipping a run: a pin does not un-pin
-    /// mid-loop.
+    /// The window round the entity's head at this instant, or `None` for
+    /// "take nothing more" -- the entity is pinned now, or it has no head
+    /// the domain indexes. Neither is a state that has a window for the pass
+    /// to keep, so the reclaim stops rather than skipping a run: a pin does
+    /// not un-pin mid-loop. The first of [`Self::windows_now`].
     pub fn window_now(&self) -> Option<Range<u32>> {
+        self.windows_now().map(|mut windows| windows.swap_remove(0))
+    }
+
+    /// The torrent's shape: every window live at this instant, from one
+    /// reading of L2 -- the one round the entity's head first, then one
+    /// round each open reader's *current* playhead -- or `None` as
+    /// [`Self::window_now`] answers it. Two readers on one file (a seek is a
+    /// second response on the file still playing) each have a head, and a
+    /// run between them is cut round both: the entity's head is the last
+    /// byte either delivered, and a window round that alone would have the
+    /// pass take the piece the other reader is inside. The pass's own
+    /// windows are not here: they were drawn round heads at the re-read,
+    /// and where those heads have moved the window at the door is the
+    /// current one, as it has always been for the entity's.
+    pub fn windows_now(&self) -> Option<Vec<Range<u32>>> {
         if self.backing.keeps_everything(&self.key) {
             return None;
         }
-        let head = self.state.lock().last_position?;
+        let state = self.state.lock();
+        let head = state.last_position?;
         let index = B::index_of(&self.domain, head)?;
-        Some(self.policy.window_at(index))
+        let mut windows = vec![self.policy.window_at(index)];
+        for window in state
+            .readers
+            .values()
+            .filter_map(|reader| reader.playhead)
+            .filter_map(|position| B::index_of(&self.domain, position))
+            .map(|head| self.policy.window_at(head))
+        {
+            if !windows.contains(&window) {
+                windows.push(window);
+            }
+        }
+        Some(windows)
     }
 
     /// The proxy's shape: whether `index` may not be taken at this instant.
@@ -2542,42 +2548,60 @@ mod tests {
         assert_eq!(backing.reclaims.lock().len(), 1);
     }
 
-    /// **A head in another file, and a listing we do not have, both
-    /// conclude nothing** and leave the policy where it is.
+    /// **A byte of another key moves nothing here, and a listing we do not
+    /// have concludes nothing** and leaves the policy where it is.
+    ///
+    /// Each entity has its own head, and only its own bytes reach it. A
+    /// byte noted for file 1 -- before file 0 has a head, or while file 0's
+    /// pass is at its listing -- leaves file 0's head where it was: no head,
+    /// so no listing and nothing concluded; then the head at piece 0, so the
+    /// pass concludes on it as if nothing had happened elsewhere.
     #[tokio::test]
-    async fn a_head_in_another_file_or_a_failed_listing_concludes_nothing() {
+    async fn a_byte_of_another_key_moves_no_head_here_and_a_failed_listing_concludes_nothing() {
         let (backing, owner, _budget) = torrent();
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
-        owner.note_position(&0, (1, 0));
+        owner.note_position(&1, (1, 0));
+        assert_eq!(
+            owner.holding(&0).unwrap().last_position,
+            None,
+            "a byte of file 1 gave file 0 a head"
+        );
         let claim = owner.turn(&0).await.expect("the turn");
         assert!(owner.pass(&0, &(), claim).await.concluded.is_none());
         assert!(backing.reclaims.lock().is_empty());
         assert_eq!(
             backing.listings.load(Ordering::SeqCst),
             0,
-            "a torrent whose reader moved on paid a listing to learn it"
+            "a file with no head paid a listing to learn it"
         );
-        // The reader comes back to the file while the listing runs, having
-        // left it before: the re-read is what decides.
+        // A byte of file 1 lands while file 0's listing runs: file 0's head
+        // is still piece 0 at the re-read, and the pass concludes on it.
         owner.note_position(&0, (0, 0));
         let (entered, release) = backing.park_held();
         let claim = owner.turn(&0).await.expect("the turn");
         let pass = spawn_pass(&owner, 0, claim);
         entered.await.expect("parked at the listing");
-        owner.note_position(&0, (1, 0));
+        owner.note_position(&1, (1, 0));
         release.send(()).expect("the parked pass");
-        assert!(pass.await.expect("joined").concluded.is_none());
-        assert!(backing.reclaims.lock().is_empty());
+        let concluded = pass
+            .await
+            .expect("joined")
+            .concluded
+            .expect("a byte of another file stopped this file's pass");
+        assert_eq!(concluded.windows, vec![0..2]);
+        assert_eq!(concluded.reclaimed, 6);
+        assert_eq!(owner.holding(&0).unwrap().last_position, Some((0, 0)));
+        assert_eq!(backing.reclaims.lock().len(), 1);
         // And a listing the disk would not give: nothing concluded, nothing
         // withdrawn, the policy standing.
-        owner.note_position(&0, (0, 0));
+        backing.holds(0..16);
         backing.fail_held.store(true, Ordering::SeqCst);
         let claim = owner.turn(&0).await.expect("the turn");
         assert!(owner.pass(&0, &(), claim).await.concluded.is_none());
-        assert!(backing.reclaims.lock().is_empty());
+        assert_eq!(backing.reclaims.lock().len(), 1);
         let holding = owner.holding(&0).unwrap();
         assert!(holding.installed.is_some());
-        assert!(holding.windows.is_empty());
+        assert_eq!(holding.windows, vec![0..2], "the failed listing concluded");
         assert_eq!(*backing.advertised.lock(), vec![(0..8, false)]);
     }
 
@@ -3060,24 +3084,91 @@ mod tests {
         assert!(holding.promised.is_empty() && !holding.live_playhead);
     }
 
-    /// **A head that leaves the file between two runs stops the reclaim**:
-    /// `window_now` answers `None` for a head not in this domain, and the
-    /// second run is never asked about.
+    /// **A byte in file B between two runs of file A's reclaim leaves A's
+    /// pass concluding normally on A's own head**: the byte is B's, A's
+    /// head is where it was, `window_now` still answers A's window, and the
+    /// second run is asked about and taken.
     #[tokio::test]
-    async fn a_head_that_leaves_the_file_between_the_runs_of_a_reclaim_stops_it() {
+    async fn a_byte_in_another_file_between_the_runs_of_a_reclaim_leaves_it_running() {
         let (backing, owner, _budget) = torrent();
         *backing.held.lock() = [0, 1, 2, 6, 7].into_iter().collect();
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         owner.note_position(&0, (0, 4 * PIECE));
         *backing.between_runs.lock() = Some(Box::new({
             let owner = owner.clone();
-            move || owner.note_position(&0, (1, 0))
+            move || owner.note_position(&1, (1, 0))
         }));
         let claim = owner.turn(&0).await.expect("the turn");
         let outcome = owner.pass(&0, &(), claim).await.concluded.expect("a pass");
-        assert_eq!(*backing.asked.lock(), vec![vec![0..3]]);
-        assert_eq!(outcome.reclaimed, 3);
-        assert_eq!(backing.on_disk(), vec![6, 7]);
+        assert_eq!(*backing.asked.lock(), vec![vec![0..3, 6..8]]);
+        assert_eq!(outcome.reclaimed, 5);
+        assert!(backing.on_disk().is_empty());
+        assert_eq!(
+            owner.holding(&0).unwrap().last_position,
+            Some((0, 4 * PIECE)),
+            "a byte of file 1 moved file 0's head"
+        );
+    }
+
+    /// **Two readers on one entity each have a window at the door of the
+    /// torrent's shape.** The entity's head is the last byte either
+    /// delivered, and `windows_now` answers the window round it and the one
+    /// round every other open reader's current playhead, from one reading;
+    /// a reader that has ended is not among them, and its window goes.
+    #[tokio::test]
+    async fn the_torrents_door_answers_a_window_per_open_reader() {
+        let (backing, owner, _budget) = torrent();
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        let first = owner.reader_on(&0).expect("the entity install made");
+        let second = owner.reader_on(&0).expect("the same entity");
+        assert!(
+            owner.reader_on(&9).is_none(),
+            "a reader was opened on a key with no entity"
+        );
+        assert_eq!(
+            owner.readers_of(&0),
+            0,
+            "a reader that delivered nothing counts"
+        );
+        assert!(
+            first.note((0, 0)).is_none(),
+            "the tick is the torrent's trigger"
+        );
+        assert!(second.note((0, 6 * PIECE)).is_none());
+        assert_eq!(owner.readers_of(&0), 2);
+        assert_eq!(owner.readers_of(&1), 0);
+        let answers = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let first = parking_lot::Mutex::new(Some(first));
+        let hook: Hook<TorrentSide> = Box::new({
+            let answers = answers.clone();
+            move |door: &Door<Torrent>| {
+                let mut answers = answers.lock();
+                answers.push(door.windows_now());
+                answers.push(door.window_now().map(|window| vec![window]));
+                drop(first.lock().take());
+                answers.push(door.windows_now());
+            }
+        });
+        *backing.on_reclaim.lock() = Some(hook);
+        let claim = owner.turn(&0).await.expect("the turn");
+        let outcome = owner.pass(&0, &(), claim).await.concluded.expect("a pass");
+        assert_eq!(
+            outcome.windows,
+            vec![6..8, 0..2],
+            "one window per head at the re-read"
+        );
+        assert_eq!(
+            *answers.lock(),
+            vec![
+                Some(vec![6..8, 0..2]),
+                Some(std::iter::once(6..8).collect()),
+                Some(std::iter::once(6..8).collect()),
+            ],
+            "the entity's head first, then the other reader's; the first's gone once it ended"
+        );
+        assert_eq!(owner.readers_of(&0), 1);
+        drop(second);
+        assert_eq!(owner.readers_of(&0), 0);
     }
 
     /// **The test hook runs twice per pass, with the turn held and no owner

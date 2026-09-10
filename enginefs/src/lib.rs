@@ -10091,8 +10091,8 @@ mod tests {
         // piece 0 and has committed nothing, so pieces 3 to 5 are its to
         // give up.
         enginefs.set_cache_budget(Some(50));
-        engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
         let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
         std::fs::create_dir_all(&bucket).unwrap();
         for piece in [3u32, 4, 5] {
@@ -10208,8 +10208,8 @@ mod tests {
             .store(true, Ordering::SeqCst);
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
         enginefs.set_cache_budget(Some(50));
-        engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
         let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
         std::fs::create_dir_all(&bucket).unwrap();
         std::fs::write(bucket.join("5"), [7u8; 25]).unwrap();
@@ -10260,8 +10260,8 @@ mod tests {
         }
 
         // A reader sixty bytes into the file: piece two.
-        engine.note_playhead(0, 60);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 60);
         let _store = seeded_store(&enginefs, &engine);
 
         let numbers = enginefs
@@ -10365,8 +10365,8 @@ mod tests {
         }
 
         // A reader twenty-five bytes into the second episode: piece five.
-        engine.note_playhead(1, 25);
         engine.begin_retention(1).await;
+        engine.note_playhead(1, 25);
         let _store = seeded_store(&enginefs, &engine);
 
         let numbers = enginefs
@@ -10408,8 +10408,8 @@ mod tests {
         }
 
         let _store = seeded_store(&enginefs, &engine);
-        engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
         engine
             .retain(enginefs.store_registry())
             .await
@@ -10494,8 +10494,8 @@ mod tests {
         };
         let seeded = listings();
         assert!(seeded > 0, "the seed listed the directory");
-        engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
 
         let first = engine
             .retain(enginefs.store_registry())
@@ -10655,8 +10655,8 @@ mod tests {
         std::fs::create_dir_all(&bucket).unwrap();
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let store = seeded_store(&enginefs, &engine);
-        engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
         let selected = || -> std::collections::BTreeSet<u32> {
             let dropped = counters.dropped.lock().unwrap();
             (0..8).filter(|piece| !dropped.contains(piece)).collect()
@@ -10722,8 +10722,8 @@ mod tests {
         std::fs::create_dir_all(&bucket).unwrap();
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let store = Arc::new(seeded_store(&enginefs, &engine));
-        engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
         // Piece 2 completes while the backend is forgetting 1..4.
         *counters.on_first_drop.lock().unwrap() = Some(Box::new({
             let store = store.clone();
@@ -10787,8 +10787,8 @@ mod tests {
         std::fs::create_dir_all(&bucket).unwrap();
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let store = Arc::new(seeded_store(&enginefs, &engine));
-        engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
         // Piece 2 completes and the user pins the file while the backend is
         // forgetting 1..4.
         *counters.on_first_drop.lock().unwrap() = Some(Box::new({
@@ -10854,8 +10854,8 @@ mod tests {
         std::fs::create_dir_all(&bucket).unwrap();
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let store = Arc::new(seeded_store(&enginefs, &engine));
-        engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
         // Piece 2 completes and the reader seeks onto it while the backend
         // is forgetting 1..4.
         *counters.on_first_drop.lock().unwrap() = Some(Box::new({
@@ -10887,6 +10887,73 @@ mod tests {
         );
     }
 
+    /// **And a piece that arrives under the want step inside another
+    /// reader's window stays.** The door the want step asks is the one the
+    /// reclaim asks, and it answers a window per open reader: two players
+    /// on one file deliver in turn, so the file's head is whichever byte
+    /// went out last and the other player's window is not round it. Both
+    /// readers move inside the drop; the piece under the one whose byte was
+    /// not the last is kept because it has a head of its own, where a door
+    /// that drew one window round the file's head took it.
+    #[tokio::test]
+    async fn a_piece_that_arrives_under_the_want_step_inside_another_readers_window_stays() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
+        let store = Arc::new(seeded_store(&enginefs, &engine));
+        engine.begin_retention(0).await;
+        // Held by the test across the pass: the hook below is consumed when
+        // it has run, and a reader dropped with it is a reader gone.
+        let first = Arc::new(engine.retention.reader_on(&0).expect("the entity"));
+        let second = Arc::new(engine.retention.reader_on(&0).expect("the entity"));
+        assert!(first.note((0, 0)).is_none());
+        // Piece 2 completes while the backend is forgetting 1..4; the
+        // second player reads onto it, and then the first delivers again,
+        // so the file's head is back on piece 0.
+        *counters.on_first_drop.lock().unwrap() = Some(Box::new({
+            let store = store.clone();
+            let bucket = bucket.clone();
+            let first = first.clone();
+            let second = second.clone();
+            move || {
+                std::fs::write(bucket.join("2"), [7u8; 25]).unwrap();
+                store.init_for_tests().unwrap();
+                assert!(second.note((0, 50)).is_none());
+                assert!(first.note((0, 1)).is_none());
+            }
+        }));
+
+        engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass");
+        assert!(
+            bucket.join("2").is_file(),
+            "the piece under the second player was taken from under it"
+        );
+        assert_eq!(
+            enginefs
+                .store_registry()
+                .held(TEST_HASH)
+                .expect("registered")
+                .in_range(0..4),
+            std::collections::BTreeSet::from([0, 2])
+        );
+        assert_eq!(
+            engine.retention.holding(&0).unwrap().last_position,
+            Some((0, 1)),
+            "the file's head is the first player's last byte"
+        );
+        assert_eq!(engine.retention.readers_of(&0), 2);
+    }
+
     /// **A reclaim unlinks through the registered store, so the pieces leave
     /// the held set with their files.**
     ///
@@ -10912,8 +10979,8 @@ mod tests {
             std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
         }
         let _store = seeded_store(&enginefs, &engine);
-        engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
 
         let pass = engine
             .retain(enginefs.store_registry())
@@ -11046,8 +11113,8 @@ mod tests {
             std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
         }
         let _store = seeded_store(&enginefs, &engine);
-        engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
         counters.paused.store(true, Ordering::SeqCst);
         assert_eq!(engine.handle.run_state(), RunState::Paused);
 
@@ -11116,8 +11183,8 @@ mod tests {
         counters.pieces_per_file.store(4, Ordering::SeqCst);
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
         enginefs.set_cache_budget(Some(50));
-        engine.note_playhead(0, 25);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 25);
         assert!(
             engine.policy_reading(0).is_some(),
             "a policy stands and the reader is inside the file"
@@ -11172,8 +11239,8 @@ mod tests {
             std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
         }
         let _store = seeded_store(&enginefs, &engine);
-        engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
         let all_here = || (0..4).all(|piece| bucket.join(piece.to_string()).is_file());
 
         // The check is running again -- a restart out of error re-checks
@@ -11241,8 +11308,8 @@ mod tests {
         // for the want step to stop wanting.
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let _store = seeded_store(&enginefs, &engine);
-        engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
 
         counters.in_error_state.store(true, Ordering::SeqCst);
         engine
@@ -11292,8 +11359,8 @@ mod tests {
         std::fs::create_dir_all(&bucket).unwrap();
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let _store = seeded_store(&enginefs, &engine);
-        engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
         counters.paused.store(true, Ordering::SeqCst);
         engine
             .retain(enginefs.store_registry())
@@ -11319,8 +11386,8 @@ mod tests {
         std::fs::create_dir_all(&bucket).unwrap();
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let _store = seeded_store(&enginefs, &engine);
-        engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
         assert!(
             engine.retain(enginefs.store_registry()).await.is_none(),
             "a torrent under its check has no pass"
@@ -11363,8 +11430,8 @@ mod tests {
         std::fs::create_dir_all(&bucket).unwrap();
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let _store = seeded_store(&enginefs, &engine);
-        engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
         engine
             .retain(enginefs.store_registry())
             .await
@@ -11452,8 +11519,8 @@ mod tests {
         }
 
         let _store = seeded_store(&enginefs, &engine);
-        engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
 
         // Playback, in the gap this pass has: from inside the pass, as it
         // starts its listing. See `Engine::interleave` for why not a queued
@@ -11511,8 +11578,8 @@ mod tests {
         std::fs::create_dir_all(&bucket).unwrap();
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let store = seeded_store(&enginefs, &engine);
-        engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
         engine
             .retain(enginefs.store_registry())
             .await
@@ -11553,22 +11620,21 @@ mod tests {
         );
     }
 
-    /// **And a reader that left the file while the pass listed leaves the
-    /// policy exactly as it was.**
+    /// **And a byte in another file while the pass listed leaves this
+    /// file's pass concluding normally, on this file's own head.**
     ///
-    /// The playhead the pass re-reads after its held reading can name
-    /// another file: the reader opened the next episode of the pack while
-    /// the pass ran. A window drawn from that offset on this file's policy is a
-    /// window round the wrong piece, and everything else on the disk goes.
-    /// So the pass concludes nothing -- and puts the policy back rather than
-    /// clearing or dropping it. Cleared, it would re-announce a range the
-    /// budget still does not cover, for the rest of the session (only a
-    /// reader opening installs one); dropped, it would leave the range held
-    /// back while the cleaner's gate called the torrent announced, which is
-    /// the one combination that is never right. `begin_retention` is what
-    /// replaces a policy, and it gives the old range back when it does.
+    /// Each file has a head of its own and hears only its own bytes. A byte
+    /// of the next episode -- the viewer opened it while this file's pass
+    /// was at its held reading -- is that file's, and this file's head is
+    /// still piece 0 at the re-read: the window is drawn round it, and what
+    /// is outside the window goes. When a torrent had one head told to
+    /// every file, that byte read here as "the head has left the file" and
+    /// stopped the pass cold, for as long as the viewer stayed in the other
+    /// file: the window never moved, nothing outside it was reclaimed, and
+    /// nothing was committed for sharing.
     #[tokio::test]
-    async fn a_reader_that_left_the_file_while_the_pass_listed_stops_it_cold() {
+    async fn a_byte_in_another_file_while_the_pass_listed_leaves_it_concluding_on_this_files_head()
+    {
         let (enginefs, counters) = test_enginefs_with_file_count(2);
         counters.pieces_per_file.store(4, Ordering::SeqCst);
         counters
@@ -11584,32 +11650,40 @@ mod tests {
             std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
         }
         let _store = seeded_store(&enginefs, &engine);
-        engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
 
-        // The next episode opens while the pass lists.
+        // The next episode is read while the pass lists.
         *engine.interleave.lock() = Some(Box::new({
             let engine = engine.clone();
             move || engine.note_playhead(1, 0)
         }));
 
-        assert!(
-            engine.retain(enginefs.store_registry()).await.is_none(),
-            "a pass with no playhead in the file its policy governs has nothing to conclude"
+        let pass = engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a byte of another file stopped this file's pass");
+        assert_eq!(
+            pass.reclaimed, 3,
+            "everything outside the one-piece window round piece 0: {pass:?}"
         );
         assert!(
-            counters.dropped_ranges.lock().unwrap().is_empty(),
-            "and it asked the backend to forget nothing"
+            bucket.join("0").is_file(),
+            "the piece under this file's head"
         );
-        for piece in [0u32, 1, 2, 3] {
-            assert!(bucket.join(piece.to_string()).is_file());
+        for piece in [1u32, 2, 3] {
+            assert!(!bucket.join(piece.to_string()).exists());
         }
+        let holding = engine.retention.holding(&0).expect("file 0's entity");
+        assert_eq!(
+            holding.last_position,
+            Some((0, 0)),
+            "a byte of file 1 moved file 0's head"
+        );
+        assert_eq!(holding.windows, vec![0..1]);
         assert!(
-            matches!(
-                engine.standing().await.gate,
-                crate::retention::TorrentGate::Policy { .. }
-            ),
-            "the policy is back in its slot, untouched, for begin_retention to replace"
+            engine.retention.holding(&1).is_none(),
+            "a byte of a file nothing bounds was remembered"
         );
     }
 
@@ -11654,8 +11728,8 @@ mod tests {
         std::fs::create_dir_all(&bucket).unwrap();
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let store = seeded_store(&enginefs, &engine);
-        engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
         engine
             .retain(enginefs.store_registry())
             .await
@@ -11758,8 +11832,8 @@ mod tests {
         std::fs::create_dir_all(&bucket).unwrap();
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let store = seeded_store(&enginefs, &engine);
-        engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
         engine
             .retain(enginefs.store_registry())
             .await
@@ -11842,8 +11916,8 @@ mod tests {
         std::fs::create_dir_all(&bucket).unwrap();
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let store = seeded_store(&enginefs, &engine);
-        engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
         engine
             .retain(enginefs.store_registry())
             .await
@@ -11943,8 +12017,8 @@ mod tests {
         }
 
         let _store = seeded_store(&enginefs, &engine);
-        engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
         let pass = engine
             .retain(enginefs.store_registry())
             .await
@@ -12007,8 +12081,8 @@ mod tests {
         let (enginefs, _counters) = test_enginefs_with_file_count(1);
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
         enginefs.set_cache_budget(Some(1_000_000));
-        engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
         let numbers = enginefs
             .torrent_stream_numbers(TEST_HASH, 0)
             .await
@@ -12052,8 +12126,8 @@ mod tests {
 
         // A reader twenty-five bytes into the first episode, which is what
         // the policy is bounding.
-        engine.note_playhead(0, 25);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 25);
         let _store = seeded_store(&enginefs, &engine);
         let numbers = enginefs
             .torrent_stream_numbers(TEST_HASH, 0)
@@ -12122,8 +12196,8 @@ mod tests {
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
         enginefs.set_cache_budget(Some(50));
         let _store = seeded(&enginefs, &engine);
-        engine.note_playhead(0, 25);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 25);
         assert_eq!(
             bounded(&enginefs).await,
             (
@@ -12158,8 +12232,8 @@ mod tests {
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
         enginefs.set_cache_budget(Some(50));
         let _store = seeded(&enginefs, &engine);
-        engine.note_playhead(0, 25);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 25);
         assert!(
             bounded(&enginefs).await.0.is_some(),
             "bounded to begin with"
@@ -12193,8 +12267,8 @@ mod tests {
         }
 
         let _store = seeded_store(&enginefs, &engine);
-        engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
         engine
             .retain(enginefs.store_registry())
             .await
@@ -12266,8 +12340,8 @@ mod tests {
 
         // A reader at the top of episode two: piece four is the window, and
         // pieces five and eight are outside it.
-        engine.note_playhead(1, 0);
         engine.begin_retention(1).await;
+        engine.note_playhead(1, 0);
         let _store = seeded_store(&enginefs, &engine);
         let pass = engine
             .retain(enginefs.store_registry())
@@ -12323,8 +12397,8 @@ mod tests {
         for piece in [4u32, 5] {
             std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
         }
-        engine.note_playhead(1, 0);
         engine.begin_retention(1).await;
+        engine.note_playhead(1, 0);
         let _store = seeded_store(&enginefs, &engine);
         engine
             .retain(enginefs.store_registry())
@@ -12379,8 +12453,8 @@ mod tests {
             std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
         }
 
-        engine.note_playhead(1, 0);
         engine.begin_retention(1).await;
+        engine.note_playhead(1, 0);
         let _store = seeded_store(&enginefs, &engine);
         let pass = engine
             .retain(enginefs.store_registry())
@@ -12431,8 +12505,8 @@ mod tests {
             std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
         }
 
-        engine.note_playhead(1, 0);
         engine.begin_retention(1).await;
+        engine.note_playhead(1, 0);
         let mut gate = crate::retention::ReclaimGate::default();
         gate.insert_verdict(TEST_HASH.to_lowercase(), engine.standing().await.gate);
         assert!(
@@ -12486,8 +12560,8 @@ mod tests {
 
         // A policy over file 0 that would give piece 0 up: this is the
         // reading the cleaner takes.
-        engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
         let mut gate = crate::retention::ReclaimGate::default();
         gate.insert_verdict(TEST_HASH.to_lowercase(), engine.standing().await.gate);
         assert!(
@@ -12498,8 +12572,8 @@ mod tests {
         // Then the reader moves to the other file, which puts file 0's
         // range back into what we announce -- exactly what happens when a
         // viewer skips to the next episode while a clean pass is walking.
-        engine.note_playhead(1, 0);
         engine.begin_retention(1).await;
+        engine.note_playhead(1, 0);
 
         assert_eq!(
             enginefs.release_pieces(TEST_HASH, &[0]).await,
@@ -12534,8 +12608,8 @@ mod tests {
         // file, so the fixture needs one that does not.
         enginefs.set_cache_budget(Some(1));
 
-        engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
         assert!(
             engine.standing().await.gate.releases(0),
             "before the pin, the policy would give this piece up"
@@ -12585,8 +12659,8 @@ mod tests {
         std::fs::create_dir_all(&bucket).unwrap();
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let store = seeded_store(&enginefs, &engine);
-        engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
         engine
             .retain(enginefs.store_registry())
             .await
@@ -12659,8 +12733,8 @@ mod tests {
         counters.pieces_per_file.store(4, Ordering::SeqCst);
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
         enginefs.set_cache_budget(Some(50));
-        engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
         assert_eq!(
             *counters.advertised.lock().unwrap(),
             vec![(0..4, false)],
@@ -12745,8 +12819,8 @@ mod tests {
         std::fs::create_dir_all(&bucket).unwrap();
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let store = seeded_store(&enginefs, &engine);
-        engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
         engine
             .retain(enginefs.store_registry())
             .await
@@ -12808,6 +12882,188 @@ mod tests {
         );
     }
 
+    /// An eight-piece film of twenty-five byte pieces, all on the disk,
+    /// under a budget of two pieces (a one-piece window, one committed),
+    /// with a stream open at its start and a second at byte 150 -- a seek
+    /// -- each having delivered one byte: heads at piece 0 and piece 6, the
+    /// second's the file's last byte. The fixture of the two tests below.
+    async fn two_streams_on_one_file() -> (
+        BackendEngineFS<FakeBackend>,
+        Arc<Engine<FakeHandle>>,
+        std::path::PathBuf,
+        crate::piece_store::PieceStore,
+        crate::files::FileHandle<FakeHandle>,
+        crate::files::FileHandle<FakeHandle>,
+    ) {
+        use crate::backend::priorities::{BufferProfile, PlaybackIntent};
+        use tokio::io::AsyncReadExt;
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 200)]);
+        counters.pieces_per_file.store(8, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in 0..8u32 {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let store = seeded_store(&enginefs, &engine);
+        let mut at_start = engine
+            .try_get_file_with_intent(0, 0, 255, PlaybackIntent::DirectSeek, BufferProfile::Normal)
+            .await
+            .expect("a stream at the start");
+        let mut seek = engine
+            .try_get_file_with_intent(
+                0,
+                150,
+                255,
+                PlaybackIntent::DirectSeek,
+                BufferProfile::Normal,
+            )
+            .await
+            .expect("a stream at byte 150");
+        let mut byte = [0u8; 1];
+        at_start.read_exact(&mut byte).await.expect("a byte at 0");
+        seek.read_exact(&mut byte).await.expect("a byte at 150");
+        (enginefs, engine, bucket, store, at_start, seek)
+    }
+
+    /// **Two streams on one file at different offsets are two heads at the
+    /// door, and a reclaim between them takes neither's piece.**
+    ///
+    /// A seek is a second response on the file still playing, and each
+    /// [`crate::files::FileHandle`] is a reader of the file's entity with a
+    /// playhead of its own. The file's head is the last byte either
+    /// delivered -- the seek's, at piece 6 -- and the pass concludes a
+    /// window round it and one round the other stream's piece 0; the door
+    /// answers both at every unlink, so the run between them is cut round
+    /// both. With one head per torrent the window at the door was the
+    /// seek's alone, and the piece the first stream was inside went with
+    /// everything else outside it.
+    #[tokio::test]
+    async fn two_streams_on_one_file_each_keep_the_piece_under_their_own_head() {
+        let (enginefs, engine, bucket, _store, _at_start, _seek) = two_streams_on_one_file().await;
+        assert_eq!(engine.retention.readers_of(&0), 2);
+        let pass = engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass");
+        assert_eq!(
+            engine.retention.holding(&0).unwrap().windows,
+            vec![6..7, 0..1],
+            "a window per head, the file's own first"
+        );
+        assert_eq!(pass.reclaimed, 6, "{pass:?}");
+        assert!(
+            bucket.join("0").is_file(),
+            "the piece under the first stream's head went with the run between the heads"
+        );
+        assert!(
+            bucket.join("6").is_file(),
+            "the piece under the seek's head"
+        );
+        for piece in [1u32, 2, 3, 4, 5, 7] {
+            assert!(
+                !bucket.join(piece.to_string()).exists(),
+                "piece {piece} is outside both windows and stayed"
+            );
+        }
+    }
+
+    /// **Dropping a stream's handle ends its reader, and the next pass has
+    /// one head.** The response ended; the piece it was inside is nobody's
+    /// to keep once the other stream has delivered again, and the pass
+    /// concludes one window and reclaims it.
+    #[tokio::test]
+    async fn dropping_a_stream_ends_its_reader_and_the_next_pass_has_one_head() {
+        use tokio::io::AsyncReadExt;
+        let (enginefs, engine, bucket, _store, mut at_start, seek) =
+            two_streams_on_one_file().await;
+        engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass");
+        assert!(bucket.join("6").is_file());
+        drop(seek);
+        assert_eq!(
+            engine.retention.readers_of(&0),
+            1,
+            "the dropped stream is still a reader of the file"
+        );
+        // The stream still open delivers again: the file's head is its.
+        let mut byte = [0u8; 1];
+        at_start.read_exact(&mut byte).await.expect("a byte at 1");
+        let pass = engine
+            .retain(enginefs.store_registry())
+            .await
+            .expect("a pass");
+        assert_eq!(
+            engine.retention.holding(&0).unwrap().windows,
+            vec![0..1],
+            "one head, one window"
+        );
+        assert_eq!(pass.reclaimed, 1, "{pass:?}");
+        assert!(
+            !bucket.join("6").exists(),
+            "the piece the ended stream was inside stayed"
+        );
+        assert!(bucket.join("0").is_file());
+        drop(at_start);
+        assert_eq!(engine.retention.readers_of(&0), 0);
+    }
+
+    /// **The install comes before the stream, and the stream's reader is on
+    /// the entity the install made**: the file has a holding the moment
+    /// `get_file` returns, before any byte has gone out, and the first byte
+    /// lands on it rather than on nothing. This is the ordering that keeps
+    /// a torrent file's head from ever being a byte noted into no entity,
+    /// which is not remembered -- production order, which the fixtures
+    /// above follow.
+    #[tokio::test]
+    async fn get_file_installs_before_the_first_byte_is_noted() {
+        use crate::backend::priorities::{BufferProfile, PlaybackIntent};
+        use tokio::io::AsyncReadExt;
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 200)]);
+        counters.pieces_per_file.store(8, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        assert!(engine.retention.holding(&0).is_none());
+        let mut stream = engine
+            .try_get_file_with_intent(
+                0,
+                25,
+                255,
+                PlaybackIntent::DirectSeek,
+                BufferProfile::Normal,
+            )
+            .await
+            .expect("a stream");
+        let holding = engine
+            .retention
+            .holding(&0)
+            .expect("the file has an entity the moment the stream is handed out");
+        assert!(holding.installed.is_some(), "and a policy standing on it");
+        assert_eq!(holding.last_position, None, "no byte has gone out");
+        assert!(!holding.live_playhead);
+        assert_eq!(
+            engine.retention.readers_of(&0),
+            0,
+            "a reader that has delivered nothing"
+        );
+        let mut byte = [0u8; 1];
+        stream.read_exact(&mut byte).await.expect("a byte");
+        let holding = engine.retention.holding(&0).unwrap();
+        assert_eq!(
+            holding.last_position,
+            Some((0, 26)),
+            "the first byte landed on the entity, from the stream's own offset"
+        );
+        assert!(holding.live_playhead);
+        assert_eq!(engine.retention.readers_of(&0), 1);
+    }
+
     /// **A second reader on the same file under the same budget re-holds
     /// nothing back.**
     ///
@@ -12824,8 +13080,8 @@ mod tests {
         counters.pieces_per_file.store(4, Ordering::SeqCst);
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
         enginefs.set_cache_budget(Some(50));
-        engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
         assert_eq!(*counters.advertised.lock().unwrap(), vec![(0..4, false)]);
 
         // The viewer seeks: a second reader opens on the same file.
@@ -13007,8 +13263,8 @@ mod tests {
         std::fs::create_dir_all(&bucket).unwrap();
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let store = seeded_store(&enginefs, &engine);
-        engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
         engine
             .retain(enginefs.store_registry())
             .await
@@ -13189,8 +13445,8 @@ mod tests {
         std::fs::create_dir_all(&bucket).unwrap();
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let store = seeded_store(&enginefs, &engine);
-        engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
         engine
             .retain(enginefs.store_registry())
             .await
@@ -13386,8 +13642,8 @@ mod tests {
         std::fs::create_dir_all(&bucket).unwrap();
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let store = seeded_store(&enginefs, &engine);
-        engine.note_playhead(0, 0);
         engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
         engine
             .retain(enginefs.store_registry())
             .await

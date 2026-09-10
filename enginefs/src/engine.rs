@@ -407,8 +407,8 @@ impl<H: TorrentHandle> TorrentBacking<H> {
 
 impl<H: TorrentHandle> Backing for TorrentBacking<H> {
     type Key = usize;
-    /// Which file, and how far into it -- the reader's own coordinates, so a
-    /// head in another file is a position this domain answers `None` for.
+    /// Which file, and how far into it -- the reader's own coordinates. The
+    /// file is always the entity's own ([`Self::index_of`]).
     type Position = (usize, u64);
     type Domain = FileDomain;
     type Want = usize;
@@ -461,12 +461,24 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         )
     }
 
-    /// The torrent piece a reader at `offset` of `file` is sitting on, or
-    /// `None` for a reader in another file: this policy's window is not
-    /// drawn round a byte of somebody else's pieces.
+    /// The torrent piece a reader at `offset` of `file` is sitting on.
+    /// Always `Some`: a file's entity hears only its own bytes -- the
+    /// [`FileHandle`]'s reader is on the file it reads, and the tests'
+    /// `Engine::note_playhead` names the file the byte was in -- so `file`
+    /// is this domain's, and a position that is not would be a reader
+    /// mis-keyed, not a head that left.
+    ///
+    /// [`FileHandle`]: crate::files::FileHandle
     fn index_of(domain: &FileDomain, (file, offset): (usize, u64)) -> Option<u32> {
-        (file == domain.file_idx)
-            .then(|| crate::retention::playhead_piece(&domain.span, domain.piece_length, offset))
+        debug_assert_eq!(
+            file, domain.file_idx,
+            "a file's entity was told a byte of another file"
+        );
+        Some(crate::retention::playhead_piece(
+            &domain.span,
+            domain.piece_length,
+            offset,
+        ))
     }
 
     /// Any pin on the torrent: a pin is a retention property, the user asked
@@ -536,11 +548,12 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
     /// **And that unlink asks the door first**, as the reclaim asks it
     /// before every part of every run: the pass read "not pinned" at its
     /// first step, and a pin lands in the gap as easily as a piece does. A
-    /// door that answers "take nothing" -- pinned now, or the head has left
-    /// the file -- releases the claim with the piece on the disk; librqbit
-    /// has forgotten the piece, and the pin's next pass wants the whole file
-    /// again and downloads it back over the same bytes. One piece fetched
-    /// twice, against a piece of a pinned file deleted.
+    /// door that answers "take nothing" -- pinned now -- releases the claim
+    /// with the piece on the disk; librqbit has forgotten the piece, and the
+    /// pin's next pass wants the whole file again and downloads it back over
+    /// the same bytes. One piece fetched twice, against a piece of a pinned
+    /// file deleted. And a piece inside any open reader's window now
+    /// ([`Door::windows_now`]) stays, as the reclaim leaves it.
     async fn want(
         &self,
         store: &Arc<StoreRegistry>,
@@ -575,14 +588,18 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
                 .await
             {
                 Ok(Some(claim)) => {
-                    let arrived: Vec<u32> = match (store.held(&self.info_hash), door.window_now()) {
-                        (Some(now), Some(window)) => {
+                    let arrived: Vec<u32> = match (store.held(&self.info_hash), door.windows_now())
+                    {
+                        (Some(now), Some(windows)) => {
                             let now = now.in_range(run.clone());
                             claim
                                 .pieces()
                                 .iter()
                                 .copied()
-                                .filter(|piece| now.contains(piece) && !window.contains(piece))
+                                .filter(|piece| {
+                                    now.contains(piece)
+                                        && !windows.iter().any(|window| window.contains(piece))
+                                })
                                 .collect()
                         }
                         // No store to read, or a door that says take
@@ -633,40 +650,42 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
     /// before it.** The decision was measured before two awaited backend
     /// calls per committed and withdrawn run and a `file_wants`, and
     /// neither of the two things it measured against is behind a lock the
-    /// pass holds: `note_playhead` writes the playhead on every delivered
+    /// pass holds: the reader's note writes the playhead on every delivered
     /// byte and `pin_download` writes the pin set, and the turn stops
     /// neither. A piece becoming announced under the pass is not the door's
     /// to catch: every advertise is made under this file's turn, which the
     /// pass holds throughout.
     ///
-    /// [`Door::window_now`] answers `None` for a pin taken since the pass
-    /// began, or a reader that has left this file, and it stops the reclaim
-    /// rather than skipping a run: a pin does not un-pin mid-loop, and there
-    /// is no window for a file nobody is reading. A pinned file's pieces are
-    /// the expensive ones to get wrong -- `AfterRelease::LeaveDropped`
-    /// leaves them neither held nor wanted, and the pin's own reconcile
-    /// short-circuits an unchanged selection, so nothing re-queues them and
-    /// the download the user asked for stays short of them until a restart
-    /// hash-checks the file off the disk.
+    /// [`Door::windows_now`] answers `None` for a pin taken since the pass
+    /// began, and it stops the reclaim rather than skipping a run: a pin
+    /// does not un-pin mid-loop. A pinned file's pieces are the expensive
+    /// ones to get wrong -- `AfterRelease::LeaveDropped` leaves them neither
+    /// held nor wanted, and the pin's own reconcile short-circuits an
+    /// unchanged selection, so nothing re-queues them and the download the
+    /// user asked for stays short of them until a restart hash-checks the
+    /// file off the disk.
     ///
-    /// `Some` narrows the run by the window at the reader's *current*
-    /// position. librqbit refuses a piece its own live stream is about to
-    /// read, but that is `queue_range`, the forward lookahead alone, so it
-    /// cannot see the tenth of the window that sits behind the playhead for
-    /// a scan back, it is empty whenever no stream is open, and
+    /// `Some` narrows the run by the window at the file's head and by the
+    /// window round every open reader's *current* position -- a seek is a
+    /// second reader on the file still playing, and the piece under it is
+    /// not the pass's to take because the other reader delivered the last
+    /// byte. librqbit refuses a piece its own live stream is about to read,
+    /// but that is `queue_range`, the forward lookahead alone, so it cannot
+    /// see the tenth of the window that sits behind the playhead for a scan
+    /// back, it is empty whenever no stream is open, and
     /// `TorrentHandle::drop_pieces` promises it of no backend.
     ///
     /// Per run and not per piece: `release` is the unit that holds the
     /// claim across the unlink, and `runs` exists so that two hundred
     /// consecutive pieces are one call and not two hundred locks on the
-    /// torrent. And asked again before every *part* of a run: the window at
+    /// torrent. And asked again before every *part* of a run: a window at
     /// the door can fall inside a run and cut it in two, and the second
     /// part is then given back only after the first has been released -- a
     /// `drop_pieces` and an unlink batch later. Handing the second part to
     /// `release` on the same answer is the reading the door exists to
     /// refuse, one level down: a pin taken during the first part's unlink
     /// would have the second part's pieces dropped out of a download the
-    /// user has just asked to keep. So a run the window has narrowed or
+    /// user has just asked to keep. So a run the windows have narrowed or
     /// split goes back on the list in its parts, and each part is asked
     /// about in its own turn; only a run the door lets through whole is
     /// released.
@@ -690,7 +709,7 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         let mut reclaimed = 0;
         let mut pending: VecDeque<Range<u32>> = runs.into();
         while let Some(run) = pending.pop_front() {
-            let Some(window) = door.window_now() else {
+            let Some(windows) = door.windows_now() else {
                 break;
             };
             let run_state = self.handle.run_state();
@@ -705,7 +724,13 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
                 );
                 break;
             }
-            let parts = crate::retention::outside(run.clone(), &window);
+            let mut parts = vec![run.clone()];
+            for window in &windows {
+                parts = parts
+                    .into_iter()
+                    .flat_map(|part| crate::retention::outside(part, window))
+                    .collect();
+            }
             if parts.len() == 1 && parts[0] == run {
                 #[cfg(test)]
                 let asked = (run.end - run.start) as usize;
@@ -1188,34 +1213,34 @@ impl<H: TorrentHandle> Engine<H> {
     }
 
     /// Where a reader of `file_idx` has got to, in bytes from the start of
-    /// the file. Called as each read returns, so it is the position bytes
-    /// really reached a player from.
+    /// the file, told to that file's entity and no other
+    /// ([`Retention::note_position`]).
     ///
-    /// **An absence at process start, and it has to be**: a playhead is an
-    /// observation of a player, and a torrent restored from a previous run
-    /// has none this process can vouch for. Filling one in would have the
-    /// policy commit and advertise a window around a position nobody has
-    /// ever read from. One playhead per torrent, told to every file's
-    /// entity ([`Retention::note_position_everywhere`]): a file whose
-    /// policy stands while the reader is in another file reads the byte as
-    /// "no head in my domain", which is what stops its pass and empties its
-    /// panel row. Takes no lock the pass holds and never waits on the turn.
+    /// The tests' spelling of a delivered byte: production bytes go through
+    /// the [`FileHandle`]'s own reader, which moves that reader's playhead
+    /// as well as the file's head, and a test that drives passes off the
+    /// tick with no stream open has only the head to move. A file with no
+    /// entity -- nothing installed on it yet -- remembers nothing, as
+    /// production's ordering (install, then the reader) never asks it to.
+    ///
+    /// [`FileHandle`]: crate::files::FileHandle
+    #[cfg(test)]
     pub(crate) fn note_playhead(&self, file_idx: usize, offset: u64) {
-        self.retention.note_position_everywhere((file_idx, offset));
+        self.retention.note_position(&file_idx, (file_idx, offset));
     }
 
     /// What the retention policy says about `file_idx` right now, or `None`
     /// where there is nothing to say.
     ///
-    /// The three absences are all real and none of them is a zero. **No
-    /// policy** is a torrent nothing is bounding -- the budget covers the
-    /// file, no budget has been published yet, or a pin keeps everything --
-    /// so there is no window and no committed set to have a size. **No
-    /// playhead** is a torrent no reader has been inside in this process:
-    /// nothing that survives a restart says where a player had got to, and
-    /// inventing one from what is on the disk would put a window round a
-    /// region nobody has ever read. **A playhead in another file** is a
-    /// reader that has moved on, and this file's numbers left with it.
+    /// The two absences are both real and neither is a zero. **No policy**
+    /// is a torrent nothing is bounding -- the budget covers the file, no
+    /// budget has been published yet, or a pin keeps everything -- so there
+    /// is no window and no committed set to have a size. **No playhead** is
+    /// a file no reader has been inside in this process: nothing that
+    /// survives a restart says where a player had got to, and inventing one
+    /// from what is on the disk would put a window round a region nobody
+    /// has ever read. A reader in another file of the torrent is that
+    /// file's; this file keeps the head its own last byte left it with.
     ///
     /// One copy-out of the owner's state and no I/O: the reading is finished
     /// against a listing of the store, which the caller takes for itself
@@ -1319,58 +1344,49 @@ impl<H: TorrentHandle> Engine<H> {
         policies
     }
 
-    /// The file this tick's pass runs on: of the files with a policy
-    /// standing, the lowest-numbered whose domain holds the playhead, else
-    /// the lowest-numbered. One copy-out under the owner's locks, no I/O;
-    /// `None` while nothing bounds the torrent.
+    /// The files this tick's passes run on: every file with a policy
+    /// standing, in file order. One copy-out under the owner's locks, no
+    /// I/O; empty while nothing bounds the torrent.
     ///
-    /// By the head, not by file order. A pass measures from the head, and
-    /// an entity whose domain does not hold it concludes nothing
-    /// ([`Retention::pass`]). The torrent has one head, told to every
-    /// entity, so with two policies standing -- the viewer went on to the
-    /// next episode and the backend would not give the file left back --
-    /// exactly one of the two has anything to pass over, and a pick made
-    /// by file order ran the stale one every tick: the file being played
-    /// had nothing committed for sharing, nothing outside its window
-    /// reclaimed and its want-set never trimmed for as long as both stood.
-    /// When no standing file's domain holds the head every pick concludes
-    /// the same nothing, and the lowest keeps it the same pick each tick.
-    fn file_to_pass(&self) -> Option<usize> {
-        let mut standing: Vec<(usize, bool)> = self
+    /// Every one, because each has a head of its own. A pass measures from
+    /// its file's head, and with two policies standing -- the viewer went on
+    /// to the next episode and the backend would not give the file left
+    /// back -- both files have one: the file being played where its reader
+    /// is, the file left where its reader last was. A pick of one file per
+    /// tick, whichever rule picked it, left the other's window unmeasured
+    /// for as long as both stood: nothing committed for sharing, nothing
+    /// outside its window reclaimed, its want-set never trimmed. Each pass
+    /// concludes on its own file's head, and a file with none concludes
+    /// nothing.
+    fn files_to_pass(&self) -> Vec<usize> {
+        let mut standing: Vec<usize> = self
             .retention
             .holdings()
             .into_iter()
             .filter(|(_, holding)| holding.installed.is_some())
-            .map(|(file_idx, holding)| {
-                let head_here = holding
-                    .last_position
-                    .and_then(|at| <TorrentBacking<H> as Backing>::index_of(&holding.domain, at))
-                    .is_some();
-                (file_idx, head_here)
-            })
+            .map(|(file_idx, _)| file_idx)
             .collect();
-        standing.sort_by_key(|(file_idx, _)| *file_idx);
+        standing.sort_unstable();
         standing
-            .iter()
-            .find(|(_, head_here)| *head_here)
-            .or(standing.first())
-            .map(|(file_idx, _)| *file_idx)
     }
 
-    /// One retention pass: what the policy makes of where the playhead is
-    /// now, and the calls that make it so. `None` when there is nothing to
-    /// do -- no policy, no reader has been anywhere yet, the reader is in a
-    /// file no standing policy governs before or after the reading, a pin,
-    /// or a torrent with no registered store. Every one of those
-    /// leaves the policy where it was; none of them is a pass that ran and
-    /// found nothing, which is `Some` with a zeroed count.
+    /// One retention pass per file with a policy standing, in file order,
+    /// each under its own turn: what the policy makes of where that file's
+    /// head is now, and the calls that make it so. `None` when no pass
+    /// concluded anything -- no policy, no reader has been anywhere in a
+    /// bounded file yet, a pin, or a torrent with no registered store. Every
+    /// one of those leaves the policies where they were; none of them is a
+    /// pass that ran and found nothing, which is `Some` with a zeroed count.
+    /// Where more than one pass concluded, the counts are summed.
     ///
-    /// The file's turn from the first line to the last
-    /// ([`Retention::turn`] then [`Retention::pass`]): a second pass queues
-    /// behind this one, a [`Self::begin_retention`] that arrives meanwhile
-    /// waits its turn, and the cleaner's delete waits behind both. The
-    /// policy stays in its cell throughout; a pass that dies at an await
-    /// drops the turn like any other local and the next tick's pass runs.
+    /// The file's turn from the first line of its pass to the last
+    /// ([`Retention::turn`] then [`Retention::pass`]), and released before
+    /// the next file's is taken (rule 4 of the owner: no two turns at once).
+    /// A second pass queues behind this one, a [`Self::begin_retention`]
+    /// that arrives meanwhile waits its turn, and the cleaner's delete waits
+    /// behind both. The policy stays in its cell throughout; a pass that
+    /// dies at an await drops the turn like any other local and the next
+    /// tick's pass runs.
     ///
     /// Not while the torrent is under its initial hash check. The check is
     /// reading every piece it means to claim, and the pass would only be
@@ -1388,18 +1404,21 @@ impl<H: TorrentHandle> Engine<H> {
         ) {
             return None;
         }
-        let file_idx = self.file_to_pass()?;
-        let claim = self.retention.turn(&file_idx).await?;
-        let concluded = self
-            .retention
-            .pass(&file_idx, store, claim)
-            .await
-            .concluded?;
-        Some(crate::retention::RetentionPass {
-            committed: concluded.committed,
-            reclaimed: concluded.reclaimed,
-            withdrawn: concluded.withdrawn,
-        })
+        let mut total: Option<crate::retention::RetentionPass> = None;
+        for file_idx in self.files_to_pass() {
+            let Some(claim) = self.retention.turn(&file_idx).await else {
+                continue;
+            };
+            let Some(concluded) = self.retention.pass(&file_idx, store, claim).await.concluded
+            else {
+                continue;
+            };
+            let total = total.get_or_insert_default();
+            total.committed += concluded.committed;
+            total.reclaimed += concluded.reclaimed;
+            total.withdrawn += concluded.withdrawn;
+        }
+        total
     }
 
     /// What this engine tells the cache cleaner it may take -- **asked by

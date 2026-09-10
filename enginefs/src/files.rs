@@ -82,9 +82,25 @@ pub struct FileHandle<H: TorrentHandle> {
     ///
     /// [`Engine::refuse_reads_for_space`]: crate::engine::Engine::refuse_reads_for_space
     reader_id: u64,
+    /// This read, as the retention owner sees it: its own playhead on the
+    /// file's entity, moved by every byte that really goes out and gone
+    /// when this handle is. Two handles on one file -- a seek is a second
+    /// response on the file still playing -- are two heads, each with a
+    /// window at the pass's door, where one head per torrent had the pass
+    /// take the piece the other response was inside. `None` for a file the
+    /// owner has no entity for ([`Retention::reader_on`]): nothing could
+    /// bound it, and its bytes are not remembered.
+    ///
+    /// [`Retention::reader_on`]: crate::retention::owner::Retention::reader_on
+    reader: Option<crate::retention::owner::Reader<crate::engine::TorrentBacking<H>>>,
 }
 
 impl<H: TorrentHandle> FileHandle<H> {
+    /// A handle over `stream`, reading `file_idx` from `start_offset`.
+    /// Opened after the engine has installed the file's retention policy
+    /// (`Engine::try_get_file_with_intent` does, before it asks the backend
+    /// for the stream), so the reader this takes on the file's entity is
+    /// there before the first byte is noted to it.
     pub fn new(
         size: u64,
         name: String,
@@ -94,6 +110,7 @@ impl<H: TorrentHandle> FileHandle<H> {
         start_offset: u64,
     ) -> Self {
         let reader_id = engine.next_reader_id();
+        let reader = engine.retention.reader_on(&file_idx);
         Self {
             size,
             name,
@@ -102,6 +119,7 @@ impl<H: TorrentHandle> FileHandle<H> {
             file_idx,
             cursor: ReadCursor::new(start_offset),
             reader_id,
+            reader,
         }
     }
 
@@ -172,12 +190,17 @@ impl<H: TorrentHandle> AsyncRead for FileHandle<H> {
                     self.log_blocked_read(waited);
                 }
                 // Where a byte really reached a player from, which is what
-                // the retention policy calls the playhead. Written after
-                // the read rather than before it, so a read that failed or
-                // parked moves nothing.
-                if delivered > 0 {
-                    self.engine
-                        .note_playhead(self.file_idx, self.cursor.position);
+                // the retention policy calls the playhead: this read's own,
+                // on the file's entity. Written after the read rather than
+                // before it, so a read that failed or parked moves nothing.
+                if delivered > 0
+                    && let Some(reader) = &self.reader
+                {
+                    let claim = reader.note((self.file_idx, self.cursor.position));
+                    debug_assert!(
+                        claim.is_none(),
+                        "a delivered byte claimed a torrent file's turn; the tick is its trigger"
+                    );
                 }
             }
         }
