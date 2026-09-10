@@ -2274,9 +2274,15 @@ fn the_cleaner_leaves_the_chunks_a_proxied_player_is_inside() -> anyhow::Result<
     );
 
     // Now the player comes back for those bytes, and this time it is inside
-    // them with a body open: the response is framed round the run, which is
-    // a promise about chunks that have to still be there when it reads them.
-    let (first, last) = (kept.start * CHUNK, kept.end * CHUNK - 1);
+    // them with a body open: the response is framed round the window, which
+    // is a promise about chunks that have to still be there when it reads
+    // them. The window and not the run, for the reason given above: the
+    // run's surplus over the window was the cleaner's to take, and on the
+    // platforms where the last pass left one it did take it -- so a request
+    // for the whole run is a request for bytes this test has just agreed
+    // may be gone, and the origin answering for them is not a failure of
+    // anything.
+    let (first, last) = (inside[0] * CHUNK, kept.end * CHUNK - 1);
     let mut player = client
         .get(&url)
         .header(reqwest::header::RANGE, format!("bytes={first}-{last}"))
@@ -2286,13 +2292,13 @@ fn the_cleaner_leaves_the_chunks_a_proxied_player_is_inside() -> anyhow::Result<
     assert_eq!(
         promised,
         first..last + 1,
-        "the whole run survived the pass above, so the body is framed round \
-         all of it"
+        "the whole window survived the pass above, so the body is framed \
+         round all of it"
     );
     assert!(
         fixture.origin.was_asked_for_nothing_more(),
         "and every byte of it is the cache's to answer, which is what makes \
-         this a run the player is inside rather than one being fetched"
+         this a window the player is inside rather than one being fetched"
     );
     let mut head = vec![0u8; CHUNK as usize];
     player.read_exact(&mut head)?;
