@@ -391,6 +391,14 @@ impl PieceStore {
     }
 }
 
+/// Which thread last ran [`StoreRoot::delete_pieces`] for each torrent
+/// directory: the probe for the tests that pin a delete to the blocking
+/// pool, keyed by directory so that tests running in parallel, each in a
+/// scratch root of its own, do not read one another's answer.
+#[cfg(test)]
+pub(crate) static DELETED_ON: Mutex<std::collections::BTreeMap<PathBuf, std::thread::ThreadId>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
 /// The piece store's root, and **the only thing outside this module that may
 /// be asked what is under it**.
 ///
@@ -686,6 +694,10 @@ impl StoreRoot {
         pieces: impl IntoIterator<Item = u32>,
     ) -> usize {
         let chunks = self.chunks(info_hash);
+        #[cfg(test)]
+        DELETED_ON
+            .lock()
+            .insert(chunks.path().to_path_buf(), std::thread::current().id());
         let mut removed = 0;
         for piece in pieces {
             match chunks.remove(u64::from(piece)) {

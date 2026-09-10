@@ -2240,7 +2240,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             )
         });
         let Some(_handle) = live else {
-            return store.delete_pieces(info_hash, pieces.iter().copied());
+            // Off the reactor like every other unlink: the cleaner calls
+            // this one piece at a time from a task on the runtime, and a
+            // torrent nobody holds can still be tens of thousands of
+            // files on the flash of a television.
+            return crate::retention::unlink(&store, info_hash, pieces.to_vec(), None).await;
         };
         // Through the engine, so the question the cleaner asked before its
         // walk is asked again against the live policy -- see
@@ -10044,6 +10048,37 @@ mod tests {
         counters.refuses_drop.store(true, Ordering::SeqCst);
         assert_eq!(enginefs.release_pieces(TEST_HASH, &[5]).await, 0);
         assert!(bucket.join("5").is_file());
+    }
+
+    /// **A torrent nobody holds is unlinked off the reactor too.**
+    ///
+    /// The other two doors -- the pass's own reclaim and the cleaner's
+    /// delete through a live engine -- go to the blocking pool through
+    /// `retention::unlink`. This one went straight to the store on the
+    /// runtime thread, one piece per cleaner call, for a torrent that can be
+    /// tens of thousands of files.
+    #[tokio::test]
+    async fn a_torrent_the_session_does_not_hold_is_unlinked_off_the_reactor() {
+        let (enginefs, _counters) = test_enginefs_with_file_count(1);
+        let store = enginefs.piece_store();
+        let other = "ffffffffffffffffffffffffffffffffffffffff";
+        let torrent_dir = store.torrent_dir(other);
+        let bucket = torrent_dir.join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("4"), [7u8; 25]).unwrap();
+
+        assert_eq!(enginefs.release_pieces(other, &[4]).await, 1);
+        assert!(!bucket.join("4").exists());
+        let deleted_on = crate::piece_store::store::DELETED_ON
+            .lock()
+            .get(&torrent_dir)
+            .copied()
+            .expect("the store recorded the delete");
+        assert_ne!(
+            deleted_on,
+            std::thread::current().id(),
+            "the unlink ran on the runtime thread"
+        );
     }
 
     /// **The delete asks the walk's question again, and the same one.**

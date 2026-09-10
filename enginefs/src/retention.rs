@@ -719,10 +719,13 @@ pub(crate) async fn take_claimed(
 /// so the deletion finishes and the claim goes with it.
 ///
 /// Both doors come through here so that the move off the reactor is written
-/// once. The claimed one is the door every reclaim of a live torrent takes
-/// and is what the tests exercise; the claimless one is for a backend that
-/// keeps no have-set, which nothing in this workspace is.
-async fn unlink(
+/// once. The claimed one is the door every reclaim of a live torrent takes;
+/// the claimless one is for a torrent with no live have-set for a deletion
+/// to disagree with -- one the session does not hold, or holds stopped in
+/// error -- which is `EngineFS::release_pieces`'s other branch, and would
+/// also be a backend that keeps no have-set, which nothing in this workspace
+/// is.
+pub(crate) async fn unlink(
     store: &StoreRoot,
     info_hash: &str,
     pieces: Vec<u32>,
