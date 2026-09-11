@@ -566,6 +566,25 @@ struct State<B: Backing> {
     /// cleaner the torrent announces them. Held back and protected at once
     /// is the one combination that is never right, and there was no pass
     /// left to undo it. So the fact is recorded, and `clear_under` reads it.
+    ///
+    /// **A fresh entity starts with it set** (under [`Share::Half`]). The
+    /// mask is the backend's, and it outlives everything here that could
+    /// record it: the entity a slack pass emptied and then forgot
+    /// ([`Retention::forget_empty`]), the pieces that pass took, the
+    /// record `reclaim_rest` never makes for pieces outside every entity --
+    /// and the fork keeps a held-back piece held back when it is dropped
+    /// and downloaded again. An entity made afresh with this `false` took
+    /// every install that installs nothing -- a budget that covers the
+    /// file, a pin, no budget yet -- through `clear_under`'s "nothing to
+    /// give back", so every rewatch of a file smaller than the budget,
+    /// after any switch, seeded nothing for the rest of the process.
+    /// Assuming the mask costs one give-back of a range nothing hides,
+    /// which announces nothing; an install that holds the same range back
+    /// again skips even that ([`State::only_assumed_held_back`]).
+    ///
+    /// Read only where nothing is installed: a policy's own hold-back is
+    /// recorded by the policy, and `clear_under` gives that back off the
+    /// policy. It may stand `true` beside one, and means nothing there.
     held_back: bool,
     /// What the pass standing over this entity decided to take off the
     /// disk, and what is therefore never put back into what we announce.
@@ -818,7 +837,11 @@ impl<B: Backing> Retention<B> {
                         windows: Vec::new(),
                         readers: HashMap::new(),
                         last_position: None,
-                        held_back: false,
+                        // Assumed held back until a clear says otherwise: an
+                        // entity that was forgotten took the record with it,
+                        // and the backend's mask outlives both the record and
+                        // the pieces. See [`State::held_back`].
+                        held_back: B::SHARE == Share::Half,
                         doomed: Vec::new(),
                         opens: 0,
                     })),
@@ -979,7 +1002,18 @@ impl<B: Backing> Retention<B> {
         // entity whose reader moved on would leave the old range announced
         // to nobody for the life of the owner, with no policy left to say
         // that it was held back.
-        if !self.clear_under(&entity, &mut claim).await {
+        //
+        // Except a hold-back no policy records ([`State::held_back`]) when
+        // a policy is about to hold the same range back: every piece the
+        // give-back announced, the hold-back one backend call later would
+        // hide again, and there is no un-Have -- a Have for a piece the
+        // window is going to reclaim is the failure this owner exists to
+        // prevent. A policy is built over the whole extent (asserted below,
+        // with the policy in hand), so its hold-back covers what the
+        // give-back would have given.
+        let hold_back_follows = matches!((&resolved, &policy), (Some(_), Some(_)));
+        let subsumed = hold_back_follows && entity.state.lock().only_assumed_held_back();
+        if !subsumed && !self.clear_under(&entity, &mut claim).await {
             return InstallOutcome::OldStands;
         }
         // Nothing installed after this point leaves the entity unbounded,
@@ -991,6 +1025,11 @@ impl<B: Backing> Retention<B> {
             return InstallOutcome::Unbounded;
         };
         let pieces = policy.pieces();
+        debug_assert_eq!(
+            pieces,
+            B::extent(&domain),
+            "a policy over less than the extent would leave part of an assumed hold-back unrecorded"
+        );
         if B::SHARE == Share::Half
             && let Err(error) = self.backing.advertise(pieces.clone(), false).await
         {
@@ -1053,11 +1092,13 @@ impl<B: Backing> Retention<B> {
             match state.installed.as_ref() {
                 Some(installed) => (installed.policy.pieces(), state.doomed.clone()),
                 // Nothing installed, but a slack pass held the range back
-                // and could not finish taking it: see [`State::held_back`].
-                // Nothing is doomed there -- a slack pass records no runs --
-                // and a piece its reclaim did take is one the backend has
-                // already forgotten, so lifting the mask over it announces
-                // nothing.
+                // and could not finish taking it -- or nothing here knows
+                // whether one did: see [`State::held_back`]. Nothing is
+                // doomed there -- a slack pass records no runs -- and a
+                // piece its reclaim did take is one the backend has already
+                // forgotten, so lifting the mask over it announces nothing,
+                // as it announces nothing over a range that was never held
+                // back.
                 None if state.held_back => (B::extent(&state.domain), Vec::new()),
                 None => return true,
             }
@@ -1905,6 +1946,14 @@ impl<B: Backing> State<B> {
     /// [`Self::doomed`].
     fn doom(&mut self, _turn: &mut Turn, runs: Vec<Range<u32>>) {
         self.doomed = runs;
+    }
+
+    /// The range is held back, or may be, with no policy to record it
+    /// ([`Self::held_back`]): what a clear has to give back, and what a
+    /// hold-back about to go out over the same range makes redundant to
+    /// give back first.
+    fn only_assumed_held_back(&self) -> bool {
+        self.installed.is_none() && self.held_back
     }
 
     /// A stream has been opened on this entity. Under the turn, from
@@ -3339,6 +3388,73 @@ mod tests {
         );
     }
 
+    /// **A fresh entity assumes its range is held back, and the first
+    /// install that holds nothing back gives it back.**
+    ///
+    /// The mask is the backend's and outlives the record: a slack pass that
+    /// empties a file forgets its entity, and the fork keeps a held-back
+    /// piece held back when it is dropped and downloaded again. The next
+    /// open made an entity that knew nothing of it, and an install that
+    /// installs nothing -- here a budget that covers the file -- gave
+    /// nothing back, so every rewatch of a small file after a switch was
+    /// downloaded again under the old mask and seeded to nobody for the
+    /// rest of the process.
+    ///
+    /// Once, and not before a hold-back over the same range: an install
+    /// that is about to hold the extent back would only announce, for the
+    /// length of one backend call, what it then hides again.
+    #[tokio::test]
+    async fn an_install_that_holds_nothing_back_gives_a_fresh_entitys_range_back() {
+        let (backing, owner, budget) = torrent();
+        *backing.held.lock() = (0..8).collect();
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        let opens = owner.opens_of(&0);
+        let claim = owner.turn(&0).await.expect("the turn");
+        assert_eq!(
+            owner
+                .pass(&0, &(), claim, Mode::Slack { opens })
+                .await
+                .concluded
+                .expect("a pass that ran")
+                .reclaimed,
+            8
+        );
+        assert!(
+            owner.holding(&0).is_none(),
+            "the emptied entity is forgotten"
+        );
+        assert_eq!(
+            backing.advertised.lock().last(),
+            Some(&(0..8, false)),
+            "and its extent is held back, with nothing left here to say so"
+        );
+        backing.advertised.lock().clear();
+
+        // The rewatch, under a budget that covers the file: nothing to
+        // install, and the range the forgotten entity left held back goes
+        // back into what we announce.
+        budget.set(Some(8 * PIECE));
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Unbounded);
+        assert_eq!(
+            *backing.advertised.lock(),
+            vec![(0..8, true)],
+            "the extent a forgotten entity held back is announced again"
+        );
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Unbounded);
+        assert_eq!(
+            *backing.advertised.lock(),
+            vec![(0..8, true)],
+            "and once given back, it is not given back again"
+        );
+
+        // A fresh entity that goes straight to a policy is not given back
+        // first: the hold-back it is about to get covers the same range.
+        budget.set(Some(4 * PIECE));
+        backing.advertised.lock().clear();
+        assert_eq!(owner.install(1, 1).await, InstallOutcome::Installed);
+        assert_eq!(*backing.advertised.lock(), vec![(8..16, false)]);
+    }
+
     /// **An entity a reader is open on is never forgotten, even emptied.**
     ///
     /// [`Retention::forget_empty`] prunes on a fact -- it holds nothing and
@@ -3778,7 +3894,12 @@ mod tests {
             "a want that resolves to nothing was installed"
         );
         assert!(owner.holding(&2).is_none());
-        assert!(backing.advertised.lock().is_empty());
+        assert_eq!(
+            *backing.advertised.lock(),
+            vec![(0..8, true)],
+            "a fresh entity assumes its range held back, and the first install \
+             that holds nothing back gives it back -- once"
+        );
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         // A pin clears, and gives the range back.
         backing.keeps_everything.store(true, Ordering::SeqCst);
@@ -3786,7 +3907,7 @@ mod tests {
         assert!(owner.holding(&0).unwrap().installed.is_none());
         assert_eq!(
             *backing.advertised.lock(),
-            vec![(0..8, false), (0..8, true)]
+            vec![(0..8, true), (0..8, false), (0..8, true)]
         );
         backing.keeps_everything.store(false, Ordering::SeqCst);
         // The same key under a new budget is not kept: given back, and
@@ -3801,6 +3922,7 @@ mod tests {
         assert_eq!(
             *backing.advertised.lock(),
             vec![
+                (0..8, true),
                 (0..8, false),
                 (0..8, true),
                 (0..8, false),
