@@ -173,11 +173,21 @@ pub(super) struct Inner {
     /// is reading every piece it means to claim, and nothing outside this
     /// store may unlink one.
     checking: AtomicBool,
-    /// Moved by every `init`. A torrent restarted out of an error runs
-    /// `init` again on a fresh store and librqbit rebuilds its chunk tracker
-    /// behind it, forgetting every hold-back it was told; a reader that
-    /// remembers the epoch it asserted under can tell that this has
-    /// happened.
+    /// Which store of this torrent's this is: handed out by the registry
+    /// when the store registers, and unchanged by a later seed of the same
+    /// store ([`StoreRegistry::insert`]).
+    ///
+    /// A torrent restarted out of an error runs `init` again on a **fresh**
+    /// store -- librqbit builds one through the factory for the
+    /// initializing state -- and rebuilds its chunk tracker behind it,
+    /// forgetting every hold-back it was told. The two go together: the
+    /// tracker that was told what to hold back is the one beside the store
+    /// that was registered then. So a reader that remembers the epoch it
+    /// asserted its hold-back under can tell that it has been forgotten,
+    /// which is the whole of what this is for. Counted per store it could
+    /// not: the fresh store's first seed would report the same number the
+    /// errored one's did. A store no registry knows counts its own seeds --
+    /// nothing reads it, and there is nobody to be told apart from.
     epoch: AtomicU64,
     /// The handles most recently opened -- see the type doc. Empty on a
     /// store that has just been created or taken.
@@ -470,9 +480,9 @@ impl PieceStore {
         self.inner.is_checking()
     }
 
-    /// How many times `init` has seeded this store. Moves on a restart out
-    /// of error, which is when librqbit forgets every hold-back it was told
-    /// -- see [`Inner::epoch`].
+    /// Which store of this torrent's this is. Moves on a restart out of
+    /// error, which is when librqbit forgets every hold-back it was told --
+    /// see [`Inner::epoch`].
     pub fn epoch(&self) -> u64 {
         self.inner.epoch()
     }
@@ -626,6 +636,12 @@ impl Inner {
         self.epoch.load(Ordering::Acquire)
     }
 
+    /// Which store of its torrent's this one is, as the registry numbers
+    /// them. Written there and nowhere else -- see [`Self::epoch`].
+    pub(super) fn set_epoch(&self, epoch: u64) {
+        self.epoch.store(epoch, Ordering::Release);
+    }
+
     #[cfg(test)]
     pub(super) fn dir(&self) -> &Path {
         self.chunks.path()
@@ -740,7 +756,13 @@ impl Inner {
         self.held.seed(complete);
         self.seeded.store(true, Ordering::Release);
         self.checking.store(true, Ordering::Release);
-        self.epoch.fetch_add(1, Ordering::AcqRel);
+        // A store no registry knows counts its own seeds: there is nobody
+        // for it to be told apart from. Every other store's epoch is the
+        // registry's to hand out, at the registration below -- see
+        // [`Self::epoch`].
+        if self.registration.is_none() {
+            self.epoch.fetch_add(1, Ordering::AcqRel);
+        }
         Ok(())
     }
 

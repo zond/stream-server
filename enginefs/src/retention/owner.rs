@@ -127,8 +127,10 @@
 //! 5. RE-READ under L2, and REFUSE if the resident policy's budget or
 //!    domain differs from the snapshot -- a decide ran under us. Otherwise
 //!    advance the resident policy in place and build the windows.
-//! 6. Advertise committed runs, withdraw lost runs, no L2 held (both lists
-//!    empty by construction under [`Share::Nothing`]); then
+//! 6. Re-issue the hold-back if [`Backing::epoch`] says the backend threw
+//!    away the record that carried it; advertise committed runs, withdraw
+//!    lost runs, no L2 held (all three empty by construction under
+//!    [`Share::Nothing`]); then
 //!    [`Backing::want`], which trims what the backend fetches to the windows
 //!    and what is on the disk, asking the same [`Door`] the reclaim asks
 //!    before it unlinks anything that arrived under the pass.
@@ -391,6 +393,25 @@ pub trait Backing: Sized + Send + Sync + 'static {
         pieces: Range<u32>,
         on: bool,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
+    /// Which build of the backend's record of what it holds is in force,
+    /// moving whenever that record -- and with it every hold-back
+    /// [`Self::advertise`] put into it -- was thrown away and made again.
+    ///
+    /// The torrent: a restart out of an error builds a fresh piece store
+    /// and a fresh chunk tracker, and librqbit announces everything the
+    /// disk holds in the handshake bitfield as it comes back, so the
+    /// pieces the window holds back are announced again with nothing here
+    /// having asked for it. It cannot be prevented from this side -- the
+    /// seed runs under librqbit's own lock, where the call that holds
+    /// pieces back is refused -- so the pass notices instead
+    /// ([`Installed::asserted_epoch`]). A backing that rebuilds no such
+    /// record answers the default and is never asked to re-issue anything.
+    ///
+    /// Read at step 6 of the pass with the turn held and no owner lock, so
+    /// it may take a lock of its own.
+    fn epoch(&self, _store: &Self::Store) -> u64 {
+        0
+    }
     /// The subset of `pieces` this domain alone owns bytes in: the torrent's
     /// boundary rule (`this_files_alone`); the proxy's identity.
     fn alone(&self, domain: &Self::Domain, pieces: &[u32])
@@ -599,6 +620,24 @@ struct State<B: Backing> {
 struct Installed {
     budget: CacheBudget,
     policy: RetentionPolicy,
+    /// The [`Backing::epoch`] this policy's hold-back is known to be in
+    /// force under, and `None` until a pass has read one.
+    ///
+    /// [`Retention::install`] held this policy's whole range back before
+    /// the reader opened, and nothing here gives it back until the policy
+    /// goes -- but the backend can lose it without being asked to, by
+    /// rebuilding the record that carries it, and then announces every
+    /// piece of the window it holds. Nothing can stop that; a pass can see
+    /// it, by comparing the epoch it is under with the one this hold-back
+    /// was issued under, and issue it again.
+    ///
+    /// `None` is the install's own assertion. The install cannot read the
+    /// epoch -- the store is the pass's, handed to it by the driver -- so
+    /// the first pass records what it sees rather than re-issuing what
+    /// went out a moment ago, and every later one compares. The window
+    /// that leaves open is a rebuild between the install and the first
+    /// pass over the entity.
+    asserted_epoch: Option<u64>,
 }
 
 /// One open read of one entity.
@@ -1401,7 +1440,7 @@ impl<B: Backing> Retention<B> {
         // asked for, or the old one that no longer exists. The byte that
         // decided it is owed the pass it could not start: `nothing` with no
         // measurement hands the claim on while something is installed.
-        let (decision, windows, promised, door_policy, at, doomed) = {
+        let (decision, windows, promised, door_policy, at, doomed, asserted) = {
             let mut state = entity.state.lock();
             if !state.still(&begin) {
                 return Self::nothing(&state, claim, about, None);
@@ -1457,6 +1496,7 @@ impl<B: Backing> Retention<B> {
                 policy,
                 at,
                 state.doomed.clone(),
+                state.asserted_epoch(),
             )
         };
         // 6. Advertise what is committed before reclaiming: the two sets are
@@ -1474,6 +1514,42 @@ impl<B: Backing> Retention<B> {
                 "a Share::Nothing policy committed or withdrew pieces"
             );
         } else {
+            // The hold-back first, if the backend has rebuilt the record
+            // that carried it: everything of this policy that is not
+            // committed goes back out of what we announce before a piece
+            // of it is committed or reclaimed, which is the order the
+            // install used and for the same reason -- a piece announced
+            // once is announced to every peer already connected. See
+            // [`Installed::asserted_epoch`] for what `None` is, and why
+            // this is a re-issue and not a repair: the Haves librqbit sent
+            // as it came back cannot be recalled.
+            let epoch = self.backing.epoch(store);
+            if asserted != Some(epoch) {
+                let committed: Vec<u32> = door_policy.advertised().iter().copied().collect();
+                let mut in_force = true;
+                if asserted.is_some() {
+                    tracing::debug!(
+                        key = ?key,
+                        epoch,
+                        was = asserted,
+                        "the backend rebuilt what it holds; holding this entity's window back again"
+                    );
+                    for run in without(door_policy.pieces(), &runs(&committed)) {
+                        if let Err(error) = self.backing.advertise(run, false).await {
+                            tracing::warn!(
+                                key = ?key,
+                                error = %format!("{error:#}"),
+                                "could not hold the window back again after the backend rebuilt what it holds; the next pass retries"
+                            );
+                            in_force = false;
+                            break;
+                        }
+                    }
+                }
+                if in_force {
+                    entity.state.lock().assert_epoch(&mut claim.guard, epoch);
+                }
+            }
             // The doomed runs are subtracted here too, though the two
             // sets are disjoint by construction (`advance` never commits a
             // piece it reclaims): a belt is only a belt if it is worn on
@@ -1773,7 +1849,11 @@ impl<B: Backing> State<B> {
             return Ok(());
         };
         self.stride = stride_for::<B>(window);
-        self.installed = Some(Installed { budget, policy });
+        self.installed = Some(Installed {
+            budget,
+            policy,
+            asserted_epoch: None,
+        });
         Ok(())
     }
 
@@ -1794,7 +1874,11 @@ impl<B: Backing> State<B> {
             reader.passed_at = None;
         }
         self.doomed = Vec::new();
-        self.installed = Some(Installed { budget, policy });
+        self.installed = Some(Installed {
+            budget,
+            policy,
+            asserted_epoch: None,
+        });
     }
 
     /// Forget the policy, and that the entity was decided at all. Under the
@@ -1829,6 +1913,23 @@ impl<B: Backing> State<B> {
         let installed = self.installed.as_mut()?;
         let decision = installed.policy.advance(at, held);
         Some((decision, installed.policy.clone()))
+    }
+
+    /// The epoch the standing policy's hold-back was issued under, or
+    /// `None` when no pass has read one; asked only where a policy is
+    /// known to stand. See [`Installed::asserted_epoch`].
+    fn asserted_epoch(&self) -> Option<u64> {
+        self.installed
+            .as_ref()
+            .and_then(|installed| installed.asserted_epoch)
+    }
+
+    /// Record that the standing policy's hold-back is in force under
+    /// `epoch`. Under the turn.
+    fn assert_epoch(&mut self, _turn: &mut Turn, epoch: u64) {
+        if let Some(installed) = self.installed.as_mut() {
+            installed.asserted_epoch = Some(epoch);
+        }
     }
 
     /// Write what a pass concluded. Under the turn.
@@ -2252,6 +2353,10 @@ mod tests {
         /// What [`Backing::is_live`] answers: the entity the fake is
         /// playing right now.
         is_live: AtomicBool,
+        /// What [`Backing::epoch`] answers: moved by a test to say that the
+        /// backend threw away everything it was told about what to hold
+        /// back, as a restart out of an error does.
+        epoch: AtomicU64,
         /// The runs each `reclaim` call was handed.
         reclaims: parking_lot::Mutex<Vec<Vec<Range<u32>>>>,
         /// The runs each `reclaim` call really asked the door about, which
@@ -2285,6 +2390,7 @@ mod tests {
                 listings: AtomicU64::new(0),
                 keeps_everything: AtomicBool::new(false),
                 is_live: AtomicBool::new(false),
+                epoch: AtomicU64::new(1),
                 reclaims: parking_lot::Mutex::new(Vec::new()),
                 asked: parking_lot::Mutex::new(Vec::new()),
                 reclaim_panics: AtomicBool::new(false),
@@ -2436,6 +2542,10 @@ mod tests {
             }
             self.advertised.lock().push((pieces, on));
             Ok(())
+        }
+
+        fn epoch(&self, _store: &()) -> u64 {
+            self.epoch.load(Ordering::SeqCst)
         }
 
         async fn alone(&self, _domain: &FakeDomain, pieces: &[u32]) -> Vec<u32> {
@@ -3840,6 +3950,76 @@ mod tests {
             "a refused announce stopped the pass"
         );
         assert_eq!(*backing.advertised.lock(), vec![(0..8, false)]);
+    }
+
+    /// **A backend that threw away what it was holding back is told again,
+    /// once.**
+    ///
+    /// The install held the file back from what we announce before the
+    /// reader opened, and nothing here gives it back while the policy
+    /// stands -- but a restart out of an error builds librqbit a fresh
+    /// chunk tracker, and the hold-back went with the old one: the window's
+    /// pieces are announced again, by an event no call of ours ordered and
+    /// none can refuse. The only thing left is to notice, which is what the
+    /// epoch is for. So the pass that finds it moved holds everything the
+    /// policy has not committed back again -- the committed half is what we
+    /// announce, and re-issuing over it would withdraw what a peer is
+    /// downloading -- and the pass after it, finding the epoch where it
+    /// left it, says nothing.
+    #[tokio::test]
+    async fn a_moved_epoch_holds_the_window_back_again_and_the_pass_after_it_does_not() {
+        let (backing, owner, _budget) = torrent();
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        owner.note_position(&0, (0, 0));
+        let claim = owner.turn(&0).await.expect("the turn");
+        owner.pass(&0, &(), claim, Mode::Live).await;
+        // Playback walks to piece 1, which commits piece 0: the re-issue
+        // has to leave a committed piece announced.
+        owner.note_position(&0, (0, PIECE));
+        let claim = owner.turn(&0).await.expect("the turn");
+        owner.pass(&0, &(), claim, Mode::Live).await;
+        assert_eq!(
+            *backing.advertised.lock(),
+            vec![(0..8, false), (0..1, true)],
+            "the install's hold-back and the commit, and no re-issue: the first \
+             pass recorded the epoch the install went out under"
+        );
+
+        // The restart.
+        backing.epoch.fetch_add(1, Ordering::SeqCst);
+        let claim = owner.turn(&0).await.expect("the turn");
+        owner.pass(&0, &(), claim, Mode::Live).await;
+        assert_eq!(
+            *backing.advertised.lock(),
+            vec![(0..8, false), (0..1, true), (1..8, false)],
+            "everything but the committed piece is held back again"
+        );
+        let claim = owner.turn(&0).await.expect("the turn");
+        owner.pass(&0, &(), claim, Mode::Live).await;
+        assert_eq!(
+            backing.advertised.lock().len(),
+            3,
+            "and the pass after it re-issued nothing"
+        );
+
+        // A refused re-issue is not recorded as made: the next pass tries
+        // again, and the one after that -- once it went out -- does not.
+        backing.epoch.fetch_add(1, Ordering::SeqCst);
+        backing.fail_advertise.store(true, Ordering::SeqCst);
+        let claim = owner.turn(&0).await.expect("the turn");
+        owner.pass(&0, &(), claim, Mode::Live).await;
+        assert_eq!(backing.advertised.lock().len(), 3, "a refusal was recorded");
+        backing.fail_advertise.store(false, Ordering::SeqCst);
+        let claim = owner.turn(&0).await.expect("the turn");
+        owner.pass(&0, &(), claim, Mode::Live).await;
+        assert_eq!(
+            *backing.advertised.lock(),
+            vec![(0..8, false), (0..1, true), (1..8, false), (1..8, false)],
+            "the retry"
+        );
+        let claim = owner.turn(&0).await.expect("the turn");
+        owner.pass(&0, &(), claim, Mode::Live).await;
+        assert_eq!(backing.advertised.lock().len(), 4);
     }
 
     /// **A reader reports what it holds**: its promise shrinks from the

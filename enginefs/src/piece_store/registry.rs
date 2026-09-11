@@ -28,6 +28,7 @@
 //! may trust one reading across an unlink.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use parking_lot::Mutex;
@@ -48,6 +49,11 @@ pub struct StoreRegistry {
     /// the process goes through a registered store.
     root: StoreRoot,
     by_hash: Mutex<HashMap<String, Weak<Inner>>>,
+    /// The last epoch handed out, to any store under this root. One counter
+    /// rather than one per hash because it is only ever compared with
+    /// itself, and a hash that has had two stores is what it exists to
+    /// tell apart -- see [`Self::insert`].
+    epochs: AtomicU64,
 }
 
 /// What [`StoreRegistry::delete`] did.
@@ -75,6 +81,7 @@ impl StoreRegistry {
         Self {
             root,
             by_hash: Mutex::new(HashMap::new()),
+            epochs: AtomicU64::new(0),
         }
     }
 
@@ -175,9 +182,16 @@ impl StoreRegistry {
             .is_some_and(|inner| inner.is_checking())
     }
 
-    /// How many times the registered store's `init` has seeded it, or
-    /// `None` for a hash with no store. Moves on a restart out of error,
-    /// which is when librqbit forgets every hold-back it was told.
+    /// Which store of `info_hash`'s the live one is, or `None` for a hash
+    /// with no store.
+    ///
+    /// It moves when a fresh store registers over an older one, which is
+    /// what a restart out of error does -- and a restart out of error is
+    /// when librqbit rebuilds the chunk tracker and forgets every hold-back
+    /// it was told. That is the whole of what this is read for, so it must
+    /// move across the *fresh* store rather than count the seeds of each:
+    /// a per-store count starts over with the store, and a reader comparing
+    /// it would be told nothing had happened. See [`Self::insert`].
     pub fn epoch(&self, info_hash: &str) -> Option<u64> {
         self.live(info_hash).map(|inner| inner.epoch())
     }
@@ -214,10 +228,24 @@ impl StoreRegistry {
     /// there: a restart out of error builds a fresh store while the old
     /// one's registration may not have gone yet, and the newest is the one
     /// librqbit reads and writes.
+    ///
+    /// A store the hash has not had before takes an epoch here, and one
+    /// that is already the registered store keeps the one it has: the epoch
+    /// names the store, not the seed ([`Inner::epoch`]), and a store that
+    /// seeds again is the same store with the same chunk tracker beside it
+    /// -- what it holds may have changed, but nothing has forgotten what we
+    /// held back. Assigned under the map lock, so the number a reader gets
+    /// with a registration is the one that registration was given.
     pub(super) fn insert(&self, info_hash: &str, inner: &Arc<Inner>) {
-        self.by_hash
-            .lock()
-            .insert(info_hash.to_ascii_lowercase(), Arc::downgrade(inner));
+        let mut by_hash = self.by_hash.lock();
+        let key = info_hash.to_ascii_lowercase();
+        let already = by_hash
+            .get(&key)
+            .is_some_and(|weak| Weak::as_ptr(weak) == Arc::as_ptr(inner));
+        if !already {
+            inner.set_epoch(self.epochs.fetch_add(1, Ordering::Relaxed) + 1);
+        }
+        by_hash.insert(key, Arc::downgrade(inner));
     }
 
     /// Drop the registration for `info_hash` if it still points at
@@ -363,8 +391,10 @@ mod tests {
         );
         assert_eq!(
             registry.epoch(HASH),
-            Some(1),
-            "each Inner counts its own inits"
+            Some(2),
+            "the second seed, though it is the fresh store's first: what the \
+             epoch is asked is whether the hold-back survived, and a number \
+             each store counted for itself would say yes here"
         );
 
         drop(first);

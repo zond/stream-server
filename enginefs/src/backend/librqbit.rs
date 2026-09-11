@@ -9350,8 +9350,167 @@ mod tests {
         assert!(held.count() > 0);
         assert_eq!(
             registry.epoch(&hash),
-            Some(1),
-            "the fresh store's first seed: a new Inner counts from nothing"
+            Some(2),
+            "a seed the registry numbered, not one the store counted for itself: \
+             it is read to tell a rebuilt tracker from the one that was told \
+             what to hold back, and a fresh store counting its own inits would \
+             report the 1 the errored one reported"
         );
+    }
+
+    /// **A restart out of an error announces the window again, and the next
+    /// pass holds it back again.**
+    ///
+    /// librqbit builds a fresh chunk tracker for the re-check, and the
+    /// hold-back lives in the tracker: everything the disk holds is
+    /// announced in the handshake bitfield as the torrent comes back, the
+    /// window's uncommitted pieces included. Nothing in this process
+    /// ordered that and nothing can refuse it -- the seed that would notice
+    /// runs on the reactor under librqbit's own lock, where the call that
+    /// holds pieces back is refused -- so the next pass compares the
+    /// registry's epoch with the one its hold-back went out under and
+    /// issues it again.
+    ///
+    /// The viewer is still playing the file throughout, so the entity the
+    /// pass runs on is the one the install put a policy in, not one a fresh
+    /// open re-asserted: an open would hold the range back itself, and
+    /// prove nothing.
+    ///
+    /// What is measured is what librqbit would announce: asking it to hold
+    /// the file back again reports how many pieces really changed, which is
+    /// the committed half alone when the pass has done its work and the
+    /// whole file when nothing did. Unix only, for the same reason as the
+    /// test above: the error is an unwritable directory.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restart_out_of_error_has_its_hold_back_issued_again_by_the_next_pass() {
+        use crate::backend::TorrentHandle;
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::AsyncReadExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let content = tmp.path().join("content");
+        tokio::fs::create_dir_all(&content).await.unwrap();
+        let payload = content.join("movie.bin");
+        write_payload(&payload, RETENTION_FILE_BYTES).await;
+        let (torrent_bytes, _) =
+            make_torrent_with_piece_length(&payload, RETENTION_PIECE as u32).await;
+
+        let client_dir = tmp.path().join("client");
+        let (efs, client_addr) = streaming_engine_fs(&client_dir).await;
+        let store = efs.piece_store();
+        efs.set_cache_budget(Some(RETENTION_BUDGET));
+
+        let engine = efs
+            .add_torrent(TorrentSource::Bytes(torrent_bytes.clone()), None)
+            .await
+            .expect("add");
+        let hash = engine.info_hash.clone();
+        engine.handle.handle.wait_until_initialized().await.unwrap();
+        // The viewer is playing file 0, and goes on playing it across the
+        // error: every pass here is a live one.
+        efs.live().open(
+            crate::retention::live::LiveEntity::Torrent {
+                info_hash: hash.clone(),
+                file_idx: 0,
+            },
+            false,
+        );
+        let _seeder = seeder_dialling(&content, &torrent_bytes, client_addr).await;
+
+        let mut reader = engine
+            .try_get_file_with_intent(
+                0,
+                0,
+                255,
+                crate::backend::priorities::PlaybackIntent::DirectInitial,
+                crate::backend::priorities::BufferProfile::Normal,
+            )
+            .await
+            .expect("reader");
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut done = 0usize;
+        let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
+        while done < 4 * 1024 * 1024 {
+            assert!(std::time::Instant::now() < deadline, "stalled at {done}");
+            let n = reader.read(&mut buf).await.expect("read");
+            assert_ne!(n, 0);
+            done += n;
+            if done % (1024 * 1024) < n {
+                efs.reconcile_tick().await;
+            }
+        }
+        drop(reader);
+        efs.reconcile_tick().await;
+        let committed_before = committed_of(&engine).await;
+        assert!(
+            !committed_before.is_empty(),
+            "nothing was committed, so the re-issue has nothing to leave announced"
+        );
+
+        // The bucket will take no new file. A process that ignores the mode
+        // (root, and some CI containers) cannot be shown this.
+        let bucket = store.torrent_dir(&hash).join("0");
+        std::fs::set_permissions(&bucket, std::fs::Permissions::from_mode(0o500)).unwrap();
+        if std::fs::File::create(bucket.join("probe")).is_ok() {
+            let _ = std::fs::remove_file(bucket.join("probe"));
+            std::fs::set_permissions(&bucket, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+        let errored = std::time::Instant::now() + TEST_WAIT_BOUND;
+        while engine.handle.run_state() != RunState::Error {
+            assert!(
+                std::time::Instant::now() < errored,
+                "the download never hit the unwritable bucket: {:?}",
+                engine.handle.run_state()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        std::fs::set_permissions(&bucket, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        engine
+            .handle
+            .restart_from_error()
+            .await
+            .expect("restart from error");
+        engine.handle.handle.wait_until_initialized().await.unwrap();
+        efs.reconcile_tick().await;
+
+        let policy = engine
+            .standing()
+            .await
+            .policies
+            .into_iter()
+            .find(|policy| policy.file_idx == 0)
+            .expect("the policy the install put in stands across the restart");
+        let pieces = policy.view.pieces.clone();
+        let announced = engine
+            .handle
+            .set_pieces_advertised(pieces.clone(), false)
+            .await
+            .expect("hold the file back");
+        assert_eq!(
+            announced,
+            policy.view.committed.len(),
+            "{announced} of the {} pieces of the file were still announced after the \
+             restart; only the {} committed ones should have been",
+            pieces.end - pieces.start,
+            policy.view.committed.len()
+        );
+    }
+
+    /// What a torrent's file 0 has committed for sharing, from the owner's
+    /// own cells.
+    async fn committed_of(
+        engine: &crate::engine::Engine<LibrqbitHandle>,
+    ) -> std::collections::BTreeSet<u32> {
+        engine
+            .standing()
+            .await
+            .policies
+            .into_iter()
+            .find(|policy| policy.file_idx == 0)
+            .map(|policy| policy.view.committed)
+            .unwrap_or_default()
     }
 }

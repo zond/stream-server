@@ -495,6 +495,18 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
             .map(|_changed| ())
     }
 
+    /// Which seed of this torrent's piece store is in force. It moves when
+    /// a restart out of an error builds a fresh store, which is the same
+    /// act that builds librqbit a fresh chunk tracker and loses every
+    /// hold-back the tracker carried.
+    ///
+    /// 0 for a torrent with no registered store: one held in Error, whose
+    /// pass concluded nothing over an unknown held set a step earlier, and
+    /// which announces nothing either way.
+    fn epoch(&self, store: &Arc<StoreRegistry>) -> u64 {
+        store.epoch(&self.info_hash).unwrap_or(0)
+    }
+
     async fn alone(&self, domain: &FileDomain, pieces: &[u32]) -> Vec<u32> {
         crate::retention::this_files_alone(&self.handle, domain.file_idx, pieces).await
     }
