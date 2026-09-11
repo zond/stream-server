@@ -4197,6 +4197,134 @@ fn an_archive_member_read_lets_the_torrent_be_stopped_again_when_it_is_done() ->
     Ok(())
 }
 
+/// A HEAD on a torrent the viewer has just left leaves it running.
+///
+/// The stream route's metadata-resolution guard used to ask the reconciler
+/// about every torrent it was handed, before the stream open had written
+/// the liveness cell. For a torrent with its metadata that asks about one
+/// nobody has claimed: the viewer watched X, moved to Y, and comes back to
+/// X before the timer has stopped it -- X is running, neither playing nor
+/// pinned, so the ladder's last arm answers `Stop`, and the guard dropped
+/// its peers moments before the GET's own reconcile started it again. A
+/// HEAD never opens a stream, so its stop was not undone at all.
+///
+/// **The window is one tick.** A stop is not held back by the dwell, so
+/// the server's own reconciler stops X within `RECONCILE_INTERVAL` of Y
+/// opening whatever the route does, and a pause seen after the HEAD is
+/// the guard's only if no tick can have landed in between. So each
+/// attempt starts on a tick -- it watches the timer stop a torrent just
+/// added, which nobody plays -- and a pause counts only if the HEAD was
+/// answered inside half an interval of the last reading that saw that
+/// torrent running. X still running after the HEAD is an answer whatever
+/// the timing: nothing but a stream open starts X.
+///
+/// A fresh server per attempt, because a torrent just added is the one
+/// thing the test can watch the timer stop without having started it
+/// itself.
+#[test]
+fn a_head_on_a_torrent_the_viewer_left_does_not_stop_it() -> anyhow::Result<()> {
+    const ATTEMPTS: usize = 5;
+    let budget = enginefs::reconcile::RECONCILE_INTERVAL / 2;
+    for _ in 0..ATTEMPTS {
+        if let Some(stopped) = head_on_the_torrent_left(budget)? {
+            assert!(
+                !stopped,
+                "a HEAD on a torrent nobody is playing stopped it, inside a tick \
+                 that could not have"
+            );
+            return Ok(());
+        }
+    }
+    anyhow::bail!("no attempt got from a reconciler tick to the HEAD in under {budget:?}")
+}
+
+/// One attempt of [`a_head_on_a_torrent_the_viewer_left_does_not_stop_it`],
+/// on a server of its own: whether the torrent left behind was stopped
+/// after the HEAD, or `None` when a stop could have been the timer's.
+fn head_on_the_torrent_left(budget: std::time::Duration) -> anyhow::Result<Option<bool>> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    // Roomy, for the ladder and for the route's gate: Y's GET wants bytes,
+    // and no arm above the last one may have an opinion.
+    let cache_root = resolved(&cache_dir.path().join("cache"));
+    stream_server::pretend_volume_space(&cache_root, u64::MAX);
+    stream_server::pretend_available_space(&cache_root, u64::MAX);
+    let (handle, base, left_hash, left_idx, _) =
+        lan_media_server(config_dir.path(), cache_dir.path(), src.path(), None)?;
+    let client = bearer_client(&handle)?;
+
+    let other_content = src.path().join("Other");
+    std::fs::create_dir_all(&other_content)?;
+    write_payload(&other_content.join("other.bin"), 64 * 1024);
+    let (other_torrent, other_hash) = real_torrent(&other_content);
+    seed_piece_store(&cache_root, &other_torrent, &other_content);
+    client
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": hex::encode(&other_torrent) }))
+        .send()?
+        .error_for_status()?;
+    let other_stats = stats_after_check(&client, &base, &other_hash)?;
+    let other_idx = file_index(&other_stats, "other.bin");
+
+    // The tick: nothing is playing, so the timer stops the torrent just
+    // added. The last reading that saw it running was taken before that.
+    let mut running_at = None;
+    let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
+    loop {
+        let asked = std::time::Instant::now();
+        if swarm_paused(&client, &base, &other_hash)? {
+            break;
+        }
+        running_at = Some(asked);
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the reconciler never stopped a torrent nobody was playing"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    // X opened, which starts it, and its read closed again: a read open on
+    // X is `playing`, and the ladder would answer `Run` whatever the guard
+    // did. Nothing of X is left to read by now -- the retention owner has
+    // reclaimed what nobody was playing, and no peer will bring it back --
+    // so its body parks, and the player hanging up is what ends it.
+    let anonymous = reqwest::blocking::Client::new();
+    let watched = anonymous
+        .get(format!("{base}/{left_hash}/{left_idx}"))
+        .send()?
+        .error_for_status()?;
+    drop(watched);
+    let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
+    while handle.background_traffic()?.playing {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the player hung up on X and its stream stayed registered"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    // Then Y: X is running and nobody's. Y's body parks like X's did, and
+    // is held open for the rest of the attempt.
+    let watching = anonymous
+        .get(format!("{base}/{other_hash}/{other_idx}"))
+        .send()?
+        .error_for_status()?;
+
+    // And back to X -- a HEAD first, as a player asks before it reads.
+    anonymous
+        .head(format!("{base}/{left_hash}/{left_idx}"))
+        .send()?
+        .error_for_status()?;
+    let stopped = swarm_paused(&client, &base, &left_hash)?;
+    let conclusive = !stopped || running_at.is_some_and(|at| at.elapsed() < budget);
+
+    drop(watching);
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(conclusive.then_some(stopped))
+}
+
 /// A stream request below the free-space floor is refused with a `507`
 /// once a retention pass has had its chance -- not "degraded to memory-only",
 /// which re-selected the same disk-backed engine and streamed to the disk

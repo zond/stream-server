@@ -296,27 +296,44 @@ where
 /// Counts a request as active while its magnet metadata and automatic file
 /// selection are being resolved. A normal `FileHandle` takes over this count
 /// once streaming begins.
+///
+/// What reads the count is everything that asks whether a request is on an
+/// engine, and none of it is the reconciler's ladder: the housekeeping
+/// sweep, which would otherwise remove the engine of a magnet that is still
+/// resolving for somebody; `EngineFS::playback_is_live`, which is the
+/// activity light and what turns uploads on with sharing off; the cleanup
+/// of a torrent a refused pin added; and the diagnostics snapshot.
 struct MetadataResolutionGuard {
     active_readers: Arc<AtomicUsize>,
 }
 
 impl MetadataResolutionGuard {
-    /// Count the request as active, and ask the engine's reconciler whether
-    /// this torrent should now be running.
+    /// Count the request as active, and -- for a torrent that has no
+    /// metadata yet -- ask the engine's reconciler whether it should now
+    /// be running.
     ///
-    /// **The counter first, the reconcile after, and awaited.** The count
-    /// is one of the conditions the ladder reads as `playing`
-    /// (`BackendEngineFS::torrent_is_active` asks the engine's own reader
-    /// count), so a reconcile taken before the increment is a decision
-    /// about a torrent nobody is watching. And it is awaited rather than
-    /// spawned because the unpause it may issue is what un-wedges a torrent
-    /// that came back stopped from the last process: the reader this guard
-    /// exists for opens on the next line.
+    /// **Only without metadata.** The ladder reads `playing` from the
+    /// liveness cell and the reads open on the torrent, and this runs
+    /// before the stream open writes the cell, so for a torrent that has
+    /// its metadata the question is about one nobody has claimed yet. A
+    /// torrent the viewer is coming back to -- still running from before
+    /// the last switch, not yet stopped by the timer -- is neither playing
+    /// nor pinned, so the ladder's last arm answers `Stop`, and a
+    /// `PlaybackStart` is not held back by the dwell: this stopped it,
+    /// dropping its peers, only for the GET's `focus_torrent` to start it
+    /// again after the disk gate. A HEAD opens no stream at all, so its
+    /// reconcile had no reason to be asked. The stream's own reconcile is
+    /// `focus_torrent`'s, once the cell is written.
     ///
-    /// It used to read `if engine.idle_paused.load()` and resume only then
-    /// -- and that flag is `false` in a fresh process while the pause it
-    /// describes was persisted and is not, so after every restart this was
-    /// dead code in exactly the case it existed for.
+    /// A torrent without metadata is the one case where the answer does
+    /// not depend on the cell: the ladder answers `Run` for it, because a
+    /// magnet has to stay connected to resolve. Asked here and awaited, a
+    /// stopped magnet starts resolving now rather than at the next tick.
+    ///
+    /// The reading goes stale if the metadata lands between it and the
+    /// ladder's own, which is then the old question about an unclaimed
+    /// torrent -- once, at the moment a magnet resolves, and put right by
+    /// `focus_torrent` on a GET.
     async fn acquire<B: enginefs::backend::TorrentBackend + 'static>(
         engine_fs: &enginefs::BackendEngineFS<B>,
         engine: &Arc<enginefs::engine::Engine<B::Handle>>,
@@ -326,7 +343,7 @@ impl MetadataResolutionGuard {
         let guard = Self { active_readers };
 
         engine.touch();
-        if !engine.handle.manages_playback_lifecycle() {
+        if !engine.handle.manages_playback_lifecycle() && !engine.handle.has_metadata().await {
             engine_fs
                 .reconcile_hash(
                     &engine.info_hash,
