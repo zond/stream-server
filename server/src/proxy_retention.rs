@@ -1457,7 +1457,7 @@ mod tests {
 
         assert!(
             inside_something_live(&retention, &dir, 12),
-            "the chunk under the player's head is not the cleaner's to take"
+            "the chunk under the player's head is nothing's to take"
         );
         assert!(
             inside_something_live(&retention, &dir, 15),
@@ -1488,7 +1488,7 @@ mod tests {
         assert_eq!(dir.held().unwrap().len(), 16, "every chunk is still here");
         assert!(
             inside_something_live(&retention, &dir, 15),
-            "and a player is inside it, so the cleaner is not offered it either"
+            "and a player is inside it, so nothing may take it either"
         );
     }
 
@@ -1538,7 +1538,7 @@ mod tests {
         for index in 0..14u64 {
             assert!(
                 inside_something_live(&retention, &dir, index),
-                "chunk {index} is promised to an open body, so it is not the cleaner's either"
+                "chunk {index} is promised to an open body, so nothing may take it either"
             );
         }
 
@@ -1776,7 +1776,7 @@ mod tests {
         );
         assert!(
             inside_something_live(&retention, &dir, 15),
-            "the cleaner is refused the bytes the player's next request will ask for"
+            "the bytes the player's next request will ask for are refused to every deleter"
         );
         assert!(!inside_something_live(&retention, &dir, 0));
     }
@@ -2095,13 +2095,13 @@ mod tests {
         );
         assert!(
             inside_something_live(&retention, &dir, 15),
-            "and the cleaner is refused it, because that is where the player \
+            "and it is refused to every deleter, because that is where the player \
              stopped and where its next request will start"
         );
         assert!(
             !inside_something_live(&retention, &dir, 0),
             "while the head of the film, which the window left behind long \
-             ago, is the cleaner's for the asking"
+             ago, is slack and goes"
         );
         drop(reader);
     }

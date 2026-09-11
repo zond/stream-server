@@ -13741,7 +13741,7 @@ mod tests {
         assert_eq!(
             engine.standing().await.policies.len(),
             1,
-            "so the cleaner is told about the policy standing on it"
+            "so a reading of what it holds names the policy standing on it"
         );
     }
 

@@ -2628,7 +2628,7 @@ fn the_cleaner_leaves_the_chunks_a_proxied_player_is_inside() -> anyhow::Result<
     assert_eq!(
         taken_from(&inside, &left),
         Vec::<u64>::new(),
-        "the cleaner took chunks the player is inside: {inside:?} were on the \
+        "the clean took chunks the player is inside: {inside:?} were on the \
          disk and {left:?} are (the run it kept was {kept:?})"
     );
     assert!(
