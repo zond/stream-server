@@ -3168,7 +3168,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             // is the reconciler's, and it has to be asked *after* the
             // activity this call is part of is registered, or it reads a
             // torrent nobody is watching: the caller therefore asks it
-            // itself once it has finished registering (`on_stream_start`).
+            // itself once it has finished registering (`on_stream_start`,
+            // or the stream route after its disk gate, `focus_torrent`).
         }
 
         if !is_multifile {
@@ -3254,11 +3255,14 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         // nothing while its subtitle's open selected it, or while the next
         // episode was opened before the last one's body closed.
         engine.touch();
-        // No reconcile here. Its caller reaches it through `activate_file`
-        // and asks the reconciler for itself once it has finished
-        // registering its activity (`on_stream_start`), so a call here
-        // would be a second decision about the same torrent in the same
-        // request -- and one taken from a half-registered reading.
+        // No reconcile here. An open reaches it through `activate_file`
+        // and its caller asks the reconciler once the activity is
+        // registered (`on_stream_start`, or the stream route after its
+        // disk gate), so a call here would be a second decision about the
+        // same torrent in the same request -- and one taken from a
+        // half-registered reading. A hand-on (`hand_live_on`) moves the
+        // selection between two files already being read, and leaves what
+        // that changes to the next tick.
 
         Self::reconcile_multifile_engine(engine, Some(file_idx), hot_file, generation, source)
             .await;
@@ -4248,9 +4252,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
 
     /// Re-plan the engine's want-set from whatever multi-file selection is
     /// currently active (or none) so a pin change is applied without
-    /// disturbing playback. The one hot-file caller (`routes/stream.rs`)
-    /// always passes the active file as the hot file, so dropping the hot
-    /// plan here loses nothing.
+    /// disturbing playback. The hot file is not recorded, so this drops the
+    /// one plan that has one -- an aside's ([`Self::activate_file`]), a
+    /// subtitle beside the film -- from the want-set. The film stays, and
+    /// the subtitle's own read still fetches its pieces: librqbit serves a
+    /// stream's next pieces whether or not its file is selected.
     async fn reconcile_with_active_selection(
         &self,
         engine: Arc<Engine<B::Handle>>,
@@ -4318,7 +4324,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         // anything either. The last stream ending is not a decision, it is
         // a change of condition: the reconciler reads `idle_for` from
         // `Engine::last_active_at`, which was stamped while this stream was
-        // *running* -- by `on_stream_start`'s own reconcile and by every
+        // *running* -- by the reconcile its open asked for and by every
         // tick that read the registers true since -- and stops the torrent
         // on the first tick after `INACTIVE_TORRENT_PAUSE_GRACE` of quiet.
         // One ladder, with no task per stream deciding a second time.
