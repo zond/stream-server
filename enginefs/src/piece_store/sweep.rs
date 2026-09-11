@@ -468,6 +468,24 @@ mod tests {
         assert!(root.join(ADOPTED).is_dir());
     }
 
+    /// A dormant delete renames the directory to `<hash>.deleting-<nonce>`
+    /// before it walks it, and a process killed in the walk leaves that
+    /// behind. It is not the hash's name, so even with the hash pinned
+    /// again the sweep takes it.
+    #[test]
+    fn a_delete_a_killed_process_left_goes_even_under_a_pinned_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join(".pieces");
+        piece(&root, ADOPTED, "0", "1", 512);
+        let leftover = format!("{ADOPTED}.deleting-18a2b-0");
+        piece(&root, &leftover, "0", "2", 512);
+
+        let report = sweep_unadopted(&StoreRoot::new(root.clone()), &claims(&[ADOPTED]));
+        assert_eq!(report.removed, 1);
+        assert!(!root.join(&leftover).exists());
+        assert!(root.join(ADOPTED).join("0").join("1").is_file());
+    }
+
     #[test]
     fn a_store_that_has_never_been_written_is_not_a_problem() {
         let tmp = tempfile::tempdir().unwrap();

@@ -314,6 +314,19 @@ fn probe_at_existing_ancestor(
     Err(last_error.unwrap_or_else(|| std::io::Error::other("empty path")))
 }
 
+/// A name no other deletion in this process or an earlier one has used:
+/// the time and a counter. See `BackendEngineFS::delete_dormant_download_data`,
+/// which renames a directory to it before deleting it -- a clash with a
+/// leftover a killed process did not finish would make that rename fail.
+fn deletion_nonce() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_nanos())
+        .unwrap_or(0);
+    format!("{nanos:x}-{}", NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
 /// `Fn(path) -> u64` probe of the volume holding a path: available bytes
 /// (`fs4::available_space`), or an identity (`volume_id`) telling two paths
 /// on the same volume apart from two on different ones.
@@ -3728,24 +3741,80 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
         // Asked at the door, because every question above it was an
         // `await` ago: a torrent added, restored or restarted since is one
-        // whose store registered at `init`, and `remove_dir_all` of its
-        // directory would take the pieces of a live have-set out from under
-        // it. The same guard `crate::retention::unlink` makes before a
-        // claimless delete, for the same reason and at the same instant --
-        // and, like that one, the safe direction is to refuse: a directory
-        // left behind is swept at the next launch, where bytes deleted
-        // under a running check are gone.
-        if self.registry.is_registered(info_hash) {
-            tracing::warn!(
-                info_hash,
-                file_idx,
-                "a store registered for this torrent while its data was being deleted; \
-                 leaving it to the torrent that now holds it"
-            );
-            return false;
+        // whose store registered at `init`, and deleting its directory
+        // would take the pieces of a live have-set out from under it. The
+        // same guard `crate::retention::unlink` makes before a claimless
+        // delete, for the same reason and at the same instant -- and, like
+        // that one, the safe direction is to refuse: a directory left
+        // behind is swept at the next launch, where bytes deleted under a
+        // running check are gone.
+        //
+        // **And the directory leaves the hash's name before a byte goes.**
+        // The door is one instant and `remove_dir_all` is a walk of the
+        // whole download: a torrent that registered after the door and
+        // before the walk ended found half its pieces, and built a have-set
+        // from them. Renamed with nothing between the question and the
+        // rename, the hash's directory is either whole or gone, and what is
+        // deleted afterwards is under a name no store answers to (and the
+        // launch sweep's, if the process dies in the walk: it keeps only
+        // pinned hashes' own names).
+        enum Moved {
+            Registered,
+            Absent,
+            Out,
+            Failed(std::io::Error),
         }
         let folder = self.piece_store().torrent_dir(info_hash);
-        match tokio::fs::remove_dir_all(&folder).await {
+        let doomed = folder.with_file_name(format!(
+            "{}.deleting-{}",
+            info_hash.to_ascii_lowercase(),
+            deletion_nonce()
+        ));
+        let moved = {
+            let registry = Arc::clone(&self.registry);
+            let hash = info_hash.to_string();
+            let (folder, doomed) = (folder.clone(), doomed.clone());
+            tokio::task::spawn_blocking(move || {
+                if registry.is_registered(&hash) {
+                    return Moved::Registered;
+                }
+                match std::fs::rename(&folder, &doomed) {
+                    Ok(()) => Moved::Out,
+                    // "Nothing there" is not "freed", and under this storage
+                    // it is the ordinary answer for a hash nothing ever
+                    // downloaded: the flag says what left the disk, never
+                    // what was asked for.
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Moved::Absent,
+                    Err(error) => Moved::Failed(error),
+                }
+            })
+            .await
+            .unwrap_or_else(|join| Moved::Failed(std::io::Error::other(join.to_string())))
+        };
+        match moved {
+            Moved::Out => {}
+            Moved::Registered => {
+                tracing::warn!(
+                    info_hash,
+                    file_idx,
+                    "a store registered for this torrent while its data was being deleted; \
+                     leaving it to the torrent that now holds it"
+                );
+                return false;
+            }
+            Moved::Absent => return false,
+            Moved::Failed(error) => {
+                tracing::warn!(
+                    info_hash,
+                    file_idx,
+                    folder = %folder.display(),
+                    %error,
+                    "could not take the dormant download's pieces out of its name"
+                );
+                return false;
+            }
+        }
+        match tokio::fs::remove_dir_all(&doomed).await {
             Ok(()) => {
                 tracing::info!(
                     info_hash,
@@ -3755,17 +3824,13 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 );
                 true
             }
-            // "Nothing there" is not "freed", and under this storage it is
-            // the ordinary answer for a hash nothing ever downloaded: the
-            // flag says what left the disk, never what was asked for.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
             Err(error) => {
                 tracing::warn!(
                     info_hash,
                     file_idx,
-                    folder = %folder.display(),
+                    folder = %doomed.display(),
                     %error,
-                    "could not delete the dormant download's pieces"
+                    "could not delete the dormant download's pieces; the next launch sweep takes what is left"
                 );
                 false
             }
@@ -15232,6 +15297,63 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "there was no torrent to remove"
+        );
+    }
+
+    /// **The hash's directory is whole or gone, never half-deleted.**
+    ///
+    /// The registry is asked at the door, and `remove_dir_all` is a walk of
+    /// the whole download after it: a torrent whose store registered in
+    /// the walk found half its pieces under its name. So the directory is
+    /// renamed out of the hash's name before anything is deleted, and a
+    /// walk that stops partway -- here a bucket the process may not delete
+    /// in -- leaves nothing under that name, only a leftover the launch
+    /// sweep takes. A process that can delete through a read-only
+    /// directory proves nothing here, and the test says so.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dormant_delete_takes_the_directory_out_of_the_hashs_name_first() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let enginefs = BackendEngineFS::new_with_backend(
+            FakeBackend::new(Vec::new()),
+            HashMap::new(),
+            root.path().join("cache"),
+            root.path().join("rqbit-downloads"),
+        );
+        let pieces = enginefs.piece_store().path().to_path_buf();
+        let folder = pieces.join(TEST_HASH);
+        std::fs::create_dir_all(folder.join("0")).unwrap();
+        std::fs::write(folder.join("0").join("1"), [7u8; 4096]).unwrap();
+        let bucket = folder.join("0");
+        std::fs::set_permissions(&bucket, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::remove_file(bucket.join("1")).is_ok() {
+            eprintln!("this process deletes through a read-only directory; nothing to prove");
+            return;
+        }
+        let pins = crate::piece_store::PinSet::from([(TEST_HASH.to_string(), vec![0usize])]);
+        enginefs.apply_pins(Some(pins)).await;
+
+        let outcome = enginefs.unpin_download(TEST_HASH, 0, true).await.unwrap();
+        let left: Vec<std::path::PathBuf> = std::fs::read_dir(&pieces)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        for dir in &left {
+            let _ = std::fs::set_permissions(dir.join("0"), std::fs::Permissions::from_mode(0o755));
+        }
+        assert!(!outcome.deleted_files, "the walk did not finish");
+        assert!(
+            !folder.exists(),
+            "a half-deleted directory stood under the hash's name"
+        );
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert!(
+            left[0]
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&format!("{TEST_HASH}.deleting-"))),
+            "{left:?}"
         );
     }
 
