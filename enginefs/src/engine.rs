@@ -502,11 +502,50 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
             .map(|held| held.in_range(Self::extent(domain)))
     }
 
+    /// A hold-back leaves a pinned file's pieces announced. The piece an
+    /// unpinned file shares with a pinned neighbour is in its extent, which
+    /// its policy holds back when it is installed and its slack pass holds
+    /// back again on every tick; nothing takes that piece, since it is the
+    /// pinned file's ([`Self::alone`]), so the entity never empties and
+    /// nothing ever lifted the hold-back. The pinned file was kept whole and
+    /// one piece of it was announced to nobody for as long as the pin stood.
+    ///
+    /// Given back after the hold-back, from a reading of the pin set taken
+    /// after it: a pin that landed while the hold-back was being made is
+    /// seen, and one that lands later is seen by the next hold-back -- at
+    /// the latest the slack pass the file gets once nobody plays it, which
+    /// holds back again on every tick. A hold-back of a pinned span has no
+    /// reclaim behind it to protect, because every reclaim reads the pin
+    /// set again after this and leaves the span alone. Refused, the give
+    /// back is logged and the hold-back still stands as asked: the caller's
+    /// deletions depend on that, not on this.
     async fn advertise(&self, pieces: Range<u32>, on: bool) -> anyhow::Result<()> {
         self.handle
-            .set_pieces_advertised(pieces, on)
-            .await
-            .map(|_changed| ())
+            .set_pieces_advertised(pieces.clone(), on)
+            .await?;
+        if on {
+            return Ok(());
+        }
+        for span in pinned_spans(&self.handle, &self.pinned, None).await {
+            let shared = pieces.start.max(span.start)..pieces.end.min(span.end);
+            if shared.is_empty() {
+                continue;
+            }
+            if let Err(error) = self
+                .handle
+                .set_pieces_advertised(shared.clone(), true)
+                .await
+            {
+                tracing::warn!(
+                    info_hash = %self.info_hash,
+                    first = shared.start,
+                    end = shared.end,
+                    error = %format!("{error:#}"),
+                    "could not announce a pinned file's pieces a neighbour held back; the next hold-back tries again"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Which seed of this torrent's piece store is in force. It moves when

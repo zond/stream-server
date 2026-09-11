@@ -9939,6 +9939,58 @@ mod tests {
         );
     }
 
+    /// **What a file beside a pinned one holds back never hides the piece
+    /// the two share.**
+    ///
+    /// An unpinned file's policy holds its whole extent back when it is
+    /// installed, and its slack pass does it again on every tick for as
+    /// long as the entity holds anything. The boundary piece a pinned
+    /// neighbour shares is in that extent, and the slack pass never takes
+    /// it -- it is the pinned file's -- so the entity never empties and the
+    /// hold-back is never lifted: one piece of a file the user asked to
+    /// keep and share, announced to nobody for as long as the pin stands.
+    #[tokio::test]
+    async fn a_pinned_neighbours_boundary_piece_stays_announced() {
+        let (enginefs, counters) = a_neighbour_the_backend_does_not_want_yet();
+        *counters.wanted_files.lock().unwrap() = Some([0, 1, 2].into_iter().collect());
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        engine.pinned_files.write().insert(2);
+        enginefs.set_cache_budget(Some(50));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in 4u32..9 {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let _store = seeded_store(&enginefs, &engine);
+        engine.begin_retention(1).await;
+        engine.note_playhead(1, 0);
+        engine
+            .retain(enginefs.store_registry(), &playing(1))
+            .await
+            .expect("a pass");
+        nothing_torrent_is_playing(&enginefs);
+        enginefs.drop_slack().await;
+        assert!(
+            !bucket.join("4").exists() && bucket.join("8").is_file(),
+            "the second episode went, and the piece it shares with the pinned one stayed"
+        );
+        let advertised = counters.advertised.lock().unwrap().clone();
+        assert!(
+            advertised
+                .iter()
+                .any(|(range, on)| !on && range.contains(&4)),
+            "the second episode was held back: {advertised:?}"
+        );
+        assert!(
+            advertised
+                .iter()
+                .rev()
+                .find(|(range, _)| range.contains(&8))
+                .is_none_or(|(_, on)| *on),
+            "piece eight is the pinned episode's, and announced: {advertised:?}"
+        );
+    }
+
     /// The set the embedder names is applied at startup to the torrents the
     /// backend restored; the hash is matched however it was cased, and a
     /// pin of a file the torrent does not have is dropped.
