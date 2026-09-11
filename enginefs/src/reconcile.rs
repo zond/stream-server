@@ -92,10 +92,9 @@ pub enum Trigger {
     /// not made to wait out a dwell that exists to protect an announce
     /// budget.
     ///
-    /// The test is *waiting*, not *asked*. A user moving the seeding switch
-    /// asked for something too, and that is still a [`Self::Timer`]
-    /// decision: nothing is about to open a reader, so there is no reason
-    /// to spend either concession on it.
+    /// The test is *waiting*, not *asked*: a caller that is not about to
+    /// open a reader asks as a [`Self::Timer`], so neither concession is
+    /// spent on it.
     PlaybackStart,
 }
 
@@ -148,8 +147,6 @@ pub struct Conditions {
     /// what the platform can address -- because restarting one of those
     /// puts it straight back where it was.
     pub out_of_space: bool,
-    /// The user's seeding setting (session-wide).
-    pub seeding_enabled: bool,
     /// The info dictionary is known. A magnet that is still resolving one
     /// has no files, no length and nothing to write.
     pub has_metadata: bool,
@@ -732,7 +729,6 @@ mod tests {
             settled: true,
             playing: true,
             pinned: false,
-            seeding_enabled: true,
             has_metadata: true,
             finished: false,
             available: Some(u64::MAX),
@@ -761,17 +757,6 @@ mod tests {
             desired(&left, Trigger::PlaybackStart),
             Decision::Stop,
             "the trigger says why the question is asked, never that anything is playing"
-        );
-        assert_eq!(
-            desired(
-                &Conditions {
-                    seeding_enabled: false,
-                    ..left
-                },
-                Trigger::Timer
-            ),
-            Decision::Stop,
-            "and seeding is what a pinned torrent does; this one has no bytes to seed"
         );
         assert_eq!(
             desired(
@@ -934,14 +919,13 @@ mod tests {
 
     /// A magnet that has not resolved its info dictionary is fetching that
     /// dictionary from the swarm and writing no file data. Stopping it is
-    /// how a magnet never resolves -- so not even a full volume, seeding
-    /// off and a day of idleness stops one.
+    /// how a magnet never resolves -- so not even a full volume and a day
+    /// of idleness stops one.
     #[test]
     fn a_resolving_magnet_runs_whatever_else_is_true() {
         let resolving = Conditions {
             has_metadata: false,
             available: Some(0),
-            seeding_enabled: false,
             playing: false,
             ..healthy()
         };

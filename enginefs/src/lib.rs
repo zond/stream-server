@@ -1418,7 +1418,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             // -- the episode just started, parked for fifteen seconds.
             playing: self.live.is_torrent(&engine.info_hash) || engine.retention.readers() > 0,
             pinned: engine.is_pinned(),
-            seeding_enabled: self.seeding_enabled.load(Ordering::Relaxed),
             has_metadata: engine.handle.has_metadata().await,
             finished: engine.handle.is_finished().await,
             available: self.volumes.available(),
@@ -1438,7 +1437,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             run_state = ?conditions.run_state,
             playing = conditions.playing,
             pinned = conditions.pinned,
-            seeding_enabled = conditions.seeding_enabled,
             has_metadata = conditions.has_metadata,
             finished = conditions.finished,
             available = ?conditions.available,
@@ -1517,7 +1515,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     available = ?conditions.available,
                     playing = conditions.playing,
                     pinned = conditions.pinned,
-                    seeding_enabled = conditions.seeding_enabled,
                     "torrent_stopped_by_reconciler"
                 );
                 true
@@ -2644,49 +2641,14 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// Turn sharing while idle on or off: what the upload switch reads
     /// ([`Self::apply_upload_switch`]), applied before this returns.
     ///
-    /// It then asks the reconciler about every torrent at once, which
-    /// decides nothing new today: `seeding_enabled` is still copied into
-    /// [`crate::reconcile::Conditions`], but no arm of the ladder reads it
-    /// since the idle arm went -- the setting governs uploading, and the
-    /// ladder governs whether a torrent runs. The pass is kept as it is,
-    /// and so is what it has to get right:
-    ///
-    /// [`crate::reconcile::Trigger::Timer`], not `PlaybackStart`, even
-    /// though a person did move the switch: nobody is *waiting* on the
-    /// answer, no reader is about to open, and the two things that trigger
-    /// changes are both concessions made to someone who is. A torrent
-    /// stopped for want of space keeps its resume margin here, which is
-    /// what stops this call restarting torrents into a nearly-full volume
-    /// -- and `server::run` applies the persisted setting at startup, over
-    /// every torrent the last process left stopped, where "a user is
-    /// waiting" would be simply false.
-    ///
-    /// **Awaited, and the registry dropped first.** The engines are
-    /// snapshotted out of `self.engines` and the read guard dropped before
-    /// the first `.await`: it is a write-preferring `RwLock`, so a read
-    /// guard held across an await parks every later reader behind any
-    /// writer that queues meanwhile -- and the await here reaches
-    /// `Session::unpause`, which flushes librqbit's persistence file. One
-    /// torrent's disk write would otherwise stall every route that wants to
-    /// look an engine up.
-    ///
-    /// It used to spawn instead, over `if idle_paused.swap(false) &&
-    /// resume()`, which is `false && ...` in a fresh process: dead code
-    /// after every restart, and a restart is exactly when torrents come up
-    /// stopped with nothing in this process able to say why.
+    /// That is all it does. It used to ask the reconciler about every
+    /// torrent as well, which decided nothing: the ladder governs whether a
+    /// torrent runs, and no arm of it has read this setting since the idle
+    /// arm went.
     pub async fn set_seeding_enabled(&self, enabled: bool) {
         self.seeding_enabled.store(enabled, Ordering::Relaxed);
         self.apply_upload_switch().await;
         tracing::info!(seeding_enabled = enabled, "Seeding policy updated");
-
-        let hashes: Vec<String> = {
-            let engines = self.engines.read().await;
-            engines.keys().cloned().collect()
-        };
-        for hash in hashes {
-            self.reconcile_hash(&hash, crate::reconcile::Trigger::Timer)
-                .await;
-        }
     }
 
     pub fn seeding_enabled(&self) -> bool {
@@ -8365,64 +8327,6 @@ mod tests {
         // room *now* is not what the ladder is waiting for, and the volume
         // is over the floor.
         assert!(!engine.is_stopped_for_space().await);
-    }
-
-    /// The seeding switch reconciles every torrent there is, and does not
-    /// hold the engine registry while it waits for the backend.
-    ///
-    /// `engines` is a write-preferring `RwLock`: a read guard held across
-    /// an await parks every later reader behind any writer that queues
-    /// meanwhile, and the await here is `Session::unpause`, which flushes
-    /// librqbit's persistence file. One torrent's disk write would stall
-    /// every route that wants to look an engine up.
-    ///
-    /// The torrent that starts is a **pinned** one. Seeding has no
-    /// consequence of its own on the ladder any more -- what a torrent
-    /// nobody is playing does with seeding on is fetch a film nobody is
-    /// watching into a cache whose next pass deletes it -- so the switch's
-    /// reconcile is what is under test here and the pin is what gives it
-    /// something to do. Written straight into the pin set, because
-    /// `pin_download` reconciles for itself and would record a transition
-    /// for the dwell to hold.
-    #[tokio::test]
-    async fn the_seeding_switch_reconciles_without_holding_the_engine_registry() {
-        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
-        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
-        let enginefs = Arc::new(enginefs);
-        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
-        enginefs
-            .get_engine(TEST_HASH)
-            .await
-            .expect("the fixture's engine")
-            .pinned_files
-            .write()
-            .insert(0);
-        stop_torrent(&enginefs, TEST_HASH).await;
-
-        counters.hold_start.store(true, Ordering::SeqCst);
-        let switch = tokio::spawn({
-            let enginefs = enginefs.clone();
-            async move { enginefs.set_seeding_enabled(true).await }
-        });
-        assert!(
-            wait_until(TEST_WAIT_BOUND, || counters
-                .start_torrent
-                .load(Ordering::SeqCst)
-                == 1)
-            .await,
-            "the start reached the backend and is waiting there"
-        );
-
-        let engines = enginefs.engines.clone();
-        let writer = tokio::spawn(async move { drop(engines.write().await) });
-        assert!(
-            wait_until(TEST_WAIT_BOUND, || writer.is_finished()).await,
-            "a writer on the engine registry is not parked behind that call"
-        );
-
-        counters.start_gate.notify_one();
-        switch.await.expect("the switch finished");
-        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
     }
 
     /// **With sharing off, nothing uploads until a player reads, and the
