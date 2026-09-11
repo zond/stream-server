@@ -3198,6 +3198,21 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
     let (torrent, info_hash) = real_torrent(&content);
 
     let cache_root = resolved(&cache_dir.path().join("cache"));
+
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_root.clone()),
+        ..offline_config()
+    })?;
+    // Written *after* the server opened, and that is the whole of why it is
+    // here rather than above: a previous release's whole-file data is the
+    // one category with no owner, and the launch sweep
+    // (`piece_store::sweep_legacy_downloads`) is what takes it -- at launch,
+    // and nowhere else. Put here, these stand for the life of the process
+    // exactly as they would in one that had already booted, which is what
+    // makes them a witness that no *route* takes them.
+    //
     // An idle leftover with no engine managing it at all -- ordinary cache
     // from a torrent nothing is tracking any more.
     let idle = cache_root
@@ -3215,13 +3230,6 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
         content.join("subtitle.srt"),
         root_folder.join("subtitle.srt"),
     )?;
-
-    let handle = stream_server::start(stream_server::ServerConfig {
-        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
-        config_dir: Some(config_dir.path().join("config")),
-        cache_dir: Some(cache_root.clone()),
-        ..offline_config()
-    })?;
     // Already "streamed": the data sits in the piece store, as it would
     // after playback, and `POST /create` below picks it up from there.
     seed_piece_store(&cache_root, &torrent, &content);

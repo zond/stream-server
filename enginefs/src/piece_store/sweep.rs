@@ -142,13 +142,172 @@ pub async fn sweep_before_session(download_dir: &Path, record: &PinRecord) -> Sw
     }
     let root = StoreRoot::in_download_dir(download_dir);
     let claims = record.claims();
-    match tokio::task::spawn_blocking(move || sweep_unadopted(&root, &claims)).await {
+    let legacy_root = download_dir.to_path_buf();
+    match tokio::task::spawn_blocking(move || {
+        let mut report = sweep_unadopted(&root, &claims);
+        // Beside the store, not under it, and nothing else will ever take
+        // them: see `sweep_legacy_downloads`. On the same hop, because both
+        // are `read_dir` plus `remove_dir_all` on the thread opening the
+        // session.
+        let legacy = sweep_legacy_downloads(&legacy_root);
+        report.removed += legacy.removed;
+        report.freed_bytes += legacy.freed_bytes;
+        report.errors += legacy.errors;
+        report
+    })
+    .await
+    {
         Ok(report) => report,
         Err(error) => {
             tracing::warn!(%error, "the piece store sweep did not finish");
             SweepReport::default()
         }
     }
+}
+
+/// Directories under the download root that belong to something else, each
+/// of which reconciles itself.
+///
+/// `.pieces` is [`sweep_unadopted`]'s, and it is the pin record that decides
+/// what survives there. `.proxy` is the proxy cache's, emptied by its own
+/// launch sweep. `.archives` is the archive scratch's, which has a lifetime
+/// of its own. Handing any of them to [`sweep_legacy_downloads`] would be
+/// one sweep deciding another's business, and for `.pieces` it would delete
+/// every pin.
+const NOT_OURS: [&str; 5] = [".pieces", ".proxy", ".archives", ".metadata", ".cache"];
+
+/// Whether `name`, directly under the download root, is something the
+/// session writes and reads.
+///
+/// Taken from the cache cleaner's `is_session_artifact`, which is what
+/// exempted these from its walk for as long as it had one. librqbit keeps
+/// its resume data beside the data itself -- `session.json`, a `.torrent`
+/// and a `.bitv` per info hash -- and the DHT its bootstrap; the pin record
+/// is this crate's own, and its atomic write leaves a `pinned-downloads
+/// .json.tmp-<n>` behind if it is interrupted.
+fn is_session_artifact(name: &str) -> bool {
+    let name = name.strip_suffix(".tmp").unwrap_or(name);
+    if matches!(
+        name,
+        "session.json" | "pinned-downloads.json" | "dht.json" | "dht-bootstrap.json"
+    ) {
+        return true;
+    }
+    if let Some(rest) = name.strip_prefix("pinned-downloads.json.tmp-") {
+        return !rest.is_empty();
+    }
+    match name.rsplit_once('.') {
+        Some((stem, "torrent" | "bitv")) => {
+            stem.len() == 40 && stem.bytes().all(|b| b.is_ascii_hexdigit())
+        }
+        _ => false,
+    }
+}
+
+/// Remove what an **older version of this server** left beside the store:
+/// whole-file downloads at `<download dir>/<torrent name>/<file>`.
+///
+/// **This is the one category of byte with no owner.** Everything this
+/// server writes now goes through the piece store or the proxy cache, and
+/// both have an owner that bounds them and a launch sweep that reconciles
+/// them. A whole-file download predates all of it: no store speaks for it,
+/// no policy bounds it, no pass will ever look at it, and until the cache
+/// cleaner was deleted its walk was the only thing that ever took one.
+/// Left alone it is invisible disk usage that grows once and never shrinks
+/// -- the failure this design exists to stop producing, wearing the clothes
+/// of a previous release.
+///
+/// So it goes, once, at launch, and the rule is the cleaner's own: what is
+/// not another component's directory ([`NOT_OURS`]) and not a session
+/// artifact ([`is_session_artifact`]) is a previous release's data.
+///
+/// **It runs where the session's own data lives**, so the exemptions are
+/// load-bearing rather than tidy: removing `session.json` would lose every
+/// torrent the user has, and removing `.pieces` would delete every pin.
+/// A name this server has never written is removed with them, which is the
+/// same judgement [`sweep_unadopted`] makes about its own root: the
+/// directory is this server's, and the alternative to deleting what we do
+/// not recognise is keeping it for ever.
+///
+/// Skipped for an unreadable pin record, like [`sweep_before_session`] and
+/// for the same reason: that boot keeps what the disk held.
+pub fn sweep_legacy_downloads(download_dir: &Path) -> SweepReport {
+    let mut report = SweepReport::default();
+    let Ok(entries) = std::fs::read_dir(download_dir) else {
+        return report;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            report.errors += 1;
+            continue;
+        };
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            // A name this process cannot spell is one it cannot reason
+            // about, and deleting it would be deleting something unread.
+            report.errors += 1;
+            continue;
+        };
+        if NOT_OURS.contains(&name) || is_session_artifact(name) {
+            continue;
+        }
+        let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+        let freed = if is_dir {
+            tree_bytes(&path)
+        } else {
+            std::fs::metadata(&path)
+                .as_ref()
+                .map(crate::chunk_store::occupied_bytes)
+                .unwrap_or(0)
+        };
+        let removed = if is_dir {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match removed {
+            Ok(()) => {
+                tracing::info!(
+                    path = %path.display(),
+                    freed,
+                    "swept a previous release's whole-file download"
+                );
+                report.removed += 1;
+                report.freed_bytes += freed;
+            }
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "could not sweep legacy download data");
+                report.errors += 1;
+            }
+        }
+    }
+    report
+}
+
+/// What a tree occupies, as the volume counts it.
+///
+/// A walk, unlike [`sweep_unadopted`]'s figure, because there is no store to
+/// ask: these bytes are exactly the ones nothing keeps a reading of. It runs
+/// once per launch over what a previous release left, and never again once
+/// that is gone.
+fn tree_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| {
+            let path = entry.path();
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                tree_bytes(&path)
+            } else {
+                std::fs::metadata(&path)
+                    .as_ref()
+                    .map(crate::chunk_store::occupied_bytes)
+                    .unwrap_or(0)
+            }
+        })
+        .sum()
 }
 
 #[cfg(test)]
@@ -167,6 +326,95 @@ mod tests {
 
     fn claims(hashes: &[&str]) -> HashSet<String> {
         hashes.iter().map(|h| h.to_string()).collect()
+    }
+
+    /// **The one category of byte with no owner goes at launch.**
+    ///
+    /// A whole-file download from an older release lives beside the store,
+    /// not under it: no store speaks for it, no policy bounds it, no pass
+    /// will ever look at it, and the cache cleaner's walk -- deleted with
+    /// the rest of the eviction machinery -- was the only thing that ever
+    /// took one. Left alone it is disk usage that grows once and never
+    /// shrinks.
+    ///
+    /// What it must not take is anything the session needs: `session.json`
+    /// and the per-hash resume files are how every torrent the user has
+    /// comes back, and `.pieces` is where every pin lives.
+    #[test]
+    fn a_previous_releases_whole_file_download_goes_and_the_session_stays() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // A previous release's download: a directory named after the
+        // torrent, with the file inside it.
+        let legacy = root.join("Some Film (2011)");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("film.mkv"), vec![7u8; 4096]).unwrap();
+        // And one it left directly under the root.
+        std::fs::write(root.join("loose.mkv"), vec![7u8; 2048]).unwrap();
+
+        // Everything the session reads at startup.
+        std::fs::write(root.join("session.json"), b"{}").unwrap();
+        std::fs::write(root.join("pinned-downloads.json"), b"{}").unwrap();
+        std::fs::write(root.join("dht.json"), b"{}").unwrap();
+        std::fs::write(root.join("dht-bootstrap.json"), b"{}").unwrap();
+        std::fs::write(root.join(format!("{ADOPTED}.torrent")), b"d4:infod").unwrap();
+        std::fs::write(root.join(format!("{ADOPTED}.bitv")), [0u8; 8]).unwrap();
+        std::fs::write(root.join("pinned-downloads.json.tmp-7"), b"{}").unwrap();
+        // And the three directories that reconcile themselves.
+        for name in [".pieces", ".proxy", ".archives"] {
+            std::fs::create_dir_all(root.join(name).join("inside")).unwrap();
+        }
+
+        let report = sweep_legacy_downloads(root);
+        assert_eq!(report.removed, 2, "the film's directory and the loose file");
+        assert_eq!(report.errors, 0);
+        assert!(report.freed_bytes >= 4096 + 2048, "{report:?}");
+
+        assert!(!legacy.exists(), "the previous release's download is gone");
+        assert!(!root.join("loose.mkv").exists());
+        for name in [
+            "session.json",
+            "pinned-downloads.json",
+            "dht.json",
+            "dht-bootstrap.json",
+            "pinned-downloads.json.tmp-7",
+        ] {
+            assert!(root.join(name).is_file(), "{name} is the session's");
+        }
+        assert!(root.join(format!("{ADOPTED}.torrent")).is_file());
+        assert!(root.join(format!("{ADOPTED}.bitv")).is_file());
+        for name in [".pieces", ".proxy", ".archives"] {
+            assert!(
+                root.join(name).join("inside").exists(),
+                "{name} reconciles itself and is not this sweep's"
+            );
+        }
+
+        // And it is idempotent, like the sweep it runs beside.
+        let again = sweep_legacy_downloads(root);
+        assert_eq!(again, SweepReport::default(), "nothing left to take");
+    }
+
+    /// A name that only looks like a resume file is not one.
+    ///
+    /// The rule is the cleaner's: forty hex characters and one of two
+    /// extensions. A directory a user named `notahash.torrent`, or a
+    /// `.bitv` whose stem is the wrong length, is a previous release's as
+    /// far as this sweep is concerned -- and that is the safe direction,
+    /// because the session names its own files and this one would not open.
+    #[test]
+    fn only_a_real_resume_file_is_spared() {
+        assert!(is_session_artifact(&format!("{ADOPTED}.torrent")));
+        assert!(is_session_artifact(&format!("{ADOPTED}.bitv")));
+        assert!(is_session_artifact("session.json"));
+        assert!(is_session_artifact("session.json.tmp"));
+        assert!(is_session_artifact("pinned-downloads.json.tmp-12"));
+        assert!(!is_session_artifact("pinned-downloads.json.tmp-"));
+        assert!(!is_session_artifact("notahash.torrent"));
+        assert!(!is_session_artifact(&format!("{}.torrent", &ADOPTED[..39])));
+        assert!(!is_session_artifact(&format!("{ADOPTED}.mkv")));
+        assert!(!is_session_artifact("Some Film (2011)"));
     }
 
     /// The point of the sweep, and the reason it has to be safe to run every
@@ -291,10 +539,58 @@ mod tests {
         piece(&root, ADOPTED, "0", "1", 4096);
         piece(&root, ORPHAN, "0", "0", 8192);
 
+        let legacy = download_dir.join("Some Film (2011)");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("film.mkv"), vec![7u8; 4096]).unwrap();
+
         let report =
             sweep_before_session(&download_dir, &PinRecord::Unreadable("broken".into())).await;
         assert_eq!(report, SweepReport::default());
         assert!(root.join(ADOPTED).join("0").join("1").is_file());
         assert!(root.join(ORPHAN).join("0").join("0").is_file());
+        assert!(
+            legacy.join("film.mkv").is_file(),
+            "and a previous release's download is kept with everything else \
+             that boot: the record we could not read is the one that says \
+             which torrents the user meant to keep"
+        );
+    }
+
+    /// **The launch sweep takes the previous release's downloads too.**
+    ///
+    /// Two sweeps, one hop: what no pin claims under the store, and what an
+    /// older version left beside it. The second has no other deleter at all
+    /// -- see [`sweep_legacy_downloads`] -- so a boot that ran only the
+    /// first would leave those bytes for the life of the install.
+    #[tokio::test]
+    async fn the_launch_sweep_takes_a_previous_releases_download_as_well() {
+        let tmp = tempfile::tempdir().unwrap();
+        let download_dir = tmp.path().to_path_buf();
+        let root = StoreRoot::in_download_dir(&download_dir)
+            .path()
+            .to_path_buf();
+        piece(&root, ADOPTED, "0", "1", 4096);
+        let legacy = download_dir.join("Some Film (2011)");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("film.mkv"), vec![7u8; 8192]).unwrap();
+        std::fs::write(download_dir.join("session.json"), b"{}").unwrap();
+
+        let record = PinRecord::Pins(std::collections::BTreeMap::from([(
+            ADOPTED.to_string(),
+            vec![0usize],
+        )]));
+        let report = sweep_before_session(&download_dir, &record).await;
+
+        assert_eq!(report.removed, 1, "the legacy download: {report:?}");
+        assert!(report.freed_bytes >= 8192, "{report:?}");
+        assert!(!legacy.exists(), "the previous release's download went");
+        assert!(
+            root.join(ADOPTED).join("0").join("1").is_file(),
+            "and the pin it was asked to keep stayed"
+        );
+        assert!(
+            download_dir.join("session.json").is_file(),
+            "and so did the session"
+        );
     }
 }

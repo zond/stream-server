@@ -201,7 +201,7 @@ pub use registry::{DeleteOutcome, StoreRegistry};
 pub use store::{
     HeldSnapshot, MissingPiece, PieceStore, PieceStoreFactory, StoreRoot, StoredTorrent, layout_of,
 };
-pub use sweep::{SweepReport, sweep_before_session, sweep_unadopted};
+pub use sweep::{SweepReport, sweep_before_session, sweep_legacy_downloads, sweep_unadopted};
 
 /// The store's directory inside a torrent cache root.
 ///
