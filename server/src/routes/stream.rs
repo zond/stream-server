@@ -1238,7 +1238,9 @@ async fn stream_video_with(
 
     // No selection here: `on_stream_start` made it, and a second one per
     // request was a second librqbit update -- a recompute over every piece
-    // and a persistence write -- for the same set.
+    // and a persistence write -- for the same set. Planned from this
+    // request alone it would also drop the film an aside open (a subtitle)
+    // is fetched beside, which `on_stream_start` keeps selected.
     if !native_lifecycle {
         engine_fs.focus_torrent(&info_hash).await;
     }

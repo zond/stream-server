@@ -3003,7 +3003,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         // becomes of this request -- the disk gate that refuses it for want
         // of space is refusing it *after* the predecessor became slack,
         // which is what gives it room to be admitted at all.
-        self.switch_to(&info_hash, file_idx).await;
+        let beside = self.switch_to(&info_hash, file_idx).await;
         let mut rollback = StreamStartRollback::armed(self, info_hash.clone(), file_idx);
         let native_lifecycle = self
             .get_engine(&info_hash)
@@ -3014,7 +3014,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 engine.touch();
             }
         } else {
-            self.activate_file(&info_hash, file_idx, "stream").await;
+            self.activate_file(&info_hash, file_idx, beside, "stream")
+                .await;
         }
 
         // Also update legacy active_streams counter
@@ -3064,7 +3065,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     }
 
     /// Move the liveness cell onto `file_idx` of `info_hash`, unless this
-    /// open is an aside.
+    /// open is an aside -- in which case the file being played, which the
+    /// open's selection has to keep ([`Self::activate_file`]).
     ///
     /// **The aside rule.** An open on another file of the torrent being
     /// played, while some read of the playing file is still open, is a
@@ -3086,14 +3088,15 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// and the count of its readers was asked of that file: a subtitle's
     /// open that had read "episode one, nobody reading it" took the cell
     /// off episode two, which had opened and begun delivering meanwhile.
-    async fn switch_to(&self, info_hash: &str, file_idx: usize) {
+    async fn switch_to(&self, info_hash: &str, file_idx: usize) -> Option<usize> {
         let engine = self.peek_engine(info_hash).await;
-        let keep_current = match self.live.reading().file_of(info_hash) {
-            Some(playing) if playing != file_idx => {
-                engine.is_some_and(|engine| engine.retention.readers_of(&playing) > 0)
-            }
-            _ => false,
+        let beside = match self.live.reading().file_of(info_hash) {
+            Some(playing) if playing != file_idx => engine
+                .is_some_and(|engine| engine.retention.readers_of(&playing) > 0)
+                .then_some(playing),
+            _ => None,
         };
+        let keep_current = beside.is_some();
         let switch = self.live.open(
             crate::retention::live::LiveEntity::Torrent {
                 info_hash: info_hash.to_string(),
@@ -3109,6 +3112,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 "the live entity moved"
             );
         }
+        beside
     }
 
     /// Mark the torrent as active: librqbit has no session-wide streaming
@@ -3153,7 +3157,19 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             .await;
     }
 
-    async fn activate_file(&self, info_hash: &str, file_idx: usize, source: &'static str) {
+    /// `beside` is the file being played when this open is an aside to it
+    /// ([`Self::switch_to`]): the selection keeps that file and adds this
+    /// one. Planned from the open alone, the want-set was this file and the
+    /// pins, so a subtitle fetched during a film took the film out of it --
+    /// its window's fetch-ahead stopped, and librqbit called the torrent
+    /// finished while the film's pieces were still being written.
+    async fn activate_file(
+        &self,
+        info_hash: &str,
+        file_idx: usize,
+        beside: Option<usize>,
+        source: &'static str,
+    ) {
         let mut is_multifile = false;
         if let Some(engine) = self.get_engine(info_hash).await {
             engine.touch();
@@ -3169,9 +3185,28 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             // itself once it has finished registering (`on_stream_start`).
         }
 
-        if is_multifile {
-            self.activate_multifile_file(info_hash, file_idx, None, source)
-                .await;
+        if !is_multifile {
+            return;
+        }
+        match beside {
+            Some(playing) => {
+                // What is fetched beside a film, not what plays: no offset,
+                // priority or intent of it is read by any backend, only the
+                // file.
+                let aside = HotFilePriorityPlan {
+                    file_idx,
+                    start_offset: 0,
+                    priority: 0,
+                    intent: crate::backend::priorities::PlaybackIntent::Background,
+                    bitrate_bytes_per_sec: None,
+                };
+                self.activate_multifile_file(info_hash, playing, Some(aside), source)
+                    .await;
+            }
+            None => {
+                self.activate_multifile_file(info_hash, file_idx, None, source)
+                    .await;
+            }
         }
     }
 
@@ -4590,6 +4625,8 @@ mod tests {
         /// torrent was still initializing. The gate must keep this at zero.
         applied_while_initializing: AtomicUsize,
         last_active_file: Mutex<Option<usize>>,
+        /// The hot file of the last plan, beside the active one.
+        last_hot_file: Mutex<Option<usize>>,
         last_generation: AtomicU64,
         /// Test knob: the piece indices `drop_file_pieces` hands back as
         /// the ones the backend has agreed to forget. Empty by default,
@@ -4821,6 +4858,8 @@ mod tests {
                 .reconcile_file_priorities
                 .fetch_add(1, Ordering::SeqCst);
             *self.counters.last_active_file.lock().unwrap() = plan.active_file;
+            *self.counters.last_hot_file.lock().unwrap() =
+                plan.hot_file.as_ref().map(|hot| hot.file_idx);
             self.counters
                 .last_generation
                 .store(plan.generation, Ordering::SeqCst);
@@ -13620,6 +13659,48 @@ mod tests {
             enginefs.live().reading().file_of(TEST_HASH),
             Some(1),
             "with nothing left reading file 0, this is the viewer moving on"
+        );
+    }
+
+    /// **An aside keeps the film in the want-set.**
+    ///
+    /// The subtitle's open leaves the film live, and its selection has to
+    /// say the same: planned from the open alone it was the subtitle and
+    /// the pins, so librqbit stopped queueing the film's pieces -- its
+    /// window's fetch-ahead with them -- and called the torrent finished
+    /// while the film was still being written. Once nothing reads the film
+    /// the same open is a move, and plans the new file alone.
+    #[tokio::test]
+    async fn an_aside_open_keeps_the_file_being_played_selected() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        enginefs.on_stream_start(TEST_HASH, 0).await;
+        engine.begin_retention(0).await;
+        let reader = engine
+            .retention
+            .reader_on(&0)
+            .expect("file 0 has an entity");
+        reader.promises(0..1);
+
+        enginefs.on_stream_start(TEST_HASH, 1).await;
+        assert_eq!(
+            (
+                *counters.last_active_file.lock().unwrap(),
+                *counters.last_hot_file.lock().unwrap()
+            ),
+            (Some(0), Some(1)),
+            "the subtitle's selection left the film out"
+        );
+
+        drop(reader);
+        enginefs.on_stream_start(TEST_HASH, 1).await;
+        assert_eq!(
+            (
+                *counters.last_active_file.lock().unwrap(),
+                *counters.last_hot_file.lock().unwrap()
+            ),
+            (Some(1), None)
         );
     }
 
