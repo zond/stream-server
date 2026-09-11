@@ -273,9 +273,14 @@ mod tests {
         let scratch = root.path().join(crate::archives::SCRATCH_DIR_NAME);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {
+            // Each size is read through the path, not off the directory
+            // listing: on Windows a listing reports the size in the
+            // directory entry, which is not updated while the file is still
+            // open for writing, so the inflate read as 0 bytes for as long
+            // as it ran.
             let written: u64 = std::fs::read_dir(&scratch)
                 .unwrap()
-                .map(|entry| entry.unwrap().metadata().unwrap().len())
+                .map(|entry| std::fs::metadata(entry.unwrap().path()).unwrap().len())
                 .sum();
             if written == member.len() as u64 {
                 break;
