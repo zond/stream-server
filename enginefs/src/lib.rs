@@ -662,6 +662,14 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     /// a condition half the process believes is worse than either answer:
     /// see [`crate::piece_store::PinsUnknown`].
     pins_unknown: Arc<crate::piece_store::PinsUnknown>,
+    /// Serialises [`Self::materialise_unknown_pins`], which is the one
+    /// thing in this type that writes *every* hash's pin set. `pin_locks`
+    /// cannot: it is per hash, and the repair holds no hash. Two repairs
+    /// running at once is one of them re-inserting a pin the other's unpin
+    /// has already taken out and deleted the bytes of -- a download
+    /// persisted, protected and without its bytes, which is the outcome
+    /// [`Self::pin_lock`] exists to refuse.
+    materialise_lock: tokio::sync::Mutex<()>,
 }
 
 /// What an [`Engine`] needs besides its backend handle: the epoch its
@@ -1037,6 +1045,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             budget,
             registry,
             pins_unknown,
+            materialise_lock: tokio::sync::Mutex::new(()),
         };
 
         let engines_clone = engines.clone();
@@ -3312,10 +3321,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         extra_trackers: Option<Vec<String>>,
     ) -> Result<Arc<Engine<B::Handle>>, PinDownloadError> {
         let info_hash = info_hash.to_lowercase();
-        // Before the lock, and before the pin: a pin made while the pin set
-        // is unknown has to go into a record that says what the *rest* of
-        // the downloads are, or writing it would say they are not pinned.
-        self.materialise_unknown_pins().await;
         let lock = self.pin_lock(&info_hash);
         let guard = lock.lock().await;
         let result = self
@@ -3423,6 +3428,20 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             }
             return Err(error);
         }
+        // The pin is going to happen, so this is where the pin record's
+        // repair belongs: the pin has to go into a record that says what
+        // the *rest* of the downloads are, or writing it would say they
+        // are not pinned.
+        //
+        // After the preconditions and not before them. Run first, a pin
+        // that was then refused -- a hash that never resolved inside
+        // `METADATA_RESOLVE_TIMEOUT`, a volume with no room for it --
+        // returned its error having silently turned every restored torrent
+        // into a pin: exempt from the owner, from the idle sweep and from
+        // every eviction there is, with no way back but an unpin per file.
+        // A request that does nothing must leave the condition for the
+        // request that does something.
+        self.materialise_unknown_pins().await;
         // `is_pinned()` is what keeps the idle sweeper off the engine, so
         // it is recorded before the backend is asked for anything. Undone
         // below if the pin does not go through (unless the file was pinned
@@ -3511,11 +3530,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         delete_files: bool,
     ) -> Result<UnpinOutcome, PinDownloadError> {
         let info_hash = info_hash.to_lowercase();
-        // The way out of an unreadable pin record: everything restored
-        // becomes a real pin, the record is written from that set, and this
-        // unpin then takes one file out of it. Done first, so the file the
-        // user is unpinning is not re-pinned behind them.
-        self.materialise_unknown_pins().await;
         let lock = self.pin_lock(&info_hash);
         let guard = lock.lock().await;
         let result = self
@@ -3586,6 +3600,20 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     file_count,
                 });
             }
+        }
+        // The way out of an unreadable pin record: everything restored
+        // becomes a real pin, the record is written from that set, and this
+        // unpin then takes one file out of it -- so the repair runs before
+        // the removal, never after, or the file the user is unpinning is
+        // re-pinned behind them.
+        //
+        // And only once this unpin is known to name a file that exists.
+        // Run before that, a `DELETE` of a stale index, or of a hash this
+        // session does not hold -- a client re-syncing its download list on
+        // connect sends both -- answered `unpinned: false` having just
+        // converted the whole cache into pins.
+        if self.pins_unknown.is_set() && file_idx < engine.handle.file_count().await {
+            self.materialise_unknown_pins().await;
         }
         let was_pinned = engine.pinned_files.write().remove(&file_idx);
         engine.handle.unpin_file(file_idx).await?;
@@ -3973,11 +4001,15 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// [`Self::restore_pinned_downloads_with`].
     pub async fn restore_pinned_downloads(&self) -> usize {
         let download_dir = self.download_dir.clone();
+        // A read that did not come back is a record this process has not
+        // read, which is the one thing `Absent` may never mean here:
+        // `Absent` is "the user has pinned nothing", and the next persist
+        // would write that over a file full of pins.
         let record = tokio::task::spawn_blocking(move || {
             crate::piece_store::pin_record::read(&download_dir)
         })
         .await
-        .unwrap_or(crate::piece_store::PinRecord::Absent);
+        .unwrap_or_else(|error| crate::piece_store::PinRecord::Unreadable(error.to_string()));
         self.restore_pinned_downloads_with(record).await
     }
 
@@ -4072,10 +4104,37 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// direction that loses no download; the user unpins what they do not
     /// want, and that unpin goes into the same repaired record.
     ///
+    /// The pin or unpin that runs it is one that has already been
+    /// validated -- [`Self::pin_download_locked`] past its preconditions,
+    /// [`Self::unpin_download_locked`] with an engine and a file index that
+    /// exists. A request that does nothing must not do this: it is not an
+    /// answer the user gave, and there is no way back from it but an unpin
+    /// per file.
+    ///
     /// Hashes the lost record named that this session does not hold cannot
     /// be materialised -- their file indices lived only in the record --
     /// and their directories go at the next readable boot's sweep.
+    ///
+    /// **One repair at a time, and the condition is re-read inside the
+    /// lock.** This is the one write in this type that touches every
+    /// hash's pin set, so `pin_locks` -- which is per hash, and which this
+    /// call holds none of -- cannot serialise it, and the window is the
+    /// whole loop: a `file_count` and a `pin_file` await per file per
+    /// torrent. Two repairs overlapping is the failure
+    /// [`Self::pin_lock`]'s doc describes, reached from the other side:
+    /// the first finishes, clears the condition, and its caller unpins a
+    /// file and deletes its bytes; the second, still walking the engines
+    /// it listed before any of that, reaches the same file and pins it
+    /// again -- a download persisted, protected and without its bytes, and
+    /// the user's unpin silently undone. The re-read is what makes the
+    /// second one a no-op instead.
     async fn materialise_unknown_pins(&self) {
+        if !self.pins_unknown.is_set() {
+            return;
+        }
+        let _repairing = self.materialise_lock.lock().await;
+        // Asked again under the lock: the answer may have been written by
+        // the repair this call just queued behind.
         if !self.pins_unknown.is_set() {
             return;
         }
@@ -4687,6 +4746,19 @@ mod tests {
         /// instead of the default half-downloaded state.
         seeded: AtomicBool,
         pin_file: AtomicUsize,
+        /// Test knob: park the first `pin_file` call on this handle, the
+        /// way `advertise_gate` parks a pass. The fake sends on the first
+        /// channel as it enters the call and waits on the second before
+        /// returning, so a test can hold a pin-record repair in the middle
+        /// of its loop -- the condition still set, half the files pinned,
+        /// the record not yet written -- and ask what another pin or unpin
+        /// does meanwhile. Runs once and is gone.
+        pin_gate: Mutex<
+            Option<(
+                tokio::sync::oneshot::Sender<()>,
+                tokio::sync::oneshot::Receiver<()>,
+            )>,
+        >,
         unpin_file: AtomicUsize,
         /// The ranges `drop_pieces` was asked to forget and what each was
         /// to do afterwards, in order -- every reclaim must ask before it
@@ -5167,6 +5239,13 @@ mod tests {
         async fn pin_file(&self, file_idx: usize) -> Result<()> {
             if file_idx >= self.files.len() {
                 anyhow::bail!("file index {file_idx} out of range");
+            }
+            // Parked inside the call, if a test asked for it: see
+            // `FakeCounters::pin_gate`.
+            let gate = self.counters.pin_gate.lock().unwrap().take();
+            if let Some((entered, release)) = gate {
+                let _ = entered.send(());
+                let _ = release.await;
             }
             self.counters.pin_file.fetch_add(1, Ordering::SeqCst);
             self.counters.pinned.lock().unwrap().insert(file_idx);
@@ -9868,6 +9947,173 @@ mod tests {
         assert_eq!(
             read_pinned_downloads(&path),
             serde_json::json!({ TEST_HASH: [2] })
+        );
+    }
+
+    /// The repair is not bookkeeping: the backend is told to keep every
+    /// file it turns into a pin.
+    ///
+    /// `pinned_files` is what this layer answers questions from -- the
+    /// owner's `keeps_everything`, the reconciler's `is_pinned`, the record
+    /// on disk -- and every one of those can be satisfied without librqbit
+    /// ever hearing that these files are wanted. A repair that only wrote
+    /// the record would leave the user with a download list full of pins
+    /// and a session selecting none of them.
+    #[tokio::test]
+    async fn the_repair_tells_the_backend_to_keep_every_file_it_pins() {
+        let (enginefs, counters) = test_enginefs_with_file_count(3);
+        std::fs::write(enginefs.pinned_downloads_path(), b"[]").unwrap();
+        assert_eq!(enginefs.restore_pinned_downloads().await, 0);
+        assert!(enginefs.pins_unknown());
+        assert!(
+            counters.pinned.lock().unwrap().is_empty(),
+            "the record named nothing, so nothing has been selected for a download yet"
+        );
+
+        enginefs.unpin_download(TEST_HASH, 1, false).await.unwrap();
+        assert_eq!(
+            *counters.pinned.lock().unwrap(),
+            std::collections::BTreeSet::from([0, 2]),
+            "the backend was told to keep the two files the repair pinned, \
+             and to let go of the one the user unpinned"
+        );
+    }
+
+    /// **One repair at a time, and the loser of the race does nothing.**
+    ///
+    /// `pin_locks` is per info hash and the repair holds none: it rewrites
+    /// every torrent's pin set. Two of them in flight at once is the
+    /// failure `pin_download`'s own doc describes -- one finishes, its
+    /// caller unpins a file and deletes its bytes, and the other, still
+    /// walking the engine list it took before any of that, pins the same
+    /// file again and persists it. The user's unpin is undone and the
+    /// record names a download whose bytes are gone.
+    ///
+    /// The pin here is parked inside the backend's `pin_file`, which is
+    /// exactly where a real repair spends its time: one await per file per
+    /// torrent.
+    #[tokio::test]
+    async fn a_repair_in_flight_does_not_re_pin_what_another_unpin_took() {
+        let two = test_enginefs_with_two_engines();
+        let enginefs = Arc::new(two.enginefs);
+        let path = enginefs.pinned_downloads_path();
+        std::fs::write(&path, b"{ not json").unwrap();
+        assert_eq!(enginefs.restore_pinned_downloads().await, 0);
+        assert!(enginefs.pins_unknown());
+
+        // Park the repair inside its first pin of TEST_HASH, whichever
+        // order the engine list came out in.
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *two.counters[0].pin_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        let pinning = tokio::spawn({
+            let enginefs = enginefs.clone();
+            async move { enginefs.pin_download(OTHER_HASH, 1, None).await.is_ok() }
+        });
+        tokio::time::timeout(Duration::from_secs(10), entered_rx)
+            .await
+            .expect("the repair reached its first pin of the other torrent")
+            .expect("the fake said so");
+
+        // The user unpins a file of the torrent that repair is halfway
+        // through, while it is halfway through it.
+        let unpinning = tokio::spawn({
+            let enginefs = enginefs.clone();
+            async move { enginefs.unpin_download(TEST_HASH, 1, false).await }
+        });
+        // Every chance to get ahead of the parked repair, which is the
+        // whole point: serialised, it gets as far as waiting for the
+        // repair's answer and no further, so this bound is always spent;
+        // unserialised, it runs to the end in a millisecond and the repair
+        // then walks back over the file it took. The bound is a chance, not
+        // an assertion -- nothing is claimed about how long either takes.
+        wait_until(Duration::from_secs(1), || unpinning.is_finished()).await;
+        release_tx.send(()).expect("the repair is waiting on this");
+        assert!(pinning.await.expect("the pin task"), "the pin went through");
+        let outcome = unpinning
+            .await
+            .expect("the unpin task")
+            .expect("the unpin answered");
+        assert!(outcome.unpinned, "the repair had made it a pin");
+
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        assert_eq!(
+            engine.pinned_file_indices(),
+            vec![0],
+            "the file the user unpinned was not pinned again behind them"
+        );
+        assert_eq!(
+            *two.counters[0].pinned.lock().unwrap(),
+            std::collections::BTreeSet::from([0]),
+            "and the backend was not told to keep downloading it either"
+        );
+        assert_eq!(
+            enginefs
+                .get_engine(OTHER_HASH)
+                .await
+                .unwrap()
+                .pinned_file_indices(),
+            vec![0, 1],
+            "the repair itself still did its whole job"
+        );
+    }
+
+    /// **A request that does nothing leaves the condition for one that
+    /// does.**
+    ///
+    /// The repair is irreversible in the direction that matters: every file
+    /// of every restored torrent becomes a pin, exempt from the owner, the
+    /// idle sweep and every eviction there is, and the only way back is an
+    /// unpin per file. So it belongs after the request has been validated,
+    /// not before: a pin refused for a bad index (or a volume with no room,
+    /// or a magnet that never resolved) and an unpin of a hash this session
+    /// does not hold must both leave the disk exactly as they found it.
+    #[tokio::test]
+    async fn a_refused_pin_or_unpin_does_not_repair_the_record() {
+        let (enginefs, counters) = test_enginefs_with_file_count(3);
+        let path = enginefs.pinned_downloads_path();
+        std::fs::write(&path, b"[]").unwrap();
+        assert_eq!(enginefs.restore_pinned_downloads().await, 0);
+        assert!(enginefs.pins_unknown());
+
+        assert!(
+            enginefs.pin_download(TEST_HASH, 9, None).await.is_err(),
+            "a pin of a file the torrent does not have is refused"
+        );
+        assert!(
+            enginefs.pins_unknown(),
+            "and refused means refused: it pinned nothing"
+        );
+
+        let unknown_hash = "1111111111111111111111111111111111111111";
+        let outcome = enginefs
+            .unpin_download(unknown_hash, 0, false)
+            .await
+            .unwrap();
+        assert!(!outcome.unpinned, "there was nothing of that hash to unpin");
+        assert!(enginefs.pins_unknown(), "so nothing was pinned either");
+
+        let outcome = enginefs.unpin_download(TEST_HASH, 9, false).await.unwrap();
+        assert!(!outcome.unpinned, "nor a file the torrent does not have");
+        assert!(enginefs.pins_unknown());
+
+        assert_eq!(
+            counters.pin_file.load(Ordering::SeqCst),
+            0,
+            "nothing was selected for a download by any of that"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"[]",
+            "and the record the next boot will read is the one this boot could not"
+        );
+
+        // The next request that really is one still repairs it.
+        enginefs.pin_download(TEST_HASH, 1, None).await.unwrap();
+        assert!(!enginefs.pins_unknown());
+        assert_eq!(
+            read_pinned_downloads(&path),
+            serde_json::json!({ TEST_HASH: [0, 1, 2] })
         );
     }
 

@@ -158,9 +158,29 @@ pub async fn unpin_download(
 /// set instead would tell the user their downloads are gone while the bytes
 /// are still on the disk.
 pub async fn downloads(state: &AppState) -> Vec<DownloadInfo> {
+    downloads_and_pin_state(state).await.0
+}
+
+/// [`downloads`] and the pin-record condition the listing was built under,
+/// for the handler that has to put the second in a header.
+///
+/// **One read of the condition, for the whole response.** It is cleared by
+/// the first pin or unpin, from another task, at any await in here -- and
+/// the repair that clears it fills the in-memory pin set on its way, so
+/// asking again mid-listing is how a response comes back with a file
+/// listed twice (once because the set was unknown, once because it is now
+/// pinned) or with a header that says "unreadable" over entries that do not
+/// say so. A value read once and trusted for the rest of the answer is the
+/// shape [`enginefs::piece_store::PinsUnknown`] is documented against;
+/// reading it repeatedly inside one answer is that shape, not its cure.
+pub async fn downloads_and_pin_state(state: &AppState) -> (Vec<DownloadInfo>, bool) {
     let engine_fs = state.engine.clone();
-    let mut by_hash: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    if engine_fs.pins_unknown() {
+    let unknown = engine_fs.pins_unknown();
+    // A set, not a list: both sources can name the same file, and a
+    // `GET /downloads.json` that returns one download twice is one no
+    // client can reconcile against its own list.
+    let mut by_hash: BTreeMap<String, std::collections::BTreeSet<usize>> = BTreeMap::new();
+    if unknown {
         for info_hash in engine_fs.list_engines().await {
             let Some(engine) = engine_fs.get_engine(&info_hash).await else {
                 continue;
@@ -170,7 +190,10 @@ pub async fn downloads(state: &AppState) -> Vec<DownloadInfo> {
         }
     }
     for pin in engine_fs.pinned_downloads().await {
-        by_hash.entry(pin.info_hash).or_default().push(pin.file_idx);
+        by_hash
+            .entry(pin.info_hash)
+            .or_default()
+            .insert(pin.file_idx);
     }
     let mut downloads = Vec::new();
     for (info_hash, file_indices) in by_hash {
@@ -183,7 +206,7 @@ pub async fn downloads(state: &AppState) -> Vec<DownloadInfo> {
         for file_idx in file_indices {
             let path = engine.handle.get_file_path(file_idx).await;
             let mut info = live_download(&info_hash, file_idx, path, &stats);
-            if engine_fs.pins_unknown() {
+            if unknown {
                 info.error = Some(PIN_RECORD_UNREADABLE.to_string());
             }
             downloads.push(info);
@@ -205,7 +228,7 @@ pub async fn downloads(state: &AppState) -> Vec<DownloadInfo> {
                 error: Some(DORMANT_DOWNLOAD_ERROR.to_string()),
             }),
     );
-    downloads
+    (downloads, unknown)
 }
 
 /// One pinned file of a live torrent. A torrent still resolving its
@@ -327,8 +350,10 @@ pub async fn delete_download(
 }
 
 pub async fn get_downloads(State(state): State<AppState>) -> Response {
-    let unknown = state.engine.pins_unknown();
-    let mut response = Json(downloads(&state).await).into_response();
+    // The header and the entries' error slots are the same answer said
+    // twice, so they come from one reading of the condition.
+    let (downloads, unknown) = downloads_and_pin_state(&state).await;
+    let mut response = Json(downloads).into_response();
     if unknown {
         response.headers_mut().insert(
             axum::http::HeaderName::from_static(PIN_RECORD_HEADER),

@@ -2005,6 +2005,43 @@ mod tests {
         );
     }
 
+    /// The two things under the root that are not an entity directory: a
+    /// stray file, and a root that will not list at all.
+    ///
+    /// The sweep's job is that nothing a previous run wrote is here when
+    /// this one starts serving, so a plain file directly under the root --
+    /// a temporary an older layout left, a `.DS_Store`, anything -- is as
+    /// much a leftover as a key directory and goes by the same rule. And a
+    /// root that cannot be read is counted and survived: the proxy cache
+    /// filling up again is a far smaller problem than a launch that fails
+    /// because of it.
+    #[test]
+    fn a_stray_file_goes_too_and_an_unreadable_root_is_counted() {
+        let (_root, cache) = cache();
+        std::fs::create_dir_all(cache.root()).unwrap();
+        let stray = cache.root().join("left-behind.tmp");
+        std::fs::write(&stray, [1u8; 128]).unwrap();
+
+        let report = sweep(cache.root());
+        assert_eq!(report.removed, 1);
+        assert_eq!(report.errors, 0);
+        assert!(report.freed_bytes >= 128, "{report:?}");
+        assert!(!stray.exists(), "a file under the root is a leftover too");
+
+        // A root that is not a directory: one error, and a report the
+        // launch carries on from.
+        let tmp = tempfile::tempdir().unwrap();
+        let not_a_dir = tmp.path().join("proxy");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+        assert_eq!(
+            sweep(&not_a_dir),
+            SweepReport {
+                errors: 1,
+                ..SweepReport::default()
+            }
+        );
+    }
+
     /// The subtraction the key is built by, from both sides: every name
     /// taken out is one that was actually being forwarded, and what is left
     /// is the description of the request rather than the selection of bytes

@@ -1189,6 +1189,16 @@ pub async fn run(
     // else opens, and a process that has served nothing is playing nothing --
     // so every chunk a previous run left is a byte no owner here would ever
     // count or reclaim. See `proxy_cache::sweep`.
+    //
+    // Not part of the engine's boot ordering, and it does not need to be:
+    // the piece store's sweep has to precede the session because opening it
+    // seeds each store's held set off the disk, and a piece deleted after
+    // that stays counted as held for the life of the process. This root is
+    // the other cache, the session knows nothing of it, and the only thing
+    // in this process that ever writes here is a `/proxy` response -- so
+    // "before the router serves" is the whole of the requirement, and it is
+    // also what makes `ProxyRetention::occupancy` -- what *this* process
+    // wrote -- equal to what is on the disk from the first byte.
     {
         let root = state.proxy_cache.root().to_path_buf();
         if let Err(error) = tokio::task::spawn_blocking(move || proxy_cache::sweep(&root)).await {
