@@ -676,9 +676,10 @@ impl ChunkDir {
     /// [`Self::held_in_bucket`]: the name re-spells ([`canonical_index`]),
     /// the index belongs to the bucket it was found in, and the entry is a
     /// file -- a *directory* wearing a chunk's name is not a chunk, and
-    /// offered as one it would meet the delete as `EISDIR`. Anything else is
-    /// passed over: a walk must never name a chunk a delete could not
-    /// address.
+    /// offered as one it would meet the delete as `EISDIR`. A staged name is
+    /// held to the same two: its index in the bucket it was found in, and a
+    /// file. Anything else is passed over: a walk must never name a chunk a
+    /// delete could not address.
     ///
     /// **Strict, in every bucket.** A directory that does not exist yet is
     /// the ordinary state before the first write and walks empty; anything
@@ -713,8 +714,21 @@ impl ChunkDir {
                     continue;
                 };
                 if let Some(stem) = staged_stem(name) {
-                    let staged = entry.path();
                     let index = canonical_index(stem);
+                    // The complete chunk's two rules hold for a staged name
+                    // too. Seeded as a piece's staged copy, it is what a
+                    // read of that piece prefers to the complete one: a
+                    // directory wearing the name answers that read with
+                    // `EISDIR` where the piece is simply missing, and a
+                    // name in a bucket its index does not belong to is not
+                    // where a write of the chunk goes, so every read
+                    // probes a staged copy nothing will ever write.
+                    if index.is_some_and(|index| bucket_index != Some(index / CHUNKS_PER_DIRECTORY))
+                        || !entry.file_type()?.is_file()
+                    {
+                        continue;
+                    }
+                    let staged = entry.path();
                     let complete = index.map(|_| staged.with_file_name(stem));
                     found.push(Entry::Staged(StagedFile {
                         index,
@@ -1057,6 +1071,35 @@ mod tests {
             "the one chunk, in the one bucket that is one"
         );
         assert!(file.walk().is_err());
+    }
+
+    /// **A staged name is held to a complete chunk's rules.** The walk
+    /// seeds the piece store's staged set, and a read of a piece in that
+    /// set goes to the staged copy first: a directory called `5.part` was
+    /// seeded as piece 5's staged copy and read as `EISDIR` where the piece
+    /// is missing, and `7/3.part` -- piece 3 belongs to bucket 0 -- as a
+    /// staged copy at a name no write of piece 3 goes to.
+    #[test]
+    fn the_walk_names_no_staged_copy_a_write_would_not_make() {
+        let (_tmp, chunks) = dir();
+        let mut staged = chunks.open_staged_for_write(4).unwrap();
+        std::io::Write::write_all(&mut staged, b"abcd").unwrap();
+        drop(staged);
+        std::fs::create_dir_all(chunks.staging_path(5)).unwrap();
+        let elsewhere = chunks.path().join("7");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join(format!("3{STAGING_SUFFIX}")), b"abcd").unwrap();
+
+        let staged: Vec<Option<u64>> = chunks
+            .walk()
+            .unwrap()
+            .into_iter()
+            .map(|entry| match entry {
+                Entry::Staged(staged) => staged.index,
+                Entry::Complete(index) => panic!("nothing is complete, not {index}"),
+            })
+            .collect();
+        assert_eq!(staged, vec![Some(4)], "the one staged copy a write made");
     }
 
     /// `expected_len` is the commit criterion, and it refuses.
