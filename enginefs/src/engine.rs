@@ -464,16 +464,24 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         ))
     }
 
-    /// Any pin on the torrent: a pin is a retention property, the user asked
+    /// A pin on this file: a pin is a retention property, the user asked
     /// for those bytes, and they are shared like any other bytes we keep.
+    ///
+    /// This file's pin and not the torrent's, because the pin set is per
+    /// file. Asked of the torrent, one pinned episode of a season kept every
+    /// other episode anyone streamed whole: fetched whole at the open, never
+    /// windowed, never taken when the viewer moved on, and reported as slack
+    /// that nothing could take. The files beside a pinned one are retained
+    /// as any unpinned file is, and the pieces they share with it are kept
+    /// by [`Self::alone`] and at the reclaim's door.
     ///
     /// True for everything while the pin set is unknown. A boot the embedder
     /// named no set to knows only that some of this may be pinned, and the
     /// safe reading of "some" is "all": the bytes are still there to unpin,
     /// where a pass that had taken them would have destroyed a download only
     /// the embedder could have named.
-    fn keeps_everything(&self, _file_idx: &usize) -> bool {
-        self.pins_unknown.is_set() || !self.pinned.read().is_empty()
+    fn keeps_everything(&self, file_idx: &usize) -> bool {
+        self.pins_unknown.is_set() || self.pinned.read().contains(file_idx)
     }
 
     /// Whether this file is the one being played, at this instant. One
@@ -513,8 +521,18 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         store.epoch(&self.info_hash).unwrap_or(0)
     }
 
+    /// The boundary rule, and a pinned neighbour's pieces on top of it.
+    /// The rule asks the backend's want-set, and the engine records a pin
+    /// before it asks the backend to select the file, so for the length of
+    /// that call a pinned neighbour reads as unwanted and the piece this
+    /// file shares with it as this file's alone.
     async fn alone(&self, domain: &FileDomain, pieces: &[u32]) -> Vec<u32> {
-        crate::retention::this_files_alone(&self.handle, domain.file_idx, pieces).await
+        let alone = crate::retention::this_files_alone(&self.handle, domain.file_idx, pieces).await;
+        let pinned = pinned_spans(&self.handle, &self.pinned, Some(domain.file_idx)).await;
+        alone
+            .into_iter()
+            .filter(|piece| !pinned.iter().any(|span| span.contains(piece)))
+            .collect()
     }
 
     /// The want-set, trimmed to the window: librqbit's picker fetches every
@@ -595,6 +613,10 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
                 .await
             {
                 Ok(Some(claim)) => {
+                    // A neighbour pinned under the drop keeps what it shares
+                    // with this file, as it does at the reclaim's door.
+                    let pinned =
+                        pinned_spans(&self.handle, &self.pinned, Some(domain.file_idx)).await;
                     let arrived: Vec<u32> = match (store.held(&self.info_hash), door.windows_now())
                     {
                         (Some(now), Some(windows)) => {
@@ -605,7 +627,10 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
                                 .copied()
                                 .filter(|piece| {
                                     now.contains(piece)
-                                        && !windows.iter().any(|window| window.contains(piece))
+                                        && !windows
+                                            .iter()
+                                            .chain(&pinned)
+                                            .any(|window| window.contains(piece))
                                 })
                                 .collect()
                         }
@@ -709,13 +734,18 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
     async fn reclaim(
         &self,
         store: &Arc<StoreRegistry>,
-        _domain: &FileDomain,
+        domain: &FileDomain,
         runs: Vec<Range<u32>>,
         door: Door<Self>,
     ) -> usize {
         let mut reclaimed = 0;
         let mut pending: VecDeque<Range<u32>> = runs.into();
         while let Some(run) = pending.pop_front() {
+            // A neighbour pinned since the runs were planned keeps the piece
+            // it shares with this file, asked here with the door and not
+            // carried in from the plan: the door answers for this file's own
+            // pin only, and the pinned file wants its boundary piece whole.
+            let pinned = pinned_spans(&self.handle, &self.pinned, Some(domain.file_idx)).await;
             let Some(windows) = door.windows_now() else {
                 break;
             };
@@ -732,7 +762,7 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
                 break;
             }
             let mut parts = vec![run.clone()];
-            for window in &windows {
+            for window in windows.iter().chain(&pinned) {
                 parts = parts
                     .into_iter()
                     .flat_map(|part| crate::retention::outside(part, window))
@@ -760,13 +790,37 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
     }
 }
 
+/// The piece range of every file in `pinned` but `except`, read at this
+/// instant: what a reclaim of anything else must leave where it is. A
+/// file whose pieces the backend cannot name has none on the disk to keep.
+async fn pinned_spans<H: TorrentHandle>(
+    handle: &H,
+    pinned: &parking_lot::RwLock<BTreeSet<usize>>,
+    except: Option<usize>,
+) -> Vec<Range<u32>> {
+    let files: Vec<usize> = pinned
+        .read()
+        .iter()
+        .copied()
+        .filter(|file_idx| Some(*file_idx) != except)
+        .collect();
+    let mut spans = Vec::with_capacity(files.len());
+    for file_idx in files {
+        if let Some(span) = handle.file_pieces(file_idx).await {
+            spans.push(span.pieces);
+        }
+    }
+    spans
+}
+
 /// Give every pinned file of `pinned` that has no entity one, by installing
 /// on it under the pin.
 ///
 /// A pin is a write to the engine's pin set and a `pin_file` on the
 /// backend, and neither makes an entity, so a pinned file nothing has
 /// opened in this process is in no pass's list: not the passes, which walk
-/// entities, and not `reclaim_rest`, which a pinned torrent is exempt from.
+/// entities, and not `reclaim_rest`, which leaves a pinned file's pieces
+/// where they are.
 /// That is the right shape for a file that was never touched -- there is
 /// nothing to undo -- and the wrong one for a file a slack pass had dropped
 /// the pieces of and then forgotten, or that `reclaim_rest` had dropped as
@@ -1258,7 +1312,7 @@ impl<H: TorrentHandle> Engine<H> {
     /// might reclaim" true rather than nearly true.
     ///
     /// The owner's [`Retention::install`]: every other file's policy is
-    /// given back first, a pinned torrent gets no policy (a pin is a
+    /// given back first, a pinned file gets no policy (a pin is a
     /// retention property), a policy that already describes this file under
     /// this budget is kept untouched, and a hold-back the backend refuses
     /// installs nothing.
@@ -1487,10 +1541,10 @@ impl<H: TorrentHandle> Engine<H> {
         let mut total = self.pass_over(store, &self.files_to_pass(live)).await;
         // And the files nothing has opened in this process. They have no
         // entity, so no pass walks them and no window is drawn round them;
-        // on a torrent nobody is playing and nobody has pinned, every byte
-        // of them is slack -- the twelve other episodes the swarm filled
-        // while one was watched.
-        if !self.is_pinned() && !live.is_torrent(&self.info_hash) {
+        // on a torrent nobody is playing, every byte of them nobody pinned
+        // is slack -- the twelve other episodes the swarm filled while one
+        // was watched, whether or not a thirteenth is kept for offline.
+        if !live.is_torrent(&self.info_hash) {
             let freed = self.reclaim_rest(store).await;
             if freed > 0 {
                 total.get_or_insert_default().reclaimed += freed;
@@ -1500,8 +1554,8 @@ impl<H: TorrentHandle> Engine<H> {
     }
 
     /// A slack pass over every entity of this torrent that is neither being
-    /// played nor being read, and the pieces outside every entity if the
-    /// torrent itself is neither played nor pinned.
+    /// played nor being read, and the unpinned pieces outside every entity
+    /// if the torrent itself is not being played.
     ///
     /// What the switch, the running-low bell and `POST /cache/clean` call:
     /// the same passes the tick would run two seconds later, run now,
@@ -1526,7 +1580,7 @@ impl<H: TorrentHandle> Engine<H> {
             .filter(|(_, mode)| matches!(mode, Mode::Slack { .. }))
             .collect();
         let mut total = self.pass_over(store, &slack).await;
-        if !self.is_pinned() && !live.is_torrent(&self.info_hash) {
+        if !live.is_torrent(&self.info_hash) {
             let freed = self.reclaim_rest(store).await;
             if freed > 0 {
                 total.get_or_insert_default().reclaimed += freed;
@@ -1574,8 +1628,18 @@ impl<H: TorrentHandle> Engine<H> {
     /// season the swarm filled around the one episode that was watched, a
     /// resume bitfield's worth of a restored torrent -- is in no pass's
     /// extent and so in no pass's reclaim, and on a torrent nobody is
-    /// playing and nobody has pinned there is nothing that would ever want
-    /// it again.
+    /// playing there is nothing that would ever want it again -- except a
+    /// pin, whose file's pieces are left where they are. A pin is per file:
+    /// one episode kept for offline keeps that episode, and the rest of the
+    /// season is as disposable as any unpinned torrent's.
+    ///
+    /// The pin set is read before every run and cuts it, rather than read
+    /// once for the whole reclaim, like the liveness cell: a pin taken
+    /// mid-reclaim keeps the file's pieces the runs after it would have
+    /// taken. A boundary piece a pinned file shares with a file nothing
+    /// opened is the pinned file's, and stays with it. And nothing at all
+    /// is taken while the pin set is unknown, which reads as every file
+    /// pinned.
     ///
     /// Held back before it is unlinked, run by run, like every other
     /// deletion here: there is no un-Have. And the liveness cell is read
@@ -1609,9 +1673,27 @@ impl<H: TorrentHandle> Engine<H> {
             .filter(|piece| !extents.iter().any(|extent| extent.contains(piece)))
             .collect();
         let mut freed = 0;
-        for run in crate::retention::runs(&outside) {
-            if self.live.is_torrent(&self.info_hash) || self.is_pinned() {
+        let mut pending: VecDeque<Range<u32>> = crate::retention::runs(&outside).into();
+        while let Some(run) = pending.pop_front() {
+            let pinned = pinned_spans(&self.handle, &self.pinned_files, None).await;
+            if self.live.is_torrent(&self.info_hash) || self.pins_unknown.is_set() {
                 break;
+            }
+            let mut parts = vec![run.clone()];
+            for span in &pinned {
+                parts = parts
+                    .into_iter()
+                    .flat_map(|part| crate::retention::outside(part, span))
+                    .collect();
+            }
+            if parts.len() != 1 || parts[0] != run {
+                // Cut by a pin: each part is asked about again in its own
+                // turn, as the reclaim's door asks about the parts a window
+                // cut. Strictly fewer pieces each time, so this ends.
+                for part in parts.into_iter().rev() {
+                    pending.push_front(part);
+                }
+                continue;
             }
             if let Err(error) = self.handle.set_pieces_advertised(run.clone(), false).await {
                 tracing::warn!(
@@ -1649,8 +1731,9 @@ impl<H: TorrentHandle> Engine<H> {
     }
 
     /// Whether anything about this torrent is pinned -- what exempts it
-    /// from idle removal, keeps its bytes off every reclaim, and makes the
-    /// reconciler run it.
+    /// from idle removal and makes the reconciler run it. Not what keeps
+    /// its bytes: that is per file ([`TorrentBacking::keeps_everything`]),
+    /// and the files beside a pinned one are retained as any other.
     ///
     /// Always true while the pin set is unknown ([`Self::pins_unknown`]):
     /// the embedder is the only thing that can say what a pin is, and a boot
@@ -1981,7 +2064,7 @@ mod pin_tests {
     /// and there never was one), and then the user pinned the file without
     /// opening it. The fork's `pin_file` re-queues nothing for a file that
     /// was selected all along, the passes walk entities and it has none,
-    /// and `reclaim_rest` leaves a pinned torrent alone -- so nothing
+    /// and `reclaim_rest` leaves a pinned file's pieces alone -- so nothing
     /// wanted the pieces again and the download stood still. The tick's
     /// adoption installs on it under the pin, which wants the whole file,
     /// and the entity it leaves is what stops it doing so again.

@@ -3864,8 +3864,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             // piece indices precisely so that whoever asked can delete them
             // -- so without this the caller was told the disk had come back
             // while every piece of the file was still in the store, and
-            // nothing would ever have reclaimed them: the directory is
-            // protected for as long as the torrent has any pin left.
+            // stayed there until a tick found the torrent unplayed.
             let pieces_freed = match dropped {
                 // The claim goes with the pieces, into the one place that
                 // orders the unlink against the have-set
@@ -9590,9 +9589,10 @@ mod tests {
     /// **A pin taken at runtime is kept by retention, and written nowhere.**
     ///
     /// The embedder holds the record now, so the only thing a pin does on
-    /// this side is take effect: the owner stops reclaiming the torrent's
-    /// bytes from the moment `pinned_files` names the file. Nothing under
-    /// the download dir may change with it -- a second record here is one
+    /// this side is take effect: the owner stops reclaiming the file's
+    /// bytes from the moment `pinned_files` names it -- that file's, and
+    /// not the rest of the torrent's. Nothing under the download dir may
+    /// change with it -- a second record here is one
     /// this server would then have to keep in step with the embedder's, and
     /// the boot sweep acts on whichever it finds.
     #[tokio::test]
@@ -9642,16 +9642,300 @@ mod tests {
             enginefs.reconcile_tick().await;
             enginefs.drop_slack().await;
         }
-        for piece in [0u32, 1, 5, 6] {
+        for piece in [0u32, 1] {
             assert!(
                 bucket.join(piece.to_string()).is_file(),
-                "piece {piece} was taken from a torrent the user has pinned"
+                "piece {piece} was taken from the file the user has pinned"
+            );
+        }
+        for piece in [5u32, 6] {
+            assert!(
+                !bucket.join(piece.to_string()).exists(),
+                "piece {piece} is the other file's, which nobody pinned"
             );
         }
         assert_eq!(
             download_dir_entries(&enginefs.download_dir),
             before,
             "the pin wrote no record of its own beside the session"
+        );
+    }
+
+    /// Two files of four pieces, pieces 0, 1, 5 and 6 on the disk, the pin
+    /// set named and empty, and then the first file pinned: what the tests
+    /// of a pin's scope start from.
+    async fn one_file_of_two_pinned() -> (
+        BackendEngineFS<FakeBackend>,
+        Arc<FakeCounters>,
+        Arc<Engine<FakeHandle>>,
+        std::path::PathBuf,
+        crate::piece_store::PieceStore,
+    ) {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in [0u32, 1, 5, 6] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let store = seeded_store(&enginefs, &engine);
+        enginefs
+            .apply_pins(Some(crate::piece_store::PinSet::new()))
+            .await;
+        enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
+        (enginefs, counters, engine, bucket, store)
+    }
+
+    /// **The tick takes what nobody opened of a pinned torrent, and leaves
+    /// the pinned file.**
+    ///
+    /// A pin is per file. The tick's reclaim of the files nothing opened
+    /// used to skip any torrent with a pin, so a season with one episode
+    /// kept for offline kept every episode the swarm had filled beside it,
+    /// for as long as the pin stood. The reconciler still runs the torrent:
+    /// "pinned" in its ladder is about the torrent, which has a download to
+    /// finish.
+    #[tokio::test]
+    async fn the_tick_reclaims_a_pinned_torrents_unpinned_files() {
+        let (enginefs, _counters, _engine, bucket, _store) = one_file_of_two_pinned().await;
+        nothing_torrent_is_playing(&enginefs);
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), crate::reconcile::Decision::Run)],
+            "a torrent with a pin runs"
+        );
+        for piece in [0u32, 1] {
+            assert!(
+                bucket.join(piece.to_string()).is_file(),
+                "piece {piece} is the pinned file's"
+            );
+        }
+        for piece in [5u32, 6] {
+            assert!(
+                !bucket.join(piece.to_string()).exists(),
+                "piece {piece} is a file nobody pinned or opened"
+            );
+        }
+    }
+
+    /// **And so does a slack drop, reading the pin set at each run.**
+    ///
+    /// No tick has run, so the pinned file has no entity yet and its pieces
+    /// are outside every extent like the unpinned file's: the pin set, read
+    /// before every run of the reclaim, is the only thing that tells them
+    /// apart.
+    #[tokio::test]
+    async fn a_slack_drop_reclaims_a_pinned_torrents_unpinned_files_and_not_the_pinned_one() {
+        let (enginefs, _counters, engine, bucket, _store) = one_file_of_two_pinned().await;
+        assert!(
+            engine.retention.holding(&0).is_none(),
+            "the fixture's pinned file has no entity"
+        );
+        nothing_torrent_is_playing(&enginefs);
+        assert_eq!(enginefs.drop_slack().await, 2);
+        for piece in [0u32, 1] {
+            assert!(
+                bucket.join(piece.to_string()).is_file(),
+                "piece {piece} is the pinned file's"
+            );
+        }
+        for piece in [5u32, 6] {
+            assert!(
+                !bucket.join(piece.to_string()).exists(),
+                "piece {piece} is a file nobody pinned or opened"
+            );
+        }
+    }
+
+    /// **A file streamed beside a pinned one is windowed like any other, and
+    /// only the pin is protected whole.**
+    ///
+    /// The owner asked "is anything on this torrent pinned" of every file,
+    /// so the episode being watched beside a pinned one was installed on as
+    /// a pin: no policy, fetched whole, nothing reclaimed, and the usage
+    /// figure called every byte of it protected because a live entity with
+    /// no policy keeps its whole extent. Now it has a window like any
+    /// unpinned file's, and the figure is the pinned file plus that window.
+    #[tokio::test]
+    async fn a_file_streamed_beside_a_pinned_one_is_windowed_and_not_protected_whole() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in 0u32..8 {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let _store = seeded_store(&enginefs, &engine);
+        enginefs
+            .apply_pins(Some(crate::piece_store::PinSet::new()))
+            .await;
+        enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
+        // Two pieces of budget over a four-piece file: a split.
+        enginefs.set_cache_budget(Some(50));
+
+        enginefs.on_stream_start(TEST_HASH, 1).await;
+        engine.begin_retention(1).await;
+        engine.note_playhead(1, 0);
+        engine.retain(enginefs.store_registry(), &playing(1)).await;
+        let standing = engine.standing().await;
+        assert_eq!(
+            standing
+                .policies
+                .iter()
+                .map(|policy| policy.file_idx)
+                .collect::<Vec<_>>(),
+            vec![1],
+            "the streamed file is bounded, the pinned one is not"
+        );
+
+        let holdings = enginefs.cache_holdings().await;
+        assert_eq!(holdings.total_bytes, 200);
+        assert_eq!(holdings.protected_files, 2);
+        assert!(
+            holdings.protected_bytes > 100 && holdings.protected_bytes < 200,
+            "the pinned file whole and the streamed file's window: {holdings:?}"
+        );
+    }
+
+    /// Three episodes of 100, 110 and 100 bytes at 25 bytes a piece: the
+    /// second is pieces 4..9 and shares piece 8 with the third. The third
+    /// is out of the backend's want-set, which is where a pin stands for
+    /// the length of the backend call that selects its file: the engine
+    /// records the pin first.
+    fn a_neighbour_the_backend_does_not_want_yet()
+    -> (BackendEngineFS<FakeBackend>, Arc<FakeCounters>) {
+        let (enginefs, counters) = test_enginefs_with_files(vec![
+            ("Show.S01E01.mkv".into(), 100),
+            ("Show.S01E02.mkv".into(), 110),
+            ("Show.S01E03.mkv".into(), 100),
+        ]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        *counters.wanted_files.lock().unwrap() = Some([0, 1].into_iter().collect());
+        (enginefs, counters)
+    }
+
+    /// **The piece a file shares with a pinned neighbour is not this file's
+    /// to stop wanting.**
+    ///
+    /// The boundary rule asks the backend's want-set, and a pin reaches the
+    /// engine's pin set before the backend has selected the file. Dropped
+    /// from the want-set in that gap, the boundary piece stays dropped: the
+    /// pinned file wants its pieces whole once, when it is adopted, and a
+    /// piece dropped after that is one it never fetches.
+    #[tokio::test]
+    async fn a_pinned_neighbours_boundary_piece_is_never_dropped_from_the_want_set() {
+        let (enginefs, counters) = a_neighbour_the_backend_does_not_want_yet();
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        engine.pinned_files.write().insert(2);
+        enginefs.set_cache_budget(Some(50));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("4"), [7u8; 25]).unwrap();
+        engine.begin_retention(1).await;
+        engine.note_playhead(1, 0);
+        let _store = seeded_store(&enginefs, &engine);
+        engine
+            .retain(enginefs.store_registry(), &playing(1))
+            .await
+            .expect("a pass");
+        let dropped = counters.dropped_ranges.lock().unwrap().clone();
+        assert!(
+            !dropped.is_empty(),
+            "the fixture is one whose want step drops something"
+        );
+        assert!(
+            dropped.iter().all(|(range, _)| !range.contains(&8)),
+            "piece eight is the pinned episode's too: {dropped:?}"
+        );
+    }
+
+    /// **A pin taken on the neighbour while a slack reclaim runs keeps the
+    /// piece the two share.**
+    ///
+    /// The door the reclaim asks before every run answers for the file's
+    /// own pin. The plan was made before the pin, so it names the boundary
+    /// piece, and only a reading of the pin set at the run keeps it.
+    #[tokio::test]
+    async fn a_pin_taken_on_the_neighbour_mid_reclaim_keeps_the_piece_they_share() {
+        let (enginefs, counters) = a_neighbour_the_backend_does_not_want_yet();
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in [5u32, 8] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let _store = seeded_store(&enginefs, &engine);
+        engine.begin_retention(1).await;
+        // The neighbour is pinned while the first run is being dropped.
+        *counters.on_first_drop.lock().unwrap() = Some(Box::new({
+            let pinned = engine.pinned_files.clone();
+            move || {
+                pinned.write().insert(2);
+            }
+        }));
+        nothing_torrent_is_playing(&enginefs);
+        enginefs.drop_slack().await;
+        assert!(!bucket.join("5").exists(), "the first run went");
+        assert!(
+            bucket.join("8").is_file(),
+            "piece eight is the pinned episode's too"
+        );
+    }
+
+    /// **And a pin taken on the neighbour under the want step keeps the
+    /// boundary piece that arrived under it.**
+    ///
+    /// The want step unlinks what arrived between its reading of the disk
+    /// and its drop, asking the door first. The door is about this file;
+    /// the neighbour's pin is read beside it.
+    #[tokio::test]
+    async fn a_pin_taken_on_the_neighbour_under_the_want_step_keeps_the_boundary_piece() {
+        let (enginefs, counters) = a_neighbour_the_backend_does_not_want_yet();
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("4"), [7u8; 25]).unwrap();
+        let store = Arc::new(seeded_store(&enginefs, &engine));
+        engine.begin_retention(1).await;
+        engine.note_playhead(1, 0);
+        // Piece 8 completes, and the third episode is pinned, while the
+        // backend is forgetting the pieces outside the window.
+        *counters.on_first_drop.lock().unwrap() = Some(Box::new({
+            let store = store.clone();
+            let bucket = bucket.clone();
+            let pinned = engine.pinned_files.clone();
+            move || {
+                std::fs::write(bucket.join("8"), [7u8; 25]).unwrap();
+                store.init_for_tests().unwrap();
+                pinned.write().insert(2);
+            }
+        }));
+        engine
+            .retain(enginefs.store_registry(), &playing(1))
+            .await
+            .expect("a pass");
+        assert!(
+            counters
+                .dropped_ranges
+                .lock()
+                .unwrap()
+                .first()
+                .is_some_and(|(range, _)| range.contains(&8)),
+            "the fixture's drop is the one the piece arrived under"
+        );
+        assert!(
+            bucket.join("8").is_file(),
+            "piece eight is the pinned episode's too"
         );
     }
 
