@@ -1166,6 +1166,17 @@ impl<B: Backing> Retention<B> {
         self.backing.want_all(&domain).await;
     }
 
+    /// A pin stands on `entity`: whatever it was holding back goes back
+    /// into what we announce, and once nothing bounds it every piece of it
+    /// is wanted again. The pin exit of both passes, under the turn. A
+    /// clear the backend refuses leaves the policy standing and wants
+    /// nothing: the next pass retries both.
+    async fn release_to_pin(&self, entity: &Entity<B>, claim: &mut Claim) {
+        if self.clear_under(entity, claim).await {
+            self.want_whole(entity).await;
+        }
+    }
+
     /// The entity's turn, awaited: the torrent's tick and the proxy's slack
     /// sweep queue here, with no owner lock held (rule 3). `None` is a key
     /// with no entity, so nothing to serialise against.
@@ -1263,12 +1274,25 @@ impl<B: Backing> Retention<B> {
         };
         let about = claim.about;
         // A pin is a retention property and outranks the slack: the user
-        // asked for those bytes. Nothing is taken and nothing is given
-        // back -- the pin's own install is what clears the policy.
+        // asked for those bytes. Nothing is taken -- and what was held back
+        // is given back, and what stopped being wanted is wanted again,
+        // exactly as the live pass does under a pin. This exit is not the
+        // rare one: the driver reads a pinned file nobody is playing as
+        // slack, so it is the exit every tick takes over a pinned download
+        // that is not being watched. "The pin's own install clears the
+        // policy" was the assumption here, and the install runs only when
+        // the file is opened; a pin on a file a slack pass had already held
+        // back and dropped pieces of left the extent hidden from every peer
+        // and the pieces unwanted, with nothing due to run over it but this.
         //
         // Asked before L2, like every copy-out of a lock outside the owner
         // (rule 1), and so is the liveness cell beside it.
-        if self.backing.keeps_everything(key) || self.backing.is_live(key) {
+        if self.backing.keeps_everything(key) {
+            self.release_to_pin(&entity, &mut claim).await;
+            let state = entity.state.lock();
+            return Self::nothing(&state, claim, about, None);
+        }
+        if self.backing.is_live(key) {
             let state = entity.state.lock();
             return Self::nothing(&state, claim, about, None);
         }
@@ -1408,9 +1432,7 @@ impl<B: Backing> Retention<B> {
         // also holds its range back, the file the user asked to keep is
         // announced to nobody while librqbit re-fetches it in a loop.
         if self.backing.keeps_everything(key) {
-            if self.clear_under(&entity, &mut claim).await {
-                self.want_whole(&entity).await;
-            }
+            self.release_to_pin(&entity, &mut claim).await;
             let state = entity.state.lock();
             return Self::nothing(&state, claim, about, None);
         }
@@ -2366,6 +2388,8 @@ mod tests {
         epoch: AtomicU64,
         /// The runs each `reclaim` call was handed.
         reclaims: parking_lot::Mutex<Vec<Vec<Range<u32>>>>,
+        /// The extent of every `want_all` call, in order.
+        wanted_all: parking_lot::Mutex<Vec<Range<u32>>>,
         /// The runs each `reclaim` call really asked the door about, which
         /// stops at the first `window_now` of `None`.
         asked: parking_lot::Mutex<Vec<Vec<Range<u32>>>>,
@@ -2399,6 +2423,7 @@ mod tests {
                 is_live: AtomicBool::new(false),
                 epoch: AtomicU64::new(1),
                 reclaims: parking_lot::Mutex::new(Vec::new()),
+                wanted_all: parking_lot::Mutex::new(Vec::new()),
                 asked: parking_lot::Mutex::new(Vec::new()),
                 reclaim_panics: AtomicBool::new(false),
                 park_held: parking_lot::Mutex::new(None),
@@ -2556,6 +2581,10 @@ mod tests {
 
         async fn alone(&self, _domain: &FakeDomain, pieces: &[u32]) -> Vec<u32> {
             pieces.to_vec()
+        }
+
+        async fn want_all(&self, domain: &FakeDomain) {
+            self.wanted_all.lock().push(domain.pieces.clone());
         }
 
         /// Both shapes at once: `window_now` gates each run as the torrent
@@ -3261,8 +3290,12 @@ mod tests {
         assert!(outcome.concluded.is_none());
         assert_eq!(backing.on_disk(), vec![0, 1, 2]);
         assert!(
-            backing.advertised.lock().is_empty(),
+            backing.advertised.lock().iter().all(|(_, on)| *on),
             "a pinned file's pieces are not held back from the swarm"
+        );
+        assert!(
+            owner.holding(&0).unwrap().installed.is_none(),
+            "the policy went with the pin, as it does under the live pass"
         );
         assert_eq!(
             backing.listings.load(Ordering::SeqCst),
@@ -3453,6 +3486,72 @@ mod tests {
         backing.advertised.lock().clear();
         assert_eq!(owner.install(1, 1).await, InstallOutcome::Installed);
         assert_eq!(*backing.advertised.lock(), vec![(8..16, false)]);
+    }
+
+    /// **And the slack pass gives them back too, because the slack pass is
+    /// the one that runs over a pinned file nobody is playing.**
+    ///
+    /// The test above hands the pin's pass [`Mode::Live`], which is what the
+    /// driver decides for a file being played or read. A pinned download
+    /// nobody is watching is neither: the driver reads it as
+    /// [`Mode::Slack`] every tick, and the slack pass's pin exit used to
+    /// take nothing and give nothing back, on the assumption that the
+    /// pin's own install would clear the policy -- but the install runs
+    /// only when the file is opened, and an offline download is pinned to
+    /// be fetched *without* being opened. The extent stayed held back from
+    /// every peer, and the pieces the slack pass had dropped stayed
+    /// unwanted, so the download the user asked to keep stood still.
+    #[tokio::test]
+    async fn a_pin_on_a_slack_entity_nobody_plays_gives_its_bytes_back_on_the_slack_pass() {
+        let (backing, owner, _budget) = torrent();
+        *backing.held.lock() = [0, 1, 2].into_iter().collect();
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        owner.note_position(&0, (0, 0));
+
+        // The slack pass holds the extent back and then cannot unlink.
+        backing.reclaim_panics.store(true, Ordering::SeqCst);
+        let opens = owner.opens_of(&0);
+        let claim = owner.turn(&0).await.expect("the turn");
+        owner.pass(&0, &(), claim, Mode::Slack { opens }).await;
+        assert!(owner.holding(&0).expect("the entity").installed.is_none());
+        assert!(
+            backing.wanted_all.lock().is_empty(),
+            "a slack pass wants nothing"
+        );
+
+        // The user pins the file and does not open it: the next tick reads
+        // it as slack, and that pass is the one that has to put it right.
+        backing.reclaim_panics.store(false, Ordering::SeqCst);
+        backing.keeps_everything.store(true, Ordering::SeqCst);
+        let claim = owner.turn(&0).await.expect("the turn");
+        let outcome = owner.pass(&0, &(), claim, Mode::Slack { opens }).await;
+        assert!(
+            outcome.concluded.is_none(),
+            "a pinned entity is never slack"
+        );
+        assert_eq!(
+            backing.on_disk(),
+            vec![0, 1, 2],
+            "and nothing of it is taken"
+        );
+
+        let covered: BTreeSet<u32> = backing
+            .advertised
+            .lock()
+            .iter()
+            .filter(|(_, on)| *on)
+            .flat_map(|(range, _)| range.clone())
+            .collect();
+        assert_eq!(
+            covered,
+            (0..8).collect::<BTreeSet<u32>>(),
+            "the pinned entity's range is back in what we announce"
+        );
+        assert_eq!(
+            *backing.wanted_all.lock(),
+            vec![0..8],
+            "and every piece of it is wanted again"
+        );
     }
 
     /// **An entity a reader is open on is never forgotten, even emptied.**
