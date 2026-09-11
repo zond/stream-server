@@ -375,6 +375,12 @@ pub(crate) struct TorrentBacking<H: TorrentHandle> {
     /// property, and the owner asks about it before every pass and at every
     /// door.
     pinned: Arc<parking_lot::RwLock<BTreeSet<usize>>>,
+    /// Whether the pin record was unreadable at boot, shared with the whole
+    /// process ([`crate::piece_store::PinsUnknown`]). While it holds, the
+    /// pin set is not "empty", it is *unknown*, and an owner that reclaimed
+    /// on that reading would delete the offline downloads the record was
+    /// the only description of.
+    pins_unknown: Arc<crate::piece_store::PinsUnknown>,
     /// Pieces a reclaim asked the backend to forget and did not get back --
     /// a peer mid-flight on them, or a stream's lookahead over them. Shared
     /// with [`Engine::refused_reclaims`], where a test reads it.
@@ -476,8 +482,14 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
 
     /// Any pin on the torrent: a pin is a retention property, the user asked
     /// for those bytes, and they are shared like any other bytes we keep.
+    ///
+    /// True for everything while the pin set is unknown. A boot that could
+    /// not read the pin record knows only that some of this may be pinned,
+    /// and the safe reading of "some" is "all": the bytes are still there
+    /// to unpin, where a pass that had taken them would have destroyed the
+    /// download the unreadable file was the only record of.
     fn keeps_everything(&self, _file_idx: &usize) -> bool {
-        !self.pinned.read().is_empty()
+        self.pins_unknown.is_set() || !self.pinned.read().is_empty()
     }
 
     /// Whether this file is the one being played, at this instant. One
@@ -834,6 +846,11 @@ pub struct Engine<H: TorrentHandle> {
     /// [`TorrentBacking`], which is how the retention owner learns of a
     /// pin: read as a copy-out, never under any lock of the owner's.
     pub pinned_files: Arc<parking_lot::RwLock<BTreeSet<usize>>>,
+    /// The process-wide "the pin record would not read" condition, shared
+    /// with every engine and every backing. [`Self::is_pinned`] answers
+    /// from it, which is how one unreadable file at boot keeps every
+    /// restored torrent running and keeps every byte of it on the disk.
+    pins_unknown: Arc<crate::piece_store::PinsUnknown>,
     /// The last free-space reading of every volume, shared with the
     /// `BackendEngineFS` that made this engine and written by its
     /// reconciler. Whether this torrent is stopped for want of space is
@@ -912,6 +929,7 @@ impl<H: TorrentHandle> Engine<H> {
             info_hash: self.info_hash.clone(),
             live: self.live.clone(),
             pinned: self.pinned_files.clone(),
+            pins_unknown: self.pins_unknown.clone(),
             refused: self.refused_reclaims.clone(),
         };
         let domain = backing.resolve(file_idx).await?;
@@ -925,6 +943,7 @@ impl<H: TorrentHandle> Engine<H> {
         volumes: Arc<crate::reconcile::Volumes>,
         budget: Arc<crate::retention::RetentionBudget>,
         live: Arc<Live>,
+        pins_unknown: Arc<crate::piece_store::PinsUnknown>,
     ) -> Self {
         let pinned_files = Arc::new(parking_lot::RwLock::new(BTreeSet::new()));
         #[cfg(test)]
@@ -935,6 +954,7 @@ impl<H: TorrentHandle> Engine<H> {
                 info_hash: info_hash.to_string(),
                 live: live.clone(),
                 pinned: pinned_files.clone(),
+                pins_unknown: pins_unknown.clone(),
                 #[cfg(test)]
                 refused: refused_reclaims.clone(),
             }),
@@ -964,6 +984,7 @@ impl<H: TorrentHandle> Engine<H> {
             settled: AtomicBool::new(true),
             last_transition_at: AtomicU64::new(NEVER_MOVED),
             pinned_files,
+            pins_unknown,
             volumes,
             reads_refused: AtomicBool::new(false),
             read_wakers: parking_lot::Mutex::new(HashMap::new()),
@@ -1792,8 +1813,18 @@ impl<H: TorrentHandle> Engine<H> {
         freed
     }
 
+    /// Whether anything about this torrent is pinned -- what exempts it
+    /// from idle removal, keeps its bytes off every reclaim, and makes the
+    /// reconciler run it.
+    ///
+    /// Always true while the pin set is unknown ([`Self::pins_unknown`]):
+    /// the pin record is the only place a pin lives across a restart, and a
+    /// boot that could not read it must report and treat every restored
+    /// torrent as pinned rather than as unpinned. The user is told so on
+    /// the wire, and the first pin or unpin writes a true record and ends
+    /// it.
     pub fn is_pinned(&self) -> bool {
-        !self.pinned_files.read().is_empty()
+        self.pins_unknown.is_set() || !self.pinned_files.read().is_empty()
     }
 
     /// The pinned file indices, ascending.

@@ -182,6 +182,7 @@
 //! is still on our disk when the stream is over.
 
 pub mod layout;
+pub mod pin_record;
 pub mod policy;
 pub mod registry;
 pub mod store;
@@ -189,13 +190,14 @@ pub mod sweep;
 
 pub use crate::chunk_store::StoredChunk as StoredPiece;
 pub use layout::{FileSpec, PieceLayout, Segment};
+pub use pin_record::{PinRecord, PinsUnknown};
 pub use policy::{Decision, RetentionPolicy, Shape, Share};
 pub use registry::{DeleteOutcome, StoreRegistry};
 pub use store::{
     HeldSnapshot, MissingPiece, PieceStore, PieceStoreFactory, StoreContents, StoreRoot,
     StoredTorrent, layout_of,
 };
-pub use sweep::{SweepReport, session_recorded_hashes, sweep_unadopted};
+pub use sweep::{SweepReport, sweep_before_session, sweep_unadopted};
 
 /// The store's directory inside a torrent cache root.
 ///

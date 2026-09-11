@@ -1184,9 +1184,11 @@ pub async fn run(
     }
 
     // The proxy cache's own launch-time sweep, before the router can serve a
-    // request that writes into it. It removes the temporary files a kill left
-    // mid-write and nothing else -- everything else under that root is cache
-    // that is meant to survive a restart. See `proxy_cache::sweep`.
+    // request that writes into it. It empties the root: a proxied entity is
+    // kept while something is playing it and disposable the moment anything
+    // else opens, and a process that has served nothing is playing nothing --
+    // so every chunk a previous run left is a byte no owner here would ever
+    // count or reclaim. See `proxy_cache::sweep`.
     {
         let root = state.proxy_cache.root().to_path_buf();
         if let Err(error) = tokio::task::spawn_blocking(move || proxy_cache::sweep(&root)).await {

@@ -852,14 +852,11 @@ impl ProxyRetention {
     /// `occupied + available - floor` that reads as a *larger* cap and
     /// grows the cache with every pass.
     ///
-    /// What it does not hear is a *writer* outside this process. Chunks a
-    /// previous run left are on the disk and not in this count, so until
-    /// the launch sweep empties the proxy cache at boot -- which it does
-    /// not yet: today's sweep takes the staged temporaries and keeps every
-    /// complete chunk -- a warm cache reads as nothing until this process
-    /// rewrites it. That understates the volume, which is the safe
-    /// direction for a cap, and it is what
-    /// `cache_cleaner::cache_usage` clamps the protected figure against.
+    /// What it does not hear is a *writer* outside this process -- and
+    /// there is none left to hear. The launch sweep empties this root
+    /// before the router serves anything (`proxy_cache::sweep`), so "what
+    /// this process wrote" and "what is on the disk" are the same set from
+    /// the first byte.
     pub fn occupancy(&self) -> u64 {
         self.occupancy.bytes()
     }

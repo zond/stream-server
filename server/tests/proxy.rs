@@ -2662,14 +2662,15 @@ fn taken_from(named: &[u64], left: &[u64]) -> Vec<u64> {
 
 /// The launch-time sweep, through a real restart.
 ///
-/// It takes the temporaries a kill left mid-write and nothing else. That is
-/// the whole difference from the piece store's sweep, and it is worth a test
-/// in both directions: a torrent's pieces are claimed by the session, so
-/// anything unclaimed there is data nothing will ever reclaim, while nothing
-/// claims a cached URL -- every committed chunk is cache, and surviving a
-/// restart is the point of it.
+/// It empties the proxy cache: the chunk a kill was writing and the chunk
+/// beside it that was committed. Nothing here outlives a process, because a
+/// proxied entity is kept only while something is playing it -- and a process
+/// that has served nothing is playing nothing, so a chunk from the last run is
+/// a byte no owner in this one would ever count or reclaim. The piece store's
+/// sweep beside it keeps exactly one thing, the pin, for the same reason: a
+/// pin is the only claim that was ever meant to survive a restart.
 #[test]
-fn a_restart_sweeps_the_chunks_a_kill_was_writing_and_keeps_the_rest() -> anyhow::Result<()> {
+fn a_restart_empties_the_proxy_cache() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
     let cache_root = tempfile::tempdir()?;
     let start = || {
@@ -2702,7 +2703,14 @@ fn a_restart_sweeps_the_chunks_a_kill_was_writing_and_keeps_the_rest() -> anyhow
 
     let handle = start()?;
     assert!(!killed.exists(), "the temporary is gone");
-    assert!(committed.is_file(), "and the chunk beside it is not");
+    assert!(
+        !committed.exists(),
+        "and so is the committed chunk beside it: nothing here is being played"
+    );
+    assert!(
+        !bucket.exists(),
+        "the entity directory goes whole, not chunk by chunk"
+    );
 
     drop(handle);
     Ok(())

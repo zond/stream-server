@@ -57,6 +57,30 @@ pub struct DownloadInfo {
 pub const DORMANT_DOWNLOAD_ERROR: &str = "the torrent is not managed right now; \
      the pin is kept and applies when it comes back";
 
+/// What every download reports as its `error` while this process could not
+/// read the pin record (`enginefs::BackendEngineFS::pins_unknown`).
+///
+/// The pin record is the only place a pin lives across a restart, so a boot
+/// that could not read it does not know which of these the user asked to
+/// keep. It keeps all of them and says so, here and in
+/// [`PIN_RECORD_HEADER`]: the downloads listed are every file of every
+/// torrent the session restored, not a pin set, and a client that shows them
+/// as pinned is showing what is true of the disk. The next pin or unpin
+/// writes a true record and the condition ends.
+pub const PIN_RECORD_UNREADABLE: &str = "PIN_RECORD_UNREADABLE";
+
+/// The response header `GET /downloads.json` carries while the pin set is
+/// unknown: `X-Pin-Record: unreadable`.
+///
+/// The per-download `error` cannot say it on its own -- a session that
+/// restored nothing has no download to hang it on, and an empty list is
+/// exactly what a lost pin record looks like from the outside. The header is
+/// there either way.
+pub const PIN_RECORD_HEADER: &str = "x-pin-record";
+
+/// [`PIN_RECORD_HEADER`]'s value while the pin set is unknown.
+pub const PIN_RECORD_UNREADABLE_HEADER_VALUE: &str = "unreadable";
+
 /// Pin `file_idx` of `info_hash` as an offline download, exactly what
 /// `POST /{infoHash}/{fileIdx}/download` will answer: the engine is created
 /// through the magnet registry with `trackers` (normalised like the stats
@@ -127,9 +151,24 @@ pub async fn unpin_download(
 /// ordered by info hash then file index, the live ones first and the
 /// dormant ones (torrent not restored, [`DORMANT_DOWNLOAD_ERROR`]) after
 /// them. One stats call per torrent, not per file.
+///
+/// While the pin record is unreadable the list is every file of every
+/// torrent the session restored, each with [`PIN_RECORD_UNREADABLE`] as its
+/// error: that is what is being kept, and reporting the empty in-memory pin
+/// set instead would tell the user their downloads are gone while the bytes
+/// are still on the disk.
 pub async fn downloads(state: &AppState) -> Vec<DownloadInfo> {
     let engine_fs = state.engine.clone();
     let mut by_hash: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    if engine_fs.pins_unknown() {
+        for info_hash in engine_fs.list_engines().await {
+            let Some(engine) = engine_fs.get_engine(&info_hash).await else {
+                continue;
+            };
+            let count = engine.handle.file_count().await;
+            by_hash.insert(engine.info_hash.clone(), (0..count).collect());
+        }
+    }
     for pin in engine_fs.pinned_downloads().await {
         by_hash.entry(pin.info_hash).or_default().push(pin.file_idx);
     }
@@ -143,7 +182,11 @@ pub async fn downloads(state: &AppState) -> Vec<DownloadInfo> {
         let stats = engine.get_statistics().await;
         for file_idx in file_indices {
             let path = engine.handle.get_file_path(file_idx).await;
-            downloads.push(live_download(&info_hash, file_idx, path, &stats));
+            let mut info = live_download(&info_hash, file_idx, path, &stats);
+            if engine_fs.pins_unknown() {
+                info.error = Some(PIN_RECORD_UNREADABLE.to_string());
+            }
+            downloads.push(info);
         }
     }
     downloads.extend(
@@ -284,7 +327,15 @@ pub async fn delete_download(
 }
 
 pub async fn get_downloads(State(state): State<AppState>) -> Response {
-    Json(downloads(&state).await).into_response()
+    let unknown = state.engine.pins_unknown();
+    let mut response = Json(downloads(&state).await).into_response();
+    if unknown {
+        response.headers_mut().insert(
+            axum::http::HeaderName::from_static(PIN_RECORD_HEADER),
+            axum::http::HeaderValue::from_static(PIN_RECORD_UNREADABLE_HEADER_VALUE),
+        );
+    }
+    response
 }
 
 #[cfg(test)]

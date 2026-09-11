@@ -8,25 +8,34 @@
 //! asks the engine what it holds, and is never reclaimed: exactly the
 //! invisible disk usage this design exists to stop producing.
 //!
-//! So the store is reconciled against the session once, at launch, before the
-//! first add: every directory under the piece root whose info hash no torrent
-//! and no pin claims is removed outright. Running before the first add is what
-//! makes that safe -- a torrent being added concurrently would have a
-//! directory and no claim yet.
+//! So the store is reconciled against the pin record once, at launch, before
+//! the session opens: every directory under the piece root whose info hash no
+//! pin claims is removed outright. Running before the session is what makes
+//! that safe -- a torrent being restored or added concurrently would have a
+//! directory, a registered store and no claim yet.
 //!
 //! It is idempotent by construction: it deletes what is not claimed, and a
 //! second pass finds the same claims and nothing left to delete.
 //!
-//! What may claim a torrent is therefore the whole of the question. It is not
-//! "what came up on this boot": a restore is allowed to fail -- the volume the
-//! torrent writes to is not mounted, its `.torrent` will not parse, the add
-//! errored -- and the failure says nothing at all about the data. The claim is
-//! *what the session still has a record of*, which is what
-//! [`session_recorded_hashes`] reads off disk.
+//! What may claim a torrent is therefore the whole of the question, and the
+//! answer is now one word: a pin. Everything else under this root is cache --
+//! a window round a playhead, the committed half a peer is served from, a
+//! slack file the next tick takes -- and none of it is worth a byte across a
+//! restart, because nothing is playing in a process that has served nothing.
+//! So the claim set is the pin record's keys ([`super::pin_record`]) and the
+//! sweep runs *before the session opens*, while no store is registered and no
+//! torrent can be mid-check: what it deletes, it deletes with nothing holding
+//! a handle on it.
+//!
+//! The one state it refuses to run in is a pin record that would not read.
+//! An unreadable record names no pins, and sweeping on that would delete
+//! every offline download the user has -- so it is skipped for that boot and
+//! the disk keeps what it held; see [`super::pin_record::PinsUnknown`].
 
 use std::collections::HashSet;
 use std::path::Path;
 
+use super::pin_record::PinRecord;
 use super::store::StoreRoot;
 
 /// What one sweep did.
@@ -41,91 +50,6 @@ pub struct SweepReport {
     /// Entries that could not be removed. Logged, never fatal: a sweep that
     /// trips over one directory must still do the rest.
     pub errors: usize,
-}
-
-/// Info hashes librqbit's session persistence still has a record of, read
-/// straight out of its folder (which is the engine's `download_dir` -- see
-/// `LibrqbitBackend::new`, which hands `SessionPersistenceConfig::Json` that
-/// same path).
-///
-/// Two records, because either can outlive the other and each on its own is
-/// reason enough not to delete a download:
-///
-/// * `session.json`, the session database: a `torrents` map of
-///   `SerializedTorrent`, of which only `info_hash` matters here.
-/// * `<info hash>.bitv` and `<info hash>.torrent`, the per-torrent fastresume
-///   bitfield and metadata file. A `session.json` that is truncated, half
-///   written or unparseable takes every claim in it down with it, and these
-///   are what is left; conversely a torrent added seconds before the process
-///   died has a session entry and no bitfield yet.
-///
-/// Anything unreadable is a warning and no claim, never an error: a sweep must
-/// still run. That direction is the safe one only because it is paired with
-/// the second record -- losing *both* is the one case that can still take a
-/// torrent's pieces, and by then the session has forgotten the torrent too.
-pub fn session_recorded_hashes(persistence_folder: &Path) -> HashSet<String> {
-    #[derive(serde::Deserialize)]
-    struct SessionDatabase {
-        #[serde(default)]
-        torrents: std::collections::HashMap<String, SerializedTorrent>,
-    }
-    #[derive(serde::Deserialize)]
-    struct SerializedTorrent {
-        info_hash: String,
-    }
-
-    let mut hashes = HashSet::new();
-    let db_path = persistence_folder.join("session.json");
-    match std::fs::read(&db_path) {
-        Ok(bytes) => match serde_json::from_slice::<SessionDatabase>(&bytes) {
-            Ok(db) => hashes.extend(
-                db.torrents
-                    .into_values()
-                    .filter_map(|torrent| info_hash_of(&torrent.info_hash)),
-            ),
-            Err(error) => tracing::warn!(
-                path = %db_path.display(),
-                %error,
-                "could not read the session database; the per-torrent records are the only claims left"
-            ),
-        },
-        // No session database is the ordinary first-launch state.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => tracing::warn!(
-            path = %db_path.display(),
-            %error,
-            "could not open the session database; the per-torrent records are the only claims left"
-        ),
-    }
-
-    match std::fs::read_dir(persistence_folder) {
-        Ok(entries) => {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let Some(name) = name.to_str() else {
-                    continue;
-                };
-                if let Some((stem, "bitv" | "torrent")) = name.rsplit_once('.')
-                    && let Some(hash) = info_hash_of(stem)
-                {
-                    hashes.insert(hash);
-                }
-            }
-        }
-        Err(error) => tracing::warn!(
-            path = %persistence_folder.display(),
-            %error,
-            "could not read the session persistence folder"
-        ),
-    }
-    hashes
-}
-
-/// `name` as a lowercase info hash, or `None` when it is not one. The same
-/// shape `cache_cleaner::is_session_artifact` recognises: forty hex digits.
-fn info_hash_of(name: &str) -> Option<String> {
-    (name.len() == 40 && name.bytes().all(|b| b.is_ascii_hexdigit()))
-        .then(|| name.to_ascii_lowercase())
 }
 
 /// Remove every torrent's pieces under `root` except those whose lowercase
@@ -191,6 +115,40 @@ pub fn sweep_unadopted(root: &StoreRoot, adopted: &HashSet<String>) -> SweepRepo
         }
     }
     report
+}
+
+/// The launch sweep, in the one order that is safe: whatever `record`
+/// claims is kept and everything else under the piece root goes, before the
+/// session opens.
+///
+/// Skipped outright for a record that would not read. An unreadable record
+/// claims nothing, and a sweep on nothing is `remove_dir_all` over every
+/// offline download the user has -- so the disk keeps what it held for that
+/// boot, the condition is reported instead
+/// ([`super::pin_record::PinsUnknown`]), and the next boot with a readable
+/// record sweeps what this one left.
+///
+/// On the blocking pool: it is `read_dir` plus `remove_dir_all` over a tree
+/// that can be the whole cache, and it runs on the thread that is opening the
+/// session.
+pub async fn sweep_before_session(download_dir: &Path, record: &PinRecord) -> SweepReport {
+    if let Some(why) = record.unreadable() {
+        tracing::warn!(
+            path = %super::pin_record::path(download_dir).display(),
+            error = %why,
+            "the pin record could not be read; keeping every torrent's data and sweeping nothing this boot"
+        );
+        return SweepReport::default();
+    }
+    let root = StoreRoot::in_download_dir(download_dir);
+    let claims = record.claims();
+    match tokio::task::spawn_blocking(move || sweep_unadopted(&root, &claims)).await {
+        Ok(report) => report,
+        Err(error) => {
+            tracing::warn!(%error, "the piece store sweep did not finish");
+            SweepReport::default()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -260,55 +218,6 @@ mod tests {
         assert!(root.join(ADOPTED).is_dir());
     }
 
-    /// The claim that keeps a download alive on a boot where the restore
-    /// failed: librqbit's own records, read off disk. Both of them, because
-    /// either can be the only one left.
-    #[test]
-    fn the_sessions_own_records_are_claims() {
-        let tmp = tempfile::tempdir().unwrap();
-        let folder = tmp.path();
-        std::fs::write(
-            folder.join("session.json"),
-            serde_json::json!({
-                "torrents": { "0": { "info_hash": ADOPTED }, "7": { "info_hash": DORMANT } }
-            })
-            .to_string(),
-        )
-        .unwrap();
-        // Recorded by a per-torrent file alone -- `session.json` has no entry
-        // for it, which is what a truncated flush or a torrent added between
-        // two flushes leaves.
-        std::fs::write(folder.join(format!("{ORPHAN}.bitv")), [0u8; 8]).unwrap();
-        // Debris that is not a record of anything.
-        std::fs::write(folder.join("notes.bitv"), b"x").unwrap();
-        std::fs::write(folder.join("dht.json"), b"{}").unwrap();
-
-        assert_eq!(
-            session_recorded_hashes(folder),
-            claims(&[ADOPTED, DORMANT, ORPHAN])
-        );
-    }
-
-    /// A session database that will not parse must not silently un-claim
-    /// every torrent in it. It costs a warning and the per-torrent records
-    /// carry the claims instead -- which is the whole reason both are read.
-    #[test]
-    fn an_unreadable_session_database_falls_back_to_the_per_torrent_records() {
-        let tmp = tempfile::tempdir().unwrap();
-        let folder = tmp.path();
-        std::fs::write(folder.join("session.json"), b"{\"torrents\": {\"0\": ").unwrap();
-        std::fs::write(folder.join(format!("{ADOPTED}.torrent")), b"d4:infod").unwrap();
-
-        assert_eq!(session_recorded_hashes(folder), claims(&[ADOPTED]));
-    }
-
-    #[test]
-    fn a_folder_with_no_session_in_it_records_nothing() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert!(session_recorded_hashes(tmp.path()).is_empty());
-        assert!(session_recorded_hashes(&tmp.path().join("never")).is_empty());
-    }
-
     #[test]
     fn a_store_that_has_never_been_written_is_not_a_problem() {
         let tmp = tempfile::tempdir().unwrap();
@@ -329,5 +238,63 @@ mod tests {
         let report = sweep_unadopted(&StoreRoot::new(root.clone()), &claims(&[ADOPTED, DORMANT]));
         assert_eq!(report.removed, 1);
         assert!(!root.join(ADOPTED).exists());
+    }
+
+    /// The claim set is the pin record's keys and nothing else: a torrent
+    /// the session will restore in a moment, and whose pieces are right
+    /// there, is cache unless it is pinned.
+    #[tokio::test]
+    async fn the_sweep_keeps_what_the_pin_record_names_and_takes_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let download_dir = tmp.path().to_path_buf();
+        let root = StoreRoot::in_download_dir(&download_dir)
+            .path()
+            .to_path_buf();
+        piece(&root, ADOPTED, "0", "1", 4096);
+        piece(&root, ORPHAN, "0", "0", 8192);
+
+        let record = PinRecord::Pins(std::collections::BTreeMap::from([(
+            ADOPTED.to_string(),
+            vec![0usize],
+        )]));
+        let report = sweep_before_session(&download_dir, &record).await;
+        assert_eq!(report.removed, 1, "{report:?}");
+        assert!(root.join(ADOPTED).join("0").join("1").is_file(), "pinned");
+        assert!(!root.join(ORPHAN).exists(), "and nothing else is claimed");
+    }
+
+    /// No record at all is an empty claim set -- first launch, or a user who
+    /// has never pinned -- and the sweep runs on it.
+    #[tokio::test]
+    async fn an_absent_record_claims_nothing_and_the_sweep_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let download_dir = tmp.path().to_path_buf();
+        let root = StoreRoot::in_download_dir(&download_dir)
+            .path()
+            .to_path_buf();
+        piece(&root, ADOPTED, "0", "1", 4096);
+
+        let report = sweep_before_session(&download_dir, &PinRecord::Absent).await;
+        assert_eq!(report.removed, 1, "{report:?}");
+        assert!(!root.join(ADOPTED).exists());
+    }
+
+    /// And a record that would not read is not an empty claim set: nothing
+    /// is swept at all, because the pins it named are exactly what would go.
+    #[tokio::test]
+    async fn an_unreadable_record_sweeps_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let download_dir = tmp.path().to_path_buf();
+        let root = StoreRoot::in_download_dir(&download_dir)
+            .path()
+            .to_path_buf();
+        piece(&root, ADOPTED, "0", "1", 4096);
+        piece(&root, ORPHAN, "0", "0", 8192);
+
+        let report =
+            sweep_before_session(&download_dir, &PinRecord::Unreadable("broken".into())).await;
+        assert_eq!(report, SweepReport::default());
+        assert!(root.join(ADOPTED).join("0").join("1").is_file());
+        assert!(root.join(ORPHAN).join("0").join("0").is_file());
     }
 }

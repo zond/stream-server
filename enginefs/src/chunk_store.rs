@@ -723,11 +723,6 @@ pub fn staged_stem(name: &str) -> Option<&str> {
     name.strip_suffix(STAGING_SUFFIX)
 }
 
-/// Whether a file name is a staged copy of some chunk, addressable or not.
-pub fn is_staged_name(name: &str) -> bool {
-    staged_stem(name).is_some()
-}
-
 /// A file name in a bucket directory back to the chunk it holds and which
 /// copy of it, or `None` when it is not a name this store writes.
 pub fn chunk_of_name(name: &str) -> Option<(u64, bool)> {

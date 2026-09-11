@@ -1014,7 +1014,7 @@ where
 /// What one sweep did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SweepReport {
-    /// Temporary chunk files removed.
+    /// Cached resources removed -- one per key directory under the root.
     pub removed: usize,
     /// What they occupied, in bytes as the volume counts them.
     pub freed_bytes: u64,
@@ -1022,53 +1022,73 @@ pub struct SweepReport {
     pub errors: usize,
 }
 
-/// Delete the staged files a kill left behind, at launch.
+/// Empty the proxy cache, at launch.
 ///
-/// **This is not the piece store's sweep, and the difference is the claim
-/// set and the staging identity.** A torrent's pieces are claimed by the
-/// session, so anything unclaimed there is data nothing will ever reclaim,
-/// and its staged copy is addressable and resumable -- so its sweep discards
-/// a staged copy only when it *shadows* a complete one. Nothing claims a
-/// cached URL: every chunk here is cache, the cleaner counts and evicts all
-/// of it, and surviving a restart is the whole point. And a staged chunk
-/// here is anonymous: nothing can address it, so nothing can resume it. So
-/// the only thing a kill can leave that is not cache is a chunk that was
-/// being written when the process died, and all of those go.
+/// **Nothing here survives a restart, and that is the whole of it.** A
+/// proxied entity is kept for exactly as long as something is playing it: a
+/// window round the playhead while it is live, and nothing at all once a
+/// stream opens on anything else. A process that has served nothing is
+/// playing nothing, so every chunk under this root belongs to a playback
+/// that ended when the last process did -- there is no pin here, no claim
+/// that outlives the run, and no owner in this process that would ever
+/// count these bytes or reclaim them. Left alone they would be exactly the
+/// invisible disk usage the design exists to remove: on the disk, out of
+/// every occupancy figure this process publishes
+/// (`crate::proxy_retention::ProxyRetention::occupancy` counts what *it*
+/// wrote), and reclaimed by nothing.
 ///
-/// What a staged file is *called* is asked of the store
-/// ([`enginefs::chunk_store::is_staged_name`]) rather than spelled a second
-/// time here.
+/// Which also makes the occupancy count true from the first byte: the
+/// launch sweep is what makes "what this process wrote" and "what is on the
+/// disk" the same set.
+///
+/// Removed whole rather than chunk by chunk -- the key directory and every
+/// entity under it -- because an empty tree of directories is debris too.
+/// The chunk a kill was writing to its temporary name goes with the rest;
+/// it needed naming when committed chunks stayed.
 pub fn sweep(root: &Path) -> SweepReport {
     let mut report = SweepReport::default();
-    for entry in walkdir::WalkDir::new(root) {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        // No cache root yet is the ordinary first-launch state.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return report,
+        Err(error) => {
+            tracing::warn!(root = %root.display(), %error, "could not read the proxy cache");
+            report.errors += 1;
+            return report;
+        }
+    };
+    for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
-            // No cache root yet is the ordinary first-launch state.
-            Err(error) if error.io_error().map(|e| e.kind()) == Some(io::ErrorKind::NotFound) => {
-                continue;
-            }
             Err(error) => {
-                tracing::warn!(root = %root.display(), %error, "could not read the proxy cache");
+                tracing::warn!(root = %root.display(), %error, "could not read a proxy cache entry");
                 report.errors += 1;
                 continue;
             }
         };
-        if !entry.file_type().is_file()
-            || !enginefs::chunk_store::is_staged_name(&entry.file_name().to_string_lossy())
-        {
-            continue;
-        }
-        let freed = entry
-            .metadata()
-            .map(|m| enginefs::chunk_store::occupied_bytes(&m))
-            .unwrap_or(0);
-        match std::fs::remove_file(entry.path()) {
+        let path = entry.path();
+        // Measured before it goes, and by the volume's own accounting: a
+        // partly-written chunk frees what its blocks free, not what its
+        // length claims.
+        let held: u64 = walkdir::WalkDir::new(&path)
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry.file_type().is_file())
+            .filter_map(|entry| entry.metadata().ok())
+            .map(|metadata| enginefs::chunk_store::occupied_bytes(&metadata))
+            .sum();
+        let removed = if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match removed {
             Ok(()) => {
                 report.removed += 1;
-                report.freed_bytes += freed;
+                report.freed_bytes += held;
             }
             Err(error) => {
-                tracing::warn!(path = %entry.path().display(), %error, "could not sweep a proxy cache temporary");
+                tracing::warn!(path = %path.display(), %error, "could not sweep proxy cache data");
                 report.errors += 1;
             }
         }
@@ -1077,7 +1097,7 @@ pub fn sweep(root: &Path) -> SweepReport {
         tracing::info!(
             removed = report.removed,
             freed = report.freed_bytes,
-            "swept proxy cache chunks that were being written when the process died"
+            "emptied the proxy cache: nothing cached by a previous run is being played by this one"
         );
     }
     report
@@ -1873,7 +1893,6 @@ mod tests {
             !chunk_path(&dir, 1).exists(),
             "and the twelve bytes of the next one are not"
         );
-        assert_eq!(sweep(cache.root()), SweepReport::default());
     }
 
     /// A body that does not start on a chunk boundary contributes nothing to
@@ -1950,11 +1969,16 @@ mod tests {
         }
     }
 
-    /// The sweep's whole job: a chunk that was being written when the
-    /// process died. Everything else under the root is cache, which is what
-    /// surviving a restart means.
+    /// The sweep's whole job: leave the proxy cache empty.
+    ///
+    /// Nothing here outlives the process that wrote it. A proxied entity is
+    /// kept while something is playing it and disposable the moment anything
+    /// else opens, and a process that has served nothing is playing nothing
+    /// -- so a committed chunk from the last run is a byte no owner in this
+    /// run will ever count or reclaim. The temporary a kill left goes with
+    /// it, and needs no rule of its own any more.
     #[test]
-    fn the_sweep_takes_the_temporaries_and_nothing_else() {
+    fn the_sweep_empties_the_cache() {
         let (_root, cache) = cache();
         let entry = entry_of(&cache, "https://host/film.mkv");
         let dir = entry
@@ -1965,10 +1989,15 @@ mod tests {
         std::fs::write(&killed, [3u8; 64]).unwrap();
 
         let report = sweep(cache.root());
-        assert_eq!(report.removed, 1);
+        assert_eq!(report.removed, 1, "the one resource that was cached");
         assert_eq!(report.errors, 0);
+        assert!(report.freed_bytes >= CHUNK_BYTES, "{report:?}");
         assert!(!killed.exists());
-        assert!(chunk_path(&dir, 0).is_file(), "a committed chunk is cache");
+        assert!(
+            !chunk_path(&dir, 0).exists(),
+            "and the committed chunk beside it, which nothing in this process is playing"
+        );
+        assert!(!entry.dir.exists(), "the key directory goes whole");
         assert_eq!(
             sweep(cache.root()),
             SweepReport::default(),
