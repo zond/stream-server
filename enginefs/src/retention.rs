@@ -400,8 +400,9 @@ pub(crate) async fn release<H: TorrentHandle>(
 /// no file was not there to leave it, and is not an error; nor is one the
 /// volume refuses to unlink, which is logged and stepped over rather than
 /// abandoning the rest of the run: every piece in it has had its have-bit
-/// cleared already, and the claim that would let a caller retry is released
-/// on the way out of here.
+/// cleared already. It keeps its bit in the held set, so the next pass
+/// offers it again, and librqbit hands a dropped piece to a new claim once
+/// this one is released: that is the retry.
 pub(crate) async fn take_claimed(
     store: &Arc<StoreRegistry>,
     info_hash: &str,

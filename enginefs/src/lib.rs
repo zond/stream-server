@@ -10899,9 +10899,9 @@ mod tests {
     /// want-set, and a piece outside the window can complete in that gap.
     /// librqbit drops it -- it is a have piece -- and a have piece dropped
     /// and left on the disk is one the store counts and the backend has
-    /// forgotten, which no later pass can take: librqbit refuses to drop a
-    /// piece twice. So what the backend reports dropped is read against the
-    /// store now, and the piece that arrived goes with the claim. The
+    /// forgotten, until a later pass offers it again. So what the backend
+    /// reports dropped is read against the store now, and the piece that
+    /// arrived goes with the claim. The
     /// fixture lands the piece from inside the backend's own drop call,
     /// which is the gap exactly.
     #[tokio::test]

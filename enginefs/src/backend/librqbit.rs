@@ -6831,6 +6831,92 @@ mod tests {
         assert_eq!(handle.reselect_pieces(0..3).await.unwrap(), 0);
     }
 
+    /// **A dropped piece is offered to the next claim, once the last one is
+    /// gone.** Against the real backend, because the retry of a failed
+    /// unlink is librqbit's to allow: the store keeps the bit of a piece
+    /// the volume would not unlink, the next pass offers it again, and a
+    /// `drop_pieces` that refused a piece already dropped left that piece
+    /// on the disk until a restart. While a claim still stands, nothing
+    /// is handed out twice.
+    ///
+    /// And a piece of a file nobody selects is claimed although it was
+    /// never had: the storage can hold one (a failed hash, a crash before
+    /// the bitfield flush), nothing downloads it again, and the claim is
+    /// the only way a reclaim of that file can take it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_piece_and_a_deselected_piece_we_lack_are_both_claimable() {
+        use crate::backend::{AfterRelease, TorrentHandle};
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let payload = dir.join("payload.bin");
+        write_payload(&payload, 96 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+        let (_backend, handle) = reclaiming_backend_with_torrent(&dir, &torrent_bytes).await;
+        handle.handle.wait_until_initialized().await.unwrap();
+        assert!(handle.handle.stats().finished, "seeded");
+
+        let first = handle
+            .drop_pieces(0..2, AfterRelease::LeaveDropped)
+            .await
+            .expect("a live torrent added here can drop")
+            .expect("librqbit keeps a have-set");
+        assert_eq!(first.pieces(), &[0, 1]);
+        let under_it = handle
+            .drop_pieces(0..2, AfterRelease::LeaveDropped)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            under_it.pieces().is_empty(),
+            "a piece a claim holds is not handed to a second one: {under_it:?}"
+        );
+        drop(under_it);
+        // Released with the bytes still there: an unlink that failed.
+        drop(first);
+        let again = handle
+            .drop_pieces(0..2, AfterRelease::LeaveDropped)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            again.pieces(),
+            &[0, 1],
+            "the retry of a failed unlink gets its claim"
+        );
+        drop(again);
+
+        // Two files of two whole pieces each, nothing on the disk, and only
+        // the first selected.
+        let content = tmp.path().join("multi");
+        tokio::fs::create_dir_all(&content).await.unwrap();
+        write_payload(&content.join("a.bin"), 32 * 1024).await;
+        write_payload(&content.join("b.bin"), 32 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&content).await;
+        let (_backend, handle) =
+            reclaiming_backend_with_torrent(&tmp.path().join("dl"), &torrent_bytes).await;
+        handle.handle.wait_until_initialized().await.unwrap();
+        let ranges: Vec<std::ops::Range<u32>> = handle
+            .handle
+            .with_metadata(|m| m.file_infos.iter().map(|f| f.piece_range.clone()).collect())
+            .unwrap();
+        assert!(
+            ranges[0].end <= ranges[1].start,
+            "no boundary piece: {ranges:?}"
+        );
+        handle.pin_file(0).await.unwrap();
+        assert_eq!(handle.handle.only_files(), Some(vec![0]));
+        let lacked = handle
+            .drop_pieces(ranges[1].clone(), AfterRelease::LeaveDropped)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            lacked.pieces(),
+            ranges[1].clone().collect::<Vec<_>>(),
+            "not had and not selected is still the claim's to take"
+        );
+    }
+
     /// **A torrent that wants nothing more is not finished until its files
     /// are whole on the disk.**
     ///

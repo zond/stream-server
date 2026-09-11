@@ -113,9 +113,11 @@ impl StoreRegistry {
     /// it becomes a have-bit over nothing.
     ///
     /// A piece the volume refuses to unlink is logged and stepped over, not
-    /// returned: by the time this is called the backend has forgotten every
-    /// piece in the run, so there is no retry a caller could make, and the
-    /// count of what did go is what `ENOSPC` recovery reads.
+    /// returned: the count of what did go is what `ENOSPC` recovery reads.
+    /// Its held bit stays, so the next pass offers it again, and the backend
+    /// hands a piece it has already forgotten to that pass's claim once
+    /// this one is released -- the retry is the next pass's, not the
+    /// caller's.
     ///
     /// What this does not close: the check is asked of the store registered
     /// at entry and the run is unlinked through that store. A restart out

@@ -545,13 +545,12 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
     /// sets its bit, then librqbit its have-bit. Asked to drop it, librqbit
     /// does: it is a have piece, and dropping it is what the reclaim would
     /// have done a pass later. But a have piece dropped and left on the disk
-    /// is a file the store counts and the backend has forgotten, and the
-    /// next pass cannot take it -- librqbit refuses to drop a piece twice --
-    /// so it would sit there, offered and refused every tick, until a
-    /// restart. So what librqbit reports dropped is read against the store's
-    /// set *now*, and whatever is on the disk goes under the claim, as a
-    /// reclaim's pieces do. The set is read after the drop: a piece the
-    /// store has is one librqbit had, never the reverse.
+    /// is a file the store counts and the backend has forgotten, sitting
+    /// there until the next pass offers it again and librqbit hands the
+    /// dropped piece out a second time. So what librqbit reports dropped is
+    /// read against the store's set *now*, and whatever is on the disk goes
+    /// under the claim, as a reclaim's pieces do. The set is read after the
+    /// drop: a piece the store has is one librqbit had, never the reverse.
     ///
     /// **And that unlink asks the door first**, as the reclaim asks it
     /// before every part of every run: the pass read "not pinned" at its
