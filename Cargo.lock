@@ -4010,7 +4010,6 @@ dependencies = [
  "lz-str",
  "mimalloc",
  "mime_guess",
- "once_cell",
  "ratatui",
  "rcgen",
  "regex",

@@ -72,6 +72,7 @@ pub(crate) const DEFAULT_LOG_FILTER: &str = "server=info,stream_server=info,towe
 pub const DEFAULT_HTTP_PORT: u16 = 11470;
 pub const DEFAULT_HTTPS_PORT: u16 = 12470;
 
+#[cfg(any(target_os = "android", test))]
 pub mod jni;
 
 mod archives;

@@ -1,42 +1,10 @@
-use crate::{ServerAuth, ServerConfig, ServerHandle};
-use jni::Env;
-use jni::EnvUnowned;
-use jni::objects::{JClass, JObject, JString};
-use jni::sys::jstring;
-use once_cell::sync::Lazy;
+//! The JNI surface stremio-android loads the cdylib through. Only an
+//! Android build has it (and links the `jni` crate); elsewhere only
+//! `jni_config` is compiled, and only for its test.
+
+use crate::{ServerAuth, ServerConfig};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Mutex;
-
-static SERVER_HANDLE: Lazy<Mutex<Option<ServerHandle>>> = Lazy::new(|| Mutex::new(None));
-
-/// Hands `rustls-platform-verifier` the JVM and the app `Context` it needs to
-/// call Java's `CertPathValidator`.
-///
-/// **Nothing in this workspace should ever reach that verifier any more.**
-/// Every HTTPS client either crate builds goes through
-/// [`enginefs::http_client_builder`], and librqbit's through its own
-/// `http_client_builder`; both call reqwest's `tls_certs_only`, which is the
-/// one builder state that takes the plain `with_root_certificates` arm and
-/// never names the platform verifier. That change exists because on this
-/// device the Java path cost about 400 MB of Java heap per tracker announce
-/// -- see `enginefs::http_client` for the measurement and the trust trade.
-///
-/// This call stays as the arming of a fallback, not as the policy: if some
-/// future client is built with a bare `reqwest::ClientBuilder`, it verifies
-/// slowly rather than failing every handshake outright. A handshake that
-/// actually goes through here on Android is the bug this whole arrangement
-/// exists to prevent, so treat one as a missed call site and not as
-/// business as usual.
-#[cfg(target_os = "android")]
-fn init_android_tls_verifier(env: &mut Env, context: JObject) -> jni::errors::Result<()> {
-    rustls_platform_verifier::android::init_with_env(env, context)
-}
-
-#[cfg(not(target_os = "android"))]
-fn init_android_tls_verifier(_env: &mut Env, _context: JObject) -> jni::errors::Result<()> {
-    Ok(())
-}
 
 /// The configuration `startServerNative` runs with: [`ServerConfig::embedded`]
 /// bound to loopback on `port`, logging to `config_dir`.
@@ -58,117 +26,153 @@ fn jni_config(config_dir: PathBuf, cache_dir: PathBuf, port: u16) -> ServerConfi
     cfg
 }
 
-#[unsafe(no_mangle)]
-/// Starts the embedded server from a JVM native call.
-///
-/// # Safety
-///
-/// The JNI environment and object handles must be valid for the duration of
-/// this call and must originate from the invoking JVM thread.
-pub unsafe extern "C" fn Java_com_stremio_mobile_server_JniStreamingServerController_startServerNative(
-    mut env: EnvUnowned,
-    _class: JClass,
-    context: JObject,
-    config_dir: JString,
-    cache_dir: JString,
-    port: jni::sys::jint,
-) -> jstring {
-    env.with_env(|env| -> jni::errors::Result<jstring> {
-        init_android_tls_verifier(env, context)?;
+#[cfg(target_os = "android")]
+mod exports {
+    use super::jni_config;
+    use crate::ServerHandle;
+    use jni::Env;
+    use jni::EnvUnowned;
+    use jni::objects::{JClass, JObject, JString};
+    use jni::sys::jstring;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
 
-        let config_dir_str: String = match config_dir.try_to_string(env) {
-            Ok(s) => s,
-            Err(_) => {
-                let _ = env.throw_new(
-                    jni::jni_str!("java/lang/IllegalArgumentException"),
-                    jni::jni_str!("Invalid configDir string"),
-                );
-                return Ok(std::ptr::null_mut());
+    static SERVER_HANDLE: Mutex<Option<ServerHandle>> = Mutex::new(None);
+
+    /// Hands `rustls-platform-verifier` the JVM and the app `Context` it needs to
+    /// call Java's `CertPathValidator`.
+    ///
+    /// **Nothing in this workspace should ever reach that verifier any more.**
+    /// Every HTTPS client either crate builds goes through
+    /// [`enginefs::http_client_builder`], and librqbit's through its own
+    /// `http_client_builder`; both call reqwest's `tls_certs_only`, which is the
+    /// one builder state that takes the plain `with_root_certificates` arm and
+    /// never names the platform verifier. That change exists because on this
+    /// device the Java path cost about 400 MB of Java heap per tracker announce
+    /// -- see `enginefs::http_client` for the measurement and the trust trade.
+    ///
+    /// This call stays as the arming of a fallback, not as the policy: if some
+    /// future client is built with a bare `reqwest::ClientBuilder`, it verifies
+    /// slowly rather than failing every handshake outright. A handshake that
+    /// actually goes through here on Android is the bug this whole arrangement
+    /// exists to prevent, so treat one as a missed call site and not as
+    /// business as usual.
+    fn init_android_tls_verifier(env: &mut Env, context: JObject) -> jni::errors::Result<()> {
+        rustls_platform_verifier::android::init_with_env(env, context)
+    }
+
+    #[unsafe(no_mangle)]
+    /// Starts the embedded server from a JVM native call.
+    ///
+    /// # Safety
+    ///
+    /// The JNI environment and object handles must be valid for the duration of
+    /// this call and must originate from the invoking JVM thread.
+    pub unsafe extern "C" fn Java_com_stremio_mobile_server_JniStreamingServerController_startServerNative(
+        mut env: EnvUnowned,
+        _class: JClass,
+        context: JObject,
+        config_dir: JString,
+        cache_dir: JString,
+        port: jni::sys::jint,
+    ) -> jstring {
+        env.with_env(|env| -> jni::errors::Result<jstring> {
+            init_android_tls_verifier(env, context)?;
+
+            let config_dir_str: String = match config_dir.try_to_string(env) {
+                Ok(s) => s,
+                Err(_) => {
+                    let _ = env.throw_new(
+                        jni::jni_str!("java/lang/IllegalArgumentException"),
+                        jni::jni_str!("Invalid configDir string"),
+                    );
+                    return Ok(std::ptr::null_mut());
+                }
+            };
+
+            let cache_dir_str: String = match cache_dir.try_to_string(env) {
+                Ok(s) => s,
+                Err(_) => {
+                    let _ = env.throw_new(
+                        jni::jni_str!("java/lang/IllegalArgumentException"),
+                        jni::jni_str!("Invalid cacheDir string"),
+                    );
+                    return Ok(std::ptr::null_mut());
+                }
+            };
+
+            let mut handle_lock = SERVER_HANDLE.lock().unwrap();
+            if handle_lock.is_some() {
+                let bound_addr = handle_lock.as_ref().unwrap().bound_http_addr();
+                let url = format!("http://{}", bound_addr);
+                return Ok(env.new_string(url)?.into_raw());
             }
-        };
 
-        let cache_dir_str: String = match cache_dir.try_to_string(env) {
-            Ok(s) => s,
-            Err(_) => {
-                let _ = env.throw_new(
-                    jni::jni_str!("java/lang/IllegalArgumentException"),
-                    jni::jni_str!("Invalid cacheDir string"),
-                );
-                return Ok(std::ptr::null_mut());
+            let cfg = jni_config(
+                PathBuf::from(config_dir_str),
+                PathBuf::from(cache_dir_str),
+                port as u16,
+            );
+
+            match crate::start(cfg) {
+                Ok(handle) => {
+                    let bound_addr = handle.bound_http_addr();
+                    let url = format!("http://{}", bound_addr);
+                    *handle_lock = Some(handle);
+                    Ok(env.new_string(url)?.into_raw())
+                }
+                Err(err) => {
+                    let err_msg = format!("Failed to start server: {}", err);
+                    let jni_err_msg = jni::strings::JNIString::from(err_msg);
+                    let _ = env.throw_new(jni::jni_str!("java/lang/RuntimeException"), jni_err_msg);
+                    Ok(std::ptr::null_mut())
+                }
             }
-        };
+        })
+        .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
+    }
 
+    #[unsafe(no_mangle)]
+    /// Stops the embedded server from a JVM native call.
+    ///
+    /// # Safety
+    ///
+    /// The JNI environment and class handle must originate from the invoking JVM
+    /// thread.
+    pub unsafe extern "C" fn Java_com_stremio_mobile_server_JniStreamingServerController_stopServerNative(
+        _env: EnvUnowned,
+        _class: JClass,
+    ) {
         let mut handle_lock = SERVER_HANDLE.lock().unwrap();
-        if handle_lock.is_some() {
-            let bound_addr = handle_lock.as_ref().unwrap().bound_http_addr();
-            let url = format!("http://{}", bound_addr);
-            return Ok(env.new_string(url)?.into_raw());
+        if let Some(handle) = handle_lock.take() {
+            let _ = handle.shutdown();
+            let _ = handle.join();
         }
+    }
 
-        let cfg = jni_config(
-            PathBuf::from(config_dir_str),
-            PathBuf::from(cache_dir_str),
-            port as u16,
-        );
-
-        match crate::start(cfg) {
-            Ok(handle) => {
+    #[unsafe(no_mangle)]
+    /// Returns the embedded server URL to a JVM native caller.
+    ///
+    /// # Safety
+    ///
+    /// The JNI environment and class handle must be valid for the duration of this
+    /// call and must originate from the invoking JVM thread.
+    pub unsafe extern "C" fn Java_com_stremio_mobile_server_JniStreamingServerController_getServerUrlNative(
+        mut env: EnvUnowned,
+        _class: JClass,
+    ) -> jstring {
+        env.with_env(|env| -> jni::errors::Result<jstring> {
+            let handle_lock = SERVER_HANDLE.lock().unwrap();
+            if let Some(handle) = handle_lock.as_ref() {
                 let bound_addr = handle.bound_http_addr();
                 let url = format!("http://{}", bound_addr);
-                *handle_lock = Some(handle);
                 Ok(env.new_string(url)?.into_raw())
-            }
-            Err(err) => {
-                let err_msg = format!("Failed to start server: {}", err);
-                let jni_err_msg = jni::strings::JNIString::from(err_msg);
-                let _ = env.throw_new(jni::jni_str!("java/lang/RuntimeException"), jni_err_msg);
+            } else {
                 Ok(std::ptr::null_mut())
             }
-        }
-    })
-    .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
-}
-
-#[unsafe(no_mangle)]
-/// Stops the embedded server from a JVM native call.
-///
-/// # Safety
-///
-/// The JNI environment and class handle must originate from the invoking JVM
-/// thread.
-pub unsafe extern "C" fn Java_com_stremio_mobile_server_JniStreamingServerController_stopServerNative(
-    _env: EnvUnowned,
-    _class: JClass,
-) {
-    let mut handle_lock = SERVER_HANDLE.lock().unwrap();
-    if let Some(handle) = handle_lock.take() {
-        let _ = handle.shutdown();
-        let _ = handle.join();
+        })
+        .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
     }
-}
-
-#[unsafe(no_mangle)]
-/// Returns the embedded server URL to a JVM native caller.
-///
-/// # Safety
-///
-/// The JNI environment and class handle must be valid for the duration of this
-/// call and must originate from the invoking JVM thread.
-pub unsafe extern "C" fn Java_com_stremio_mobile_server_JniStreamingServerController_getServerUrlNative(
-    mut env: EnvUnowned,
-    _class: JClass,
-) -> jstring {
-    env.with_env(|env| -> jni::errors::Result<jstring> {
-        let handle_lock = SERVER_HANDLE.lock().unwrap();
-        if let Some(handle) = handle_lock.as_ref() {
-            let bound_addr = handle.bound_http_addr();
-            let url = format!("http://{}", bound_addr);
-            Ok(env.new_string(url)?.into_raw())
-        } else {
-            Ok(std::ptr::null_mut())
-        }
-    })
-    .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
 }
 
 #[cfg(test)]
