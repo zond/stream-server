@@ -12,7 +12,7 @@ use axum::http::HeaderMap;
 use enginefs::EngineFS;
 use enginefs::backend::librqbit::{LibrqbitHandle, TorrentInitError};
 use enginefs::backend::{
-    HotFilePriorityPlan, TorrentHandle,
+    TorrentHandle,
     priorities::{BufferProfile, PlaybackIntent},
 };
 use enginefs::engine::{Engine, GetFileError};
@@ -1231,21 +1231,10 @@ async fn stream_video_with(
         );
     }
 
+    // No selection here: `on_stream_start` made it, and a second one per
+    // request was a second librqbit update -- a recompute over every piece
+    // and a persistence write -- for the same set.
     if !native_lifecycle {
-        engine_fs
-            .activate_multifile_file_for_playback(
-                &info_hash,
-                idx,
-                Some(HotFilePriorityPlan {
-                    file_idx: idx,
-                    start_offset: start_offset_hint,
-                    priority,
-                    intent: playback_intent,
-                    bitrate_bytes_per_sec: None,
-                }),
-                "stream-read",
-            )
-            .await;
         engine_fs.focus_torrent(&info_hash).await;
     }
 

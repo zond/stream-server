@@ -1666,7 +1666,25 @@ enum SelectionOp {
 ///   index is a no-op: playback switching never deselects an offline
 ///   download.
 /// - Out-of-range indices are dropped; a plan left empty by that is a no-op.
+/// - A plan equal to the current selection is a no-op.
 fn plan_only_files(
+    current: Option<&[usize]>,
+    file_count: usize,
+    pinned: &BTreeSet<usize>,
+    op: SelectionOp,
+) -> Option<HashSet<usize>> {
+    let planned = plan_selection(current, file_count, pinned, op)?;
+    // The selection it already has is no update. Every stream request
+    // plans one, and librqbit's update is a recompute over every piece under
+    // the torrent's lock and a write of its persistence file, for nothing.
+    let unchanged = current
+        .is_some_and(|current| current.iter().copied().collect::<HashSet<usize>>() == planned);
+    (!unchanged).then_some(planned)
+}
+
+/// [`plan_only_files`] before it compares the plan with the selection the
+/// torrent already has.
+fn plan_selection(
     current: Option<&[usize]>,
     file_count: usize,
     pinned: &BTreeSet<usize>,
@@ -6562,6 +6580,24 @@ mod tests {
         assert_eq!(plan(Some(&[1]), 3, Pin(2)), set(&[1, 2]));
         assert_eq!(plan(None, 3, Pin(2)), set(&[2]));
         assert_eq!(plan(None, 3, Pin(3)), None);
+
+        // The selection the torrent already has: nothing to apply, whatever
+        // the op and whatever order librqbit lists it in.
+        assert_eq!(plan(Some(&[1]), 3, Prepare(1)), None);
+        assert_eq!(
+            plan(
+                Some(&[2, 0]),
+                3,
+                Reconcile {
+                    active: Some(0),
+                    hot: Some(2)
+                }
+            ),
+            None
+        );
+        assert_eq!(plan(Some(&[1, 2]), 3, Pin(2)), None);
+        // "Everything wanted" is not a list of every file.
+        assert_eq!(plan(None, 2, Pin(1)), set(&[1]));
     }
 
     /// The pinned set is unioned into every plan, so playback switching
