@@ -2096,6 +2096,25 @@ mod pin_tests {
         )
     }
 
+    /// **A file the backend cannot place is a refusal to drop, not a
+    /// backend with no have-set.** `drop_file_pieces` answered `Ok(None)`
+    /// for a file whose pieces `file_pieces` could not name -- no metadata
+    /// yet, or no such file -- which is what a backend that keeps no
+    /// have-set answers, where its doc says `Err`: the backend has not
+    /// agreed to forget anything, and the delete that asked is told so and
+    /// says so.
+    #[tokio::test]
+    async fn a_file_the_backend_cannot_place_is_refused_by_drop_file_pieces() {
+        let handle = PinnedHandle {
+            reselected: Arc::default(),
+        };
+        assert!(
+            handle.drop_file_pieces(0).await.unwrap().is_none(),
+            "a file it places goes to drop_pieces, which keeps no have-set here"
+        );
+        assert!(handle.drop_file_pieces(2).await.is_err());
+    }
+
     /// **A pinned file with no entity is wanted whole, once.**
     ///
     /// The case no pass reaches: a slack pass dropped the file's pieces,

@@ -542,7 +542,9 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
     /// not agreed to forget anything.
     async fn drop_file_pieces(&self, file_idx: usize) -> Result<Option<DroppedFilePieces>> {
         let Some(span) = self.file_pieces(file_idx).await else {
-            return Ok(None);
+            anyhow::bail!(
+                "the backend cannot name the pieces of file {file_idx}: no metadata yet, or no such file"
+            );
         };
         self.drop_pieces(span.pieces, AfterRelease::Reselect).await
     }

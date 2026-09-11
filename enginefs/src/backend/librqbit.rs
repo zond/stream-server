@@ -2880,39 +2880,6 @@ impl TorrentHandle for LibrqbitHandle {
         Ok(())
     }
 
-    /// `ManagedTorrent::drop_pieces` over the file's piece range (see the
-    /// trait doc). librqbit clears the have-bits, stops advertising the
-    /// pieces and stops wanting them, and hands back the claim that keeps
-    /// them unwanted until the caller has deleted the bytes.
-    ///
-    /// librqbit skips two kinds of piece on its own: ones it does not have
-    /// (nothing to forget) and ones a live stream's lookahead is about to
-    /// read (dropping those would only re-request them at once; a reader
-    /// still on the file being deleted gets the read error it was going to
-    /// get anyway). A boundary piece the neighbouring file shares is
-    /// dropped too -- half of its bytes are about to go, so its have-bit
-    /// would be a lie -- and comes back through the neighbour's selection
-    /// once the claim is released.
-    ///
-    /// Two states refuse. A torrent that is still hash-checking (or stopped
-    /// with an error) has no have-set to edit. And a torrent added without
-    /// `piece_reclaim` has librqbit answer `PieceReclaimDisabled` however
-    /// long it has been running. `add_torrent_placed` sets the option on
-    /// every add it makes, since the session's default storage is the piece
-    /// store and it can release one (see [`LibrqbitBackend`]'s
-    /// `piece_reclaim` field), so the second refusal is left over from the
-    /// whole-file session this ran on before: no add this backend makes
-    /// lands there.
-    ///
-    /// Both refusals are reported, not hidden: the caller deletes what bytes
-    /// it can, and until the next restart librqbit believes it has the
-    /// pieces. The restart heals it -- the fastresume validation hash-checks
-    /// at least one claimed piece of every file, the deleted file reads back
-    /// empty, and the whole torrent is re-checked from disk -- and the pieces
-    /// stay out of the want-set because `only_files` is persisted without the
-    /// file. What it does *not* heal is the disk: with no claim there are no
-    /// piece indices, and `delete_download_data` will not take pieces the
-    /// backend still believes it has.
     /// The file's piece range, its offset in the torrent, and what those
     /// pieces hold -- which is not the file's length when it shares its
     /// first or last piece with a neighbour. The last piece of the
@@ -2954,6 +2921,40 @@ impl TorrentHandle for LibrqbitHandle {
         })
     }
 
+    /// `ManagedTorrent::drop_pieces` over a run of pieces, which for
+    /// `drop_file_pieces` is the file's whole range (see the trait doc).
+    /// librqbit clears the have-bits, stops advertising the pieces and stops
+    /// wanting them, and hands back the claim that keeps them unwanted until
+    /// the caller has deleted the bytes.
+    ///
+    /// librqbit skips two kinds of piece on its own: ones it does not have
+    /// (nothing to forget) and ones a live stream's lookahead is about to
+    /// read (dropping those would only re-request them at once; a reader
+    /// still on the file being deleted gets the read error it was going to
+    /// get anyway). A boundary piece the neighbouring file shares is
+    /// dropped too -- half of its bytes are about to go, so its have-bit
+    /// would be a lie -- and comes back through the neighbour's selection
+    /// once the claim is released.
+    ///
+    /// Two states refuse. A torrent that is still hash-checking (or stopped
+    /// with an error) has no have-set to edit. And a torrent added without
+    /// `piece_reclaim` has librqbit answer `PieceReclaimDisabled` however
+    /// long it has been running. `add_torrent_placed` sets the option on
+    /// every add it makes, since the session's default storage is the piece
+    /// store and it can release one (see [`LibrqbitBackend`]'s
+    /// `piece_reclaim` field), so the second refusal is left over from the
+    /// whole-file session this ran on before: no add this backend makes
+    /// lands there.
+    ///
+    /// Both refusals are reported, not hidden: the caller deletes what bytes
+    /// it can, and until the next restart librqbit believes it has the
+    /// pieces. The restart heals it -- the fastresume validation hash-checks
+    /// at least one claimed piece of every file, the deleted file reads back
+    /// empty, and the whole torrent is re-checked from disk -- and the pieces
+    /// stay out of the want-set because `only_files` is persisted without the
+    /// file. What it does *not* heal is the disk: with no claim there are no
+    /// piece indices, and `delete_download_data` will not take pieces the
+    /// backend still believes it has.
     async fn drop_pieces(
         &self,
         pieces: std::ops::Range<u32>,
