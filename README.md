@@ -244,7 +244,7 @@ The HTTP surface is deliberately small and split in two by `build_router()` (`se
 | GET | `/{rar\|zip\|7zip\|tar\|tgz}/stream`, `/{…}/stream/{key}`, `/{…}/stream/{key}/{*file}` | OPEN | players — archive member bytes |
 | GET, POST | `/nzb/create`, `/nzb/create/{key}` | OPEN | players |
 | GET | `/nzb/stream`, `/nzb/stream/{key}/{*file}` | OPEN | players |
-| GET | `/ftp/{filename}?lz=…` | OPEN | players (HTTP/FTP passthrough) |
+| GET | `/ftp/{filename}?lz=…` | OPEN | players (FTP/FTPS passthrough via `curl`; any other scheme is `400`) |
 | any | `/proxy/{*rest}`, `/proxy`, `/proxy/` | OPEN | players — a remote stream fetched on their behalf, with the headers the addon asked for, and cached in whole chunks so a seek back into it is answered from disk. See [Proxied remote streams](#proxied-remote-streams) |
 | GET | `/local-addon/manifest.json` | OPEN | stremio-core default profile — **stub**: a valid manifest (`org.stremio.local`, "Local Files") declaring no types, resources or catalogs |
 | GET | `/local-addon/stream/{type}/{id}`, `/local-addon/stream/{type}/{id}.json` | OPEN | stremio-core default profile — **stub**: always `{"streams": []}` |
@@ -577,8 +577,8 @@ exists as an operator veto that no embedder call can override.
 of a route belonging on the LAN is that it serves bytes the loopback side has
 already arranged and cannot be made to arrange anything. `/proxy` and `/ftp`
 fail it outright: both fetch an arbitrary caller-supplied remote URL rather
-than media bytes from this server — `/proxy` over HTTP(S), `/ftp` over
-HTTP(S) or a spawned `curl` for FTP/FTPS — which makes either an open proxy
+than media bytes from this server — `/proxy` over HTTP(S), `/ftp` through a
+spawned `curl` for FTP/FTPS only — which makes either an open proxy
 for whoever can reach it. So do the archive and NZB `/create` routes, which
 download an archive from a caller-named URL or open TCP connections to
 caller-named news servers, and the loopback stream route's first request for

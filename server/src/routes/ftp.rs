@@ -8,7 +8,6 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use futures_util::StreamExt;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -53,81 +52,49 @@ async fn stream_ftp(Path(filename): Path<String>, Query(params): Query<FtpQuery>
         }
     };
 
-    let url = &body.ftp_url;
-
-    // For HTTP/HTTPS URLs, use reqwest (cross-platform)
-    // For actual FTP URLs, we need curl or a dedicated FTP library
-    if url.starts_with("http://") || url.starts_with("https://") {
-        return stream_http(url, &filename).await;
-    }
-
-    // For FTP/FTPS, attempt curl (available on Linux/macOS, less common on Windows)
-    stream_via_curl(url, &filename).await
+    // Only what the route is named for. The URL goes to a spawned `curl`,
+    // which speaks every scheme there is, and this route is open to any
+    // loopback caller -- on Android, every app on the device. Without this
+    // gate, `file:///<data dir>/settings.json` streamed the proxy password
+    // to whoever asked, and any URL curl knows a scheme for was fetched on
+    // the caller's behalf. HTTP(S) is refused too: a caller with an HTTP
+    // URL has `/proxy`, which is built to be handed one.
+    let args = match curl_args(&body.ftp_url) {
+        Ok(args) => args,
+        Err(refusal) => return (StatusCode::BAD_REQUEST, refusal).into_response(),
+    };
+    stream_via_curl(args, &filename).await
 }
 
-async fn stream_http(url: &str, filename: &str) -> Response {
-    let client = match enginefs::http_client_builder().build() {
-        Ok(client) => client,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to build HTTP client: {}", e),
-            )
-                .into_response();
+/// The argument vector `curl` is spawned with for `url`, or why it is not
+/// spawned at all.
+///
+/// The scheme is matched by allow-list, not by refusing what is known to be
+/// dangerous: curl's scheme table is long (`file`, `gopher`, `dict`,
+/// `smb`, ...) and every entry not named here is a capability handed to an
+/// unauthenticated caller. The `--` before the URL is the second lock: it
+/// ends option parsing, so a URL that passed the scheme check can never be
+/// read as a flag whatever follows it -- the check stands on the scheme, not
+/// on the first byte, and the two do not depend on each other.
+fn curl_args(url: &str) -> Result<Vec<String>, &'static str> {
+    let scheme = url.split_once("://").map(|(scheme, _)| scheme);
+    match scheme {
+        Some(scheme)
+            if scheme.eq_ignore_ascii_case("ftp") || scheme.eq_ignore_ascii_case("ftps") =>
+        {
+            Ok(vec!["-s".into(), "-L".into(), "--".into(), url.to_string()])
         }
-    };
-    let response = match client.get(url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                format!("Failed to fetch URL: {}", e),
-            )
-                .into_response();
-        }
-    };
-
-    if !response.status().is_success() {
-        return (
-            StatusCode::BAD_GATEWAY,
-            format!("Upstream returned {}", response.status()),
-        )
-            .into_response();
+        _ => Err("ftpUrl must be an ftp:// or ftps:// URL"),
     }
-
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            mime_guess::from_path(filename)
-                .first_or_octet_stream()
-                .to_string()
-        });
-
-    let stream = response
-        .bytes_stream()
-        .map(|result| result.map_err(std::io::Error::other));
-
-    Response::builder()
-        .header(axum::http::header::CONTENT_TYPE, content_type)
-        .header(
-            axum::http::header::CONTENT_DISPOSITION,
-            compat::content_disposition_inline(filename),
-        )
-        .header("transferMode.dlna.org", compat::DLNA_TRANSFER_MODE)
-        .header("contentFeatures.dlna.org", compat::DLNA_CONTENT_FEATURES)
-        .body(Body::from_stream(stream))
-        .unwrap()
 }
 
-async fn stream_via_curl(url: &str, filename: &str) -> Response {
+/// Stream `curl`'s stdout for the argument vector [`curl_args`] built.
+async fn stream_via_curl(args: Vec<String>, filename: &str) -> Response {
     use tokio_util::io::ReaderStream;
 
     // curl is typically available on Linux/macOS, less so on Windows
     let mut cmd = tokio::process::Command::new("curl");
-    cmd.args(["-s", "-L", url])
+    cmd.args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
 
@@ -165,4 +132,68 @@ async fn stream_via_curl(url: &str, filename: &str) -> Response {
         .header("contentFeatures.dlna.org", compat::DLNA_CONTENT_FEATURES)
         .body(Body::from_stream(stream))
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What the route is named for goes through; nothing else does. Every
+    /// scheme curl knows and this list does not is a capability handed to
+    /// an unauthenticated loopback caller -- `file://` read the settings
+    /// file, and the proxy password in it, to any app on the device.
+    #[test]
+    fn only_ftp_and_ftps_reach_curl() {
+        let ftp = curl_args("ftp://host/dir/movie.mkv").unwrap();
+        assert_eq!(ftp, ["-s", "-L", "--", "ftp://host/dir/movie.mkv"]);
+        assert!(
+            curl_args("FTPS://host/movie.mkv").is_ok(),
+            "the scheme is case-insensitive"
+        );
+
+        assert!(curl_args("file:///data/data/app/files/settings.json").is_err());
+        assert!(curl_args("http://example.com/movie.mkv").is_err());
+        assert!(curl_args("https://example.com/movie.mkv").is_err());
+        assert!(curl_args("gopher://host/1").is_err());
+        assert!(curl_args("host/movie.mkv").is_err(), "no scheme is not ftp");
+        assert!(
+            curl_args("ftp:host").is_err(),
+            "and nor is a scheme without a host part"
+        );
+    }
+
+    /// The scheme check refuses a URL that begins with `-`, and the `--`
+    /// would stop it being read as a flag even if it did not: the URL is
+    /// always the argument after the terminator, so no byte of it is ever
+    /// parsed as an option.
+    #[test]
+    fn the_url_is_never_where_an_option_could_be() {
+        assert!(curl_args("-o/tmp/owned").is_err());
+        assert!(curl_args("--config=/etc/curlrc").is_err());
+        let args = curl_args("ftp://-host/x").unwrap();
+        assert_eq!(args[args.len() - 2], "--");
+        assert_eq!(args.last().unwrap(), "ftp://-host/x");
+    }
+
+    fn lz(url: &str) -> Option<String> {
+        let json = serde_json::json!({ "ftpUrl": url }).to_string();
+        Some(lz_str::compress_to_encoded_uri_component(&json))
+    }
+
+    /// The refusal reaches the wire as a 400 before anything is spawned:
+    /// the handler has no state, so it is called as the router would.
+    #[tokio::test]
+    async fn a_non_ftp_url_is_refused_at_the_route() {
+        for url in [
+            "file:///data/data/app/files/settings.json",
+            "http://example.com/movie.mkv",
+        ] {
+            let response = stream_ftp(
+                Path("movie.mkv".to_string()),
+                Query(FtpQuery { lz: lz(url) }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{url}");
+        }
+    }
 }
