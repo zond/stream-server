@@ -259,6 +259,98 @@ impl Drop for DiskTicket {
     }
 }
 
+/// How old a reading of the volume [`VolumeFloor`] acts on may be before
+/// the next chunk write takes another.
+const VOLUME_READING_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How the volume is read: bytes an unprivileged writer may still write
+/// under the path, `None` when that cannot be read.
+type VolumeProbe = Box<dyn Fn(&Path) -> Option<u64> + Send + Sync>;
+
+/// The free-space floor, for the chunk writes of a fill.
+///
+/// **A cap is not a floor.** The published cap is `occupied + available -
+/// floor`, and a proxy write moves `occupied` up and `available` down by
+/// the same bytes, so it never tightens under the fill that is using the
+/// volume up. The retention owner keeps a live entity whole when the cap
+/// can hold it, and the slack passes leave the live entity alone -- so a
+/// film proxied onto a volume that pins had taken to the margin filled it
+/// to zero, one chunk at a time, each `ENOSPC` logged at debug and the next
+/// chunk tried. The torrent half has the reconciler to stop a writer at
+/// the floor; the proxy had nothing.
+///
+/// This is that stop. A chunk the volume cannot take without going under
+/// [`crate::cache_budget::CACHE_FREE_SPACE_FLOOR`] is not written, and
+/// nothing else changes: the body goes on reaching the player from the
+/// origin, so what the floor costs is a later seek back that has to fetch
+/// again.
+///
+/// The volume is read at most every [`VOLUME_READING_TTL`], on the write's
+/// blocking thread, and what this process writes in between is taken off
+/// the reading, so a burst of chunks cannot all pass one reading that only
+/// had room for the first. (The engine keeps a reading of the same volume
+/// on the same clock, for its reconciler, but the server cannot reach it.)
+/// An unreadable volume is not a full one, as everywhere else.
+pub(crate) struct VolumeFloor {
+    /// The torrent-data root, which exists for as long as the engine does;
+    /// the proxy's own directory may not have been made yet.
+    root: PathBuf,
+    probe: VolumeProbe,
+    reading: std::sync::Mutex<Option<FloorReading>>,
+}
+
+struct FloorReading {
+    at: std::time::Instant,
+    available: Option<u64>,
+    /// Bytes let through since the reading was taken.
+    written: u64,
+}
+
+impl VolumeFloor {
+    fn new(root: PathBuf) -> Self {
+        Self::with_probe(
+            root,
+            Box::new(|path: &Path| crate::cache_budget::available_space(path)),
+        )
+    }
+
+    fn with_probe(root: PathBuf, probe: VolumeProbe) -> Self {
+        Self {
+            root,
+            probe,
+            reading: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Whether `len` more bytes may be written without the volume going
+    /// under the floor, booking them if so. Blocking: it may `statvfs`.
+    fn allows(&self, len: u64) -> bool {
+        let mut reading = self.reading.lock().unwrap_or_else(|e| e.into_inner());
+        if reading
+            .as_ref()
+            .is_none_or(|reading| reading.at.elapsed() >= VOLUME_READING_TTL)
+        {
+            *reading = Some(FloorReading {
+                at: std::time::Instant::now(),
+                available: (self.probe)(&self.root),
+                written: 0,
+            });
+        }
+        let reading = reading.as_mut().expect("a reading was just taken");
+        let Some(available) = reading.available else {
+            return true;
+        };
+        let after = available
+            .saturating_sub(reading.written)
+            .saturating_sub(len);
+        if after < crate::cache_budget::CACHE_FREE_SPACE_FLOOR {
+            return false;
+        }
+        reading.written += len;
+        true
+    }
+}
+
 /// One cache, rooted inside the one torrent-data root so that every byte
 /// of it is in the one usage figure.
 pub struct ProxyCache {
@@ -272,6 +364,9 @@ pub struct ProxyCache {
     retention: Arc<ProxyRetention>,
     /// What this cache has on the blocking pool right now: see [`DiskWork`].
     work: Arc<DiskWork>,
+    /// What stops a fill writing the volume under the floor: see
+    /// [`VolumeFloor`].
+    floor: Arc<VolumeFloor>,
 }
 
 impl ProxyCache {
@@ -296,7 +391,16 @@ impl ProxyCache {
             root: download_dir.join(PROXY_CACHE_DIR),
             retention: Arc::new(ProxyRetention::new(budget, work.clone(), live)),
             work,
+            floor: Arc::new(VolumeFloor::new(download_dir.to_path_buf())),
         }
+    }
+
+    /// This cache, reading the volume through `probe` rather than
+    /// `statvfs`: a volume cannot be filled on demand.
+    #[cfg(test)]
+    fn with_volume_probe(mut self, probe: VolumeProbe) -> Self {
+        self.floor = Arc::new(VolumeFloor::with_probe(self.floor.root.clone(), probe));
+        self
     }
 
     pub fn root(&self) -> &Path {
@@ -430,6 +534,7 @@ impl ProxyCache {
             dir: self.root.join(hex::encode(hash.finalize())),
             retention: self.retention.clone(),
             work: self.work.clone(),
+            floor: self.floor.clone(),
             target: url.as_str().into(),
         })
     }
@@ -469,6 +574,9 @@ pub struct Entry {
     /// fills it opens, and the sweep of a stale entity -- while it is on its
     /// way to the disk. See [`DiskWork`].
     work: Arc<DiskWork>,
+    /// What the fills this entry opens ask before each chunk write: see
+    /// [`VolumeFloor`].
+    floor: Arc<VolumeFloor>,
     /// The origin URL this entry is of, carried down to every reader it
     /// opens so that a client holding a `/proxy` URL can ask what is held
     /// for the stream it is playing. See [`crate::proxy_retention`].
@@ -612,6 +720,7 @@ impl Entry {
             retention: reader.retention(),
             reader,
             work: self.work.clone(),
+            floor: self.floor.clone(),
             dir,
             total,
             offset: body_start,
@@ -941,6 +1050,8 @@ pub struct Filler {
     /// The chunk writes below, while they are on their way to the disk: see
     /// [`DiskWork`].
     work: Arc<DiskWork>,
+    /// Asked before each chunk write: see [`VolumeFloor`].
+    floor: Arc<VolumeFloor>,
     total: u64,
     /// Absolute offset of the next byte to arrive.
     offset: u64,
@@ -985,8 +1096,17 @@ impl Filler {
                     let dir = self.dir.clone();
                     let ticket = self.work.start();
                     let retention = self.retention.clone();
+                    let floor = self.floor.clone();
                     tokio::task::spawn_blocking(move || {
                         let _ticket = ticket;
+                        if !floor.allows(want) {
+                            tracing::debug!(
+                                path = %dir.path().display(),
+                                index,
+                                "not caching a proxied chunk: the volume is at the free-space floor"
+                            );
+                            return;
+                        }
                         retention.counted(|| write_chunk(&dir, index, &chunk, want));
                     });
                 }
@@ -1837,6 +1957,43 @@ mod tests {
             occupancy_under(&entry.dir),
             "the count is what this key's directory really holds"
         );
+    }
+
+    /// **A fill stops writing at the free-space floor, and the body goes
+    /// on.** A chunk the volume cannot take without going under the floor
+    /// is not written; one it can is, and what the fill has written since
+    /// the last reading counts against it.
+    #[tokio::test]
+    async fn a_fill_writes_nothing_under_the_free_space_floor() {
+        const FLOOR: u64 = crate::cache_budget::CACHE_FREE_SPACE_FLOOR;
+        let dir = tempfile::tempdir().expect("a scratch root");
+        // Room above the floor for two chunks and a half at the first
+        // reading, and none at any later one -- which a slow runner can
+        // take, since a reading only lasts `VOLUME_READING_TTL`.
+        let readings = std::sync::atomic::AtomicUsize::new(0);
+        let probe = move |_: &Path| {
+            let first = readings.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            Some(
+                FLOOR
+                    + if first {
+                        2 * CHUNK_BYTES + CHUNK_BYTES / 2
+                    } else {
+                        0
+                    },
+            )
+        };
+        let cache = ProxyCache::new(dir.path(), Arc::default(), Arc::default())
+            .with_volume_probe(Box::new(probe));
+        let entry = entry_of(&cache, "https://host/film.mkv");
+        let total = 4 * CHUNK_BYTES;
+        let entity = entry
+            .dir
+            .join(entity_dir_name(total, "video/mp4", VALIDATOR));
+        let mut filler = entry.fill(total, "video/mp4", VALIDATOR, 0);
+        filler.take(&vec![7u8; total as usize]);
+        cache.settled().await;
+        let held: HashSet<u64> = committed_chunks(&entity, 0);
+        assert_eq!(held.len(), 2, "two chunks fit above the floor: {held:?}");
     }
 
     /// **A chunk written where one already is gains the cache nothing.**
