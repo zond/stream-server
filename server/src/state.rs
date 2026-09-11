@@ -52,6 +52,10 @@ pub struct AppState {
     /// two callers with two of these would each consume windows the other
     /// never sees.
     pub traffic_window: Arc<enginefs::traffic::TrafficWindow>,
+    /// Whose turn it is to publish the cache budget: one publication at a
+    /// time, each reading its inputs inside its turn (see
+    /// `crate::cache_budget::publish_now`).
+    pub budget_publication: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {
@@ -112,6 +116,7 @@ impl AppState {
             lan_media: Arc::new(crate::lan_media::LanMedia::new(None)),
             https,
             traffic_window: Arc::new(enginefs::traffic::TrafficWindow::new()),
+            budget_publication: Arc::default(),
         }
     }
 

@@ -256,17 +256,49 @@ pub(crate) fn publish(budget: &enginefs::retention::RetentionBudget, limit: Opti
 /// takes every directory the embedder's pin set does not name before the
 /// session opens.
 pub(crate) async fn publish_now(state: &AppState) -> Option<u64> {
-    let configured = {
-        let settings = state.settings.read().await;
-        crate::routes::system::cache_size_bytes(settings.cache_size)
-    };
-    // The root the session was opened on, not `settings.cacheRoot`: the
-    // setting is where the data will be after the next start, the engine is
-    // where it is now.
-    let root = &state.engine.download_dir;
-    let occupied = state.engine.cache_occupancy() + state.proxy_cache.retention().occupancy();
-    let cap = cap_to_publish(configured, available_space(root), occupied);
-    publish(&state.engine.cache_budget(), cap);
+    publish_in_turn(
+        &state.budget_publication,
+        &state.engine.cache_budget(),
+        || async {
+            let configured = {
+                let settings = state.settings.read().await;
+                crate::routes::system::cache_size_bytes(settings.cache_size)
+            };
+            // The root the session was opened on, not `settings.cacheRoot`:
+            // the setting is where the data will be after the next start,
+            // the engine is where it is now.
+            let root = &state.engine.download_dir;
+            let occupied =
+                state.engine.cache_occupancy() + state.proxy_cache.retention().occupancy();
+            (configured, available_space(root), occupied)
+        },
+    )
+    .await
+}
+
+/// One publication: wait for `turn`, read the inputs, state the cap.
+///
+/// **The inputs are read inside the turn, so the last publication to
+/// start states the newest of them.** There are three publishers -- the
+/// minute timer, `update_settings` after a new `cacheSize`, and a clean --
+/// and each reads settings, volume and occupancy across awaits before it
+/// publishes. With nothing ordering them, a timer tick that read the old
+/// `cacheSize` just before `update_settings` wrote the new one could
+/// publish after it, and the old cap stood until the next tick, a minute
+/// later, under everything already playing.
+async fn publish_in_turn<F, Fut>(
+    turn: &tokio::sync::Mutex<()>,
+    budget: &enginefs::retention::RetentionBudget,
+    read: F,
+) -> Option<u64>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = (u64, Option<u64>, u64)>,
+{
+    let _turn = turn.lock().await;
+    let (configured, available, occupied) = read().await;
+    let cap = cap_to_publish(configured, available, occupied);
+    publish(budget, cap);
     cap
 }
 
@@ -331,7 +363,7 @@ where
 mod tests {
     use super::{
         BUDGET_INTERVAL, CACHE_FREE_SPACE_FLOOR, CacheLimit, available_space, cap_to_publish,
-        publish, restate_every,
+        publish, publish_in_turn, restate_every,
     };
     use enginefs::piece_store::layout::FileSpec;
     use enginefs::piece_store::{PieceLayout, PieceStore, StoreRegistry, StoreRoot};
@@ -432,6 +464,38 @@ mod tests {
             Some(11 * MIB),
             "the volume's headroom plus what both owners hold"
         );
+    }
+
+    /// **A publication that had to wait reads its inputs after the wait.**
+    /// One publication is in its turn; a second one starts, and while it
+    /// waits the `cacheSize` behind it changes. What it states is the new
+    /// setting's cap: had it read before waiting, it would land the old one
+    /// over whatever the first stated.
+    #[tokio::test]
+    async fn a_publication_reads_its_inputs_in_its_turn() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let turn = Arc::new(tokio::sync::Mutex::new(()));
+        let budget = Arc::new(RetentionBudget::default());
+        let configured = Arc::new(AtomicU64::new(100 * MIB));
+
+        let in_turn = turn.clone().lock_owned().await;
+        let waiting = tokio::spawn({
+            let (turn, budget, configured) = (turn.clone(), budget.clone(), configured.clone());
+            async move {
+                publish_in_turn(&turn, &budget, || async move {
+                    (configured.load(Ordering::SeqCst), None, 0)
+                })
+                .await
+            }
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        configured.store(50 * MIB, Ordering::SeqCst);
+        drop(in_turn);
+
+        assert_eq!(waiting.await.unwrap(), Some(50 * MIB));
+        assert_eq!(budget.get(), CacheBudget::Bytes(50 * MIB));
     }
 
     /// The publication itself: what the timer in [`super::start`] does on
