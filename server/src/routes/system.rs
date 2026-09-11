@@ -332,9 +332,10 @@ pub struct ServerSettings {
     #[serde(rename = "trackersSourceUrl", default = "default_trackers_url")]
     pub trackers_source_url: String,
 
-    /// When true (default), torrents continue seeding after download
-    /// completes, improving swarm health and download speeds from reciprocal
-    /// peers.  When false, torrents are paused once their download finishes.
+    /// When true (default), the server uploads to peers all the time.
+    /// When false, it uploads only while a player is reading from it;
+    /// downloading is not affected either way
+    /// (`BackendEngineFS::apply_upload_switch`).
     #[serde(rename = "seedingEnabled", default = "default_seeding_enabled")]
     pub seeding_enabled: bool,
 

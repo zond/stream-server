@@ -77,7 +77,13 @@ pub trait TorrentBackend: Send + Sync {
     fn dht_status(&self) -> DhtStatus {
         DhtStatus::default()
     }
-    fn set_seeding_enabled(&self, _enabled: bool) {}
+    /// Upload to peers, or stop: every torrent at once, and nothing else
+    /// about them changed -- they stay connected and go on downloading.
+    /// Re-asserted on every reconciler tick
+    /// (`BackendEngineFS::apply_upload_switch`), so saying what is already
+    /// in force must be cheap. The default does nothing, for a backend with
+    /// no peers to upload to.
+    fn set_upload_enabled(&self, _enabled: bool) {}
 
     /// Shrink to, or grow back from, a [`Footprint`]: applied to every
     /// torrent the backend has and to every one it adds afterwards, until

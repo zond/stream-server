@@ -2103,6 +2103,13 @@ impl TorrentBackend for LibrqbitBackend {
     /// Synchronous and cheap: atomics, one read lock per torrent, and a
     /// `Disconnect` message per surplus peer; the peers hang up on their
     /// own tasks afterwards. Nothing is awaited.
+    /// The session's upload switch, which chokes every peer rather than
+    /// pausing anything, and wakes nobody when it is told what it already
+    /// says.
+    fn set_upload_enabled(&self, enabled: bool) {
+        self.session.set_upload_enabled(enabled);
+    }
+
     fn set_footprint(&self, footprint: Footprint) {
         let mut caps = self.caps.lock();
         if caps.footprint == footprint {

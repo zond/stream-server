@@ -545,8 +545,12 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     /// so it is dead code today; kept for a future backend that wants it.
     #[allow(dead_code)]
     disk_cache: Option<Arc<disk_cache::DiskCacheManager>>,
-    /// When false, torrents are paused once their download completes.
+    /// The user's sharing setting: with it on this server uploads all the
+    /// time, and with it off only while a player is reading from it. See
+    /// [`Self::apply_upload_switch`].
     seeding_enabled: Arc<AtomicBool>,
+    /// Held across [`Self::apply_upload_switch`]'s reading and its write.
+    upload_switch: Arc<tokio::sync::Mutex<()>>,
     /// Magnet adds still inside the backend's `add_torrent`, plus the failure
     /// records of ones that ended without an engine, keyed by info hash. See
     /// [`PendingMagnetAdd`] and [`FailedMagnetAdd`].
@@ -950,6 +954,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             priority_generation: Arc::new(AtomicU64::new(0)),
             disk_cache: None,
             seeding_enabled: Arc::new(AtomicBool::new(true)),
+            upload_switch: Arc::new(tokio::sync::Mutex::new(())),
             magnet_adds: Arc::new(RwLock::new(HashMap::new())),
             pin_locks: parking_lot::Mutex::new(HashMap::new()),
             dormant_pins: Arc::new(parking_lot::Mutex::new(BTreeMap::new())),
@@ -1295,6 +1300,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         // proxies, and one whose torrents the sweep has all removed, both
         // hold cache and never open a torrent.
         self.probe_volume(self.volumes.data_folder(), now);
+        // Where the upload switch turns off: a stream ends in more than one
+        // place (the response's end, the last reader's drop), and this
+        // reads both registers without either having to remember to ask.
+        self.apply_upload_switch().await;
         let mut probed = true;
         let mut decisions = Vec::with_capacity(engines.len());
         // Taken once, before the first engine, for the retention pass: the
@@ -2632,14 +2641,15 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         &self.registry
     }
 
-    /// Turn seeding on or off session-wide, and put back to work the
-    /// torrents the idle arm had stopped for want of it.
+    /// Turn sharing while idle on or off: what the upload switch reads
+    /// ([`Self::apply_upload_switch`]), applied before this returns.
     ///
-    /// `seeding_enabled` is one of the ladder's conditions
-    /// ([`crate::reconcile::Conditions`]), so flipping it changes what
-    /// every torrent should be doing -- and the reconciler is asked at once
-    /// rather than at its next tick, so that the switch takes effect when
-    /// it is moved.
+    /// It then asks the reconciler about every torrent at once, which
+    /// decides nothing new today: `seeding_enabled` is still copied into
+    /// [`crate::reconcile::Conditions`], but no arm of the ladder reads it
+    /// since the idle arm went -- the setting governs uploading, and the
+    /// ladder governs whether a torrent runs. The pass is kept as it is,
+    /// and so is what it has to get right:
     ///
     /// [`crate::reconcile::Trigger::Timer`], not `PlaybackStart`, even
     /// though a person did move the switch: nobody is *waiting* on the
@@ -2666,7 +2676,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// stopped with nothing in this process able to say why.
     pub async fn set_seeding_enabled(&self, enabled: bool) {
         self.seeding_enabled.store(enabled, Ordering::Relaxed);
-        self.backend.set_seeding_enabled(enabled);
+        self.apply_upload_switch().await;
         tracing::info!(seeding_enabled = enabled, "Seeding policy updated");
 
         let hashes: Vec<String> = {
@@ -2681,6 +2691,39 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
 
     pub fn seeding_enabled(&self) -> bool {
         self.seeding_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Tell the backend whether to upload, from what is true now: always
+    /// while the sharing setting is on, and with it off only while a
+    /// player is reading from this server.
+    ///
+    /// **"A player is reading" is [`Self::playback_is_live`]**, the answer
+    /// the activity light is drawn from, so the light can never show an
+    /// upload the setting has ruled out: it is lit only while nothing is
+    /// playing, and with the setting off that is exactly when nothing
+    /// uploads. A player that is paused still holds its response open,
+    /// so a paused film keeps sharing. While one is reading, every torrent
+    /// uploads -- the one being watched and a title kept offline alike --
+    /// because the switch is the session's: it chokes peers, it does not
+    /// choose between torrents, and a rule that did would be the retention
+    /// owner's advertise mask, which is not a thing to share.
+    ///
+    /// Only uploading is switched. Nothing is paused and no peer is
+    /// dropped, so what a torrent downloads is still the ladder's and the
+    /// retention owner's to decide, and turning sharing back on costs one
+    /// Unchoke per peer.
+    ///
+    /// **Recomputed, never remembered**: asked where the answer can turn
+    /// true (a stream opening, the setting moving) so sharing starts at
+    /// once, and on every reconciler tick, which is where it turns false.
+    /// Serialised, because the reading and the write are two steps with an
+    /// await between them: a tick that read "nothing playing" just before
+    /// a stream registered must not land its "off" after the open's "on".
+    /// Under the lock the later caller reads the later registers.
+    async fn apply_upload_switch(&self) {
+        let _turn = self.upload_switch.lock().await;
+        let enabled = self.seeding_enabled() || self.playback_is_live().await;
+        self.backend.set_upload_enabled(enabled);
     }
 
     /// Put the torrent `info_hash` back to work after the backend stopped it
@@ -2970,6 +3013,9 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             *count += 1;
         }
         rollback.counted_file_stream();
+        // Registered, so this reads a player: sharing starts with the
+        // stream rather than at the next tick.
+        self.apply_upload_switch().await;
 
         tracing::debug!(
             "Stream started for {} file_idx={} (shared mode)",
@@ -4787,6 +4833,9 @@ mod tests {
         /// second before returning, so a test can ask what a pin does
         /// while a removal is inside the backend. Runs once and is gone.
         remove_gate: Arc<Mutex<Option<Gate>>>,
+        /// The last thing `set_upload_enabled` was told; `None` before the
+        /// first call.
+        upload_enabled: Arc<Mutex<Option<bool>>>,
     }
 
     /// A parked backend call's two ends, as the fake holds them: it sends
@@ -4807,6 +4856,7 @@ mod tests {
                 hold_add: Arc::new(AtomicBool::new(false)),
                 add_hold: Arc::new(tokio::sync::Semaphore::new(0)),
                 remove_gate: Arc::new(Mutex::new(None)),
+                upload_enabled: Arc::new(Mutex::new(None)),
             }
         }
     }
@@ -4857,6 +4907,10 @@ mod tests {
         async fn remove_torrent(&self, info_hash: &str) -> Result<()> {
             self.removed.lock().unwrap().push(info_hash.to_string());
             Ok(())
+        }
+
+        fn set_upload_enabled(&self, enabled: bool) {
+            *self.upload_enabled.lock().unwrap() = Some(enabled);
         }
 
         async fn remove_torrent_and_files(&self, info_hash: &str) -> Result<()> {
@@ -8196,6 +8250,49 @@ mod tests {
         counters.start_gate.notify_one();
         switch.await.expect("the switch finished");
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
+    }
+
+    /// **With sharing off, nothing uploads until a player reads, and the
+    /// upload stops when the player does.** The switch is recomputed where
+    /// it can turn on -- the stream opening, so the first byte the player
+    /// asks for is already shared -- and on the tick, which is where it
+    /// turns off: nothing on the way out of a stream has to remember to
+    /// ask.
+    #[tokio::test]
+    async fn with_sharing_off_the_upload_switch_follows_the_player() {
+        let (mut enginefs, _counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        let upload = enginefs.backend.upload_enabled.clone();
+        let told = || *upload.lock().unwrap();
+
+        enginefs.set_seeding_enabled(false).await;
+        assert_eq!(told(), Some(false), "off, and nothing is playing");
+
+        enginefs.on_stream_start(TEST_HASH, 0).await;
+        assert_eq!(told(), Some(true), "a player is reading: shared at once");
+        enginefs.reconcile_tick().await;
+        assert_eq!(told(), Some(true), "and the tick agrees while it reads");
+
+        enginefs.on_stream_end(TEST_HASH, 0).await;
+        enginefs.reconcile_tick().await;
+        assert_eq!(told(), Some(false), "the player left, and the tick saw it");
+    }
+
+    /// **With sharing on, the server uploads with nothing playing**, and
+    /// the setting moving is applied when it moves, not at the next tick.
+    #[tokio::test]
+    async fn with_sharing_on_the_upload_switch_stays_on_with_nothing_playing() {
+        let (mut enginefs, _counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        let upload = enginefs.backend.upload_enabled.clone();
+        let told = || *upload.lock().unwrap();
+
+        enginefs.reconcile_tick().await;
+        assert_eq!(told(), Some(true), "the default is on");
+        enginefs.set_seeding_enabled(false).await;
+        assert_eq!(told(), Some(false), "turned off with nothing playing");
+        enginefs.set_seeding_enabled(true).await;
+        assert_eq!(told(), Some(true), "turned on again");
     }
 
     /// The same of the reconciler's own tick, whose await is
