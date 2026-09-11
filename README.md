@@ -44,7 +44,7 @@ This is not a drop-in replacement for `server.js` — the API surface it exposes
 ## ✨ Features
 
 ### Core Streaming
-- **🚀 No system libraries, always**: the entire build — every feature combination — has no system-library or external-binary dependencies, only the pinned Rust toolchain and a C compiler for the C that `aws-lc-sys` and `libmimalloc-sys` bundle
+- **🚀 No system libraries, always**: the entire build — every feature combination — needs no system library and no tool but the pinned Rust toolchain and a C compiler, for the C that `aws-lc-sys` and `libmimalloc-sys` bundle. At run time the server runs one external program, and only for `/ftp`: `curl`
 - **🔧 Single backend**: `librqbit` (Rust, via the `zond/rqbit` fork — see [About](#-about)) is the only torrent engine — there is no C++ alternative to opt into
 - **📡 HTTP Range Requests**: torrent pieces are streamed straight to HTTP range requests for instant seeking — direct play, no transcoding step in between
 
