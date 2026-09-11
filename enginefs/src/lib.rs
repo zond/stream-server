@@ -1299,7 +1299,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         // the session the bell it rings exists for: a viewer who only ever
         // proxies, and one whose torrents the sweep has all removed, both
         // hold cache and never open a torrent.
-        self.probe_volume(self.volumes.data_folder(), now);
+        self.probe_volume(self.volumes.data_folder(), now).await;
         // Where the upload switch turns off: a stream ends in more than one
         // place (the response's end, the last reader's drop), and this
         // reads both registers without either having to remember to ask.
@@ -1394,7 +1394,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let folder = self.volumes.data_folder().to_path_buf();
         if !*probed {
             *probed = true;
-            self.probe_volume(&folder, now);
+            self.probe_volume(&folder, now).await;
         }
         let conditions = crate::reconcile::Conditions {
             run_state: engine.handle.run_state(),
@@ -1759,19 +1759,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// volume is still inside the band -- the slack has to be gone *before*
     /// the floor is reached, not after. A probe that failed rings nothing:
     /// an unreadable volume is not a full one.
-    fn probe_volume(&self, folder: &std::path::Path, now: u64) {
-        let reading = probe_at_existing_ancestor(&*self.free_space_probe, folder);
-        self.record_volume(folder, reading, now);
-    }
-
-    /// Record a reading somebody else has already taken, and ring the bell
-    /// if it is under the line ([`Self::probe_volume`]).
     ///
-    /// Split out for the one caller that cannot take the reading where it
-    /// stands: [`Self::reread_volume`] runs on a request's task, and a
-    /// `statvfs` of a stalled mount taken there parks the whole worker.
-    fn record_volume(&self, folder: &std::path::Path, reading: std::io::Result<u64>, now: u64) {
-        let available = match reading {
+    /// Off the worker ([`Self::free_space_of`]), like every probe here.
+    async fn probe_volume(&self, folder: &std::path::Path, now: u64) {
+        let available = match self.free_space_of(folder).await {
             Ok(available) => Some(available),
             Err(error) => {
                 debug!(
@@ -1787,6 +1778,26 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             self.slack_bell.ring();
         }
         self.volumes.record(available, now);
+    }
+
+    /// The free space of the volume under `folder` (or its nearest existing
+    /// ancestor), with the `statvfs` taken on the blocking pool.
+    ///
+    /// Every caller is on an async worker -- the tick, a stream request's
+    /// reconcile, a pin -- and the device is the one that is filling up:
+    /// a spun-down disk, a network mount that has stopped answering. Taken
+    /// inline it parks the worker, and every stream and API task scheduled
+    /// on it, for as long as the device does not answer.
+    async fn free_space_of(&self, folder: &std::path::Path) -> std::io::Result<u64> {
+        let probe = Arc::clone(&self.free_space_probe);
+        let folder = folder.to_path_buf();
+        tokio::task::spawn_blocking(move || probe_at_existing_ancestor(&*probe, &folder))
+            .await
+            .unwrap_or_else(|join| {
+                Err(std::io::Error::other(format!(
+                    "the volume probe task failed: {join}"
+                )))
+            })
     }
 
     /// Take a fresh reading of the volume the pieces land on, now, and ring
@@ -1809,18 +1820,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// `SLACK_DROP_BOUND` had just bounded the request's waiting for.
     pub async fn reread_volume(&self) {
         let folder = self.volumes.data_folder().to_path_buf();
-        let probe = Arc::clone(&self.free_space_probe);
-        let reading = {
-            let folder = folder.clone();
-            tokio::task::spawn_blocking(move || probe_at_existing_ancestor(&*probe, &folder)).await
-        };
-        let reading = match reading {
-            Ok(reading) => reading,
-            Err(join) => Err(std::io::Error::other(format!(
-                "the volume probe task failed: {join}"
-            ))),
-        };
-        self.record_volume(&folder, reading, self.clock.now_secs());
+        self.probe_volume(&folder, self.clock.now_secs()).await;
     }
 
     /// The bell the tick's reading of the volume rings when it is running
@@ -4145,7 +4145,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             return Ok(());
         }
         let volume = self.piece_store().path().to_path_buf();
-        match probe_at_existing_ancestor(&*self.free_space_probe, &volume) {
+        match self.free_space_of(&volume).await {
             Ok(available) if free_space_allows(available, required, PIN_FREE_SPACE_MARGIN) => {
                 Ok(())
             }
@@ -7775,6 +7775,47 @@ mod tests {
             worker,
             "the re-read parked the async worker it was asked on"
         );
+    }
+
+    /// **And so is every other reading of the volume**: the tick's, the one
+    /// a stream request's reconcile takes, and a pin's.
+    ///
+    /// Each ran its `statvfs` inline on the worker that asked, and the
+    /// device each reads is the one filling up -- a spun-down disk, a mount
+    /// that has stopped answering. The request's reconcile is one per Range
+    /// request, and the tick's parks whatever else shares its worker.
+    #[tokio::test]
+    async fn every_reading_of_the_volume_is_taken_off_the_worker_that_asked_for_it() {
+        let (mut enginefs, _counters) = test_enginefs_for_reconciler(1);
+        let worker = std::thread::current().id();
+        let probed_on = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorder = probed_on.clone();
+        enginefs.set_free_space_probe(move |_| {
+            recorder.lock().push(std::thread::current().id());
+            Ok(u64::MAX)
+        });
+        let taken = || std::mem::take(&mut *probed_on.lock());
+
+        enginefs.reconcile_tick().await;
+        let tick = taken();
+        enginefs
+            .reconcile_hash(TEST_HASH, Trigger::PlaybackStart)
+            .await;
+        let request = taken();
+        enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
+        let pin = taken();
+
+        for (who, threads) in [
+            ("the tick", tick),
+            ("a request's reconcile", request),
+            ("a pin", pin),
+        ] {
+            assert!(!threads.is_empty(), "{who} read no volume");
+            assert!(
+                !threads.contains(&worker),
+                "{who} parked the async worker it was asked on"
+            );
+        }
     }
 
     /// The defect that four rounds of this work kept re-introducing, and it
