@@ -54,6 +54,29 @@ fn fixture_7z(dir: &Path) -> Vec<u8> {
     std::fs::read(&path).expect("read fixture back")
 }
 
+/// The same two members as a `.tar.gz`.
+fn fixture_tgz() -> Vec<u8> {
+    let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    let mut builder = tar::Builder::new(encoder);
+    for (name, data) in [
+        ("first.txt", FIRST_CONTENT.to_vec()),
+        ("videos/second.bin", second_content()),
+    ] {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, name, data.as_slice())
+            .expect("append tar entry");
+    }
+    builder
+        .into_inner()
+        .expect("finish tar")
+        .finish()
+        .expect("finish gzip")
+}
+
 /// An HTTP/1.1 origin serving fixed bodies by path, counting the requests
 /// for each. `Connection: close` on every response keeps it to one request
 /// per socket.
@@ -148,6 +171,7 @@ fn fixture() -> anyhow::Result<Fixture> {
         ("/fixture.7z".to_string(), archive.clone()),
         // The same archive behind a URL that names no format.
         ("/download?id=7".to_string(), archive),
+        ("/fixture.tgz".to_string(), fixture_tgz()),
         (
             "/notes.txt".to_string(),
             b"just some text, not an archive".to_vec(),
@@ -348,6 +372,31 @@ fn a_failed_create_leaves_nothing_behind() -> anyhow::Result<()> {
     let response = fixture.create(&fixture.origin.url("/missing.7z"))?;
     assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
     assert!(fixture.scratch_files().is_empty());
+
+    fixture.finish()
+}
+
+/// A member of a `.tar.gz` is served, whole and by range. Every request for
+/// one used to be a 500: the extraction's cache was made without the
+/// member's length, and the route's seek from the end to learn it failed.
+#[test]
+fn a_tgz_member_is_served_whole_and_by_range() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let key = fixture.create_key(&fixture.origin.url("/fixture.tgz"))?;
+    let client = reqwest::blocking::Client::new();
+    let member = format!("{}/tgz/stream/{key}/videos/second.bin", fixture.base);
+    let expected = second_content();
+
+    let whole = client.get(&member).send()?;
+    assert_eq!(whole.status(), reqwest::StatusCode::OK);
+    assert_eq!(whole.bytes()?.as_ref(), expected.as_slice());
+
+    let ranged = client
+        .get(&member)
+        .header(reqwest::header::RANGE, "bytes=40000-40999")
+        .send()?;
+    assert_eq!(ranged.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(ranged.bytes()?.as_ref(), &expected[40000..41000]);
 
     fixture.finish()
 }
