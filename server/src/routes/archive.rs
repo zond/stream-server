@@ -1012,8 +1012,16 @@ mod tests {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
                 std::thread::spawn(move || {
-                    let mut request = [0u8; 4096];
-                    let _ = stream.read(&mut request);
+                    // The whole request head, so nothing unread is left on
+                    // the socket to turn the close into a reset.
+                    let mut request = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !request.ends_with(b"\r\n\r\n") {
+                        match stream.read(&mut byte) {
+                            Ok(1) => request.push(byte[0]),
+                            _ => return,
+                        }
+                    }
                     let length = match answer {
                         Answer::Unstated => String::new(),
                         _ => format!("Content-Length: {body_len}\r\n"),
