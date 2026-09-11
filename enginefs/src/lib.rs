@@ -1100,16 +1100,60 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                                 removed = true,
                                 "Scheduling inactive-engine cleanup"
                             );
-                            to_remove.push(hash.clone());
+                            to_remove.push(engine.clone());
                         }
                     }
                 }
 
                 if !to_remove.is_empty() {
+                    // Decided above under the read lock, across several
+                    // awaits; removed here under the write lock, which is
+                    // a later instant. What can happen in between is a
+                    // stream opening on the very engine that was found
+                    // idle: `on_stream_start` writes the cell, finds the
+                    // engine (a `get_engine`, which touches it) and counts
+                    // its stream, all of it after the reading above and
+                    // before this guard. An unconditional `remove` here
+                    // then took the torrent out from under that stream --
+                    // its reads failed against a torrent the session no
+                    // longer had, and the bytes it had just started reading
+                    // went with the directory.
+                    //
+                    // So the removal is decided again, from the facts as
+                    // they stand under the guard. The engine must still be
+                    // the one that was read (a re-add meanwhile publishes
+                    // another, which this pass knows nothing about), and
+                    // still idle by the readings that need no other lock:
+                    // the clock every lookup stamps, the engine's own reader
+                    // count, the liveness cell and the pin set. Every writer
+                    // of the three activity maps read above looks the engine
+                    // up first, so a touch is the earliest trace any of them
+                    // leaves, and a stamp at or after this sweep's `now`
+                    // reads as an age of zero.
                     let mut write = engines_clone.write().await;
-                    for hash in &to_remove {
+                    let mut removed = Vec::with_capacity(to_remove.len());
+                    for engine in to_remove {
+                        let hash = &engine.info_hash;
+                        let current = write.get(hash).is_some_and(|current| Arc::ptr_eq(current, &engine));
+                        let age_secs = now.saturating_sub(engine.last_accessed.load(std::sync::atomic::Ordering::SeqCst));
+                        let still_idle = current
+                            && !engine.is_pinned()
+                            && engine.active_streams.load(std::sync::atomic::Ordering::SeqCst) == 0
+                            && age_secs > INACTIVE_TORRENT_REMOVE_TIMEOUT.as_secs()
+                            && !live_clone.is_torrent(hash);
+                        if !still_idle {
+                            tracing::debug!(
+                                info_hash = %hash,
+                                current,
+                                age_secs,
+                                removed = false,
+                                "an engine found idle was used before it could be removed; keeping it"
+                            );
+                            continue;
+                        }
                         debug!(info_hash = %hash, "Auto-removing inactive engine");
                         write.remove(hash);
+                        removed.push(engine.info_hash.clone());
                     }
                     drop(write);
 
@@ -1119,7 +1163,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     // the slack passes have already emptied, and what it
                     // leaves behind is a directory nothing in this process
                     // has a deleter for once its store is gone.
-                    for hash in to_remove {
+                    for hash in removed {
                         if let Err(e) = backend_clone.remove_torrent_and_files(&hash).await {
                             tracing::warn!(
                                 info_hash = %hash,
@@ -13627,6 +13671,60 @@ mod tests {
         );
         assert!(!present(OTHER_HASH).await, "the idle one is removed");
         assert_eq!(*removed.lock().unwrap(), vec![OTHER_HASH.to_string()]);
+    }
+
+    /// **A stream that opens between the sweep's decision and its removal
+    /// keeps its engine.**
+    ///
+    /// The sweep decides under the registry's read lock, across several
+    /// awaits, and removed under a write lock taken later -- with no second
+    /// look. A viewer pressing play in that gap had `on_stream_start` write
+    /// the cell, find the engine and count the stream, and then watched the
+    /// torrent leave the session under the reads it had just opened, its
+    /// directory with it.
+    ///
+    /// The park is the last lock the decision awaits, the multi-file
+    /// selection map: held by the test, it stops the sweep with every
+    /// reading taken and the removal still to make. A one-file torrent's
+    /// stream open does not touch that map, so the open runs to the end
+    /// while the sweep is parked.
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_opened_between_the_sweeps_decision_and_its_removal_keeps_its_engine() {
+        let (enginefs, _counters) = test_enginefs();
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        // The fixture's torrent is the one being played; the viewer moves
+        // on, and nobody touches the engine for the inactivity window.
+        nothing_torrent_is_playing(&enginefs);
+
+        // The sweep that finds it idle parks behind this guard, its
+        // decision made.
+        let park = enginefs.active_multifile_files.write().await;
+        tokio::time::sleep(INACTIVE_TORRENT_REMOVE_TIMEOUT + Duration::from_secs(30)).await;
+
+        // The viewer opens it while the sweep is parked.
+        enginefs.on_stream_start(TEST_HASH, 0).await;
+        assert!(
+            enginefs.live().is_torrent(TEST_HASH),
+            "the open wrote the cell before anything else"
+        );
+        drop(park);
+        // The sweep runs to the end of its pass and goes back to sleep.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let kept = enginefs.peek_engine(TEST_HASH).await;
+        assert!(
+            kept.is_some_and(|kept| Arc::ptr_eq(&kept, &engine)),
+            "the engine the stream is reading through is still the registered one"
+        );
+        assert!(
+            enginefs
+                .backend
+                .removed_with_files
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "and the torrent was not taken out of the session under it"
+        );
     }
 
     /// **A restart leaves nothing playing, and the first tick stops every
