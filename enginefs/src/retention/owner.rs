@@ -688,6 +688,20 @@ pub enum InstallOutcome {
     OldStands,
 }
 
+/// What [`Retention::clear_under`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cleared {
+    /// Nothing was installed and nothing was held back: nothing to give
+    /// back, and nothing changed.
+    Nothing,
+    /// A policy, or a hold-back no policy recorded, was given back to what
+    /// we announce and forgotten.
+    GivenBack,
+    /// The backend refused the give-back, so whatever stood still stands:
+    /// the policy, or the record of the hold-back.
+    Refused,
+}
+
 /// What one pass did.
 #[derive(Debug)]
 pub struct Outcome {
@@ -953,11 +967,12 @@ impl<B: Backing> Retention<B> {
             // bytes, and they are shared like any other bytes we keep --
             // and fetched whole, which the policy's passes stopped asking
             // for beyond the window.
-            return if self.clear_under(&entity, &mut claim).await {
-                self.want_whole(&entity).await;
-                InstallOutcome::Unbounded
-            } else {
-                InstallOutcome::OldStands
+            return match self.clear_under(&entity, &mut claim).await {
+                Cleared::Refused => InstallOutcome::OldStands,
+                Cleared::Nothing | Cleared::GivenBack => {
+                    self.want_whole(&entity).await;
+                    InstallOutcome::Unbounded
+                }
             };
         }
         {
@@ -1013,7 +1028,7 @@ impl<B: Backing> Retention<B> {
         // give-back would have given.
         let hold_back_follows = matches!((&resolved, &policy), (Some(_), Some(_)));
         let subsumed = hold_back_follows && entity.state.lock().only_assumed_held_back();
-        if !subsumed && !self.clear_under(&entity, &mut claim).await {
+        if !subsumed && self.clear_under(&entity, &mut claim).await == Cleared::Refused {
             return InstallOutcome::OldStands;
         }
         // Nothing installed after this point leaves the entity unbounded,
@@ -1068,8 +1083,9 @@ impl<B: Backing> Retention<B> {
         self.clear_under(&entity, &mut claim).await;
     }
 
-    /// [`Self::clear`] with the turn already held. `true` when nothing is
-    /// installed afterwards.
+    /// [`Self::clear`] with the turn already held, saying what it did
+    /// ([`Cleared`]): nothing is installed afterwards unless it was
+    /// refused.
     ///
     /// **The range is advertised back first, and the policy forgotten only
     /// when that succeeded.** Today's order is the reverse -- slot to
@@ -1086,7 +1102,7 @@ impl<B: Backing> Retention<B> {
     /// [`Self::want_whole`], asked by the callers that leave the entity with
     /// nothing installed, and not by the ones that replace the policy or
     /// retire a sibling.
-    async fn clear_under(&self, entity: &Entity<B>, claim: &mut Claim) -> bool {
+    async fn clear_under(&self, entity: &Entity<B>, claim: &mut Claim) -> Cleared {
         let (extent, doomed) = {
             let state = entity.state.lock();
             match state.installed.as_ref() {
@@ -1100,7 +1116,7 @@ impl<B: Backing> Retention<B> {
                 // as it announces nothing over a range that was never held
                 // back.
                 None if state.held_back => (B::extent(&state.domain), Vec::new()),
-                None => return true,
+                None => return Cleared::Nothing,
             }
         };
         if B::SHARE == Share::Half {
@@ -1116,7 +1132,7 @@ impl<B: Backing> Retention<B> {
                         error = %format!("{error:#}"),
                         "could not put a policy's pieces back into what we announce; the policy stands until a later clear can"
                     );
-                    return false;
+                    return Cleared::Refused;
                 }
             }
         }
@@ -1126,7 +1142,7 @@ impl<B: Backing> Retention<B> {
         // pass's ([`State::held_back`]).
         state.held_back = false;
         state.forget_policy(&mut claim.guard);
-        true
+        Cleared::GivenBack
     }
 
     /// Forget the entity for `key` once its slack pass has taken the last
@@ -1171,8 +1187,16 @@ impl<B: Backing> Retention<B> {
     /// is wanted again. The pin exit of both passes, under the turn. A
     /// clear the backend refuses leaves the policy standing and wants
     /// nothing: the next pass retries both.
+    ///
+    /// Wanted again only by the pass that gave something back. This exit
+    /// is taken every tick for as long as the pin stands, and a pinned
+    /// entity has nothing installed after the first of them; asking for the
+    /// whole extent on every one of those is a reselect of every piece of
+    /// the file under librqbit's torrent lock every two seconds, for
+    /// nothing -- a piece the first exit wanted is wanted still. The one
+    /// that cleared is the one after which something could be unwanted.
     async fn release_to_pin(&self, entity: &Entity<B>, claim: &mut Claim) {
-        if self.clear_under(entity, claim).await {
+        if self.clear_under(entity, claim).await == Cleared::GivenBack {
             self.want_whole(entity).await;
         }
     }
@@ -3552,6 +3576,47 @@ mod tests {
             vec![0..8],
             "and every piece of it is wanted again"
         );
+    }
+
+    /// **A pinned entity is wanted whole by the pass that cleared it, and
+    /// by no pass after.**
+    ///
+    /// The pin exit runs every tick for as long as the pin stands, and after
+    /// the first there is nothing installed to clear. `want_all` is a
+    /// reselect of every piece of the file under the torrent's write lock;
+    /// once is what changes anything, and every two seconds was the cost of
+    /// asking a question whose answer was already in force.
+    #[tokio::test]
+    async fn a_pinned_entity_is_wanted_whole_once_and_not_on_every_pass() {
+        let (backing, owner, _budget) = torrent();
+        *backing.held.lock() = [0, 1, 2].into_iter().collect();
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        owner.note_position(&0, (0, 0));
+        backing.keeps_everything.store(true, Ordering::SeqCst);
+        let opens = owner.opens_of(&0);
+
+        for (tick, mode) in [
+            Mode::Live,
+            Mode::Slack { opens },
+            Mode::Live,
+            Mode::Slack { opens },
+            Mode::Live,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let claim = owner.turn(&0).await.expect("the turn");
+            assert!(
+                owner.pass(&0, &(), claim, mode).await.concluded.is_none(),
+                "tick {tick}: a pinned entity's pass concludes nothing"
+            );
+            assert!(owner.holding(&0).unwrap().installed.is_none());
+            assert_eq!(
+                *backing.wanted_all.lock(),
+                vec![0..8],
+                "tick {tick}: wanted whole by the pass that cleared the policy, and by no other"
+            );
+        }
     }
 
     /// **An entity a reader is open on is never forgotten, even emptied.**
