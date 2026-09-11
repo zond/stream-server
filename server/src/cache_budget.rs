@@ -44,20 +44,17 @@
 //! process that has held a piece for a millisecond can say so.
 //!
 //! What it does not count is what nothing in this process wrote -- a
-//! torrent held in Error, a directory a previous run left, the strays, the
-//! proxy chunks of an earlier run. Reading the store's share of those costs
-//! a `read_dir`, so they are read on demand for `GET /cache.json`
-//! (`enginefs::EngineFS::cache_holdings`) and not on the minute timer; the
-//! proxy's share is not read at all until a fill rewrites it. The cap is
-//! therefore stated over what this session holds, which understates the
-//! volume by whatever an earlier one left -- the safe direction, since a
-//! smaller `occupied` is a tighter cap, and **the claim above is a claim
-//! about a cache this process filled**: on a warm cache the first minute is
-//! still the volume's headroom alone. What makes that nothing is the launch
-//! sweep, which does not yet empty the proxy cache -- it takes the staged
-//! temporaries and keeps every complete chunk -- so until it does, a
-//! television that restarts over four gigabytes of relayed film states the
-//! same cap it used to until the fills book those bytes again.
+//! torrent held in Error, a directory a previous run left, the strays.
+//! Reading those costs a `read_dir`, so they are read on demand for
+//! `GET /cache.json` (`enginefs::EngineFS::cache_holdings`) and not on the
+//! minute timer. The cap is therefore stated over what this session holds,
+//! which understates the volume by whatever an earlier one left -- the safe
+//! direction, since a smaller `occupied` is a tighter cap, and **the claim
+//! above is a claim about a cache this process filled**: on a warm cache the
+//! first minute is still the volume's headroom alone. The proxy cache is not
+//! part of that gap: its launch sweep (`crate::proxy_cache::sweep`) empties
+//! it before the router serves anything, so what its owner counts is all it
+//! holds.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -76,11 +73,8 @@ use crate::state::AppState;
 /// both owners for their slack and, if the disk is still short, answers the
 /// stream `507 Insufficient Storage`. Below this line the server has
 /// therefore already decided the disk is unusable, so it is exactly the line
-/// [`CacheLimit::effective`] must keep the cache out of. (One constant, two
-/// readings: this module asks `fs4::available_space`, which is `statvfs` on
-/// the path, while `ensure_download_disk_ready` matches the path against
-/// `sysinfo`'s mount list behind a 3-second cache. Same question, different
-/// syscall.)
+/// [`CacheLimit::effective`] must keep the cache out of. Both read it the
+/// same way, through [`available_space`] (`statvfs` on the path).
 ///
 /// The third reader is the engine's reconciler, whose free-space arm this
 /// is (`enginefs::reconcile::desired`), and it is what turns the target into

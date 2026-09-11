@@ -1728,9 +1728,9 @@ fn the_cache_figure_follows_the_chunks_the_proxy_wrote() -> anyhow::Result<()> {
     // **And the figure is the count, not a reading of the tree.** A chunk
     // put into the entity's own directory by hand is a chunk no fill
     // booked: a walk would find it, the count cannot, and which of the two
-    // answers this route gives is the whole of this slice. (It is also why
-    // a cache an earlier process filled reads as nothing until the launch
-    // sweep empties it -- see `cache_cleaner::usage`.)
+    // answers this route gives is the whole of this slice. (A count can
+    // stand for the tree only because the launch sweep empties the cache
+    // before anything is served -- see `proxy_cache::sweep`.)
     let bucket = cached_chunks(&fixture)
         .first()
         .and_then(|chunk| chunk.parent().map(std::path::Path::to_path_buf))
@@ -2616,7 +2616,7 @@ fn a_second_player_fetching_does_not_truncate_the_first_ones_read() -> anyhow::R
 /// a different claim, and it is asserted here only as a direction -- the
 /// pass did not grow the disk -- never as an equality.
 #[test]
-fn the_cleaner_leaves_the_chunks_a_proxied_player_is_inside() -> anyhow::Result<()> {
+fn a_clean_leaves_the_chunks_a_proxied_player_is_inside() -> anyhow::Result<()> {
     use std::io::Read;
 
     let fixture = fixture_with(Origin::start_sized(RETENTION_ORIGIN)?)?;
@@ -2628,8 +2628,8 @@ fn the_cleaner_leaves_the_chunks_a_proxied_player_is_inside() -> anyhow::Result<
 
     // Play the film through. What is left when the last byte has gone past
     // is the window round the end of it, which is where the player is: a
-    // player between two requests has no body open, and holding the bytes
-    // its next one will ask for is the whole of what the idle grace is for.
+    // player between two requests has no body open, and the entity stays
+    // live, window and all, until a stream opens on something else.
     let mut response = client
         .get(&url)
         .header(reqwest::header::RANGE, "bytes=0-")
