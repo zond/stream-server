@@ -78,16 +78,33 @@ pub struct CacheConfig {
 /// walk that used to run over `<cacheRoot>/rqbit-downloads` before it was
 /// deleted -- that walk never came in here either.
 ///
-/// **What is under it owns itself, and that is the whole of its bound.**
-/// Every file here is a `tempfile::NamedTempFile` -- the download's and the
-/// extraction's alike -- so it is unlinked when the session holding it
-/// drops, which is when the idle sweep takes that session
-/// ([`SESSION_IDLE_TIMEOUT`], `crate::archives::sessions`). No retention
-/// owner speaks for these bytes: they are neither a torrent's pieces nor a
-/// proxied entity. What a *crash* leaves behind has therefore never had a
-/// deleter and still has none; it is bounded by how often this process
-/// dies rather than by anything here.
+/// **What is under it owns itself while the process lives, and the next
+/// launch takes the rest.** Every file here is a `tempfile::NamedTempFile`
+/// -- the download's and the extraction's alike -- so it is unlinked when
+/// the session holding it drops, which is when the idle sweep takes that
+/// session ([`SESSION_IDLE_TIMEOUT`], `crate::archives::sessions`). No
+/// retention owner speaks for these bytes: they are neither a torrent's
+/// pieces nor a proxied entity. That deleter is process memory, and a
+/// process that is killed -- which Android's low-memory killer does as a
+/// matter of course -- drops nothing: every archive played since the last
+/// clean exit stayed here, about twice its size (the download and the
+/// extraction), counted by nobody. So [`sweep_scratch`] empties the
+/// directory at launch, before the router can open a session: session keys
+/// are minted per process, so nothing a previous one left here is
+/// addressable by any request this one can receive.
 pub const SCRATCH_DIR_NAME: &str = ".archives";
+
+/// Delete everything a previous process left under `<cache_dir>/.archives`
+/// -- see [`SCRATCH_DIR_NAME`] for why there is anything to delete, and why
+/// none of it can be wanted. A directory that is not there is the sweep's
+/// own result, not a failure.
+pub fn sweep_scratch(cache_dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(cache_dir.join(SCRATCH_DIR_NAME)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
 
 impl CacheConfig {
     /// `<cache root>/.archives` -- see [`SCRATCH_DIR_NAME`].

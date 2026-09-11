@@ -1221,6 +1221,26 @@ pub async fn run(
         }
     }
 
+    // The archive scratch directory's launch sweep, for the same reason and
+    // at the same moment. Its files are unlinked when the session holding
+    // them drops, and a killed process drops nothing -- Android's low-memory
+    // killer takes this process as a matter of course -- so every archive
+    // played since the last clean exit stood there, twice over, counted by
+    // nobody. Session keys are minted per process: nothing a previous run
+    // left there can be named by any request this one receives. See
+    // `archives::SCRATCH_DIR_NAME`. Not the piece store's sweep's to do: that
+    // one exempts `.archives` by name, and this is the archive layer's own.
+    {
+        let cache_root = torrent_data_root.clone();
+        match tokio::task::spawn_blocking(move || archives::sweep_scratch(&cache_root)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "the archive scratch sweep did not finish");
+            }
+            Err(error) => tracing::warn!(%error, "the archive scratch sweep did not finish"),
+        }
+    }
+
     let mut background_tasks = Vec::new();
     // The engines' tracker refresher is a forever loop like the rest, so it
     // belongs in the list this function aborts. Detached, it is still parked

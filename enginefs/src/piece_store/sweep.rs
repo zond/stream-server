@@ -167,8 +167,8 @@ pub async fn sweep_before_session(download_dir: &Path, pins: Option<&PinSet>) ->
 ///
 /// `.pieces` is [`sweep_unadopted`]'s, and it is the embedder's pin set that
 /// decides what survives there. `.proxy` is the proxy cache's, emptied by its own
-/// launch sweep. `.archives` is the archive scratch's, which has a lifetime
-/// of its own. Handing any of them to [`sweep_legacy_downloads`] would be
+/// launch sweep. `.archives` is the archive scratch's, emptied by the server's
+/// own launch sweep of it. Handing any of them to [`sweep_legacy_downloads`] would be
 /// one sweep deciding another's business, and for `.pieces` it would delete
 /// every pin.
 const NOT_OURS: [&str; 5] = [".pieces", ".proxy", ".archives", ".metadata", ".cache"];

@@ -1717,6 +1717,45 @@ fn set_background_caps_the_torrent_and_still_streams() -> anyhow::Result<()> {
 /// where a torrent's bytes go.
 ///
 /// A librqbit session's storage is fixed when the session opens, so a
+/// What the archive routes write under `<cacheRoot>/.archives` is unlinked
+/// when the session holding it drops, and a killed process drops nothing.
+/// Session keys are per process, so nothing a previous run left there can
+/// be asked for again -- and the launch sweeps it, before the router opens.
+#[test]
+fn a_killed_process_s_archive_scratch_is_gone_at_the_next_start() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let cache_root = cache_dir.path().join("cache");
+    // The name is the on-disk contract (`archives::SCRATCH_DIR_NAME`), and
+    // a test of what is on disk spells it.
+    let scratch = cache_root.join(".archives");
+    std::fs::create_dir_all(&scratch)?;
+    let leftover = scratch.join("archive_abc123.zip");
+    write_payload(&leftover, 4 * 1024);
+    // Beside it, what the sweep must leave alone: the root itself and a
+    // neighbour that is not the archive layer's.
+    let neighbour = cache_root.join("keep.txt");
+    std::fs::write(&neighbour, b"not the archive layer's")?;
+
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_root.clone()),
+        ..offline_config()
+    })?;
+    assert!(
+        !leftover.exists(),
+        "the leftover archive is swept at launch"
+    );
+    assert!(
+        !scratch.exists(),
+        "the directory goes with it; the next play recreates it"
+    );
+    assert!(neighbour.is_file(), "and nothing beside it is touched");
+    handle.shutdown()?;
+    Ok(())
+}
+
 /// `cacheRoot` set through `POST /settings` is where the data lives *from the
 /// next start*: the running server keeps writing where it opened. At that
 /// next start the setting is prepared before anything opens on it, and one
