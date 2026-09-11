@@ -656,7 +656,7 @@ Everything below existed for server.js compatibility and had no consumer in stre
 
 ## 🔧 Build Instructions
 
-All you need on any platform is Rust via [rustup](https://rustup.rs) — `rust-toolchain.toml` pins the exact toolchain (1.98.0) and rustup installs it automatically on first build. No platform has any extra system packages to install; the steps below are the same everywhere:
+What you need on any platform is Rust via [rustup](https://rustup.rs) — `rust-toolchain.toml` pins the exact toolchain (1.98.0) and rustup installs it on first build — and a C compiler for the C that `aws-lc-sys` and `libmimalloc-sys` bundle. No system libraries; the build itself is the same everywhere:
 
 ```bash
 cargo build --release
@@ -666,7 +666,7 @@ cargo build --release
 <summary><b>🐧 Arch Linux</b></summary>
 
 ```bash
-sudo pacman -S rustup
+sudo pacman -S rustup base-devel
 rustup default stable
 cargo build --release
 ```
@@ -677,6 +677,7 @@ cargo build --release
 <summary><b>🐧 Ubuntu / Debian</b></summary>
 
 ```bash
+sudo apt install build-essential curl
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source ~/.cargo/env
 cargo build --release
@@ -688,6 +689,7 @@ cargo build --release
 <summary><b>🐧 Fedora / RHEL</b></summary>
 
 ```bash
+sudo dnf install gcc
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source ~/.cargo/env
 cargo build --release
@@ -696,9 +698,10 @@ cargo build --release
 </details>
 
 <details>
-<summary><b>🍎 macOS</b></summary>
+<summary><b>🍎 macOS</b> (not built by CI)</summary>
 
 ```bash
+xcode-select --install   # the C compiler
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source ~/.cargo/env
 cargo build --release
@@ -710,11 +713,25 @@ cargo build --release
 <summary><b>🪟 Windows</b></summary>
 
 ```powershell
-# Install Rust from https://rustup.rs — that's it, no other tooling needed.
+# Install Rust from https://rustup.rs, with the MSVC C++ build tools it asks for.
 cargo build --release
 ```
 
 </details>
+
+### CI
+
+[`ci.yml`](.github/workflows/ci.yml) runs on every push and pull request to `master`/`main`, on the pinned 1.98.0 toolchain, with no `apt install` step:
+
+| Job | What it runs |
+|---|---|
+| Format | `cargo fmt --all --check` |
+| Clippy and Tests (Ubuntu) | `cargo clippy --all-targets --all-features` (the correctness and suspicious groups are errors, the rest warnings) and `cargo test` |
+| MIT build (no RAR) | `cargo test -p server --no-default-features` — the only place the `cfg(not(feature = "rar"))` paths compile |
+| Android check | `cargo ndk -t armeabi-v7a -t arm64-v8a check -p server --all-targets --locked`, with the runner's NDK: a check, not a build — nothing links and no test runs |
+| Windows Build and Test | `cargo build --features server/tui` and `cargo test` |
+
+Nothing builds or tests macOS. [`release.yml`](.github/workflows/release.yml) is separate: on a `v*` tag (or by hand) it builds the Windows, Linux and Arch artifacts with `--features server/tui`.
 
 ---
 
@@ -724,11 +741,13 @@ cargo build --release
 stream-server/
 ├── server/           # HTTP server (media + token-protected control routers), embeddable library
 │   ├── src/auth.rs   # ServerAuth + the bearer middleware
-│   └── src/archives/ # ZIP/7Z/TAR (always on) + RAR (default-on "rar" feature), all pure Rust
+│   └── src/archives/ # ZIP/7Z/TAR/tgz (always on) + RAR (default-on "rar" feature), all pure Rust
 ├── enginefs/         # Torrent engine abstraction
 │   └── src/backend/
 │       └── librqbit.rs   # The sole torrent backend (pure Rust)
-└── stremio-runtime-stub/ # Legacy-compatible launcher shim
+├── stremio-runtime-stub/ # stands in for Stremio desktop's stremio-runtime; spawns stream-server.exe --no-auth
+├── docs/             # bittorrent-settings.md
+└── scripts/          # release-notes generator, the stub's Windows installer
 ```
 
 There is no `bindings/` directory and no vcpkg apparatus: the optional C++ `libtorrent` backend and everything it needed to build (the `libtorrent-sys` FFI crate, `triplets/`, `vcpkg-overlays/`, `vcpkg.json`) have been removed. RAR is handled by the pure-Rust `unrar-rs` crate — a direct `server` dependency behind the default-on `rar` feature — so there is no separate RAR binding crate either.
