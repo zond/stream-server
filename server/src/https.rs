@@ -29,6 +29,22 @@ use anyhow::Context;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+/// Put `contents` at `path` whole or not at all: written beside it, then
+/// renamed over it. A plain write truncates first, so a kill between the
+/// truncate and the write left a PEM that would not load, and the listener
+/// with it.
+async fn write_whole(path: &Path, contents: &str) -> anyhow::Result<()> {
+    let mut staged = path.as_os_str().to_owned();
+    staged.push(".tmp");
+    let staged = PathBuf::from(staged);
+    tokio::fs::write(&staged, contents)
+        .await
+        .with_context(|| format!("failed to write {}", staged.display()))?;
+    tokio::fs::rename(&staged, path)
+        .await
+        .with_context(|| format!("failed to put {} in place", path.display()))
+}
+
 /// The HTTPS listener's control block, held by [`AppState`].
 pub struct HttpsListener {
     /// Where the listener binds, from `ServerConfig::https_addr`. `None`
@@ -102,12 +118,8 @@ impl HttpsListener {
              so there is nothing to serve a certificate on"
         );
         let mut running = self.running.lock().await;
-        tokio::fs::write(&self.cert_path, cert_pem)
-            .await
-            .with_context(|| format!("failed to write {}", self.cert_path.display()))?;
-        tokio::fs::write(&self.key_path, key_pem)
-            .await
-            .with_context(|| format!("failed to write {}", self.key_path.display()))?;
+        write_whole(&self.cert_path, cert_pem).await?;
+        write_whole(&self.key_path, key_pem).await?;
         tracing::info!(dir = %self.cert_path.parent().unwrap_or(&self.cert_path).display(), "Saved HTTPS certificate");
         if let Some(previous) = running.take() {
             // A listener presenting the old certificate has to go; the
@@ -129,7 +141,8 @@ impl HttpsListener {
     /// this listener's port, and a client that kept the URL expects it back
     /// after a restart. Nothing to do when no address is configured or no
     /// certificate is present; a certificate that will not load or a port
-    /// that will not bind is an error for the caller.
+    /// that will not bind is an error for the caller, which `run` logs and
+    /// serves on without.
     pub async fn start_if_certificate_present(
         &self,
         state: &AppState,

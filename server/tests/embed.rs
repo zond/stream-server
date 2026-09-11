@@ -4933,6 +4933,38 @@ fn set_lan_media_toggles_the_listener_and_the_setting_can_forbid_it() -> anyhow:
     Ok(())
 }
 
+/// A certificate on disk that will not load costs the HTTPS listener and
+/// nothing else: the server starts and serves plain HTTP. It used to refuse
+/// to start at all, at every launch, over the remote-access feature.
+#[test]
+fn a_certificate_that_will_not_load_leaves_the_plain_server_up() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let config_path = config_dir.path().join("config");
+    std::fs::create_dir_all(&config_path)?;
+    std::fs::write(config_path.join("https-cert.pem"), "not a certificate")?;
+    std::fs::write(config_path.join("https-key.pem"), "not a key")?;
+
+    let handle = stream_server::start(ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        https_addr: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
+        config_dir: Some(config_path),
+        cache_dir: Some(cache_dir.path().join("cache")),
+        ..offline_config()
+    })?;
+    assert_eq!(handle.https_addr(), None);
+    let heartbeat: serde_json::Value = bearer_client(&handle)?
+        .get(format!("http://{}/heartbeat", handle.http_addr()))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    assert_eq!(heartbeat["success"], true);
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
 /// `/get-https` answers with a port a TLS handshake succeeds on, because the
 /// listener behind the answer is started by the same call that writes the
 /// certificate -- not the plain-HTTP port, and not a port that only exists

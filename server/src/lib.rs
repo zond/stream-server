@@ -1338,7 +1338,19 @@ pub async fn run(
     // certificate is either serving or has failed the start by the time
     // `start` hands back a handle.
     let https_listener = state.https.clone();
-    https_listener.start_if_certificate_present(&state).await?;
+    // A failure here is the HTTPS listener's and nobody else's. It used to
+    // be the whole server's: a certificate that would not load -- a key
+    // and a certificate from two different `/get-https` answers, a file
+    // cut short -- or a port something else held refused the loopback
+    // server every client needs, over a remote-access feature, at every
+    // start until someone found the file. `/get-https` starts the listener
+    // again when it fetches a certificate.
+    if let Err(error) = https_listener.start_if_certificate_present(&state).await {
+        tracing::warn!(
+            error = format!("{error:#}"),
+            "the HTTPS listener did not start; serving plain HTTP only"
+        );
+    }
 
     tracing::info!("listening on {}", bound_http_addr);
     if cfg.print_startup {
