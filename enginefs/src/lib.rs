@@ -3560,6 +3560,24 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 }
             };
         }
+        // Asked at the door, because every question above it was an
+        // `await` ago: a torrent added, restored or restarted since is one
+        // whose store registered at `init`, and `remove_dir_all` of its
+        // directory would take the pieces of a live have-set out from under
+        // it. The same guard `crate::retention::unlink` makes before a
+        // claimless delete, for the same reason and at the same instant --
+        // and, like that one, the safe direction is to refuse: a directory
+        // left behind is swept at the next launch, where bytes deleted
+        // under a running check are gone.
+        if self.registry.is_registered(info_hash) {
+            tracing::warn!(
+                info_hash,
+                file_idx,
+                "a store registered for this torrent while its data was being deleted; \
+                 leaving it to the torrent that now holds it"
+            );
+            return false;
+        }
         let folder = self.piece_store().torrent_dir(info_hash);
         match tokio::fs::remove_dir_all(&folder).await {
             Ok(()) => {
@@ -14385,6 +14403,78 @@ mod tests {
                     .unwrap()
                     .is_empty(),
             "and the torrent nobody unpinned stays in the session"
+        );
+    }
+
+    /// **A store that registered while the delete was in flight keeps its
+    /// bytes.**
+    ///
+    /// Every question `delete_dormant_download_data` asks before its
+    /// `remove_dir_all` -- is another file pinned, is an add pending, does
+    /// the session hold the torrent -- is an `await` old by the time the
+    /// directory goes. A torrent added, restored or restarted in that gap
+    /// has a store registered at `init` and a have-set built from what is
+    /// on the disk, and removing the directory under it is the
+    /// advertise-then-serve-a-hole this design exists to prevent, reached
+    /// from the one door that never went through the backend.
+    ///
+    /// So the registry is asked at the door, as `retention::unlink` asks it
+    /// before a claimless delete. Refusing is the safe direction: a
+    /// directory left behind is swept at the next launch, where bytes taken
+    /// from under a running check are gone.
+    #[tokio::test]
+    async fn a_dormant_delete_refuses_a_torrent_whose_store_registered_since() {
+        let root = tempfile::tempdir().unwrap();
+        let enginefs = BackendEngineFS::new_with_backend(
+            FakeBackend::new(Vec::new()),
+            HashMap::new(),
+            root.path().join("cache"),
+            root.path().join("rqbit-downloads"),
+        );
+        std::fs::create_dir_all(root.path().join("rqbit-downloads")).unwrap();
+        let pieces = enginefs.piece_store().path().to_path_buf();
+        let folder = pieces.join(TEST_HASH);
+        std::fs::create_dir_all(folder.join("0")).unwrap();
+        std::fs::write(folder.join("0").join("1"), [7u8; 4096]).unwrap();
+
+        std::fs::write(
+            enginefs.pinned_downloads_path(),
+            serde_json::to_vec(&serde_json::json!({ TEST_HASH: [1] })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(enginefs.restore_pinned_downloads().await, 0);
+
+        // The gap: a torrent for this hash is added while the unpin is on
+        // its way to the disk, and its store registers as `init` seeds it.
+        let layout = Arc::new(
+            crate::piece_store::PieceLayout::new(
+                4096,
+                4096,
+                [crate::piece_store::FileSpec::payload(4096)],
+            )
+            .expect("a layout"),
+        );
+        let store = crate::piece_store::PieceStore::under(
+            Arc::clone(enginefs.store_registry()),
+            TEST_HASH,
+            layout,
+        );
+        store
+            .init_for_tests()
+            .expect("the store seeds and registers");
+        assert!(enginefs.store_registry().is_registered(TEST_HASH));
+
+        assert_eq!(
+            enginefs.unpin_download(TEST_HASH, 1, true).await.unwrap(),
+            UnpinOutcome {
+                unpinned: true,
+                deleted_files: false,
+            },
+            "the pin goes, but its bytes are the registered store's now"
+        );
+        assert!(
+            folder.join("0").join("1").is_file(),
+            "the piece a live have-set speaks for is still on the disk"
         );
     }
 
