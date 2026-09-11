@@ -3,7 +3,6 @@ use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncRead, AsyncSeek};
 
-pub mod bridge;
 pub mod cache;
 #[cfg(feature = "rar")]
 pub mod rar;
