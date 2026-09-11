@@ -41,7 +41,7 @@ jobs:
 
       - name: Build Release
         run: |
-          cargo build --release --target x86_64-pc-windows-msvc
+          cargo build --release --target x86_64-pc-windows-msvc --features server/tui
           cargo build --release --target x86_64-pc-windows-msvc -p stremio-runtime-stub
 
       - name: Upload EXE
@@ -92,8 +92,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      # The desktop binary's `--tui` is a feature, off by default so the
+      # library embedders link does not carry it (server/Cargo.toml).
       - name: Build Release
-        run: cargo build --release
+        run: cargo build --release --features server/tui
 
       - name: Build DEB Package
         run: cargo deb --package server --no-build
@@ -171,7 +173,7 @@ jobs:
             arch-cargo-
 
       - name: Build binary
-        run: cargo build --release
+        run: cargo build --release --features server/tui
 
       - name: Create PKGBUILD
         run: |

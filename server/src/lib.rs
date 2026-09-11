@@ -88,6 +88,7 @@ mod routes;
 mod ssdp;
 mod state;
 pub mod stream_numbers;
+#[cfg(feature = "tui")]
 mod tui;
 
 #[derive(Clone, Debug)]
@@ -104,6 +105,8 @@ pub struct ServerConfig {
     /// platform cache dir. No environment variable is consulted once
     /// `config_dir` is given.
     pub cache_dir: Option<PathBuf>,
+    /// The terminal UI on stdout. Only a build with the `tui` feature has
+    /// one; without it, `run` refuses a config that asks for it.
     pub use_tui: bool,
     pub init_logging: bool,
     pub manage_process_globals: bool,
@@ -929,6 +932,13 @@ pub async fn run(
     mut external_shutdown_rx: tokio::sync::mpsc::Receiver<()>,
     ready_tx: Option<tokio::sync::oneshot::Sender<Started>>,
 ) -> anyhow::Result<Option<ShutdownSource>> {
+    // Refused rather than ignored: the operator asked for a screen and would
+    // get a server logging to stdout instead.
+    #[cfg(not(feature = "tui"))]
+    anyhow::ensure!(
+        !cfg.use_tui,
+        "use_tui asks for the terminal UI, which this build left out (feature `tui`)"
+    );
     let listener = tokio::net::TcpListener::bind(cfg.http_addr)
         .await
         .with_context(|| format!("failed to bind HTTP listener on {}", cfg.http_addr))?;
@@ -939,12 +949,15 @@ pub async fn run(
         .clone()
         .unwrap_or_else(|| format!("http://{}", public_http_addr));
 
+    #[cfg(feature = "tui")]
     let (tui_log_layer, tui_rx) = if cfg.use_tui {
         let (tx, rx) = crossbeam_channel::bounded(1000);
         (Some(tui::log_layer::TuiLogLayer::new(tx)), Some(rx))
     } else {
         (None, None)
     };
+    #[cfg(not(feature = "tui"))]
+    let tui_log_layer: Option<tracing_subscriber::layer::Identity> = None;
 
     let (config_dir, cache_dir) = resolve_dirs(&cfg)?;
     let log_dir = config_dir.join("logs");
@@ -981,24 +994,15 @@ pub async fn run(
             .with_writer(json_writer)
             .with_ansi(false);
 
-        let init_result = if let Some(layer) = tui_log_layer {
-            registry
-                .with(human_file_layer)
-                .with(json_file_layer)
-                .with(layer)
-                .try_init()
-        } else if std::io::stdout().is_terminal() {
-            registry
-                .with(human_file_layer)
-                .with(json_file_layer)
-                .with(tracing_subscriber::fmt::layer())
-                .try_init()
-        } else {
-            registry
-                .with(human_file_layer)
-                .with(json_file_layer)
-                .try_init()
-        };
+        // The TUI owns the terminal, so stdout gets log lines only without it.
+        let stdout_layer = (tui_log_layer.is_none() && std::io::stdout().is_terminal())
+            .then(tracing_subscriber::fmt::layer);
+        let init_result = registry
+            .with(human_file_layer)
+            .with(json_file_layer)
+            .with(tui_log_layer)
+            .with(stdout_layer)
+            .try_init();
 
         if init_result.is_ok() {
             diagnostics::logging::store_log_guards(guards);
@@ -1304,12 +1308,17 @@ pub async fn run(
     // See `diagnostics::dht_health`.
     background_tasks.push(diagnostics::dht_health::start(state.engine.clone()));
 
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel(1);
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+    #[cfg(feature = "tui")]
     if cfg.use_tui
         && let Some(rx) = tui_rx
     {
         tui::start_tui(Arc::new(state.clone()), rx, shutdown_tx);
     }
+    // Moved, not dropped (as `let _ =` would): a closed channel reads as the
+    // TUI's quit and shuts the server down at once.
+    #[cfg(not(feature = "tui"))]
+    let _no_tui_quits = shutdown_tx;
 
     let app = build_router(state.clone());
 

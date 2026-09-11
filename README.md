@@ -89,6 +89,7 @@ cargo build --release --no-default-features
 |---|---|---|
 | *(default)* | `rar` (pure-Rust RAR via `unrar-rs`) on top of the always-on `librqbit` backend | None |
 | `rar` | RAR archive streaming via pure-Rust `unrar-rs` (**on by default**) | None |
+| `tui` | The binary's `--tui` terminal UI (ratatui/crossterm). **Off by default**, so the library an app embeds carries no terminal stack; the release builds turn it on with `--features server/tui`, and a binary built without it refuses `--tui` | None |
 
 RAR streaming is **on by default** and pure Rust — no libclang or C++ toolchain. ZIP, 7Z, and TAR streaming are always built in too, and are not gated by any feature. Because `unrar-rs` is GPL-3.0-or-later, the default binary is GPL-3.0-or-later; drop the `rar` feature (`--no-default-features`) for an MIT binary, where RAR requests then return a 501 JSON error.
 
@@ -112,6 +113,7 @@ The server starts on `http://localhost:11470` by default (compatible with standa
 | `--token <t>` / `--token=<t>` | Use exactly this token (headless use: the operator already knows it, nothing is printed) |
 | `STREAM_SERVER_TOKEN=<t>` | Same as `--token`, from the environment; `--token` wins if both are given, a blank value counts as unset |
 | `--no-auth` | Run the control API open (every route answers without a token). Wins over `STREAM_SERVER_TOKEN`; contradicts an explicit `--token` and is rejected together with it |
+| `--tui` | A terminal UI in place of the log on stdout. Only in a build with the `tui` feature (`cargo build --release --features server/tui`); any other build refuses the flag |
 
 The `stremio-runtime` stub spawns the server with `--no-auth`: it is the compatibility shim for legacy clients that speak plain HTTP and cannot send the header. See [API](#-api).
 

@@ -44,6 +44,23 @@ fn offline_config() -> ServerConfig {
     }
 }
 
+/// A build without the `tui` feature has no terminal UI to start, and says
+/// so instead of starting without one.
+#[cfg(not(feature = "tui"))]
+#[test]
+fn a_build_without_the_tui_refuses_a_config_that_asks_for_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = ServerConfig {
+        use_tui: true,
+        config_dir: Some(dir.path().to_path_buf()),
+        ..offline_config()
+    };
+    let error = stream_server::start(cfg)
+        .err()
+        .expect("the start is refused");
+    assert!(error.to_string().contains("tui"), "{error}");
+}
+
 /// Resolving bootstrap names is on for both shipped configurations -- the
 /// Android embed, which uses `embedded()`, is the case it exists for.
 #[test]

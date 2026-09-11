@@ -16,7 +16,8 @@ mod app {
         pub auth: ServerAuth,
     }
 
-    /// Parse the daemon's command line. `--tui` selects the ratatui mode.
+    /// Parse the daemon's command line. `--tui` selects the ratatui mode,
+    /// and is refused by a build without the `tui` feature.
     /// The control API token comes from, in order of precedence: `--no-auth`
     /// (every route open), `--token <t>` / `--token=<t>`, the
     /// `STREAM_SERVER_TOKEN` environment variable (`env_token`; blank counts
@@ -34,7 +35,10 @@ mod app {
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
-                "--tui" => use_tui = true,
+                "--tui" if cfg!(feature = "tui") => use_tui = true,
+                "--tui" => anyhow::bail!(
+                    "--tui: this build has no terminal UI; build it with `--features tui`"
+                ),
                 "--no-auth" => no_auth = true,
                 "--token" => {
                     let value = args
@@ -114,11 +118,20 @@ mod app {
             assert_eq!(parse(&["--verbose"], None).unwrap(), options);
         }
 
+        #[cfg(feature = "tui")]
         #[test]
         fn tui_and_no_auth_flags() {
             let options = parse(&["--tui", "--no-auth"], None).unwrap();
             assert!(options.use_tui);
             assert_eq!(options.auth, ServerAuth::Disabled);
+        }
+
+        /// Rather than start a server whose operator asked for a screen and
+        /// gets a log on stdout.
+        #[cfg(not(feature = "tui"))]
+        #[test]
+        fn a_build_without_the_tui_refuses_the_flag() {
+            assert!(parse(&["--tui"], None).is_err());
         }
 
         #[test]

@@ -59,10 +59,11 @@ jobs:
       # correctness and suspicious groups; everything else stays a warning.
       #
       # The bare invocation lints the workspace default-members, which is
-      # exactly the pure-Rust set (identical to `members`).
+      # exactly the pure-Rust set (identical to `members`). `--all-features`
+      # so the off-by-default `tui` feature is compiled somewhere.
       - name: Clippy
         run: >-
-          cargo clippy --all-targets --
+          cargo clippy --all-targets --all-features --
           -D clippy::correctness -D clippy::suspicious -W clippy::all
 
       - name: Test
@@ -110,11 +111,12 @@ jobs:
         with:
           cache-on-failure: true
 
-      # Default features only (pure-Rust librqbit backend): no ffmpeg, no
-      # libclang, no system libraries. This is a cheap cross-platform guard for
-      # the default build; the tag-triggered release build stays in release.yml.
+      # Pure Rust: no ffmpeg, no libclang, no system libraries. A cheap
+      # cross-platform guard for the release build, which stays in
+      # release.yml; built with the `tui` feature as that build is, since
+      # crossterm has a Windows path of its own.
       - name: Build
-        run: cargo build
+        run: cargo build --features server/tui
 
       - name: Test
         run: cargo test
