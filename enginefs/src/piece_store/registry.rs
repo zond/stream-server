@@ -178,8 +178,16 @@ impl StoreRegistry {
     /// One `read_dir` of the root and a `stat` of every directory no live
     /// store speaks for: a torrent the session holds in Error (which holds
     /// no storage, so it has no registration), one a previous process left,
-    /// and whatever is not a piece file. Filesystem work, so it belongs off
-    /// the reactor and is asked on demand, never on the tick.
+    /// and whatever is not a piece file. And the staged copies of the
+    /// stores that are registered, one `stat` each: a held set counts
+    /// complete pieces, so without them every piece in flight was in
+    /// neither half. Filesystem work, so it belongs off the reactor and is
+    /// asked on demand, never on the tick.
+    ///
+    /// What a registered store's directory holds beyond its pieces and
+    /// their staged copies is in neither half. Nothing writes such a file
+    /// there, and finding one would take the walk of the tree this exists
+    /// not to make.
     ///
     /// The registration is asked at this instant and the `stat` follows it,
     /// so a torrent that registers between the two is counted twice for the
@@ -189,6 +197,10 @@ impl StoreRegistry {
     pub fn unregistered_bytes(&self) -> u64 {
         self.root
             .unregistered_bytes(|info_hash| self.is_registered(info_hash))
+            + self
+                .every_live()
+                .map(|inner| inner.staged_bytes())
+                .sum::<u64>()
     }
 
     /// Whether the store registered for `info_hash` is under its initial
@@ -613,6 +625,37 @@ mod tests {
             8,
             "and none of it moved what the stores hold"
         );
+    }
+
+    /// **A piece in flight is on the volume, so it is in the figure.** A
+    /// held set counts complete pieces, and the directory of a registered
+    /// store is stepped over, so a staged copy was in neither half: up to a
+    /// piece per piece in flight, and the copy a re-download writes over a
+    /// complete one, all missing from `GET /cache.json`.
+    #[test]
+    fn a_registered_stores_staged_copies_are_in_the_unregistered_half() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = registry(tmp.path());
+        let store = store_under(&registry);
+        std::fs::create_dir_all(store.dir()).unwrap();
+        write_piece(&store, 0);
+        store.init_for_tests().unwrap();
+        // Half of piece 1, and piece 0 being written again over its
+        // complete copy.
+        store.pwrite_all(0, PIECE_LENGTH, &[7u8; 4]).unwrap();
+        store.pwrite_all(0, 0, &[7u8; 8]).unwrap();
+
+        let staged = [0u32, 1]
+            .iter()
+            .map(|piece| {
+                crate::chunk_store::occupied_bytes(
+                    &std::fs::metadata(store.staging_path(*piece)).unwrap(),
+                )
+            })
+            .sum::<u64>();
+        assert!(staged > 0, "the staged copies are on the volume");
+        assert_eq!(registry.unregistered_bytes(), staged);
+        assert_eq!(registry.occupancy(), 8, "the complete piece, from its bit");
     }
 
     /// Occupancy is the registered stores' held bits priced by their

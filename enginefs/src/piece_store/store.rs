@@ -655,6 +655,25 @@ impl Inner {
         self.checking.load(Ordering::Acquire)
     }
 
+    /// What this store's staged copies occupy, as the volume counts them:
+    /// one `stat` per piece [`Self::staged`] names, and none of the tree.
+    ///
+    /// The held bits price complete pieces only, so a piece being written
+    /// -- one per piece in flight, up to a whole piece each, and a copy
+    /// being written again over a complete one -- is on the volume and in
+    /// no count at all. The set is copied out before the `stat`s, which are
+    /// filesystem work the write path must not wait behind; an entry the
+    /// set still names after its copy was completed or deleted finds
+    /// nothing and counts nothing.
+    pub(super) fn staged_bytes(&self) -> u64 {
+        let staged: Vec<u32> = self.staged.lock().iter().copied().collect();
+        staged
+            .into_iter()
+            .filter_map(|piece| std::fs::metadata(self.staging_path(piece)).ok())
+            .map(|metadata| crate::chunk_store::occupied_bytes(&metadata))
+            .sum()
+    }
+
     pub(super) fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::Acquire)
     }
@@ -1080,8 +1099,9 @@ impl StoreRoot {
     /// bytes from the bits it keeps, with no syscall at all; what it cannot
     /// count is what belongs to no store -- a torrent the session holds in
     /// Error, one a previous process left behind, and whatever under the
-    /// root is not a piece file. Those are read here, on demand, so that
-    /// every byte under the root is in somebody's answer.
+    /// root is not a piece file. Those are read here, on demand; what a
+    /// registered store's bits cannot count either -- its staged copies --
+    /// [`StoreRegistry::unregistered_bytes`] adds.
     ///
     /// Nothing is deleted and nothing is offered for deletion: only
     /// [`super::sweep`] can say a directory is unadopted, and it runs at

@@ -2580,9 +2580,9 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// is, is minutes old.
     pub async fn cache_holdings(&self) -> CacheHoldings {
         let registry = self.registry.clone();
-        // A `read_dir` of the root and a `stat` per unadopted directory:
-        // filesystem work, and this is called from a request a worker is
-        // serving.
+        // A `read_dir` of the root, a `stat` per unadopted directory and one
+        // per staged copy a registered store has: filesystem work, and this
+        // is called from a request a worker is serving.
         let unregistered = tokio::task::spawn_blocking(move || registry.unregistered_bytes())
             .await
             .unwrap_or_else(|error| {
