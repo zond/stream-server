@@ -92,9 +92,22 @@ impl LanMedia {
     /// an already-running listener is left alone and its address returned.
     /// The request count is reset either way -- see below.
     ///
-    /// Fails when no address is configured, or when the bind fails.
+    /// Fails when the `lanMediaEnabled` setting forbids the listener, when
+    /// no address is configured, or when the bind fails.
     pub async fn start(&self, state: &AppState) -> anyhow::Result<SocketAddr> {
         let mut running = self.running.lock().await;
+        // The operator's veto, read under the lock that `stop` takes. It
+        // used to be read by the caller before this lock was waited for,
+        // and a settings update that revoked it in between found nothing
+        // running to stop -- then this bound the listener the setting had
+        // just forbidden. Read here, a revocation either lands first and is
+        // seen, or its `stop` queues behind this start and takes what it
+        // bound.
+        anyhow::ensure!(
+            state.settings.read().await.lan_media_enabled,
+            "the lanMediaEnabled setting forbids the LAN media listener; \
+             set it through POST /settings (or update_settings) first"
+        );
         // The count belongs to this session, not to the process or to the
         // listener: a caller asking "has the receiver fetched anything yet?"
         // is asking about the cast it just started, and a count left over

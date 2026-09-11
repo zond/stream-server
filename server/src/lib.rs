@@ -759,11 +759,8 @@ impl ServerHandle {
                 state.lan_media.stop().await;
                 return Ok(None);
             }
-            anyhow::ensure!(
-                state.settings.read().await.lan_media_enabled,
-                "the lanMediaEnabled setting forbids the LAN media listener; \
-                 set it through POST /settings (or update_settings) first"
-            );
+            // The `lanMediaEnabled` veto is `start`'s to check, under the
+            // lock a revocation's stop takes.
             state.lan_media.start(&state).await.map(Some)
         })?
     }
