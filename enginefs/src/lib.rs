@@ -3366,7 +3366,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let placement = TorrentPlacement {
             only_files: Some(vec![file_idx]),
         };
-        let was_managed = self.get_engine(info_hash).await.is_some();
         let AddedMagnet {
             engine,
             started_here,
@@ -3374,8 +3373,12 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         } = self
             .add_magnet_placed(info_hash, extra_trackers, placement)
             .await?;
+        // Data may be in place unless this pin's own add made the torrent:
+        // an engine that was there already, and an add a stream started and
+        // this pin joined, both come with whatever the store held -- and
+        // measured while they check, a complete file reads as nothing had.
         let checked = self
-            .check_pin_preconditions(&engine, file_idx, was_managed)
+            .check_pin_preconditions(&engine, file_idx, !started_here)
             .await;
         if let Err(error) = checked {
             // Torn down only when demonstrably this pin's and nobody
@@ -4084,8 +4087,9 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// A volume that cannot be probed is not held against the pin (logged).
     ///
     /// A torrent that is still `checking` data that may already be there
-    /// (`may_have_data_in_place`: it was managed before this call -- a
-    /// restart, a stream) is not measured at all: `downloaded` reads 0
+    /// (`may_have_data_in_place`: this call did not add it -- a restart, a
+    /// stream, an add a stream started that the pin joined) is not
+    /// measured at all: `downloaded` reads 0
     /// until the check ends, so a complete file would be refused as if it
     /// had everything left to write -- and refusing changes nothing about a
     /// download librqbit already wants. A torrent this pin *added* is
@@ -8945,6 +8949,41 @@ mod tests {
             enginefs.pin_download(TEST_HASH, 0, None).await,
             Err(PinDownloadError::InsufficientSpace { .. })
         ));
+    }
+
+    /// **And so is a pin that joined an add a stream started.** The torrent
+    /// is the stream's, not the pin's, and what its store holds came with
+    /// it -- but the pin found no engine before the add (it was in flight),
+    /// took itself for the torrent's adder and measured a checking torrent
+    /// whose files read 0: a complete file refused for want of the space to
+    /// download it all again.
+    #[tokio::test]
+    async fn a_pin_that_joined_a_streams_add_is_not_measured_while_it_checks() {
+        let (mut enginefs, _counters) = test_enginefs_unmanaged_checking();
+        enginefs.set_free_space_probe(|_| Ok(0));
+        enginefs.backend.hold_add.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            enginefs.get_or_begin_add_magnet(TEST_HASH, None).await,
+            EngineLookup::Adding(_)
+        ));
+        let release = async {
+            assert!(
+                wait_until(TEST_WAIT_BOUND, || {
+                    !enginefs.backend.placements.lock().unwrap().is_empty()
+                        && enginefs.pin_locks.lock().contains_key(TEST_HASH)
+                })
+                .await,
+                "the stream's add and the pin both got going"
+            );
+            enginefs.backend.add_hold.add_permits(1);
+        };
+        let (result, ()) = tokio::join!(enginefs.pin_download(TEST_HASH, 0, None), release);
+        assert!(
+            result.is_ok(),
+            "a joined add was measured while it checked: {:?}",
+            result.err()
+        );
+        assert_eq!(enginefs.backend.placements.lock().unwrap().len(), 1);
     }
 
     /// Engine over an unmanaged fake torrent that is still checking (as a
