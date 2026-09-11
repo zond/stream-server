@@ -2351,6 +2351,24 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// pass below keeps the reading, because the modes of one tick must
     /// agree with the ladder's; the delete asks again, as every delete
     /// here does.
+    ///
+    /// **And it holds the hash's pin lock while it removes.** A pin is the
+    /// other thing that can say this torrent's bytes are wanted, and
+    /// `pin_download` finds the engine in the registry, records the pin on
+    /// it and answers `Ok`. Made outside the lock, this removal could be
+    /// inside its backend call when that pin landed: the pin went onto an
+    /// engine `remove_engine_if_current` then took out of the registry, and
+    /// the user was told their download was kept while its torrent left the
+    /// session and its files went with it. Under the lock the pin queues
+    /// behind the removal, finds no engine, and adds the torrent again as a
+    /// pin of an unmanaged torrent does. The pin set and the cell are asked
+    /// again under the lock: no await separates the reading above from the
+    /// `try_lock`, but a pin or a stream on another worker thread can land
+    /// in between, and the lock is free again by the time it is taken.
+    /// `try_lock`, because the tick may not wait: a pin holding the lock
+    /// is resolving metadata, which is bounded by
+    /// `METADATA_RESOLVE_TIMEOUT` and not by the tick, and the removal
+    /// nothing is racing comes round again in two seconds.
     async fn retain_engine(
         &self,
         engine: &Arc<Engine<B::Handle>>,
@@ -2360,23 +2378,17 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             && !engine.is_pinned()
             && !self.live.is_torrent(&engine.info_hash)
         {
-            tracing::info!(
-                info_hash = %engine.info_hash,
-                "removing an errored torrent nobody is playing and nobody pinned, with its files"
-            );
-            if let Err(error) = self
-                .backend
-                .remove_torrent_and_files(&engine.info_hash)
-                .await
-            {
-                tracing::warn!(
+            let lock = self.pin_lock(&engine.info_hash);
+            if let Ok(guard) = lock.try_lock() {
+                self.remove_errored_engine_locked(engine).await;
+                drop(guard);
+            } else {
+                debug!(
                     info_hash = %engine.info_hash,
-                    error = %format!("{error:#}"),
-                    "could not remove an errored torrent; its bytes stay until the next tick"
+                    "a pin or unpin of an errored torrent is in flight; its removal waits for the next tick"
                 );
-                return;
             }
-            self.remove_engine_if_current(engine).await;
+            self.release_pin_lock(&engine.info_hash, lock);
             return;
         }
         let Some(pass) = engine.retain(&self.registry, live).await else {
@@ -2391,6 +2403,37 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 "retention pass"
             );
         }
+    }
+
+    /// The Error arm of [`Self::retain_engine`], with the hash's pin lock
+    /// held: the pin set and the cell asked once more under it, then the
+    /// torrent and its files removed and the engine dropped from the
+    /// registry -- while it is still this engine.
+    async fn remove_errored_engine_locked(&self, engine: &Arc<Engine<B::Handle>>) {
+        if engine.is_pinned() || self.live.is_torrent(&engine.info_hash) {
+            debug!(
+                info_hash = %engine.info_hash,
+                "an errored torrent was pinned or opened before its removal took the lock; kept"
+            );
+            return;
+        }
+        tracing::info!(
+            info_hash = %engine.info_hash,
+            "removing an errored torrent nobody is playing and nobody pinned, with its files"
+        );
+        if let Err(error) = self
+            .backend
+            .remove_torrent_and_files(&engine.info_hash)
+            .await
+        {
+            tracing::warn!(
+                info_hash = %engine.info_hash,
+                error = %format!("{error:#}"),
+                "could not remove an errored torrent; its bytes stay until the next tick"
+            );
+            return;
+        }
+        self.remove_engine_if_current(engine).await;
     }
 
     /// Every entity nobody is playing and nobody is reading, taken off the
@@ -4721,6 +4764,19 @@ mod tests {
         /// `add_hold`, standing in for metadata still resolving.
         hold_add: Arc<AtomicBool>,
         add_hold: Arc<tokio::sync::Semaphore>,
+        /// Test knob: park the next `remove_torrent_and_files` call, the
+        /// way `FakeCounters::advertise_gate` parks a pass. The fake sends
+        /// on the first channel as it enters the call and waits on the
+        /// second before returning, so a test can ask what a pin does
+        /// while a removal is inside the backend. Runs once and is gone.
+        remove_gate: Arc<
+            Mutex<
+                Option<(
+                    tokio::sync::oneshot::Sender<()>,
+                    tokio::sync::oneshot::Receiver<()>,
+                )>,
+            >,
+        >,
     }
 
     impl FakeBackend {
@@ -4733,6 +4789,7 @@ mod tests {
                 hide_torrents: Arc::new(AtomicBool::new(false)),
                 hold_add: Arc::new(AtomicBool::new(false)),
                 add_hold: Arc::new(tokio::sync::Semaphore::new(0)),
+                remove_gate: Arc::new(Mutex::new(None)),
             }
         }
     }
@@ -4786,6 +4843,13 @@ mod tests {
         }
 
         async fn remove_torrent_and_files(&self, info_hash: &str) -> Result<()> {
+            // Parked inside the call, if a test asked for it: see
+            // `FakeBackend::remove_gate`.
+            let gate = self.remove_gate.lock().unwrap().take();
+            if let Some((entered, release)) = gate {
+                let _ = entered.send(());
+                let _ = release.await;
+            }
             self.removed_with_files
                 .lock()
                 .unwrap()
@@ -13594,6 +13658,162 @@ mod tests {
                 .is_some(),
             "and the policy that bounds them"
         );
+    }
+
+    /// **A pin that lands while the errored torrent's removal is inside the
+    /// backend is not told `Ok` about a torrent that is then gone.**
+    ///
+    /// `pin_download` runs under the hash's pin lock; the removal used not
+    /// to. It found the engine in the registry, recorded the pin on it, told
+    /// the handle, and answered `Ok` -- and the removal then finished:
+    /// `remove_engine_if_current` took that very engine out of the registry,
+    /// the torrent had already left the session, and its files with it. The
+    /// user's download was kept, according to the answer they got.
+    ///
+    /// The removal now holds the pin lock, so the pin queues behind it,
+    /// finds no engine, and adds the torrent again -- as a pin of a torrent
+    /// the session does not have always has. Whatever the pin answers, the
+    /// registry must hold a pinned engine for the hash when it answers `Ok`.
+    #[tokio::test(start_paused = true)]
+    async fn a_pin_under_an_errored_torrents_removal_is_not_told_ok_about_a_torrent_then_gone() {
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        nothing_torrent_is_playing(&enginefs);
+        counters.in_error_state.store(true, Ordering::SeqCst);
+        let enginefs = Arc::new(enginefs);
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *enginefs.backend.remove_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        let tick = tokio::spawn({
+            let enginefs = enginefs.clone();
+            async move { enginefs.reconcile_tick().await }
+        });
+        tokio::time::timeout(TEST_WAIT_BOUND, entered_rx)
+            .await
+            .expect("the tick reached the backend's removal")
+            .expect("the fake said so");
+
+        // The user taps download for offline while the removal is inside
+        // the backend.
+        let pin = tokio::spawn({
+            let enginefs = enginefs.clone();
+            async move { enginefs.pin_download(TEST_HASH, 0, None).await }
+        });
+        // Give the pin every chance to run ahead of the release.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        release_tx.send(()).expect("the removal is waiting on this");
+        tick.await.expect("the tick finished");
+        let pinned = pin
+            .await
+            .expect("the pin task")
+            .expect("the pin was accepted");
+
+        let registered = enginefs
+            .peek_engine(TEST_HASH)
+            .await
+            .expect("a pin that answered Ok left a torrent in the registry");
+        assert!(
+            Arc::ptr_eq(&registered, &pinned),
+            "and the engine it answered with is the one registered"
+        );
+        assert!(registered.is_pinned(), "pinned, as the answer said");
+        assert_eq!(registered.pinned_file_indices(), vec![0]);
+    }
+
+    /// **And once it holds the lock, the removal asks the pin set and the
+    /// cell again.**
+    ///
+    /// `retain_engine` reads both before it takes the hash's pin lock. No
+    /// await separates that reading from the `try_lock`, but a pin running
+    /// on another worker thread can record itself and let go of the lock
+    /// inside that gap, and the lock is then free for a removal decided
+    /// from a pin set without it: the download the user was told is kept
+    /// goes with its files. A stream opening on another thread fits the
+    /// same gap. So the removal decides again under the lock, and that
+    /// decision is what this calls directly -- a current-thread test cannot
+    /// put another thread's pin between two statements.
+    #[tokio::test(start_paused = true)]
+    async fn an_errored_torrents_removal_asks_again_under_the_lock() {
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        nothing_torrent_is_playing(&enginefs);
+        counters.in_error_state.store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        let removed = || enginefs.backend.removed_with_files.lock().unwrap().clone();
+
+        // A pin that landed after the tick's reading and before its lock.
+        engine.pinned_files.write().insert(0);
+        enginefs.remove_errored_engine_locked(&engine).await;
+        assert!(
+            removed().is_empty(),
+            "a pin that landed before the lock was taken was removed with its files"
+        );
+        assert!(enginefs.peek_engine(TEST_HASH).await.is_some());
+
+        // A stream that opened in the same gap.
+        engine.pinned_files.write().remove(&0);
+        enginefs.live().open(
+            crate::retention::live::LiveEntity::Torrent {
+                info_hash: TEST_HASH.to_string(),
+                file_idx: 0,
+            },
+            false,
+        );
+        enginefs.remove_errored_engine_locked(&engine).await;
+        assert!(
+            removed().is_empty(),
+            "a torrent opened before the lock was taken was removed with its files"
+        );
+        assert!(enginefs.peek_engine(TEST_HASH).await.is_some());
+
+        // With neither, it goes: the two refusals above were the checks'.
+        nothing_torrent_is_playing(&enginefs);
+        enginefs.remove_errored_engine_locked(&engine).await;
+        assert_eq!(removed(), vec![TEST_HASH.to_string()]);
+        assert!(enginefs.peek_engine(TEST_HASH).await.is_none());
+    }
+
+    /// **And the tick does not wait for a pin in flight: it leaves the
+    /// removal to the next one.**
+    ///
+    /// A pin holds the hash's lock across metadata resolution, which is
+    /// bounded by `METADATA_RESOLVE_TIMEOUT` and not by the two-second
+    /// tick, and every torrent after this one waits for the tick. Taking
+    /// the torrent out under that pin is what the lock is there to prevent.
+    #[tokio::test(start_paused = true)]
+    async fn an_errored_torrents_removal_steps_round_a_pin_in_flight() {
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        nothing_torrent_is_playing(&enginefs);
+        counters.in_error_state.store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+
+        // A pin of this hash, holding its lock.
+        let lock = enginefs.pin_lock(TEST_HASH);
+        let guard = lock.lock().await;
+        let tick = enginefs.live().reading();
+        tokio::time::timeout(TEST_WAIT_BOUND, enginefs.retain_engine(&engine, &tick))
+            .await
+            .expect("the tick waited on a pin in flight");
+        assert!(
+            enginefs
+                .backend
+                .removed_with_files
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "the torrent went with its files under a pin in flight"
+        );
+        assert!(enginefs.peek_engine(TEST_HASH).await.is_some());
+
+        // The pin is done; the next tick removes it.
+        drop(guard);
+        enginefs.release_pin_lock(TEST_HASH, lock);
+        enginefs.retain_engine(&engine, &tick).await;
+        assert!(enginefs.peek_engine(TEST_HASH).await.is_none());
     }
 
     /// **And a torrent in error that the viewer has just started is not
