@@ -30,7 +30,7 @@
 //! torrents the stats show `downloaded` growing while the light stays
 //! dark, and that disagreement is the point: one describes the disk, the
 //! other the connection. What the two do share is the set of torrents they
-//! sum over -- the same merge, so a torrent cannot be in one and not the
+//! sum over -- the one engine's, so a torrent cannot be in one and not the
 //! other.
 //!
 //! The counters are the live state's, so a torrent that pauses or is removed
@@ -42,10 +42,10 @@
 //! # Where the judge sits
 //!
 //! [`TrafficWindow`] is arithmetic over two readings and a flag: it knows
-//! nothing about engines, and it is fed by whoever can see all of them. The
-//! server's state has two engine fields (one instance behind both in
-//! production), so the sum and the conjunction with "nothing playing" are
-//! taken there, in one place, and handed over as one [`BackgroundTraffic`]
+//! nothing about engines, and it is fed by whoever can see all of them: the
+//! server, which holds the one engine, takes the sum and the conjunction
+//! with "nothing playing" there, in one place, and hands them over as one
+//! [`BackgroundTraffic`]
 //! -- never as two signals for a client to combine, because two signals
 //! crossing an FFI boundary are sampled a moment apart and a light driven
 //! by the pair flickers on every disagreement.

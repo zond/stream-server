@@ -18,10 +18,14 @@
 //!   is the backend forgetting it and the store unlinking it, in that order
 //!   and under one claim ([`take_claimed`]).
 //!
-//! So the only pieces a peer is ever told about are the ones nothing will
-//! ever reclaim. That was a decision the policy could state and not perform
-//! until the fork gained a have-bit that is not an announcement; it performs
-//! it now.
+//! So while a file is being played, the only pieces of it a peer is told
+//! about are ones nothing will reclaim while it is -- what
+//! [`crate::piece_store::policy::RetentionPolicy::advertised`] says, and no
+//! more: once nobody plays the file it is slack, and the pass takes the
+//! committed half too. It holds the whole file back from what we announce
+//! before it unlinks anything, so a piece is never deleted while announced.
+//! That was a decision the policy could state and not perform until the
+//! fork gained a have-bit that is not an announcement; it performs it now.
 //!
 //! # What decides the budget, and what a missing one means
 //!

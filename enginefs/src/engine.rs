@@ -957,7 +957,7 @@ pub struct Engine<H: TorrentHandle> {
     last_transition_at: AtomicU64,
     /// Files pinned as offline downloads (`BackendEngineFS::pin_download`).
     /// While non-empty the engine is exempt from idle removal and the
-    /// seeding-disabled pause; the handle keeps its own copy for the
+    /// reconciler runs it; the handle keeps its own copy for the
     /// want-set planner (`TorrentHandle::pin_file`). Shared with
     /// [`TorrentBacking`], which is how the retention owner learns of a
     /// pin: read as a copy-out, never under any lock of the owner's.

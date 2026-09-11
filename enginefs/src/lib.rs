@@ -3322,12 +3322,12 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
 
     /// Pin `file_idx` of `info_hash` as an offline download: the file stays
     /// wanted no matter which file is being played, and the engine is exempt
-    /// from idle removal and the seeding-disabled pause for as long as it has
-    /// a pinned file. Creates the engine if needed (through the magnet
+    /// from idle removal and run by the reconciler for as long as it has a
+    /// pinned file. Creates the engine if needed (through the magnet
     /// registry, waiting for metadata -- the file index has to be validated
-    /// against the file list) with `extra_trackers` merged in, resumes a
-    /// torrent the idle policy had paused, and reconciles the want-set so the
-    /// pin takes effect now. Idempotent.
+    /// against the file list) with `extra_trackers` merged in, has the
+    /// reconciler start a torrent it had stopped, and reconciles the
+    /// want-set so the pin takes effect now. Idempotent.
     ///
     /// **The pin moves nothing.** It is a retention property, not a
     /// location: a torrent's bytes are piece files under the store's one
@@ -3497,9 +3497,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
         engine.touch();
         // The pin is registered above, so the ladder reads `pinned` and
-        // wants this torrent running whatever the idle arm would have said
-        // -- and it is the reconciler that starts it, because a pause that
-        // survived a restart is one no record in this process can explain.
+        // wants this torrent running where nothing playing would have had it
+        // stopped -- and it is the reconciler that starts it, because a
+        // pause that survived a restart is one no record in this process can
+        // explain.
         // Awaited: the pin is an instruction to download now.
         self.reconcile_hash(&engine.info_hash, crate::reconcile::Trigger::PlaybackStart)
             .await;
@@ -3519,11 +3520,14 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// dormant pin of a torrent the backend does not have, which is then
     /// dropped from the persisted set).
     ///
-    /// Without `delete_files` only the pin goes: the data stays, the engine
-    /// becomes an ordinary one again (idle removal applies), and the
-    /// want-set is reconciled against the current playback selection --
-    /// with nothing playing that is a no-op, so the file keeps downloading
-    /// until the engine is swept or another file is prepared.
+    /// Without `delete_files` only the pin goes, and the file is cache again:
+    /// the want-set is reconciled against the current playback selection,
+    /// and unless the file is being played the next tick's pass reclaims
+    /// its pieces like any other unplayed file's. With no other pin on the
+    /// torrent and nothing of it playing, the reconciler stops the torrent
+    /// on that tick and idle removal applies to the engine again. (Not
+    /// while the pin set is unknown, which keeps everything and counts
+    /// every torrent as pinned: [`crate::piece_store::PinsUnknown`].)
     ///
     /// With `delete_files` the data goes too, whether or not the file was
     /// pinned (the caller wants the download gone; a pin lost to a crash
@@ -3869,9 +3873,9 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// files ([`crate::piece_store`]) and the whole-file copy an earlier
     /// version of this server wrote may also still be sitting at the path
     /// the backend reports: **the dropped pieces**, and that path -- which is
-    /// truncated before it is unlinked, since librqbit keeps an open `File`
-    /// on every file of a running torrent and an unlink alone would not free
-    /// a byte. The caller reconciles the want-set without the file first, so
+    /// truncated before it is unlinked, since an unlink alone frees nothing
+    /// while something still has the file open. The caller reconciles the
+    /// want-set without the file first, so
     /// the backend does not write it again. Best effort: a failure is logged,
     /// the unpin stands, and the returned flag says whether anything
     /// actually left the disk -- never that it was already absent.
@@ -3922,11 +3926,12 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     None
                 }
             };
-            // Truncated before it is unlinked: librqbit opens every file of
-            // a torrent at storage init and keeps the `File` for the
-            // torrent's lifetime, so an unlink alone drops the directory
-            // entry while the inode's blocks stay allocated until the
-            // torrent is dropped -- and the caller asked for the disk back.
+            // Truncated before it is unlinked: an unlink alone frees nothing
+            // while something still has the file open, and the caller asked
+            // for the disk back. librqbit's filesystem storage kept every
+            // file of a torrent open for its lifetime, which is how the
+            // server that wrote this copy held it; the piece store never
+            // opens this path.
             match tokio::fs::OpenOptions::new().write(true).open(&path).await {
                 Ok(file) => {
                     if let Err(error) = file.set_len(0).await {

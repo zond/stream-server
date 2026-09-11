@@ -479,7 +479,7 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
     /// the want-set until
     /// `unpin_file`. This is the backend half of an offline download; the
     /// engine layer (`BackendEngineFS::pin_download`) also exempts the torrent
-    /// from idle removal and the seeding-disabled pause. Backends that cannot
+    /// from idle removal and has the reconciler run it. Backends that cannot
     /// select files per file (or always want everything) may leave this as a
     /// no-op. Err only for a provably-bad file index.
     async fn pin_file(&self, _file_idx: usize) -> Result<()> {
