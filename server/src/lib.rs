@@ -277,9 +277,12 @@ impl ServerHandle {
 
     /// Where the HTTPS listener is bound, or `None` while it is not running
     /// -- which is the case until `/get-https` (or
-    /// [`Self::install_https_certificate`]) has put a certificate on disk,
-    /// and always when [`ServerConfig::https_addr`] is unset. With a
-    /// configured port of `0` this is the port the OS assigned.
+    /// [`Self::install_https_certificate`]) has put a certificate on disk;
+    /// again until the next one when the certificate on disk at boot would
+    /// not load or its port would not bind (the server serves plain HTTP
+    /// alone meanwhile); and always when [`ServerConfig::https_addr`] is
+    /// unset. With a configured port of `0` this is the port the OS
+    /// assigned.
     pub fn https_addr(&self) -> Option<SocketAddr> {
         let state = self.state.clone();
         self.block_on_server(async move { state.https.bound_addr().await })
@@ -1334,9 +1337,9 @@ pub async fn run(
     // left its certificate on disk; otherwise that route starts it when it
     // fetches one (see `https`). The same control block serves both, so the
     // route answers with the port that is actually bound. Before the ready
-    // signal, like the plain listener: a configured address with a
-    // certificate is either serving or has failed the start by the time
-    // `start` hands back a handle.
+    // signal, like the plain listener: by the time `start` hands back a
+    // handle, a configured address with a certificate is either serving or
+    // has been logged as not starting -- never still on its way up.
     let https_listener = state.https.clone();
     // A failure here is the HTTPS listener's and nobody else's. It used to
     // be the whole server's: a certificate that would not load -- a key
