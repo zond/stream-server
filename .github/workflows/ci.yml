@@ -79,10 +79,11 @@ jobs:
       # test job above already builds and tests it — no libclang, no separate
       # rar job. What still needs its own guard is the MIT escape hatch:
       # `--no-default-features` must keep building WITHOUT unrar-rs
-      # (GPL-3.0-or-later), so a distributor can produce an MIT-licensed binary.
-      # The librqbit backend is always compiled (it is no longer a feature), so
-      # no backend feature needs to be named. No apt installs: this path is pure
-      # Rust too.
+      # (GPL-3.0-or-later), so a distributor can produce an MIT-licensed binary,
+      # and that binary must work: the cfg(not(feature = "rar")) paths (RAR
+      # answered 501) are only compiled here, so only here can a test reach
+      # them. The librqbit backend is always compiled (it is no longer a
+      # feature), so no backend feature needs to be named. No apt installs.
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@1.98.0
 
@@ -91,8 +92,8 @@ jobs:
         with:
           cache-on-failure: true
 
-      - name: Build MIT escape hatch (no rar)
-        run: cargo build -p server --no-default-features
+      - name: Test MIT escape hatch (no rar)
+        run: cargo test -p server --no-default-features
 
   android:
     name: Android check (armv7, aarch64)

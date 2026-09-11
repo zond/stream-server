@@ -181,6 +181,11 @@ fn fixture() -> anyhow::Result<Fixture> {
             "/broken.zip".to_string(),
             b"PK\x03\x04 and then garbage".to_vec(),
         ),
+        // Only the name matters to a build without RAR.
+        (
+            "/fixture.rar".to_string(),
+            b"Rar!\x1a\x07\x01\x00 and then garbage".to_vec(),
+        ),
     ]))?;
     let cache_dir = cache_root.path().join("cache");
     let handle = stream_server::start(stream_server::ServerConfig {
@@ -458,5 +463,27 @@ fn a_7z_inside_a_torrent_is_refused_as_unreadable_rather_than_missing() -> anyho
         "ab".repeat(20)
     ))?;
     assert_eq!(response.status(), reqwest::StatusCode::NOT_IMPLEMENTED);
+    fixture.finish()
+}
+
+/// The MIT build, which leaves unrar-rs out, answers a RAR session with
+/// `501` and says why, rather than failing it as some other error or
+/// handing the archive to a reader that is not there.
+#[cfg(not(feature = "rar"))]
+#[test]
+fn a_build_without_rar_refuses_a_rar_archive_as_not_implemented() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let response = reqwest::blocking::Client::new()
+        .post(format!("{}/rar/create", fixture.base))
+        .json(&serde_json::json!({ "urls": [fixture.origin.url("/fixture.rar")] }))
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_IMPLEMENTED);
+    let body: serde_json::Value = response.json()?;
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("RAR")),
+        "{body}"
+    );
     fixture.finish()
 }
