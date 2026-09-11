@@ -5,7 +5,6 @@ use tokio::io::{AsyncRead, AsyncSeek};
 
 pub mod bridge;
 pub mod cache;
-pub mod nzb;
 #[cfg(feature = "rar")]
 pub mod rar;
 pub mod sessions;
@@ -17,7 +16,7 @@ pub mod zip;
 
 pub use source::{ArchiveSession, ArchiveSource};
 
-/// How long an archive or NZB session outlives its last use before it is
+/// How long an archive session outlives its last use before it is
 /// swept, with what it owns (see [`sessions`]).
 ///
 /// A use is a request, or a response body still being read. The clock
@@ -30,8 +29,7 @@ pub use source::{ArchiveSession, ArchiveSource};
 /// stays paused and short against what a session costs while it waits --
 /// scratch files under the cache root that **only this sweep** unlinks
 /// (see [`SCRATCH_DIR_NAME`]: nothing else in the process speaks for
-/// them), and for NZB a pool of idle connections the news server is
-/// likelier to close first.
+/// them).
 pub const SESSION_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// Error message used when a RAR archive is requested but this binary was
@@ -115,7 +113,7 @@ impl CacheConfig {
 
 /// The suffixes the readers are chosen by, longest first so `.tar.gz` is
 /// found before `.gz` would not be.
-const ARCHIVE_SUFFIXES: [&str; 7] = [".tar.gz", ".tgz", ".zip", ".rar", ".7z", ".tar", ".nzb"];
+const ARCHIVE_SUFFIXES: [&str; 6] = [".tar.gz", ".tgz", ".zip", ".rar", ".7z", ".tar"];
 
 /// The recognised archive suffix `name` ends with (case-insensitively), as
 /// written in [`ARCHIVE_SUFFIXES`], or `None` when it has none. `name` may
@@ -134,7 +132,7 @@ pub fn archive_suffix(name: &str) -> Option<&'static str> {
 ///
 /// A download is named by the URL it came from, and a URL that ends in an
 /// id rather than a filename says nothing about the format -- while the
-/// bytes always do. NZB is XML and has no signature to find here.
+/// bytes always do.
 pub fn archive_suffix_from_magic(head: &[u8]) -> Option<&'static str> {
     if head.starts_with(b"Rar!\x1a\x07") {
         Some(".rar")
@@ -265,10 +263,6 @@ pub async fn get_archive_reader_with_config(
                 cache_config,
             ))) // TODO: Async Tgz
         }
-        Some(".nzb") => {
-            tracing::info!("Archive detected: NZB at {:?}", path);
-            Ok(Box::new(nzb::NzbHandler::new(path.to_path_buf())))
-        }
         Some(_) | None => {
             tracing::info!("Normal file detected (not an archive): {:?}", path);
             Err(anyhow::anyhow!(
@@ -313,7 +307,6 @@ mod tests {
         assert_eq!(archive_suffix("/tmp/archive_x9.7z"), Some(".7z"));
         assert_eq!(archive_suffix("/dl/show.tar.gz"), Some(".tar.gz"));
         assert_eq!(archive_suffix("show.tgz"), Some(".tgz"));
-        assert_eq!(archive_suffix("index.nzb"), Some(".nzb"));
         assert_eq!(archive_suffix("/download?id=1"), None);
         assert_eq!(archive_suffix("movie.mkv"), None);
         assert_eq!(archive_suffix("archive.zip.txt"), None);

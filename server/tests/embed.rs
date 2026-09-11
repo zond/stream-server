@@ -4467,12 +4467,11 @@ fn stats_json_reports_the_piece_the_open_reader_waits_for() -> anyhow::Result<()
 ///
 /// It must also NOT expose anything a stranger on the network could make
 /// this device *do*: `/proxy` and `/ftp` fetch an arbitrary caller-supplied
-/// remote URL; the archive and NZB `/create` routes download an archive from
-/// a caller-named URL or open TCP connections to caller-named news servers;
-/// and the loopback stream route's first request for a hash starts a torrent
+/// remote URL; the archive `/create` routes download an archive from a
+/// caller-named URL; and the loopback stream route's first request for a hash starts a torrent
 /// with the caller's trackers. All of that is loopback only. The LAN gets the
 /// byte-serving halves alone -- a torrent that exists, a member of an
-/// archive or NZB session loopback already created -- and an unknown torrent
+/// archive session loopback already created -- and an unknown torrent
 /// there is a `404` that starts nothing. The `/local-addon` stub is not on
 /// the LAN either: no receiver calls it.
 #[test]
@@ -4610,15 +4609,14 @@ fn lan_media_listener_serves_media_but_no_control_route() -> anyhow::Result<()> 
         );
     }
 
-    // The archive and NZB session-create routes fetch a caller-named URL
-    // (an archive to download whole, an NZB plus the news servers to open
-    // connections to), so they are loopback only: a real route there (a
+    // The archive session-create routes fetch a caller-named URL (an
+    // archive to download whole), so they are loopback only: a real route there (a
     // `400` for the missing payload) and absent from the LAN. `GET` on the
     // LAN is the two-segment collision answered by the LAN stream handler
     // looking `"rar"` up as an info hash and finding nothing; the keyed
     // form has three segments and reaches the fallback; `POST` is a method
     // the stream route does not take.
-    for prefix in ["/rar", "/zip", "/7zip", "/tar", "/tgz", "/nzb"] {
+    for prefix in ["/rar", "/zip", "/7zip", "/tar", "/tgz"] {
         let create = format!("{prefix}/create");
         assert_eq!(
             anonymous.get(format!("{base}{create}")).send()?.status(),

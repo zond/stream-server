@@ -1,12 +1,12 @@
 //! Keyed sessions that go away when nobody has used them for a while.
 //!
-//! An archive or NZB session is created by one request (`/create`) and read
+//! An archive session is created by one request (`/create`) and read
 //! by others (`/stream/{key}/...`), so it has to outlive the request that
 //! made it and nothing tells the server when the player is done with it.
-//! Until this module the answer was "never": both session maps were plain
-//! `DashMap`s with an `insert` and a `get` and no `remove` anywhere, so every
+//! Until this module the answer was "never": the session map was a plain
+//! `DashMap` with an `insert` and a `get` and no `remove` anywhere, so every
 //! play left behind whatever the session owned -- a downloaded archive on
-//! disk, a pool of open NNTP connections -- for the life of the process.
+//! disk -- for the life of the process.
 //!
 //! [`Sessions`] gives a session a lifetime measured from its last use. A use
 //! is a lookup: [`Sessions::get`] hands out a [`Lease`], and a session with a
@@ -15,8 +15,7 @@
 //! reading for two hours holds the session for two hours -- and the idle
 //! clock starts when the last lease is dropped. Sessions idle for longer
 //! than the timeout are removed by a sweep, which drops what they owned:
-//! dropping an NZB session closes its connections, dropping an archive
-//! session deletes its files.
+//! dropping an archive session deletes its files.
 //!
 //! The sweep runs on every insert, and from a janitor task the registry
 //! starts for itself on the first insert made inside a tokio runtime. The

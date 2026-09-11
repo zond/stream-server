@@ -1729,18 +1729,6 @@ fn archive_stream_routes() -> Router<AppState> {
     archive_prefixes(routes::archive::stream_router)
 }
 
-/// The whole NZB API: a session created from an NZB and the news servers the
-/// caller names (`routes::nzb::session_router`) and the files read out of it
-/// (`routes::nzb::stream_router`).
-fn nzb_routes() -> Router<AppState> {
-    Router::new().nest("/nzb", routes::nzb::router())
-}
-
-/// The byte-serving half of [`nzb_routes`] alone.
-fn nzb_stream_routes() -> Router<AppState> {
-    Router::new().nest("/nzb", routes::nzb::stream_router())
-}
-
 /// The `/local-addon` stub (see `routes::local_addon`): not media bytes, but
 /// harmless and open for the same reason it lives in [`media_router`] at all
 /// -- default profiles, legacy clients included, call it as an addon, and it
@@ -1761,15 +1749,14 @@ fn local_addon_routes() -> Router<AppState> {
 /// HTTP(S), `/ftp` via a spawned `curl`, for FTP/FTPS URLs only) and
 /// stream back whatever answers. That makes each an open proxy, which is
 /// fine on the loopback listener -- only this host's own stremio-core can
-/// reach it -- but not on the LAN one. The archive and NZB `/create` routes
-/// and the torrent-creating first request of [`stream_routes`] are the same
+/// reach it -- but not on the LAN one. The archive `/create` routes and the
+/// torrent-creating first request of [`stream_routes`] are the same
 /// kind of thing in a smaller way. See [`lan_media_routes`], which is the
 /// allow-list that keeps all of them off the LAN.
 fn media_router() -> Router<AppState> {
     Router::new()
         .merge(stream_routes())
         .merge(archive_routes())
-        .merge(nzb_routes())
         .merge(routes::proxy::router())
         .nest("/ftp", routes::ftp::router())
         .merge(local_addon_routes())
@@ -1783,14 +1770,13 @@ fn media_router() -> Router<AppState> {
 /// side has already arranged and cannot be made to arrange anything: the
 /// receiver is an unauthenticated stranger on the network, so whatever it
 /// can reach, anyone on the network can. That rules out every route that
-/// fetches a caller-named URL (`/proxy`, `/ftp`, the archive and NZB
-/// `/create`s, which download an archive or open TCP connections to news
-/// servers the caller names), every route that starts a torrent (the
+/// fetches a caller-named URL (`/proxy`, `/ftp`, the archive `/create`s,
+/// which download an archive), every route that starts a torrent (the
 /// loopback [`stream_routes`], whose first request for a hash creates it
 /// with the caller's trackers -- the LAN gets [`lan_stream_routes`], which
 /// only look one up), and the `/local-addon` stub, which no receiver calls.
 /// What is left is byte-serving over sessions and torrents that exist:
-/// [`lan_stream_routes`], [`archive_stream_routes`], [`nzb_stream_routes`].
+/// [`lan_stream_routes`] and [`archive_stream_routes`].
 ///
 /// Deliberately spelled as *what is safe*, not as [`media_router`] minus the
 /// hazardous routes: a plain `media_router() - proxy - ftp` reads correctly
@@ -1805,7 +1791,6 @@ fn lan_media_routes() -> Router<AppState> {
     Router::new()
         .merge(lan_stream_routes())
         .merge(archive_stream_routes())
-        .merge(nzb_stream_routes())
 }
 
 /// Everything that is not media bytes: what stremio-core's StreamingServer

@@ -25,9 +25,6 @@ pub struct AppState {
     /// Archive sessions, swept when idle (see `crate::archives::sessions`);
     /// a swept session's downloaded archive goes with it.
     pub archive_cache: crate::archives::sessions::Sessions<crate::archives::ArchiveSession>,
-    /// NZB sessions, swept when idle (see `crate::archives::sessions`).
-    pub nzb_sessions:
-        crate::archives::sessions::Sessions<crate::archives::nzb::session::NzbSession>,
     pub devices: Arc<RwLock<Vec<crate::ssdp::Device>>>,
     /// The proxied streams players are reading right now, so a client can
     /// end its own player's (see `crate::proxy_streams`).
@@ -107,9 +104,6 @@ impl AppState {
             http_addr: SocketAddr::from(([127, 0, 0, 1], 11470)),
             auth_token: None,
             archive_cache: crate::archives::sessions::Sessions::new(
-                crate::archives::SESSION_IDLE_TIMEOUT,
-            ),
-            nzb_sessions: crate::archives::sessions::Sessions::new(
                 crate::archives::SESSION_IDLE_TIMEOUT,
             ),
             devices: Arc::new(RwLock::new(Vec::new())),

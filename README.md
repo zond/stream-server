@@ -48,7 +48,7 @@ This is not a drop-in replacement for `server.js` — the API surface it exposes
 - **📡 HTTP Range Requests**: torrent pieces are streamed straight to HTTP range requests for instant seeking — direct play, no transcoding step in between
 
 ### Media & Archives
-- **📦 Archive Streaming**: direct playback from ZIP, 7Z, TAR, NZB, and RAR archives out of the box (all pure Rust). RAR is **on by default** via `unrar-rs`, which is GPL-3.0-or-later, so the default binary is GPL-3.0-or-later — see [License](#-license); build `--no-default-features` for an MIT binary without RAR
+- **📦 Archive Streaming**: direct playback from ZIP, 7Z, TAR, and RAR archives out of the box (all pure Rust). RAR is **on by default** via `unrar-rs`, which is GPL-3.0-or-later, so the default binary is GPL-3.0-or-later — see [License](#-license); build `--no-default-features` for an MIT binary without RAR
 - Subtitles are the client's job: there is no subtitle conversion, track discovery or OpenSubtitles hashing in the server (see [Removed routes](#removed-routes))
 
 ### Control API
@@ -90,7 +90,7 @@ cargo build --release --no-default-features
 | *(default)* | `rar` (pure-Rust RAR via `unrar-rs`) on top of the always-on `librqbit` backend | None |
 | `rar` | RAR archive streaming via pure-Rust `unrar-rs` (**on by default**) | None |
 
-RAR streaming is **on by default** and pure Rust — no libclang or C++ toolchain. ZIP, 7Z, TAR, and NZB streaming are always built in too, and are not gated by any feature. Because `unrar-rs` is GPL-3.0-or-later, the default binary is GPL-3.0-or-later; drop the `rar` feature (`--no-default-features`) for an MIT binary, where RAR requests then return a 501 JSON error.
+RAR streaming is **on by default** and pure Rust — no libclang or C++ toolchain. ZIP, 7Z, and TAR streaming are always built in too, and are not gated by any feature. Because `unrar-rs` is GPL-3.0-or-later, the default binary is GPL-3.0-or-later; drop the `rar` feature (`--no-default-features`) for an MIT binary, where RAR requests then return a 501 JSON error.
 
 ---
 
@@ -242,8 +242,6 @@ The HTTP surface is deliberately small and split in two by `build_router()` (`se
 | GET, HEAD | `/stream/{infoHash}/{fileIdx}` | OPEN | players (alias of the above) |
 | GET, POST | `/{rar\|zip\|7zip\|tar\|tgz}/create`, `/{…}/create/{key}` | OPEN | players — archive session creation via `?lz=` (stremio-core builds these URLs) |
 | GET | `/{rar\|zip\|7zip\|tar\|tgz}/stream`, `/{…}/stream/{key}`, `/{…}/stream/{key}/{*file}` | OPEN | players — archive member bytes |
-| GET, POST | `/nzb/create`, `/nzb/create/{key}` | OPEN | players |
-| GET | `/nzb/stream`, `/nzb/stream/{key}/{*file}` | OPEN | players |
 | GET | `/ftp/{filename}?lz=…` | OPEN | players (FTP/FTPS passthrough via `curl`; any other scheme is `400`) |
 | any | `/proxy/{*rest}`, `/proxy`, `/proxy/` | OPEN | players — a remote stream fetched on their behalf, with the headers the addon asked for, and cached in whole chunks so a seek back into it is answered from disk. See [Proxied remote streams](#proxied-remote-streams) |
 | GET | `/local-addon/manifest.json` | OPEN | stremio-core default profile — **stub**: a valid manifest (`org.stremio.local`, "Local Files") declaring no types, resources or catalogs |
@@ -294,7 +292,7 @@ The hot window is librqbit's per-stream lookahead (`FileStreamOptions::lookahead
 
 **Validation is lenient by design.** The value is matched case-insensitively with surrounding whitespace ignored. Anything else — a profile a future build added, a typo, an empty value — is *not* an error: on `?buffer=` it falls back to `settings.bufferProfile`, and on `POST /settings` it leaves the setting as it was, like every other unrecognised value in that payload. A player must never lose a playback because it guessed a name wrong. The wire is additive throughout: a client that sends neither gets exactly today's behaviour.
 
-Archive members (RAR/ZIP/7Z/TAR/NZB) and offline downloads are not affected — neither is a playback the viewer gets to make this choice about, and both already read whole and sequentially.
+Archive members (RAR/ZIP/7Z/TAR) and offline downloads are not affected — neither is a playback the viewer gets to make this choice about, and both already read whole and sequentially.
 
 ### Library API
 
@@ -495,7 +493,7 @@ So there is a **second listener** instead, and it serves media routes only.
 
 | | |
 |---|---|
-| **What it exposes** | An explicit allow-list (`lan_media_routes()` in [`server/src/lib.rs`](server/src/lib.rs)), not `media_router()` itself: exactly what a cast receiver needs, which is the bytes of something this device already has. `/{infoHash}/{fileIdx}` and `/stream/…` over torrents that exist — an unknown hash is a `404` and `tr=` is ignored, where on loopback the same request would create the torrent with the caller's trackers — and the archive/NZB `/{fmt}/stream/…` routes over sessions loopback already created. `/proxy`, `/ftp`, every `/create` and the `/local-addon` stub are deliberately absent — see below |
+| **What it exposes** | An explicit allow-list (`lan_media_routes()` in [`server/src/lib.rs`](server/src/lib.rs)), not `media_router()` itself: exactly what a cast receiver needs, which is the bytes of something this device already has. `/{infoHash}/{fileIdx}` and `/stream/…` over torrents that exist — an unknown hash is a `404` and `tr=` is ignored, where on loopback the same request would create the torrent with the caller's trackers — and the archive `/{fmt}/stream/…` routes over sessions loopback already created. `/proxy`, `/ftp`, every `/create` and the `/local-addon` stub are deliberately absent — see below |
 | **What it does not** | The control router is **not mounted on it at all**, not even behind the bearer middleware. A control path there is an unknown path: `404`, never the `401` that would confirm the route exists and only a token is missing. There is no token on that listener to guess, leak or brute-force. `/proxy` and `/ftp` are likewise unmounted and answer `404` |
 | **Where it binds** | `ServerConfig::lan_media_addr: Option<SocketAddr>` — `None` by default for **both** `embedded()` and `binary_default()`, so nothing changes unless an embedder asks for it. `Some(0.0.0.0:0)` lets the OS pick the port |
 | **When it runs** | `ServerHandle::set_lan_media(true)` starts it, `set_lan_media(false)` stops it — meant to bracket a cast session, so the LAN surface exists only while something is casting. Nothing is bound at startup, whatever the configuration: a port already in use fails the cast that asked for the listener, never the server |
@@ -579,9 +577,8 @@ already arranged and cannot be made to arrange anything. `/proxy` and `/ftp`
 fail it outright: both fetch an arbitrary caller-supplied remote URL rather
 than media bytes from this server — `/proxy` over HTTP(S), `/ftp` through a
 spawned `curl` for FTP/FTPS only — which makes either an open proxy
-for whoever can reach it. So do the archive and NZB `/create` routes, which
-download an archive from a caller-named URL or open TCP connections to
-caller-named news servers, and the loopback stream route's first request for
+for whoever can reach it. So do the archive `/create` routes, which
+download an archive from a caller-named URL, and the loopback stream route's first request for
 an info hash, which starts a torrent with the caller's trackers on this
 device's disk and connection; the LAN's stream route only looks a hash up.
 That is fine on the loopback listener, where only this host's own
@@ -616,6 +613,8 @@ Everything below existed for server.js compatibility and had no consumer in stre
 - `/{ipc_key}/downloader/*` — stubs for an HTTP downloader that was never implemented.
 - `/local-addon/*` — the local-files Stremio addon (scanned `localFiles/` directory, catalogs, `bt:`/`local:` metas). **A stub remains** (see the table above), because stremio-core's `OFFICIAL_ADDONS` carries a *protected* descriptor for `http://127.0.0.1:11470/local-addon/manifest.json` with a `stream` resource for `tt` movies/series: a stock profile requests `/local-addon/stream/{type}/{id}.json` on every details page, and a `404` there shows up as an error group in the client and an ERROR-level unhandled-request log line each time. A profile synced from a Stremio account carries an older descriptor for the same addon that *also* declares an `other`/`local` catalog, so core requests `/local-addon/catalog/other/local.json` (and `/local-addon/catalog/other/local/{extra}.json` once the board pages or a filter is applied — the two shapes `AddonHTTPTransport::resource` builds); a `404` there broke the catalog row and logged an ERROR on every refresh. The stub answers an empty manifest, `{"streams": []}` and `{"metas": []}` instead and serves no local files; `meta` (only ever asked for `local:`/`bt:` ids) is a quiet `404`, and so is every other path under the prefix — the stub has its own fallback so a 404 it *intends* is logged at debug, not through the ERROR-level unhandled-request path. The served manifest still declares no catalogs, so a profile that does not already carry one gains no empty row.
 - `/casting/transcode`, `/casting/convert`, `GET /casting/{devID}` and the `501` stubs for `/ftp/create*` and `/ftp/stream*`.
+
+**Usenet (NZB)**: `/nzb/create*` and `/nzb/stream*` are gone, with the NNTP client and yEnc decoder behind them. stremio-core still builds `/nzb/create` for an addon's `nzbUrl` streams, and this server now answers those as it answers any path it does not serve. The feature never worked end to end: article bodies were read as UTF-8 text, so binary data did not survive, and the connection pool was never refilled. Its routes were also open, fetching a caller-named URL and opening connections to caller-named news servers.
 
 **YouTube**: stremio-core builds `/yt/{id}` URLs for `StreamSource::YouTube` when a streaming server is configured; this server has no `/yt` route (that needed yt-dlp/ffmpeg upstream). YouTube-via-server is unsupported — the client opens YouTube streams itself (`404` from the server signals it).
 
@@ -691,7 +690,7 @@ cargo build --release
 stream-server/
 ├── server/           # HTTP server (media + token-protected control routers), embeddable library
 │   ├── src/auth.rs   # ServerAuth + the bearer middleware
-│   └── src/archives/ # ZIP/7Z/TAR/NZB (always on) + RAR (default-on "rar" feature), all pure Rust
+│   └── src/archives/ # ZIP/7Z/TAR (always on) + RAR (default-on "rar" feature), all pure Rust
 ├── enginefs/         # Torrent engine abstraction
 │   └── src/backend/
 │       └── librqbit.rs   # The sole torrent backend (pure Rust)
