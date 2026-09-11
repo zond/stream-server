@@ -142,7 +142,9 @@ async fn resolve_source(
         return Ok(existing.source.clone());
     }
     if url.starts_with("http://") || url.starts_with("https://") {
-        download_archive(url, cache_config).await.map(Arc::new)
+        download_archive(url, cache_config, crate::cache_budget::available_space)
+            .await
+            .map(Arc::new)
     } else {
         let path = PathBuf::from(url);
         if !path.exists() {
@@ -162,6 +164,84 @@ async fn resolve_source(
 /// every signature `archives::archive_suffix_from_magic` looks for.
 const SNIFF_BYTES: usize = 512;
 
+/// How long a download may take to connect, and how long it may then go
+/// without a byte, before it is given up. There is no bound on the whole:
+/// an archive is gigabytes over whatever link the origin has.
+const DOWNLOAD_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const DOWNLOAD_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How much a download writes before it reads the volume again. Everything
+/// else on the device writes to the same volume in the meantime -- torrents
+/// above all -- so one reading at the start is not enough for gigabytes.
+const DOWNLOAD_RECHECK_BYTES: u64 = 64 * 1024 * 1024;
+
+/// What a download may still write under the cache root: the volume's free
+/// space above the floor, read on the blocking pool and again every
+/// [`DOWNLOAD_RECHECK_BYTES`].
+///
+/// A download goes under the cache root, on the volume the torrent cache
+/// and the proxy cache are capped against, and it was written whole with
+/// nothing asking the volume anything: a large enough archive went through
+/// the floor the rest of the server keeps, to ENOSPC. An unreadable volume
+/// is not a full one, as everywhere else.
+struct DownloadRoom<P> {
+    probe: P,
+    dir: PathBuf,
+    /// Bytes above the floor at the last reading; `None` when it failed.
+    room: Option<u64>,
+    written_since: u64,
+}
+
+impl<P> DownloadRoom<P>
+where
+    P: Fn(&std::path::Path) -> Option<u64> + Clone + Send + 'static,
+{
+    async fn read(probe: P, dir: PathBuf) -> Self {
+        let mut room = Self {
+            probe,
+            dir,
+            room: None,
+            written_since: 0,
+        };
+        room.reread().await;
+        room
+    }
+
+    async fn reread(&mut self) {
+        let probe = self.probe.clone();
+        let dir = self.dir.clone();
+        self.room = tokio::task::spawn_blocking(move || probe(&dir))
+            .await
+            .ok()
+            .flatten()
+            .map(|available| available.saturating_sub(crate::cache_budget::CACHE_FREE_SPACE_FLOOR));
+        self.written_since = 0;
+    }
+
+    /// Whether `len` bytes would fit above the floor as of the last reading,
+    /// booking nothing: for a length an origin states up front, which is
+    /// refused before a byte of it is fetched.
+    fn fits(&self, len: u64) -> bool {
+        self.room
+            .is_none_or(|room| self.written_since.saturating_add(len) <= room)
+    }
+
+    /// Whether `len` more bytes fit above the floor, booking them if so.
+    async fn take(&mut self, len: u64) -> bool {
+        if self.written_since >= DOWNLOAD_RECHECK_BYTES {
+            self.reread().await;
+        }
+        match self.room {
+            None => true,
+            Some(room) if self.written_since.saturating_add(len) > room => false,
+            Some(_) => {
+                self.written_since += len;
+                true
+            }
+        }
+    }
+}
+
 /// Fetch `url` whole into a scratch file under the cache root and hand it
 /// back owned, so it is deleted with the last session holding it.
 ///
@@ -172,15 +252,26 @@ const SNIFF_BYTES: usize = 512;
 /// first bytes of the body say what it is, and a body that is neither is
 /// `415` before it is stored. Nothing is kept on any error: the scratch
 /// file is a `NamedTempFile` until the source takes it.
-async fn download_archive(
+async fn download_archive<P>(
     url: &str,
     cache_config: CacheConfig,
-) -> Result<ArchiveSource, StatusCode> {
+    probe: P,
+) -> Result<ArchiveSource, StatusCode>
+where
+    P: Fn(&std::path::Path) -> Option<u64> + Clone + Send + 'static,
+{
     tracing::info!("Downloading archive from URL: {}", url);
-    let client = enginefs::http_client_builder().build().map_err(|e| {
-        tracing::error!("Failed to build HTTP client: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    // Without these a download that stalled -- an origin that stopped
+    // sending, a link that dropped without a reset -- held its `/create`
+    // open for as long as the socket lived.
+    let client = enginefs::http_client_builder()
+        .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
+        .read_timeout(DOWNLOAD_READ_TIMEOUT)
+        .build()
+        .map_err(|e| {
+            tracing::error!("Failed to build HTTP client: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     let response = client.get(url).send().await.map_err(|e| {
         tracing::error!("Failed to fetch URL {}: {}", url, e);
         StatusCode::BAD_REQUEST
@@ -189,6 +280,23 @@ async fn download_archive(
     if !response.status().is_success() {
         tracing::error!("URL {} returned status {}", url, response.status());
         return Err(StatusCode::NOT_FOUND);
+    }
+
+    // The volume the cache root is on, read before a byte is stored; a
+    // length the origin states that will not fit is refused before one is
+    // even fetched.
+    let mut room = DownloadRoom::read(probe, cache_config.cache_dir.clone()).await;
+    let too_big = || {
+        tracing::warn!(
+            url,
+            "the archive would take the cache volume under its free-space floor"
+        );
+        StatusCode::INSUFFICIENT_STORAGE
+    };
+    if let Some(length) = response.content_length()
+        && !room.fits(length)
+    {
+        return Err(too_big());
     }
 
     let mut content = response.bytes_stream();
@@ -227,12 +335,21 @@ async fn download_archive(
         tracing::error!("Failed to write archive scratch file: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     };
-    async_file.write_all(&head).await.map_err(write_error)?;
-    while let Some(chunk) = content.next().await {
-        let chunk = chunk.map_err(|e| {
-            tracing::error!("Download stream error: {}", e);
-            StatusCode::BAD_GATEWAY
-        })?;
+    let mut pending = Some(bytes::Bytes::from(head));
+    loop {
+        let chunk = match pending.take() {
+            Some(head) => head,
+            None => match content.next().await {
+                Some(chunk) => chunk.map_err(|e| {
+                    tracing::error!("Download stream error: {}", e);
+                    StatusCode::BAD_GATEWAY
+                })?,
+                None => break,
+            },
+        };
+        if !room.take(chunk.len() as u64).await {
+            return Err(too_big());
+        }
         async_file.write_all(&chunk).await.map_err(write_error)?;
     }
     async_file.flush().await.map_err(write_error)?;
@@ -872,6 +989,106 @@ mod tests {
         let mut body = media_body(std::io::Cursor::new(data));
         let first = body.next().await.expect("a chunk").expect("no error");
         assert_eq!(first.len(), MEDIA_BODY_CHUNK_BYTES);
+    }
+
+    /// How an [`origin`] answers.
+    #[derive(Clone, Copy)]
+    enum Answer {
+        /// The whole body, with its length stated.
+        Stated,
+        /// The whole body, delimited by the close alone.
+        Unstated,
+        /// A stated length, and then nothing: the body never comes.
+        StatedThenStall,
+    }
+
+    /// An origin that answers every request with `body_len` bytes -- a
+    /// zip's signature and then filler -- as `answer` says.
+    fn origin(body_len: usize, answer: Answer) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                std::thread::spawn(move || {
+                    let mut request = [0u8; 4096];
+                    let _ = stream.read(&mut request);
+                    let length = match answer {
+                        Answer::Unstated => String::new(),
+                        _ => format!("Content-Length: {body_len}\r\n"),
+                    };
+                    let head = format!("HTTP/1.1 200 OK\r\n{length}Connection: close\r\n\r\n");
+                    let _ = stream.write_all(head.as_bytes());
+                    if let Answer::StatedThenStall = answer {
+                        std::thread::sleep(std::time::Duration::from_secs(120));
+                        return;
+                    }
+                    let mut body = b"PK\x03\x04".to_vec();
+                    body.resize(body_len, 0);
+                    let _ = stream.write_all(&body);
+                });
+            }
+        });
+        format!("http://{addr}/archive.zip")
+    }
+
+    fn scratch(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(root.join(archives::SCRATCH_DIR_NAME))
+            .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Room above the free-space floor for `bytes`, whatever the volume.
+    fn room_for(bytes: u64) -> impl Fn(&std::path::Path) -> Option<u64> + Clone + Send + 'static {
+        move |_: &std::path::Path| Some(crate::cache_budget::CACHE_FREE_SPACE_FLOOR + bytes)
+    }
+
+    fn config(root: &std::path::Path) -> CacheConfig {
+        CacheConfig {
+            cache_dir: root.to_path_buf(),
+            _cache_size: 0,
+        }
+    }
+
+    /// A download whose stated length the volume has no room for above the
+    /// floor is refused with 507 before its body is read -- this origin
+    /// never sends one.
+    #[tokio::test]
+    async fn a_stated_length_with_no_room_is_refused_before_the_body() {
+        let root = tempfile::tempdir().unwrap();
+        let url = origin(1024 * 1024, Answer::StatedThenStall);
+        let refused = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            download_archive(&url, config(root.path()), room_for(512 * 1024)),
+        )
+        .await
+        .expect("the refusal waited for a body");
+        assert_eq!(refused.err(), Some(StatusCode::INSUFFICIENT_STORAGE));
+        assert!(scratch(root.path()).is_empty());
+    }
+
+    /// A body that says nothing of its length is refused at the byte that
+    /// would take the volume under the floor, and what it had written goes
+    /// with the refusal; with room it is stored.
+    #[tokio::test]
+    async fn a_body_that_would_cross_the_floor_is_refused_and_leaves_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let url = origin(1024 * 1024, Answer::Unstated);
+        let refused = download_archive(&url, config(root.path()), room_for(512 * 1024)).await;
+        assert_eq!(refused.err(), Some(StatusCode::INSUFFICIENT_STORAGE));
+        assert!(
+            scratch(root.path()).is_empty(),
+            "{:?}",
+            scratch(root.path())
+        );
+
+        for answer in [Answer::Unstated, Answer::Stated] {
+            let url = origin(1024 * 1024, answer);
+            let stored =
+                download_archive(&url, config(root.path()), room_for(2 * 1024 * 1024)).await;
+            assert!(stored.is_ok());
+        }
     }
 
     #[test]
