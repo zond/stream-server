@@ -73,10 +73,11 @@
 //! The root is `.proxy` inside the engine's `download_dir`, beside
 //! `.pieces` -- inside the cache root on purpose, so every byte of it is
 //! counted in the one usage figure and capped by the one published budget.
-//! It is **not** named `.cache` or `.metadata`: those were the two
-//! components the old cache cleaner's walk exempted as session records, and
-//! a cache that exempts itself is unbounded disk nobody counts. Nothing
-//! here is pinned either -- a proxied stream nobody is reading is the first
+//! It is on the launch sweep's list of directories that reconcile
+//! themselves (`enginefs::piece_store::sweep`'s `NOT_OURS`): anything else
+//! under the download root is deleted at launch as a previous release's
+//! data, `.cache` and `.metadata` -- a pre-fork server's -- included. Nothing
+//! here is pinned -- a proxied stream nobody is reading is the first
 //! thing that should go.
 //!
 //! # What bounds it, and where the playhead comes from
@@ -151,8 +152,8 @@ use url::Url;
 
 /// The store's directory inside a torrent cache root, beside the piece
 /// store's `.pieces`. Dot-prefixed so a target host called `proxy` could
-/// never land on top of it, and deliberately neither `.cache` nor
-/// `.metadata` -- see the module docs.
+/// never land on top of it, and on the launch sweep's list of directories
+/// that are not a previous release's -- see the module docs.
 pub const PROXY_CACHE_DIR: &str = ".proxy";
 
 /// How many bytes one chunk file holds, except the last of an entity.

@@ -170,8 +170,17 @@ pub async fn sweep_before_session(download_dir: &Path, pins: Option<&PinSet>) ->
 /// launch sweep. `.archives` is the archive scratch's, emptied by the server's
 /// own launch sweep of it. Handing any of them to [`sweep_legacy_downloads`] would be
 /// one sweep deciding another's business, and for `.pieces` it would delete
-/// every pin.
-const NOT_OURS: [&str; 5] = [".pieces", ".proxy", ".archives", ".metadata", ".cache"];
+/// every pin. **A new directory under the download root goes on this list,
+/// or the next launch deletes it.**
+///
+/// `.cache` and `.metadata` were on it too, and are a previous release's
+/// data now like anything else here. `.cache` held a pre-fork server's
+/// `<hash>.torrent` files, which this server re-added at boot until dda7f96
+/// removed that restore; `.metadata` was read by nothing even then. Neither
+/// this crate, the server nor librqbit writes or reads either, and
+/// librqbit's own session files sit directly under the root, where
+/// [`is_session_artifact`] names them.
+const NOT_OURS: [&str; 3] = [".pieces", ".proxy", ".archives"];
 
 /// Whether `name`, directly under the download root, is something the
 /// session writes and reads.
@@ -354,6 +363,17 @@ mod tests {
         std::fs::write(legacy.join("film.mkv"), vec![7u8; 4096]).unwrap();
         // And one it left directly under the root.
         std::fs::write(root.join("loose.mkv"), vec![7u8; 2048]).unwrap();
+        // And a pre-fork server's torrent cache, and the `.metadata` beside
+        // it: read by nothing in this process, so as much a previous
+        // release's as the film.
+        std::fs::create_dir_all(root.join(".cache")).unwrap();
+        std::fs::write(
+            root.join(".cache").join(format!("{ADOPTED}.torrent")),
+            b"d4:infod",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".metadata")).unwrap();
+        std::fs::write(root.join(".metadata").join("entry"), [1u8; 512]).unwrap();
 
         // Everything the session reads at startup.
         std::fs::write(root.join("session.json"), b"{}").unwrap();
@@ -369,12 +389,18 @@ mod tests {
         }
 
         let report = sweep_legacy_downloads(root);
-        assert_eq!(report.removed, 2, "the film's directory and the loose file");
+        assert_eq!(
+            report.removed, 4,
+            "the film's directory, the loose file, .cache and .metadata"
+        );
         assert_eq!(report.errors, 0);
         assert!(report.freed_bytes >= 4096 + 2048, "{report:?}");
 
         assert!(!legacy.exists(), "the previous release's download is gone");
         assert!(!root.join("loose.mkv").exists());
+        for name in [".cache", ".metadata"] {
+            assert!(!root.join(name).exists(), "{name} is a previous release's");
+        }
         for name in [
             "session.json",
             "pinned-downloads.json",
