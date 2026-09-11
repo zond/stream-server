@@ -1176,10 +1176,11 @@ pub async fn run(
     }
 
     let seeding_enabled = settings_arc.read().await.seeding_enabled;
-    // Outside the settings lock: applying the setting awaits a reconcile of
-    // every restored torrent, which reaches librqbit's persistence file.
-    // Holding the settings write guard across that would park every route
-    // that reads a setting behind a disk write.
+    // The engine's flag starts on and the session opens uploading, so with
+    // sharing off in the settings nothing stops the uploads until this
+    // line. It stores the flag and applies the upload switch, and nothing
+    // else: no torrent is reconciled here. The settings guard is gone by
+    // then, taken only for the read above.
     state.engine.set_seeding_enabled(seeding_enabled).await;
     // The root the session was actually opened on, persisted, so
     // `GET /settings`, the settings file and the next boot all name the
