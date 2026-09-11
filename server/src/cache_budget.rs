@@ -44,13 +44,20 @@
 //! process that has held a piece for a millisecond can say so.
 //!
 //! What it does not count is what nothing in this process wrote -- a
-//! torrent held in Error, a directory a previous run left, the strays.
-//! Reading those costs a `read_dir`, so they are read on demand for
-//! `GET /cache.json` (`enginefs::EngineFS::cache_holdings`) and not on the
-//! minute timer. The cap is therefore stated over what the session holds,
-//! which understates the volume by whatever is unadopted -- the safe
-//! direction, since a smaller `occupied` is a tighter cap, and the launch
-//! sweep is what makes it nothing.
+//! torrent held in Error, a directory a previous run left, the strays, the
+//! proxy chunks of an earlier run. Reading the store's share of those costs
+//! a `read_dir`, so they are read on demand for `GET /cache.json`
+//! (`enginefs::EngineFS::cache_holdings`) and not on the minute timer; the
+//! proxy's share is not read at all until a fill rewrites it. The cap is
+//! therefore stated over what this session holds, which understates the
+//! volume by whatever an earlier one left -- the safe direction, since a
+//! smaller `occupied` is a tighter cap, and **the claim above is a claim
+//! about a cache this process filled**: on a warm cache the first minute is
+//! still the volume's headroom alone. What makes that nothing is the launch
+//! sweep, which does not yet empty the proxy cache -- it takes the staged
+//! temporaries and keeps every complete chunk -- so until it does, a
+//! television that restarts over four gigabytes of relayed film states the
+//! same cap it used to until the fills book those bytes again.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -413,7 +420,7 @@ mod tests {
             Arc::default(),
             Arc::default(),
         );
-        proxy.counted(2 * MIB);
+        proxy.counted(|| 2 * MIB);
 
         assert_eq!(
             cap_to_publish(

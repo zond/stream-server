@@ -148,7 +148,6 @@ use std::collections::BTreeSet;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
-#[cfg(test)]
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
@@ -240,8 +239,8 @@ struct ProxyBacking {
     /// What this cache holds, counted as it is written and as it goes:
     /// [`ProxyRetention::occupancy`]. The reclaim below is the only place
     /// the owner takes a chunk off the disk, so it is the only place the
-    /// count comes down.
-    occupancy: Arc<AtomicU64>,
+    /// count comes down through this backing.
+    occupancy: Arc<Occupancy>,
     /// The threads the blocking halves of a pass really ran on.
     ///
     /// A `#[tokio::test]` drives its runtime on the test's own thread, so
@@ -427,13 +426,18 @@ impl Backing for ProxyBacking {
                 // the fill added when the chunk landed, and a chunk that
                 // will not `stat` is one this run books as freeing nothing
                 // rather than as freeing a guess.
-                let bytes = std::fs::metadata(&path)
-                    .map(|metadata| enginefs::chunk_store::occupied_bytes(&metadata))
-                    .unwrap_or(0);
-                if std::fs::remove_file(&path).is_ok() {
-                    uncount(&backing.occupancy, bytes);
-                    freed += 1;
-                }
+                // Priced and taken under one booking, so the stat cannot
+                // read a chunk a fill is replacing at that moment and book
+                // the unlink of a file that is still there.
+                freed += backing.occupancy.lost(|| {
+                    let bytes = std::fs::metadata(&path)
+                        .map(|metadata| enginefs::chunk_store::occupied_bytes(&metadata))
+                        .unwrap_or(0);
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => (bytes, 1),
+                        Err(_) => (0, 0),
+                    }
+                });
             }
             freed
         })
@@ -455,18 +459,71 @@ impl ProxyBacking {
     }
 }
 
-/// Take `bytes` off a running count of what the cache holds, saturating at
-/// nothing.
+/// What the proxy cache holds, in bytes, and the lock that keeps each
+/// booking atomic with the change to the disk it prices.
 ///
-/// The floor is not defensive arithmetic, it is the honest answer to a
-/// count that cannot hear every deleter: while the cache cleaner still
-/// walks this root it unlinks chunks by path, and those bytes are never
-/// taken off here. A count that went negative would wrap to the whole of a
-/// `u64` and state a cap of everything.
-fn uncount(counter: &AtomicU64, bytes: u64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
-        Some(held.saturating_sub(bytes))
-    });
+/// **The lock is what makes the count the disk's.** Every booking is a
+/// reading of a chunk file either side of a change to it -- what was at
+/// that name before a fill renamed its copy in, what was there before an
+/// unlink -- and two writers of one chunk are ordinary here: a second
+/// reader of a stream overlaps the first past `proxy_cache::Filler::take`'s
+/// check, and each writes from its own blocking task. Both would read "no
+/// file" before either rename and both would book the whole chunk, so one
+/// 256 KiB file on the disk would stand as half a megabyte in the count --
+/// and a count that reads high publishes a *larger* cap
+/// (`crate::cache_budget`), which is the direction that grows the cache. So
+/// the pair of readings and the change between them are taken together.
+///
+/// It serialises the proxy cache's chunk writes against each other, which
+/// costs nothing worth keeping: they are 256 KiB blocking writes to one
+/// volume, and the disk was already the thing they queued on.
+#[derive(Debug, Default)]
+pub(crate) struct Occupancy {
+    held: AtomicU64,
+    booking: Mutex<()>,
+}
+
+impl Occupancy {
+    /// What the cache holds right now.
+    fn bytes(&self) -> u64 {
+        self.held.load(Ordering::Relaxed)
+    }
+
+    /// Do `change` -- something that writes or unlinks a chunk and answers
+    /// what the cache gained by it -- and book that, with no other booking
+    /// inside the readings it took.
+    fn gained<T>(&self, change: impl FnOnce() -> (u64, T)) -> T {
+        let _booking = self.booking.lock().unwrap_or_else(|held| held.into_inner());
+        let (bytes, answer) = change();
+        self.held.fetch_add(bytes, Ordering::Relaxed);
+        answer
+    }
+
+    /// Do `change` and take what it says left the disk off the count.
+    fn lost<T>(&self, change: impl FnOnce() -> (u64, T)) -> T {
+        let _booking = self.booking.lock().unwrap_or_else(|held| held.into_inner());
+        let (bytes, answer) = change();
+        self.take(bytes);
+        answer
+    }
+
+    /// Take `bytes` off the count, saturating at nothing.
+    ///
+    /// The floor is not defensive arithmetic, it is the honest answer to a
+    /// count that hears every deleter but did not hear every writer: chunks
+    /// a *previous* process left are on the disk and in nobody's count, so
+    /// the first thing that takes them -- a fill replacing the entity under
+    /// a key (`proxy_cache::remove_other_entities`), a pass
+    /// reclaiming outside the window, the cleaner's own unlink -- prices
+    /// bytes this process never booked. A count that went negative would
+    /// wrap to the whole of a `u64` and state a cap of everything.
+    fn take(&self, bytes: u64) {
+        let _ = self
+            .held
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                Some(held.saturating_sub(bytes))
+            });
+    }
 }
 
 /// A chunk index in the policy's `u32` index space. An index a `u32` cannot
@@ -517,7 +574,7 @@ pub struct ProxyRetention {
     work: Arc<crate::proxy_cache::DiskWork>,
     /// What this cache holds, in bytes, counted as chunks are written and
     /// as they go: see [`Self::occupancy`].
-    occupancy: Arc<AtomicU64>,
+    occupancy: Arc<Occupancy>,
     /// The one place a test can be *inside* a pass.
     ///
     /// A pass reads the playheads, lists the entity's directories and
@@ -577,7 +634,7 @@ impl ProxyRetention {
     ) -> Self {
         #[cfg(test)]
         let disk_threads: Arc<Mutex<Vec<std::thread::ThreadId>>> = Arc::default();
-        let occupancy: Arc<AtomicU64> = Arc::default();
+        let occupancy: Arc<Occupancy> = Arc::default();
         let owner = Retention::new(
             Arc::new(ProxyBacking {
                 live: live.clone(),
@@ -784,25 +841,39 @@ impl ProxyRetention {
     /// read, where the number it replaced was whatever an eviction pass had
     /// last counted -- 0 until the first walk of the root finished.
     ///
-    /// What it cannot hear, named rather than implied: the cache cleaner
-    /// still walks this root and unlinks chunks by path, and those bytes
-    /// stay in this count until the process restarts. It is the last
-    /// deleter that does not come through the owner, and it goes with the
-    /// walk. Chunks a *previous* process left are not in the count either,
-    /// because nothing here wrote them; the launch sweep is what makes 0
-    /// the truth at boot.
+    /// **Every deleter of a chunk is booked, including the two outside the
+    /// owner.** The cache cleaner still walks this root and unlinks chunks
+    /// by path, and what it takes comes off here
+    /// (`cache_cleaner::reclaim`); so does the entity a fill replaces under
+    /// a key, and so does the chunk `proxy_cache::Cached::body` refuses for
+    /// its length. A
+    /// deletion this count did not hear would leave the bytes booked for
+    /// the life of the process, and since the published cap is
+    /// `occupied + available - floor` that reads as a *larger* cap and
+    /// grows the cache with every pass.
+    ///
+    /// What it does not hear is a *writer* outside this process. Chunks a
+    /// previous run left are on the disk and not in this count, so until
+    /// the launch sweep empties the proxy cache at boot -- which it does
+    /// not yet: today's sweep takes the staged temporaries and keeps every
+    /// complete chunk -- a warm cache reads as nothing until this process
+    /// rewrites it. That understates the volume, which is the safe
+    /// direction for a cap, and it is what
+    /// `cache_cleaner::cache_usage` clamps the protected figure against.
     pub fn occupancy(&self) -> u64 {
-        self.occupancy.load(Ordering::Relaxed)
+        self.occupancy.bytes()
     }
 
-    /// Book `bytes` this cache has just written.
-    pub(crate) fn counted(&self, bytes: u64) {
-        self.occupancy.fetch_add(bytes, Ordering::Relaxed);
+    /// Do `write` -- a chunk on its way to the disk, answering what the
+    /// cache gained by it -- and book that: see [`Occupancy`] for why the
+    /// two are one operation.
+    pub(crate) fn counted(&self, write: impl FnOnce() -> u64) {
+        self.occupancy.gained(|| (write(), ()));
     }
 
     /// Take `bytes` this cache no longer holds off the count.
     pub(crate) fn uncounted(&self, bytes: u64) {
-        uncount(&self.occupancy, bytes);
+        self.occupancy.take(bytes);
     }
 
     /// What a live proxied entity keeps, in bytes, and how many entities
@@ -1078,6 +1149,128 @@ mod tests {
             !retention.still_free(&path),
             "but asked now, the promise refuses the unlink"
         );
+    }
+
+    /// **What nobody is playing and nobody is reading protects nothing,
+    /// though its windows are still in the map.**
+    ///
+    /// An entity does not disappear when the viewer opens something else:
+    /// its policy, its window and its last playhead stay where they are
+    /// until a slack pass has taken the chunks. A protection read off the
+    /// holdings alone would therefore report a finished stream as
+    /// unreclaimable for as long as its entity lived, and a client shown
+    /// `protected == total` over a cache above its limit is being told the
+    /// shortfall has no remedy when the remedy is the pass already running.
+    #[tokio::test]
+    async fn what_nobody_is_playing_and_nobody_is_reading_protects_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = ChunkDir::new(tmp.path().join("entity"));
+        write_chunks(&dir, 0..16);
+        let live = Arc::new(Live::default());
+        let retention = Arc::new(ProxyRetention::new(
+            Arc::new(RetentionBudget::default()),
+            Arc::default(),
+            live.clone(),
+        ));
+
+        let reader = retention.reader(&dir, TOTAL, TARGET.into());
+        reader.note(CHUNK_BYTES);
+        let playing = retention.protected().await;
+        assert_eq!(
+            (playing.bytes, playing.entities),
+            (16 * CHUNK_BYTES, 1),
+            "nothing bounds it and a player is inside it: {playing:?}"
+        );
+
+        // The body ended and the viewer opened a torrent, which is what
+        // makes this entity slack. Its chunks are all still there.
+        drop(reader);
+        live.open(
+            LiveEntity::Torrent {
+                info_hash: "0123456789abcdef0123456789abcdef01234567".into(),
+                file_idx: 0,
+            },
+            false,
+        );
+        assert_eq!(
+            dir.held().expect("the entity's chunks").len(),
+            16,
+            "every chunk is still on the disk, which is what makes this a \
+             test of the rule and not of the disk"
+        );
+        let slack = retention.protected().await;
+        assert_eq!(
+            (slack.bytes, slack.entities),
+            (0, 0),
+            "and every one of them is on its way off it: {slack:?}"
+        );
+    }
+
+    /// **A bounded entity protects the window its pass concluded, not
+    /// whatever is in its directory.**
+    ///
+    /// The two are the same number for most of a stream's life -- the pass
+    /// has just taken everything else -- so the figure has to be measured
+    /// where they differ: chunks that landed after the last pass are on the
+    /// disk, outside the window, and are the next pass's to take. Counting
+    /// them as protected would report a cache with a remedy as a cache
+    /// without one; counting the window itself rather than the chunks of it
+    /// that are really there would report protection the disk does not
+    /// hold.
+    #[tokio::test]
+    async fn a_bounded_entity_protects_its_window_and_not_what_landed_since() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = ChunkDir::new(tmp.path().join("entity"));
+        write_chunks(&dir, 0..16);
+
+        // Four chunks of budget over sixteen: the pass keeps a window round
+        // the playhead and takes the rest.
+        let retention = retention(Some(4 * CHUNK_BYTES));
+        let reader = retention.reader(&dir, TOTAL, TARGET.into());
+        reader.note(0);
+        settled(&retention, "the pass kept a window", |gate| {
+            gate.releases_file(&dir.chunk_path(15))
+        })
+        .await;
+
+        let kept = dir.held().expect("the entity's chunks").len() as u64;
+        assert!(
+            kept < 16,
+            "the pass took what its window did not cover: {kept} chunks left"
+        );
+        let window = retention.protected().await;
+        assert_eq!(
+            (window.bytes, window.entities),
+            (kept * CHUNK_BYTES, 1),
+            "what the pass kept, priced from the disk: {window:?}"
+        );
+
+        // What a fill wrote since that pass: on the disk, outside the
+        // window, and the next pass's to take.
+        write_chunks(&dir, 14..16);
+        let since = retention.protected().await;
+        assert_eq!(
+            (since.bytes, since.entities),
+            (kept * CHUNK_BYTES, 1),
+            "the window is what is protected, not the directory: {since:?}"
+        );
+
+        // Unless a body has been framed around them. A promise is not a
+        // second policy -- it decides nothing about what to keep -- but
+        // while it stands nothing may unlink what it has said it will
+        // serve, so a figure that called those bytes reclaimable would be
+        // offering a remedy that costs the player a broken read.
+        let seeking = retention.reader(&dir, TOTAL, TARGET.into());
+        seeking.promises(14..16);
+        let promised = retention.protected().await;
+        assert_eq!(
+            (promised.bytes, promised.entities),
+            ((kept + 2) * CHUNK_BYTES, 1),
+            "the window and what an open body is still to deliver: {promised:?}"
+        );
+
+        drop(seeking);
+        drop(reader);
     }
 
     /// A 4 MiB entity: sixteen chunks.

@@ -544,6 +544,26 @@ impl ServerHandle {
         self.block_on_server(async move { routes::cache::clean_cache_now(&state).await })?
     }
 
+    /// The cap the budget publisher last stated, as the owners of the cache
+    /// read it (`cache_budget::publish_now`), or `None` while nothing caps
+    /// it at all.
+    ///
+    /// **The one place the published cap is observable from outside.** It
+    /// is not [`Self::cache_usage`]'s `limit_bytes`: that is the same
+    /// arithmetic run again for the answer a client reads, while this is
+    /// the number the retention policies of both owners are sized from --
+    /// so a publisher that stopped reading what the cache holds would size
+    /// every window on a volume's free space alone and nothing a client
+    /// asked would say so. Here for the tests that pin it, and cheap: a
+    /// read of one cell.
+    pub fn published_cache_budget(&self) -> Option<u64> {
+        match self.state.engine.cache_budget().get() {
+            enginefs::retention::CacheBudget::Bytes(bytes) => Some(bytes),
+            enginefs::retention::CacheBudget::Unknown
+            | enginefs::retention::CacheBudget::Unbounded => None,
+        }
+    }
+
     /// How many open bodies the proxy cache is answering right now: the
     /// reads whose windows and promises the cache cleaner's gate is refused
     /// bytes by (`proxy_retention::ProxyRetention::reads`).

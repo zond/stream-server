@@ -912,7 +912,7 @@ impl Filler {
                     let retention = self.retention.clone();
                     tokio::task::spawn_blocking(move || {
                         let _ticket = ticket;
-                        retention.counted(write_chunk(&dir, index, &chunk, want));
+                        retention.counted(|| write_chunk(&dir, index, &chunk, want));
                     });
                 }
             }
@@ -950,7 +950,11 @@ impl Filler {
 /// chunk past [`Filler::take`]'s check, and the second one's rename
 /// replaces the first one's file rather than adding a second, so a count
 /// that booked the length twice would say the cache held a chunk it does
-/// not.
+/// not. **The difference is only a difference if nothing else writes that
+/// name between the two readings**, which is why the caller takes it
+/// through `ProxyRetention::counted` and not around it -- the two racing
+/// writers would otherwise both read "no file" first and both book the
+/// whole chunk.
 fn write_chunk(dir: &ChunkDir, index: u64, chunk: &[u8], want: u64) -> u64 {
     let occupancy = |path: &Path| {
         std::fs::metadata(path)
@@ -1761,6 +1765,46 @@ mod tests {
             super::write_chunk(&entity, 0, &bytes, CHUNK_BYTES),
             0,
             "and the second is what it gained, which is nothing"
+        );
+    }
+
+    /// **And two bodies writing that chunk at once book it once between
+    /// them.**
+    ///
+    /// The sibling above is sequential, so the second write sees the first
+    /// one's file; this is the case that actually happens. Two bodies of
+    /// one entity race past [`Filler::take`]'s check and each writes from
+    /// its own blocking task, so both read "nothing at this name" before
+    /// either rename, and a count that priced each write from its own pair
+    /// of readings would book half a megabyte for one 256 KiB file. The
+    /// surplus is permanent -- the reclaim of the one file subtracts one
+    /// file's worth -- and it moves the published cap *up*
+    /// (`crate::cache_budget`), which grows the cache rather than bounding
+    /// it. So the readings and the write between them are one booking.
+    #[test]
+    fn two_bodies_writing_one_chunk_at_once_book_it_once() {
+        let dir = tempfile::tempdir().expect("a scratch root");
+        let retention = crate::proxy_retention::ProxyRetention::new(
+            Arc::default(),
+            Arc::default(),
+            Arc::default(),
+        );
+        let entity = chunks(dir.path());
+        let bytes = vec![1u8; CHUNK_BYTES as usize];
+        let both = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    both.wait();
+                    retention.counted(|| super::write_chunk(&entity, 0, &bytes, CHUNK_BYTES));
+                });
+            }
+        });
+
+        assert_eq!(
+            retention.occupancy(),
+            occupancy_under(dir.path()),
+            "one file on the disk is one file in the count"
         );
     }
 

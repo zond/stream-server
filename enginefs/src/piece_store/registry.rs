@@ -575,10 +575,28 @@ mod tests {
         // And debris directly under the root, which addresses no torrent at
         // all.
         std::fs::write(tmp.path().join(".pieces").join("stray"), [2u8; 8]).unwrap();
+        // And a *directory* whose name this store would never have written:
+        // a hash is lowercase here, so no registration can speak for this
+        // one and `stat` of it would read the lowercase directory beside it
+        // instead. It is on the volume, so what is in it is counted, and it
+        // is counted the one way that cannot address the wrong files --
+        // everything under the name, as a stray.
+        let shouted = tmp
+            .path()
+            .join(".pieces")
+            .join("89ABCDEF0123456789ABCDEF0123456789ABCDEF");
+        std::fs::create_dir_all(shouted.join("0")).unwrap();
+        // Deliberately a different size from the lowercase directory's
+        // piece: a rule that let this name through would `stat` the
+        // *lowercase* directory beside it, and the two would only add up if
+        // both held the same bytes.
+        std::fs::write(shouted.join("0").join("0"), [3u8; 40960]).unwrap();
         let expected = crate::chunk_store::occupied_bytes(
             &std::fs::metadata(left.join("0").join("0")).unwrap(),
         ) + crate::chunk_store::occupied_bytes(
             &std::fs::metadata(tmp.path().join(".pieces").join("stray")).unwrap(),
+        ) + crate::chunk_store::occupied_bytes(
+            &std::fs::metadata(shouted.join("0").join("0")).unwrap(),
         );
         assert_eq!(registry.unregistered_bytes(), expected);
         assert_eq!(

@@ -2532,6 +2532,37 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             holdings.protected_bytes += held.bytes_of(&protected.pieces);
             holdings.protected_files += protected.files.len();
         }
+        // A dormant pin has no engine to speak for it -- that is what
+        // dormant means -- and no store either, so its directory is in the
+        // unregistered bytes above and nothing so far has protected a byte
+        // of it. Nothing can ever take those bytes while the pin stands
+        // (`Self::reclaim_verdicts` announces them to the cleaner, and the
+        // sweep at launch keeps the pin set), so reporting them as
+        // reclaimable tells a client a shortfall has a remedy it has not
+        // got. The one `stat` per dormant pin is on the same blocking hop
+        // the unregistered half already takes.
+        let pins = self.dormant_pinned_downloads();
+        let dormant: std::collections::BTreeSet<String> = pins
+            .iter()
+            .map(|pin| pin.info_hash.to_lowercase())
+            .collect();
+        if !dormant.is_empty() {
+            let store = self.piece_store();
+            let files = pins.len();
+            let bytes = tokio::task::spawn_blocking(move || {
+                dormant
+                    .iter()
+                    .map(|info_hash| store.stat(info_hash).occupancy())
+                    .sum::<u64>()
+            })
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "a dormant pin's bytes could not be read");
+                0
+            });
+            holdings.protected_bytes += bytes;
+            holdings.protected_files += files;
+        }
         holdings
     }
 
@@ -10456,6 +10487,162 @@ mod tests {
             (with_stray.protected_bytes, with_stray.protected_files),
             (100, 1),
             "the pin still, and nothing new"
+        );
+    }
+
+    /// **A dormant pin's bytes are protected, though no engine speaks for
+    /// them.**
+    ///
+    /// A pin the session has not restored a torrent for has no engine and
+    /// no registered store, so its directory is in the unregistered half of
+    /// the total -- `stat`ed, because nothing holds bits for it -- and
+    /// nothing in the engines' loop above ever names it. Nothing can take
+    /// those bytes either: the pin stands, the cleaner is told they are
+    /// announced (`Self::reclaim_verdicts`) and the sweep at launch keeps
+    /// the pin set. So reporting them as reclaimable tells a client a
+    /// shortfall has a remedy it has not got, which is the same wrong
+    /// answer as calling slack protected, in the other direction.
+    #[tokio::test]
+    async fn a_dormant_pins_bytes_are_protected_though_no_engine_speaks_for_them() {
+        let (enginefs, _counters) = test_enginefs_unmanaged();
+        let pieces = enginefs.piece_store().torrent_dir(TEST_HASH);
+        std::fs::create_dir_all(pieces.join("0")).unwrap();
+        let piece = pieces.join("0").join("1");
+        std::fs::write(&piece, [7u8; 100]).unwrap();
+        let bytes = crate::chunk_store::occupied_bytes(&std::fs::metadata(&piece).unwrap());
+
+        let unclaimed = enginefs.cache_holdings().await;
+        assert_eq!(
+            (unclaimed.total_bytes, unclaimed.protected_bytes),
+            (bytes, 0),
+            "no store speaks for it and nobody has pinned it: ordinary cache"
+        );
+
+        std::fs::create_dir_all(&enginefs.download_dir).unwrap();
+        std::fs::write(
+            enginefs.pinned_downloads_path(),
+            serde_json::to_vec(&serde_json::json!({ TEST_HASH: [0] })).unwrap(),
+        )
+        .unwrap();
+        // Dormant: the record names it, and no engine came back with it.
+        assert_eq!(enginefs.restore_pinned_downloads().await, 0);
+
+        let pinned = enginefs.cache_holdings().await;
+        assert_eq!(
+            (
+                pinned.total_bytes,
+                pinned.protected_bytes,
+                pinned.protected_files
+            ),
+            (bytes, bytes, 1),
+            "the user asked for those bytes and nothing here may take them: {pinned:?}"
+        );
+    }
+
+    /// **A file that stopped being the live one protects nothing, though
+    /// its policy is still standing.**
+    ///
+    /// The rule the figure is built on, and the one it would be easiest to
+    /// get backwards. A holding does not go when the viewer opens
+    /// something else -- the window and the committed half stay in the map
+    /// until the slack pass has taken the bytes -- so a protection read off
+    /// the holdings alone would report a whole film as unreclaimable for as
+    /// long as the entity lived. What that costs is not a wrong number: a
+    /// client shown `protected == total` over a cache that is over its
+    /// limit is being told the shortfall has no remedy, when the remedy is
+    /// the pass that is already running.
+    #[tokio::test]
+    async fn a_file_that_stopped_being_live_protects_nothing() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in [0u32, 1, 2, 3] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let _store = seeded_store(&enginefs, &engine);
+
+        enginefs.on_stream_start(TEST_HASH, 0).await;
+        engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
+        engine
+            .retain(enginefs.store_registry(), &playing(0))
+            .await
+            .expect("a pass ran");
+        let playing = enginefs.cache_holdings().await;
+        assert!(
+            playing.protected_bytes > 0 && playing.protected_files == 1,
+            "the window it is playing inside: {playing:?}"
+        );
+
+        // The viewer opened a proxied stream. Nothing about this file's
+        // policy changed -- the same window, the same committed half, the
+        // same pieces on the disk -- and every one of those bytes is now
+        // slack.
+        enginefs.live().open(
+            crate::retention::live::LiveEntity::Proxy {
+                dir: std::path::PathBuf::from("/proxy/other-film"),
+            },
+            false,
+        );
+        assert!(
+            engine.retention.holding(&0).is_some(),
+            "the holding is still there, which is what makes this a test of the rule \
+             and not of the map"
+        );
+        let slack = enginefs.cache_holdings().await;
+        assert_eq!(
+            (
+                slack.total_bytes,
+                slack.protected_bytes,
+                slack.protected_files
+            ),
+            (100, 0, 0),
+            "every byte of it is still on the disk, and every byte of it is \
+             on its way off: {slack:?}"
+        );
+    }
+
+    /// **A live file nothing bounds keeps the whole of itself.**
+    ///
+    /// No budget covers it, so no policy is installed and no window exists
+    /// -- and while it is live nothing reclaims any of it, so the honest
+    /// figure is its whole extent. Reporting 0 here would say a stream
+    /// being played is entirely reclaimable, which is the one thing that is
+    /// never true of it.
+    #[tokio::test]
+    async fn a_live_file_nothing_bounds_keeps_the_whole_of_itself() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        // A budget far above the file: there is nothing here to bound.
+        enginefs.set_cache_budget(Some(10_000));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in [0u32, 1, 2, 3] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let _store = seeded_store(&enginefs, &engine);
+
+        enginefs.on_stream_start(TEST_HASH, 0).await;
+        engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
+        // A pass that concludes nothing: with no budget to measure against
+        // there is nothing for it to keep or take.
+        engine.retain(enginefs.store_registry(), &playing(0)).await;
+        let holding = engine.retention.holding(&0).expect("an entity of its own");
+        assert!(
+            holding.installed.is_none() && holding.windows.is_empty(),
+            "nothing bounds it, so there is no window to report"
+        );
+
+        let holdings = enginefs.cache_holdings().await;
+        assert_eq!(
+            (holdings.protected_bytes, holdings.protected_files),
+            (100, 1),
+            "the whole of what it holds: {holdings:?}"
         );
     }
 

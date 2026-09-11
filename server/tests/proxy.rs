@@ -1634,6 +1634,97 @@ fn the_cache_figure_follows_the_chunks_the_proxy_wrote() -> anyhow::Result<()> {
         "the one entity a player is inside: {usage:?}"
     );
 
+    // **And the figure is the count, not a reading of the tree.** A chunk
+    // put into the entity's own directory by hand is a chunk no fill
+    // booked: a walk would find it, the count cannot, and which of the two
+    // answers this route gives is the whole of this slice. (It is also why
+    // a cache an earlier process filled reads as nothing until the launch
+    // sweep empties it -- see `cache_cleaner::cache_usage`.)
+    let bucket = cached_chunks(&fixture)
+        .first()
+        .and_then(|chunk| chunk.parent().map(std::path::Path::to_path_buf))
+        .expect("a bucket directory the fill made");
+    std::fs::write(bucket.join("900"), vec![3u8; CHUNK as usize])?;
+    assert_eq!(
+        fixture.handle.cache_usage()?.total_bytes,
+        usage.total_bytes,
+        "nothing here walks the root, so a chunk nothing booked is not in it"
+    );
+    std::fs::remove_file(bucket.join("900"))?;
+
+    drop(fixture.handle);
+    Ok(())
+}
+
+/// **A chunk the cleaner unlinks comes off the count that booked it.**
+///
+/// The cache cleaner is not one of the owners: it walks this root and
+/// unlinks a proxy chunk by path, the last deleter of a cached byte that
+/// does not come through the owner. A count that never heard those
+/// deletions would keep the bytes booked for the life of the process -- and
+/// the cap this process publishes is `occupied + available - floor`, so an
+/// over-counted occupancy states a *larger* cap, the windows are sized to
+/// it, the cache refills past the floor and the next pass has more to take.
+/// There is no term in that loop that brings the count back down.
+#[test]
+fn the_count_hears_the_cleaners_unlink() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    // One file under the same root that belongs to no owner at all: a
+    // whole-file download an earlier version of this server left behind,
+    // written first so the pass's age order reaches it first. Its bytes are
+    // in nobody's count, so a subtraction addressed to the proxy's count
+    // for it would take that figure below what the proxy really holds.
+    let legacy = fixture
+        .cache_root
+        .path()
+        .join("cache")
+        .join("rqbit-downloads")
+        .join("Leftover")
+        .join("old.mkv");
+    std::fs::create_dir_all(legacy.parent().expect("a parent"))?;
+    std::fs::write(&legacy, vec![9u8; 64 * 1024])?;
+
+    let origin = format!("http://{}", fixture.origin.addr);
+    let url = format!("{}/proxy/d={}/movie.mp4", fixture.base, encode(&origin));
+    let response = reqwest::blocking::Client::new()
+        .get(&url)
+        .header(reqwest::header::RANGE, "bytes=0-")
+        .send()?;
+    assert_eq!(response.bytes()?.len(), ORIGIN_LENGTH);
+    fixture.origin.next_request();
+    wait_for_chunks(&fixture, 4);
+    nothing_is_reading(&fixture);
+
+    let cached = cached_chunks(&fixture).len() as u64;
+    assert_eq!(
+        fixture.handle.cache_usage()?.total_bytes,
+        cached * CHUNK,
+        "what the fill booked, before anything has taken any of it"
+    );
+
+    // A cap under what is cached, so the pass has something to do, and well
+    // above one chunk, so the "a single file bigger than the whole cap is
+    // kept" rule is not what is being measured.
+    fixture
+        .handle
+        .update_settings(serde_json::json!({ "cacheSize": (CHUNK as f64) * 1.5 }))?;
+    let report = fixture.handle.clean_cache_now()?;
+    assert!(report.freed > 0, "the pass took chunks: {report:?}");
+    settled(&fixture);
+
+    let left = cached_chunks(&fixture).len() as u64;
+    assert!(left < cached, "the pass really unlinked some: {left} left");
+    assert!(
+        !legacy.exists(),
+        "and the legacy copy with them: {report:?}"
+    );
+    assert_eq!(
+        fixture.handle.cache_usage()?.total_bytes,
+        left * CHUNK,
+        "and the count is what the disk holds, not what it held before the \
+         pass walked it"
+    );
+
     drop(fixture.handle);
     Ok(())
 }

@@ -2647,6 +2647,42 @@ mod tests {
         assert_eq!(fresh.held().unwrap().bytes(), 16);
     }
 
+    /// **A claim is priced only where the store holds it.**
+    ///
+    /// [`HeldSnapshot::bytes_of`] prices a set somebody else chose -- a
+    /// pin's file, a window round a playhead, the half a torrent committed
+    /// for sharing. Those are statements about what may not be *taken*, and
+    /// they are made over a file's whole extent whether or not the bytes
+    /// have arrived: a window is mostly read-ahead that has not been
+    /// fetched yet. Priced at a piece length each, a freshly started film
+    /// would report a film's worth of protection over an all but empty
+    /// directory, and `GET /cache.json` would answer a protection larger
+    /// than the cache it is part of.
+    #[test]
+    fn a_claim_is_priced_only_where_the_store_holds_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path(), PIECE_LENGTH, &SPECS);
+        let global = global_bytes(store.layout().total_length());
+        fill_piece(&store, &global, 2);
+        fill_piece(&store, &global, 3);
+        let fresh = open_store(tmp.path(), PIECE_LENGTH, &SPECS);
+        fresh.seed_from_disk().unwrap();
+        let held = fresh.held().expect("seeded");
+
+        assert_eq!(
+            held.bytes_of(&BTreeSet::from([2, 3])),
+            8 + 6,
+            "the two it holds, the last at its own short length"
+        );
+        assert_eq!(
+            held.bytes_of(&BTreeSet::from([0, 1, 2, 3])),
+            8 + 6,
+            "and a claim over the whole file is priced at what is there"
+        );
+        assert_eq!(held.bytes_of(&BTreeSet::from([0, 1])), 0);
+        assert_eq!(held.bytes_of(&BTreeSet::new()), 0);
+    }
+
     /// The bound is the layout's piece count, not the word array's: a
     /// four-piece torrent has one word with room for sixty more indices,
     /// and the walk reports every complete-spelled file in a bucket -- a

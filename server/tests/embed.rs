@@ -2855,6 +2855,108 @@ fn content_range_total(response: &reqwest::blocking::Response) -> u64 {
         .expect("the total is a number")
 }
 
+/// **The cap the publisher states follows what the owners hold.**
+///
+/// The disk arm of the cap is `occupied + available - floor`, and
+/// `occupied` used to be whatever an eviction pass had last counted -- 0
+/// until the first walk of the root finished. That is not a stale figure
+/// that is close: a four-gigabyte television already holding four gigabytes
+/// with six hundred megabytes free stated a cap of eighty-eight megabytes,
+/// and every stream opened in the minutes a sixteen-thousand-file walk
+/// takes ran under a window that size. The publisher reads the owners now,
+/// and this is the moment that proves it: bytes that were on the volume
+/// before the process started -- so the free-space arm has already lost
+/// them -- become *counted* when the session registers the store over them,
+/// and the very next publication states a cap that much larger.
+///
+/// The cap is read where the retention policies read it
+/// (`ServerHandle::published_cache_budget`), not from `GET /cache.json`,
+/// which runs the arithmetic again for the client: a publisher that stopped
+/// reading the owners would still be answering that route correctly while
+/// sizing every window on free space alone.
+#[test]
+fn the_minute_publishers_cap_follows_the_owners_occupancy() -> anyhow::Result<()> {
+    /// Enough that the difference is nothing like the noise of a session
+    /// writing its own records while this runs.
+    const SEEDED: usize = 16 * 1024 * 1024;
+    /// `cacheSize` above anything a volume could offer, so the cap under
+    /// test is the disk arm and not the setting.
+    const UNCAPPED: f64 = 1024.0 * 1024.0 * 1024.0 * 1024.0;
+
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    let content = src.path().join("Movie");
+    std::fs::create_dir_all(&content)?;
+    write_payload(&content.join("film.mkv"), SEEDED);
+    let (torrent, info_hash) = real_torrent(&content);
+
+    let cache_root = resolved(&cache_dir.path().join("cache"));
+    let handle = stream_server::start(ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_root.clone()),
+        ..offline_config()
+    })?;
+    // Already "streamed": the data sits in the piece store, as it would
+    // after playback, and no store speaks for it until the session picks it
+    // up below. The bytes are on the volume before the reading below, which
+    // is the whole point -- whatever `statvfs` answers has already lost
+    // them, so nothing but the count can put them back into the cap. (The
+    // seed goes after the launch sweep, which removes every store directory
+    // the session does not claim.)
+    seed_piece_store(&cache_root, &torrent, &content);
+    handle.update_settings(serde_json::json!({ "cacheSize": UNCAPPED }))?;
+    let before = handle
+        .published_cache_budget()
+        .expect("a cap from the volume");
+
+    // The session picks the seeded pieces up: `init` seeds the store's held
+    // set from what is on the disk and registers it, and from that instant
+    // the process knows it holds those bytes.
+    let base = format!("http://{}", handle.http_addr());
+    let client = bearer_client(&handle)?;
+    let created: serde_json::Value = client
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    assert_eq!(created["infoHash"], info_hash);
+    let stats = stats_after_check(&client, &base, &info_hash)?;
+    // Pinned, so nothing is playing it and nothing takes it either: the
+    // count under test stays still while the two publications straddle it.
+    handle.pin_download(&info_hash, file_index(&stats, "film.mkv"), &[])?;
+
+    handle.update_settings(serde_json::json!({ "cacheSize": UNCAPPED }))?;
+    let after = handle
+        .published_cache_budget()
+        .expect("a cap from the volume");
+    let usage = handle.cache_usage()?;
+    assert!(
+        usage.total_bytes >= SEEDED as u64,
+        "the store counts what it registered: {usage:?}"
+    );
+    assert!(
+        after > before,
+        "the cap grew by what the store now says it holds: {before} -> {after}"
+    );
+    // And the two readings of the same cache agree. `GET /cache.json` runs
+    // the same arithmetic over the same owners a moment later, so the only
+    // difference between them is whatever the volume did in between -- a
+    // publisher reading no occupancy at all would be short by the whole of
+    // the seeded film.
+    let reported = usage.limit_bytes.expect("a cap from the volume");
+    assert!(
+        after.abs_diff(reported) < SEEDED as u64 / 2,
+        "the cap in force and the cap reported are one number: {after} against {reported}"
+    );
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
 /// `GET /cache.json` and `POST /cache/clean` share their functions with
 /// `ServerHandle::{cache_usage, clean_cache_now}` -- the replacement for a
 /// client restarting the server just to make the cache cleaner's start-up
@@ -2880,9 +2982,13 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
     let content = src.path().join("Movie");
     std::fs::create_dir_all(&content)?;
     // Two files, each a whole number of 16 KiB pieces (as `lan_media_server`
-    // does). Pinning only `movie.mkv` still protects the whole torrent's
-    // data: the engine stays live for as long as it has any pinned file, and
-    // a piece store is not divisible by file at the protection level.
+    // does). Pinning only `movie.mkv` protects the whole torrent's data
+    // *from this pass*: the walk's gate refuses every piece the torrent
+    // announces, and a piece store is not divisible by file at that level.
+    // What `GET /cache.json` reports as protected is the pinned file alone
+    // -- a pin is per file, and a file is the unit a client can put in
+    // front of a user -- so the two figures below are two honest answers to
+    // two different questions and are not read against each other.
     write_payload(&content.join("movie.mkv"), 64 * 1024);
     write_payload(&content.join("subtitle.srt"), 16 * 1024);
     let (torrent, info_hash) = real_torrent(&content);
@@ -2971,7 +3077,9 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
     assert_eq!(http_usage["limitBytes"], limit, "{http_usage}");
     assert!(
         http_usage["totalBytes"].as_u64().unwrap() > limit,
-        "the leftovers push the cache over the limit: {http_usage}"
+        "the torrent's own unpinned pieces push the cache over the limit -- \
+         the legacy whole-file copies belong to no owner and are in no \
+         owner's count: {http_usage}"
     );
     assert_eq!(
         http_usage["protectedFiles"], 1,
@@ -2983,9 +3091,29 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
         "{http_usage}"
     );
 
+    // Everything this pass can take, counted before it runs: the idle
+    // leftover and the two legacy whole-file copies, in the occupancy
+    // accounting the report is in.
+    let evictable: u64 = [
+        idle.clone(),
+        root_folder.join("movie.mkv"),
+        root_folder.join("subtitle.srt"),
+    ]
+    .iter()
+    .map(|path| {
+        enginefs::chunk_store::occupied_bytes(
+            &std::fs::metadata(path).expect("a file this test wrote"),
+        )
+    })
+    .sum();
+    // What it cannot: the pinned torrent's own pieces, every one of which
+    // the gate refuses.
+    let pinned_bytes = piece_store(&cache_root).stat(&info_hash).occupancy();
+
     // clean_cache_now() over HTTP: the idle file goes, the pinned one does
-    // not, and the run lands exactly at the limit -- nothing but the idle
-    // leftover was ever evictable.
+    // not, and the run ends over the limit rather than at it -- the limit
+    // is the pinned *file*'s bytes plus one, while what the walk may not
+    // take is the whole torrent's pieces.
     let report: serde_json::Value = client
         .post(format!("{base}/cache/clean"))
         .send()?
@@ -3005,14 +3133,15 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
     assert_eq!(report["deleted"], 3, "{report}");
     // The pass's own numbers are the walk's, and the walk counts piece
     // files where `GET /cache.json` counts what the owners hold -- so they
-    // are read against each other rather than against the usage figures
-    // above: everything the walk could take, it took, and what is left is
-    // what the gate refused.
+    // are read against what this test put on the disk rather than against
+    // the usage figures above: everything the walk could take, it took, and
+    // what is left is what the gate refused.
+    assert_eq!(report["freed"], evictable, "{report}");
+    assert_eq!(report["protected"], pinned_bytes, "{report}");
     assert_eq!(
         report["total"], report["protected"],
         "nothing but the pinned torrent's own pieces is left: {report}"
     );
-    assert!(report["freed"].as_u64().unwrap() > 0, "{report}");
     assert_eq!(report["protectedFiles"], seeded_pieces, "{report}");
 
     // clean_cache_now() == POST /cache/clean, run right after over the

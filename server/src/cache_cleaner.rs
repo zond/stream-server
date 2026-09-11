@@ -391,6 +391,16 @@ async fn recover_out_of_space_torrents(state: &AppState, recovery: &mut DiskFull
 /// a client reads comes from the owners that hold the bytes, which is the
 /// same question asked of something that already knows the answer, and the
 /// walk is a reading of the disk this pass is about to act on.
+///
+/// **Where the two now differ is one category of byte, and it is named.** A
+/// whole-file download an earlier version of this server left under the
+/// root belongs to no owner, so [`usage`] does not count it while this walk
+/// still evicts it -- so `total - protected` understates what a pass would
+/// free by exactly those legacy bytes, on the devices that still carry
+/// any. Nothing else is on one side only: a dormant pin is protected in
+/// both (`enginefs::CacheHoldings`), and every other byte under the root is
+/// a store's or the proxy's. The walk goes at the end of this series, and
+/// with it the difference.
 struct CacheRoots {
     /// The one torrent-data root (`settings.cacheRoot`, as the engine
     /// reports it -- never as the setting spells it). Everything a torrent
@@ -545,12 +555,24 @@ async fn clean_cache_with_headroom(
         // before the walk below and goes stale under a reader that seeks.
         let retention = state.proxy_cache.retention().clone();
         let still_free = move |path: &std::path::Path| retention.still_free(path);
+        // And the owner of those bytes told when they go. Everything under
+        // the proxy cache's own root is a chunk its fill booked, and a
+        // deletion it never hears is bytes booked for the life of the
+        // process -- see [`reclaim`] for which way that moves the cap.
+        let counting = state.proxy_cache.retention().clone();
+        let proxy_root = state.proxy_cache.root().to_path_buf();
+        let forget = move |path: &std::path::Path, bytes: u64| {
+            if path.starts_with(&proxy_root) {
+                counting.uncounted(bytes);
+            }
+        };
         evict(
             &roots.root,
             &roots.store,
             &roots.gate,
             &release,
             &still_free,
+            &forget,
             &stopped,
             &evictors,
             roots.limit,
@@ -610,6 +632,20 @@ pub(crate) async fn usage(state: &AppState) -> CacheUsage {
 /// two disjoint sets of bytes -- a piece of a torrent is never a chunk of a
 /// proxied URL -- and each has already made its own sum over sets that do
 /// overlap inside it.
+///
+/// **And then held to the total, because the two are priced from different
+/// bases.** A protection is read off the disk -- the pieces a store holds,
+/// the chunks in a live window that are really there -- while the proxy's
+/// half of the total is what *this process* booked as it wrote it
+/// (`crate::proxy_retention::ProxyRetention::occupancy`). A cache the last
+/// process filled is therefore protected bytes against a total that has
+/// not heard of them: resume a fully cached film after a restart and the
+/// window protects four gigabytes the count reads as nothing. `protected`
+/// is documented as part of `total` and read as one -- a client compares
+/// the two to decide whether cleaning can help -- so the sum is held to it
+/// rather than allowed to exceed it. What removes the divergence is the
+/// launch sweep emptying the proxy cache before the session opens, after
+/// which every chunk on the disk is one this process wrote.
 fn cache_usage(
     torrents: enginefs::CacheHoldings,
     proxy_bytes: u64,
@@ -622,7 +658,7 @@ fn cache_usage(
         limit_bytes: limit
             .effective(total_bytes)
             .filter(|limit| *limit != u64::MAX),
-        protected_bytes: torrents.protected_bytes + proxy_protection.bytes,
+        protected_bytes: (torrents.protected_bytes + proxy_protection.bytes).min(total_bytes),
         protected_files: torrents.protected_files + proxy_protection.entities,
     }
 }
@@ -672,7 +708,10 @@ pub struct CacheUsage {
     /// it, or it is inside the window of the one stream being played. When
     /// this equals `total_bytes` and the cache is still over `limit_bytes`,
     /// nothing is evictable -- cleaning cannot help until playback moves on
-    /// or something is unpinned.
+    /// or something is unpinned. Never more than `total_bytes`: it is a
+    /// part of that figure and a client reads it as one (see
+    /// [`cache_usage`] for the one case where the two readings would
+    /// otherwise disagree).
     pub protected_bytes: u64,
     /// How many **files and proxied entities** that is -- not how many
     /// piece files. A pinned file is one, whatever it is stored as, which
@@ -789,12 +828,13 @@ impl EvictionReport {
 /// which covers live engines and the dormant pins that have no engine to
 /// speak for them.
 #[allow(clippy::too_many_arguments)]
-async fn evict<E, R, S>(
+async fn evict<E, R, S, F>(
     download_dir: &std::path::Path,
     store: &enginefs::piece_store::StoreRoot,
     gate: &enginefs::retention::ReclaimGate,
     release: &R,
     still_free: &S,
+    forget: &F,
     stopped: &[String],
     evictors: &[E],
     limit: CacheLimit,
@@ -804,6 +844,7 @@ where
     E: for<'a> Fn(&'a str) -> BoxFuture<'a, anyhow::Result<bool>>,
     R: for<'a> Fn(&'a str, u32) -> BoxFuture<'a, bool>,
     S: Fn(&std::path::Path) -> bool,
+    F: Fn(&std::path::Path, u64),
 {
     debug_assert_eq!(stopped.len(), evictors.len());
     // 1. Walk. On the blocking pool, not on the worker this future is
@@ -844,7 +885,7 @@ where
     let mut aged_out_files = 0usize;
     for (item, size) in aged_out {
         info!("Older than 30 days, deleting: {}", item);
-        match reclaim(&item, release, still_free, download_dir).await {
+        match reclaim(&item, size, release, still_free, forget, download_dir).await {
             Ok(true) => {
                 aged_out_bytes += size;
                 aged_out_files += 1;
@@ -929,7 +970,7 @@ where
             }
 
             debug!("Deleting (size limit): {}", item);
-            match reclaim(&item, release, still_free, download_dir).await {
+            match reclaim(&item, size, release, still_free, forget, download_dir).await {
                 Ok(true) => {
                     total_size = total_size.saturating_sub(size);
                     freed_space += size;
@@ -1296,6 +1337,19 @@ impl WalkInputs {
 /// offers it pieces of torrents that are, and unlinking one of those behind
 /// librqbit's back leaves it advertising a piece it does not have.
 ///
+/// **A file the owner of those bytes is counting comes off its count here.**
+/// The proxy cache lives under this root (`crate::proxy_cache`), so a
+/// walked file may be a chunk the fill that wrote it booked, and a
+/// deletion the count never hears leaves those bytes booked for the life
+/// of the process. That is not a figure that drifts harmlessly: the
+/// published cap is `occupied + available - floor`
+/// (`crate::cache_budget`), so an over-counted occupancy states a *larger*
+/// cap, the owners size their windows to it, the cache refills past the
+/// floor and the next pass evicts more -- a loop with no term that brings
+/// the count back down. `forget` is the count being told, and it is given
+/// the walk's own occupancy figure for the file, which is the accounting
+/// the count was moved by when the chunk landed.
+///
 /// **`Ok(false)` is not success and it is not failure: it is "there were no
 /// bytes here to take".** The walk's answer and the delete's are two
 /// readings of the disk taken a moment apart, and nothing serialises passes
@@ -1307,15 +1361,18 @@ impl WalkInputs {
 /// `DiskFullRecovery` exists to stop. A piece the backend refuses to forget
 /// answers the same way, and for a reason of the same shape: the bytes are
 /// still there and no delete of ours may reach them.
-async fn reclaim<R, S>(
+async fn reclaim<R, S, F>(
     item: &Reclaimable,
+    size: u64,
     release: &R,
     still_free: &S,
+    forget: &F,
     download_dir: &std::path::Path,
 ) -> std::io::Result<bool>
 where
     R: for<'a> Fn(&'a str, u32) -> BoxFuture<'a, bool>,
     S: Fn(&std::path::Path) -> bool,
+    F: Fn(&std::path::Path, u64),
 {
     match item {
         Reclaimable::File(path) => {
@@ -1333,6 +1390,7 @@ where
             // has no second reading of the disk to reconcile with the
             // walk's.
             tokio::fs::remove_file(path).await?;
+            forget(path, size);
             if let Some(parent) = path.parent() {
                 remove_empty_parents(parent, download_dir).await;
             }
@@ -1545,6 +1603,7 @@ mod tests {
             // gate about the file the rule wants -- which is what a seek
             // does while the walk is still running.
             &move |path: &Path| path != kept_for_closure,
+            &forgets_nothing(),
             &[],
             &no_evictors(),
             limit,
@@ -1579,12 +1638,20 @@ mod tests {
             // No proxy retention behind these tests, so nothing is promised
             // and the gate they build is the whole answer.
             &|_: &std::path::Path| true,
+            &forgets_nothing(),
             &[],
             &no_evictors(),
             limit,
             0,
         )
         .await
+    }
+
+    /// The count nobody is keeping behind these tests: no proxy cache is
+    /// wired to them, so the files they evict are bytes no owner booked.
+    /// The shipped pass hands this the proxy owner's `uncounted`.
+    fn forgets_nothing() -> impl Fn(&Path, u64) {
+        |_: &Path, _: u64| {}
     }
 
     /// A gate that announces (and so keeps) every piece of `hashes`, and
@@ -2098,6 +2165,7 @@ mod tests {
             &store_releaser(store(&root)),
             // No proxy retention behind these tests.
             &|_: &std::path::Path| true,
+            &forgets_nothing(),
             &[],
             &no_evictors(),
             CacheLimit::configured(occupied - dead_occupancy / 2),
@@ -2121,6 +2189,7 @@ mod tests {
             &store_releaser(store(&root)),
             // No proxy retention behind these tests.
             &|_: &std::path::Path| true,
+            &forgets_nothing(),
             &[],
             &no_evictors(),
             CacheLimit::configured(occupancy(&old_film) + occupancy(&p1)),
@@ -2272,6 +2341,7 @@ mod tests {
             &refuse,
             // No proxy retention behind these tests.
             &|_: &std::path::Path| true,
+            &forgets_nothing(),
             &[],
             &no_evictors(),
             CacheLimit::configured(u64::MAX),
@@ -2344,6 +2414,7 @@ mod tests {
             &store_releaser(store(&root)),
             // No proxy retention behind these tests.
             &|_: &std::path::Path| true,
+            &forgets_nothing(),
             &stopped,
             &[fake_evictor(&calls, &root, true)],
             CacheLimit::configured(old_occupancy + partial_occupancy - old_occupancy / 2),
@@ -2373,6 +2444,7 @@ mod tests {
             &store_releaser(store(&root)),
             // No proxy retention behind these tests.
             &|_: &std::path::Path| true,
+            &forgets_nothing(),
             &stopped,
             &[fake_evictor(&calls, &root, true)],
             CacheLimit::configured(partial_occupancy / 2),
@@ -2399,6 +2471,7 @@ mod tests {
             &store_releaser(store(&root)),
             // No proxy retention behind these tests.
             &|_: &std::path::Path| true,
+            &forgets_nothing(),
             &stopped,
             &[fake_evictor(&calls, &root, false)],
             CacheLimit::configured(partial_occupancy / 2),
@@ -2446,6 +2519,7 @@ mod tests {
             &store_releaser(store(&root)),
             // No proxy retention behind these tests.
             &|_: &std::path::Path| true,
+            &forgets_nothing(),
             &[],
             &no_evictors(),
             CacheLimit::configured(occupied),
@@ -2674,6 +2748,60 @@ mod tests {
         assert_eq!(json["protectedBytes"], 4096 + CHUNK);
         assert_eq!(json["protectedFiles"], 2);
         assert_eq!(json["limitBytes"], serde_json::Value::Null);
+    }
+
+    /// **A protection is never more than the total it is part of.**
+    ///
+    /// The two figures are priced from different bases and one of them can
+    /// name bytes the other has not heard of. A protection is read off the
+    /// disk -- the pieces a store holds, the chunks of a live window that
+    /// are really there -- while the proxy's half of the total is what
+    /// *this process* booked as it wrote it. So the ordinary case on the
+    /// device this is for: the server restarts over a cache full of a film
+    /// somebody watched yesterday, a player resumes it, the entity's window
+    /// covers four gigabytes of chunks on the disk, and the count says the
+    /// proxy cache holds nothing, because this process has written nothing.
+    ///
+    /// `protected_bytes` is documented as part of `total_bytes` and read as
+    /// one -- a client compares them to decide whether cleaning can help --
+    /// so it is held to it. What removes the divergence is the launch sweep
+    /// emptying the proxy cache before the session opens.
+    #[test]
+    fn a_protection_is_never_more_than_the_total_it_is_part_of() {
+        const CHUNK: u64 = crate::proxy_cache::CHUNK_BYTES;
+        let usage = cache_usage(
+            enginefs::CacheHoldings::default(),
+            // Nothing booked: every chunk under the proxy root was written
+            // by the process before this one.
+            0,
+            crate::proxy_retention::ProxyProtection {
+                bytes: 16 * CHUNK,
+                entities: 1,
+            },
+            CacheLimit::configured(u64::MAX),
+        );
+        assert_eq!(usage.total_bytes, 0);
+        assert_eq!(
+            usage.protected_bytes, 0,
+            "a part of nothing is nothing, whatever the window covers"
+        );
+
+        // And with the same chunks booked, the protection is the whole of
+        // the figure, which is what "cleaning cannot help" honestly looks
+        // like.
+        let counted = cache_usage(
+            enginefs::CacheHoldings::default(),
+            16 * CHUNK,
+            crate::proxy_retention::ProxyProtection {
+                bytes: 16 * CHUNK,
+                entities: 1,
+            },
+            CacheLimit::configured(u64::MAX),
+        );
+        assert_eq!(
+            (counted.total_bytes, counted.protected_bytes),
+            (16 * CHUNK, 16 * CHUNK)
+        );
     }
 
     /// The field condition: downloads land in the very root the engine
