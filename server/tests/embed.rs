@@ -1499,6 +1499,17 @@ fn pieces_held(cache_root: &std::path::Path, info_hash: &str) -> usize {
     piece_store(cache_root).stat(info_hash).pieces.len()
 }
 
+/// The indices of the complete pieces a torrent's piece store holds.
+fn held_piece_indices(cache_root: &std::path::Path, info_hash: &str) -> Vec<u64> {
+    piece_store(cache_root)
+        .stat(info_hash)
+        .pieces
+        .iter()
+        .filter(|chunk| chunk.complete.is_some())
+        .map(|chunk| chunk.index)
+        .collect()
+}
+
 /// Deterministic, non-trivial payload so piece hashes mean something.
 fn write_payload(path: &std::path::Path, len: usize) {
     let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
@@ -1910,10 +1921,15 @@ fn the_cache_root_setting_decides_where_the_next_session_opens() -> anyhow::Resu
 
 /// **A pin moves nothing.** A torrent that was streamed first is pinned
 /// exactly where it is: `pin_download` reports the same path the backend
-/// reported before, every piece it had it still has, and no second copy
-/// appears anywhere -- there is one root and a pin is not a location. A
-/// restart on the same dirs, with the embedder handing the pin back in,
-/// restores the torrent with its pin and its pieces.
+/// reported before, every piece of the pinned file is still held, and no
+/// second copy appears anywhere -- there is one root and a pin is not a
+/// location. A restart on the same dirs, with the embedder handing the pin
+/// back in, restores the torrent with its pin and the pinned file's pieces.
+///
+/// What a pin keeps is the **file**: e2's pieces, 2 and 3 (piece 2 is the
+/// one e1 ends in, and it is kept because e2 needs it). e1 is not pinned and
+/// not playing, so its own pieces, 0 and 1, are the retention owner's to
+/// take at any tick -- which is why nothing here asserts on them.
 #[test]
 fn a_pin_moves_nothing_and_survives_a_restart() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -1976,10 +1992,13 @@ fn a_pin_moves_nothing_and_survives_a_restart() -> anyhow::Result<()> {
     // A whole file is produced nowhere at all: the torrent's bytes are
     // piece files under the store's one root.
     assert!(!root_folder.join("e2.bin").exists(), "no whole file");
-    assert_eq!(
-        pieces_held(&cache_root, &info_hash),
-        seeded_pieces,
-        "the pin kept every piece it had"
+    // e1 is 40 KiB and e2 24 KiB in 16 KiB pieces: e2 is pieces 2 and 3.
+    let e2_pieces = [2u64, 3];
+    assert_eq!(seeded_pieces, 4);
+    let held = held_piece_indices(&cache_root, &info_hash);
+    assert!(
+        e2_pieces.iter().all(|piece| held.contains(piece)),
+        "the pin kept every piece of the pinned file: {held:?}"
     );
     let stats = stats_after_check(&client, &base, &info_hash)?;
     assert_eq!(
@@ -2027,10 +2046,10 @@ fn a_pin_moves_nothing_and_survives_a_restart() -> anyhow::Result<()> {
     let info = handle.pin_download(&info_hash, idx, &[])?;
     assert_eq!(info.path, before, "still where it always was");
     assert!(info.complete);
-    assert_eq!(
-        pieces_held(&cache_root, &info_hash),
-        seeded_pieces,
-        "the restart found the same pieces"
+    let held = held_piece_indices(&cache_root, &info_hash);
+    assert!(
+        e2_pieces.iter().all(|piece| held.contains(piece)),
+        "the restart found the pinned file's pieces: {held:?}"
     );
 
     handle.shutdown()?;
@@ -3201,7 +3220,8 @@ fn a_clean_restates_the_cap_before_it_reports_it() -> anyhow::Result<()> {
 /// library call returns, field for field.
 ///
 /// What a clean does is give back both owners' slack, so on this fixture it
-/// gives back **nothing**, and that is the claim. A pinned download is kept
+/// gives back **nothing**, and that is the claim. Both of the torrent's
+/// files are pinned, so no piece of it is slack. A pinned download is kept
 /// until it is unpinned, however far over the cap the cache is; and the
 /// **whole-file copies an earlier version of this server left behind**
 /// belong to no owner at all -- nothing here booked those bytes, nothing
@@ -3220,13 +3240,10 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
     let content = src.path().join("Movie");
     std::fs::create_dir_all(&content)?;
     // Two files, each a whole number of 16 KiB pieces (as `lan_media_server`
-    // does). Pinning only `movie.mkv` keeps the whole torrent's data from
-    // this clean: a pinned torrent keeps everything it holds, and a piece
-    // store is not divisible by file at that level. What `GET /cache.json`
-    // reports as protected is the pinned file alone -- a pin is per file,
-    // and a file is the unit a client can put in front of a user -- so the
-    // two figures below are two honest answers to two different questions
-    // and are not read against each other.
+    // does), so no piece is shared between them. A pin keeps a file, not the
+    // torrent it is in: with only `movie.mkv` pinned, the subtitle's piece
+    // would be slack for this clean -- or for any tick before it -- to take.
+    // Both are pinned, so there is nothing disposable here at all.
     write_payload(&content.join("movie.mkv"), 64 * 1024);
     write_payload(&content.join("subtitle.srt"), 16 * 1024);
     let (torrent, info_hash) = real_torrent(&content);
@@ -3289,22 +3306,23 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
         .json()?;
     assert_eq!(created["infoHash"], info_hash);
     let stats = stats_after_check(&client, &base, &info_hash)?;
-    let idx = file_index(&stats, "movie.mkv");
-    handle.pin_download(&info_hash, idx, &[])?;
+    for name in ["movie.mkv", "subtitle.srt"] {
+        handle.pin_download(&info_hash, file_index(&stats, name), &[])?;
+    }
     stats_after_check(&client, &base, &info_hash)?;
 
     // Read usage() before touching the limit, to learn how many bytes the
-    // pinned file occupies. The limit below sits one byte over that, so the
+    // pinned files occupy. The limit below sits one byte under that, so the
     // cache is really over its cap while the clean runs -- otherwise
     // "nothing was taken" would be the uninteresting answer of a cache with
     // room to spare rather than the answer of one that has nothing
     // disposable in it.
     let baseline = handle.cache_usage()?;
     assert_eq!(
-        baseline.protected_files, 1,
-        "the pinned file, counted as a file and not as its piece files: {baseline:?}"
+        baseline.protected_files, 2,
+        "the pinned files, counted as files and not as their piece files: {baseline:?}"
     );
-    let limit = baseline.protected_bytes + 1;
+    let limit = baseline.protected_bytes - 1;
     handle.update_settings(serde_json::json!({ "cacheSize": limit as f64 }))?;
 
     // cache_usage() == GET /cache.json, and reading it evicts nothing.
@@ -3320,14 +3338,13 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
     assert_eq!(http_usage["limitBytes"], limit, "{http_usage}");
     assert!(
         http_usage["totalBytes"].as_u64().unwrap() > limit,
-        "the torrent's own unpinned pieces push the cache over the limit -- \
-         the legacy whole-file copies belong to no owner and are in no \
-         owner's count: {http_usage}"
+        "the pinned pieces alone are over the limit -- the legacy whole-file \
+         copies belong to no owner and are in no owner's count: {http_usage}"
     );
     assert_eq!(
-        http_usage["protectedFiles"], 1,
-        "the pinned file: a pin is per file, and nothing else here is played \
-         or pinned: {http_usage}"
+        http_usage["protectedFiles"], 2,
+        "the two pinned files: a pin is per file, and nothing here is played: \
+         {http_usage}"
     );
     assert_eq!(
         http_usage["protectedBytes"], baseline.protected_bytes,
@@ -3360,9 +3377,9 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
     assert_eq!(report["deleted"], 0, "{report}");
     assert_eq!(report["freed"], 0, "{report}");
     // The figures are the owners' own, which is what makes them the same
-    // figures `GET /cache.json` answers: the pinned file, counted as a
-    // file, and the cap the process has just restated.
-    assert_eq!(report["protectedFiles"], 1, "{report}");
+    // figures `GET /cache.json` answers: the pinned files, counted as
+    // files, and the cap the process has just restated.
+    assert_eq!(report["protectedFiles"], 2, "{report}");
     assert_eq!(report["protected"], baseline.protected_bytes, "{report}");
     assert_eq!(report["limit"], limit, "{report}");
     assert!(
