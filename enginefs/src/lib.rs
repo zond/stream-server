@@ -1236,19 +1236,17 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         self.probe_volume(self.volumes.data_folder(), now);
         let mut probed = true;
         let mut decisions = Vec::with_capacity(engines.len());
-        // Taken once, before the first engine, and handed to both consumers
-        // of every engine: what the ladder calls playing and what the pass
-        // calls live are one reading.
+        // Taken once, before the first engine, for the retention pass: the
+        // modes it derives for the files of one tick must agree with each
+        // other, so they come off one reading. The ladder does **not** read
+        // it -- see `reconcile_engine`, which asks the cell under the hash
+        // lock, because a copy taken before the first engine is a tick old
+        // by the last one and a ladder that stops from it stops the torrent
+        // the viewer has just opened.
         let live = self.live.reading();
         for engine in engines {
             if let Some(decision) = self
-                .reconcile_engine(
-                    &engine,
-                    crate::reconcile::Trigger::Timer,
-                    now,
-                    &live,
-                    &mut probed,
-                )
+                .reconcile_engine(&engine, crate::reconcile::Trigger::Timer, now, &mut probed)
                 .await
             {
                 decisions.push((engine.info_hash.clone(), decision));
@@ -1285,8 +1283,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let engine = self.peek_engine(info_hash).await?;
         let now = self.clock.now_secs();
         let mut probed = false;
-        let live = self.live.reading();
-        self.reconcile_engine(&engine, trigger, now, &live, &mut probed)
+        self.reconcile_engine(&engine, trigger, now, &mut probed)
             .await
     }
 
@@ -1315,7 +1312,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         engine: &Arc<Engine<B::Handle>>,
         trigger: crate::reconcile::Trigger,
         now: u64,
-        live: &crate::retention::live::Reading,
         probed: &mut bool,
     ) -> Option<crate::reconcile::Decision> {
         if engine.handle.manages_playback_lifecycle() {
@@ -1338,7 +1334,19 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             // viewer is watching, but stopping the torrent under one stalls
             // it. Neither is a clock, and neither is an activity register a
             // request left behind.
-            playing: live.is_torrent(&engine.info_hash) || engine.retention.readers() > 0,
+            //
+            // **The cell itself, under this hash's lock -- never the tick's
+            // copy of it.** The timer takes one reading before its first
+            // engine and then spends the tick on the engines before this
+            // one, and a pass on the predecessor can hold it inside a
+            // backend call for the length of the switch task's unlink.
+            // The torrent a viewer opened meanwhile has its cell written
+            // (`on_stream_start` does that first) and no byte delivered
+            // yet, so `readers()` is 0; read from the copy it is a torrent
+            // nobody is playing, the idle arm answers `Stop`, and the
+            // timer's next `Run` for it waits out `RECONCILE_MIN_DWELL`
+            // -- the episode just started, parked for fifteen seconds.
+            playing: self.live.is_torrent(&engine.info_hash) || engine.retention.readers() > 0,
             pinned: engine.is_pinned(),
             seeding_enabled: self.seeding_enabled.load(Ordering::Relaxed),
             has_metadata: engine.handle.has_metadata().await,
@@ -13514,6 +13522,89 @@ mod tests {
                 (OTHER_HASH.to_string(), Decision::Stop),
             ],
             "every restored torrent is one nobody is playing"
+        );
+    }
+
+    /// **A torrent the viewer opens while the tick is walking is not
+    /// stopped from the reading the tick started with.**
+    ///
+    /// The timer takes one copy of what is playing before its first engine
+    /// and then spends the tick on the engines in turn, and the pass on the
+    /// predecessor can hold it inside a backend call for as long as the
+    /// switch task's unlink takes. A stream that opens meanwhile has its
+    /// cell written first (`on_stream_start`) and no byte delivered yet, so
+    /// `readers()` is 0: read from the copy it is a torrent nobody is
+    /// playing, the idle arm answers `Stop`, and the stop is made -- a stop
+    /// is never held by the dwell. The next timer's `Run` for it then *is*
+    /// held, for `RECONCILE_MIN_DWELL`: the episode the viewer just started
+    /// stands still for fifteen seconds. Roughly every other switch, since
+    /// the tick is two seconds and the unlink is of the same order.
+    ///
+    /// So the ladder asks the cell under the hash lock, and only the pass
+    /// keeps the tick's reading (its modes for one tick must agree). The
+    /// park here is on the first engine's stop rather than on its pass:
+    /// the registry is a `HashMap`, so which engine the tick reaches first
+    /// is not the test's to choose, and holding the stop open on both lets
+    /// whichever comes first be the predecessor.
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_opened_under_the_tick_is_not_stopped_from_its_reading() {
+        let TwoEngines {
+            mut enginefs,
+            counters,
+            ..
+        } = test_enginefs_with_two_engines();
+        if let Some(sweep) = enginefs.take_sweep_task() {
+            sweep.abort();
+        }
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        // The boot's pin pass, with nothing pinned: the want-set is back and
+        // the ladder reads its bottom arm for both.
+        enginefs.apply_pins(Some(Default::default())).await;
+        let enginefs = Arc::new(enginefs);
+
+        // Nothing is playing, so the tick stops the first engine it
+        // reaches; the fake holds that stop open.
+        for counters in &counters {
+            counters.hold_stop.store(true, Ordering::SeqCst);
+        }
+        let tick = tokio::spawn({
+            let enginefs = enginefs.clone();
+            async move { enginefs.reconcile_tick().await }
+        });
+        let stops = |idx: usize| counters[idx].stop_torrent.load(Ordering::SeqCst);
+        assert!(
+            wait_until(TEST_WAIT_BOUND, || stops(0) + stops(1) == 1).await,
+            "the tick is inside the first engine's stop"
+        );
+        let (first, second) = if stops(0) == 1 {
+            (0, OTHER_HASH)
+        } else {
+            (1, TEST_HASH)
+        };
+        let second_counters = &counters[1 - first];
+
+        // The viewer opens the other torrent while the tick is parked. Its
+        // own reconcile (`PlaybackStart`) finds it running and leaves it.
+        second_counters.hold_stop.store(false, Ordering::SeqCst);
+        enginefs.on_stream_start(second, 0).await;
+        assert_eq!(second_counters.stop_torrent.load(Ordering::SeqCst), 0);
+
+        counters[first].stop_gate.notify_one();
+        let decisions = tick.await.expect("the tick finished");
+        assert!(
+            decisions.contains(&(second.to_string(), Decision::Run)),
+            "the torrent the viewer opened under the tick is wanted running: {decisions:?}"
+        );
+        assert_eq!(
+            second_counters.stop_torrent.load(Ordering::SeqCst),
+            0,
+            "and the tick did not stop it from the reading it started with"
+        );
+        assert_eq!(run_state_of(&enginefs, second).await, RunState::Live);
+        assert_eq!(
+            run_state_of(&enginefs, [TEST_HASH, OTHER_HASH][first]).await,
+            RunState::Paused,
+            "the predecessor, which nobody is playing, is stopped"
         );
     }
 
