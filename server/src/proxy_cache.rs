@@ -580,17 +580,20 @@ impl Entry {
         let stale = self.dir.clone();
         let fresh = dir.clone();
         let ticket = self.work.start();
+        let retention = self.retention.clone();
         tokio::task::spawn_blocking(move || {
             let _ticket = ticket;
             if let Err(error) = std::fs::create_dir_all(&fresh) {
                 tracing::debug!(path = %fresh.display(), %error, "could not open a proxy cache entry");
                 return;
             }
-            remove_other_entities(&stale, &fresh);
+            retention.uncounted(remove_other_entities(&stale, &fresh));
         });
         let dir = ChunkDir::new(dir);
+        let reader = self.retention.reader(&dir, total, self.target.clone());
         Filler {
-            reader: self.retention.reader(&dir, total, self.target.clone()),
+            retention: reader.retention(),
+            reader,
             work: self.work.clone(),
             dir,
             total,
@@ -680,30 +683,48 @@ pub fn can_be_filed(total: u64, content_type: &str, validator: &str) -> bool {
 /// Remove every entity under `key_dir` but `keep`: the origin has just said
 /// what this resource is, and an entity of a different length, a different
 /// type or a different validator is not it any more.
-fn remove_other_entities(key_dir: &Path, keep: &Path) {
+fn remove_other_entities(key_dir: &Path, keep: &Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(key_dir) else {
-        return;
+        return 0;
     };
+    let mut freed = 0u64;
     for entry in entries.flatten() {
         let path = entry.path();
         if path == keep || parse_entity_dir_name(&entry.file_name().to_string_lossy()).is_none() {
             continue;
         }
+        // Measured before the directory goes, because this is the one place
+        // besides a reclaim where chunks this process counted leave the
+        // disk, and a running total that did not hear about them would
+        // state a cap over bytes that are not there
+        // (`crate::proxy_retention::ProxyRetention::occupancy`). The walk is
+        // over a directory that is about to be removed anyway.
+        let held: u64 = walkdir::WalkDir::new(&path)
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry.file_type().is_file())
+            .filter_map(|entry| entry.metadata().ok())
+            .map(|metadata| enginefs::chunk_store::occupied_bytes(&metadata))
+            .sum();
         match std::fs::remove_dir_all(&path) {
-            Ok(()) => tracing::debug!(
-                path = %path.display(),
-                "the origin's entity changed; dropping what was cached of the old one"
-            ),
+            Ok(()) => {
+                freed += held;
+                tracing::debug!(
+                    path = %path.display(),
+                    "the origin's entity changed; dropping what was cached of the old one"
+                )
+            }
             Err(error) => {
                 tracing::debug!(path = %path.display(), %error, "could not drop a stale cache entity")
             }
         }
     }
+    freed
 }
 
 /// How long chunk `index` of a `total`-byte entity is: a whole chunk, or
 /// whatever is left at the end of the entity.
-fn chunk_len(index: u64, total: u64) -> u64 {
+pub(crate) fn chunk_len(index: u64, total: u64) -> u64 {
     let start = index.saturating_mul(CHUNK_BYTES);
     (total.saturating_sub(start)).min(CHUNK_BYTES)
 }
@@ -831,6 +852,11 @@ impl Cached {
 /// chunk later, and the reactor never blocks on the write.
 pub struct Filler {
     dir: ChunkDir,
+    /// Where the chunks this writes are counted: see
+    /// [`crate::proxy_retention::ProxyRetention::occupancy`]. The write is
+    /// a blocking task that cannot borrow this struct, so it carries a
+    /// clone of the owner rather than reaching back through the reader.
+    retention: Arc<crate::proxy_retention::ProxyRetention>,
     /// This fill, as a read of the entity: the origin's body is on its way
     /// to the player as it goes past here, so every byte of it is a
     /// playhead. It promises nothing -- what a fill delivers comes off the
@@ -883,9 +909,10 @@ impl Filler {
                     self.collecting = None;
                     let dir = self.dir.clone();
                     let ticket = self.work.start();
+                    let retention = self.retention.clone();
                     tokio::task::spawn_blocking(move || {
                         let _ticket = ticket;
-                        write_chunk(&dir, index, &chunk, want);
+                        retention.counted(write_chunk(&dir, index, &chunk, want));
                     });
                 }
             }
@@ -915,10 +942,28 @@ impl Filler {
 ///
 /// Nothing fails loudly -- a cache that cannot write is a slower stream and
 /// never a broken one.
-fn write_chunk(dir: &ChunkDir, index: u64, chunk: &[u8], want: u64) {
+///
+/// Answers what the cache gained by it, which is what the running count of
+/// its occupancy is moved by
+/// (`crate::proxy_retention::ProxyRetention::occupancy`). A difference and
+/// not the chunk's length: two bodies of one entity can race to the same
+/// chunk past [`Filler::take`]'s check, and the second one's rename
+/// replaces the first one's file rather than adding a second, so a count
+/// that booked the length twice would say the cache held a chunk it does
+/// not.
+fn write_chunk(dir: &ChunkDir, index: u64, chunk: &[u8], want: u64) -> u64 {
+    let occupancy = |path: &Path| {
+        std::fs::metadata(path)
+            .map(|metadata| enginefs::chunk_store::occupied_bytes(&metadata))
+            .unwrap_or(0)
+    };
+    let path = dir.chunk_path(index);
+    let before = occupancy(&path);
     if let Err(error) = dir.write_whole(index, chunk, Some(want)) {
-        tracing::debug!(path = %dir.chunk_path(index).display(), %error, "could not write a proxy cache chunk");
+        tracing::debug!(path = %path.display(), %error, "could not write a proxy cache chunk");
+        return 0;
     }
+    occupancy(&path).saturating_sub(before)
 }
 
 /// The origin's body, with every whole chunk of it written to the cache on
@@ -1595,6 +1640,139 @@ mod tests {
         let whole = entry.look_up(None).expect("every chunk is here now");
         assert!(whole.complete());
         assert_eq!((whole.first, whole.last), (0, total - 1));
+    }
+
+    /// **What this cache holds is counted as it is written and as it goes,
+    /// and nothing walks the tree to learn it.**
+    ///
+    /// The budget's disk arm used to be sized from whatever an eviction
+    /// pass had last counted, which is 0 until the first walk of the root
+    /// finishes -- minutes, on a television with sixteen thousand cache
+    /// files, and the whole of a film. The two places this cache's bytes
+    /// move are a chunk landing and a chunk being reclaimed, so both of
+    /// them book what they did and the figure is current without a syscall.
+    ///
+    /// The count is asserted against the directory itself at each step
+    /// rather than against an arithmetic of chunk lengths: what it has to
+    /// be right about is the disk, and a count that agreed with a
+    /// calculation and not with the volume would be exactly the 17 GB
+    /// reading `occupied_bytes` exists to prevent.
+    #[tokio::test]
+    async fn the_cache_counts_its_chunks_as_they_land_and_as_they_go() {
+        use enginefs::retention::live::{Live, LiveEntity};
+
+        let dir = tempfile::tempdir().expect("a scratch root");
+        // The launch sweep, before anything is relayed: what it leaves is
+        // what this process has counted, which is nothing.
+        assert_eq!(super::sweep(dir.path()).removed, 0);
+        let live = Arc::new(Live::default());
+        let cache = ProxyCache::new(dir.path(), Arc::default(), live.clone());
+        assert_eq!(cache.retention().occupancy(), 0, "a fill has written none");
+
+        let entry = entry_of(&cache, "https://host/film.mkv");
+        let total = 4 * CHUNK_BYTES;
+        let entity = entry
+            .dir
+            .join(entity_dir_name(total, "video/mp4", VALIDATOR));
+        let mut filler = entry.fill(total, "video/mp4", VALIDATOR, 0);
+        filler.take(&vec![7u8; total as usize]);
+        cache.settled().await;
+        let on_disk = occupancy_under(&entity);
+        assert!(on_disk >= total, "four chunks landed: {on_disk}");
+        assert_eq!(
+            cache.retention().occupancy(),
+            on_disk,
+            "and what the fill booked is what the volume gave up for them"
+        );
+
+        // Nobody is playing it any more -- the body ended, and a stream
+        // opened somewhere else -- so a slack pass takes the lot.
+        drop(filler);
+        live.open(
+            LiveEntity::Torrent {
+                info_hash: "0123456789abcdef0123456789abcdef01234567".into(),
+                file_idx: 0,
+            },
+            false,
+        );
+        cache.retention().drop_slack().await;
+        cache.settled().await;
+        assert_eq!(occupancy_under(&entity), 0, "every chunk went");
+        assert_eq!(
+            cache.retention().occupancy(),
+            0,
+            "and the count came back down with them"
+        );
+    }
+
+    /// **An entity the origin replaced takes its bytes off the count with
+    /// it.**
+    ///
+    /// The other place chunks this process wrote leave the disk: not a
+    /// reclaim, but a whole directory removed because the origin's resource
+    /// changed under its key. A running total that did not hear about it
+    /// would go on stating a cap over bytes that are not there, and it
+    /// would never come back down -- nothing else in the process would ever
+    /// subtract them.
+    #[tokio::test]
+    async fn a_replaced_entity_takes_its_bytes_off_the_count() {
+        let dir = tempfile::tempdir().expect("a scratch root");
+        let cache = ProxyCache::new(dir.path(), Arc::default(), Arc::default());
+        let entry = entry_of(&cache, "https://host/film.mkv");
+
+        let was = 2 * CHUNK_BYTES;
+        let mut filler = entry.fill(was, "video/mp4", VALIDATOR, 0);
+        filler.take(&vec![1u8; was as usize]);
+        cache.settled().await;
+        drop(filler);
+        assert!(cache.retention().occupancy() >= was, "two chunks landed");
+
+        // The origin now answers a different length, which is a different
+        // entity: the fill that finds out drops what was cached of the old
+        // one.
+        let mut fresh = entry.fill(3 * CHUNK_BYTES, "video/mp4", VALIDATOR, 0);
+        fresh.take(&vec![2u8; CHUNK_BYTES as usize]);
+        cache.settled().await;
+        assert_eq!(
+            cache.retention().occupancy(),
+            occupancy_under(&entry.dir),
+            "the count is what this key's directory really holds"
+        );
+    }
+
+    /// **A chunk written where one already is gains the cache nothing.**
+    ///
+    /// Two bodies of one entity can race past [`Filler::take`]'s check on
+    /// the same chunk, and the second one's rename replaces the first one's
+    /// file rather than adding a second. A count that booked the chunk's
+    /// length each time would say the cache held a chunk it does not, and
+    /// nothing would ever take that back off: the reclaim of the one file
+    /// subtracts one file's worth.
+    #[test]
+    fn writing_a_chunk_that_is_already_there_gains_the_cache_nothing() {
+        let dir = tempfile::tempdir().expect("a scratch root");
+        let entity = chunks(dir.path());
+        let bytes = vec![1u8; CHUNK_BYTES as usize];
+        assert!(
+            super::write_chunk(&entity, 0, &bytes, CHUNK_BYTES) >= CHUNK_BYTES,
+            "the first write is what the chunk occupies"
+        );
+        assert_eq!(
+            super::write_chunk(&entity, 0, &bytes, CHUNK_BYTES),
+            0,
+            "and the second is what it gained, which is nothing"
+        );
+    }
+
+    /// What a directory really occupies, as the volume counts it.
+    fn occupancy_under(dir: &Path) -> u64 {
+        walkdir::WalkDir::new(dir)
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry.file_type().is_file())
+            .filter_map(|entry| entry.metadata().ok())
+            .map(|metadata| enginefs::chunk_store::occupied_bytes(&metadata))
+            .sum()
     }
 
     /// What the entity directory is for: a resource whose length or type

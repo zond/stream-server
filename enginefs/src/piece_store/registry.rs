@@ -174,6 +174,25 @@ impl StoreRegistry {
             .sum()
     }
 
+    /// What lies under the root that no registered store's held set
+    /// accounts for, in bytes -- the other half of [`Self::occupancy`].
+    ///
+    /// One `read_dir` of the root and a `stat` of every directory no live
+    /// store speaks for: a torrent the session holds in Error (which holds
+    /// no storage, so it has no registration), one a previous process left,
+    /// and whatever is not a piece file. Filesystem work, so it belongs off
+    /// the reactor and is asked on demand, never on the tick.
+    ///
+    /// The registration is asked at this instant and the `stat` follows it,
+    /// so a torrent that registers between the two is counted twice for the
+    /// length of one usage figure and a torrent that errors between them is
+    /// counted by neither. Both are a reading of a moving tree, which is
+    /// what a usage figure is.
+    pub fn unregistered_bytes(&self) -> u64 {
+        self.root
+            .unregistered_bytes(|info_hash| self.is_registered(info_hash))
+    }
+
     /// Whether the store registered for `info_hash` is under its initial
     /// hash check. False for a hash with no store: there is nothing to
     /// check.
@@ -518,6 +537,55 @@ mod tests {
             DeleteOutcome::Registered { unlinked: 1 }
         );
         assert_eq!(held_of(&registry), Some(BTreeSet::new()));
+    }
+
+    /// **What the registry counts and what it has to `stat`.**
+    ///
+    /// A registered store's bytes are its bits: no syscall, and the
+    /// directory is stepped over entirely. What no store speaks for is
+    /// everything else on the volume under this root -- a torrent held in
+    /// Error, a directory a previous process left, a file the store would
+    /// never have written -- and a usage figure that left those out would
+    /// read smaller than the disk does. So they are `stat`ed, and the two
+    /// halves are disjoint by construction: a hash is in one or the other,
+    /// never both.
+    #[test]
+    fn what_no_store_speaks_for_is_stated_and_what_one_does_is_stepped_over() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = registry(tmp.path());
+        assert_eq!(registry.unregistered_bytes(), 0, "no root yet");
+
+        let store = store_under(&registry);
+        std::fs::create_dir_all(store.dir()).unwrap();
+        write_piece(&store, 0);
+        store.init_for_tests().unwrap();
+        assert_eq!(registry.occupancy(), 8);
+        assert_eq!(
+            registry.unregistered_bytes(),
+            0,
+            "the registered store's own directory is counted from its bits"
+        );
+
+        // A second torrent nothing registered: a previous process's, or one
+        // this session holds in Error.
+        let orphan = StoreRoot::new(tmp.path().join(".pieces"));
+        let left = orphan.torrent_dir("89abcdef0123456789abcdef0123456789abcdef");
+        std::fs::create_dir_all(left.join("0")).unwrap();
+        std::fs::write(left.join("0").join("0"), [1u8; 8]).unwrap();
+        // And debris directly under the root, which addresses no torrent at
+        // all.
+        std::fs::write(tmp.path().join(".pieces").join("stray"), [2u8; 8]).unwrap();
+        let expected = crate::chunk_store::occupied_bytes(
+            &std::fs::metadata(left.join("0").join("0")).unwrap(),
+        ) + crate::chunk_store::occupied_bytes(
+            &std::fs::metadata(tmp.path().join(".pieces").join("stray")).unwrap(),
+        );
+        assert_eq!(registry.unregistered_bytes(), expected);
+        assert_eq!(
+            registry.occupancy(),
+            8,
+            "and none of it moved what the stores hold"
+        );
     }
 
     /// Occupancy is the registered stores' held bits priced by their

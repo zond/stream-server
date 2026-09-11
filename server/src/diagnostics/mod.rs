@@ -16,29 +16,10 @@ pub struct ProcessMemorySnapshot {
     pub thread_count: u64,
 }
 
-/// What the cache cleaner's last pass found, as the sampler reports it: the
-/// occupancy of the walked roots, how much of it protection holds, and how
-/// long ago the pass finished. `None` until the first pass has run.
-#[derive(Debug, Clone, Copy, Serialize)]
-pub struct CacheFigures {
-    pub total_bytes: u64,
-    pub protected_bytes: u64,
-    pub report_age_secs: u64,
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct MemorySnapshot {
     pub process: ProcessMemorySnapshot,
     pub engine: enginefs::EngineDiagnosticsSnapshot,
-    /// The cache's size as the cleaner last counted it (see
-    /// `cache_cleaner::LastEviction`). The sampler used to walk the whole
-    /// download dir for this itself, synchronously, on the runtime, every
-    /// thirty seconds -- twice the cleaner's debounce and a hundred and
-    /// twenty times its idle fallback -- for two numbers it logged once a
-    /// minute at most. The cleaner's count is the same tree, at most a
-    /// minute old while anything is writing and exactly current while
-    /// nothing is, and it costs this task nothing.
-    pub cache: Option<CacheFigures>,
     pub active_disk_downloads: u64,
     pub disk_download_root: String,
     pub archive_session_count: usize,
@@ -140,23 +121,12 @@ async fn memory_snapshot_for_state(
     MemorySnapshot {
         process,
         engine,
-        cache: cache_figures(&state.last_eviction),
         active_disk_downloads,
         disk_download_root: state.engine.download_dir.display().to_string(),
         archive_session_count: state.archive_cache.len(),
         nzb_session_count: state.nzb_sessions.len(),
         active_direct_streams: logging::active_direct_streams(),
     }
-}
-
-/// The cleaner's last count, in the shape the line logs it.
-fn cache_figures(last_eviction: &crate::cache_cleaner::LastEviction) -> Option<CacheFigures> {
-    let (age, report) = last_eviction.get()?;
-    Some(CacheFigures {
-        total_bytes: report.total,
-        protected_bytes: report.protected,
-        report_age_secs: age.as_secs(),
-    })
 }
 
 pub fn start_memory_sampler(state: AppState) -> tokio::task::JoinHandle<()> {
@@ -198,9 +168,6 @@ pub fn start_memory_sampler(state: AppState) -> tokio::task::JoinHandle<()> {
                     rust_piece_cache_bytes = snapshot.engine.memory.rust_piece_cache_bytes,
                     native_storage_bytes = snapshot.engine.memory.native_storage_bytes,
                     native_storage_pieces = snapshot.engine.memory.native_storage_pieces,
-                    cache_bytes = snapshot.cache.map_or(0, |cache| cache.total_bytes),
-                    cache_protected_bytes = snapshot.cache.map_or(0, |cache| cache.protected_bytes),
-                    cache_report_age_secs = ?snapshot.cache.map(|cache| cache.report_age_secs),
                     active_disk_downloads = snapshot.active_disk_downloads,
                     disk_download_root = %snapshot.disk_download_root,
                     waiter_keys = snapshot.engine.memory.waiter_keys,
@@ -238,23 +205,5 @@ mod tests {
         assert_eq!(snapshot.pid, std::process::id());
         assert!(snapshot.rss_bytes > 0, "a running process occupies memory");
         assert!(snapshot.virtual_memory_bytes > 0, "and has a virtual size");
-    }
-
-    /// The cache figures are the cleaner's, read back: nothing before a pass,
-    /// and the pass's own totals with their age after one.
-    #[test]
-    fn the_cache_figures_are_the_cleaners_last_report() {
-        let last = crate::cache_cleaner::LastEviction::default();
-        assert!(cache_figures(&last).is_none(), "no pass has run yet");
-
-        last.record(&crate::cache_cleaner::EvictionReport {
-            total: 3_850_000_000,
-            protected: 700_000_000,
-            ..Default::default()
-        });
-        let figures = cache_figures(&last).expect("a pass has run");
-        assert_eq!(figures.total_bytes, 3_850_000_000);
-        assert_eq!(figures.protected_bytes, 700_000_000);
-        assert!(figures.report_age_secs < 60);
     }
 }

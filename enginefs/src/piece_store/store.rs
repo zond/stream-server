@@ -369,6 +369,22 @@ impl HeldSnapshot {
         };
         count * self.layout.default_piece_length() - short_by
     }
+
+    /// What the pieces of `of` this snapshot holds occupy, by the layout's
+    /// lengths.
+    ///
+    /// [`Self::bytes`] narrowed to a set somebody else chose: a pin's file,
+    /// a window, a committed half. Pieces the snapshot does not hold are
+    /// skipped rather than counted as nothing, because the caller's set is
+    /// a statement about what may not be taken and this is a statement
+    /// about what is on the disk -- a window over pieces we have not
+    /// fetched yet is not occupancy.
+    pub fn bytes_of(&self, of: &BTreeSet<u32>) -> u64 {
+        of.iter()
+            .filter(|piece| self.contains(**piece))
+            .map(|piece| self.layout.piece_length_of(*piece))
+            .sum()
+    }
 }
 
 impl PieceStore {
@@ -576,7 +592,7 @@ impl PieceStore {
     /// ends the initial check, because a store a test registers is one
     /// nothing is checking. Called again after the test has written more
     /// piece files by hand, it re-seeds, as a re-check would.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seed"))]
     pub fn init_for_tests(&self) -> anyhow::Result<()> {
         std::fs::create_dir_all(self.dir())?;
         self.seed_from_disk()?;
@@ -587,7 +603,7 @@ impl PieceStore {
     /// `init` as librqbit runs it, for a test that wants the check it
     /// begins: the seed and the registration, and the store left checking
     /// until a take ends it.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seed"))]
     pub fn init_begins_check_for_tests(&self) -> anyhow::Result<()> {
         std::fs::create_dir_all(self.dir())?;
         self.seed_from_disk()
@@ -949,6 +965,25 @@ pub struct StoredTorrent {
     pub strays: Vec<std::fs::Metadata>,
 }
 
+impl StoredTorrent {
+    /// What this directory occupies, in the one occupancy accounting this
+    /// repository has ([`crate::chunk_store::occupied_bytes`]): allocated
+    /// blocks, never apparent length.
+    ///
+    /// Strays included. They are on the volume, so a count that left them
+    /// out reads smaller than the disk does -- and a delete addressed to a
+    /// name the store would never have written frees nothing, so they are
+    /// counted and never offered as pieces.
+    pub fn occupancy(&self) -> u64 {
+        self.pieces
+            .iter()
+            .flat_map(|piece| piece.files())
+            .chain(self.strays.iter())
+            .map(crate::chunk_store::occupied_bytes)
+            .sum()
+    }
+}
+
 impl StoreRoot {
     /// The store under a torrent-data root: `<download dir>/.pieces`, the
     /// same root the session's storage factory is built on.
@@ -1062,6 +1097,58 @@ impl StoreRoot {
             pieces,
             strays: stored.strays,
         }
+    }
+
+    /// What lies under the root that no live store speaks for, in
+    /// occupancy bytes: one `read_dir` of the root, and a [`Self::stat`] of
+    /// the directories `speaks_for` answers `false` about.
+    ///
+    /// The other half of a usage figure, beside
+    /// [`StoreRegistry::occupancy`]. A registered store counts its own
+    /// bytes from the bits it keeps, with no syscall at all; what it cannot
+    /// count is what belongs to no store -- a torrent the session holds in
+    /// Error, one a previous process left behind, and whatever under the
+    /// root is not a piece file. Those are read here, on demand, so that
+    /// every byte under the root is in somebody's answer.
+    ///
+    /// Nothing is deleted and nothing is offered for deletion: only
+    /// [`super::sweep`] can say a directory is unadopted, and it runs at
+    /// launch.
+    pub fn unregistered_bytes(&self, speaks_for: impl Fn(&str) -> bool) -> u64 {
+        let Ok(entries) = std::fs::read_dir(self.root.as_path()) else {
+            return 0;
+        };
+        let mut bytes = 0u64;
+        let mut strays = Vec::new();
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                if let Ok(metadata) = entry.metadata() {
+                    strays.push(metadata);
+                }
+                continue;
+            }
+            // [`Self::scan`]'s naming rule, and for its reason: a name this
+            // store would never have written addresses no torrent, so no
+            // registration can speak for it and a `stat` of it would read
+            // the lowercase directory beside it instead.
+            let name = entry.file_name();
+            match name
+                .to_str()
+                .filter(|name| !name.bytes().any(|b| b.is_ascii_uppercase()))
+            {
+                Some(info_hash) if speaks_for(info_hash) => continue,
+                Some(info_hash) => bytes += self.stat(info_hash).occupancy(),
+                None => collect_strays(&entry.path(), &mut strays),
+            }
+        }
+        bytes
+            + strays
+                .iter()
+                .map(crate::chunk_store::occupied_bytes)
+                .sum::<u64>()
     }
 
     /// One torrent's directory as a directory of chunks -- the one place the

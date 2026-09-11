@@ -4,17 +4,15 @@
 //! **Publishing a budget is not the same job as evicting.** It used to be
 //! the tail of one: the cache cleaner walked sixteen thousand files to
 //! decide what to delete, and on its way out told the engine what the cap
-//! was ([`publish`]). Everything downstream of the number depends on that
-//! having happened -- `enginefs::retention::CacheBudget::Unknown` installs
-//! no policy at all, so a process that has never published one holds no
-//! window over a proxied stream and reclaims none of it -- and so the whole
-//! of the retention story hung off a walk whose only purpose was eviction.
+//! was. Everything downstream of the number depends on that having
+//! happened -- `enginefs::retention::CacheBudget::Unknown` installs no
+//! policy at all, so a process that has never published one holds no window
+//! over a proxied stream and reclaims none of it -- and so the whole of the
+//! retention story hung off a walk whose only purpose was eviction.
 //!
-//! So the two are separated here. The number and the order it is stated in
-//! ([`CachePasses`]) live in this module, with a trigger of their own
-//! ([`start`]) that takes one `statvfs` and walks nothing; eviction is one
-//! more caller of [`publish`], stating the occupancy it happens to have
-//! just counted.
+//! So the two are separated here. The number lives in this module, with a
+//! trigger of its own ([`start`]) that takes one `statvfs` and walks
+//! nothing.
 //!
 //! # What supplies each input
 //!
@@ -23,61 +21,36 @@
 //! `available` is a `statvfs` of the volume ([`available_space`]): one
 //! syscall, no walk, taken fresh at every publication.
 //!
-//! `occupied` is what the cache holds, and there is no cheap source for it
-//! -- nothing counts the bytes as they are written, so the only honest
-//! reading is a walk of the root and a listing of the piece store
-//! (`cache_cleaner::WalkInputs::run`). What this module does instead of
-//! demanding one is to lean on the fact that **`occupied + available` does
-//! not move when the cache does**: every byte the cache writes comes off
-//! `available` and goes onto `occupied`, and every byte eviction takes does
-//! the reverse, so the sum only changes when something that is *not* the
-//! cache writes to the volume. A stale `occupied` against a fresh
-//! `available` is therefore right to within what the rest of the device did
-//! in the meantime, which is a far weaker dependency than waiting for a
-//! walk.
+//! `occupied` is what the cache holds, and **the things that write the
+//! cache are what count it**. The piece store keeps a bit per piece it
+//! holds and the layout that gives each bit a size, so a torrent's
+//! occupancy is a sum over words in memory
+//! (`enginefs::EngineFS::cache_occupancy`); the proxy cache adds what each
+//! chunk occupied as it lands and takes it off again when the owner unlinks
+//! it (`crate::proxy_retention::ProxyRetention::occupancy`). Neither costs
+//! a syscall, so the cap can be restated on a timer against a reading of
+//! the cache that is current rather than against whatever a walk last
+//! found.
 //!
-//! So [`occupancy_last_counted`] takes the last figure something counted
-//! (`cache_cleaner::LastEviction`), and **nothing may drop that figure**:
-//! [`publish_counted`] records it outside the claim the cap is published
-//! under. The pass that walks is the only thing in the process that counts
-//! the cache, while the publisher that overtakes it walked nothing -- one
-//! `statvfs` and a publication microseconds later -- so every walk longer
-//! than [`BUDGET_INTERVAL`] is overtaken with certainty, which on the
-//! device this exists for (sixteen thousand files on eMMC, a statx each,
-//! against a dentry cache memory pressure keeps evicting) is every walk. A
-//! count that rode on the cap's claim would therefore be dropped for the
-//! life of the process, and the fallback below would be the permanent
-//! answer instead of the first minute's.
+//! That is what this module was waiting for. The figure it used to publish
+//! was the last eviction pass's count, which is right to within whatever
+//! the cache has done since -- and **0 before the first walk finished**,
+//! which is not a stale figure that is close but one wrong by the whole of
+//! the cache: a four-gigabyte television already holding four gigabytes
+//! with six hundred megabytes free stated a cap of eighty-eight megabytes,
+//! so every stream in the first minutes of the process ran under a window
+//! that size. On a device with sixteen thousand files on eMMC those minutes
+//! were the whole of a film. The owners' count has no such window: a
+//! process that has held a piece for a millisecond can say so.
 //!
-//! Before anything has counted at all, that fallback is 0, and it is worth
-//! being plain about what 0 costs rather than calling it merely tight. It
-//! is not a stale figure that is close: it is wrong by the whole of the
-//! cache. A four-gigabyte television already holding four gigabytes with
-//! six hundred megabytes free states a cap of eighty-eight megabytes --
-//! the free space above the floor and nothing else -- and that is a real
-//! policy rather than none (the owner installs one wherever the budget does
-//! not cover the file), so pieces
-//! of the stream outside a window that size become reclaimable and are
-//! refetched if the player seeks back into them, and the proxy's window is
-//! the same figure. What it is not is the stored cache being thrown away:
-//! eviction sizes its cap from the occupancy its own walk counted
-//! (`cache_cleaner::clean_cache_with_headroom`) and never from the
-//! published number, so nothing deletes the tree on the strength of this.
-//!
-//! It is still the right absence, for two reasons rather than one. The
-//! alternative is `CacheBudget::Unknown`, which installs no policy at all,
-//! and an unbounded stream is what filled the volume this whole module
-//! exists for. And the window in which 0 is the answer now ends at the
-//! first walk, because no publisher can drop that walk's count -- which is
-//! what makes it the first minute of a process rather than a state it can
-//! be stuck in.
-//!
-//! What would have to change if the walk went away: something must still
-//! keep [`occupancy_last_counted`]'s figure honest, or the disk arm of the
-//! cap drifts by however much the cache has grown since the last count. A
-//! per-entity owner that knows what it holds could report it; a running
-//! total in the chunk store could too. Neither exists today, and this
-//! module names the hole rather than hiding it.
+//! What it does not count is what nothing in this process wrote -- a
+//! torrent held in Error, a directory a previous run left, the strays.
+//! Reading those costs a `read_dir`, so they are read on demand for
+//! `GET /cache.json` (`enginefs::EngineFS::cache_holdings`) and not on the
+//! minute timer. The cap is therefore stated over what the session holds,
+//! which understates the volume by whatever is unadopted -- the safe
+//! direction, since a smaller `occupied` is a tighter cap, and the launch
+//! sweep is what makes it nothing.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -236,105 +209,44 @@ pub(crate) fn available_space(path: &std::path::Path) -> Option<u64> {
 /// restated on the minute like any other.
 const BUDGET_INTERVAL: Duration = Duration::from_secs(60);
 
-/// The occupancy a publication that has not counted the cache itself uses:
-/// what the last thing that *did* count it found, and 0 before anything
-/// has.
-///
-/// See this module's header for why a stale figure is usable at all, what
-/// 0 costs and why it is still the safe absence.
-/// `cache_cleaner::LastEviction` is the supplier today, and the only one,
-/// which is why [`publish_counted`] never lets a count be dropped; the
-/// header says what would have to replace it.
-fn occupancy_last_counted(last: &crate::cache_cleaner::LastEviction) -> u64 {
-    last.get().map_or(0, |(_, report)| report.total)
-}
-
-/// The cap a publication states, from the two readings behind it.
+/// The cap a publication states, from the three readings behind it.
 ///
 /// `configured` is `settings.cacheSize`, `available` one `statvfs` of the
-/// volume, and `last` whatever most recently counted the cache -- see this
-/// module's header for why the third may be as old as it is, and what
-/// stands in for it before anything has counted at all.
-fn cap_to_publish(
-    configured: u64,
-    available: Option<u64>,
-    last: &crate::cache_cleaner::LastEviction,
-) -> Option<u64> {
+/// volume, and `occupied` what the owners of the cache say they hold -- see
+/// this module's header for what each of the three costs.
+fn cap_to_publish(configured: u64, available: Option<u64>, occupied: u64) -> Option<u64> {
     CacheLimit {
         configured,
         available,
     }
-    .effective(occupancy_last_counted(last))
+    .effective(occupied)
 }
 
-/// Publish `limit` as the cache budget, under `pass`'s place in the order
-/// volume readings were taken, running `alongside` under the same claim.
+/// Publish `limit` as the cache budget.
 ///
 /// **The one writer.** Every publication in the process goes through here,
-/// which is what makes [`CachePasses`]'s ordering a property of the process
-/// and not of one call site: a `RetentionBudget::set` beside this one is
-/// exactly the bug that comment describes.
+/// which is what makes the cap one number rather than one per caller: a
+/// `RetentionBudget::set` beside this one is a second copy of a figure the
+/// torrent half and the proxy half both read, and two copies is how two
+/// layers come to evict against different limits.
 ///
 /// It is handed the shared cell (`EngineFS::cache_budget`) rather than an
-/// engine to tell, because the cell is the dependency: the torrent half and
-/// the proxy half read that one place, and a second copy of the number is
-/// how two layers come to evict against different limits.
-///
-/// Publishing is all this does: what a pass *counted* is not published
-/// here and is not dropped with the cap -- see [`publish_counted`], which
-/// is the entry point a walk uses.
-pub(crate) fn publish(
-    passes: &CachePasses,
-    budget: &enginefs::retention::RetentionBudget,
-    pass: CachePass,
-    limit: Option<u64>,
-) {
-    passes.publish(pass, || budget.set(limit));
-}
-
-/// Publish the cap a pass computed *and* keep the occupancy it counted,
-/// whatever happens to the cap.
-///
-/// The asymmetry is the whole of this function. A cap is an answer about
-/// the volume, so the newest reading of the volume wins and an older one is
-/// dropped ([`CachePasses`]). A count is an answer about the *cache*, and
-/// the only things that produce one are these walks: there is no second
-/// supplier, so a dropped count is not replaced by anything, it is
-/// subtracted. Ordering it by when the volume was read would also be
-/// ordering it by the wrong key -- a walk is a reading of the tree taken
-/// over its whole length, and the fresher of two is the one that finished
-/// later, which is when this is called. So the count is written straight
-/// in, last walk to finish wins, and the cap goes on through the claim.
-///
-/// What that costs, stated rather than implied: the report
-/// `diagnostics::cache_figures` shows can now come from a pass
-/// whose cap was dropped, so `report.limit` there may not be the cap in
-/// force. It describes the walk it came from, which is what a diagnostic is
-/// for; a count nobody kept described nothing.
-pub(crate) fn publish_counted(
-    passes: &CachePasses,
-    budget: &enginefs::retention::RetentionBudget,
-    last: &crate::cache_cleaner::LastEviction,
-    pass: CachePass,
-    report: &crate::cache_cleaner::EvictionReport,
-) {
-    last.record(report);
-    publish(passes, budget, pass, report.limit);
+/// engine to tell, because the cell is the dependency.
+pub(crate) fn publish(budget: &enginefs::retention::RetentionBudget, limit: Option<u64>) {
+    budget.set(limit);
 }
 
 /// Read the volume and publish what it allows, now, without walking
 /// anything.
 ///
-/// The entry point the process's own trigger uses ([`start`]) and the one
-/// that does not need an eviction pass to have run: `cacheSize` from the
-/// settings, `available` from one `statvfs`, `occupied` from whatever last
-/// counted the cache ([`occupancy_last_counted`]). Returns the cap it
-/// stated, or `None` for no cap -- which is not the same as having
-/// published nothing, since a publication of `None` is still a publication.
+/// **The one publisher.** `cacheSize` from the settings, `available` from
+/// one `statvfs`, `occupied` from the two owners that count the cache as
+/// they write it -- so this is as cheap on the minute timer as it is after
+/// `POST /settings`, and there is no second path with a different reading
+/// behind it. Returns the cap it stated, or `None` for no cap -- which is
+/// not the same as having published nothing, since a publication of `None`
+/// is still a publication.
 pub(crate) async fn publish_now(state: &AppState) -> Option<u64> {
-    // Numbered before the settings and the volume are read, which is what
-    // this orders: see [`CachePasses`].
-    let pass = state.cache_passes.begin();
     let configured = {
         let settings = state.settings.read().await;
         crate::routes::system::cache_size_bytes(settings.cache_size)
@@ -343,8 +255,9 @@ pub(crate) async fn publish_now(state: &AppState) -> Option<u64> {
     // reason `cache_cleaner::cache_roots` gives: the setting is where the
     // data will be after the next start, the engine is where it is now.
     let root = &state.engine.download_dir;
-    let cap = cap_to_publish(configured, available_space(root), &state.last_eviction);
-    publish(&state.cache_passes, &state.engine.cache_budget(), pass, cap);
+    let occupied = state.engine.cache_occupancy() + state.proxy_cache.retention().occupancy();
+    let cap = cap_to_publish(configured, available_space(root), occupied);
+    publish(&state.engine.cache_budget(), cap);
     cap
 }
 
@@ -406,146 +319,117 @@ where
     }
 }
 
-/// Which pass's reading of the volume is the newest.
-///
-/// Passes overlap. The sweep every launch takes runs while the first
-/// request is being served, a writer arms a debounced one, a client asks
-/// for one over `POST /cache/clean`, a stopped torrent rings one -- and the
-/// pass that finishes last is not the pass that started last, because a
-/// walk of sixteen thousand files takes as long as it takes and `cacheSize`
-/// can be changed while it runs.
-///
-/// Whoever finished last used to publish, so a pass that had read the cap
-/// before it was lowered could put the old number back over the new one.
-/// What that costs is not a slightly wrong cap: the retention policy is
-/// sized from this number, and a budget that covers the entity installs no
-/// policy at all ([`crate::proxy_retention`]), so a proxied stream measured
-/// against a stale ten gigabytes is not bounded by a window at all -- every
-/// chunk of it stays on the disk until the next pass republishes, which on
-/// a cache nothing is writing to is an hour away.
-///
-/// So a pass takes a number before it reads the volume and publishes only
-/// while nothing newer has: an older reading is dropped rather than
-/// overwriting a newer one. Its eviction still happened -- deleting what
-/// was over a cap that has since risen costs a refetch and nothing else --
-/// and it is only the *reading* that is stale.
-#[derive(Default)]
-pub struct CachePasses {
-    /// Numbers handed out, in the order passes started reading.
-    started: std::sync::atomic::AtomicU64,
-    /// The newest one that has published, so an older one can tell that it
-    /// has been overtaken.
-    published: std::sync::atomic::AtomicU64,
-}
-
-/// One pass's place in the order they started reading the volume in.
-#[derive(Clone, Copy, Debug)]
-pub struct CachePass(u64);
-
-impl CachePasses {
-    /// Number a pass that is about to read the volume.
-    pub fn begin(&self) -> CachePass {
-        CachePass(
-            self.started
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                + 1,
-        )
-    }
-
-    /// Publish `pass`'s reading, if nothing newer has published one.
-    ///
-    /// The claim and the publication are one call so that there is nowhere
-    /// to publish from that does not go through the order: an unguarded
-    /// `RetentionBudget::set` beside this one is exactly the bug -- which
-    /// is why [`super::publish`] is the only thing in the process that
-    /// calls this, and everything that wants to state a cap goes through
-    /// that.
-    ///
-    /// **One call is not one operation, and this does not totally order two
-    /// publications.** Two passes numbered five and six can each win the
-    /// claim -- five takes it while `published` is nought, six takes it
-    /// while `published` is five -- and then run their closures the other
-    /// way round, so six's cap lands first and five's stale one lands over
-    /// it. What the claim removes is the *long* window: the reading used to
-    /// be published after a walk of sixteen thousand files, and the race is
-    /// now the few instructions between the `fetch_max` and the call. It is
-    /// not nothing, and the cost when it is lost is what [`CachePasses`]
-    /// describes -- a cap nobody has read the volume for, standing until the
-    /// next pass republishes. Closing it means holding the claim across the
-    /// closure under a mutex, which is a small change and an untestable one:
-    /// the interleaving is a few instructions wide, so no deterministic test
-    /// distinguishes the two. It is written down here rather than implied
-    /// away.
-    pub fn publish(&self, pass: CachePass, publish: impl FnOnce()) {
-        if self
-            .published
-            .fetch_max(pass.0, std::sync::atomic::Ordering::Relaxed)
-            < pass.0
-        {
-            publish();
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        BUDGET_INTERVAL, CACHE_FREE_SPACE_FLOOR, CacheLimit, CachePasses, available_space,
-        cap_to_publish, occupancy_last_counted, publish, publish_counted, restate_every,
+        BUDGET_INTERVAL, CACHE_FREE_SPACE_FLOOR, CacheLimit, available_space, cap_to_publish,
+        publish, restate_every,
     };
-    use crate::cache_cleaner::{EvictionReport, LastEviction};
+    use enginefs::piece_store::layout::FileSpec;
+    use enginefs::piece_store::{PieceLayout, PieceStore, StoreRegistry, StoreRoot};
     use enginefs::retention::{CacheBudget, RetentionBudget};
     use std::sync::Arc;
     use std::time::Duration;
 
     const MIB: u64 = 1024 * 1024;
+    const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
 
-    /// **A process that has walked nothing still states a cap.**
+    /// **A process that has counted nothing still states a cap, and one
+    /// held piece moves it by that piece's size.**
     ///
     /// The budget used to be the tail of an eviction pass, so until the
-    /// first walk of the root finished there was no budget at all -- and
-    /// `CacheBudget::Unknown` installs no retention policy, so every chunk
-    /// of every stream relayed in that window stayed on the disk. On a
-    /// device with sixteen thousand cache files on eMMC that window is not
-    /// short. The occupancy such a publication has is nobody's count, which
-    /// is read as 0: the smallest occupancy there can be, so the tightest
-    /// cap the volume could justify, which is the side to be wrong on.
+    /// first walk of the root finished the occupancy behind every cap was
+    /// nobody's count, read as 0 -- and on a device whose cache is most of
+    /// what is on the volume that is wrong by the whole of the cache. It is
+    /// still the right answer for a cache that really holds nothing, which
+    /// is the first half here. What the second half pins is that the figure
+    /// no longer waits for a walk: the store books a piece the instant it
+    /// lands, so the very next publication states a cap that piece's size
+    /// bigger.
     #[test]
-    fn a_cache_nothing_has_counted_is_still_capped_at_the_volumes_own_headroom() {
+    fn a_cache_nothing_has_counted_is_capped_at_the_volumes_headroom() {
         let free = CACHE_FREE_SPACE_FLOOR + 8 * MIB;
-        let nothing_counted = LastEviction::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = Arc::new(StoreRegistry::new(StoreRoot::in_download_dir(tmp.path())));
         assert_eq!(
-            occupancy_last_counted(&nothing_counted),
+            registry.occupancy(),
             0,
-            "nothing has counted the cache, which is not the same as its being uncappable"
+            "a session holding nothing holds nothing, which is not the same \
+             as its being uncappable"
         );
         assert_eq!(
-            cap_to_publish(u64::MAX, Some(free), &nothing_counted),
+            cap_to_publish(u64::MAX, Some(free), registry.occupancy()),
             Some(8 * MIB),
             "the free space above the floor, with nothing assumed on top of it"
         );
 
-        // And once something has counted it, those bytes are room the cap
-        // may include: the same volume reading, a bigger cap.
-        let counted = LastEviction::default();
-        counted.record(&EvictionReport {
-            total: 3 * MIB,
-            ..EvictionReport::default()
-        });
-        assert_eq!(occupancy_last_counted(&counted), 3 * MIB);
+        // One torrent of four one-mebibyte pieces, and one of them held.
+        let layout = Arc::new(
+            PieceLayout::new(MIB, 4 * MIB, [FileSpec::payload(4 * MIB)]).expect("a layout"),
+        );
+        let store = PieceStore::under(Arc::clone(&registry), HASH, layout);
+        store.init_for_tests().unwrap();
+        assert_eq!(registry.occupancy(), 0, "registered, and holding nothing");
+        let piece = store.piece_path(0);
+        std::fs::create_dir_all(piece.parent().unwrap()).unwrap();
+        std::fs::write(&piece, vec![7u8; MIB as usize]).unwrap();
+        // The seed a start makes, over a directory that now has a piece in
+        // it: the same bit a completion would set.
+        store.init_for_tests().unwrap();
+
+        assert_eq!(registry.occupancy(), MIB);
         assert_eq!(
-            cap_to_publish(u64::MAX, Some(free), &counted),
-            Some(11 * MIB),
-            "what the cache already holds is room it may keep on holding"
+            cap_to_publish(u64::MAX, Some(free), registry.occupancy()),
+            Some(9 * MIB),
+            "what the cache already holds is room it may keep on holding, \
+             from the moment it holds it"
         );
     }
 
-    /// The publication itself, with no pass behind it: what the timer in
-    /// [`super::start`] does on its first tick, before anything has written
-    /// to the cache or walked it.
+    /// **The cap is sized from both owners of the cache, added.**
+    ///
+    /// A torrent's pieces and a proxied URL's chunks are two disjoint sets
+    /// of bytes on one volume, and a cap sized from either alone is a cap
+    /// over half the cache: a server relaying nothing would state the same
+    /// number as one relaying a film. Neither reading costs a syscall,
+    /// which is what lets [`super::publish_now`] take both on the minute.
+    #[tokio::test]
+    async fn the_cap_is_sized_from_both_owners_of_the_cache() {
+        let free = CACHE_FREE_SPACE_FLOOR + 8 * MIB;
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = Arc::new(StoreRegistry::new(StoreRoot::in_download_dir(tmp.path())));
+        let layout = Arc::new(
+            PieceLayout::new(MIB, 4 * MIB, [FileSpec::payload(4 * MIB)]).expect("a layout"),
+        );
+        let store = PieceStore::under(Arc::clone(&registry), HASH, layout);
+        store.init_for_tests().unwrap();
+        let piece = store.piece_path(0);
+        std::fs::create_dir_all(piece.parent().unwrap()).unwrap();
+        std::fs::write(&piece, vec![7u8; MIB as usize]).unwrap();
+        store.init_for_tests().unwrap();
+
+        let proxy = crate::proxy_retention::ProxyRetention::new(
+            Arc::default(),
+            Arc::default(),
+            Arc::default(),
+        );
+        proxy.counted(2 * MIB);
+
+        assert_eq!(
+            cap_to_publish(
+                u64::MAX,
+                Some(free),
+                registry.occupancy() + proxy.occupancy()
+            ),
+            Some(11 * MIB),
+            "the volume's headroom plus what both owners hold"
+        );
+    }
+
+    /// The publication itself: what the timer in [`super::start`] does on
+    /// its first tick, before anything has written to the cache.
     #[test]
     fn a_budget_published_from_the_volume_alone_is_a_budget_like_any_other() {
-        let passes = CachePasses::default();
         let budget = RetentionBudget::default();
         assert_eq!(
             budget.get(),
@@ -553,122 +437,12 @@ mod tests {
             "nothing has published one yet"
         );
 
-        let cap = cap_to_publish(
-            u64::MAX,
-            Some(CACHE_FREE_SPACE_FLOOR + 8 * MIB),
-            &LastEviction::default(),
-        );
-        publish(&passes, &budget, passes.begin(), cap);
+        let cap = cap_to_publish(u64::MAX, Some(CACHE_FREE_SPACE_FLOOR + 8 * MIB), 0);
+        publish(&budget, cap);
         assert_eq!(
             budget.get(),
             CacheBudget::Bytes(8 * MIB),
             "a reading of the volume is a cap whether or not a walk produced it"
-        );
-    }
-
-    /// **The publisher with its own trigger is not a second, unguarded
-    /// writer -- and the walk it overtakes still hands over its count.**
-    ///
-    /// [`CachePasses`] exists because readings of the volume overlap and
-    /// the one taken last is not the one published last. A publication that
-    /// took its own reading and wrote the cell directly would reintroduce
-    /// exactly that: the minute timer's reading, taken before a client
-    /// lowered `cacheSize` over `POST /cache/clean`, landing on top of the
-    /// pass that answered the client. So this publisher takes a number
-    /// first and publishes through the same claim.
-    ///
-    /// The count is the other half, and it goes the other way. The timer
-    /// takes one `statvfs` and publishes microseconds later, while a walk
-    /// numbers itself and publishes sixteen thousand files afterwards, so
-    /// the walk is the one that gets overtaken -- every time, on the device
-    /// this is for. Dropping its cap costs a stale reading of the volume,
-    /// which the next tick corrects. Dropping its *count* costs the only
-    /// count there is: nothing else in the process walks the tree, so
-    /// [`occupancy_last_counted`] would answer 0 for ever and every tick
-    /// after it would state the volume's bare headroom as the whole budget.
-    #[test]
-    fn an_overtaken_walk_loses_its_cap_but_not_the_count_it_made() {
-        let passes = CachePasses::default();
-        let budget = RetentionBudget::default();
-        let last = LastEviction::default();
-        let free = CACHE_FREE_SPACE_FLOOR + 8 * MIB;
-        let gib = 1024 * MIB;
-
-        // A walk numbers itself and starts reading the tree.
-        let walk = passes.begin();
-        // The minute timer, while it is still going: nothing counted, so
-        // the cap it states is the free space above the floor and nothing
-        // else.
-        let tick = passes.begin();
-        publish(
-            &passes,
-            &budget,
-            tick,
-            cap_to_publish(u64::MAX, Some(free), &last),
-        );
-        assert_eq!(
-            budget.get(),
-            CacheBudget::Bytes(8 * MIB),
-            "the tick states what a volume nobody has counted allows"
-        );
-
-        // And now the walk finishes: three gigabytes of cache counted, and
-        // a cap that says the cache may keep them.
-        let walked = EvictionReport {
-            total: 3 * gib,
-            limit: Some(3 * gib + 8 * MIB),
-            ..EvictionReport::default()
-        };
-        publish_counted(&passes, &budget, &last, walk, &walked);
-
-        assert_eq!(
-            budget.get(),
-            CacheBudget::Bytes(8 * MIB),
-            "the older reading of the volume is still dropped rather than \
-             published over the newer one"
-        );
-        assert_eq!(
-            last.get().map(|(_, report)| report.total),
-            Some(3 * gib),
-            "but what it counted is not dropped with it: nothing else counts"
-        );
-        assert_eq!(
-            cap_to_publish(u64::MAX, Some(free), &last),
-            Some(3 * gib + 8 * MIB),
-            "so the next tick states the cache's own room and not the \
-             volume's bare headroom"
-        );
-    }
-
-    /// **The cap that stands is the newest reading of the volume, not the
-    /// last pass to finish.**
-    ///
-    /// Passes overlap -- the sweep every launch takes runs while the first
-    /// request is being served, and `cacheSize` can be lowered while a walk
-    /// of sixteen thousand files is still going. The pass that finished
-    /// last used to publish, so the launch sweep's ten gigabytes could land
-    /// on top of the eight megabytes a client had just asked for. The
-    /// retention policy is sized from that number and installs no policy at
-    /// all for a budget that covers the entity, so what the stale cap cost
-    /// was not a slightly wrong bound but no bound: every chunk of every
-    /// proxied stream stayed on the disk until something wrote to the cache
-    /// and armed the next pass.
-    #[test]
-    fn a_pass_that_finishes_late_does_not_publish_its_cap_over_a_newer_one() {
-        let passes = CachePasses::default();
-        let launch = passes.begin();
-        let asked_for = passes.begin();
-        let published = std::cell::RefCell::new(Vec::new());
-        passes.publish(asked_for, || {
-            published.borrow_mut().push("the cap asked for")
-        });
-        passes.publish(launch, || published.borrow_mut().push("the launch sweep's"));
-        let next = passes.begin();
-        passes.publish(next, || published.borrow_mut().push("the pass after both"));
-        assert_eq!(
-            *published.borrow(),
-            ["the cap asked for", "the pass after both"],
-            "the older reading, finishing last, is the one that is dropped"
         );
     }
 

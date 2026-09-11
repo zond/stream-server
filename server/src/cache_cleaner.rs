@@ -383,9 +383,14 @@ async fn recover_out_of_space_torrents(state: &AppState, recovery: &mut DiskFull
     }
 }
 
-/// The root, its cap and the protections both [`clean_cache`] and [`usage`]
-/// need, gathered once so the two read `AppState` the same way and can
-/// never disagree about what the cache *is*.
+/// The root, its cap and the protections one [`clean_cache`] pass needs,
+/// gathered once before the walk.
+///
+/// [`usage`] used to be built from the same struct, so that the two could
+/// not disagree about what the cache *is*. It is not any more: the figure
+/// a client reads comes from the owners that hold the bytes, which is the
+/// same question asked of something that already knows the answer, and the
+/// walk is a reading of the disk this pass is about to act on.
 struct CacheRoots {
     /// The one torrent-data root (`settings.cacheRoot`, as the engine
     /// reports it -- never as the setting spells it). Everything a torrent
@@ -520,9 +525,6 @@ async fn clean_cache_with_headroom(
     state: &AppState,
     headroom: u64,
 ) -> anyhow::Result<EvictionReport> {
-    // Before the settings and the volume are read, which is what this
-    // numbers: see [`CachePasses`].
-    let pass = state.cache_passes.begin();
     let roots = cache_roots(state).await;
     // A root that does not exist yet has nothing to walk, but its cap is
     // still what this run enforced.
@@ -556,123 +558,72 @@ async fn clean_cache_with_headroom(
         )
         .await?
     };
-    // This pass is one publisher of the budget among others
-    // (`crate::cache_budget`), distinguished by having just counted the
-    // cache rather than taking the last count on trust -- so it states the
-    // cap through the same writer, in the same order. The count itself is
-    // not the cap's to lose: the walk above is the only thing in the
-    // process that produces one, and the publisher likeliest to overtake it
-    // is the minute timer, which walked nothing. See
-    // `cache_budget::publish_counted`.
-    crate::cache_budget::publish_counted(
-        &state.cache_passes,
-        &state.engine.cache_budget(),
-        &state.last_eviction,
-        pass,
-        &report,
-    );
+    // Nothing is published here. The cap is stated from what the owners of
+    // the cache say they hold (`crate::cache_budget`), which costs no
+    // syscall and is current, so a walk's count is not a second supplier of
+    // the same number -- it is an older reading of it.
     Ok(report)
 }
 
-/// The report of the last pass, kept for a reader that wants to know what
-/// the cache occupies without walking it (see [`LastEviction::get`]).
-///
-/// "Last" is the last pass to *finish walking*, which is not the last to
-/// have read the volume: the cap and the count are ordered by different
-/// keys on purpose (`cache_budget::publish_counted`). A cap is an answer
-/// about the volume and the newest reading of it wins; a count is an answer
-/// about the tree, taken over the whole length of a walk, so the fresher of
-/// two is the one that ended later. Recording it under the cap's claim
-/// instead made this the tighter of the two rules and starved it: a walk
-/// overtaken by the minute timer -- every walk longer than a minute, which
-/// on the device the header describes is every walk -- recorded nothing,
-/// and nothing else in the process counts, so the figure stayed absent for
-/// good.
-///
-/// What that costs is a report here whose `limit` may not be the cap in
-/// force, because the pass that walked can be overtaken between the two.
-/// It describes the walk it came from, which is what this is read for.
-///
-/// The memory sampler is that reader. It used to walk the whole download
-/// dir itself, synchronously, on the runtime, every thirty seconds -- twice
-/// the cleaner's debounce, and a hundred and twenty times its hourly
-/// fallback on an idle device -- for two numbers it then logged once a
-/// minute at most. The cleaner has just counted the same tree: while
-/// something is writing, a minute ago; while nothing is, whenever the tree
-/// last changed, which is when the figure last could have. So the sampler
-/// reads this, with its age, and walks nothing.
-#[derive(Default)]
-pub struct LastEviction(std::sync::Mutex<Option<(std::time::Instant, EvictionReport)>>);
-
-impl LastEviction {
-    pub(crate) fn record(&self, report: &EvictionReport) {
-        if let Ok(mut last) = self.0.lock() {
-            *last = Some((std::time::Instant::now(), report.clone()));
-        }
-    }
-
-    /// The last pass's report and how long ago that pass finished, or
-    /// `None` before the first pass has run (the first fallback tick fires at
-    /// startup, so that is a few seconds at most).
-    pub fn get(&self) -> Option<(Duration, EvictionReport)> {
-        self.0
-            .lock()
-            .ok()?
-            .as_ref()
-            .map(|(at, report)| (at.elapsed(), report.clone()))
-    }
-}
-
 /// What the cache currently occupies against its configured limit
-/// ([`CacheUsage`]), reading exactly what [`evict`] reads: the same
-/// [`WalkInputs`], so there is one implementation of "what the cache
-/// contains" and not two that have to be kept agreeing.
+/// ([`CacheUsage`]), from the owners that hold it rather than from a walk
+/// of it.
 ///
-/// The difference is a rule, not a walk: nothing may age out here (the age
-/// rule is what a pass *acts* on, and this pass acts on nothing), so the
-/// whole of what is on disk is in the total. Shared by
-/// `routes::cache::cache_usage` (`ServerHandle::cache_usage` and
+/// **No listing of the root, and none of the tree.** The piece store counts
+/// its own bytes from the bits it keeps, the proxy cache counts its chunks
+/// as they land and as they go, and the only filesystem work left is one
+/// `read_dir` of the store root for what belongs to no live store at all --
+/// a torrent held in Error, a directory a previous process left. On the
+/// device this exists for that is a handful of syscalls where it used to be
+/// a `statx` of sixteen thousand files, and the answer is current rather
+/// than as old as the walk that produced it.
+///
+/// What it no longer counts is a **legacy whole-file download** left by an
+/// earlier version of this server, which lives beside the store rather than
+/// in it. Nothing owns those bytes and nothing here ever wrote them; the
+/// cache cleaner's walk is what finds and reclaims them, for as long as it
+/// still walks.
+///
+/// Shared by `routes::cache::cache_usage` (`ServerHandle::cache_usage` and
 /// `GET /cache.json`).
 pub(crate) async fn usage(state: &AppState) -> CacheUsage {
-    let roots = cache_roots(state).await;
-    let limit = roots.limit;
-    let inputs = WalkInputs {
-        download_dir: roots.root,
-        store: roots.store,
-        gate: roots.gate,
-        // Not a rule this run: nothing is evicted, so nothing is set aside
-        // for the engine. A stopped torrent's pieces are counted like any
-        // other cache, which is what they are until a pass decides to take
-        // them.
-        stopped: Vec::new(),
-        max_age: Duration::MAX,
-        now: std::time::SystemTime::now(),
+    let configured = {
+        let settings = state.settings.read().await;
+        crate::routes::system::cache_size_bytes(settings.cache_size)
     };
-    // The scan is synchronous filesystem work -- see [`evict`] for why it is
-    // off the runtime -- and a `GET /cache.json` is a request a worker is
-    // serving.
-    tokio::task::spawn_blocking(move || scan_usage(inputs, limit))
-        .await
-        .unwrap_or_else(|error| {
-            // A panic in the scan, in a debug build; the release profile aborts
-            // the process instead. Nothing to report but that nothing was read.
-            error!("the cache usage scan did not finish: {error}");
-            CacheUsage::default()
-        })
+    // The root the session was opened on, not `settings.cacheRoot`, for the
+    // reason [`cache_roots`] gives.
+    let limit = CacheLimit {
+        configured,
+        available: available_space(&state.engine.download_dir),
+    };
+    let torrents = state.engine.cache_holdings().await;
+    let proxy = state.proxy_cache.retention();
+    let protection = proxy.protected().await;
+    cache_usage(torrents, proxy.occupancy(), protection, limit)
 }
 
-/// [`usage`]'s reading, without the `AppState` plumbing: the same
-/// [`WalkInputs::run`] a clean pass makes its decisions from, read as
-/// occupancy against the cap rather than acted on.
-fn scan_usage(inputs: WalkInputs, limit: CacheLimit) -> CacheUsage {
-    let walked = inputs.run();
+/// [`usage`]'s arithmetic, with the `AppState` plumbing taken off: the two
+/// owners' readings against the cap.
+///
+/// Protection is added rather than intersected because the two owners hold
+/// two disjoint sets of bytes -- a piece of a torrent is never a chunk of a
+/// proxied URL -- and each has already made its own sum over sets that do
+/// overlap inside it.
+fn cache_usage(
+    torrents: enginefs::CacheHoldings,
+    proxy_bytes: u64,
+    proxy_protection: crate::proxy_retention::ProxyProtection,
+    limit: CacheLimit,
+) -> CacheUsage {
+    let total_bytes = torrents.total_bytes + proxy_bytes;
     CacheUsage {
-        total_bytes: walked.total_size,
+        total_bytes,
         limit_bytes: limit
-            .effective(walked.total_size)
+            .effective(total_bytes)
             .filter(|limit| *limit != u64::MAX),
-        protected_bytes: walked.protected_size,
-        protected_files: walked.protected_files,
+        protected_bytes: torrents.protected_bytes + proxy_protection.bytes,
+        protected_files: torrents.protected_files + proxy_protection.entities,
     }
 }
 
@@ -707,7 +658,9 @@ pub(crate) use enginefs::chunk_store::occupied_bytes;
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheUsage {
-    /// Occupancy of the walked root right now.
+    /// Occupancy of the torrent store and the proxy cache right now, as
+    /// their owners count it. A whole-file download an earlier version of
+    /// this server left under the root belongs to neither and is not in it.
     pub total_bytes: u64,
     /// The limit actually enforced, in the same accounting: the smaller of
     /// `settings.cacheSize` and what the volume can give while keeping
@@ -715,13 +668,15 @@ pub struct CacheUsage {
     /// anything -- `cacheSize` unlimited (JSON `null`) *and* the volume's
     /// free space unreadable.
     pub limit_bytes: Option<u64>,
-    /// How much of `total_bytes` a clean pass may never touch right now: a
-    /// live engine is writing it, or a pin keeps it (live or dormant). When
+    /// How much of `total_bytes` nothing may take right now: a pin keeps
+    /// it, or it is inside the window of the one stream being played. When
     /// this equals `total_bytes` and the cache is still over `limit_bytes`,
-    /// nothing is evictable -- cleaning cannot help until playback stops or
-    /// something is unpinned.
+    /// nothing is evictable -- cleaning cannot help until playback moves on
+    /// or something is unpinned.
     pub protected_bytes: u64,
-    /// How many files that is.
+    /// How many **files and proxied entities** that is -- not how many
+    /// piece files. A pinned file is one, whatever it is stored as, which
+    /// is the unit a client can put in front of a user.
     pub protected_files: usize,
 }
 
@@ -1461,10 +1416,10 @@ async fn remove_empty_parents(mut dir: &std::path::Path, keep: &std::path::Path)
 mod tests {
     use super::{
         CACHE_FREE_SPACE_FLOOR, CacheLimit, CleanSchedule, DiskFullRecovery, Event, EvictionReport,
-        LastEviction, WALKED_ON_THIS_THREAD, WATCHED_ON, WalkInputs, evict, is_session_artifact,
-        mpsc, occupied_bytes, remove_empty_parents, ring_doorbell, scan_usage, watch_tree,
+        WALKED_ON_THIS_THREAD, WATCHED_ON, cache_usage, evict, is_session_artifact, mpsc,
+        occupied_bytes, remove_empty_parents, ring_doorbell, watch_tree,
     };
-    use enginefs::piece_store::{FileSpec, PieceLayout, PieceStore, StoreRoot};
+    use enginefs::piece_store::{FileSpec, PieceLayout, PieceStore, StoreRegistry, StoreRoot};
     use enginefs::retention::ReclaimGate;
     use futures_util::future::BoxFuture;
     use notify::EventKind;
@@ -1630,19 +1585,6 @@ mod tests {
             0,
         )
         .await
-    }
-
-    /// The inputs `usage` builds: the same scan a pass makes its decisions
-    /// from, with nothing to age out and no rules to order by.
-    fn usage_inputs(download_dir: &Path, gate: &ReclaimGate) -> WalkInputs {
-        WalkInputs {
-            download_dir: download_dir.to_path_buf(),
-            store: store(download_dir),
-            gate: gate.clone(),
-            stopped: Vec::new(),
-            max_age: Duration::MAX,
-            now: SystemTime::now(),
-        }
     }
 
     /// A gate that announces (and so keeps) every piece of `hashes`, and
@@ -2038,8 +1980,7 @@ mod tests {
     /// `made_room()`, `DiskFullRecovery` clears its exhausted set on that and
     /// `restart_from_error` puts the ENOSPC torrents back on a disk that
     /// gained nothing -- the restart loop the guard exists to stop, with the
-    /// guard unable to latch because every pass "made room". The same total
-    /// is recorded in `LastEviction` and read back as the cache's occupancy.
+    /// guard unable to latch because every pass "made room".
     ///
     /// Both eviction rules are here: the aged-out piece goes by the 30-day
     /// rule and the fresh ones by the size rule, and each books what it took
@@ -2586,11 +2527,15 @@ mod tests {
         assert_eq!(report.shortfall_message(), None, "the cache is not over");
     }
 
-    /// [`scan_usage`] is `usage`'s reading (`usage` itself only adds the
-    /// `AppState` plumbing `evict`'s callers already do). It must count a
-    /// sparse file's occupancy honestly too: a "Storage" screen reading
-    /// `len()` would report the whole film as cached before a single byte
-    /// past its first block had landed on disk.
+    /// **A usage figure counts a sparse file by what it allocated**, and
+    /// it is the bytes no live store speaks for that make the question
+    /// arise at all: those are `stat`ed, where a registered torrent's are
+    /// summed from the store's own bits and cannot be sparse.
+    ///
+    /// librqbit's old filesystem storage pre-allocated every file it wanted
+    /// at its full length, so a part-streamed film was a multi-gigabyte
+    /// apparent length over a handful of blocks -- a "Storage" screen
+    /// reading `len()` reported 17 GB on a device holding 3.85 GB.
     #[cfg(unix)]
     #[test]
     fn usage_reports_occupancy_not_apparent_length_for_a_sparse_file() {
@@ -2598,10 +2543,13 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("rqbit-downloads");
-        std::fs::create_dir_all(&root).unwrap();
+        let registry = StoreRegistry::new(store(&root));
+        // A piece of a torrent no store is registered for: a previous
+        // process's, or one this session holds in Error.
+        let sparse = piece_store_for(&root, HASH, 1).piece_path(0);
+        std::fs::create_dir_all(sparse.parent().unwrap()).unwrap();
 
         let apparent = 4u64 << 30;
-        let sparse = root.join("film.mkv");
         let mut file = std::fs::File::create(&sparse).unwrap();
         file.set_len(apparent).unwrap();
         file.seek(SeekFrom::Start(apparent - 1)).unwrap();
@@ -2617,61 +2565,114 @@ mod tests {
             return;
         }
 
-        let usage = scan_usage(
-            usage_inputs(&root, &ReclaimGate::default()),
-            CacheLimit::configured(0),
+        assert_eq!(
+            registry.unregistered_bytes(),
+            allocated,
+            "occupancy, not len()"
         );
-
-        assert_eq!(usage.total_bytes, allocated, "occupancy, not len()");
         assert!(
-            usage.total_bytes < 1 << 20,
+            registry.unregistered_bytes() < 1 << 20,
             "4 GiB of apparent length reported as {} bytes",
-            usage.total_bytes
+            registry.unregistered_bytes()
         );
-        assert_eq!(usage.protected_bytes, 0);
-        assert_eq!(usage.protected_files, 0);
     }
 
-    /// A caller explaining "over the limit but nothing is evictable" needs
-    /// `protected_bytes`/`protected_files` to name exactly what a live
-    /// engine or a pin is holding -- the same set `evict` never touches.
+    /// **The two halves of what the cache holds: a registered store's own
+    /// count, and a `stat` of what no store speaks for.**
+    ///
+    /// A running torrent's occupancy is the bits its store keeps priced by
+    /// the layout -- no syscall, so it is current the instant a piece
+    /// lands. Nothing keeps bits for a directory no store is registered for
+    /// (a previous process's, a torrent held in Error, debris the store
+    /// would never have written), and those bytes are on the volume, so
+    /// they are `stat`ed: a figure that left them out would read smaller
+    /// than the disk does, and a caller told "over the limit and nothing is
+    /// evictable" would see two numbers that do not add up.
+    ///
+    /// The second half is what the owners hand up: protection is theirs to
+    /// decide -- a pin, a live window -- and this only has to add the two
+    /// owners' answers and cap the total.
     #[tokio::test]
-    async fn usage_reports_the_protected_bytes_a_live_engine_holds() {
+    async fn usage_counts_a_registered_store_and_stats_what_no_store_speaks_for() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("rqbit-downloads");
-        let pinned = write_piece(&root, HASH, 0, 8192, Duration::from_secs(600));
-        let free = root.join("Free").join("e1.mkv");
-        write_aged(&free, &[0u8; 4096], Duration::from_secs(600));
-        let protected = torrents(&[HASH]);
-        let pinned_bytes = occupancy(&pinned);
-        let free_bytes = occupancy(&free);
+        let registry = Arc::new(StoreRegistry::new(store(&root)));
+
+        // A registered torrent, holding one piece of its four.
+        let layout = Arc::new(
+            PieceLayout::new(
+                4096,
+                4 * 4096,
+                [FileSpec {
+                    len: 4 * 4096,
+                    padding: false,
+                }],
+            )
+            .unwrap(),
+        );
+        let live = PieceStore::under(Arc::clone(&registry), HASH, layout);
+        live.init_for_tests().unwrap();
+        let piece = live.piece_path(0);
+        std::fs::create_dir_all(piece.parent().unwrap()).unwrap();
+        std::fs::write(&piece, [0u8; 4096]).unwrap();
+        live.init_for_tests().unwrap();
+
+        // And a directory nothing is registered for, with debris in it that
+        // no delete could ever address back.
+        let debris = store(&root).torrent_dir(OTHER_HASH).join("0").join("00");
+        write_aged(&debris, &[0u8; 4096], Duration::from_secs(60));
+        let debris_bytes = occupancy(&debris);
+
+        assert_eq!(registry.occupancy(), 4096, "the bit the store set");
+        assert_eq!(
+            registry.unregistered_bytes(),
+            debris_bytes,
+            "and the directory no store speaks for, `stat`ed"
+        );
 
         // `u64::MAX` is what `cache_size_bytes(None)` produces for an
-        // unlimited cache -- the only value `scan_usage` treats as "no
+        // unlimited cache -- the only value [`cache_usage`] treats as "no
         // limit" (unlike `evict`'s own `limit == 0` shortfall check: `0` is
         // a distinct, explicit zero-size cap, per `ServerSettings.cache_size`
         // -- `Some(0.0)`, not `None` -- and `CacheUsage` must not blur the
         // two the way `EvictionReport::shortfall_message` does).
-        let usage = scan_usage(
-            usage_inputs(&root, &protected),
+        // What the proxy owner would hand up beside it: one chunk of a
+        // stream a player is inside.
+        const CHUNK: u64 = crate::proxy_cache::CHUNK_BYTES;
+        let holdings = enginefs::CacheHoldings {
+            total_bytes: registry.occupancy() + registry.unregistered_bytes(),
+            protected_bytes: 4096,
+            protected_files: 1,
+        };
+        let usage = cache_usage(
+            holdings,
+            CHUNK,
+            crate::proxy_retention::ProxyProtection {
+                bytes: CHUNK,
+                entities: 1,
+            },
             CacheLimit::configured(u64::MAX),
         );
 
-        assert_eq!(usage.total_bytes, pinned_bytes + free_bytes);
-        assert_eq!(usage.protected_bytes, pinned_bytes);
-        assert_eq!(usage.protected_files, 1);
+        assert_eq!(usage.total_bytes, 4096 + debris_bytes + CHUNK);
+        assert_eq!(
+            usage.protected_bytes,
+            4096 + CHUNK,
+            "the two owners hold disjoint bytes, so their protections add"
+        );
+        assert_eq!(usage.protected_files, 2);
         assert_eq!(usage.limit_bytes, None, "u64::MAX means unlimited");
 
         // Reading usage never deletes anything, unlike a clean pass.
-        assert!(pinned.is_file());
-        assert!(free.is_file());
+        assert!(piece.is_file());
+        assert!(debris.is_file());
 
         // A `CacheUsage` crosses `GET /cache.json` and `ServerHandle::cache_usage`
         // as JSON, camelCase like every other response type.
         let json = serde_json::to_value(&usage).unwrap();
-        assert_eq!(json["totalBytes"], pinned_bytes + free_bytes);
-        assert_eq!(json["protectedBytes"], pinned_bytes);
-        assert_eq!(json["protectedFiles"], 1);
+        assert_eq!(json["totalBytes"], 4096 + debris_bytes + CHUNK);
+        assert_eq!(json["protectedBytes"], 4096 + CHUNK);
+        assert_eq!(json["protectedFiles"], 2);
         assert_eq!(json["limitBytes"], serde_json::Value::Null);
     }
 
@@ -3147,37 +3148,6 @@ mod tests {
         };
         assert!(freed_something.made_room());
         assert!(freed_something.shortfall_message().is_none());
-    }
-
-    /// What the memory sampler reads instead of walking: nothing before the
-    /// first pass, and after it the pass's own report with its age.
-    #[test]
-    fn the_last_report_is_kept_with_its_age() {
-        let last = LastEviction::default();
-        assert!(last.get().is_none(), "no pass has run");
-
-        let report = EvictionReport {
-            total: 4096,
-            protected: 1024,
-            protected_files: 1,
-            limit: Some(1 << 30),
-            ..EvictionReport::default()
-        };
-        last.record(&report);
-        let (age, kept) = last.get().expect("a pass has run");
-        assert_eq!(kept, report);
-        assert!(age < Duration::from_secs(60), "recorded just now");
-
-        let next = EvictionReport {
-            total: 2048,
-            ..report.clone()
-        };
-        last.record(&next);
-        assert_eq!(
-            last.get().map(|(_, kept)| kept.total),
-            Some(2048),
-            "the latest pass wins"
-        );
     }
 
     /// **The inotify walk runs on the blocking pool, and the watcher comes

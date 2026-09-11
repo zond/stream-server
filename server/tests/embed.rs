@@ -2855,70 +2855,6 @@ fn content_range_total(response: &reqwest::blocking::Response) -> u64 {
         .expect("the total is a number")
 }
 
-/// **A pass hands the process the count it made, and it is the only thing
-/// that ever does.**
-///
-/// The cap a pass states is one publisher's answer among several
-/// (`server::cache_budget`), and an older reading of the volume is dropped
-/// rather than published over a newer one -- the minute timer takes one
-/// `statvfs` and publishes microseconds later, so it overtakes any walk
-/// longer than a minute, which on a device with sixteen thousand cache
-/// files is every walk. The *count* cannot be dropped with it: nothing
-/// else in the process walks the tree, so a count nobody kept is not stale,
-/// it is absent, and the publisher that reads it then sizes every cap from
-/// an occupancy of nought -- free space alone, on a device whose cache is
-/// most of what is on the volume.
-///
-/// So this asks for a pass and then asks the process what the cache holds.
-/// The cleaner is off, which makes the pass here the only walk there has
-/// been: before it, nothing has counted, and that is a different answer
-/// from zero.
-#[test]
-fn a_pass_that_walked_the_cache_leaves_the_process_its_count() -> anyhow::Result<()> {
-    let config_dir = tempfile::tempdir()?;
-    let cache_dir = tempfile::tempdir()?;
-    let cache_root = resolved(&cache_dir.path().join("cache"));
-    // Ordinary cache from a torrent nothing is tracking any more, so the
-    // walk has something to count.
-    let leftover = cache_root
-        .join("rqbit-downloads")
-        .join("Leftover")
-        .join("old.mkv");
-    std::fs::create_dir_all(leftover.parent().unwrap())?;
-    write_payload(&leftover, 64 * 1024);
-
-    let handle = stream_server::start(ServerConfig {
-        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
-        config_dir: Some(config_dir.path().join("config")),
-        cache_dir: Some(cache_root.clone()),
-        // Off, so the pass below is the only walk in this process: with the
-        // scheduled sweep running there is no moment at which nothing has
-        // counted.
-        enable_cache_cleaner: false,
-        ..offline_config()
-    })?;
-    assert_eq!(
-        handle.last_counted_cache_bytes(),
-        None,
-        "nothing has walked the cache yet, which is not the same as its \
-         holding nothing"
-    );
-
-    let report = handle.clean_cache_now()?;
-    assert!(
-        report.total >= 64 * 1024,
-        "the pass counted the cache it walked: {report:?}"
-    );
-    assert_eq!(
-        handle.last_counted_cache_bytes(),
-        Some(report.total),
-        "and the count it made is the count the process holds"
-    );
-
-    handle.shutdown()?;
-    Ok(())
-}
-
 /// `GET /cache.json` and `POST /cache/clean` share their functions with
 /// `ServerHandle::{cache_usage, clean_cache_now}` -- the replacement for a
 /// client restarting the server just to make the cache cleaner's start-up
@@ -3016,8 +2952,8 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
     // it, so only that leftover is evictable.
     let baseline = handle.cache_usage()?;
     assert_eq!(
-        baseline.protected_files, seeded_pieces,
-        "the pinned torrent's pieces, and nothing else: {baseline:?}"
+        baseline.protected_files, 1,
+        "the pinned file, counted as a file and not as its piece files: {baseline:?}"
     );
     let limit = baseline.protected_bytes + 1;
     handle.update_settings(serde_json::json!({ "cacheSize": limit as f64 }))?;
@@ -3038,8 +2974,9 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
         "the leftovers push the cache over the limit: {http_usage}"
     );
     assert_eq!(
-        http_usage["protectedFiles"], seeded_pieces,
-        "the whole torrent's pieces, not only the pinned file's: {http_usage}"
+        http_usage["protectedFiles"], 1,
+        "the pinned file: a pin is per file, and nothing else here is played \
+         or pinned: {http_usage}"
     );
     assert_eq!(
         http_usage["protectedBytes"], baseline.protected_bytes,
@@ -3066,14 +3003,17 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
         "while the pin's real bytes are untouched: {report}"
     );
     assert_eq!(report["deleted"], 3, "{report}");
-    assert_eq!(report["total"], baseline.protected_bytes, "{report}");
+    // The pass's own numbers are the walk's, and the walk counts piece
+    // files where `GET /cache.json` counts what the owners hold -- so they
+    // are read against each other rather than against the usage figures
+    // above: everything the walk could take, it took, and what is left is
+    // what the gate refused.
     assert_eq!(
-        report["freed"],
-        http_usage["totalBytes"].as_u64().unwrap() - baseline.protected_bytes,
-        "{report}"
+        report["total"], report["protected"],
+        "nothing but the pinned torrent's own pieces is left: {report}"
     );
+    assert!(report["freed"].as_u64().unwrap() > 0, "{report}");
     assert_eq!(report["protectedFiles"], seeded_pieces, "{report}");
-    assert_eq!(report["protected"], baseline.protected_bytes, "{report}");
 
     // clean_cache_now() == POST /cache/clean, run right after over the
     // library instead: nothing is left to evict, but the pinned torrent's

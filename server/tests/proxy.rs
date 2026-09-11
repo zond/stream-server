@@ -1587,6 +1587,57 @@ fn the_cleaner_evicts_cached_proxy_bytes() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// **`GET /cache.json` counts the proxy's chunks as the fill books them,
+/// and names what the stream being played keeps -- with nothing having
+/// walked the tree.**
+///
+/// The figure behind that route used to be an eviction pass's walk of the
+/// whole cache root, so it was as old as the last pass and absent before
+/// the first: a client's "Storage" screen read 0 for the minutes a device
+/// with sixteen thousand files takes to finish one. The two things that put
+/// bytes in this cache count them as they land, so the answer is current
+/// and costs no `statx`.
+#[test]
+fn the_cache_figure_follows_the_chunks_the_proxy_wrote() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let empty = fixture.handle.cache_usage()?;
+    assert_eq!(
+        empty.total_bytes, 0,
+        "nothing has been relayed and no torrent holds anything: {empty:?}"
+    );
+    assert_eq!(empty.protected_bytes, 0);
+
+    let origin = format!("http://{}", fixture.origin.addr);
+    let url = format!("{}/proxy/d={}/movie.mp4", fixture.base, encode(&origin));
+    let response = reqwest::blocking::Client::new()
+        .get(&url)
+        .header(reqwest::header::RANGE, "bytes=0-")
+        .send()?;
+    assert_eq!(response.bytes()?.len(), ORIGIN_LENGTH);
+    fixture.origin.next_request();
+    wait_for_chunks(&fixture, 4);
+    nothing_is_reading(&fixture);
+
+    let cached = cached_chunks(&fixture).len() as u64;
+    let usage = fixture.handle.cache_usage()?;
+    assert_eq!(
+        usage.total_bytes,
+        cached * CHUNK,
+        "every chunk the fill wrote, and no walk of the root to find them: {usage:?}"
+    );
+    // Nothing is bounding this entity -- the volume this test runs on is
+    // roomier than a megabyte -- and it is the stream being played, so no
+    // pass may take any of it and the whole of it is protected.
+    assert_eq!(
+        (usage.protected_bytes, usage.protected_files),
+        (usage.total_bytes, 1),
+        "the one entity a player is inside: {usage:?}"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
 /// **What empties a proxied stream's cache is another one being opened.**
 ///
 /// Not a clock, which is what it used to be: an entity nothing was reading

@@ -12,6 +12,11 @@ test-roots = []
 # have no engine to go through. Off in every release build, so the cleaner
 # cannot reach the unlink in production -- see `piece_store::store`.
 test-unlink = []
+# Lets a test seed and register a piece store without a librqbit session
+# behind it -- what `server`'s cache-usage tests need in order to count the
+# bytes of a registered torrent. Off in every release build, so nothing but a
+# session's own `init` can put a store in the registry there.
+test-seed = []
 # Lets a test put a closure inside a retention pass -- before its listing,
 # and again before its unlinks -- which is the one place no test can reach
 # from outside: see `retention::owner`. `server` turns it on through its

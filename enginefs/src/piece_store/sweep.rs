@@ -170,7 +170,7 @@ pub fn sweep_unadopted(root: &StoreRoot, adopted: &HashSet<String>) -> SweepRepo
         // bucketing is `StoreRoot`'s and this is the same reading the cache
         // cleaner gets.
         let freed = match (is_dir, name) {
-            (true, Some(name)) => occupancy(&store.stat(name)),
+            (true, Some(name)) => store.stat(name).occupancy(),
             _ => 0,
         };
         let removed = if is_dir {
@@ -191,22 +191,6 @@ pub fn sweep_unadopted(root: &StoreRoot, adopted: &HashSet<String>) -> SweepRepo
         }
     }
     report
-}
-
-/// What one torrent's directory occupies, in the one occupancy accounting
-/// this repository has ([`crate::chunk_store::occupied_bytes`]): allocated
-/// blocks, never apparent length.
-///
-/// Strays included: this is about to remove the directory whole, so what
-/// leaves the disk with it is what it holds, piece file or not.
-fn occupancy(stored: &super::store::StoredTorrent) -> u64 {
-    stored
-        .pieces
-        .iter()
-        .flat_map(|piece| piece.files())
-        .chain(stored.strays.iter())
-        .map(crate::chunk_store::occupied_bytes)
-        .sum()
 }
 
 #[cfg(test)]

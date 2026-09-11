@@ -55,14 +55,6 @@ pub struct AppState {
     /// two callers with two of these would each consume windows the other
     /// never sees.
     pub traffic_window: Arc<enginefs::traffic::TrafficWindow>,
-    /// What the cache cleaner's last pass found (see
-    /// `cache_cleaner::LastEviction`), for the memory sampler to log the
-    /// cache's size from rather than walking the tree itself.
-    pub last_eviction: Arc<crate::cache_cleaner::LastEviction>,
-    /// Which cache pass's reading of the volume is the newest, so an older
-    /// one that finished later does not publish its cap over it (see
-    /// `cache_budget::CachePasses`).
-    pub cache_passes: Arc<crate::cache_budget::CachePasses>,
 }
 
 impl AppState {
@@ -126,8 +118,6 @@ impl AppState {
             lan_media: Arc::new(crate::lan_media::LanMedia::new(None)),
             https,
             traffic_window: Arc::new(enginefs::traffic::TrafficWindow::new()),
-            last_eviction: Arc::default(),
-            cache_passes: Arc::default(),
         }
     }
 

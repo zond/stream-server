@@ -782,6 +782,25 @@ pub struct ReclaimVerdicts {
     pub stopped_for_space: Vec<String>,
 }
 
+/// What the torrent cache holds and what nothing may take from it, as the
+/// owners know it -- [`BackendEngineFS::cache_holdings`].
+///
+/// The replacement for a walk of the tree. Every byte under the piece store
+/// is in `total_bytes`: a running store counts its own from the bits it
+/// keeps, with no syscall at all, and what belongs to no store is `stat`ed
+/// on demand. `protected_bytes` is the part a pin or a live window keeps,
+/// which is what a caller shown "over the limit" needs in order to know
+/// whether anything can be done about it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CacheHoldings {
+    /// Occupancy of the whole piece store.
+    pub total_bytes: u64,
+    /// How much of it a pin or a live window keeps.
+    pub protected_bytes: u64,
+    /// How many files that is.
+    pub protected_files: usize,
+}
+
 pub type EngineFS = BackendEngineFS<LibrqbitBackend>;
 
 /// Undoes what [`BackendEngineFS::on_stream_start`] registered, if that call
@@ -2451,6 +2470,69 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             verdicts.gate.insert_announced(pin.info_hash.to_lowercase());
         }
         verdicts
+    }
+
+    /// What every registered store holds, in bytes, by the bits it keeps:
+    /// no syscall, no listing, no walk.
+    ///
+    /// The disk arm of the published cap is sized from this
+    /// (`server::cache_budget`), which is why it may not cost anything: it
+    /// is read on a timer, and the figure it replaced was whatever an
+    /// eviction pass had last counted -- 0 until the first walk of the root
+    /// finished, which on a television with sixteen thousand cache files is
+    /// minutes after the first stream opened.
+    ///
+    /// What it does **not** count is what no store speaks for: strays, and
+    /// a torrent held in Error. Those are read by
+    /// [`Self::cache_holdings`], on demand, because reading them costs a
+    /// `read_dir`.
+    pub fn cache_occupancy(&self) -> u64 {
+        self.registry.occupancy()
+    }
+
+    /// What the piece store holds and what nothing may take from it, whole:
+    /// [`Self::cache_occupancy`] plus the bytes no store speaks for, and
+    /// the pins and live windows that keep part of it.
+    ///
+    /// The reading behind `GET /cache.json`. It is the on-demand half of
+    /// the pair: one `read_dir` of the store root on the blocking pool for
+    /// the unregistered bytes, and a copy-out per engine for the
+    /// protections. Nothing here is on a tick, and nothing here walks the
+    /// tree.
+    ///
+    /// Taken over several instants -- the registry's sum, then the
+    /// directory listing, then the engines one after another -- so what it
+    /// answers is a reading of a moving cache and not a transaction over
+    /// it. That is what a usage figure has always been; what it no longer
+    /// is, is minutes old.
+    pub async fn cache_holdings(&self) -> CacheHoldings {
+        let registry = self.registry.clone();
+        // A `read_dir` of the root and a `stat` per unadopted directory:
+        // filesystem work, and this is called from a request a worker is
+        // serving.
+        let unregistered = tokio::task::spawn_blocking(move || registry.unregistered_bytes())
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "the piece store's unregistered bytes could not be read");
+                0
+            });
+        let mut holdings = CacheHoldings {
+            total_bytes: self.cache_occupancy() + unregistered,
+            ..CacheHoldings::default()
+        };
+        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
+        for engine in engines {
+            // No registration is no reading, never an empty one: a torrent
+            // in Error holds no storage, and its bytes are in the
+            // unregistered half above with nothing protecting them.
+            let Some(held) = self.registry.held(&engine.info_hash.to_lowercase()) else {
+                continue;
+            };
+            let protected = engine.protects(&held).await;
+            holdings.protected_bytes += held.bytes_of(&protected.pieces);
+            holdings.protected_files += protected.files.len();
+        }
+        holdings
     }
 
     /// The piece store this engine's data is in:
@@ -10294,6 +10376,86 @@ mod tests {
                 ahead_bytes: 25,
             }),
             "piece four is behind the playhead and piece five is under it;              the four pieces of the other episode are not this stream's to              scrub back into"
+        );
+    }
+
+    /// **What the cache holds is the store's own count, and what no pass
+    /// may take is a pin or a live window -- neither read off the disk.**
+    ///
+    /// The figure behind `GET /cache.json` used to be an eviction pass's
+    /// walk: a `statx` of every file in the tree, so it was as old as the
+    /// last pass and absent before the first. The store keeps a bit per
+    /// piece it holds and the layout that prices each bit, so the total is
+    /// a sum in memory, and the two claims on it are the owners' own --
+    /// which is why a file nobody is playing and nobody has pinned protects
+    /// nothing, however many bytes of it are on the disk.
+    #[tokio::test]
+    async fn the_cache_figure_is_the_stores_count_and_the_owners_protections() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        // Two pieces of budget over a four-piece file: a split, so a policy
+        // is installed and a window is something less than the whole file.
+        enginefs.set_cache_budget(Some(50));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in [0u32, 1, 2, 3] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let _store = seeded_store(&enginefs, &engine);
+
+        let idle = enginefs.cache_holdings().await;
+        assert_eq!(idle.total_bytes, 100, "four pieces of twenty-five bytes");
+        assert_eq!(
+            (idle.protected_bytes, idle.protected_files),
+            (0, 0),
+            "nobody is playing it and nobody pinned it, so nothing holds it"
+        );
+
+        // Now it is the stream being played, with a pass behind it.
+        enginefs.on_stream_start(TEST_HASH, 0).await;
+        engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
+        engine
+            .retain(enginefs.store_registry(), &playing(0))
+            .await
+            .expect("a pass ran");
+        let live = enginefs.cache_holdings().await;
+        assert_eq!(live.total_bytes, 100, "a pass that kept its window");
+        assert_eq!(live.protected_files, 1);
+        assert!(
+            live.protected_bytes > 0 && live.protected_bytes < 100,
+            "the window and the committed half, not the whole file: {live:?}"
+        );
+
+        // And a pin keeps every piece of its file, window or no window.
+        engine.pinned_files.write().insert(0);
+        let pinned = enginefs.cache_holdings().await;
+        assert_eq!(
+            (pinned.protected_bytes, pinned.protected_files),
+            (100, 1),
+            "a pin is the user asking for the file, not for a window of it"
+        );
+
+        // And a directory no store speaks for -- a torrent this session
+        // holds in Error, or one a previous process left. No bits are kept
+        // for it, so it is the one thing here that costs a `stat`; it is on
+        // the volume, so it is in the total, and nothing speaks for it, so
+        // nothing protects it.
+        let orphan = enginefs
+            .piece_store()
+            .torrent_dir("89abcdef0123456789abcdef0123456789abcdef")
+            .join("0");
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(orphan.join("0"), [3u8; 40]).unwrap();
+        let stray_bytes =
+            crate::chunk_store::occupied_bytes(&std::fs::metadata(orphan.join("0")).unwrap());
+        let with_stray = enginefs.cache_holdings().await;
+        assert_eq!(with_stray.total_bytes, 100 + stray_bytes);
+        assert_eq!(
+            (with_stray.protected_bytes, with_stray.protected_files),
+            (100, 1),
+            "the pin still, and nothing new"
         );
     }
 

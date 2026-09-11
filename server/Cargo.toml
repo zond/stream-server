@@ -104,7 +104,12 @@ sysinfo = "0.39.5"
 # owner's test hook, which is how a proxy test stands inside a pass. Feature
 # unification keeps this to test builds -- `cargo build --release` never sees
 # it.
-enginefs = { path = "../enginefs", features = ["test-roots", "test-unlink", "test-hooks"] }
+enginefs = { path = "../enginefs", features = [
+    "test-roots",
+    "test-unlink",
+    "test-hooks",
+    "test-seed",
+] }
 # Generates that fixture's CA and leaf at run time. The old fixture shipped a
 # self-signed CA certificate used as an end entity, which rustls refuses
 # whatever it is trusted as, so it could only ever be the unverifiable case.

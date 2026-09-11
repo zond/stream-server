@@ -150,7 +150,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
-#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
 use std::time::Duration;
@@ -238,6 +237,11 @@ struct ProxyBacking {
     /// thread per chunk, which is why [`Live::is_proxy`] borrows rather
     /// than clones.
     live: Arc<Live>,
+    /// What this cache holds, counted as it is written and as it goes:
+    /// [`ProxyRetention::occupancy`]. The reclaim below is the only place
+    /// the owner takes a chunk off the disk, so it is the only place the
+    /// count comes down.
+    occupancy: Arc<AtomicU64>,
     /// The threads the blocking halves of a pass really ran on.
     ///
     /// A `#[tokio::test]` drives its runtime on the test's own thread, so
@@ -417,7 +421,17 @@ impl Backing for ProxyBacking {
                 if door.refuses(index) {
                     continue;
                 }
-                if std::fs::remove_file(dir.chunk_path(u64::from(index))).is_ok() {
+                let path = dir.chunk_path(u64::from(index));
+                // Measured before the unlink, because after it there is
+                // nothing to measure: the count this comes off is the one
+                // the fill added when the chunk landed, and a chunk that
+                // will not `stat` is one this run books as freeing nothing
+                // rather than as freeing a guess.
+                let bytes = std::fs::metadata(&path)
+                    .map(|metadata| enginefs::chunk_store::occupied_bytes(&metadata))
+                    .unwrap_or(0);
+                if std::fs::remove_file(&path).is_ok() {
+                    uncount(&backing.occupancy, bytes);
                     freed += 1;
                 }
             }
@@ -434,10 +448,25 @@ impl ProxyBacking {
     fn probe(&self) -> ProxyBacking {
         ProxyBacking {
             live: self.live.clone(),
+            occupancy: self.occupancy.clone(),
             #[cfg(test)]
             disk_threads: self.disk_threads.clone(),
         }
     }
+}
+
+/// Take `bytes` off a running count of what the cache holds, saturating at
+/// nothing.
+///
+/// The floor is not defensive arithmetic, it is the honest answer to a
+/// count that cannot hear every deleter: while the cache cleaner still
+/// walks this root it unlinks chunks by path, and those bytes are never
+/// taken off here. A count that went negative would wrap to the whole of a
+/// `u64` and state a cap of everything.
+fn uncount(counter: &AtomicU64, bytes: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+        Some(held.saturating_sub(bytes))
+    });
 }
 
 /// A chunk index in the policy's `u32` index space. An index a `u32` cannot
@@ -486,6 +515,9 @@ pub struct ProxyRetention {
     /// `spawn_blocking` calls inside a pass it would say the cache had
     /// stopped moving at the very moments it is deciding what to move.
     work: Arc<crate::proxy_cache::DiskWork>,
+    /// What this cache holds, in bytes, counted as chunks are written and
+    /// as they go: see [`Self::occupancy`].
+    occupancy: Arc<AtomicU64>,
     /// The one place a test can be *inside* a pass.
     ///
     /// A pass reads the playheads, lists the entity's directories and
@@ -516,6 +548,16 @@ pub struct ProxyRetention {
     disk_threads: Arc<Mutex<Vec<std::thread::ThreadId>>>,
 }
 
+/// What the proxy cache keeps for the streams somebody is inside
+/// ([`ProxyRetention::protected`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ProxyProtection {
+    /// Bytes on the disk that no pass may take.
+    pub bytes: u64,
+    /// How many entities they belong to.
+    pub entities: usize,
+}
+
 /// One open read: a handle that holds its promise and carries its playhead.
 ///
 /// Dropping it is what says the read is over -- the body ended, or the
@@ -535,9 +577,11 @@ impl ProxyRetention {
     ) -> Self {
         #[cfg(test)]
         let disk_threads: Arc<Mutex<Vec<std::thread::ThreadId>>> = Arc::default();
+        let occupancy: Arc<AtomicU64> = Arc::default();
         let owner = Retention::new(
             Arc::new(ProxyBacking {
                 live: live.clone(),
+                occupancy: occupancy.clone(),
                 #[cfg(test)]
                 disk_threads: disk_threads.clone(),
             }),
@@ -564,6 +608,7 @@ impl ProxyRetention {
             owner,
             live,
             work,
+            occupancy,
             #[cfg(test)]
             interleave,
             #[cfg(test)]
@@ -729,6 +774,90 @@ impl ProxyRetention {
         self.owner.readers()
     }
 
+    /// What this cache holds, in bytes, as it has been counted rather than
+    /// as anything walked it.
+    ///
+    /// **A running total, and the two places it moves are the two places
+    /// the proxy's bytes move**: a chunk renamed into place by a fill adds
+    /// what it occupies, and a chunk the owner unlinks takes it off again.
+    /// So the figure costs nothing to read and is right the moment it is
+    /// read, where the number it replaced was whatever an eviction pass had
+    /// last counted -- 0 until the first walk of the root finished.
+    ///
+    /// What it cannot hear, named rather than implied: the cache cleaner
+    /// still walks this root and unlinks chunks by path, and those bytes
+    /// stay in this count until the process restarts. It is the last
+    /// deleter that does not come through the owner, and it goes with the
+    /// walk. Chunks a *previous* process left are not in the count either,
+    /// because nothing here wrote them; the launch sweep is what makes 0
+    /// the truth at boot.
+    pub fn occupancy(&self) -> u64 {
+        self.occupancy.load(Ordering::Relaxed)
+    }
+
+    /// Book `bytes` this cache has just written.
+    pub(crate) fn counted(&self, bytes: u64) {
+        self.occupancy.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Take `bytes` this cache no longer holds off the count.
+    pub(crate) fn uncounted(&self, bytes: u64) {
+        uncount(&self.occupancy, bytes);
+    }
+
+    /// What a live proxied entity keeps, in bytes, and how many entities
+    /// that is: the proxy's half of `GET /cache.json`'s protection.
+    ///
+    /// Live is the same question [`Self::drop_slack`] asks and the same
+    /// answer: the entity the cell names, and any entity an open body is
+    /// still reading. What such an entity keeps is what a pass concluded
+    /// -- its windows -- plus what an open body was promised, and, for an
+    /// entity nothing bounds or nothing has measured yet, the whole of it,
+    /// exactly as [`Self::fill_gate`] tells the cleaner.
+    ///
+    /// It lists the entity's directory, so what it reports is the window's
+    /// chunks that are really on the disk and not the window's own size. On
+    /// the blocking pool, one listing per live entity, and only from
+    /// `GET /cache.json`.
+    pub async fn protected(&self) -> ProxyProtection {
+        let live = self.live.reading();
+        let mut protection = ProxyProtection::default();
+        for (key, holding) in self.owner.holdings() {
+            if !live.is_proxy(&key) && self.owner.readers_of(&key) == 0 {
+                continue;
+            }
+            protection.entities += 1;
+            let mut kept: BTreeSet<u32> = BTreeSet::new();
+            for range in holding.windows.iter().chain(holding.promised.iter()) {
+                kept.extend(range.clone());
+            }
+            // Nothing bounds this entity -- the budget covers it, the volume
+            // has no cap, or no pass has measured it yet -- so while it is
+            // live nothing reclaims any of it, and what it keeps is the whole
+            // of it. The same answer [`Self::fill_gate`] gives the cleaner,
+            // and the same one the torrent side gives for a live file with no
+            // policy standing.
+            if holding.installed.is_none() || (holding.windows.is_empty() && holding.live_playhead)
+            {
+                kept.extend(0..index(holding.domain.chunks()));
+            }
+            let dir = holding.domain.dir.clone();
+            let total = holding.domain.total;
+            // No listing, no answer for this entity: a protection figure
+            // built over a directory nobody could read would report the
+            // window's size where the disk holds part of it.
+            let Ok(Some(held)) = tokio::task::spawn_blocking(move || dir.held().ok()).await else {
+                continue;
+            };
+            for chunk in held {
+                if u32::try_from(chunk).is_ok_and(|chunk| kept.contains(&chunk)) {
+                    protection.bytes += crate::proxy_cache::chunk_len(chunk, total);
+                }
+            }
+        }
+        protection
+    }
+
     /// Whether this path is still outside every live window, asked at the
     /// instant of the unlink rather than read from a gate.
     ///
@@ -871,6 +1000,14 @@ impl Reader {
             return;
         }
         self.inner.promises(index(chunks.start)..index(chunks.end));
+    }
+
+    /// The owner this read belongs to, for the fill that is writing its
+    /// chunks: what lands on the disk is counted there
+    /// ([`ProxyRetention::occupancy`]), and the write happens on a blocking
+    /// task that cannot borrow this handle.
+    pub(crate) fn retention(&self) -> Arc<ProxyRetention> {
+        self.retention.clone()
     }
 
     /// A byte at `delivered_to` of this entity has reached a player.

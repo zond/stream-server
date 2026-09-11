@@ -3,7 +3,7 @@ use crate::backend::{
     priorities::{self, BufferProfile, PlaybackIntent},
 };
 use crate::cache::DataCache;
-use crate::piece_store::{RetentionPolicy, Share, StoreRegistry};
+use crate::piece_store::{HeldSnapshot, RetentionPolicy, Share, StoreRegistry};
 use crate::retention::live::{Live, Reading};
 use crate::retention::owner::{Backing, Door, Install, InstalledView, Mode, Retention, Trigger};
 use anyhow::Context;
@@ -307,6 +307,21 @@ pub(crate) struct FileStanding {
     /// whole, so telling the cleaner they are announced would leave them
     /// for a deleter that is already deleting them.
     pub mode: Mode,
+}
+
+/// What a pin or a live window keeps of one torrent ([`Engine::protects`]).
+///
+/// Pieces rather than bytes, and a set of file indices rather than a count,
+/// because two claims can name one piece -- a pinned file and the live
+/// file share their boundary piece, and two windows in one file overlap --
+/// and a figure that added them up would report more protection than there
+/// are bytes on the disk.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Protected {
+    /// The held pieces nothing may take.
+    pub pieces: BTreeSet<u32>,
+    /// The files they are the pieces of.
+    pub files: BTreeSet<usize>,
 }
 
 /// The file whose standing policy governs `piece`: the lowest-numbered of
@@ -1274,6 +1289,62 @@ impl<H: TorrentHandle> Engine<H> {
             .collect();
         policies.sort_by_key(|policy| policy.file_idx);
         policies
+    }
+
+    /// What no pass may take of this torrent right now: the held pieces a
+    /// pin or a live window keeps, and which files they belong to.
+    ///
+    /// The two claims a usage figure reports as protected, and the only two
+    /// there are. A **pin** keeps every piece of its file for as long as it
+    /// stands, whatever any window says. A **[`Mode::Live`] entity** keeps
+    /// what its last pass concluded -- the windows round its heads, plus
+    /// the half it has committed for sharing, which is advertised and never
+    /// reclaimed. An entity nothing bounds has no policy and no window, and
+    /// while it is live nothing reclaims any of it, so what it keeps is its
+    /// whole extent.
+    ///
+    /// Everything else is slack: its bytes go at the next pass, so calling
+    /// them protected would be telling a caller that a shortfall has no
+    /// remedy when the remedy is already running.
+    ///
+    /// `held` is the reading the bytes are counted against, taken by the
+    /// caller: a window over pieces we have not fetched is not occupancy,
+    /// so a piece is in the answer only if the store had it when that
+    /// reading was taken.
+    pub(crate) async fn protects(&self, held: &HeldSnapshot) -> Protected {
+        let mut protected = Protected::default();
+        for file_idx in self.pinned_file_indices() {
+            // A file the backend cannot name pieces for -- no metadata --
+            // has nothing on the disk to protect yet.
+            if let Some(span) = self.handle.file_pieces(file_idx).await {
+                protected.pieces.extend(held.in_range(span.pieces));
+                protected.files.insert(file_idx);
+            }
+        }
+        let live = self.live.reading();
+        for (file_idx, holding) in self.retention.holdings() {
+            if !matches!(self.mode_of(&live, file_idx), Mode::Live) {
+                continue;
+            }
+            protected.files.insert(file_idx);
+            match &holding.installed {
+                Some(view) => {
+                    for window in &holding.windows {
+                        protected.pieces.extend(held.in_range(window.clone()));
+                    }
+                    protected.pieces.extend(
+                        view.committed
+                            .iter()
+                            .copied()
+                            .filter(|piece| held.contains(*piece)),
+                    );
+                }
+                None => protected
+                    .pieces
+                    .extend(held.in_range(holding.extent.clone())),
+            }
+        }
+        protected
     }
 
     /// What a pass over `file_idx` would be for, from `live`.
