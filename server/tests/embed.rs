@@ -1922,10 +1922,13 @@ fn the_cache_root_setting_decides_where_the_next_session_opens() -> anyhow::Resu
 /// location. A restart on the same dirs, with the embedder handing the pin
 /// back in, restores the torrent with its pin and the pinned file's pieces.
 ///
-/// What a pin keeps is the **file**: e2's pieces, 2 and 3 (piece 2 is the
-/// one e1 ends in, and it is kept because e2 needs it). e1 is not pinned and
-/// not playing, so its own pieces, 0 and 1, are the retention owner's to
-/// take at any tick -- which is why nothing here asserts on them.
+/// What a pin keeps is the **file**: every piece of e2, the boundary piece
+/// it shares with e1 among them, kept because e2 needs it. e1 is not pinned
+/// and not playing, so the pieces that are only its own are the retention
+/// owner's to take at any tick -- which is why nothing here asserts on
+/// them. Which pieces are e2's is read off its offset in the stats: the
+/// torrent's file order is the order the directory walk met the files in,
+/// which the fixture does not control (see `file_index`).
 #[test]
 fn a_pin_moves_nothing_and_survives_a_restart() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -1970,6 +1973,15 @@ fn a_pin_moves_nothing_and_survives_a_restart() -> anyhow::Result<()> {
     assert_eq!(stats["files"][1]["complete"], true, "{stats}");
     assert_eq!(stats["pinnedFiles"], serde_json::json!([]));
     let idx = file_index(&stats, "e2.bin");
+    // e1 is 40 KiB and e2 24 KiB, in 16 KiB pieces: e2 is pieces 2 and 3
+    // when it comes second and 0 and 1 when it comes first, and the order
+    // is `create_torrent`'s directory walk. Hardcoded as 2 and 3, this
+    // failed on the runners whose file system lists e2 first.
+    const PIECE: u64 = 16 * 1024;
+    let e2_offset = stats["files"][idx]["offset"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("e2 has no offset in {stats}"));
+    let e2_pieces: Vec<u64> = (e2_offset / PIECE..=(e2_offset + 24 * 1024 - 1) / PIECE).collect();
 
     // Pin: nothing moves, and the name the backend gives the file is the
     // one it gave it before.
@@ -1988,8 +2000,6 @@ fn a_pin_moves_nothing_and_survives_a_restart() -> anyhow::Result<()> {
     // A whole file is produced nowhere at all: the torrent's bytes are
     // piece files under the store's one root.
     assert!(!root_folder.join("e2.bin").exists(), "no whole file");
-    // e1 is 40 KiB and e2 24 KiB in 16 KiB pieces: e2 is pieces 2 and 3.
-    let e2_pieces = [2u64, 3];
     assert_eq!(seeded_pieces, 4);
     let held = held_piece_indices(&cache_root, &info_hash);
     assert!(
