@@ -5,7 +5,7 @@ use crate::backend::{
 use crate::cache::DataCache;
 use crate::piece_store::{HeldSnapshot, RetentionPolicy, Share, StoreRegistry};
 use crate::retention::live::{Live, Reading};
-use crate::retention::owner::{Backing, Door, Install, InstalledView, Mode, Retention, Trigger};
+use crate::retention::owner::{Backing, Door, Install, Mode, Retention, Trigger};
 use anyhow::Context;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ops::Range;
@@ -275,37 +275,32 @@ const NEVER_MOVED: u64 = u64::MAX;
 pub const STOPPED_FOR_SPACE_MESSAGE: &str =
     "the torrent is stopped for want of disk space; free some space and it will resume";
 
-/// One torrent's standing with the cache cleaner: what it will give up,
-/// and whether it is one of the torrents the cleaner is evicting *for*.
+/// What one torrent's policies say, as a value: the reading a test takes
+/// of cells the owner keeps under its own locks.
 ///
-/// The walk collects one of these per engine into a
-/// [`crate::retention::ReclaimGate`] and the delete asks for it again --
-/// see [`Engine::standing`], which is the one place it is computed.
+/// **Test-only, and that is what is left of it.** It used to be the cache
+/// cleaner's gate -- what this torrent would let a walk of the disk take --
+/// asked once before the walk and again at each delete. Nothing walks the
+/// disk any more and nothing outside this crate deletes a piece, so what
+/// remains is the copy-out itself, which is how a test reads a policy
+/// without reaching into the owner's locks. See [`Engine::standing`].
+#[cfg(test)]
 pub(crate) struct Standing {
-    pub gate: crate::retention::TorrentGate,
-    /// Every policy standing on this torrent, in file order, from the one
-    /// copy-out the gate was built from -- whatever the gate's shape, so a
-    /// delete can find the turn a piece is ordered under even where the pin
-    /// or the error state answered for the torrent. Empty when none stands.
+    /// Every policy standing on this torrent, in file order, from one
+    /// copy-out. Empty when none stands.
     pub policies: Vec<FileStanding>,
-    /// The backend stopped this torrent for want of space, or the
-    /// reconciler did before the backend could: the cleaner has bytes to
-    /// find for it.
-    pub stopped_for_space: bool,
 }
 
 /// One file's standing policy, as a value.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FileStanding {
     /// The file the policy is over -- the key its turn is taken under.
     pub file_idx: usize,
     /// The policy itself.
-    pub view: InstalledView,
+    pub view: crate::retention::owner::InstalledView,
     /// What the next pass over this file will be, from the reading taken
-    /// when this standing was built. A [`Mode::Slack`] policy protects
-    /// nothing it committed: its pieces are on their way off the disk
-    /// whole, so telling the cleaner they are announced would leave them
-    /// for a deleter that is already deleting them.
+    /// when this standing was built.
     pub mode: Mode,
 }
 
@@ -322,16 +317,6 @@ pub(crate) struct Protected {
     pub pieces: BTreeSet<u32>,
     /// The files they are the pieces of.
     pub files: BTreeSet<usize>,
-}
-
-/// The file whose standing policy governs `piece`: the lowest-numbered of
-/// those whose range holds it, so the boundary piece two files share is
-/// always the first file's to order. `None` when no policy's range holds it.
-fn file_governing(policies: &[FileStanding], piece: u32) -> Option<usize> {
-    policies
-        .iter()
-        .find(|policy| policy.view.pieces.contains(&piece))
-        .map(|policy| policy.file_idx)
 }
 
 /// How far ahead of its opening offset a reader may fetch, as
@@ -878,8 +863,8 @@ pub struct Engine<H: TorrentHandle> {
     pub(crate) retention: Arc<Retention<TorrentBacking<H>>>,
     /// Which entity the server is playing, shared with the whole process.
     /// Read for a fresh copy where a caller needs one of its own -- the
-    /// cleaner's standing, the switch task -- and handed to the pass by the
-    /// tick, which takes one reading for the ladder and the pass together.
+    /// switch task, a usage figure -- and handed to the pass by the tick,
+    /// which takes one reading for the ladder and the pass together.
     live: Arc<Live>,
     /// The turn for the pieces no entity's extent covers: the files of this
     /// torrent nothing has opened in this process, which have no entity and
@@ -1040,17 +1025,16 @@ impl<H: TorrentHandle> Engine<H> {
     /// `crate::reconcile::line`, which is the floor plus
     /// `FREE_SPACE_RESUME_MARGIN`; the stall clock that fails its reads is
     /// started at the same line. `is_stopped_for_space` measures at the
-    /// floor alone, deliberately, because eviction and the 507 gate are
-    /// about whether there is room *now*.
+    /// floor alone, deliberately, because the 507 gate is about whether
+    /// there is room *now*.
     ///
-    /// So for a volume between the two -- which is exactly where a cleaner
-    /// pass leaves it, since `CacheLimit::effective` stops the instant
-    /// `available` reaches the floor -- the reconciler stopped the torrent
-    /// and failed its reads while every reader that asks "is anything
-    /// wrong?" was told no: `stats.json` reported buffering with no error,
-    /// and `out_of_space_torrents` returned nothing, so the cleaner was
-    /// never asked to free the space that would end it. A pinned download
-    /// stalled at whatever percent it had reached, in silence, for good.
+    /// So for a volume between the two -- which is exactly where a volume
+    /// that has just given its slack back sits, since `CacheLimit::effective`
+    /// stops the instant `available` reaches the floor -- the reconciler
+    /// stopped the torrent and failed its reads while every reader that asks
+    /// "is anything wrong?" was told no: `stats.json` reported buffering
+    /// with no error. A pinned download stalled at whatever percent it had
+    /// reached, in silence, for good.
     ///
     /// Readers that report a condition or ask for room use this. Readers
     /// that decide whether *this request* can proceed keep the floor: a
@@ -1085,19 +1069,16 @@ impl<H: TorrentHandle> Engine<H> {
     /// payload under it.
     ///
     /// **At [`crate::CACHE_FREE_SPACE_FLOOR`], not at the reconciler's
-    /// hysteresis line.** The two readers of this are a client's statistics
-    /// (`phase: error`, [`STOPPED_FOR_SPACE_MESSAGE`]) and the cache
-    /// cleaner's eviction classes, and both are asking about the *device*,
-    /// which the rest of this server judges at the floor: it is what
+    /// hysteresis line.** What reads this is a client's statistics
+    /// (`phase: error`, [`STOPPED_FOR_SPACE_MESSAGE`]) and the stream
+    /// route's disk gate, and both are asking about the *device*, which the
+    /// rest of this server judges at the floor: it is what
     /// `ensure_download_disk_ready` answers `507` under and what the
-    /// cleaner's cap keeps free. Judging it at floor + resume margin
+    /// published cap keeps free. Judging it at floor + resume margin
     /// instead -- the line the *ladder* holds a stopped torrent at, so that
     /// it has room to run into before it is started again -- tells a client
     /// that a volume the stream route is serving from happily is out of
-    /// disk, and moves every torrent that merely happens to be paused
-    /// inside the band out of `EvictionClasses::protected` and into
-    /// `stopped_for_space`, whose files the cleaner will unlink piecemeal
-    /// under a torrent that still holds them open.
+    /// disk.
     ///
     /// It used to be a bit set when the free-space watch stopped a torrent
     /// and cleared when something started it again, and that bit was wrong
@@ -1111,9 +1092,8 @@ impl<H: TorrentHandle> Engine<H> {
     /// present.
     ///
     /// The reading is the reconciler's last probe of the volume rather than
-    /// a fresh one: this is asked on every `stats.json` poll and by every
-    /// cache-cleaner pass over every engine, and it is a number that moves
-    /// on the scale of seconds. `false` for a volume nothing has probed yet
+    /// a fresh one: this is asked on every `stats.json` poll, and it is a
+    /// number that moves on the scale of seconds. `false` for a volume nothing has probed yet
     /// -- unknown is not full.
     pub async fn is_stopped_for_space(&self) -> bool {
         let run_state = self.handle.run_state();
@@ -1286,15 +1266,11 @@ impl<H: TorrentHandle> Engine<H> {
     /// copy-out under the owner's locks; no I/O. Empty while nothing bounds
     /// it.
     ///
-    /// One file at most has a policy installed -- [`Retention::install`]
-    /// clears every other before it installs, and installs are ordered over
-    /// the owner so two opens on different files cannot each miss the
-    /// other. The one way two can stand is a sibling whose range the
-    /// backend would not take back at its retiring (`retire_siblings` warns
-    /// and goes on), and then both are here: a reading that kept the first
-    /// the map listed answered for a different file from one call to the
-    /// next, called the other file's held-back pieces announced, and had
-    /// the delete take that one file's turn for a request about both.
+    /// Every file that has been opened has an entity of its own and may
+    /// have a policy of its own, so this is a list and not an option: a
+    /// reading that kept whichever one the map listed first answered for a
+    /// different file from one call to the next.
+    #[cfg(test)]
     fn standing_policies(&self, live: &Reading) -> Vec<FileStanding> {
         let mut policies: Vec<FileStanding> = self
             .retention
@@ -1435,9 +1411,8 @@ impl<H: TorrentHandle> Engine<H> {
     /// The file's turn from the first line of its pass to the last
     /// ([`Retention::turn`] then [`Retention::pass`]), and released before
     /// the next file's is taken (rule 4 of the owner: no two turns at once).
-    /// A second pass queues behind this one, a [`Self::begin_retention`]
-    /// that arrives meanwhile waits its turn, and the cleaner's delete waits
-    /// behind both. The policy stays in its cell throughout; a pass that
+    /// A second pass queues behind this one and a [`Self::begin_retention`]
+    /// that arrives meanwhile waits its turn. The policy stays in its cell throughout; a pass that
     /// dies at an await drops the turn like any other local and the next
     /// tick's pass runs.
     ///
@@ -1602,215 +1577,24 @@ impl<H: TorrentHandle> Engine<H> {
         freed
     }
 
-    /// What this engine tells the cache cleaner it may take -- **asked by
-    /// the walk and asked again by the delete, from this one function.**
+    /// Every policy standing on this torrent, as a value -- **for the
+    /// tests, which is all that asks now.**
     ///
-    /// The walk's copy is a reading taken before a blocking directory walk
-    /// and every delete before this one, so by the time a delete arrives it
-    /// can be minutes old, and [`Self::release_reclaimable`] asks again at
-    /// the door. It has to ask the *same* question. A second asking that
-    /// answered a narrower one -- as this used to, taking every piece the
-    /// cleaner named unless a policy was in the slot to refuse it -- is not
-    /// a check on the reading but a way round it: the walk protects a
-    /// torrent that announces everything and a pinned one, and the delete
-    /// took their pieces anyway whenever its reading had gone stale in
-    /// between. So everything the walk folds into its verdict is folded in
-    /// here:
+    /// It was the cache cleaner's question: what may be taken off this
+    /// torrent, asked before a walk of the disk and again at every delete.
+    /// The walk is gone and so is the second asking; what a caller outside
+    /// this crate can still learn about the cache it asks
+    /// [`Self::protects`], which is a reading of what is on the disk rather
+    /// than of what is installed.
     ///
-    /// * a **pinned** torrent announces everything and releases nothing,
-    ///   whatever policy is still installed -- a pin taken while the file
-    ///   was streaming leaves the policy installed until the next pass
-    ///   clears it, and the download the user asked to keep must not lose
-    ///   pieces through that gap;
-    /// * a torrent the backend stopped with an **error** announces nothing,
-    ///   and its bytes go first;
-    /// * otherwise the policy answers, or the absence of one does.
-    ///
-    /// A torrent stopped for **space** is not an error here: the cleaner is
-    /// what gets it going again, by evicting other bytes, so it keeps its
-    /// policy's protection meanwhile and is named to the cleaner separately
-    /// ([`Standing::stopped_for_space`]).
-    ///
-    /// The policies' half is read off the owner's live cells, so a pass in
-    /// flight answers `Policy` with the committed set as the pass has
-    /// advanced it, never "no policy" -- and every standing policy is in
-    /// the answer, in file order, so two callers reading the same cells get
-    /// the same gate and the same files.
+    /// One copy-out under the owner's locks and one reading of what is
+    /// being played, so the policies and their modes cannot disagree about
+    /// which file is live.
+    #[cfg(test)]
     pub(crate) async fn standing(&self) -> Standing {
-        // One copy-out for the gate and the files, and one reading of what
-        // is being played for both: a gate built from one reading and files
-        // listed from another could name a turn the gate was not built
-        // under.
-        let policies = self.standing_policies(&self.live.reading());
-        if self.is_pinned() {
-            return Standing {
-                gate: crate::retention::TorrentGate::Announced,
-                policies,
-                stopped_for_space: false,
-            };
-        }
-        let stopped_for_space =
-            self.is_stopped_for_space().await || self.handle.is_out_of_space().await;
-        if !stopped_for_space && self.handle.is_in_error_state().await {
-            return Standing {
-                gate: crate::retention::TorrentGate::Nothing,
-                policies,
-                stopped_for_space,
-            };
-        }
-        let gate = if policies.is_empty() {
-            crate::retention::TorrentGate::Announced
-        } else {
-            crate::retention::TorrentGate::Policy(
-                policies
-                    .iter()
-                    .map(|policy| crate::retention::FilePolicy {
-                        file_idx: policy.file_idx,
-                        pieces: policy.view.pieces.clone(),
-                        committed: policy.view.committed.clone(),
-                        live: policy.mode == Mode::Live,
-                    })
-                    .collect(),
-            )
-        };
         Standing {
-            gate,
-            policies,
-            stopped_for_space,
+            policies: self.standing_policies(&self.live.reading()),
         }
-    }
-
-    /// Delete the pieces of this torrent that are *still* reclaimable, and
-    /// answer how many bytes went.
-    ///
-    /// **The second asking, and the reason the cleaner's delete comes
-    /// through the engine at all.** The gate the cleaner carries was taken
-    /// before its walk; between that reading and this unlink a piece can
-    /// have become announced, and two paths do it on the happy path --
-    /// [`Self::retain`] commits and advertises pieces on every pass, and
-    /// [`Self::begin_retention`] puts a whole range back when the reader
-    /// moves to another file. Deleting a piece we have told a peer about is
-    /// the one thing this design exists to prevent, so the question is
-    /// asked again here, under the file's turn -- which those two also take
-    /// -- and the answer taken from the live policy rather than from a copy
-    /// of it.
-    ///
-    /// The gate is not the only narrowing the cleaner's request needs. A
-    /// policy's file shares its first and last piece with its neighbours,
-    /// and the gate cannot see that -- it answers for the torrent, so a
-    /// shared piece is in range and uncommitted like any other. So
-    /// [`crate::retention::this_files_alone`] is asked here as well as in
-    /// the pass, and for the same reason: unlinking a piece a still-wanted
-    /// neighbour owns is a refetch loop, whichever caller does it.
-    ///
-    /// **One turn per file, and the file is the piece's.** The pieces are
-    /// grouped by the policy whose range holds them, and each group is
-    /// released under that file's turn, one file after another, with the
-    /// question asked again under each. Taking one turn for the whole
-    /// request was the value read once and trusted later: with two policies
-    /// standing the turn held was one file's and the gate answered for
-    /// whichever the map listed, so the other file's held-back pieces were
-    /// refused as announced -- and which file's, by the map's order.
-    /// A piece no policy's range holds is released under no turn, because
-    /// nothing orders it: only the error state's gate gives such a piece up.
-    pub(crate) async fn release_reclaimable(
-        &self,
-        store: &Arc<StoreRegistry>,
-        pieces: &[u32],
-    ) -> usize {
-        // The grouping reading. It decides which turns are taken and
-        // nothing else; what is taken is decided under each.
-        let policies = self.standing().await.policies;
-        let mut by_file: std::collections::BTreeMap<Option<usize>, Vec<u32>> =
-            std::collections::BTreeMap::new();
-        for piece in pieces {
-            by_file
-                .entry(file_governing(&policies, *piece))
-                .or_default()
-                .push(*piece);
-        }
-        let mut freed = 0;
-        for (file, group) in by_file {
-            // The turn is per file, and the file is the one whose policy
-            // holds the piece. Taken before the asking, held across the
-            // unlink: a pass on that file cannot commit a piece between
-            // this reading and its release. A piece in no policy's range
-            // has no turn to take and nothing that could advertise it but
-            // an install, whose hold-back makes a piece less announced, not
-            // more.
-            let _turn = match file {
-                Some(file_idx) => self.retention.turn(&file_idx).await,
-                None => None,
-            };
-            freed += self.release_under_turn(store, file, &group).await;
-        }
-        freed
-    }
-
-    /// The cleaner's question, asked again at the door for one group of
-    /// pieces, with the turn of `file` (the policy whose range held them at
-    /// the grouping) in hand; `None` is the group no policy held.
-    ///
-    /// The same question as `standing`, and not a narrower one. This used to
-    /// filter only where a policy was in the slot and take everything the
-    /// cleaner named otherwise, on the argument that a torrent with no
-    /// policy had no opinion the cleaner did not already have. But the
-    /// cleaner's own rule already refuses every piece of a torrent that
-    /// announces everything, so the only way it comes to ask for one is a
-    /// reading that went stale on the way here: a reader opened on the
-    /// torrent since the walk (which found no engine and called its bytes
-    /// cache), a pin was taken since, or the policy that released the piece
-    /// was cleared since. Taking the piece then was the advertise-then-refuse
-    /// the gate exists to prevent, on exactly the torrents a reader has just
-    /// opened -- and the delete of a download the user had just pinned.
-    ///
-    /// And a piece the gate still releases is taken only if the policy that
-    /// holds it now is the one whose turn this is: a policy that moved to
-    /// another file between the grouping and this turn -- the reader went
-    /// to the next episode, and its boundary piece is in the new range --
-    /// is ordered by a turn not held here, and nothing is taken on it. The
-    /// cleaner's next walk asks again.
-    async fn release_under_turn(
-        &self,
-        store: &Arc<StoreRegistry>,
-        file: Option<usize>,
-        pieces: &[u32],
-    ) -> usize {
-        let standing = self.standing().await;
-        let mut still: Vec<u32> = pieces
-            .iter()
-            .copied()
-            .filter(|piece| {
-                standing.gate.releases(*piece)
-                    && (matches!(standing.gate, crate::retention::TorrentGate::Nothing)
-                        || file_governing(&standing.policies, *piece) == file)
-            })
-            .collect();
-        if still.len() != pieces.len() {
-            tracing::debug!(
-                info_hash = %self.info_hash,
-                file,
-                asked = pieces.len(),
-                taking = still.len(),
-                "the cleaner's reading of this torrent went stale before its delete"
-            );
-        }
-        // The gate has no answer about the boundary. It speaks for the
-        // torrent, and a piece the policy's file shares with a neighbour is
-        // in range and uncommitted exactly like any other, so a policy
-        // offers the cleaner the same shared pieces the retention pass
-        // offers itself. The same narrowing is therefore made here, or the
-        // cleaner's delete starts the refetch loop the pass no longer
-        // starts. Only a policy has a file to narrow by; where there is
-        // none this engine already has no opinion.
-        if let (Some(file_idx), crate::retention::TorrentGate::Policy(_)) = (file, &standing.gate) {
-            still = crate::retention::this_files_alone(&self.handle, file_idx, &still).await;
-        }
-        let mut freed = 0;
-        for run in crate::retention::runs(&still) {
-            freed += crate::retention::release(&self.handle, store, &self.info_hash, run).await;
-        }
-        freed
     }
 
     /// Whether anything about this torrent is pinned -- what exempts it

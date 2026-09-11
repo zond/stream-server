@@ -11,11 +11,11 @@
 //!
 //! # The policy
 //!
-//! **The budget** is bytes, per volume, and comes from the cache cleaner's
+//! **The budget** is bytes, per volume, and comes from the server's
 //! `CacheLimit::effective` -- `min(configured, occupied + available - floor)`.
 //! It is an input here and is not recomputed: a second reading of "how much
-//! room is there" that disagreed with the cleaner's would have the two layers
-//! evicting against different numbers.
+//! room is there" that disagreed with the published one would have the two
+//! halves of the cache sized against different numbers.
 //!
 //! **If the budget covers the whole file we keep the whole file** and share
 //! all of it. No split and no window. This is the phone with 379 GB free and
@@ -360,9 +360,9 @@ impl RetentionPolicy {
     ///
     /// [`crate::retention`] is what makes that true -- it holds the whole
     /// file back from what the torrent announces before the reader opens,
-    /// and puts a piece back only when [`Self::advance`] commits it. It is
-    /// also what the cache cleaner is answered from: what we announce is
-    /// exactly what nothing will reclaim.
+    /// and puts a piece back only when [`Self::advance`] commits it. What
+    /// we announce is exactly what nothing will reclaim while the entity is
+    /// being played.
     pub fn advertised(&self) -> &BTreeSet<u32> {
         &self.committed
     }

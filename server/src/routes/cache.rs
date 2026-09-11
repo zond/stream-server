@@ -21,8 +21,8 @@ use axum::{
 
 /// What the cache currently occupies against its configured limit, exactly
 /// what `GET /cache.json` answers. See [`CacheUsage`] for the shape and
-/// `cache_cleaner::usage` for the walk it runs (read-only; nothing is
-/// evicted or aged out).
+/// `cache_cleaner::usage` for where the figures come from (the owners'
+/// own counts; nothing is walked and nothing is deleted).
 pub async fn cache_usage(state: &AppState) -> CacheUsage {
     cache_cleaner::usage(state).await
 }

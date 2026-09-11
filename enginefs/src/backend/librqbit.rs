@@ -1966,36 +1966,6 @@ impl TorrentBackend for LibrqbitBackend {
         self.store_registry.clone()
     }
 
-    /// The hash a source names, without adding it -- for the
-    /// evicted-for-space refusal, which has to happen before any file is
-    /// created.
-    ///
-    /// A `.torrent` blob is parsed with librqbit's own
-    /// `torrent_from_bytes`, so what this reports is exactly what the add
-    /// would manage; a magnet link goes through `Magnet::parse`, and a bare
-    /// 40-hex hash through `magnet_with_trackers`'s upgrade of one, so this
-    /// accepts everything `add_torrent_placed` does. `None` for a blob that
-    /// will not parse (the add is left to produce the real error, in its
-    /// own words) and for a `.torrent` behind an http URL, whose hash is
-    /// not knowable without fetching it -- librqbit fetches it inside the
-    /// add. Lowercased hex, like every hash the engine layer keys on.
-    fn source_info_hash(&self, source: &TorrentSource) -> Option<String> {
-        match source {
-            TorrentSource::Bytes(bytes) => Some(
-                librqbit::torrent_from_bytes(bytes)
-                    .ok()?
-                    .info_hash
-                    .as_string()
-                    .to_lowercase(),
-            ),
-            TorrentSource::Url(url) => {
-                let magnet = magnet_with_trackers(url, &[]);
-                let magnet = librqbit::Magnet::parse(&magnet).ok()?;
-                Some(magnet.as_id20()?.as_string().to_lowercase())
-            }
-        }
-    }
-
     async fn add_torrent(
         &self,
         source: TorrentSource,
@@ -5000,68 +4970,6 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-    }
-
-    /// `source_info_hash` reads the same hash the add would manage, from a
-    /// real `.torrent` blob and from a magnet, without adding either.
-    ///
-    /// The evicted-for-space refusal is only as good as this: a hash it
-    /// cannot read is a source it waves through, and a wrong one would
-    /// refuse the wrong torrent. Checked against the hash `make_torrent`
-    /// reports and against a torrent this session really added, so a
-    /// spelling difference (case, a `urn:btih:` prefix) shows up here.
-    #[tokio::test]
-    async fn source_info_hash_reads_a_hash_without_adding_anything() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().to_path_buf();
-        let payload = dir.join("payload.bin");
-        write_payload(&payload, 16 * 1024).await;
-        let (torrent_bytes, hash) = make_torrent(&payload).await;
-
-        let backend = LibrqbitBackend::new_for_tests(dir.clone())
-            .await
-            .expect("hermetic session");
-        assert_eq!(
-            backend.source_info_hash(&TorrentSource::Bytes(torrent_bytes.clone())),
-            Some(hash.to_lowercase()),
-            "a .torrent blob"
-        );
-        assert_eq!(
-            backend.source_info_hash(&TorrentSource::Url(format!("magnet:?xt=urn:btih:{hash}"))),
-            Some(hash.to_lowercase()),
-            "a magnet link"
-        );
-        assert_eq!(
-            backend.source_info_hash(&TorrentSource::Url(hash.to_uppercase())),
-            Some(hash.to_lowercase()),
-            "a bare hash, which add_torrent also accepts"
-        );
-        assert_eq!(
-            backend.source_info_hash(&TorrentSource::Bytes(b"not a torrent".to_vec())),
-            None,
-            "an unparseable blob leaves the real error to the add"
-        );
-        assert_eq!(
-            backend.source_info_hash(&TorrentSource::Url(
-                "https://example.invalid/x.torrent".into()
-            )),
-            None,
-            "a .torrent behind a URL has no hash until it is fetched"
-        );
-        assert!(
-            backend.list_torrents().await.is_empty(),
-            "and none of that added a torrent"
-        );
-
-        // The same hash the add really manages.
-        let handle = backend
-            .add_torrent(TorrentSource::Bytes(torrent_bytes), vec![])
-            .await
-            .expect("add torrent");
-        assert_eq!(
-            crate::backend::TorrentHandle::info_hash(&handle),
-            hash.to_lowercase()
-        );
     }
 
     /// `stats().sources` must list the trackers the torrent was added with:

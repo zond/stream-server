@@ -9,9 +9,9 @@
 //! any of it existed: **a proxied stream had no playhead at all**. It serves
 //! ranges, so the reads were always there and the route always knew the
 //! offset, but nothing recorded where playback *was*, so there was nothing
-//! for a window to follow and the cache was bounded by the cleaner's walk
-//! alone: a minute after the last write at best, while a stream at 20 MB/s
-//! writes a gigabyte in that minute.
+//! for a window to follow and the cache was bounded by the cache cleaner's
+//! walk alone: a minute after the last write at best, while a stream at
+//! 20 MB/s writes a gigabyte in that minute.
 //!
 //! # The playhead is an observation, and its absence is real
 //!
@@ -27,19 +27,20 @@
 //! therefore a reader with no playhead and no window: what it has is a
 //! promise, which is the other half of this module.
 //!
-//! Nothing here is persisted for the same reason. What survives a restart is
-//! the chunks; a chunk with no live reader is ordinary cache, which is
-//! exactly what the cleaner already treats it as.
+//! Nothing here is persisted for the same reason. Nothing survives a
+//! restart either: the launch sweep empties this cache before the router
+//! serves, so a chunk on the disk is one this process wrote and a reader
+//! this process has.
 //!
 //! # An open read holds what it promised, and that is the missing interlock
 //!
 //! A torrent's reader is protected by librqbit: a reclaim goes through
 //! `drop_pieces`, which will not forget a piece a reader is waiting on, so a
 //! live read's own bytes cannot be unlinked out from under it. **A proxied
-//! read has no backend to refuse**, and it is not only the cleaner it needs
-//! refusing -- the retention pass unlinks the same files, and the playhead
-//! that drives it is the reading body's own. A response is framed before its
-//! first byte goes out (`Content-Length`, `Content-Range`), so the bytes it
+//! read has no backend to refuse**: the retention pass unlinks the files
+//! itself, and the playhead that drives it is the reading body's own. A
+//! response is framed before its first byte goes out (`Content-Length`,
+//! `Content-Range`), so the bytes it
 //! has yet to deliver are already promised; a window that had moved on from
 //! them would delete a body's own tail while the body was reading it, and
 //! the player would get a truncated read of a range the cache told it it
@@ -50,10 +51,9 @@
 //! observation that can be absent. Its **promise** ([`Reader::promises`]) is
 //! the chunks an open body still has to deliver off the disk; it shrinks as
 //! they go out and it is released when the body ends or the client vanishes,
-//! and while it stands neither the pass nor the cleaner may take those
-//! chunks. The promise is not a second policy: it decides nothing about what
-//! to keep, it only refuses to unlink bytes we have already said we would
-//! serve.
+//! and while it stands no pass may take those chunks. The promise is not a
+//! second policy: it decides nothing about what to keep, it only refuses to
+//! unlink bytes we have already said we would serve.
 //!
 //! What that can cost is stated rather than hidden. A body framed around
 //! more than the budget holds more than the budget until it has delivered
@@ -136,13 +136,13 @@
 //! and every desktop), for a volume with no cap, and before any pass has
 //! published a budget at all (`CacheBudget::Unknown`, which is an absence
 //! and not a zero), there is nothing to reclaim -- **but there is still a
-//! player inside these bytes**, and the cleaner's cap is a per-volume number
-//! that the rest of the cache can push past on its own. So the window in
-//! that case is the whole entity, which is what the policy itself answers
-//! for `Shape::Whole`, and it is the same answer the torrent half gives:
-//! an engine with no policy is `TorrentGate::Announced`, and the cleaner may
-//! take none of it. What is *not* protected in either case is a stream
-//! nobody is reading, which is the first thing that should go.
+//! player inside these bytes**, and the published cap is a per-volume
+//! number that the rest of the cache can push past on its own. So the
+//! window in that case is the whole entity, which is what the policy itself
+//! answers for `Shape::Whole`, and it is the same answer the torrent half
+//! gives: a live file with no policy standing keeps its whole extent. What
+//! is *not* kept in either case is a stream nobody is reading, which is the
+//! first thing that should go.
 
 use std::collections::BTreeSet;
 use std::ops::Range;
@@ -158,9 +158,9 @@ use std::time::Instant;
 use anyhow::Context as _;
 use enginefs::chunk_store::ChunkDir;
 use enginefs::piece_store::{RetentionPolicy, Share};
+use enginefs::retention::RetentionBudget;
 use enginefs::retention::live::{Live, LiveEntity};
 use enginefs::retention::owner::{Backing, Claim, Door, Install, Mode, Retention, Trigger};
-use enginefs::retention::{ReclaimGate, RetentionBudget};
 
 use crate::proxy_cache::CHUNK_BYTES;
 
@@ -393,7 +393,7 @@ impl Backing for ProxyBacking {
     /// pool whole. Splitting the asking from the taking is the one
     /// rearrangement of this that would change what a pass deletes. It is
     /// the same refusal the cleaner's own delete makes
-    /// ([`ProxyRetention::still_free`], the sibling of this one), for the
+    /// (the second asking the pass makes at its door), for the
     /// same reason: a chunk somebody is inside costs the player a broken
     /// read and the origin the same fetch again, while a chunk left standing
     /// costs a few bytes until the next pass.
@@ -531,11 +531,6 @@ impl Occupancy {
 /// the clamp never names a chunk a window exists over.
 fn index(chunk: u64) -> u32 {
     u32::try_from(chunk).unwrap_or(u32::MAX)
-}
-
-/// A chunk range in the `u64` index space the gate and the cleaner speak.
-fn span(chunks: Range<u32>) -> Range<u64> {
-    u64::from(chunks.start)..u64::from(chunks.end)
 }
 
 /// The cell a test writes its interleaving into: see
@@ -842,13 +837,10 @@ impl ProxyRetention {
     /// last counted -- 0 until the first walk of the root finished.
     ///
     /// **Every deleter of a chunk is booked, including the two outside the
-    /// owner.** The cache cleaner still walks this root and unlinks chunks
-    /// by path, and what it takes comes off here
-    /// (`cache_cleaner::reclaim`); so does the entity a fill replaces under
-    /// a key, and so does the chunk `proxy_cache::Cached::body` refuses for
-    /// its length. A
-    /// deletion this count did not hear would leave the bytes booked for
-    /// the life of the process, and since the published cap is
+    /// owner.** The entity a fill replaces under a key comes off here, and
+    /// so does the chunk `proxy_cache::Cached::body` refuses for its
+    /// length. A deletion this count did not hear would leave the bytes
+    /// booked for the life of the process, and since the published cap is
     /// `occupied + available - floor` that reads as a *larger* cap and
     /// grows the cache with every pass.
     ///
@@ -880,8 +872,8 @@ impl ProxyRetention {
     /// answer: the entity the cell names, and any entity an open body is
     /// still reading. What such an entity keeps is what a pass concluded
     /// -- its windows -- plus what an open body was promised, and, for an
-    /// entity nothing bounds or nothing has measured yet, the whole of it,
-    /// exactly as [`Self::fill_gate`] tells the cleaner.
+    /// entity nothing bounds or nothing has measured yet, the whole of
+    /// it.
     ///
     /// It lists the entity's directory, so what it reports is the window's
     /// chunks that are really on the disk and not the window's own size. On
@@ -902,9 +894,8 @@ impl ProxyRetention {
             // Nothing bounds this entity -- the budget covers it, the volume
             // has no cap, or no pass has measured it yet -- so while it is
             // live nothing reclaims any of it, and what it keeps is the whole
-            // of it. The same answer [`Self::fill_gate`] gives the cleaner,
-            // and the same one the torrent side gives for a live file with no
-            // policy standing.
+            // of it. The same answer the torrent side gives for a live
+            // file with no policy standing.
             if holding.installed.is_none() || (holding.windows.is_empty() && holding.live_playhead)
             {
                 kept.extend(0..index(holding.domain.chunks()));
@@ -924,27 +915,6 @@ impl ProxyRetention {
             }
         }
         protection
-    }
-
-    /// Whether this path is still outside every live window, asked at the
-    /// instant of the unlink rather than read from a gate.
-    ///
-    /// **The second asking, and the sibling of the torrent side's.** The
-    /// gate the cleaner carries was filled before a walkdir over the whole
-    /// root -- sixteen thousand files on the television that prompted the
-    /// debounce -- and before every delete ahead of this one. A reader that
-    /// seeks in that time promises chunks the snapshot says are free, and
-    /// unlinking one costs the player a broken read and the origin the same
-    /// fetch again, which are the two things a cache is for. So the promise
-    /// is a refusal at the door and not only a reading taken at the start.
-    ///
-    /// `true` for anything this has no opinion about: a path that is not a
-    /// chunk name, an entity nothing is reading. The cleaner's own rules
-    /// decide those, as they did before.
-    pub fn still_free(&self, path: &std::path::Path) -> bool {
-        let mut gate = ReclaimGate::default();
-        self.fill_gate(&mut gate);
-        gate.releases_file(path)
     }
 
     /// Every entity nobody is playing and nobody is reading, taken off the
@@ -1013,51 +983,6 @@ impl ProxyRetention {
         }
         reclaimed
     }
-
-    /// Tell the cache cleaner's gate what live readers are holding.
-    ///
-    /// Two things are inserted and they are different claims. A **window**
-    /// is where a playhead is and what playback is about to want; a
-    /// **promise** is bytes an open body has already been framed to
-    /// deliver, which is not a policy question at all. The cleaner asks one
-    /// gate about everything it walks, so both are put where it can read
-    /// them.
-    ///
-    /// Nothing is pruned here any more: an entity goes when a slack pass
-    /// has taken the last of it off the disk, which is a fact about the
-    /// entity and not an age. A reader's entry goes with the body it
-    /// belongs to.
-    pub fn fill_gate(&self, gate: &mut ReclaimGate) {
-        self.fill_holdings(gate, self.owner.holdings());
-    }
-
-    fn fill_holdings(
-        &self,
-        gate: &mut ReclaimGate,
-        holdings: Vec<(PathBuf, enginefs::retention::owner::Holding<ProxyBacking>)>,
-    ) {
-        for (dir, holding) in holdings {
-            for window in &holding.windows {
-                gate.insert_window(dir.clone(), span(window.clone()));
-            }
-            // A reader that is inside these bytes and has no window round it
-            // yet is inside all of them: either nothing here reclaims
-            // anything (the budget covers the entity, the volume has no cap,
-            // no pass has published one) or no pass has run since the byte
-            // that made this a playhead. Both are "we have measured nothing
-            // to give up", and what a live reader may not lose is the chunk
-            // under its head. Once the last reader has gone, what stands is
-            // the windows a pass really chose, until a stream opens on
-            // something else and [`Self::drop_slack`] takes the lot.
-            if (holding.installed.is_none() || holding.windows.is_empty()) && holding.live_playhead
-            {
-                gate.insert_window(dir.clone(), 0..holding.domain.chunks());
-            }
-            for promised in holding.promised {
-                gate.insert_window(dir.clone(), span(promised));
-            }
-        }
-    }
 }
 
 impl Reader {
@@ -1106,51 +1031,34 @@ impl Reader {
 mod tests {
     use super::*;
 
-    /// A promise made after the cleaner took its reading still refuses the
-    /// unlink.
+    /// Whether anything live is inside `chunk` of `dir`: a window a pass
+    /// concluded, a promise an open body has still to deliver, or the whole
+    /// of an entity a reader is inside and no pass has measured.
     ///
-    /// The gate a pass carries is filled once, before a walkdir over the
-    /// whole root -- sixteen thousand files on the television that prompted
-    /// the debounce -- and before every delete ahead of this one. A reader
-    /// that seeks in that time promises chunks the reading calls free, and
-    /// unlinking one costs the player a broken read and the origin the same
-    /// fetch again, which are the two things a cache is for.
-    ///
-    /// The torrent half has always re-asked: its delete goes to the engine,
-    /// which consults the live policy under the lock. This is the sibling,
-    /// and it was missing -- the promise was a snapshot rather than a
-    /// refusal at the door.
-    #[tokio::test]
-    async fn a_promise_made_since_the_reading_still_refuses_the_unlink() {
-        let tmp = tempfile::tempdir().expect("a scratch root");
-        let dir = ChunkDir::new(tmp.path().join("entity"));
-        write_chunks(&dir, [4]);
-        let path = dir.chunk_path(4);
-        let retention = retention(Some(CHUNK_BYTES));
-
-        // The reading the cleaner would take: nothing is promised, so the
-        // chunk is free.
-        let mut reading = ReclaimGate::default();
-        retention.fill_gate(&mut reading);
-        assert!(
-            reading.releases_file(&path),
-            "with nothing open, the chunk is ordinary cache"
-        );
-        assert!(retention.still_free(&path));
-
-        // A reader opens and promises that very chunk, which is what a seek
-        // does while the walk is still running.
-        let reader = retention.reader(&dir, TOTAL, TARGET.into());
-        reader.promises(4..5);
-
-        assert!(
-            reading.releases_file(&path),
-            "the reading is a snapshot and cannot know: this is the defect"
-        );
-        assert!(
-            !retention.still_free(&path),
-            "but asked now, the promise refuses the unlink"
-        );
+    /// **This is what the cache cleaner's gate was filled with**, asked of
+    /// the owner's own cells now that nothing walks the disk with a
+    /// snapshot in its hand. The answer is the same one
+    /// [`ProxyRetention::drop_slack`] and [`ProxyRetention::protected`]
+    /// give; it is spelled out here so a test can name one chunk.
+    fn inside_something_live(retention: &Arc<ProxyRetention>, dir: &ChunkDir, chunk: u64) -> bool {
+        let Ok(wanted) = u32::try_from(chunk) else {
+            return false;
+        };
+        retention
+            .owner
+            .holdings()
+            .into_iter()
+            .filter(|(key, _)| key == dir.path())
+            .any(|(_, holding)| {
+                holding
+                    .windows
+                    .iter()
+                    .chain(holding.promised.iter())
+                    .any(|range| range.contains(&wanted))
+                    || ((holding.installed.is_none() || holding.windows.is_empty())
+                        && holding.live_playhead
+                        && wanted < index(holding.domain.chunks()))
+            })
     }
 
     /// **What nobody is playing and nobody is reading protects nothing,
@@ -1230,8 +1138,8 @@ mod tests {
         let retention = retention(Some(4 * CHUNK_BYTES));
         let reader = retention.reader(&dir, TOTAL, TARGET.into());
         reader.note(0);
-        settled(&retention, "the pass kept a window", |gate| {
-            gate.releases_file(&dir.chunk_path(15))
+        settled(&retention, "the pass kept a window", || {
+            !inside_something_live(&retention, &dir, 15)
         })
         .await;
 
@@ -1309,22 +1217,16 @@ mod tests {
     /// -- the windows back in the map, the throttle rearmed, the next pass
     /// armed -- it does after that, past a suspension point, since the
     /// unlinks are awaited on the blocking pool. So a file that has gone is
-    /// not a pass that has finished, and a test that read the gate on the
+    /// not a pass that has finished, and a test that read the windows on the
     /// strength of one would be reading the *previous* pass's windows
     /// beside this pass's disk. `DiskWork` counts a whole pass, which is
     /// what `ServerHandle::proxy_cache_settled` is for, so a count of
     /// nothing beside the condition is a cache that has stopped moving and
     /// has said where it stopped.
-    async fn settled(
-        retention: &Arc<ProxyRetention>,
-        what: &str,
-        until: impl Fn(&ReclaimGate) -> bool,
-    ) {
+    async fn settled(retention: &Arc<ProxyRetention>, what: &str, until: impl Fn() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
-            let mut gate = ReclaimGate::default();
-            retention.fill_gate(&mut gate);
-            if retention.work.idle() && until(&gate) {
+            if retention.work.idle() && until() {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1416,11 +1318,9 @@ mod tests {
         // delivered nothing and promised nothing. That is not a playhead,
         // and it is not a window either.
         let reader = retention.reader(&dir, TOTAL, TARGET.into());
-        let mut gate = ReclaimGate::default();
-        retention.fill_gate(&mut gate);
         for index in 0..16u64 {
             assert!(
-                gate.releases_file(&dir.chunk_path(index)),
+                !inside_something_live(&retention, &dir, index),
                 "chunk {index} is cache: nothing has been played out of this entity"
             );
         }
@@ -1514,19 +1414,17 @@ mod tests {
         reader.note(12 * CHUNK_BYTES);
         // Until the first pass has run, the window is the whole entity:
         // nothing has been measured yet and nothing is given up on a guess.
-        settled(&retention, "the first pass narrowed the window", |gate| {
-            gate.releases_file(&dir.chunk_path(0))
+        settled(&retention, "the first pass narrowed the window", || {
+            !inside_something_live(&retention, &dir, 0)
         })
         .await;
 
-        let mut gate = ReclaimGate::default();
-        retention.fill_gate(&mut gate);
         assert!(
-            !gate.releases_file(&dir.chunk_path(12)),
+            inside_something_live(&retention, &dir, 12),
             "the chunk under the player's head"
         );
         assert!(
-            gate.releases_file(&dir.chunk_path(0)),
+            !inside_something_live(&retention, &dir, 0),
             "and the start of the film, which it played past long ago"
         );
     }
@@ -1551,14 +1449,12 @@ mod tests {
         let reader = retention.reader(&dir, TOTAL, TARGET.into());
         reader.note(12 * CHUNK_BYTES);
 
-        let mut gate = ReclaimGate::default();
-        retention.fill_gate(&mut gate);
         assert!(
-            !gate.releases_file(&dir.chunk_path(12)),
+            inside_something_live(&retention, &dir, 12),
             "the chunk under the player's head is not the cleaner's to take"
         );
         assert!(
-            !gate.releases_file(&dir.chunk_path(15)),
+            inside_something_live(&retention, &dir, 15),
             "and neither is the read-ahead: all of it fits, so all of it is the window"
         );
         assert_eq!(dir.held().unwrap().len(), 16, "and nothing was reclaimed");
@@ -1584,10 +1480,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         assert_eq!(dir.held().unwrap().len(), 16, "every chunk is still here");
-        let mut gate = ReclaimGate::default();
-        retention.fill_gate(&mut gate);
         assert!(
-            !gate.releases_file(&dir.chunk_path(15)),
+            inside_something_live(&retention, &dir, 15),
             "and a player is inside it, so the cleaner is not offered it either"
         );
     }
@@ -1620,7 +1514,7 @@ mod tests {
         let reader = retention.reader(&dir, TOTAL, TARGET.into());
         reader.promises(0..14);
         reader.note(0);
-        settled(&retention, "a pass reclaimed what nobody promised", |_| {
+        settled(&retention, "a pass reclaimed what nobody promised", || {
             !dir.chunk_path(15).exists()
         })
         .await;
@@ -1635,11 +1529,9 @@ mod tests {
             !dir.chunk_path(14).exists(),
             "while the chunks nothing promised, outside the window, went"
         );
-        let mut gate = ReclaimGate::default();
-        retention.fill_gate(&mut gate);
         for index in 0..14u64 {
             assert!(
-                !gate.releases_file(&dir.chunk_path(index)),
+                inside_something_live(&retention, &dir, index),
                 "chunk {index} is promised to an open body, so it is not the cleaner's either"
             );
         }
@@ -1652,7 +1544,7 @@ mod tests {
         settled(
             &retention,
             "the head of the film left the promise and the window",
-            |_| !dir.chunk_path(0).exists(),
+            || !dir.chunk_path(0).exists(),
         )
         .await;
         assert!(
@@ -1684,24 +1576,22 @@ mod tests {
         let one = retention.reader(&dir, TOTAL, TARGET.into());
         let two = retention.reader(&dir, TOTAL, TARGET.into());
         one.note(0);
-        settled(&retention, "the first player's pass ran", |gate| {
-            gate.releases_file(&dir.chunk_path(15))
+        settled(&retention, "the first player's pass ran", || {
+            !inside_something_live(&retention, &dir, 15)
         })
         .await;
         two.note(12 * CHUNK_BYTES);
-        settled(&retention, "the second player's pass ran", |gate| {
-            !gate.releases_file(&dir.chunk_path(12))
+        settled(&retention, "the second player's pass ran", || {
+            inside_something_live(&retention, &dir, 12)
         })
         .await;
 
-        let mut gate = ReclaimGate::default();
-        retention.fill_gate(&mut gate);
         assert!(
-            !gate.releases_file(&dir.chunk_path(0)),
+            inside_something_live(&retention, &dir, 0),
             "the first player's head, which the second player's pass ran over"
         );
         assert!(
-            !gate.releases_file(&dir.chunk_path(12)),
+            inside_something_live(&retention, &dir, 12),
             "and the second player's own"
         );
         assert!(
@@ -1840,7 +1730,7 @@ mod tests {
         settled(
             &retention,
             "the window settled at the head of the film",
-            |_| !dir.chunk_path(15).exists(),
+            || !dir.chunk_path(15).exists(),
         )
         .await;
         // Playback goes on to the end of the film, filling as it goes.
@@ -1862,7 +1752,7 @@ mod tests {
         settled(
             &retention,
             "the pass the last byte started put the window where playback stopped",
-            |_| !dir.chunk_path(0).exists(),
+            || !dir.chunk_path(0).exists(),
         )
         .await;
         assert!(
@@ -1878,13 +1768,11 @@ mod tests {
             !dir.chunk_path(0).exists(),
             "and the head of the film, a window behind it, is not"
         );
-        let mut gate = ReclaimGate::default();
-        retention.fill_gate(&mut gate);
         assert!(
-            !gate.releases_file(&dir.chunk_path(15)),
+            inside_something_live(&retention, &dir, 15),
             "the cleaner is refused the bytes the player's next request will ask for"
         );
-        assert!(gate.releases_file(&dir.chunk_path(0)));
+        assert!(!inside_something_live(&retention, &dir, 0));
     }
 
     /// **A budget published while a pass was running is the one that
@@ -1917,7 +1805,7 @@ mod tests {
         ));
         let reader = Arc::new(retention.reader(&dir, TOTAL, TARGET.into()));
         reader.note(0);
-        settled(&retention, "the published cap was applied", |_| {
+        settled(&retention, "the published cap was applied", || {
             dir.held().unwrap().len() <= 12
         })
         .await;
@@ -1938,7 +1826,7 @@ mod tests {
         settled(
             &retention,
             "the pass that measured the old cap is over",
-            |_| true,
+            || true,
         )
         .await;
 
@@ -2011,7 +1899,7 @@ mod tests {
         settled(
             &retention,
             "the pass the movement armed reclaimed round the twentieth chunk",
-            |_| !dir.chunk_path(10).exists(),
+            || !dir.chunk_path(10).exists(),
         )
         .await;
 
@@ -2054,7 +1942,7 @@ mod tests {
         settled(
             &retention,
             "the pass reclaimed the far end of the film",
-            |_| !dir.chunk_path(15).exists(),
+            || !dir.chunk_path(15).exists(),
         )
         .await;
 
@@ -2118,7 +2006,7 @@ mod tests {
         settled(
             &retention,
             "the pass reclaimed the far end of the film",
-            |_| !dir.chunk_path(15).exists(),
+            || !dir.chunk_path(15).exists(),
         )
         .await;
 
@@ -2187,7 +2075,7 @@ mod tests {
         settled(
             &retention,
             "the pass the swallowed trigger armed reclaimed the head of the film",
-            |_| !dir.chunk_path(0).exists(),
+            || !dir.chunk_path(0).exists(),
         )
         .await;
         assert_eq!(
@@ -2199,15 +2087,13 @@ mod tests {
             dir.chunk_path(15).is_file(),
             "the chunk the player stopped inside is still here"
         );
-        let mut gate = ReclaimGate::default();
-        retention.fill_gate(&mut gate);
         assert!(
-            !gate.releases_file(&dir.chunk_path(15)),
+            inside_something_live(&retention, &dir, 15),
             "and the cleaner is refused it, because that is where the player \
              stopped and where its next request will start"
         );
         assert!(
-            gate.releases_file(&dir.chunk_path(0)),
+            !inside_something_live(&retention, &dir, 0),
             "while the head of the film, which the window left behind long \
              ago, is the cleaner's for the asking"
         );
@@ -2321,7 +2207,7 @@ mod tests {
             settled(
                 &retention,
                 "the next byte's pass reclaimed the far end",
-                |_| !dir.chunk_path(15).exists(),
+                || !dir.chunk_path(15).exists(),
             )
             .await;
             assert!(
@@ -2343,15 +2229,13 @@ mod tests {
         let reader = retention.reader(&dir, TOTAL, TARGET.into());
         reader.promises(0..16);
         reader.note(0);
-        let mut gate = ReclaimGate::default();
-        retention.fill_gate(&mut gate);
-        assert!(!gate.releases_file(&dir.chunk_path(15)), "promised");
+        assert!(inside_something_live(&retention, &dir, 15), "promised");
 
         drop(reader);
         settled(
             &retention,
             "the read that ended stopped holding chunk 15",
-            |gate| gate.releases_file(&dir.chunk_path(15)),
+            || !inside_something_live(&retention, &dir, 15),
         )
         .await;
     }
@@ -2386,16 +2270,14 @@ mod tests {
         // The head of the film going is what says a pass really ran: a
         // reader with no window yet is inside all of the entity, so the gate
         // alone would answer before anything had been measured.
-        settled(&retention, "the first player's pass ran", |_| {
+        settled(&retention, "the first player's pass ran", || {
             !dir.chunk_path(0).exists()
         })
         .await;
         drop(played);
 
-        let mut gate = ReclaimGate::default();
-        retention.fill_gate(&mut gate);
         assert!(
-            !gate.releases_file(&dir.chunk_path(15)),
+            inside_something_live(&retention, &dir, 15),
             "with nothing else reading the entity, the window the read that \
              ended left behind is still standing"
         );
@@ -2407,7 +2289,7 @@ mod tests {
         settled(
             &retention,
             "the pass for the position the player seeked to ran",
-            |gate| gate.releases_file(&dir.chunk_path(15)) && !dir.chunk_path(15).exists(),
+            || !inside_something_live(&retention, &dir, 15) && !dir.chunk_path(15).exists(),
         )
         .await;
 
@@ -2513,7 +2395,7 @@ mod tests {
         // that could not tell the two deletes apart would not say so.
         let played = retention.reader(&first, TOTAL, TARGET.into());
         played.note(0);
-        settled(&retention, "the playing body's own pass ran", |_| {
+        settled(&retention, "the playing body's own pass ran", || {
             first.held().is_ok_and(|held| held.len() == 12)
         })
         .await;
@@ -2579,7 +2461,7 @@ mod tests {
         // slack and both drops below are about them.
         let played = retention.reader(&left, TOTAL, TARGET.into());
         played.note(0);
-        settled(&retention, "the playing body's own pass ran", |_| {
+        settled(&retention, "the playing body's own pass ran", || {
             left.held().is_ok_and(|held| held.len() == 12)
         })
         .await;
@@ -2625,7 +2507,7 @@ mod tests {
         // the sweep's own ticket and nobody else's.
         let opened = ChunkDir::new(tmp.path().join("opened"));
         let watching = retention.reader(&opened, TOTAL, "https://origin.example/next.mkv".into());
-        settled(&retention, "the playing body's own pass ran", |_| true).await;
+        settled(&retention, "the playing body's own pass ran", || true).await;
 
         let seen = Arc::new(Mutex::new(Vec::new()));
         *retention.interleave.lock().expect("the interleave slot") = Some(Arc::new({

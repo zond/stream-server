@@ -251,9 +251,8 @@ pub fn desired(conditions: &Conditions, trigger: Trigger) -> Decision {
 /// returns to anything that could store it. It is here because the two
 /// stops mean different things to different readers: only the free-space
 /// one is a statement about the device, which is what the statistics report
-/// to a client (`Engine::is_stopped_for_space`), what the cache cleaner
-/// evicts for, and -- while the idle policy still has an owner of its own
-/// -- the only stop this reconciler is allowed to make.
+/// to a client (`Engine::is_stopped_for_space`) and what the stream
+/// route's disk gate refuses on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Verdict {
     /// What should happen to the torrent.
@@ -343,7 +342,7 @@ pub fn verdict(conditions: &Conditions, trigger: Trigger) -> Verdict {
 /// It is a function of its own, and not a line inside the ladder, because
 /// the ladder is not the only caller: `Engine::is_stopped_for_space` asks
 /// the same question of a torrent that is already stopped, for the
-/// statistics a client polls and for the cache cleaner's eviction classes.
+/// statistics a client polls and for the stream route's disk gate.
 /// A second copy of the test in either place is a policy in two halves that
 /// drift, which is how the free-space watch came to skip the very torrents
 /// the stream route was answering `507` for.
@@ -351,13 +350,11 @@ pub fn verdict(conditions: &Conditions, trigger: Trigger) -> Verdict {
 /// **The line is the caller's, and the two callers do not want the same
 /// one.** The ladder asks "should I start this torrent?" and takes its line
 /// from [`line`], which is the hysteresis; everything that asks "is this
-/// device short?" -- the statistics a client reads, the cleaner's eviction
-/// classes -- asks at [`CACHE_FREE_SPACE_FLOOR`], the same number
-/// `ensure_download_disk_ready` answers `507` under and the cleaner keeps
-/// free. Handing the hysteresis to those callers reports a volume the rest
-/// of the server is happy with as out of disk, and takes the files of every
-/// torrent that happens to be paused inside the band out of the protected
-/// class.
+/// device short?" -- the statistics a client reads, the stream route's
+/// gate -- asks at [`CACHE_FREE_SPACE_FLOOR`], the same number
+/// `ensure_download_disk_ready` answers `507` under and the published cap
+/// keeps free. Handing the hysteresis to those callers reports a volume the
+/// rest of the server is happy with as out of disk.
 pub fn volume_is_short(
     line: u64,
     has_metadata: bool,
@@ -406,10 +403,10 @@ pub(crate) fn line(trigger: Trigger, observed: RunState) -> u64 {
 /// reconciler's most recent *observation* of a live input -- at most one
 /// [`RECONCILE_INTERVAL`] old -- kept because the question "is this torrent
 /// stopped because its volume is full?" is asked far more often than the
-/// volume can usefully be measured: every `stats.json` poll asks it, and so
-/// does every pass of the cache cleaner, over every engine. A `statvfs` per
-/// asker would be a syscall per torrent per poll for a number that changes
-/// on the scale of seconds.
+/// volume can usefully be measured: every `stats.json` poll asks it, and
+/// so does the disk gate in front of every stream. A `statvfs` per asker
+/// would be a syscall per torrent per poll for a number that changes on the
+/// scale of seconds.
 ///
 /// **One reading for the whole session, not one per torrent.** It is a
 /// property of a device: torrents writing to it share it, and the stall

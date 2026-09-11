@@ -62,13 +62,23 @@ pub struct CacheConfig {
 ///
 /// Under the cache root, and not the system temp dir, on purpose. Nothing
 /// here is precious -- every byte can be fetched or extracted again from
-/// what the session names -- so it should be cache to the cleaner like
-/// everything else: counted against the limit, aged by mtime, evicted when
-/// the disk is short, no protection. The system temp dir gave none of that
-/// and, on Android, is not writable by an app at all. The name may not be
-/// `.cache` or `.metadata`: `cache_cleaner::is_session_artifact` exempts any
-/// path with either component in it, and a directory the cleaner exempts is
+/// what the session names -- so it belongs where the rest of the cache is,
+/// on the volume the server counts and caps rather than on one it knows
+/// nothing about. The system temp dir gave none of that and, on Android, is
+/// not writable by an app at all. The name may not be `.cache` or
+/// `.metadata`: those were the two components the old cache cleaner's walk
+/// exempted as session records, and a directory that exempts itself is
 /// unbounded disk nobody counts.
+///
+/// **What is under it owns itself.** Every file here is a
+/// `tempfile::NamedTempFile` -- the download's and the extraction's alike --
+/// so it is unlinked when the session holding it drops, which is when the
+/// idle sweep takes that session (`crate::archives::sessions`). No
+/// retention owner speaks for these bytes: they are neither a torrent's
+/// pieces nor a proxied entity. What a *crash* leaves behind is therefore
+/// the one thing under the cache root with no deleter at all, now that
+/// nothing walks it; it is bounded by how often this process dies rather
+/// than by anything here.
 pub const SCRATCH_DIR_NAME: &str = ".archives";
 
 impl CacheConfig {

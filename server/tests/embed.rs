@@ -2769,7 +2769,7 @@ fn a_panels_numbers_are_about_the_file_the_url_resolved_to() -> anyhow::Result<(
     );
 
     // The player seeks on and reads. Opening the reader is what installs a
-    // policy under the budget the cleaner has now published, and the byte
+    // policy under the budget the process has now published, and the byte
     // reaching the player is what moves the playhead -- into the file the
     // auto-select resolved to, and no other.
     play(&auto_url, PLAYING * PIECE)?;
@@ -2900,7 +2900,7 @@ fn a_panel_asking_about_a_torrent_stream_is_told_what_is_on_the_disk() -> anyhow
     );
 
     // The player seeks on and reads. Opening the reader is what installs a
-    // policy under the budget the cleaner has now published, and the byte
+    // policy under the budget the process has now published, and the byte
     // reaching the player is what moves the playhead.
     play(PLAYING * PIECE)?;
 
@@ -3121,10 +3121,6 @@ fn a_clean_restates_the_cap_before_it_reports_it() -> anyhow::Result<()> {
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         config_dir: Some(config_dir.path().join("config")),
         cache_dir: Some(cache_root.clone()),
-        // The walk is still in the process at this slice and it publishes
-        // nothing; left running it would only add a second deleter to a
-        // test about who states the cap.
-        enable_cache_cleaner: false,
         ..offline_config()
     })?;
     seed_piece_store(&cache_root, &torrent, &content);
@@ -3190,13 +3186,13 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
     let content = src.path().join("Movie");
     std::fs::create_dir_all(&content)?;
     // Two files, each a whole number of 16 KiB pieces (as `lan_media_server`
-    // does). Pinning only `movie.mkv` protects the whole torrent's data
-    // *from this pass*: the walk's gate refuses every piece the torrent
-    // announces, and a piece store is not divisible by file at that level.
-    // What `GET /cache.json` reports as protected is the pinned file alone
-    // -- a pin is per file, and a file is the unit a client can put in
-    // front of a user -- so the two figures below are two honest answers to
-    // two different questions and are not read against each other.
+    // does). Pinning only `movie.mkv` keeps the whole torrent's data from
+    // this clean: a pinned torrent keeps everything it holds, and a piece
+    // store is not divisible by file at that level. What `GET /cache.json`
+    // reports as protected is the pinned file alone -- a pin is per file,
+    // and a file is the unit a client can put in front of a user -- so the
+    // two figures below are two honest answers to two different questions
+    // and are not read against each other.
     write_payload(&content.join("movie.mkv"), 64 * 1024);
     write_payload(&content.join("subtitle.srt"), 16 * 1024);
     let (torrent, info_hash) = real_torrent(&content);
@@ -3224,12 +3220,6 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         config_dir: Some(config_dir.path().join("config")),
         cache_dir: Some(cache_root.clone()),
-        // Every assertion below is that a byte is still on the disk, and
-        // the background walk that is still in the process at this point
-        // takes bytes on a debounce nothing in this test controls. What is
-        // under test is what a clean does, so the only deleter here is the
-        // clean this test asks for.
-        enable_cache_cleaner: false,
         ..offline_config()
     })?;
     // Already "streamed": the data sits in the piece store, as it would

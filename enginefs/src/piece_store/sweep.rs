@@ -43,8 +43,8 @@ use super::store::StoreRoot;
 pub struct SweepReport {
     /// Torrent directories removed because nothing claimed them.
     pub removed: usize,
-    /// What they occupied, in bytes as the volume counts them -- the same
-    /// `st_blocks` accounting the cache cleaner uses, so a sparse or
+    /// What they occupied, in bytes as the volume counts them -- the one
+    /// `st_blocks` accounting this repository has, so a sparse or
     /// partly-written piece is reported at what deleting it actually frees.
     pub freed_bytes: u64,
     /// Entries that could not be removed. Logged, never fatal: a sweep that
@@ -91,8 +91,8 @@ pub fn sweep_unadopted(root: &StoreRoot, adopted: &HashSet<String>) -> SweepRepo
             continue;
         }
         // What the store says is in there, never a walk of our own: the
-        // bucketing is `StoreRoot`'s and this is the same reading the cache
-        // cleaner gets.
+        // bucketing is `StoreRoot`'s and this is the same reading a usage
+        // figure gets.
         let freed = match (is_dir, name) {
             (true, Some(name)) => store.stat(name).occupancy(),
             _ => 0,

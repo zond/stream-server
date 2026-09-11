@@ -1681,7 +1681,7 @@ fn the_cache_figure_follows_the_chunks_the_proxy_wrote() -> anyhow::Result<()> {
     // booked: a walk would find it, the count cannot, and which of the two
     // answers this route gives is the whole of this slice. (It is also why
     // a cache an earlier process filled reads as nothing until the launch
-    // sweep empties it -- see `cache_cleaner::cache_usage`.)
+    // sweep empties it -- see `cache_cleaner::usage`.)
     let bucket = cached_chunks(&fixture)
         .first()
         .and_then(|chunk| chunk.parent().map(std::path::Path::to_path_buf))
@@ -1781,7 +1781,8 @@ fn the_count_hears_the_clean_and_ignores_what_no_owner_booked() -> anyhow::Resul
 ///
 /// Not a clock, which is what it used to be: an entity nothing was reading
 /// was forgotten ninety seconds after its last delivered byte and its chunks
-/// became the cleaner's to find. A viewer who pauses for an hour has not
+/// became the cache cleaner's to find, whenever its walk got round to
+/// them. A viewer who pauses for an hour has not
 /// stopped playing, and a viewer who opens something else has stopped playing
 /// whatever the clock says -- so the cache keeps the one stream being played
 /// and drops what was left, at the moment it is left.
@@ -1851,8 +1852,8 @@ const RETENTION_BUDGET: u64 = 8 * 1024 * 1024;
 /// Configure `bytes` as the cache size, which is the whole of what bounds
 /// the streams below.
 ///
-/// **Nothing here runs an eviction pass.** Stating the budget is not the
-/// cleaner's job -- `update_settings` publishes it, because `cacheSize` is
+/// **Nothing here runs a pass.** Stating the budget is a publication and
+/// not a deletion -- `update_settings` publishes it, because `cacheSize` is
 /// half of what the cap is made of and a client that changes it has changed
 /// the cap (`server::cache_budget`). Sweeping the volume here first would
 /// make these tests pass just as well with the publication back where it
@@ -1883,11 +1884,11 @@ fn published_budget(fixture: &Fixture, bytes: u64) -> anyhow::Result<()> {
 /// A chunk is written from a task nobody joins and a retention pass runs on
 /// another, so a listing of the cache root taken the moment a body ends is a
 /// listing of a directory more chunks are still landing in and a pass is
-/// still deleting from. Two counts either side of a cleaner's pass are then
-/// counts of two different caches, which is how the test below came to
-/// report *more* chunks after a reclaim than before it -- a number that
-/// cannot be the cleaner having taken anything, and the sign that the count
-/// was never measuring the gate at all.
+/// still deleting from. Two counts either side of a pass are then counts of
+/// two different caches, which is how the test below came to report *more*
+/// chunks after a reclaim than before it -- a number that cannot be the pass
+/// having taken anything, and the sign that the count was never measuring
+/// the window at all.
 ///
 /// Called after a body has been read to its end, this is a real quiescence
 /// and not a guess: no byte of that stream is delivered afterwards, so
@@ -1905,8 +1906,8 @@ fn settled(fixture: &Fixture) {
 ///
 /// A read holds its window and its promise until it is dropped, which is
 /// after the last byte of it has reached the player -- so a test that has
-/// just read a body to its end and asks the cleaner what it may take is
-/// asking while somebody is still inside those bytes. Bounded so a
+/// just read a body to its end and asks what is disposable is asking while
+/// somebody is still inside those bytes. Bounded so a
 /// regression fails instead of hanging.
 fn nothing_is_reading(fixture: &Fixture) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -1940,7 +1941,7 @@ fn holds_no_more_than(fixture: &Fixture, chunks: usize) {
 /// after the last pass of a play-through concluded are still on the disk
 /// when the body ends: there is no byte left to arm the pass that would take
 /// them. That tail is a real property and not a fault -- it goes at the next
-/// byte, at the next stream, or to the cleaner -- but its *size* is whatever
+/// byte, at the next stream, or at the next boot -- but its *size* is whatever
 /// the last pass happened to be behind by, which is a property of the
 /// machine: measured here, a run that leaves 32 chunks on Linux left 73 on a
 /// Windows runner, where the unlinks are slower and the fill outruns them
@@ -2068,8 +2069,8 @@ fn a_proxied_stream_past_the_cache_budget_stays_under_it_and_still_plays() -> an
 ///
 /// Every other test here states the budget by changing a setting, which is
 /// a client acting on a running server. This one has no client and no pass:
-/// the `cacheSize` is on the disk before the process starts, the cleaner is
-/// switched off, and nothing calls `POST /settings`. So the only thing that
+/// the `cacheSize` is on the disk before the process starts and nothing
+/// calls `POST /settings`. So the only thing that
 /// can have stated a budget is the process's own publisher
 /// (`server::cache_budget::start`), and if it has not, the budget is
 /// `CacheBudget::Unknown`, which installs no retention policy at all -- and
@@ -2105,10 +2106,6 @@ fn a_stream_relayed_before_anything_has_walked_the_cache_is_still_bounded() -> a
         http_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
         config_dir: Some(config),
         cache_dir: Some(cache_root.path().join("cache")),
-        // The cleaner's start-up sweep publishes a budget of its own, and
-        // this test is about the budget a process has before anything has
-        // walked anything.
-        enable_cache_cleaner: false,
         ..offline_config()
     })?;
     let fixture = Fixture {
@@ -2553,7 +2550,7 @@ fn a_second_player_fetching_does_not_truncate_the_first_ones_read() -> anyhow::R
 /// test.** It used to count the files before the pass and after it and
 /// assert the two numbers were equal, which cannot express this claim: a
 /// count cannot tell a chunk a player is inside from one nobody is reading,
-/// so an equality of counts passes when the cleaner takes a protected chunk
+/// so an equality of counts passes when a pass takes a protected chunk
 /// and happens to leave an unprotected one. It could not even be relied on
 /// to fail honestly -- with chunks still landing while the first number was
 /// taken, the count *rose* across a reclaim often enough to fail one run of
@@ -6328,8 +6325,8 @@ fn content_range(headers: &reqwest::header::HeaderMap) -> std::ops::Range<u64> {
 }
 
 /// Every chunk file the proxy cache holds: the files under the `.proxy`
-/// root, which is inside the very directory `cache_cleaner::cache_roots`
-/// walks, and which therefore turns up in a plain walk of the cache root.
+/// root, which is inside the one torrent-data root and therefore turns up
+/// in a plain walk of the cache root.
 ///
 /// Temporary files are counted as chunks on purpose. A test that asserted
 /// "no chunks" while a `.part` sat there would be asserting the wrong thing.

@@ -107,8 +107,9 @@ impl ProgressiveCache {
     /// Create a new ProgressiveCache in a specific directory -- the archive
     /// scratch directory under the cache root (`CacheConfig::scratch_dir`),
     /// created if missing. There is deliberately no constructor for the
-    /// system temp dir: what is written here is cache, and the cleaner only
-    /// governs what is under the cache root.
+    /// system temp dir: what is written here is cache, and it belongs on
+    /// the volume this server counts and caps rather than on one it knows
+    /// nothing about.
     pub async fn new_in_dir(
         dir: &std::path::Path,
         total_size: Option<u64>,

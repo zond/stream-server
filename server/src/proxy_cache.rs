@@ -71,20 +71,19 @@
 //!   a directory linearly, and that is exactly where a phone's cache lives.
 //!
 //! The root is `.proxy` inside the engine's `download_dir`, beside
-//! `.pieces` -- inside the cache root on purpose, so the cleaner walks,
-//! counts and evicts every byte of it with no change to `cache_roots`. It is
-//! **not** named `.cache` or `.metadata`: `cache_cleaner::is_session_artifact`
-//! exempts any path with either component anywhere in it, and a cache that
-//! exempts itself from the cleaner is unbounded disk nobody counts. Nothing
-//! here is in `EngineFS::protected_paths` either -- a proxied stream nobody is
-//! reading is the first thing that should go.
+//! `.pieces` -- inside the cache root on purpose, so every byte of it is
+//! counted in the one usage figure and capped by the one published budget.
+//! It is **not** named `.cache` or `.metadata`: those were the two
+//! components the old cache cleaner's walk exempted as session records, and
+//! a cache that exempts itself is unbounded disk nobody counts. Nothing
+//! here is pinned either -- a proxied stream nobody is reading is the first
+//! thing that should go.
 //!
 //! # What bounds it, and where the playhead comes from
 //!
-//! The cleaner is the outer bound and it is not a fast one: it walks the
-//! volume a minute after the last write at best, and a proxied stream at
-//! 20 MB/s writes a gigabyte in that minute. So the same retention policy
-//! the piece store is under bounds this too --
+//! Nothing outside this owner bounds it, and a proxied stream at 20 MB/s
+//! writes a gigabyte a minute. So the same retention policy the piece store
+//! is under bounds this too --
 //! `enginefs::piece_store::policy`, one budget, a window roughly 90% ahead
 //! of the playhead and 10% behind it -- driven by
 //! [`crate::proxy_retention`]. The only input it was missing is the
@@ -96,11 +95,9 @@
 //! player *asks* for and is not one of them.
 //!
 //! Two things follow for what may be unlinked, and they are the same fact
-//! from two sides. A chunk inside a live stream's window is not offered to
-//! the cleaner's size rule
-//! (`enginefs::retention::ReclaimGate::releases_file`), and a chunk an open
-//! body has been framed to deliver and has not delivered yet is offered to
-//! neither the cleaner nor the retention pass -- a response says its length
+//! from two sides. A chunk inside a live stream's window is not the pass's
+//! to take, and a chunk an open body has been framed to deliver and has not
+//! delivered yet is not either -- a response says its length
 //! before its first byte goes out, and a window 90% ahead of the playhead
 //! does not cover a body longer than that, so without it the pass a read's
 //! own playhead drives would delete that read's tail. `Cached` opens a
@@ -278,10 +275,10 @@ pub struct ProxyCache {
 }
 
 impl ProxyCache {
-    /// The cache under an engine's `download_dir` -- the directory
-    /// `cache_cleaner::cache_roots` already walks -- bounded by the cache
-    /// cleaner's cap, which is the *same* cell the torrent half reads
-    /// (`EngineFS::cache_budget`) and not a second copy of the number.
+    /// The cache under an engine's `download_dir` -- the one torrent-data
+    /// root -- bounded by the published cap, which is the *same* cell the
+    /// torrent half reads (`EngineFS::cache_budget`) and not a second copy
+    /// of the number.
     ///
     /// `live` is shared the same way and for the same reason
     /// (`EngineFS::live`): what is being played is one fact about the

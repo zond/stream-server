@@ -109,7 +109,6 @@ pub struct ServerConfig {
     pub listen_for_ctrl_c: bool,
     pub print_startup: bool,
     pub exit_process_on_shutdown_timeout: bool,
-    pub enable_cache_cleaner: bool,
     pub enable_memory_sampler: bool,
     pub enable_ssdp_discovery: bool,
     pub graceful_shutdown_timeout: Duration,
@@ -171,7 +170,6 @@ impl ServerConfig {
             listen_for_ctrl_c: false,
             print_startup: false,
             exit_process_on_shutdown_timeout: false,
-            enable_cache_cleaner: true,
             enable_memory_sampler: false,
             enable_ssdp_discovery: false,
             graceful_shutdown_timeout: Duration::from_secs(3),
@@ -195,7 +193,6 @@ impl ServerConfig {
             listen_for_ctrl_c: true,
             print_startup: true,
             exit_process_on_shutdown_timeout: true,
-            enable_cache_cleaner: true,
             enable_memory_sampler: true,
             enable_ssdp_discovery: true,
             graceful_shutdown_timeout: Duration::from_secs(3),
@@ -511,35 +508,33 @@ impl ServerHandle {
         })
     }
 
-    /// What the cache currently occupies against its configured limit, using
-    /// the same occupancy accounting the cleaner uses ([`cache_cleaner::occupied_bytes`]
-    /// -- allocated blocks, not apparent length), exactly what `GET /cache.json`
-    /// answers (see `routes::cache::cache_usage`). [`CacheUsage::protected_bytes`]
-    /// and `protected_files` are what a live engine or a pinned download is
+    /// What the cache currently occupies against its configured limit, in
+    /// the one occupancy accounting this repository has
+    /// (`enginefs::chunk_store::occupied_bytes` -- allocated blocks, not
+    /// apparent length), exactly what `GET /cache.json` answers (see
+    /// `routes::cache::cache_usage`). [`CacheUsage::protected_bytes`] and
+    /// `protected_files` are what a pin or the stream being played is
     /// holding right now, so a caller can tell "over the limit but nothing
-    /// is evictable" apart from "a clean would help" without running one.
+    /// is disposable" apart from "a clean would help" without running one.
     ///
-    /// Walks the cache tree, but only with `stat` calls -- no file reads --
-    /// and only as many of them as there are files currently in the cache;
-    /// it is the same walk the background cleaner already performs on every
-    /// debounced or hourly pass, so one call per "Storage" screen open or
-    /// manual refresh is cheap. It is not bounded or cached here, so do not
-    /// poll it on a sub-second timer -- a few seconds between calls is
-    /// plenty for a UI.
+    /// Walks nothing: the owners of the cache count what they hold as they
+    /// write it, and the only filesystem work is one `read_dir` of the
+    /// store root for what no live store speaks for. Cheap enough for a
+    /// "Storage" screen open or a manual refresh; it is not cached here, so
+    /// do not poll it on a sub-second timer.
     pub fn cache_usage(&self) -> anyhow::Result<CacheUsage> {
         let state = self.state.clone();
         self.block_on_server(async move { routes::cache::cache_usage(&state).await })
     }
 
-    /// Run one eviction pass immediately and report what it freed, exactly
-    /// what `POST /cache/clean` answers (see `routes::cache::clean_cache_now`).
-    /// Respects exactly the protections the scheduled sweep does -- a pinned
-    /// download's files and anything a live engine is writing are never
-    /// touched, however far over the limit the cache is;
-    /// [`EvictionReport::shortfall_message`] is the line to show the user
-    /// when that leaves it still over: cleaning cannot reclaim what a live
-    /// engine or a pin protects, and the fix is to stop the stream or unpin
-    /// the download, not to run the clean again.
+    /// Give back everything nobody is playing and nobody is reading, now,
+    /// and report what is left -- exactly what `POST /cache/clean` answers
+    /// (see `routes::cache::clean_cache_now`). A pinned download's files
+    /// and the window of the stream being played are never touched, however
+    /// far over the limit the cache is; [`EvictionReport::shortfall_message`]
+    /// is the line to show the user when that leaves it still over: nothing
+    /// can reclaim what a pin or a live window keeps, and the fix is to stop
+    /// the stream or unpin the download, not to run the clean again.
     pub fn clean_cache_now(&self) -> anyhow::Result<EvictionReport> {
         let state = self.state.clone();
         self.block_on_server(async move { routes::cache::clean_cache_now(&state).await })?
@@ -565,17 +560,17 @@ impl ServerHandle {
         }
     }
 
-    /// How many open bodies the proxy cache is answering right now: the
-    /// reads whose windows and promises the cache cleaner's gate is refused
-    /// bytes by (`proxy_retention::ProxyRetention::reads`).
+    /// How many open bodies the proxy cache is answering right now
+    /// (`proxy_retention::ProxyRetention::reads`) -- an entity one of them
+    /// is inside is live, so nothing takes its bytes while it stands.
     ///
     /// Not [`Self::proxy_streams_live`], which counts the reads a client can
     /// close by token: that registration goes the moment a body ends, while
-    /// the read itself lives on until hyper drops the response -- so a
-    /// cleaner run in between is still answered "somebody is inside all of
-    /// this". That gap is nanoseconds on an idle machine and milliseconds on
-    /// a loaded one, which makes it exactly the kind of thing a test has to
-    /// be able to wait for rather than hope past.
+    /// the read itself lives on until hyper drops the response -- so a pass
+    /// in between is still answered "somebody is inside all of this". That
+    /// gap is nanoseconds on an idle machine and milliseconds on a loaded
+    /// one, which makes it exactly the kind of thing a test has to be able
+    /// to wait for rather than hope past.
     pub fn proxy_cache_reads(&self) -> usize {
         self.state.proxy_cache.retention().reads()
     }
@@ -1034,7 +1029,7 @@ pub async fn run(
 
     // The one torrent-data root, prepared before anything is opened on it:
     // the piece store, the session's own records and the proxy cache all
-    // live under it, and it is the only tree the cache cleaner walks. A
+    // live under it, and it is the whole of what a usage figure counts. A
     // persisted `cacheRoot` that cannot be used any more (unmounted drive,
     // permissions) falls back to the configured default rather than
     // stopping the server, and the fallback is what gets persisted below --
@@ -1257,19 +1252,14 @@ pub async fn run(
             changed, bell, torrents, proxied,
         ))
     });
-    // And the cache budget, which is not the cleaner's even though the
-    // cleaner used to be the only thing that ever stated one. Unconditional
-    // like the DHT health check: a server whose cleaner is switched off
-    // still relays streams into the proxy cache, and a process that has
-    // published no budget holds no retention policy over them at all. See
-    // `cache_budget`.
+    // And the cache budget, which the cache cleaner used to state on its
+    // way out of a walk. Unconditional like the DHT health check: a process
+    // that has published no budget holds no retention policy over a relayed
+    // stream at all. See `cache_budget`.
     // Awaited, not merely spawned: `start` states the budget before it
     // returns, so it exists before the router below can serve a request
     // into the proxy cache rather than a moment after.
     background_tasks.push(cache_budget::start(Arc::new(state.clone())).await);
-    if cfg.enable_cache_cleaner {
-        background_tasks.push(cache_cleaner::start(Arc::new(state.clone())));
-    }
     if cfg.enable_memory_sampler {
         background_tasks.push(diagnostics::start_memory_sampler(state.clone()));
     }

@@ -8,8 +8,7 @@ use tokio::sync::RwLock;
 
 #[derive(Clone)]
 pub struct AppState {
-    /// The one torrent engine: every route, the cleaner and the
-    /// diagnostics read this. There used to be a second field,
+    /// The one torrent engine: every route and the diagnostics read this. There used to be a second field,
     /// `download_engine`, holding the same `Arc` -- see `run()`.
     pub engine: Arc<EngineFS>,
     pub settings: Arc<RwLock<ServerSettings>>,
@@ -34,12 +33,13 @@ pub struct AppState {
     /// end its own player's (see `crate::proxy_streams`).
     pub proxy_streams: Arc<crate::proxy_streams::ProxyStreams>,
     /// What `/proxy` has already fetched, on disk (see
-    /// `crate::proxy_cache`). Rooted inside the engine's `download_dir`,
-    /// which is where the cache cleaner already walks, so every byte of it
-    /// is ordinary cache to the cleaner: counted, aged, evicted, never
-    /// pinned -- with the two exceptions the retention policy makes, a chunk
-    /// under a live stream's window and one an open body has been framed to
-    /// deliver and has not yet (`crate::proxy_retention`).
+    /// `crate::proxy_cache`). Rooted inside the engine's `download_dir`, so
+    /// it is counted in the same usage figure and capped by the same
+    /// published budget -- and every byte of it is disposable the moment a
+    /// viewer opens something else, with the two exceptions its retention
+    /// owner makes: a chunk under the live stream's window and one an open
+    /// body has been framed to deliver and has not yet
+    /// (`crate::proxy_retention`).
     pub proxy_cache: Arc<crate::proxy_cache::ProxyCache>,
     /// The optional LAN media listener shared by `run` and `ServerHandle`
     /// (see `crate::lan_media`). Constructed disabled; `run` replaces it with
@@ -86,7 +86,7 @@ impl AppState {
         log_dir: PathBuf,
     ) -> Self {
         let settings_file = Arc::new(SettingsFile::new(config_dir.join("settings.json")));
-        // The cleaner's cap, shared and not copied: `/proxy`'s cache and
+        // The published cap, shared and not copied: `/proxy`'s cache and
         // the piece store are two adapters over one chunk store on one
         // volume, and the retention policy over them is sized from one
         // number.

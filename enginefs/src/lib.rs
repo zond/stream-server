@@ -1,5 +1,5 @@
 use crate::engine::Engine;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
 use std::collections::{BTreeMap, HashMap};
@@ -46,15 +46,16 @@ const INACTIVE_TORRENT_REMOVE_TIMEOUT: Duration = Duration::from_secs(300); // 5
 ///
 /// One number, three readers, and it is one number so they cannot drift:
 /// the server's stream route refuses to start a stream that would write to
-/// disk with less than this free; its cache cleaner evicts the cache back
-/// to it; and the engine's reconciler stops a torrent that is writing when
-/// the volume falls under it ([`reconcile::desired`]'s free-space arm). The
-/// third is what makes the other two hold. librqbit's storage writes the
-/// whole file it wants and stops only at ENOSPC, which it treats as a fatal
-/// torrent error -- so without the reconciler a torrent larger than the free
-/// space ran the volume to zero between two cleaner passes (40 s at full
-/// speed on the television that prompted this), and with the volume at
-/// zero every other stream and the OS around them failed too. It looks
+/// disk with less than this free; the published cap keeps the cache out of
+/// it (`cache_budget::cap_to_publish`); and the engine's reconciler stops a
+/// torrent that is writing when the volume falls under it
+/// ([`reconcile::desired`]'s free-space arm). The third is what makes the
+/// other two hold. librqbit's storage writes the whole file it wants and
+/// stops only at ENOSPC, which it treats as a fatal torrent error -- so
+/// without the reconciler a torrent larger than the free space ran the
+/// volume to zero in 40 s at full speed on the television that prompted
+/// this, and with the volume at zero every other stream and the OS around
+/// them failed too. It looks
 /// every [`FREE_SPACE_WATCH_INTERVAL`], so a torrent can overshoot the
 /// floor by that long of writing; the floor is sized to absorb it.
 ///
@@ -80,25 +81,17 @@ pub const FREE_SPACE_WATCH_INTERVAL: Duration = Duration::from_secs(2);
 pub const FREE_SPACE_RESUME_MARGIN: u64 = 64 * 1024 * 1024;
 /// How long the volume a stopped torrent writes to may stay short with that
 /// torrent's readers parked before they are failed
-/// (`Engine::refuse_reads_for_space`). The cache cleaner normally settles it
-/// well inside this -- the stop notifies it, and its pass either makes room
-/// (and the next reconcile starts the torrent) or evicts it -- so a reader
-/// sees a buffering blip, not a failure. This is the bound for a server
-/// whose cleaner is off or stuck: a parked read that nothing will complete
-/// is a player spinning for ever.
+/// (`Engine::refuse_reads_for_space`). The owners' slack passes normally
+/// settle it well inside this -- the tick and the running-low bell both give
+/// back everything nobody is playing, and the next reconcile starts the
+/// torrent -- so a reader sees a buffering blip, not a failure. This is the
+/// bound for a volume nothing here can free: a parked read that nothing will
+/// complete is a player spinning for ever.
 ///
 /// Counted per volume rather than per torrent, because what decides whether
 /// a parked read has anything coming is the disk, not when this particular
 /// torrent happened to be stopped on it.
 pub const STOPPED_READ_STALL_BOUND: Duration = Duration::from_secs(20);
-/// How long after the cache cleaner has evicted a torrent stopped for space
-/// ([`BackendEngineFS::evict_stopped_torrent`]) a request for the same hash
-/// is refused rather than re-added. A player whose body was just failed
-/// reconnects within a second and stremio-core's stats poll asks about the
-/// hash every second; either would re-add the torrent and refill the disk
-/// the cleaner has just emptied, in a loop nobody asked for. A user who
-/// sees the error and presses play again arrives later than this.
-pub const EVICTED_FOR_SPACE_RETRY_AFTER: Duration = Duration::from_secs(30);
 /// Free space that must remain on the download volume after a pinned file's
 /// missing bytes are written; `pin_download` refuses below it
 /// ([`PinDownloadError::InsufficientSpace`]). Re-pinning a complete file
@@ -218,19 +211,6 @@ pub enum MagnetAddError {
         info_hash: String,
         error: Arc<anyhow::Error>,
     },
-    /// The torrent was stopped for want of disk space and the cache cleaner
-    /// evicted it whole -- torrent and partial download -- because nothing
-    /// else on the volume could go ([`BackendEngineFS::evict_stopped_torrent`]).
-    /// Until `retry_after_secs` on the engine's clock, a request for the
-    /// hash gets this instead of a fresh add; see
-    /// [`EVICTED_FOR_SPACE_RETRY_AFTER`]. Routes map it to 507.
-    #[error(
-        "torrent {info_hash} was stopped for want of disk space and its partial download evicted"
-    )]
-    EvictedForSpace {
-        info_hash: String,
-        retry_after_secs: u64,
-    },
 }
 
 impl MagnetAddError {
@@ -246,23 +226,6 @@ impl MagnetAddError {
             Self::Backend { .. } | Self::TaskFailed { .. } | Self::Cancelled { .. } => {
                 "backend refused the torrent; see server logs".to_string()
             }
-            Self::EvictedForSpace { .. } => {
-                "the torrent was stopped for want of disk space and its partial download evicted; \
-                 free some space and retry"
-                    .to_string()
-            }
-        }
-    }
-
-    /// Whether a blocking lookup at `now_secs` may retry the add this error
-    /// ended: always, except inside the cooling-off period of an eviction
-    /// for space.
-    fn may_retry_at(&self, now_secs: u64) -> bool {
-        match self {
-            Self::EvictedForSpace {
-                retry_after_secs, ..
-            } => now_secs >= *retry_after_secs,
-            _ => true,
         }
     }
 }
@@ -384,10 +347,10 @@ type VolumeProbe = Arc<dyn Fn(&std::path::Path) -> std::io::Result<u64> + Send +
 /// same volume: the device id on Unix; the path prefix (drive letter or
 /// UNC share) on Windows, where std exposes no stable volume serial.
 ///
-/// Public because the server's cache cleaner asks the same question of its
-/// walk roots -- a free-space cap is a statement about a volume, so roots on
-/// two volumes cannot share one budget -- and two answers to "are these the
-/// same volume" that disagree would be worse than either.
+/// Public because the server asks the same question of the roots it caps --
+/// a free-space cap is a statement about a volume, so roots on two volumes
+/// cannot share one budget -- and two answers to "are these the same volume"
+/// that disagree would be worse than either.
 #[cfg(unix)]
 pub fn volume_id(path: &std::path::Path) -> std::io::Result<u64> {
     use std::os::unix::fs::MetadataExt;
@@ -631,10 +594,6 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     /// The housekeeping sweep started by the constructor, kept so its owner
     /// can cancel it. See [`Self::take_sweep_task`].
     sweep_task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// Rung once per reconciler pass that stopped a torrent for want of
-    /// space, for the cache cleaner to run a pass at once rather than on its
-    /// next poll -- see [`Self::out_of_space_signal`].
-    out_of_space_notify: Arc<tokio::sync::Notify>,
     /// Rung by the tick's own reading of the volume whenever it is under
     /// the line, for the owners that hold disposable bytes and have no
     /// tick of their own. See [`crate::retention::SlackBell`].
@@ -649,10 +608,10 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     /// map lookup rather than a `statvfs` per asker. See
     /// [`crate::reconcile::Volumes`].
     volumes: Arc<crate::reconcile::Volumes>,
-    /// What the cache cleaner says the torrent-data volume may hold,
-    /// written by the cleaner through [`Self::set_cache_budget`] and shared
-    /// with every [`Engine`] this instance makes. Unknown until a pass has
-    /// run: see [`crate::retention`].
+    /// What the server says the torrent-data volume may hold, written
+    /// through [`Self::set_cache_budget`] and shared with every [`Engine`]
+    /// this instance makes. Unknown until something has published one: see
+    /// [`crate::retention`].
     budget: Arc<crate::retention::RetentionBudget>,
     /// Where the backend's piece stores register once their `init` has
     /// seeded them, and so where a torrent's held set is read and every
@@ -776,25 +735,6 @@ pub struct EngineDiagnosticsSnapshot {
     pub uptime_secs: u64,
     pub streams: StreamActivitySnapshot,
     pub memory: BackendMemoryDiagnostics,
-}
-
-/// One walk of the engines, for the cache cleaner --
-/// [`BackendEngineFS::reclaim_verdicts`].
-///
-/// Two answers and not three classes: what the policy will part with, and
-/// what can only be taken whole. Everything else the cleaner used to be
-/// told -- which torrents were protected, which were dead -- is inside the
-/// gate now, because both were the same question about announcements.
-#[derive(Debug, Default, Clone)]
-pub struct ReclaimVerdicts {
-    /// Whether a given piece of a given torrent may be reclaimed. A torrent
-    /// it has never heard of is cache nobody speaks for.
-    pub gate: crate::retention::ReclaimGate,
-    /// Unpinned torrents the free-space arm or librqbit's own ENOSPC
-    /// stopped. Not a protection: the gate refuses their pieces because
-    /// they are announced, and this list is what lets the cleaner take one
-    /// **whole**, through the engine, when nothing else can go.
-    pub stopped_for_space: Vec<String>,
 }
 
 /// What the torrent cache holds and what nothing may take from it, as the
@@ -1043,7 +983,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             }),
             clock,
             sweep_task: parking_lot::Mutex::new(None),
-            out_of_space_notify: Arc::new(tokio::sync::Notify::new()),
             slack_bell: Arc::default(),
             reconcile_locks: Default::default(),
             volumes,
@@ -1297,11 +1236,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// from state the backend already holds, because this runs every two
     /// seconds over every torrent there is.
     ///
-    /// A pass that stopped anything rings [`Self::out_of_space_signal`]
-    /// once, whatever it stopped and however many: the cache cleaner it
-    /// wakes walks every root anyway, so a second ring would only make it
-    /// walk them twice.
-    ///
     /// **One reading of what is being played, for the whole pass.** The
     /// ladder and the retention pass both consult it, and a value that
     /// moved between the two would have the reconciler start a torrent that
@@ -1335,7 +1269,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         self.probe_volume(self.volumes.data_folder(), now);
         let mut probed = true;
         let mut decisions = Vec::with_capacity(engines.len());
-        let mut stopped_any = false;
         // Taken once, before the first engine, and handed to both consumers
         // of every engine: what the ladder calls playing and what the pass
         // calls live are one reading.
@@ -1348,7 +1281,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     now,
                     &live,
                     &mut probed,
-                    &mut stopped_any,
                 )
                 .await
             {
@@ -1359,9 +1291,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             // costs a copy of the store's held bits for a torrent something
             // is actually reading and a `None` for every other.
             self.retain_engine(&engine, &live).await;
-        }
-        if stopped_any {
-            self.out_of_space_notify.notify_one();
         }
         decisions
     }
@@ -1389,15 +1318,9 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let engine = self.peek_engine(info_hash).await?;
         let now = self.clock.now_secs();
         let mut probed = false;
-        let mut stopped_any = false;
         let live = self.live.reading();
-        let decision = self
-            .reconcile_engine(&engine, trigger, now, &live, &mut probed, &mut stopped_any)
-            .await;
-        if stopped_any {
-            self.out_of_space_notify.notify_one();
-        }
-        decision
+        self.reconcile_engine(&engine, trigger, now, &live, &mut probed)
+            .await
     }
 
     /// Decide for one engine and act on the decision, under that hash's
@@ -1418,9 +1341,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// no record of who stopped what.
     ///
     /// Only [`Verdict::for_space`] separates the two stops afterwards, and
-    /// only for things that are statements about the *device*: the cache
-    /// cleaner's wake-up and the read refusal. The stop call itself is the
-    /// same call.
+    /// only for the one thing that is a statement about the *device*: the
+    /// read refusal. The stop call itself is the same call.
     async fn reconcile_engine(
         &self,
         engine: &Arc<Engine<B::Handle>>,
@@ -1428,7 +1350,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         now: u64,
         live: &crate::retention::live::Reading,
         probed: &mut bool,
-        stopped_any: &mut bool,
     ) -> Option<crate::reconcile::Decision> {
         if engine.handle.manages_playback_lifecycle() {
             return None;
@@ -1493,13 +1414,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 // answers `Stop` for exactly that reading.
                 let stopped_here = self.stop_if_running(engine, &conditions, now).await;
                 if verdict.for_space {
-                    self.after_stopping_for_space(
-                        engine,
-                        &conditions,
-                        now,
-                        stopped_here,
-                        stopped_any,
-                    );
+                    self.after_stopping_for_space(engine, &conditions, now, stopped_here);
                 } else {
                     // Not a statement about the device, so it lifts one.
                     self.let_reads_park_again(engine);
@@ -1577,13 +1492,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// what only it does: it is the one arm that is a statement about the
     /// *device*.
     ///
-    /// The cache cleaner is woken (through `stopped_any`, once per pass
-    /// however many torrents it stopped -- the cleaner walks every root
-    /// anyway). And a torrent that is stopped on a volume that has been
-    /// short for [`STOPPED_READ_STALL_BOUND`] has its reads failed
+    /// A torrent that is stopped on a volume that has been short for
+    /// [`STOPPED_READ_STALL_BOUND`] has its reads failed
     /// ([`Engine::refuse_reads_for_space`]): a read parked on a piece that
     /// is not being fetched is a player buffering with no end, and the
-    /// bound is how long the cache cleaner gets to settle it first.
+    /// bound is how long the owners' slack passes get to settle it first.
     ///
     /// The bound is read on the same pass as the stop, not only on a later
     /// one: what decides whether a parked read has anything coming is how
@@ -1596,10 +1509,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         conditions: &crate::reconcile::Conditions,
         now: u64,
         stopped_here: bool,
-        stopped_any: &mut bool,
     ) {
         if stopped_here {
-            *stopped_any = true;
             tracing::warn!(
                 info_hash = %engine.info_hash,
                 available = ?conditions.available,
@@ -1765,9 +1676,9 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     ///
     /// Tying it to the start call instead is how a refusal that nothing
     /// could ever clear shipped. The two ways out of a refusal that are not
-    /// a start are both ordinary: the torrent is idle-paused when the
-    /// cleaner frees the volume, so the reconcile that follows answers the
-    /// idle arm's `Stop` and starts nothing; and the user then presses play,
+    /// a start are both ordinary: the torrent is stopped when the slack goes
+    /// and frees the volume, so the reconcile that follows leaves it
+    /// stopped and starts nothing; and the user then presses play,
     /// which resumes it through `activate_file` before
     /// [`Self::reconcile_hash`] is asked, so by the time the answer is `Run`
     /// the torrent is already `Live` and there is no start to hang the lift
@@ -1923,15 +1834,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             .contains_key(info_hash)
     }
 
-    /// Completes once the reconciler has stopped a torrent for want of space
-    /// since the last time this completed (or since the engine was made, if
-    /// a stop came first). One permit, not a counter: the cleaner that awaits
-    /// this runs one pass per wake-up, and a pass covers every stopped
-    /// torrent there is.
-    pub async fn out_of_space_signal(&self) {
-        self.out_of_space_notify.notified().await
-    }
-
     /// The tracker list a torrent is added with: the built-in defaults, the
     /// tracker manager's cached list (ranked by RTT), and any request-supplied
     /// extras, sorted and de-duplicated.
@@ -1984,61 +1886,15 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     }
 
     /// Add a torrent from a `.torrent` blob or URL and publish its engine.
-    ///
-    /// Honours the [`MagnetAddError::EvictedForSpace`] cooling-off period,
-    /// which the magnet path enforces in `lookup_or_begin_add_magnet`. It
-    /// has to be enforced here too and for the same reason: the cleaner
-    /// evicts a stopped torrent only when a pass could free nothing else,
-    /// and a re-add inside the window refills the volume it just emptied.
-    /// The magnet path is the one a player's reconnect and stremio-core's
-    /// stats poll take, so this one needs a user action to reach -- but
-    /// "the client re-creates the torrent it has the file for" is exactly
-    /// what a Stremio client does with a `.torrent` addon result, and the
-    /// refusal is a `507` that says why rather than a disk that fills
-    /// again.
-    ///
-    /// The check is before the add because a backend add is already writing
-    /// files by the time it could be asked what it added; the hash comes
-    /// from [`TorrentBackend::source_info_hash`], and a source whose hash
-    /// cannot be known without fetching it is added as before. The error is
-    /// the typed [`MagnetAddError`] inside the `anyhow`, so a route can
-    /// `downcast_ref` it to the same status the magnet path gives.
     pub async fn add_torrent(
         &self,
         source: TorrentSource,
         extra_trackers: Option<Vec<String>>,
     ) -> Result<Arc<Engine<B::Handle>>> {
-        if let Some(info_hash) = self.backend.source_info_hash(&source)
-            && let Some(refusal) = self.evicted_for_space_refusal(&info_hash).await
-        {
-            tracing::warn!(
-                info_hash,
-                "refusing a torrent-file add of a hash evicted for want of disk space"
-            );
-            return Err(anyhow::Error::new(refusal));
-        }
         let trackers = self.merged_trackers(extra_trackers).await;
         debug!(count = trackers.len(), "Adding torrent with trackers");
         let handle = self.backend.add_torrent(source, trackers).await?;
         Ok(Self::register_engine(&self.engines, handle, self.engine_parts()).await)
-    }
-
-    /// The standing [`MagnetAddError::EvictedForSpace`] for `info_hash`, if
-    /// the cooling-off period from [`Self::evict_stopped_torrent`] has not
-    /// run out. `None` for every other recorded failure: only this one
-    /// refuses a retry, and only for its window.
-    async fn evicted_for_space_refusal(&self, info_hash: &str) -> Option<MagnetAddError> {
-        let now = self.clock.now_secs();
-        let adds = self.magnet_adds.read().await;
-        let MagnetAddState::Failed(failed) = &adds.get(info_hash)?.state else {
-            return None;
-        };
-        match &failed.error {
-            error @ MagnetAddError::EvictedForSpace { .. } if !error.may_retry_at(now) => {
-                Some(error.clone())
-            }
-            _ => None,
-        }
     }
 
     /// Existing engine for `info_hash`, or the in-flight magnet add for it --
@@ -2161,9 +2017,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     pending.joined();
                     return Lookup::found(EngineLookup::Adding(pending.clone()));
                 }
-                MagnetAddState::Failed(failed)
-                    if !retry_failed || !failed.error.may_retry_at(now) =>
-                {
+                MagnetAddState::Failed(failed) if !retry_failed => {
                     return Lookup::found(EngineLookup::Failed(failed.clone()));
                 }
                 MagnetAddState::Failed(failed) => {
@@ -2399,11 +2253,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
 
     /// One retention pass over one engine, logged when it did anything.
     ///
-    /// The whole of what bounds the streaming cache between cleaner runs:
-    /// the cleaner walks the volume once a minute at best, and a torrent
-    /// playing at 20 MB/s writes a gigabyte in that time. This runs on the
-    /// reconciler's two-second tick, asks the policy where the playhead has
-    /// left us, and gives back what the window no longer covers.
+    /// The whole of what bounds the streaming cache: a torrent playing at
+    /// 20 MB/s writes a gigabyte a minute, so this runs on the reconciler's
+    /// two-second tick, asks the policy where the playhead has left us, and
+    /// gives back what the window no longer covers.
     ///
     /// A torrent the backend stopped with an **error** is removed with its
     /// files instead, when nobody is playing it and nobody has pinned it.
@@ -2505,67 +2358,12 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         &self.live
     }
 
-    /// Take the bytes behind `pieces` of one torrent off the disk, have-set
-    /// first, and say how many complete piece files really left it.
-    ///
-    /// **The cleaner's way in, and the only one it has.** It used to call
-    /// `StoreRoot::delete_piece` itself, which was safe only for as long as
-    /// everything it was allowed to touch belonged to no torrent in the
-    /// session. The policy now hands it pieces of torrents that *are* in
-    /// the session -- everything outside a playback window is fair game --
-    /// and unlinking one of those behind librqbit's back leaves it
-    /// advertising a piece it does not have and answering a peer's request
-    /// with a read past the end of nothing. So every path goes through the
-    /// claim in [`crate::retention::take_claimed`], and this is the call
-    /// that gets there from an info hash.
-    ///
-    /// A hash the session holds nothing for, or holds a torrent its own
-    /// error stopped, has no live have-set for a deletion to disagree with:
-    /// the next start rebuilds it by asking the storage, which under this
-    /// design *is* the piece files. Those go straight to the store -- where
-    /// the door asks again, at the unlink, whether that is still so: the
-    /// run state is read here and the unlink runs on the blocking pool
-    /// later, and a torrent that restarted out of its error in between has
-    /// a registered store and a have-set again, which the claimless door
-    /// then leaves alone (`retention::unlink`).
-    pub async fn release_pieces(&self, info_hash: &str, pieces: &[u32]) -> usize {
-        let handle = self.backend.get_torrent(info_hash).await;
-        let live = handle.filter(|handle| {
-            !matches!(
-                handle.run_state(),
-                crate::backend::RunState::Error | crate::backend::RunState::Gone
-            )
-        });
-        let Some(_handle) = live else {
-            // Off the reactor like every other unlink: the cleaner calls
-            // this one piece at a time from a task on the runtime, and a
-            // torrent nobody holds can still be tens of thousands of
-            // files on the flash of a television.
-            return crate::retention::unlink(&self.registry, info_hash, pieces.to_vec(), None)
-                .await;
-        };
-        // Through the engine, so the question the cleaner asked before its
-        // walk is asked again against the live policy -- see
-        // `Engine::release_reclaimable`. An engine-less torrent the session
-        // still runs announces everything it holds by the gate's own rule,
-        // so there is nothing here to take.
-        let Some(engine) = self.peek_engine(info_hash).await else {
-            tracing::debug!(
-                info_hash = %info_hash,
-                "the session runs this torrent but nothing here holds it; leaving its pieces alone"
-            );
-            return 0;
-        };
-        engine.release_reclaimable(&self.registry, pieces).await
-    }
-
-    /// What the cache cleaner says the torrent-data volume may hold, as of
-    /// its last pass.
+    /// What the server says the torrent-data volume may hold.
     ///
     /// **Pushed in, never recomputed.** The server's cap is
     /// `min(cacheSize, occupied + available - floor)`; a second reading of
     /// the same volume taken here would disagree with it, and the two
-    /// layers would evict against different numbers.
+    /// halves of the cache would be sized against different numbers.
     ///
     /// The server states it through [`Self::cache_budget`] and its own
     /// ordered writer (`server::cache_budget::publish`) rather than here,
@@ -2587,59 +2385,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// number, and it has to be the same number: two readings of "how much
     /// room is there" over one volume is how two layers come to evict
     /// against different limits. Handing out the shared cell rather than a
-    /// copy is what makes that structural -- there is one place the
-    /// cleaner's cap is written, and everything that reads it reads that.
+    /// copy is what makes that structural -- there is one place the cap is
+    /// written, and everything that reads it reads that.
     pub fn cache_budget(&self) -> Arc<crate::retention::RetentionBudget> {
         self.budget.clone()
-    }
-
-    /// What one walk of the engines tells the cache cleaner: what the
-    /// retention policy will part with, piece by piece, and which torrents
-    /// can only be taken whole.
-    ///
-    /// **This is what `eviction_classes` became.** The cleaner used to be
-    /// handed three lists of info hashes -- protected, dead,
-    /// stopped-for-space -- and to decide from them which of the store's
-    /// pieces it might unlink itself. Two of those were one question in two
-    /// spellings, and the policy is what answers it: *have we told a peer
-    /// about this piece?* What we announce may not be taken, whoever holds
-    /// it and whatever stopped it; what we announce to nobody is cache like
-    /// any other.
-    ///
-    /// A **pinned** torrent has no policy, so it announces everything and
-    /// releases nothing -- a pin is a retention property, and the user asked
-    /// for those bytes. A torrent the backend stopped with an error that is
-    /// not a want of space announces nothing at all: there is no live
-    /// have-set for a deletion to disagree with, and the next start rebuilds
-    /// it by asking the storage, so every piece may go and goes first.
-    ///
-    /// A torrent stopped for want of space is not a *protection* any more
-    /// and never needed to be one: it keeps its piece map and announces it
-    /// again the moment it resumes, so the gate refuses its pieces like any
-    /// other announced ones. What it still needs is the second list, which
-    /// is not about permission but about a different operation -- it is
-    /// evicted whole, through [`Self::evict_stopped_torrent`], and only when
-    /// nothing else can go.
-    pub async fn reclaim_verdicts(&self) -> ReclaimVerdicts {
-        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
-        let mut verdicts = ReclaimVerdicts::default();
-        for engine in engines {
-            let info_hash = engine.info_hash.to_lowercase();
-            // The same asking the delete makes at the door: see
-            // `Engine::standing` for why it has to be the same one.
-            let standing = engine.standing().await;
-            if standing.stopped_for_space {
-                verdicts.stopped_for_space.push(info_hash.clone());
-            }
-            verdicts.gate.insert_verdict(info_hash, standing.gate);
-        }
-        // A dormant pin has no engine to speak for it -- that is what
-        // dormant means -- and its bytes are its pieces exactly like a live
-        // engine's.
-        for pin in self.dormant_pinned_downloads() {
-            verdicts.gate.insert_announced(pin.info_hash.to_lowercase());
-        }
-        verdicts
     }
 
     /// What every registered store holds, in bytes, by the bits it keeps:
@@ -2706,8 +2455,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         // dormant means -- and no store either, so its directory is in the
         // unregistered bytes above and nothing so far has protected a byte
         // of it. Nothing can ever take those bytes while the pin stands
-        // (`Self::reclaim_verdicts` announces them to the cleaner, and the
-        // sweep at launch keeps the pin set), so reporting them as
+        // (nothing but an unpin can, and the sweep at launch keeps the
+        // pin set), so reporting them as
         // reclaimable tells a client a shortfall has a remedy it has not
         // got. The one `stat` per dormant pin is on the same blocking hop
         // the unregistered half already takes.
@@ -2757,28 +2506,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// The registry the session's piece stores report to -- see the field.
     pub fn store_registry(&self) -> &Arc<crate::piece_store::StoreRegistry> {
         &self.registry
-    }
-
-    /// Info hashes of torrents the backend stopped because the volume they
-    /// write to ran out of space, and of torrents the reconciler's
-    /// free-space arm stopped before it could
-    /// ([`Engine::is_stopped_for_space`]).
-    ///
-    /// A full disk is the one torrent error worth acting on rather than
-    /// reporting: the swarm is fine, the torrent is fine, the device is out
-    /// of room. The caller that can do something about it is the server's
-    /// cache cleaner -- this is how it finds out there is anything to evict
-    /// *for*. Cheap on purpose (no I/O: the free-space half is a lookup of
-    /// the reconciler's last reading), because it is asked on a timer.
-    pub async fn out_of_space_torrents(&self) -> Vec<String> {
-        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
-        let mut hashes = Vec::new();
-        for engine in engines {
-            if engine.held_stopped_for_space().await || engine.handle.is_out_of_space().await {
-                hashes.push(engine.handle.info_hash());
-            }
-        }
-        hashes
     }
 
     /// Turn seeding on or off session-wide, and put back to work the
@@ -2864,78 +2591,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         // have something to wait for again.
         engine.allow_reads();
         engine.wake_readers();
-        Ok(true)
-    }
-
-    /// Evict a torrent stopped for want of disk space, whole: the torrent
-    /// leaves the registry and the session, its files go with it
-    /// ([`TorrentBackend::remove_torrent_and_files`]), its readers are
-    /// failed, and a request for the hash inside
-    /// [`EVICTED_FOR_SPACE_RETRY_AFTER`] is answered
-    /// [`MagnetAddError::EvictedForSpace`] rather than re-adding it.
-    /// `false` -- and nothing done -- for a hash no engine holds, for one
-    /// that is not stopped for space, and for a pinned one.
-    ///
-    /// The cache cleaner calls this when a pass could get under the cap by
-    /// no other means (`cache_cleaner::evict`); it decides *when*, this
-    /// layer does the removing, because the two records of the data have to
-    /// go together. A torrent librqbit paused still holds its files open
-    /// (an unlink frees no block) and its piece map still says it has them
-    /// (a resume reads pieces from a file that is empty), so the files may
-    /// not simply be deleted under it; `Session::delete` takes the state,
-    /// closes the files, deletes them, and leaves any open `FileStream`
-    /// erroring on its next poll rather than reading a file that is gone.
-    ///
-    /// What the user sees is the point of it. They started a film larger
-    /// than the free space; it stopped; they press play again. Before this
-    /// the previous attempt's corpse held the space, protected as a live
-    /// engine's files, and the retry failed for want of the room the corpse
-    /// took. Now the retry finds the space (and, within the cooling-off
-    /// period, a `507` that says why rather than a fresh add that would
-    /// refill the disk to fail the same way). The earlier attempt's
-    /// progress is lost -- but it was progress into a file that could not
-    /// have been finished on this volume anyway.
-    pub async fn evict_stopped_torrent(&self, info_hash: &str) -> Result<bool> {
-        let info_hash = info_hash.to_lowercase();
-        let engine = self.engines.read().await.get(&info_hash).cloned();
-        let Some(engine) = engine else {
-            return Ok(false);
-        };
-        if engine.is_pinned()
-            || !(engine.is_stopped_for_space().await || engine.handle.is_out_of_space().await)
-        {
-            return Ok(false);
-        }
-        // Readers first, so a read that races the delete fails with the
-        // device's error rather than the backend's.
-        engine.refuse_reads_for_space();
-        if !self.remove_engine_if_current(&engine).await {
-            return Ok(false);
-        }
-        let now = self.clock.now_secs();
-        self.magnet_adds.write().await.insert(
-            info_hash.clone(),
-            MagnetAddEntry {
-                state: MagnetAddState::Failed(FailedMagnetAdd {
-                    error: MagnetAddError::EvictedForSpace {
-                        info_hash: info_hash.clone(),
-                        retry_after_secs: now
-                            .saturating_add(EVICTED_FOR_SPACE_RETRY_AFTER.as_secs()),
-                    },
-                    trackers: Arc::from(Vec::new()),
-                }),
-                last_polled_secs: AtomicU64::new(now),
-            },
-        );
-        self.backend
-            .remove_torrent_and_files(&info_hash)
-            .await
-            .with_context(|| format!("evicting {info_hash}, stopped for want of disk space"))?;
-        tracing::info!(
-            info_hash = %info_hash,
-            retry_after_secs = EVICTED_FOR_SPACE_RETRY_AFTER.as_secs(),
-            "evicted a torrent stopped for want of disk space, with its partial download"
-        );
         Ok(true)
     }
 
@@ -3567,10 +3222,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             // nothing under this storage -- there is no pre-sized
             // placeholder to sweep up any more -- while whatever the store
             // does hold for the hash was fetched by an earlier stream or an
-            // earlier session, and is cache for the cleaner rather than
-            // this pin's to delete. That is why nothing here asks where a
-            // torrent's data is: it used to take the files whenever the
-            // pin's own placement folder had not existed before the add.
+            // earlier session, and is slack for the next pass or the next
+            // launch sweep rather than this pin's to delete. That is why
+            // nothing here asks where a torrent's data is: it used to take
+            // the files whenever the pin's own placement folder had not
+            // existed before the add.
             let added_by_this_pin = started_here
                 && joiners == 0
                 && !engine.is_pinned()
@@ -3661,12 +3317,12 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// directory in the piece store -- are taken by
     /// `Self::delete_dormant_download_data`, which first makes sure the
     /// session neither holds nor is adding the torrent; while the pin
-    /// stands [`Self::protected_torrents`] keeps the cleaner off that
-    /// directory, so this is what takes it now rather than in thirty days.
-    /// With no engine **and** no pin there is nothing this call may delete:
-    /// the bytes belong to no download it knows of and stay for the
-    /// cleaner. What was really deleted is reported, not what was asked
-    /// for ([`UnpinOutcome`]). A `file_idx` the torrent does not
+    /// stands the launch sweep keeps that directory, so this is what takes
+    /// it now rather than at the next boot. With no engine **and** no pin
+    /// there is nothing this call may delete: the bytes belong to no
+    /// download it knows of, and the next launch's sweep takes them. What
+    /// was really deleted is reported, not what was asked for
+    /// ([`UnpinOutcome`]). A `file_idx` the torrent does not
     /// have is then refused with [`PinDownloadError::FileNotFound`], as
     /// [`Self::pin_download`] refuses it: a stale index must not be read as
     /// "delete the whole torrent".
@@ -3726,7 +3382,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             // here. Without an engine and without a pin this layer holds
             // no record tying the hash's bytes to a download at all: they
             // are whatever an earlier stream left in the store, which is
-            // the cleaner's to reclaim by age, not this call's to unlink.
+            // the launch sweep's to reclaim, not this call's to unlink.
             // Ungated, an unpin of a hash nobody ever pinned -- a stale
             // client index, a retry after the registry dropped the engine
             // -- was a delete of any torrent's cache.
@@ -3857,10 +3513,9 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     ///
     /// Nothing goes while another file of the same hash is still pinned --
     /// the directory holds that file's pieces too. Either way the bytes are
-    /// reachable by the cleaner, which walks the store; this call is what
-    /// makes an explicit `deleteFiles` unpin take effect at once instead of
-    /// waiting on the age rule, and what takes the directory out of
-    /// [`Self::protected_paths`] with the pin.
+    /// the next launch sweep's; this call is what makes an explicit
+    /// `deleteFiles` unpin take effect at once instead of at the next boot,
+    /// and what takes the directory out of the pin set with the pin.
     async fn delete_dormant_download_data(
         &self,
         info_hash: &str,
@@ -5179,14 +4834,6 @@ mod tests {
             let handle = self.handles[0].clone();
             handle.counters.paused.store(false, Ordering::SeqCst);
             Ok(handle)
-        }
-
-        /// This backend's one torrent is `TEST_HASH`, whatever the source
-        /// says -- as `add_torrent` above already assumes. Implemented so
-        /// the checks `EngineFS::add_torrent` makes *before* handing a
-        /// source to a backend can be tested at all.
-        fn source_info_hash(&self, _source: &TorrentSource) -> Option<String> {
-            Some(TEST_HASH.to_string())
         }
 
         async fn add_torrent_placed(
@@ -6898,10 +6545,9 @@ mod tests {
         assert!(enginefs.pin_locks.lock().is_empty(), "no lock left behind");
     }
 
-    /// A torrent the backend stopped for want of disk space is listed for
-    /// the cleaner to make room for, and **the reconciler is what puts it
-    /// back to work**: once the volume is over the line a stopped torrent
-    /// has to clear, and at most once per dwell.
+    /// A torrent the backend stopped for want of disk space is put back to
+    /// work **by the reconciler**: once the volume is over the line a
+    /// stopped torrent has to clear, and at most once per dwell.
     ///
     /// The line is the resume line and not the floor, and the dwell is what
     /// keeps the recovery from being a loop. A restart re-checks the
@@ -6920,16 +6566,10 @@ mod tests {
         enginefs.set_free_space_probe(move |_| Ok(probe_available.load(Ordering::SeqCst)));
 
         // A healthy torrent is nobody's business.
-        assert!(enginefs.out_of_space_torrents().await.is_empty());
         assert_eq!(counters.restart_from_error.load(Ordering::SeqCst), 0);
 
-        // The backend kills it: a write hit ENOSPC. The cleaner is told,
-        // because making room is still its half of this.
+        // The backend kills it: a write hit ENOSPC.
         counters.out_of_space.store(true, Ordering::SeqCst);
-        assert_eq!(
-            enginefs.out_of_space_torrents().await,
-            vec![TEST_HASH.to_string()]
-        );
 
         // Inside the band -- over the floor, under the resume line -- it is
         // left where it is: there is not enough room to run into.
@@ -6954,10 +6594,6 @@ mod tests {
         );
         assert_eq!(counters.restart_from_error.load(Ordering::SeqCst), 1);
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
-        assert!(
-            enginefs.out_of_space_torrents().await.is_empty(),
-            "a restarted torrent is no longer stopped"
-        );
 
         // And it dies again at once, as a torrent on a volume this short
         // will. The tick that sees it is inside the dwell of the restart
@@ -6988,154 +6624,6 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(counters.restart_from_error.load(Ordering::SeqCst), 2);
-    }
-
-    /// A torrent the backend stopped with an error nothing will retry is
-    /// dead, and its data is the cleaner's to take first -- it used to be
-    /// protected like a live engine's, which on a full television kept
-    /// 700 MB of two dead torrents' bytes from every later stream. One that
-    /// died of a full disk is not dead (the ladder restarts it once the
-    /// volume is over the resume line again), and a pinned one stays
-    /// protected however it died: an unpin is how the user gives those
-    /// bytes up.
-    #[tokio::test]
-    async fn a_dead_torrents_files_are_the_cleaners_to_take_first() {
-        let (enginefs, counters) = test_enginefs_with_file_count(2);
-        let hash = TEST_HASH.to_lowercase();
-
-        let live = enginefs.reclaim_verdicts().await;
-        assert!(
-            !live.gate.releases(&hash, 0),
-            "a live torrent announces what it has, so nothing of it goes"
-        );
-        assert!(!live.gate.goes_first(&hash));
-
-        counters.in_error_state.store(true, Ordering::SeqCst);
-        let dead = enginefs.reclaim_verdicts().await;
-        assert!(
-            dead.gate.releases(&hash, 0),
-            "a dead one announces nothing, so every piece of it goes"
-        );
-        assert!(dead.gate.goes_first(&hash), "and its data goes first");
-
-        // Out of space is not dead: that one is listed whole, for the
-        // ladder to restart or the cleaner to take as a last resort, and
-        // its pieces are still announced.
-        counters.out_of_space.store(true, Ordering::SeqCst);
-        let stopped = enginefs.reclaim_verdicts().await;
-        assert!(!stopped.gate.releases(&hash, 0));
-        assert!(!stopped.gate.goes_first(&hash));
-        assert_eq!(stopped.stopped_for_space, vec![hash.clone()]);
-        counters.out_of_space.store(false, Ordering::SeqCst);
-
-        // Pinned and dead: the pin outranks the death.
-        enginefs.pin_download(TEST_HASH, 1, None).await.unwrap();
-        let pinned = enginefs.reclaim_verdicts().await;
-        assert!(!pinned.gate.releases(&hash, 0));
-        assert!(!pinned.gate.goes_first(&hash));
-    }
-
-    /// A dormant pin has no engine, so nothing in the engine walk names it,
-    /// and the cleaner walks every root to the bottom. Without its piece
-    /// directory in the protected set, an offline download whose torrent the
-    /// backend did not restore would be aged out from under the user.
-    ///
-    /// That directory is the whole of what it protects. A dormant pin used
-    /// to have a second entry, `<downloadsDir>/<info hash>` -- the folder a
-    /// pin placed a torrent in -- which is not where any byte of it is, and
-    /// which no longer exists as an idea.
-    #[tokio::test]
-    async fn the_gate_covers_a_dormant_pin_and_lets_go_the_moment_it_is_unpinned() {
-        let (enginefs, _counters) = test_enginefs_with_file_count(1);
-        std::fs::create_dir_all(&enginefs.download_dir).unwrap();
-        std::fs::write(
-            enginefs.pinned_downloads_path(),
-            serde_json::to_vec(&serde_json::json!({ OTHER_HASH: [0] })).unwrap(),
-        )
-        .unwrap();
-        enginefs.restore_pinned_downloads().await;
-
-        let gate = enginefs.reclaim_verdicts().await.gate;
-        assert!(
-            !gate.releases(&TEST_HASH.to_lowercase(), 0),
-            "the live engine"
-        );
-        assert!(
-            !gate.releases(&OTHER_HASH.to_lowercase(), 0),
-            "and the dormant pin, which has no engine to speak for it"
-        );
-        assert!(
-            gate.releases("ffffffffffffffffffffffffffffffffffffffff", 0),
-            "and nothing else"
-        );
-
-        // And it stops being protected the moment the pin does, so the bytes
-        // an unpin leaves behind become ordinary cache.
-        assert!(
-            enginefs
-                .unpin_download(OTHER_HASH, 0, false)
-                .await
-                .unwrap()
-                .unpinned
-        );
-        let after = enginefs.reclaim_verdicts().await.gate;
-        assert!(after.releases(&OTHER_HASH.to_lowercase(), 0));
-        assert!(
-            !after.releases(&TEST_HASH.to_lowercase(), 0),
-            "the live engine is protected for as long as it runs"
-        );
-    }
-
-    /// An engine speaks for its pieces and for nothing else, wherever the
-    /// backend says its files are.
-    ///
-    /// This used to be the other way round -- the protected set was the
-    /// backend's `file_path` per file, plus the piece directory -- and it had
-    /// to be, while the session wrote whole files. It cannot stay that way
-    /// now that the piece store is the default: `<output folder>/<name>` is
-    /// still a name the backend reports and is no longer a byte the torrent
-    /// owns, and there is deliberately no migration, so the whole-file copy
-    /// an earlier version wrote is sitting at exactly that path with nothing
-    /// but the cache cleaner ever going to reclaim it. An engine that named
-    /// it would keep its own superseded data alive for as long as the
-    /// torrent is in the session, orphaned and immortal both.
-    ///
-    /// The gate has no way left to name a path at all -- it answers about
-    /// an info hash and a piece index -- so the question this asks is that
-    /// the answer does not move when the backend's output folder does.
-    #[tokio::test]
-    async fn an_engine_speaks_for_its_pieces_and_not_the_files_it_used_to_write() {
-        let (enginefs, counters) = test_enginefs_with_file_count(2);
-        let root = enginefs.download_dir.clone();
-        let hash = TEST_HASH.to_lowercase();
-
-        // The whole-file copy an earlier version of this server would have
-        // written, at the path the backend reports for file 0.
-        let legacy = root.join("show").join("video-0.mkv");
-        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        std::fs::write(&legacy, b"a film nothing reads any more").unwrap();
-
-        for folder in [
-            None,
-            Some(root.join("show")),
-            Some(std::path::PathBuf::from("/offline").join(TEST_HASH)),
-        ] {
-            *counters.output_folder.lock().unwrap() = folder.clone();
-            let gate = enginefs.reclaim_verdicts().await.gate;
-            assert!(
-                !gate.releases(&hash, 0),
-                "its pieces, whatever the output folder is: {folder:?}"
-            );
-            assert!(
-                gate.releases("ffffffffffffffffffffffffffffffffffffffff", 0),
-                "and nothing else: {folder:?}"
-            );
-        }
-
-        assert!(
-            legacy.is_file(),
-            "the bytes are still there -- there is no migration"
-        );
     }
 
     // --- the reconciler's free-space arm ---
@@ -7667,8 +7155,7 @@ mod tests {
 
     /// The whole point: a torrent that is writing is stopped when the
     /// volume falls under the floor, before the filesystem stops it with
-    /// ENOSPC and librqbit declares it dead -- and it is listed for the
-    /// cleaner, which is what makes room for it. Stopped once, not once per
+    /// ENOSPC and librqbit declares it dead. Stopped once, not once per
     /// tick; started again only once the volume is a margin over the floor,
     /// so it does not flap at the line.
     ///
@@ -7690,25 +7177,24 @@ mod tests {
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
         assert!(!engine.is_stopped_for_space().await);
 
-        // A byte under it: stopped, once, and the cleaner's business now.
+        // A byte under it: stopped, once.
         available.store(CACHE_FREE_SPACE_FLOOR - 1, Ordering::SeqCst);
         enginefs.reconcile_tick().await;
         enginefs.reconcile_tick().await;
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
         assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), 1);
         assert!(engine.is_stopped_for_space().await);
-        assert_eq!(
-            enginefs.out_of_space_torrents().await,
-            vec![TEST_HASH.to_string()]
+        assert!(engine.held_stopped_for_space().await);
+        assert!(
+            !engine.reads_refused(),
+            "its readers wait for the slack to go"
         );
-        assert!(!engine.reads_refused(), "its readers wait for the cleaner");
 
         // Back over the floor but inside the margin: still stopped -- the
         // margin is what it has to see cleared before anything starts it
         // again -- and said so, because the ladder holding a torrent stopped
-        // is the condition a client and the cleaner both need to know about.
-        // Eviction still measures the floor, so the torrent's own files stay
-        // protected while the volume is over it.
+        // is a condition a client needs to know about. The floor is what
+        // decides whether there is room *now*, so it reads clear here.
         available.store(
             CACHE_FREE_SPACE_FLOOR + FREE_SPACE_RESUME_MARGIN - 1,
             Ordering::SeqCst,
@@ -7717,13 +7203,12 @@ mod tests {
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
         assert!(!engine.is_stopped_for_space().await, "the floor is clear");
         assert!(
-            !enginefs.out_of_space_torrents().await.is_empty(),
+            engine.held_stopped_for_space().await,
             "but the ladder is still holding it, and says so"
         );
 
-        // The margin over: started again, and off the cleaner's list. Past
-        // the dwell as well, which every timer start of a torrent this
-        // reconciler stopped has to be.
+        // The margin over: started again. Past the dwell as well, which
+        // every timer start of a torrent this reconciler stopped has to be.
         available.store(
             CACHE_FREE_SPACE_FLOOR + FREE_SPACE_RESUME_MARGIN,
             Ordering::SeqCst,
@@ -7738,7 +7223,7 @@ mod tests {
             "the space lift is its own transition, not the error restart"
         );
         assert!(!engine.is_stopped_for_space().await);
-        assert!(enginefs.out_of_space_torrents().await.is_empty());
+        assert!(!engine.held_stopped_for_space().await);
     }
 
     /// The reconciler stops writers. A torrent that has everything it
@@ -7812,11 +7297,6 @@ mod tests {
             engine.is_stopped_for_space().await,
             "and a client asking what is wrong is told the device is"
         );
-        assert_eq!(
-            enginefs.out_of_space_torrents().await,
-            vec![TEST_HASH.to_string()],
-            "and the cleaner is asked for the room that would end it"
-        );
 
         // The other direction: the placed folder's card is full and the
         // store's has room, so there is nothing to stop.
@@ -7838,7 +7318,6 @@ mod tests {
             "a full card nothing writes to is not this torrent's problem"
         );
         assert!(!engine.is_stopped_for_space().await);
-        assert!(enginefs.out_of_space_torrents().await.is_empty());
     }
 
     /// The master bug this closes. The free-space watch skipped any engine
@@ -7868,11 +7347,6 @@ mod tests {
         assert!(
             engine.is_stopped_for_space().await,
             "it is stopped and its volume is full; who stopped it is not the question"
-        );
-        assert_eq!(
-            enginefs.out_of_space_torrents().await,
-            vec![TEST_HASH.to_string()],
-            "so the cleaner is told there is something to make room for"
         );
 
         // A playback starting on it asks the reconciler, and the reconcile
@@ -8154,59 +7628,6 @@ mod tests {
         );
     }
 
-    /// A stop rings the cleaner and the reading behind it rings the
-    /// running-low bell; the reconciler's next pass is what starts the
-    /// torrent, from a volume reading it takes itself.
-    ///
-    /// Two signals off one `statvfs`, for two different answers. The
-    /// cleaner's is "come and look for bytes"; the bell's is "give back
-    /// what is already disposable", which is what the owners of the cache
-    /// answer without choosing a victim. Neither of them starts anything:
-    /// that is the ladder's, and it reads the volume rather than either
-    /// signal.
-    ///
-    /// `restart_from_error` is deliberately not that path either. It is
-    /// the transition out of the backend's error state and nothing else, so
-    /// it refuses a torrent that is merely stopped -- one method that meant
-    /// "the error was dealt with" to one caller and "the space came back" to
-    /// another is how an earlier defect got in.
-    #[tokio::test(start_paused = true)]
-    async fn a_stop_rings_the_cleaner_and_the_next_tick_with_room_starts_the_torrent() {
-        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
-        let available = Arc::new(AtomicU64::new(0));
-        let probe_available = available.clone();
-        enginefs.set_free_space_probe(move |_| Ok(probe_available.load(Ordering::SeqCst)));
-        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
-
-        let rung = tokio::time::timeout(Duration::from_millis(10), enginefs.out_of_space_signal());
-        assert!(rung.await.is_err(), "nothing has been stopped yet");
-
-        enginefs.reconcile_tick().await;
-        tokio::time::timeout(TEST_WAIT_BOUND, enginefs.out_of_space_signal())
-            .await
-            .expect("the stop rang the cleaner");
-        tokio::time::timeout(TEST_WAIT_BOUND, enginefs.slack_bell().rung())
-            .await
-            .expect("and the reading behind it rang the running-low bell");
-        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
-        assert!(engine.is_stopped_for_space().await);
-
-        // The cleaner's error restart is not the space lift: this torrent
-        // is stopped, not errored, and nothing happens to it here.
-        assert!(!enginefs.restart_from_error(TEST_HASH).await.unwrap());
-        assert_eq!(counters.restart_from_error.load(Ordering::SeqCst), 0);
-        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
-
-        // The cleaner made room. The next pass past the dwell is what
-        // starts it.
-        available.store(u64::MAX, Ordering::SeqCst);
-        tokio::time::advance(RECONCILE_MIN_DWELL).await;
-        enginefs.reconcile_tick().await;
-        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
-        assert!(!engine.is_stopped_for_space().await);
-        assert!(enginefs.out_of_space_torrents().await.is_empty());
-    }
-
     /// The other half of that: a torrent the backend really did stop with
     /// an error goes back to work on the reconciler's own next pass, from
     /// the volume reading that pass takes -- there is no second owner of
@@ -8351,175 +7772,6 @@ mod tests {
         let stats = engine.get_statistics().await;
         assert_ne!(stats.phase, StartupPhase::Error);
         assert_eq!(stats.error, None);
-    }
-
-    /// A torrent stopped for space is not the cleaner's to unlink piece by
-    /// piece -- it keeps its piece map and announces it again the moment it
-    /// resumes -- and it is listed whole, so the cleaner can take it through
-    /// the engine when nothing else can go. Stopped by the watch or by
-    /// librqbit's ENOSPC alike; a pinned one is never listed however it
-    /// stopped.
-    #[tokio::test]
-    async fn a_torrent_stopped_for_space_is_listed_whole_for_the_cleaner() {
-        let (mut enginefs, counters) = test_enginefs_with_file_count(2);
-        let hash = TEST_HASH.to_lowercase();
-        let whole = vec![hash.clone()];
-
-        enginefs.set_free_space_probe(|_| Ok(0));
-        enginefs.reconcile_tick().await;
-        let verdicts = enginefs.reclaim_verdicts().await;
-        assert_eq!(verdicts.stopped_for_space, whole);
-        assert!(
-            !verdicts.gate.releases(&hash, 0),
-            "still announced, so not a piece at a time"
-        );
-        assert!(!verdicts.gate.goes_first(&hash));
-
-        // librqbit's own ENOSPC stop reads the same.
-        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
-        enginefs.reconcile_tick().await;
-        assert!(
-            enginefs
-                .reclaim_verdicts()
-                .await
-                .stopped_for_space
-                .is_empty()
-        );
-        counters.out_of_space.store(true, Ordering::SeqCst);
-        assert_eq!(enginefs.reclaim_verdicts().await.stopped_for_space, whole);
-
-        // The pin outranks the stop.
-        enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
-        let verdicts = enginefs.reclaim_verdicts().await;
-        assert!(!verdicts.gate.releases(&hash, 0));
-        assert!(verdicts.stopped_for_space.is_empty());
-    }
-
-    /// Evicting a stopped torrent takes the torrent and its files together
-    /// (the two records of the data), fails its readers, and refuses the
-    /// hash for a cooling-off period -- a player's reconnect and a stats
-    /// poll would otherwise re-add it within the second and refill the disk
-    /// the cleaner had just emptied. A user's retry, later, is a fresh add.
-    /// Nothing is evicted that is not stopped for space, or that is pinned.
-    #[tokio::test(start_paused = true)]
-    async fn evicting_a_stopped_torrent_takes_it_whole_and_refuses_the_hash_a_while() {
-        let (mut enginefs, _counters) = test_enginefs_with_file_count(1);
-        let removed_with_files = enginefs.backend.removed_with_files.clone();
-        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
-
-        // Live: not the cleaner's to evict.
-        assert!(!enginefs.evict_stopped_torrent(TEST_HASH).await.unwrap());
-        assert!(removed_with_files.lock().unwrap().is_empty());
-
-        // Pinned while there was room, then stopped as the volume fills:
-        // the pin keeps it.
-        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
-        enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
-        enginefs.set_free_space_probe(|_| Ok(0));
-        enginefs.reconcile_tick().await;
-        assert!(engine.is_stopped_for_space().await);
-        assert!(!enginefs.evict_stopped_torrent(TEST_HASH).await.unwrap());
-        enginefs.unpin_download(TEST_HASH, 0, false).await.unwrap();
-        assert!(
-            engine.is_stopped_for_space().await,
-            "the unpin does not restart it"
-        );
-
-        // Stopped and unpinned: gone whole.
-        assert!(enginefs.evict_stopped_torrent(TEST_HASH).await.unwrap());
-        assert_eq!(
-            *removed_with_files.lock().unwrap(),
-            vec![TEST_HASH.to_string()]
-        );
-        assert!(enginefs.peek_engine(TEST_HASH).await.is_none());
-        assert!(engine.reads_refused(), "its readers are failed");
-        assert!(enginefs.out_of_space_torrents().await.is_empty());
-        assert!(
-            !enginefs.restart_from_error(TEST_HASH).await.unwrap(),
-            "and there is nothing left to restart"
-        );
-        assert!(
-            !enginefs.evict_stopped_torrent(TEST_HASH).await.unwrap(),
-            "evicting it again does nothing"
-        );
-
-        // Inside the cooling-off period every lookup meets the eviction:
-        // the poller as a failure record, the blocking add as an error,
-        // and neither re-adds the torrent.
-        match enginefs.get_or_begin_add_magnet(TEST_HASH, None).await {
-            EngineLookup::Failed(failed) => assert!(
-                matches!(failed.error, MagnetAddError::EvictedForSpace { .. }),
-                "{:?}",
-                failed.error
-            ),
-            _ => panic!("the eviction is what a poller sees"),
-        }
-        match enginefs.get_or_add_magnet(TEST_HASH, None).await {
-            Err(MagnetAddError::EvictedForSpace { info_hash, .. }) => {
-                assert_eq!(info_hash, TEST_HASH);
-            }
-            Ok(_) => panic!("a stream request is refused, not served a fresh add"),
-            Err(other) => panic!("refused for the wrong reason: {other:?}"),
-        }
-        assert!(enginefs.peek_engine(TEST_HASH).await.is_none());
-
-        // After it, a request is a fresh add.
-        tokio::time::advance(EVICTED_FOR_SPACE_RETRY_AFTER).await;
-        let readded = enginefs
-            .get_or_add_magnet(TEST_HASH, None)
-            .await
-            .expect("the cooling-off period is over");
-        assert!(
-            !Arc::ptr_eq(&readded, &engine),
-            "a new engine, not the corpse"
-        );
-        assert!(!readded.is_stopped_for_space().await && !readded.reads_refused());
-    }
-
-    /// The cooling-off period covers the `.torrent`-file path too.
-    ///
-    /// It was enforced only in `lookup_or_begin_add_magnet`, so a client
-    /// that re-created the torrent from the file rather than from the hash
-    /// walked straight past it and started refilling the volume the cleaner
-    /// had just emptied -- and the eviction is the pass's last resort,
-    /// taken only when nothing else could go. The check is before the add,
-    /// because a backend add has already created files by the time it could
-    /// be asked what it added.
-    #[tokio::test(start_paused = true)]
-    async fn a_torrent_file_re_add_is_refused_inside_the_eviction_cooldown() {
-        let (mut enginefs, _counters) = test_enginefs_with_file_count(1);
-        enginefs.set_free_space_probe(|_| Ok(0));
-        enginefs.get_engine(TEST_HASH).await.unwrap();
-        enginefs.reconcile_tick().await;
-        assert!(enginefs.evict_stopped_torrent(TEST_HASH).await.unwrap());
-
-        let Err(refused) = enginefs
-            .add_torrent(TorrentSource::Bytes(b"a .torrent blob".to_vec()), None)
-            .await
-        else {
-            panic!("the hash is inside its cooling-off period and must be refused");
-        };
-        match refused.downcast_ref::<MagnetAddError>() {
-            Some(MagnetAddError::EvictedForSpace { info_hash, .. }) => {
-                assert_eq!(info_hash, TEST_HASH, "and it names the hash it refused");
-            }
-            _ => panic!("the route needs the typed error to answer 507: {refused:#}"),
-        }
-        assert!(
-            enginefs.peek_engine(TEST_HASH).await.is_none(),
-            "the refusal must not have added the torrent on the way to erroring"
-        );
-
-        // After the window it is an ordinary add again.
-        tokio::time::advance(EVICTED_FOR_SPACE_RETRY_AFTER).await;
-        assert!(
-            enginefs
-                .add_torrent(TorrentSource::Bytes(b"a .torrent blob".to_vec()), None)
-                .await
-                .is_ok(),
-            "the cooling-off period is over"
-        );
-        assert!(enginefs.peek_engine(TEST_HASH).await.is_some());
     }
 
     /// A read parked on a piece a stopped torrent will not download is a
@@ -8823,23 +8075,18 @@ mod tests {
     }
 
     /// A torrent that is paused for a reason of its own, on a volume the
-    /// rest of the server is happy with, is not out of disk -- and its
-    /// files keep the cleaner's protection.
+    /// rest of the server is happy with, is not out of disk at the floor --
+    /// which is the line every reader that asks "is there room *now*" uses.
     ///
     /// The band between the floor and the resume margin is the *ladder's*
     /// hysteresis: it decides when a stopped torrent may be started again.
     /// Judging "is this torrent stopped for want of space?" there instead
     /// of at the floor answers for every paused torrent on a volume with
     /// 513 MiB free -- which `ensure_download_disk_ready` serves from
-    /// without complaint and the cleaner's own cap treats as fine -- and
-    /// two things follow that are both wrong: the client is shown a torrent
-    /// error, and the files leave `EvictionClasses::protected` for
-    /// `stopped_for_space`, which the cache cleaner does not protect. Those
-    /// go to the ordinary oldest-first eviction and are unlinked piecemeal
-    /// under a torrent that still holds them open with a piece map that
-    /// says it has them.
+    /// without complaint and the published cap treats as fine -- and the
+    /// client is shown a torrent error over a device that is fine.
     #[tokio::test(start_paused = true)]
-    async fn a_paused_torrent_inside_the_margin_is_reported_and_offered_to_the_cleaner() {
+    async fn a_paused_torrent_inside_the_margin_is_reported_but_has_room_at_the_floor() {
         let (mut enginefs, _counters) = test_enginefs_for_reconciler(1);
         enginefs.set_free_space_probe(|_| Ok(CACHE_FREE_SPACE_FLOOR + 1));
         enginefs.seeding_enabled.store(false, Ordering::Relaxed);
@@ -8860,12 +8107,12 @@ mod tests {
         //
         // This asserted the opposite, on the rule that the hysteresis was
         // the ladder's line and nobody else's. That rule made the band an
-        // absorbing state: reads refused, `stats.json` reporting buffering
-        // with no error, `out_of_space_torrents` empty so no recovery pass
-        // ever ran -- and the band is where a cleaner pass leaves the volume
-        // by construction, since `CacheLimit::effective` stops the instant
-        // `available` reaches the floor. A pinned download stalled at
-        // whatever percent it had reached, in silence, for good.
+        // absorbing state: reads refused and `stats.json` reporting
+        // buffering with no error -- and the band is where a volume that
+        // has just given its slack back sits by construction, since
+        // `CacheLimit::effective` stops the instant `available` reaches the
+        // floor. A pinned download stalled at whatever percent it had
+        // reached, in silence, for good.
         let stats = engine.get_statistics().await;
         assert_eq!(
             stats.phase,
@@ -8873,20 +8120,11 @@ mod tests {
             "the ladder is holding it stopped, so the client is told so"
         );
         assert!(stats.error.is_some());
-        assert!(!enginefs.out_of_space_torrents().await.is_empty());
+        assert!(engine.held_stopped_for_space().await);
 
-        // Eviction keeps the floor, deliberately: taking a torrent's files
-        // is about whether there is room *now*, not about what the ladder is
-        // waiting for, and the volume is over the floor.
-        let verdicts = enginefs.reclaim_verdicts().await;
-        assert!(
-            verdicts.stopped_for_space.is_empty(),
-            "and its files are not the cleaner's to take whole"
-        );
-        assert!(
-            !verdicts.gate.releases(&TEST_HASH.to_lowercase(), 0),
-            "nor a piece at a time"
-        );
+        // The floor keeps its own reading, deliberately: whether there is
+        // room *now* is not what the ladder is waiting for, and the volume
+        // is over the floor.
         assert!(!engine.is_stopped_for_space().await);
     }
 
@@ -10209,7 +9447,7 @@ mod tests {
         engine.begin_retention(0).await;
         engine.note_playhead(0, 0);
         assert!(
-            engine.standing().await.gate.releases(3),
+            !engine.standing().await.policies.is_empty(),
             "the fixture is one whose policy would give a piece up"
         );
 
@@ -10969,171 +10207,6 @@ mod tests {
             vec![(0..1, crate::backend::AfterRelease::Reselect)],
             "and the backend is told to forget the file's pieces, and to want \
              the range again for the sake of a boundary piece a neighbour shares"
-        );
-    }
-
-    /// **The interlock, from the cleaner's door.** A piece only leaves the
-    /// disk once the backend has agreed to forget it, and only the pieces
-    /// it agreed to.
-    ///
-    /// Unlink behind librqbit's back and the torrent still believes it
-    /// holds the piece: it advertises it, and answers a peer's request with
-    /// a read past the end of nothing. So the caller names pieces, the
-    /// backend says which of them it will give up -- it keeps the ones a
-    /// peer is mid-flight on and the ones a live stream is about to read --
-    /// and only those are taken. A backend that will not give any of them
-    /// up leaves every byte where it is.
-    ///
-    /// The torrent has a policy that releases the pieces asked for: that is
-    /// what makes the cleaner's request one this door lets through to the
-    /// backend at all -- see the test after this one for the torrent that
-    /// does not.
-    #[tokio::test]
-    async fn a_reclaim_takes_only_the_pieces_the_backend_agreed_to_forget() {
-        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 200)]);
-        counters.pieces_per_file.store(8, Ordering::SeqCst);
-        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
-        // Two pieces of budget over eight: a policy, whose window sits on
-        // piece 0 and has committed nothing, so pieces 3 to 5 are its to
-        // give up.
-        enginefs.set_cache_budget(Some(50));
-        engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
-        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
-        std::fs::create_dir_all(&bucket).unwrap();
-        for piece in [3u32, 4, 5] {
-            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
-        }
-        // Piece 5 is one the backend keeps -- a peer is working on it, or a
-        // stream is about to read it.
-        *counters.drops_pieces.lock().unwrap() = vec![3, 4];
-
-        assert_eq!(enginefs.release_pieces(TEST_HASH, &[3, 4, 5]).await, 2);
-        assert!(!bucket.join("3").exists());
-        assert!(!bucket.join("4").exists());
-        assert!(
-            bucket.join("5").is_file(),
-            "the backend still believes it has piece 5, so it is not ours to take"
-        );
-        assert_eq!(
-            *counters.dropped_ranges.lock().unwrap(),
-            vec![(3..6, crate::backend::AfterRelease::LeaveDropped)],
-            "asked as one range, and left dropped: a piece wanted again the \
-             moment it is deleted is a re-download, not a reclaim"
-        );
-
-        // And a backend that will not forget anything keeps every byte.
-        counters.refuses_drop.store(true, Ordering::SeqCst);
-        assert_eq!(enginefs.release_pieces(TEST_HASH, &[5]).await, 0);
-        assert!(bucket.join("5").is_file());
-    }
-
-    /// **A torrent nobody holds is unlinked off the reactor too.**
-    ///
-    /// The other two doors -- the pass's own reclaim and the cleaner's
-    /// delete through a live engine -- go to the blocking pool through
-    /// `retention::unlink`. This one went straight to the store on the
-    /// runtime thread, one piece per cleaner call, for a torrent that can be
-    /// tens of thousands of files.
-    #[tokio::test]
-    async fn a_torrent_the_session_does_not_hold_is_unlinked_off_the_reactor() {
-        let (enginefs, _counters) = test_enginefs_with_file_count(1);
-        let store = enginefs.piece_store();
-        let other = "ffffffffffffffffffffffffffffffffffffffff";
-        let torrent_dir = store.torrent_dir(other);
-        let bucket = torrent_dir.join("0");
-        std::fs::create_dir_all(&bucket).unwrap();
-        std::fs::write(bucket.join("4"), [7u8; 25]).unwrap();
-
-        assert_eq!(enginefs.release_pieces(other, &[4]).await, 1);
-        assert!(!bucket.join("4").exists());
-        let deleted_on = crate::piece_store::store::DELETED_ON
-            .lock()
-            .get(&torrent_dir)
-            .copied()
-            .expect("the store recorded the delete");
-        assert_ne!(
-            deleted_on,
-            std::thread::current().id(),
-            "the unlink ran on the runtime thread"
-        );
-    }
-
-    /// **The delete asks the walk's question again, and the same one.**
-    ///
-    /// A torrent that announces everything releases nothing at the walk,
-    /// so a delete that arrives for one of its pieces is a reading that went
-    /// stale on the way: here, a reader opened on the torrent after the walk
-    /// found no engine and called its bytes cache. The door used to take
-    /// every piece the cleaner named unless a policy was in the slot to
-    /// refuse it -- and that is the advertise-then-refuse the gate exists to
-    /// prevent, on exactly the torrent a reader has just opened.
-    #[tokio::test]
-    async fn a_torrent_a_reader_opened_since_the_cleaner_looked_keeps_its_pieces() {
-        let (enginefs, counters) = test_enginefs_with_file_count(2);
-        // The cleaner's reading: no engine, so no entry in the gate, so
-        // cache.
-        assert!(
-            crate::retention::ReclaimGate::default().releases(TEST_HASH, 0),
-            "with nobody to speak for it the walk calls this torrent's bytes cache"
-        );
-        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
-        std::fs::create_dir_all(&bucket).unwrap();
-        std::fs::write(bucket.join("0"), [7u8; 4096]).unwrap();
-        *counters.drops_pieces.lock().unwrap() = vec![0];
-
-        // A reader opens on it before the delete arrives: an engine, no
-        // policy, everything it holds announced.
-        let _engine = enginefs.get_engine(TEST_HASH).await.unwrap();
-
-        assert_eq!(enginefs.release_pieces(TEST_HASH, &[0]).await, 0);
-        assert!(
-            bucket.join("0").is_file(),
-            "an announced piece is not the cleaner's to take, whatever its walk said"
-        );
-        assert!(
-            counters.dropped_ranges.lock().unwrap().is_empty(),
-            "and the backend was not asked to forget it"
-        );
-    }
-
-    /// **And a pin taken since the walk refuses the delete as the walk
-    /// would have.**
-    ///
-    /// The walk answers `Announced` for a pinned torrent before it looks at
-    /// any policy. The delete's second asking looked only at the policy --
-    /// and a pin taken while the file was streaming leaves the policy in
-    /// the slot until the next pass clears it, so for that gap the delete
-    /// took pieces out of the download the user had just asked to keep.
-    #[tokio::test]
-    async fn a_pin_taken_since_the_cleaner_looked_keeps_its_pieces() {
-        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 200)]);
-        counters.pieces_per_file.store(8, Ordering::SeqCst);
-        counters
-            .drops_what_it_is_asked
-            .store(true, Ordering::SeqCst);
-        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
-        enginefs.set_cache_budget(Some(50));
-        engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
-        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
-        std::fs::create_dir_all(&bucket).unwrap();
-        std::fs::write(bucket.join("5"), [7u8; 25]).unwrap();
-        // The cleaner's reading: the policy gives piece 5 up.
-        assert!(engine.standing().await.gate.releases(5));
-
-        // The user pins the file between the walk and the delete. The
-        // policy is still in the slot: nothing on the pin path clears it.
-        engine.pinned_files.write().insert(0);
-
-        assert_eq!(enginefs.release_pieces(TEST_HASH, &[5]).await, 0);
-        assert!(
-            bucket.join("5").is_file(),
-            "the piece of a pinned download stays whatever the policy in the slot says"
-        );
-        assert!(
-            counters.dropped_ranges.lock().unwrap().is_empty(),
-            "and the backend was not asked to forget it"
         );
     }
 
@@ -12164,73 +11237,6 @@ mod tests {
              the want-set's, for the three pieces it gave back and does not \
              want fetched again"
         );
-    }
-
-    /// **The claimless door never goes through a registered store.** A
-    /// torrent the session holds in Error or not at all is unlinked with no
-    /// claim, straight at the store -- but the state was read on the
-    /// runtime and the unlink runs on the blocking pool, and the real
-    /// backend can have restarted the torrent between the two: the fresh
-    /// store registers under its check, and once the check hands over it
-    /// is a live have-set nobody edited. Asked of a registered store in
-    /// either state, the door takes nothing; only once the store is gone --
-    /// the torrent really does hold no storage -- does the path delete go.
-    /// The fake keeps its store registered through the error, which stands
-    /// in for exactly that restart.
-    #[tokio::test]
-    async fn a_claimless_delete_never_goes_through_a_registered_store() {
-        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
-        counters.pieces_per_file.store(4, Ordering::SeqCst);
-        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
-        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
-        std::fs::create_dir_all(&bucket).unwrap();
-        std::fs::write(bucket.join("2"), [7u8; 25]).unwrap();
-        let store = seeded_store(&enginefs, &engine);
-        // `init`'s own seed, which begins the check the test seed had ended.
-        store.init_begins_check_for_tests().unwrap();
-        assert!(enginefs.store_registry().checking(TEST_HASH));
-        counters.in_error_state.store(true, Ordering::SeqCst);
-
-        assert_eq!(
-            enginefs.release_pieces(TEST_HASH, &[2]).await,
-            0,
-            "nothing is unlinked from under a check"
-        );
-        assert!(bucket.join("2").is_file(), "the file stays");
-        assert!(
-            enginefs
-                .store_registry()
-                .held(TEST_HASH)
-                .expect("registered")
-                .contains(2),
-            "and so does its bit"
-        );
-
-        // The check over, the store is a live one whose have-set this door
-        // never edited: still nothing.
-        let successor = librqbit::storage::TorrentStorage::take(&store).unwrap();
-        assert!(!enginefs.store_registry().checking(TEST_HASH));
-        assert_eq!(
-            enginefs.release_pieces(TEST_HASH, &[2]).await,
-            0,
-            "a registered store is a torrent with a have-set, claim or no claim"
-        );
-        assert!(bucket.join("2").is_file());
-        assert!(
-            enginefs
-                .store_registry()
-                .held(TEST_HASH)
-                .expect("registered")
-                .contains(2)
-        );
-
-        // The storage really gone -- what Error is once librqbit's handles
-        // have dropped -- the same delete goes by path.
-        drop(successor);
-        drop(store);
-        assert!(!enginefs.store_registry().is_registered(TEST_HASH));
-        assert_eq!(enginefs.release_pieces(TEST_HASH, &[2]).await, 1);
-        assert!(!bucket.join("2").exists());
     }
 
     /// **A reclaim from a paused torrent goes through.** Paused is a settled
@@ -13559,131 +12565,6 @@ mod tests {
         );
     }
 
-    /// **The cache cleaner's delete has the same boundary to respect.**
-    ///
-    /// Two callers unlink a policy's pieces: the retention pass, under its
-    /// own reader, and the cleaner, which walks the volume and comes back
-    /// through `Engine::release_reclaimable` for permission. The gate it
-    /// carries cannot refuse a boundary piece -- it answers for the torrent,
-    /// and a piece the policy's file shares with the next one is inside the
-    /// range and uncommitted exactly like a piece of nobody else's. So a
-    /// narrowing that lives only in the pass leaves the refetch loop fully
-    /// reachable: the cleaner unlinks the shared piece, the still-wanted
-    /// neighbour fetches it back, and the next walk finds it again.
-    #[tokio::test]
-    async fn the_cleaners_delete_also_leaves_the_piece_the_next_file_shares() {
-        let (enginefs, counters) = test_enginefs_with_files(vec![
-            ("Show.S01E01.mkv".into(), 100),
-            ("Show.S01E02.mkv".into(), 110),
-            ("Show.S01E03.mkv".into(), 100),
-        ]);
-        // Twenty-five byte pieces, as above: episode two is pieces 4..9 and
-        // episode three 8..13, so piece eight is the one they share.
-        counters.pieces_per_file.store(4, Ordering::SeqCst);
-        counters
-            .drops_what_it_is_asked
-            .store(true, Ordering::SeqCst);
-        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
-        enginefs.set_cache_budget(Some(50));
-
-        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
-        std::fs::create_dir_all(&bucket).unwrap();
-        for piece in [5u32, 8] {
-            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
-        }
-
-        engine.begin_retention(1).await;
-        engine.note_playhead(1, 0);
-        let mut gate = crate::retention::ReclaimGate::default();
-        gate.insert_verdict(TEST_HASH.to_lowercase(), engine.standing().await.gate);
-        assert!(
-            gate.releases(TEST_HASH, 8),
-            "the reading the cleaner walks with offers the shared piece,              because a gate has no way to know it is shared"
-        );
-
-        assert_eq!(
-            enginefs.release_pieces(TEST_HASH, &[5, 8]).await,
-            1,
-            "only the piece episode two holds alone is the cleaner's to take"
-        );
-        assert!(
-            bucket.join("8").is_file(),
-            "the piece episode three also lies in stays on the disk"
-        );
-        assert!(!bucket.join("5").exists());
-        assert_eq!(
-            *counters.dropped_ranges.lock().unwrap(),
-            vec![(5..6, crate::backend::AfterRelease::LeaveDropped)],
-            "and the backend is never asked to forget the shared piece"
-        );
-    }
-
-    /// A piece that becomes announced between the cleaner's reading and its
-    /// unlink is not taken.
-    ///
-    /// The cleaner's gate is collected before a blocking directory walk and
-    /// before every delete ahead of this one, so by the time a delete
-    /// happens the reading can be minutes old. What makes a piece announced
-    /// on the happy path is ordinary and constant: a retention pass commits
-    /// and advertises the pieces its window has moved off, every couple of
-    /// seconds. So the question is asked a second time, against the live
-    /// policy, inside the same turn that pass holds --
-    /// `Engine::release_reclaimable`.
-    ///
-    /// Without that, the invariant the whole design rests on is a
-    /// likelihood rather than a rule: we would delete a piece we had told a
-    /// peer about.
-    #[tokio::test]
-    async fn a_piece_announced_since_the_cleaner_looked_is_left_alone() {
-        let (enginefs, counters) = test_enginefs_with_file_count(2);
-        counters.pieces_per_file.store(4, Ordering::SeqCst);
-        counters
-            .drops_what_it_is_asked
-            .store(true, Ordering::SeqCst);
-        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
-        enginefs.set_cache_budget(Some(50));
-        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
-        std::fs::create_dir_all(&bucket).unwrap();
-        std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
-        let store = seeded_store(&enginefs, &engine);
-
-        // A policy over file 0 with piece 0 under the playhead: in the
-        // window, committed to nobody, and so the cleaner's to take.
-        engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
-        engine
-            .retain(enginefs.store_registry(), &playing(0))
-            .await
-            .expect("a pass");
-        let mut gate = crate::retention::ReclaimGate::default();
-        gate.insert_verdict(TEST_HASH.to_lowercase(), engine.standing().await.gate);
-        assert!(
-            gate.releases(TEST_HASH, 0),
-            "the cleaner's reading says this piece may go"
-        );
-
-        // Then playback moves on a piece, and the pass that follows commits
-        // piece 0 and announces it -- exactly what happens while a clean
-        // pass is walking.
-        std::fs::write(bucket.join("1"), [7u8; 25]).unwrap();
-        store.init_for_tests().unwrap();
-        engine.note_playhead(0, 25);
-        engine
-            .retain(enginefs.store_registry(), &playing(0))
-            .await
-            .expect("a pass");
-
-        assert_eq!(
-            enginefs.release_pieces(TEST_HASH, &[0]).await,
-            0,
-            "the piece is announced now, whatever the cleaner's reading said"
-        );
-        assert!(
-            bucket.join("0").is_file(),
-            "and it is still on the disk: we told a peer we had it"
-        );
-    }
-
     /// A pin taken while the file is already playing keeps its bytes.
     ///
     /// The pin exemption used to live only in `begin_retention`, which runs
@@ -13709,8 +12590,8 @@ mod tests {
         engine.begin_retention(0).await;
         engine.note_playhead(0, 0);
         assert!(
-            engine.standing().await.gate.releases(0),
-            "before the pin, the policy would give this piece up"
+            !engine.standing().await.policies.is_empty(),
+            "before the pin, a policy bounds the file"
         );
 
         // The user pins the file they are watching.
@@ -13722,10 +12603,6 @@ mod tests {
                 .await
                 .is_none(),
             "a pinned torrent has no retention pass to make"
-        );
-        assert!(
-            !engine.standing().await.gate.releases(0),
-            "and nothing of it may be reclaimed any more"
         );
     }
 
@@ -13795,10 +12672,7 @@ mod tests {
         );
 
         assert!(
-            matches!(
-                engine.standing().await.gate,
-                crate::retention::TorrentGate::Policy { .. }
-            ),
+            !engine.standing().await.policies.is_empty(),
             "the policy is still bounding the file: it never left its cell"
         );
         let pass = engine
@@ -13854,13 +12728,6 @@ mod tests {
             "a pinned torrent has no pass to make"
         );
         assert!(
-            matches!(
-                engine.standing().await.gate,
-                crate::retention::TorrentGate::Announced
-            ),
-            "the pin answers for the torrent at the gate"
-        );
-        assert!(
             engine
                 .retention
                 .holding(&0)
@@ -13896,98 +12763,6 @@ mod tests {
         assert_eq!(
             *counters.advertised.lock().unwrap(),
             vec![(0..4, false), (0..4, true)]
-        );
-    }
-
-    /// **The cleaner's delete queues behind the pass on the same file.**
-    ///
-    /// `release_reclaimable` asks the gate again at the door, and the door
-    /// is only as good as what cannot move between its asking and its
-    /// unlink. A pass commits a piece by advertising it, and that commit is
-    /// an awaited backend call: a delete that read the gate before the pass
-    /// advanced and unlinked after the pass had announced would take a piece
-    /// we had just told a peer about. `Engine::announce` used to hold the
-    /// two apart for the whole torrent; the file's turn does now, and this
-    /// is the delete waiting on it.
-    ///
-    /// Same park as the door tests: the pass is inside the call announcing
-    /// piece 0, about to reclaim 2 and 3. The delete asks for piece 2 while
-    /// it is parked, and gets to ask only once the pass has let go -- which
-    /// the order of the two `drop_pieces` calls records.
-    #[tokio::test]
-    async fn the_cleaners_delete_waits_for_the_pass_on_the_file() {
-        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
-        counters.pieces_per_file.store(4, Ordering::SeqCst);
-        counters
-            .drops_what_it_is_asked
-            .store(true, Ordering::SeqCst);
-        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
-        enginefs.set_cache_budget(Some(50));
-
-        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
-        std::fs::create_dir_all(&bucket).unwrap();
-        std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
-        let store = seeded_store(&enginefs, &engine);
-        engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
-        engine
-            .retain(enginefs.store_registry(), &playing(0))
-            .await
-            .expect("a pass");
-        for piece in [1u32, 2, 3] {
-            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
-        }
-        store.init_for_tests().unwrap();
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        *counters.advertise_gate.lock().unwrap() = Some((entered_tx, release_rx));
-        engine.note_playhead(0, 25);
-        let running = tokio::spawn({
-            let engine = engine.clone();
-            let registry = enginefs.store_registry().clone();
-            async move { engine.retain(&registry, &playing(0)).await }
-        });
-        tokio::time::timeout(Duration::from_secs(10), entered_rx)
-            .await
-            .expect("the pass reached the call it makes to announce a committed piece")
-            .expect("the fake said so");
-
-        // The cleaner's delete arrives while the pass is parked.
-        let mut delete = tokio::spawn({
-            let engine = engine.clone();
-            let registry = enginefs.store_registry().clone();
-            async move { engine.release_reclaimable(&registry, &[2]).await }
-        });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(200), &mut delete)
-                .await
-                .is_err(),
-            "the delete waits: the pass holds the file's turn"
-        );
-
-        release_tx.send(()).expect("the pass is waiting on this");
-        let pass = running
-            .await
-            .expect("the pass task")
-            .expect("a pass ran to the end");
-        assert_eq!(pass.reclaimed, 2, "the pass took pieces 2 and 3: {pass:?}");
-        let freed = delete.await.expect("the delete task");
-        assert_eq!(
-            freed, 0,
-            "by the time the delete got its turn the piece had already gone"
-        );
-        let dropped: Vec<std::ops::Range<u32>> = counters
-            .dropped_ranges
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(range, _)| range.clone())
-            .collect();
-        assert_eq!(
-            dropped,
-            vec![1..4, 2..4, 2..3],
-            "the first pass stopped wanting the pieces it did not have; then \
-             the pass asked the backend first, and the delete only after it"
         );
     }
 
@@ -14202,178 +12977,8 @@ mod tests {
              so nothing was given back and nothing re-held-back"
         );
         assert!(
-            matches!(
-                engine.standing().await.gate,
-                crate::retention::TorrentGate::Policy { .. }
-            ),
+            !engine.standing().await.policies.is_empty(),
             "and it still bounds the file"
-        );
-    }
-
-    /// **Two policies standing, and the cleaner is told about both -- the
-    /// same both, every time it asks -- and its delete holds the right
-    /// file's turn.**
-    ///
-    /// Two policies on one torrent are ordinary now: each file is its own
-    /// entity with its own head, and an install on the next episode retires
-    /// nothing. The engine's answer to the cleaner used to be read off
-    /// whichever holding the owner's map listed first -- the other file's
-    /// held-back pieces called announced and never reclaimed, and which
-    /// file that was a property of the map's order at that call. And the
-    /// delete took that one file's turn for a request about both files'
-    /// pieces (issue c). Every standing policy is in the answer now, in
-    /// file order, and the delete groups its pieces by the policy that
-    /// holds them and takes each file's own turn.
-    ///
-    /// File 0 is the one being played here, so file 1's policy is a slack
-    /// one -- which is the other half of what the gate has to say: a policy
-    /// whose bytes are on their way out protects nothing it committed.
-    #[tokio::test]
-    async fn two_standing_policies_are_both_reported_and_each_is_deleted_under_its_own_turn() {
-        let (enginefs, counters) = test_enginefs_with_file_count(2);
-        // Twenty-five byte pieces: file 0 is pieces 0..4, file 1 is 4..8.
-        counters.pieces_per_file.store(4, Ordering::SeqCst);
-        counters
-            .drops_what_it_is_asked
-            .store(true, Ordering::SeqCst);
-        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
-        enginefs.set_cache_budget(Some(50));
-
-        // File 0 plays, and two passes commit its piece 0 (the fixture of
-        // `a_pass_aborted_in_flight_leaves_the_policy_standing_and_the_next_pass_runs`).
-        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
-        std::fs::create_dir_all(&bucket).unwrap();
-        std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
-        let store = seeded_store(&enginefs, &engine);
-        engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
-        engine
-            .retain(enginefs.store_registry(), &playing(0))
-            .await
-            .expect("a pass");
-        std::fs::write(bucket.join("1"), [7u8; 25]).unwrap();
-        store.init_for_tests().unwrap();
-        engine.note_playhead(0, 25);
-        engine
-            .retain(enginefs.store_registry(), &playing(0))
-            .await
-            .expect("a pass");
-        assert_eq!(
-            engine
-                .retention
-                .holding(&0)
-                .expect("file 0 has an entity")
-                .installed
-                .expect("and a policy")
-                .committed,
-            [0].into_iter().collect::<std::collections::BTreeSet<u32>>(),
-            "the second pass committed the piece the window moved off"
-        );
-
-        // The viewer opens file 1, and nothing retires file 0: each file is
-        // its own entity with its own head and window, so two policies
-        // stand from here on.
-        engine.begin_retention(1).await;
-        assert_eq!(
-            *counters.advertised.lock().unwrap(),
-            vec![(0..4, false), (0..1, true), (4..8, false)],
-            "file 0 held back and its piece 0 committed; file 1 held back;              nothing of file 0 put back"
-        );
-
-        // Both are reported, in file order, and the same way every time.
-        let first = engine.standing().await;
-        let files = |standing: &crate::engine::Standing| -> Vec<usize> {
-            standing
-                .policies
-                .iter()
-                .map(|policy| policy.file_idx)
-                .collect()
-        };
-        let policies = |standing: &crate::engine::Standing| -> Vec<crate::retention::FilePolicy> {
-            match &standing.gate {
-                crate::retention::TorrentGate::Policy(policies) => policies.clone(),
-                other => panic!("two policies stand, and the gate says {other:?}"),
-            }
-        };
-        assert_eq!(
-            files(&first),
-            vec![0, 1],
-            "every standing policy, in file order"
-        );
-        assert_eq!(
-            policies(&first)
-                .iter()
-                .map(|policy| (policy.file_idx, policy.pieces.clone()))
-                .collect::<Vec<_>>(),
-            vec![(0, 0..4), (1, 4..8)]
-        );
-        for _ in 0..20 {
-            let again = engine.standing().await;
-            assert_eq!(files(&again), files(&first));
-            assert_eq!(policies(&again), policies(&first));
-        }
-        assert!(
-            !first.gate.releases(0),
-            "file 0's committed piece is refused, whatever else stands"
-        );
-        assert!(first.gate.releases(1), "file 0's uncommitted piece may go");
-        assert!(first.gate.releases(5), "and so may file 1's");
-
-        // The cleaner's delete asks for a piece of each file and the
-        // committed one, while a pass holds file 1's turn.
-        std::fs::write(bucket.join("5"), [7u8; 25]).unwrap();
-        store.init_for_tests().unwrap();
-        let holding_file_1 = engine
-            .retention
-            .turn(&1)
-            .await
-            .expect("file 1 has an entity");
-        let mut delete = tokio::spawn({
-            let engine = engine.clone();
-            let registry = enginefs.store_registry().clone();
-            async move { engine.release_reclaimable(&registry, &[0, 1, 5]).await }
-        });
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while bucket.join("1").exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("file 0's piece went under file 0's own turn, which nothing holds");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(200), &mut delete)
-                .await
-                .is_err(),
-            "the delete waits: file 1's piece is ordered by file 1's turn"
-        );
-        assert!(
-            bucket.join("5").is_file(),
-            "and file 1's piece stays until that turn is had"
-        );
-        assert!(bucket.join("0").is_file(), "the committed piece stays");
-
-        drop(holding_file_1);
-        assert_eq!(
-            delete.await.expect("the delete task"),
-            2,
-            "one piece of each file went, and the committed one did not"
-        );
-        assert!(!bucket.join("5").exists());
-        assert!(bucket.join("0").is_file());
-        let asked: Vec<std::ops::Range<u32>> = counters
-            .dropped_ranges
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(range, _)| range.clone())
-            .collect();
-        assert!(
-            !asked.contains(&(0..1)),
-            "the backend was never asked to forget the committed piece: {asked:?}"
-        );
-        assert!(
-            asked.contains(&(1..2)) && asked.contains(&(5..6)),
-            "{asked:?}"
         );
     }
 
@@ -14463,16 +13068,21 @@ mod tests {
     async fn a_switch_to_the_next_file_makes_the_first_slack_and_takes_its_bytes() {
         let (enginefs, counters, engine, bucket, store) = two_policies_standing().await;
         // The server sees a stream open on file 1: the switch.
-        assert!(
-            !engine.standing().await.gate.releases(0),
-            "while file 0 is being played, the cleaner is refused its committed piece"
+        assert_eq!(
+            engine.standing().await.policies[0].mode,
+            crate::retention::owner::Mode::Live,
+            "while file 0 is being played its pass is the live one, which keeps \
+             what it committed"
         );
         enginefs.on_stream_start(TEST_HASH, 1).await;
         assert_eq!(enginefs.live().reading().file_of(TEST_HASH), Some(1));
         assert!(
-            engine.standing().await.gate.releases(0),
-            "and the moment it is slack the same piece is releasable: a policy on \
-             its way out protects nothing it committed"
+            matches!(
+                engine.standing().await.policies[0].mode,
+                crate::retention::owner::Mode::Slack { .. }
+            ),
+            "and the moment the viewer leaves it, its next pass is the slack one: \
+             a policy on its way out keeps nothing it committed"
         );
         counters.advertised.lock().unwrap().clear();
 
@@ -15295,131 +13905,6 @@ mod tests {
         );
     }
 
-    /// **The cleaner's delete asks under the turn it waited for, not before
-    /// it.**
-    ///
-    /// The delete reads the standing policies once to group its pieces by
-    /// file, and that reading decides which turns are taken and nothing
-    /// else. A pass commits a piece under the file's turn; a delete that
-    /// grouped before that pass, queued behind it, and then took what its
-    /// first reading released would unlink the piece the pass had just
-    /// committed and announced -- the reading trusted past the turn it was
-    /// taken outside of. The pass is parked at its hook, turn held and its
-    /// deciding reading not yet taken, while the delete asks for the piece
-    /// the pass is about to commit and queues on the turn; the pass then
-    /// commits it and lets go, and the delete, asking again, takes nothing.
-    ///
-    /// Multi-threaded because the hook is a blocking call on the pass's
-    /// thread, and the delete has to run meanwhile.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn the_cleaners_delete_asks_again_under_the_turn_it_waited_for() {
-        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
-        counters.pieces_per_file.store(4, Ordering::SeqCst);
-        counters
-            .drops_what_it_is_asked
-            .store(true, Ordering::SeqCst);
-        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
-        enginefs.set_cache_budget(Some(50));
-
-        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
-        std::fs::create_dir_all(&bucket).unwrap();
-        std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
-        let store = seeded_store(&enginefs, &engine);
-        engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
-        engine
-            .retain(enginefs.store_registry(), &playing(0))
-            .await
-            .expect("a pass");
-        std::fs::write(bucket.join("1"), [7u8; 25]).unwrap();
-        store.init_for_tests().unwrap();
-
-        // The hook parks the next pass -- the one that commits piece 0 --
-        // with the turn held, until the test lets it go. Later passes find
-        // the entered channel spent and go straight on.
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
-        let entered_tx = std::sync::Mutex::new(Some(entered_tx));
-        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
-        let go_rx = std::sync::Mutex::new(go_rx);
-        engine.retention.hook(move || {
-            if let Some(entered) = entered_tx.lock().unwrap().take() {
-                let _ = entered.send(());
-                let _ = go_rx.lock().unwrap().recv();
-            }
-        });
-        engine.note_playhead(0, 25);
-        let running = tokio::spawn({
-            let engine = engine.clone();
-            let registry = enginefs.store_registry().clone();
-            async move { engine.retain(&registry, &playing(0)).await }
-        });
-        tokio::time::timeout(Duration::from_secs(10), entered_rx)
-            .await
-            .expect("the pass reached its hook")
-            .expect("the hook said so");
-
-        // The delete asks for the piece the pass is about to commit, and
-        // queues on the turn.
-        let mut delete = tokio::spawn({
-            let engine = engine.clone();
-            let registry = enginefs.store_registry().clone();
-            async move { engine.release_reclaimable(&registry, &[0]).await }
-        });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(200), &mut delete)
-                .await
-                .is_err(),
-            "the delete waits: the pass holds the file's turn"
-        );
-
-        go_tx.send(()).expect("the pass is waiting on this");
-        let pass = running
-            .await
-            .expect("the pass task")
-            .expect("a pass ran to the end");
-        assert_eq!(pass.committed, 1, "the pass committed piece 0: {pass:?}");
-        assert_eq!(
-            delete.await.expect("the delete task"),
-            0,
-            "asked again under the turn, the committed piece is refused"
-        );
-        assert!(bucket.join("0").is_file(), "and it is still on the disk");
-        let asked: Vec<std::ops::Range<u32>> = counters
-            .dropped_ranges
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(range, _)| range.clone())
-            .collect();
-        assert!(
-            !asked.contains(&(0..1)),
-            "the backend was never asked to forget it: {asked:?}"
-        );
-    }
-
-    /// A hash the session runs no torrent for has no have-set for a
-    /// deletion to disagree with, so its pieces go straight to the store.
-    ///
-    /// This is most of what the cache cleaner reclaims: a previous
-    /// install's leftovers, and torrents the idle sweep has already taken
-    /// out of the session. Refusing them because no backend would vouch for
-    /// them would leave a disk full of bytes nothing will ever read.
-    #[tokio::test]
-    async fn pieces_of_a_torrent_the_session_does_not_run_go_without_a_claim() {
-        let (enginefs, counters) = test_enginefs_with_file_count(1);
-        let orphan = "fedcba9876543210fedcba9876543210fedcba98";
-        let bucket = enginefs.piece_store().torrent_dir(orphan).join("0");
-        std::fs::create_dir_all(&bucket).unwrap();
-        std::fs::write(bucket.join("7"), [7u8; 4096]).unwrap();
-
-        assert_eq!(enginefs.release_pieces(orphan, &[7]).await, 1);
-        assert!(!bucket.join("7").exists());
-        assert!(
-            counters.dropped_ranges.lock().unwrap().is_empty(),
-            "there was nothing to ask"
-        );
-    }
-
     /// The file a per-file delete removes must stop being the file playback
     /// is registered on, or the want-set re-planned right after it puts the
     /// deleted index straight back into `only_files` (the active file is
@@ -15687,6 +14172,12 @@ mod tests {
         // Piece 5 is the still-pinned neighbour's, and the backend does not
         // give it up.
         *counters.drops_pieces.lock().unwrap() = vec![3, 4];
+        // A registered store over those files, as a running torrent has:
+        // every unlink in the process goes through the store that holds the
+        // held set, and a hash no store is registered for keeps its bytes
+        // for the next launch's sweep.
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        let store = seeded_store(&enginefs, &engine);
 
         enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
         enginefs.pin_download(TEST_HASH, 1, None).await.unwrap();
@@ -15710,6 +14201,7 @@ mod tests {
             enginefs.get_engine(TEST_HASH).await.is_some(),
             "the torrent keeps running for its other pin"
         );
+        drop(store);
 
         // And nothing left the disk the second time, so the answer says so
         // rather than echoing the request flag: the pieces are already gone
@@ -15720,6 +14212,46 @@ mod tests {
                 unpinned: false,
                 deleted_files: false,
             }
+        );
+    }
+
+    /// **The same delete, with no store registered for the hash: nothing is
+    /// unlinked, and the answer says so.**
+    ///
+    /// There used to be a second door -- the unlink went by path when the
+    /// registry had no store for the hash -- and it was the cache cleaner's:
+    /// it walked the root, found a directory the session did not claim, and
+    /// deleted the files it could name. With the walk gone that door has no
+    /// caller left that is not this one, and leaving it open leaves a way to
+    /// unlink a piece behind a live store's back: a held bit standing over a
+    /// file that has gone, and an unlinked inode kept alive by the store's
+    /// cached descriptor. Every unlink in this process now goes through the
+    /// registered store, and a hash that has none keeps its bytes for the
+    /// next launch's sweep, which takes every directory no pin claims.
+    #[tokio::test]
+    async fn a_delete_for_a_hash_with_no_registered_store_frees_nothing() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        *counters.output_folder.lock().unwrap() = Some(enginefs.download_dir.join("show"));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in [3u32, 4] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 4096]).unwrap();
+        }
+        *counters.drops_pieces.lock().unwrap() = vec![3, 4];
+
+        enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
+        enginefs.pin_download(TEST_HASH, 1, None).await.unwrap();
+        assert_eq!(
+            enginefs.unpin_download(TEST_HASH, 0, true).await.unwrap(),
+            UnpinOutcome {
+                unpinned: true,
+                deleted_files: false,
+            },
+            "the pin goes, and the answer does not claim bytes that are still there"
+        );
+        assert!(
+            bucket.join("3").is_file() && bucket.join("4").is_file(),
+            "no store holds these, so nothing here unlinks them by path"
         );
     }
 

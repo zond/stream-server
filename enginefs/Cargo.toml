@@ -8,10 +8,6 @@ edition = "2024"
 # stand up an HTTPS origin whose chain actually verifies. Off in every release
 # build; `server` turns it on through its dev-dependency only.
 test-roots = []
-# Opens the piece store's unlink to `server`'s cache-cleaner tests, which
-# have no engine to go through. Off in every release build, so the cleaner
-# cannot reach the unlink in production -- see `piece_store::store`.
-test-unlink = []
 # Lets a test seed and register a piece store without a librqbit session
 # behind it -- what `server`'s cache-usage tests need in order to count the
 # bytes of a registered torrent. Off in every release build, so nothing but a

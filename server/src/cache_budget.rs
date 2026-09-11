@@ -67,30 +67,31 @@ use tracing::debug;
 
 use crate::state::AppState;
 
-/// Free space on the cache's volume that the cleaner keeps the torrent
-/// cache out of -- `enginefs`'s constant, re-exported, because it is one
-/// line read three ways and the three may not drift apart.
+/// Free space on the cache's volume that the published cap keeps the
+/// torrent cache out of -- `enginefs`'s constant, re-exported, because it is
+/// one line read three ways and the three may not drift apart.
 ///
 /// `routes::stream::ensure_download_disk_ready` refuses to stream a torrent
-/// that still wants bytes unless this much is free -- a failed check runs
-/// one pass of this cleaner and, if the disk is still short, answers the
+/// that still wants bytes unless this much is free -- a failed check asks
+/// both owners for their slack and, if the disk is still short, answers the
 /// stream `507 Insufficient Storage`. Below this line the server has
 /// therefore already decided the disk is unusable, so it is exactly the line
-/// the cleaner must keep the cache out of. (One constant, two readings: the
-/// cleaner asks `fs4::available_space`, which is `statvfs` on the path,
-/// while `ensure_download_disk_ready` matches the path against `sysinfo`'s
-/// mount list behind a 3-second cache. Same question, different syscall.)
+/// [`CacheLimit::effective`] must keep the cache out of. (One constant, two
+/// readings: this module asks `fs4::available_space`, which is `statvfs` on
+/// the path, while `ensure_download_disk_ready` matches the path against
+/// `sysinfo`'s mount list behind a 3-second cache. Same question, different
+/// syscall.)
 ///
 /// The third reader is the engine's reconciler, whose free-space arm this
 /// is (`enginefs::reconcile::desired`), and it is what turns the target into
-/// something close to a guarantee. The cleaner only deletes; it cannot
-/// throttle a writer, and librqbit writes the file it wants straight through
-/// this line to ENOSPC between passes -- on the device that prompted all
+/// something close to a guarantee. A cap only bounds what the owners keep;
+/// it cannot throttle a writer, and librqbit writes the file it wants
+/// straight through this line to ENOSPC -- on the device that prompted all
 /// this, Available went to nothing in 40 s rather than stopping at 512 MiB.
 /// The reconciler stops a writing torrent when the volume falls under the
-/// floor and rings [`recover_out_of_space_torrents`], so what this cleaner
-/// is handed is a torrent paused a few MB under the line, not one dead at
-/// zero. Offline downloads keep a margin of their own
+/// floor and rings the running-low bell, so what the owners are asked to
+/// give back is asked of a volume with a torrent paused a few MB under the
+/// line, not one dead at zero. Offline downloads keep a margin of their own
 /// (`enginefs::PIN_FREE_SPACE_MARGIN`, 500 MiB, checked once when a pin is
 /// accepted), so a pin can settle the volume below this line by design; the
 /// reconciler stops it there like any other writer.
@@ -100,8 +101,8 @@ pub(crate) use enginefs::CACHE_FREE_SPACE_FLOOR;
 /// filesystem can still give.
 ///
 /// `settings.cacheSize` on its own is `u64::MAX` unless somebody set a number
-/// (`routes::system::cache_size_bytes`), so on a 4 GB television the cleaner
-/// evicted nothing and librqbit wrote until the filesystem refused -- and
+/// (`routes::system::cache_size_bytes`), so on a 4 GB television nothing
+/// bounded the cache and librqbit wrote until the filesystem refused -- and
 /// that refusal arrives as a fatal torrent error, mid-film. The enforced cap
 /// is therefore the smaller of the two, which is a number even when
 /// `cacheSize` is not.
@@ -116,10 +117,10 @@ pub(crate) struct CacheLimit {
 }
 
 impl CacheLimit {
-    /// A limit with no filesystem reading behind it: what the cleaner
-    /// enforced before it had one, and what it falls back to when the volume
-    /// cannot be probed. Written that way only by the tests -- `cache_roots`
-    /// always carries whatever the probe returned, `None` included.
+    /// A limit with no filesystem reading behind it: what the cap falls
+    /// back to when the volume cannot be probed. Written that way only by
+    /// the tests -- [`publish_now`] always carries whatever the probe
+    /// returned, `None` included.
     #[cfg(test)]
     pub(crate) const fn configured(configured: u64) -> Self {
         Self {
@@ -149,17 +150,6 @@ impl CacheLimit {
             (Some(configured), Some(from_disk)) => Some(configured.min(from_disk)),
             (Some(only), None) | (None, Some(only)) => Some(only),
             (None, None) => None,
-        }
-    }
-
-    /// Whether the filesystem, rather than the operator, is what caps the
-    /// cache at `occupied` bytes -- the fact worth a log line, since it is
-    /// the device overruling a setting.
-    pub(crate) fn disk_bound(&self, occupied: u64) -> bool {
-        match (self.effective(occupied), self.configured) {
-            (Some(effective), 0) => effective < u64::MAX,
-            (Some(effective), configured) => effective < configured,
-            (None, _) => false,
         }
     }
 }
@@ -210,10 +200,10 @@ pub(crate) fn available_space(path: &std::path::Path) -> Option<u64> {
 /// the cap may be wrong for rather than by what it costs: the number it
 /// re-reads is what the *rest* of the device has done to the volume, and a
 /// player is inside a window for minutes at a time. A minute is the same
-/// order as `cache_cleaner::CLEAN_DEBOUNCE`, so a cache something is
-/// writing to is restated about as often as it was before this existed,
-/// and an idle one -- which used to wait out the hourly fallback -- is now
-/// restated on the minute like any other.
+/// order as the debounce the cache cleaner's walk used to run on, so a
+/// cache something is writing to is restated about as often as it was
+/// before this existed, and an idle one -- which used to wait out that
+/// walk's hourly fallback -- is now restated on the minute like any other.
 const BUDGET_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The cap a publication states, from the three readings behind it.
@@ -258,9 +248,9 @@ pub(crate) async fn publish_now(state: &AppState) -> Option<u64> {
         let settings = state.settings.read().await;
         crate::routes::system::cache_size_bytes(settings.cache_size)
     };
-    // The root the session was opened on, not `settings.cacheRoot`, for the
-    // reason `cache_cleaner::cache_roots` gives: the setting is where the
-    // data will be after the next start, the engine is where it is now.
+    // The root the session was opened on, not `settings.cacheRoot`: the
+    // setting is where the data will be after the next start, the engine is
+    // where it is now.
     let root = &state.engine.download_dir;
     let occupied = state.engine.cache_occupancy() + state.proxy_cache.retention().occupancy();
     let cap = cap_to_publish(configured, available_space(root), occupied);
@@ -271,10 +261,9 @@ pub(crate) async fn publish_now(state: &AppState) -> Option<u64> {
 /// The budget's own trigger: state it now, and restate it every
 /// [`BUDGET_INTERVAL`] thereafter.
 ///
-/// Started unconditionally, and deliberately not under the cache cleaner's
-/// switch: a server whose cleaner is off still relays streams into the
-/// proxy cache, and without a published budget nothing bounds what they
-/// leave behind.
+/// Started unconditionally: without a published budget nothing bounds what
+/// a relayed stream leaves behind, since
+/// `enginefs::retention::CacheBudget::Unknown` installs no policy at all.
 ///
 /// **The first publication is this function's own, before it returns**,
 /// rather than the first tick of the task it spawns. Both would happen at
@@ -468,7 +457,6 @@ mod tests {
             available: Some(8 * gib),
         };
         assert_eq!(roomy.effective(gib), Some(2 * gib));
-        assert!(!roomy.disk_bound(gib));
 
         // The owner's box: nothing configured, 3 GiB of cache and 523 MiB
         // free. The cache may keep what it has plus the free space above the
@@ -481,7 +469,6 @@ mod tests {
             television.effective(3 * gib),
             Some(3 * gib + 523 * 1024 * 1024 - CACHE_FREE_SPACE_FLOOR)
         );
-        assert!(television.disk_bound(3 * gib));
 
         // A generous setting on the same box does not buy room the device
         // does not have.
@@ -493,7 +480,6 @@ mod tests {
             configured_too_high.effective(3 * gib),
             television.effective(3 * gib)
         );
-        assert!(configured_too_high.disk_bound(3 * gib));
     }
 
     /// The floor is never eaten into, and the arithmetic that keeps it out of
@@ -532,7 +518,6 @@ mod tests {
             available: Some(0),
         };
         assert_eq!(full.effective(0), Some(0));
-        assert!(full.disk_bound(0));
     }
 
     /// An unreadable volume leaves the configured limit exactly as it was --
@@ -545,8 +530,8 @@ mod tests {
     /// created, but Windows names the volume from the drive letter and
     /// answers for it with the drive's real free space. (That is exactly how
     /// this test used to fail there, with the real number where `None` was
-    /// expected -- the property held; the fixture did not.) What the cleaner
-    /// does with a probe that answered `None` is the property, and it is the
+    /// expected -- the property held; the fixture did not.) What a cap made
+    /// from a probe that answered `None` is, is the property, and it is the
     /// same on both.
     #[test]
     fn an_unreadable_volume_leaves_the_configured_limit_alone() {
@@ -556,11 +541,10 @@ mod tests {
             Some(u64::MAX)
         );
         assert_eq!(CacheLimit::configured(0).effective(4096), None);
-        assert!(!CacheLimit::configured(0).disk_bound(4096));
 
-        // What `cache_roots` builds when the root's free space cannot be
+        // What a publication builds when the root's free space cannot be
         // read: a cap with no filesystem reading behind it, so the
-        // configured cap -- or no cap -- is what it enforces.
+        // configured cap -- or no cap -- is what it states.
         for (configured, expected) in [(1024, Some(1024)), (u64::MAX, Some(u64::MAX)), (0, None)] {
             let limit = CacheLimit {
                 configured,
@@ -568,7 +552,6 @@ mod tests {
             };
             assert_eq!(limit, CacheLimit::configured(configured));
             assert_eq!(limit.effective(4096), expected);
-            assert!(!limit.disk_bound(4096));
         }
 
         // Whereas a real directory answers with a real number -- on every

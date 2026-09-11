@@ -69,8 +69,7 @@
 //! through the registered store. [`sweep`] reconciles the store against the
 //! session at launch. What drives [`policy`] against a real torrent -- the playhead, the
 //! hold-back, the reclaim, and the claim that keeps a delete atomic with the
-//! have-set -- is [`crate::retention`], which is also what answers the cache
-//! cleaner.
+//! have-set -- is [`crate::retention`].
 //!
 //! Two things about the chunk store are *parameters* an adapter sets, and
 //! this one sets both differently from `/proxy`. Its staged copy is
@@ -145,10 +144,9 @@
 //! **There is no migration, by decision.** A whole-file download an earlier
 //! version wrote is neither converted nor read: the torrent that owns it
 //! comes up with an empty have-set and re-downloads as pieces, and the old
-//! bytes are ordinary cache for `cache_cleaner` to age out. That only works
-//! because an engine's protected set (`EngineFS::eviction_classes`) stopped
-//! naming the backend's file paths -- an engine that named them would protect
-//! its own superseded copy for as long as the torrent is in the session.
+//! bytes belong to nobody: no store speaks for them, so they are counted in
+//! a usage figure (`StoreRoot::unregistered_bytes`) and removed whole by the
+//! launch sweep, which keeps the pinned directories and nothing else.
 //!
 //! Nothing else has a stake in the default factory. The client's activity
 //! signal briefly did -- its counters were a storage wrapper around the
@@ -194,8 +192,7 @@ pub use pin_record::{PinRecord, PinsUnknown};
 pub use policy::{Decision, RetentionPolicy, Shape, Share};
 pub use registry::{DeleteOutcome, StoreRegistry};
 pub use store::{
-    HeldSnapshot, MissingPiece, PieceStore, PieceStoreFactory, StoreContents, StoreRoot,
-    StoredTorrent, layout_of,
+    HeldSnapshot, MissingPiece, PieceStore, PieceStoreFactory, StoreRoot, StoredTorrent, layout_of,
 };
 pub use sweep::{SweepReport, sweep_before_session, sweep_unadopted};
 
@@ -204,12 +201,12 @@ pub use sweep::{SweepReport, sweep_before_session, sweep_unadopted};
 /// Dot-prefixed like the engine's other private subdirectories (`.cache`,
 /// `.metadata`) so that a torrent named `pieces` cannot land on top of it.
 ///
-/// Inside the cache root rather than beside it, deliberately: piece files are
-/// cache, and the cache cleaner has to be able to see and count them --
-/// which it does by asking [`store::StoreRoot::scan`], never by walking in
-/// here ([`store::StoreRoot::holds`] is what prunes it out of the cleaner's
-/// own walk). Nor is it one of `cache_cleaner::is_session_artifact`'s exempt
-/// directories: pieces are exactly what a full disk should be reclaiming.
+/// Inside the cache root rather than beside it, deliberately: piece files
+/// are cache, and whoever is counting the cache has to be able to see them
+/// -- which they do by asking the store ([`store::StoreRoot::stat`] and
+/// [`registry::StoreRegistry::occupancy`]), never by walking in here.
+/// Nothing exempts the directory from the launch sweep either: pieces are
+/// exactly what a full disk should be reclaiming.
 pub(crate) const PIECE_STORE_DIR: &str = ".pieces";
 
 /// Where a torrent cache root keeps its piece store.
@@ -217,7 +214,7 @@ pub(crate) const PIECE_STORE_DIR: &str = ".pieces";
 /// Crate-private, and reached from outside only through
 /// [`store::StoreRoot::in_download_dir`]: naming the store is the one thing
 /// a caller needs, and giving it the *path* is how the directory shape
-/// escaped into the cache cleaner in the first place.
+/// escaped into the `server` crate's cache cleaner in the first place.
 pub(crate) fn root_in(download_dir: &std::path::Path) -> std::path::PathBuf {
     download_dir.join(PIECE_STORE_DIR)
 }

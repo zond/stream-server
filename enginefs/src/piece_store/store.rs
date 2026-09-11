@@ -658,11 +658,6 @@ impl Inner {
         self.epoch.store(epoch, Ordering::Release);
     }
 
-    #[cfg(test)]
-    pub(super) fn dir(&self) -> &Path {
-        self.chunks.path()
-    }
-
     fn piece_path(&self, piece: u32) -> PathBuf {
         self.chunks.chunk_path(u64::from(piece))
     }
@@ -900,15 +895,6 @@ impl Inner {
     }
 }
 
-/// Which thread last deleted pieces of each torrent directory -- through
-/// [`StoreRoot::delete_pieces`] or the registered store's delete
-/// ([`StoreRegistry::delete`]): the probe for the tests that pin a delete to
-/// the blocking pool, keyed by directory so that tests running in parallel,
-/// each in a scratch root of its own, do not read one another's answer.
-#[cfg(test)]
-pub(crate) static DELETED_ON: Mutex<std::collections::BTreeMap<PathBuf, std::thread::ThreadId>> =
-    Mutex::new(std::collections::BTreeMap::new());
-
 /// The piece store's root, and **the only thing outside this module that may
 /// be asked what is under it**.
 ///
@@ -917,11 +903,11 @@ pub(crate) static DELETED_ON: Mutex<std::collections::BTreeMap<PathBuf, std::thr
 /// ([`crate::chunk_store::CHUNKS_PER_DIRECTORY`]) and the staging suffix
 /// ([`crate::chunk_store::STAGING_SUFFIX`]) -- is
 /// [`crate::chunk_store::ChunkDir`]'s, shared with `/proxy`'s cache; what
-/// this type adds is the info hash and the have-set interlock. The cache
-/// cleaner used to walk the tree itself and unlink what it found, so the
-/// bucketing was written down in two crates at once: a change to it would
-/// have shown up over there as a silent accounting error rather than as a
-/// compile failure.
+/// this type adds is the info hash and the have-set interlock. The `server`
+/// crate's cache cleaner used to walk the tree itself and unlink what it
+/// found, so the bucketing was written down in two crates at once: a change
+/// to it would have shown up over there as a silent accounting error rather
+/// than as a compile failure. Nothing walks it now.
 ///
 /// What this type does *not* decide is which pieces may go. That is
 /// [`super::policy`]'s, and a caller that deletes a piece of a torrent the
@@ -999,16 +985,6 @@ impl StoreRoot {
 
     pub fn path(&self) -> &Path {
         &self.root
-    }
-
-    /// Whether `path` is inside the store.
-    ///
-    /// What lets the cache cleaner walk the rest of the torrent-data root
-    /// without ever descending in here. `Path::starts_with` matches whole
-    /// components, so a sibling whose name merely begins with the same
-    /// letters is not swallowed.
-    pub fn holds(&self, path: &Path) -> bool {
-        path.starts_with(self.root.as_path())
     }
 
     /// Where one torrent's pieces live.
@@ -1157,47 +1133,30 @@ impl StoreRoot {
         ChunkDir::new(self.torrent_dir(info_hash))
     }
 
-    /// Reclaim pieces: both copies of each.
+    /// Reclaim pieces by path, both copies of each -- **and nothing in
+    /// this process calls it any more.**
     ///
-    /// **Only for a caller that has already had the backend forget it has
-    /// them** ([`crate::backend::DroppedFilePieces`]) and is holding that
-    /// claim across this call. That claim is the interlock, and it lives in
-    /// one place: [`crate::retention::take_claimed`], which every reclaim
-    /// in this server ends at -- the retention policy's and the per-file
-    /// delete an unpin does alike. Without it the torrent goes on believing
-    /// it holds the piece: it advertises it, and answers a peer's request
-    /// with a read past the end of nothing.
+    /// It was the door for a hash no store is registered for: the cache
+    /// cleaner walked the root, found a directory no torrent in the session
+    /// claimed, and unlinked its pieces by name. Nothing walks the root now
+    /// and nothing outside a live store deletes a piece --
+    /// [`StoreRegistry::delete`] is where every reclaim in this process
+    /// ends, so that the store forgets its cached handle and clears its
+    /// held bit with the file. A directory no store speaks for is the boot
+    /// sweep's, whole.
     ///
-    /// There is deliberately no single-piece sibling of this. The cache
-    /// cleaner had one and called it directly, which was safe only while
-    /// everything it was allowed to touch belonged to no torrent in the
-    /// session; the policy now offers it pieces of torrents that do, and a
-    /// second door into the unlink is a second place the interlock can be
-    /// forgotten.
-    ///
-    /// **For a hash no store is registered for**, and for that alone. The
-    /// live `PieceStore` of a running torrent is librqbit's, built by the
-    /// factory and handed to a torrent state this crate has no reference
-    /// to, and this used to be the only way to reach its files: by path,
-    /// behind its back. That left the store's open-handle cache holding an
-    /// unlinked inode's blocks until another piece took the slot, and it
-    /// would leave a held set the store keeps standing over files that have
-    /// gone. So a torrent with a registered store is deleted through it
-    /// ([`StoreRegistry::delete`], which is what `crate::retention::unlink`
-    /// asks first), and this is the door for the rest: a torrent the
-    /// session does not hold, or holds in Error, whose pieces are files
-    /// nothing has a handle on or a bit for.
-    ///
-    /// [`OPEN_HANDLES`]: crate::chunk_store::OPEN_HANDLES
+    /// So it is kept for the tests that pin what an unlink loop owes its
+    /// caller -- both copies of a piece go together, a name the store never
+    /// wrote is never touched, and a piece the volume refuses does not
+    /// abandon the run -- which are the rules [`StoreRegistry::delete`]
+    /// runs by over the very same [`crate::chunk_store::ChunkDir`].
     ///
     /// Returns for how many pieces a file really left the disk -- **either
     /// copy**, not the complete one alone. A piece the caller was offered
     /// with only a staged copy (a torrent whose directory nothing ran `init`
     /// on this boot) occupies real blocks and gives them back when it goes,
     /// and counting only the complete copy reported nothing freed while the
-    /// volume gained space -- which is the number
-    /// `cache_cleaner::EvictionReport::freed` uses to decide whether a
-    /// torrent stopped by ENOSPC may be restarted.
+    /// volume gained space.
     ///
     /// A piece with no file at all was not on the disk to leave it, and is
     /// not an error -- the caller asked for bytes back and there were none.
@@ -1214,44 +1173,19 @@ impl StoreRoot {
     /// room, so booking zero for a delete that freed real blocks restarts
     /// the torrents onto a disk nothing gained. What could not be unlinked
     /// is logged where it happens.
-    /// The unlink, for a test that has no engine behind it.
-    ///
-    /// Behind a feature `server` turns on only as a dev-dependency, so it
-    /// does not exist in a release build. The cache cleaner's tests need to
-    /// stand in for what the production releaser ends at once the backend
-    /// has agreed to forget a piece, and the honest way to give them that is
-    /// a door that cannot be opened outside a test -- not a `pub` on the
-    /// real one, which would hand the cleaner itself the capability the
-    /// claim exists to withhold.
-    #[cfg(feature = "test-unlink")]
-    #[doc(hidden)]
-    pub fn delete_pieces_for_tests(
-        &self,
-        info_hash: &str,
-        pieces: impl IntoIterator<Item = u32>,
-    ) -> usize {
-        self.delete_pieces(info_hash, pieces)
-    }
-
-    /// `pub(crate)`, and that is the interlock rather than a style choice.
-    /// Unlinking a piece the backend still counts as had is the
-    /// advertise-then-serve-a-hole this whole path exists to prevent, so the
-    /// only callers are in [`crate::retention`], which has just had the
-    /// backend forget the pieces and holds the claim proving it. The cache
-    /// cleaner lives in `server` and holds a `&StoreRoot` across both of its
-    /// eviction loops; this is what stops it reaching the unlink from there,
-    /// and a `pub` here would hand it exactly the capability the claim
-    /// exists to withhold -- documented as denied is not denied.
+    /// `#[cfg(test)]`, and that is the interlock rather than a style
+    /// choice. Unlinking a piece the backend still counts as had is the
+    /// advertise-then-serve-a-hole this whole path exists to prevent; with
+    /// its last production caller gone, a door left open for one to come
+    /// back through is a door that will be used. A release build has no
+    /// unlink by path at all.
+    #[cfg(test)]
     pub(crate) fn delete_pieces(
         &self,
         info_hash: &str,
         pieces: impl IntoIterator<Item = u32>,
     ) -> usize {
         let chunks = self.chunks(info_hash);
-        #[cfg(test)]
-        DELETED_ON
-            .lock()
-            .insert(chunks.path().to_path_buf(), std::thread::current().id());
         let mut removed = 0;
         for piece in pieces {
             match chunks.remove(u64::from(piece)) {
@@ -1403,7 +1337,7 @@ impl TorrentStorage for PieceStore {
     /// arrive.
     ///
     /// This exists for the filesystem backend's pre-allocation, which is the
-    /// reason the cache cleaner has to count `st_blocks` rather than lengths.
+    /// reason a usage figure counts `st_blocks` rather than lengths.
     /// Nothing here is ever longer than the bytes it holds, so there is
     /// nothing to grow and shrinking would throw data away. librqbit warns and
     /// carries on when this fails, so the honest answer is to succeed.
@@ -1774,9 +1708,9 @@ mod tests {
     }
 
     /// The scan is the store's answer to "what is on the disk", and it is
-    /// the only answer anything outside this module gets: the cache cleaner
-    /// counts and evicts from it, so what it omits is disk nothing will ever
-    /// reclaim and what it mis-names is a delete that frees nothing.
+    /// the only answer anything outside this module gets: what it omits is
+    /// disk nothing will ever count and what it mis-names is a delete that
+    /// frees nothing.
     ///
     /// Three things it has to get right. Both copies of a piece are **one**
     /// entry, because `delete_pieces` takes them together. A name the store
@@ -1870,12 +1804,10 @@ mod tests {
     ///
     /// `<hash>/00/0`, `<hash>/+0/0`, `<hash>/0/00` and `<hash>/0/+0` all
     /// parse as piece 0, and `delete_pieces(hash, [0])` goes to `<hash>/0/0`
-    /// and takes none of them. Reported as piece 0 they are bytes a cleaner
-    /// asks for and never gets: it books them as freed, the disk gives
-    /// nothing, and the next pass re-finds the very same file and books them
-    /// again -- while what a pass reports freed is what decides whether a
-    /// torrent stopped by ENOSPC is restarted. So they are strays: counted,
-    /// because they are occupying the volume, and never offered.
+    /// and takes none of them. Reported as piece 0 they are bytes a caller
+    /// asks for and never gets: it books them as freed and the disk gives
+    /// nothing back. So they are strays: counted, because they are occupying
+    /// the volume, and never offered.
     #[test]
     fn a_name_the_store_would_not_have_written_is_debris_however_it_parses() {
         let tmp = tempfile::tempdir().unwrap();

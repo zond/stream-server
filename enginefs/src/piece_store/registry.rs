@@ -132,10 +132,6 @@ impl StoreRegistry {
         if inner.is_checking() {
             return DeleteOutcome::Refused;
         }
-        #[cfg(test)]
-        super::store::DELETED_ON
-            .lock()
-            .insert(inner.dir().to_path_buf(), std::thread::current().id());
         let mut unlinked = 0;
         for piece in pieces {
             match inner.delete_piece(*piece) {
