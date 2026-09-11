@@ -1918,12 +1918,15 @@ fn holds_no_more_than_after_the_last_byte(fixture: &Fixture, url: &str, at: u64,
         .expect("the cache answers a byte it holds");
     assert_eq!(byte.status(), reqwest::StatusCode::PARTIAL_CONTENT);
     assert_eq!(byte.bytes().expect("the byte").len(), 1);
-    assert!(
-        fixture.origin.was_asked_for_nothing_more(),
-        "the probe byte came out of the cache: a fetch here would be this \
-         helper's own request, and the test's next `next_request` would get it"
-    );
-    // And settled again, for the pass the byte armed.
+    // And nothing is asserted here about the origin, though the byte missing
+    // the cache is exactly what this helper must not do. `Origin`'s record of
+    // what it was asked is a queue, and both ways of looking at it --
+    // `next_request` and `was_asked_for_nothing_more` -- take an entry off:
+    // a helper that looked would decide what the test sees next. The settle
+    // above is what keeps the byte a cache hit, and a caller that counts the
+    // origin's requests is what says so when it is not.
+    //
+    // Settled again, for the pass the byte armed.
     holds_no_more_than(fixture, chunks);
 }
 
@@ -2157,7 +2160,12 @@ fn a_panel_asking_about_a_proxied_stream_is_told_what_is_on_the_disk() -> anyhow
     let mut played = Vec::new();
     response.read_to_end(&mut played)?;
     assert_eq!(played.len() as u64, 64 * CHUNK, "the player read the lot");
-    holds_no_more_than(&fixture, (RETENTION_BUDGET / CHUNK) as usize);
+    holds_no_more_than_after_the_last_byte(
+        &fixture,
+        &url,
+        64 * CHUNK - 1,
+        (RETENTION_BUDGET / CHUNK) as usize,
+    );
 
     let numbers = fixture
         .handle
