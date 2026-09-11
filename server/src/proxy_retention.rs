@@ -441,6 +441,12 @@ impl Backing for ProxyBacking {
                     }
                 });
             }
+            // What the unlinks emptied goes too -- the bucket, the entity,
+            // the key -- or every stream a slack pass took would leave its
+            // directories behind. A chunk that stayed keeps them all.
+            if freed > 0 {
+                crate::proxy_cache::prune(&dir);
+            }
             freed
         })
         .await

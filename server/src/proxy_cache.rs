@@ -570,24 +570,41 @@ impl Entry {
         let dir = self
             .dir
             .join(entity_dir_name(total, content_type, validator));
-        // The entity directory and the removal of any *other* entity under
-        // this key happen once, off the reactor, and neither has to finish
-        // before the first chunk is written: a chunk write creates its own
-        // bucket directory, and what is being removed is by definition not
-        // the directory being written into.
+        // The removal of any *other* entity under this key happens once, off
+        // the reactor, and does not have to finish before the first chunk is
+        // written: what is being removed is by definition not the directory
+        // being written into.
+        //
+        // The entity's own directory is not made here. The first chunk
+        // write makes it with its bucket, and a fill that never completes a
+        // chunk -- a range that starts inside one and ends before the next
+        // boundary, a player gone before 256 KiB arrived -- made one that
+        // held nothing and that nothing would ever remove. The exception is
+        // a sibling left standing because a body is reading it: then this
+        // directory is what makes the key hold two entities, which sends
+        // every request to the origin until a fill can take the old one.
+        // Without it the key would hold the old entity alone, and a lookup
+        // would serve bytes the origin has just said are not this resource.
         let stale = self.dir.clone();
         let fresh = dir.clone();
         let ticket = self.work.start();
         let retention = self.retention.clone();
         tokio::task::spawn_blocking(move || {
             let _ticket = ticket;
-            if let Err(error) = std::fs::create_dir_all(&fresh) {
-                tracing::debug!(path = %fresh.display(), %error, "could not open a proxy cache entry");
-                return;
+            let (freed, left) =
+                remove_other_entities(&stale, &fresh, |entity| retention.readers_of(entity) > 0);
+            retention.uncounted(freed);
+            if left > 0 {
+                if let Err(error) = std::fs::create_dir_all(&fresh) {
+                    tracing::debug!(path = %fresh.display(), %error, "could not open a proxy cache entry");
+                }
+            } else {
+                // A key whose old entity went and whose new one has no chunk
+                // yet is an empty directory. `rmdir` refuses it the moment a
+                // chunk write has made the entity, and a write whose bucket
+                // this took in between makes it again.
+                let _ = std::fs::remove_dir(&stale);
             }
-            retention.uncounted(remove_other_entities(&stale, &fresh, |entity| {
-                retention.readers_of(entity) > 0
-            }));
         });
         let dir = ChunkDir::new(dir);
         let reader = self.retention.reader(&dir, total, self.target.clone());
@@ -693,11 +710,18 @@ pub fn can_be_filed(total: u64, content_type: &str, validator: &str) -> bool {
 /// which asks again -- until then the key holds two entities and
 /// [`Entry::sole_entity`] sends every request to the origin, which is what
 /// two entities have always meant.
-fn remove_other_entities(key_dir: &Path, keep: &Path, is_read: impl Fn(&Path) -> bool) -> u64 {
+///
+/// Answers what the removal freed and how many entities it left standing.
+fn remove_other_entities(
+    key_dir: &Path,
+    keep: &Path,
+    is_read: impl Fn(&Path) -> bool,
+) -> (u64, usize) {
     let Ok(entries) = std::fs::read_dir(key_dir) else {
-        return 0;
+        return (0, 0);
     };
     let mut freed = 0u64;
+    let mut left = 0usize;
     for entry in entries.flatten() {
         let path = entry.path();
         if path == keep || parse_entity_dir_name(&entry.file_name().to_string_lossy()).is_none() {
@@ -708,6 +732,7 @@ fn remove_other_entities(key_dir: &Path, keep: &Path, is_read: impl Fn(&Path) ->
                 path = %path.display(),
                 "the origin's entity changed, but a body is still reading the old one; leaving it"
             );
+            left += 1;
             continue;
         }
         // Measured before the directory goes, because this is the one place
@@ -732,11 +757,44 @@ fn remove_other_entities(key_dir: &Path, keep: &Path, is_read: impl Fn(&Path) ->
                 )
             }
             Err(error) => {
+                left += 1;
                 tracing::debug!(path = %path.display(), %error, "could not drop a stale cache entity")
             }
         }
     }
-    freed
+    (freed, left)
+}
+
+/// Remove the directories a reclaim has emptied: the entity's empty
+/// buckets, the entity once it has none, and its key directory once that
+/// holds no entity.
+///
+/// A reclaim unlinks chunk files and nothing else, so without this every
+/// URL anyone played left `<key>/<entity>/<bucket>/` behind once its bytes
+/// had gone. One HLS playback is a URL per segment, so that is three empty
+/// directories per segment, thousands of them in a root that the exFAT of
+/// a phone scans linearly, and nothing but the next launch's sweep removed
+/// them.
+///
+/// Only empty directories go, and `rmdir` is what decides that: it refuses
+/// a directory holding anything, a chunk or a temporary on its way to
+/// becoming one. What a writer can lose to it is a bucket it has made and
+/// not yet written into, and `ChunkDir::write_whole` makes that again.
+///
+/// The key directory is reached only for a directory named as an entity is.
+/// Anything else's parent is not a key directory, and could be the root.
+pub(crate) fn prune(dir: &ChunkDir) {
+    let _ = dir.remove_if_empty();
+    let entity = dir.path();
+    if entity
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(parse_entity_dir_name)
+        .is_some()
+        && let Some(key) = entity.parent()
+    {
+        let _ = std::fs::remove_dir(key);
+    }
 }
 
 /// How long chunk `index` of a `total`-byte entity is: a whole chunk, or
@@ -1882,7 +1940,13 @@ mod tests {
             !old.exists(),
             "the old entity is not this resource any more"
         );
-        assert!(filler.dir.path().is_dir());
+        cache.settled().await;
+        assert!(
+            !entry.dir.exists(),
+            "and the key, which holds nothing until the new entity's first \
+             chunk lands, goes with it"
+        );
+        drop(filler);
     }
 
     /// The old entity is not removed from under a body that is reading it.
@@ -1911,6 +1975,11 @@ mod tests {
             old.is_dir() && chunk_path(&old, 0).is_file(),
             "a body is inside the old entity, so the fill leaves it"
         );
+        assert!(
+            entry.sole_entity().is_none(),
+            "and the key holds two entities, so no lookup answers from the \
+             one the origin has said is not this resource any more"
+        );
         drop(fresh);
 
         drop(reading);
@@ -1921,6 +1990,89 @@ mod tests {
             !old.exists(),
             "and the fill after the read has ended takes it"
         );
+    }
+
+    /// A fill that completes no chunk leaves no directory behind.
+    ///
+    /// A range that starts inside a chunk and ends before the next boundary
+    /// carries nothing the cache can keep -- a player probing the tail of
+    /// an MP4 for its index is the everyday one -- and the fill used to make
+    /// the entity's directory before any chunk arrived. Nothing reclaims an
+    /// entity with no chunks, so that directory, and the key above it,
+    /// stood until the next launch.
+    #[tokio::test]
+    async fn a_fill_that_keeps_nothing_makes_no_directory() {
+        let (_root, cache) = cache();
+        let entry = entry_of(&cache, "https://host/film.mp4");
+        let mut filler = entry.fill(CHUNK_BYTES * 3, "video/mp4", VALIDATOR, CHUNK_BYTES + 5);
+        filler.take(&[7u8; 100]);
+        drop(filler);
+        cache.settled().await;
+        assert!(
+            !entry.dir.exists(),
+            "nothing was kept, so nothing is on the disk"
+        );
+    }
+
+    /// What a slack pass empties leaves no directory behind: not the
+    /// bucket, not the entity, not the key.
+    ///
+    /// One HLS playback is a URL per segment, and each segment opening
+    /// makes the one before it slack, so a reclaim that unlinked the chunks
+    /// and left their directories left three of them per segment in the
+    /// cache root, until the next launch.
+    #[tokio::test]
+    async fn a_stream_a_slack_pass_took_leaves_no_directory_behind() {
+        let (_root, cache) = cache();
+        let segment = entry_of(&cache, "https://host/segment1.ts");
+        let total = CHUNK_BYTES + 7;
+        let mut filler = segment.fill(total, "video/mp2t", VALIDATOR, 0);
+        filler.take(&vec![1u8; total as usize]);
+        drop(filler);
+        cache.settled().await;
+        let entity = segment
+            .dir
+            .join(entity_dir_name(total, "video/mp2t", VALIDATOR));
+        assert!(chunk_path(&entity, 1).is_file(), "the segment was cached");
+
+        // The next segment opens, which is what makes this one slack.
+        let next = entry_of(&cache, "https://host/segment2.ts");
+        let playing = next.fill(total, "video/mp2t", VALIDATOR, 0);
+        cache.retention().drop_slack().await;
+        cache.settled().await;
+
+        assert!(
+            !chunk_path(&entity, 0).exists(),
+            "the slack pass took the chunks"
+        );
+        assert!(
+            !segment.dir.exists(),
+            "and the directories they were in: the buckets, the entity and the key"
+        );
+        assert!(cache.root().is_dir(), "while the cache root stays");
+        drop(playing);
+    }
+
+    /// A prune reaches the parent only of a directory named as an entity is,
+    /// because only then is the parent a key. Anything else's parent could
+    /// be the cache root, or the download directory the root is in.
+    #[test]
+    fn a_prune_climbs_only_out_of_an_entity() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("parent");
+        let dir = chunks(&parent.join("not-an-entity"));
+        std::fs::create_dir_all(dir.chunk_path(0).parent().unwrap()).unwrap();
+
+        prune(&dir);
+        assert!(!dir.path().exists(), "the empty directory went");
+        assert!(parent.is_dir(), "and the one above it, not a key, stayed");
+
+        let key = parent.join("key");
+        let entity = chunks(&key.join(entity_dir_name(1, "video/mp4", VALIDATOR)));
+        std::fs::create_dir_all(entity.chunk_path(0).parent().unwrap()).unwrap();
+        prune(&entity);
+        assert!(!key.exists(), "an entity's empty key goes with it");
+        assert!(parent.is_dir());
     }
 
     /// Only whole chunks are written, and a body that stops mid-chunk leaves

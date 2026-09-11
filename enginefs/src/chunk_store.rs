@@ -113,6 +113,19 @@ pub const OPEN_HANDLES: usize = 8;
 /// while another process is writing the same chunk.
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
+/// How many times [`ChunkDir::write_whole`] makes its bucket again after a
+/// prune took it between the `mkdir` and the write. See there.
+const BUCKET_RETRIES: usize = 4;
+
+#[cfg(test)]
+thread_local! {
+    /// Run by [`ChunkDir::write_whole`] between making the bucket and
+    /// writing into it, on the writing thread: the one place a test can
+    /// stand a prune.
+    static BUCKET_MADE: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Why a read of a chunk did not produce a file.
 ///
 /// The distinction is the point -- see the module docs.
@@ -350,6 +363,15 @@ impl ChunkDir {
     /// `expected_len` is checked against the buffer before anything is
     /// written -- the same criterion [`Self::commit`] takes, applied where
     /// the bytes still are.
+    ///
+    /// The bucket is made here, and made again if it is gone by the time
+    /// the temporary is written: `server::proxy_cache` prunes the
+    /// directories a reclaim has emptied ([`Self::remove_if_empty`]), and a
+    /// bucket this write has just made is empty until the temporary lands
+    /// in it. Without the retry that `rmdir` loses the chunk -- the write
+    /// fails `NotFound` over a directory nobody meant to take from it.
+    /// Once the temporary is in, the bucket holds a file, and no `rmdir`
+    /// can take it before the rename.
     pub fn write_whole(
         &self,
         index: u64,
@@ -368,15 +390,35 @@ impl ChunkDir {
         let Some(bucket) = path.parent() else {
             return Err(io::Error::other("a chunk path has no bucket directory"));
         };
-        std::fs::create_dir_all(bucket)?;
         let temp = bucket.join(format!(
             "{index}.{}-{}{STAGING_SUFFIX}",
             std::process::id(),
             NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
         ));
-        if let Err(e) = std::fs::write(&temp, chunk) {
-            let _ = std::fs::remove_file(&temp);
-            return Err(e);
+        let mut lost = 0;
+        loop {
+            let written = std::fs::create_dir_all(bucket).and_then(|()| {
+                #[cfg(test)]
+                BUCKET_MADE.with_borrow_mut(|hook| {
+                    if let Some(hook) = hook.as_mut() {
+                        hook();
+                    }
+                });
+                std::fs::write(&temp, chunk)
+            });
+            match written {
+                Ok(()) => break,
+                // Bounded, so a directory that keeps vanishing is an error
+                // rather than a spin: each loss is a prune that landed in
+                // the gap between two syscalls.
+                Err(e) if e.kind() == io::ErrorKind::NotFound && lost < BUCKET_RETRIES => {
+                    lost += 1;
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&temp);
+                    return Err(e);
+                }
+            }
         }
         if let Err(e) = std::fs::rename(&temp, &path) {
             let _ = std::fs::remove_file(&temp);
@@ -1060,6 +1102,33 @@ mod tests {
             [0x5au8; 64],
             "and left the other writer's staged copy exactly as it was"
         );
+    }
+
+    /// A write whose bucket a prune took between the `mkdir` and the write
+    /// still lands.
+    ///
+    /// The proxy cache prunes what its reclaims empty, from the retention
+    /// pass's thread, while a fill writes from its own. A bucket the fill
+    /// has just made is empty and prunable until its temporary is in it, so
+    /// the prune stands exactly there -- twice, since the directory a
+    /// retry makes again is as empty as the first one was.
+    #[test]
+    fn a_bucket_pruned_under_a_write_is_made_again() {
+        let (_tmp, chunks) = dir();
+        let pruner = chunks.clone();
+        let mut prunes = 2;
+        BUCKET_MADE.set(Some(Box::new(move || {
+            if prunes > 0 {
+                prunes -= 1;
+                pruner.remove_if_empty().unwrap();
+                assert!(!pruner.path().exists(), "the prune took the directory");
+            }
+        })));
+        let written = chunks.write_whole(3, b"abcd", Some(4));
+        BUCKET_MADE.set(None);
+
+        written.expect("the write made its bucket again");
+        assert_eq!(std::fs::read(chunks.chunk_path(3)).unwrap(), b"abcd");
     }
 
     #[test]
