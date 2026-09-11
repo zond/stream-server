@@ -4262,6 +4262,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         } else {
             false
         };
+        self.hand_live_on(&info_hash, file_idx).await;
 
         // Nothing schedules a pause here any more, and nothing stamps
         // anything either. The last stream ending is not a decision, it is
@@ -4285,6 +4286,58 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             remaining,
             file_streams_remaining
         );
+    }
+
+    /// The aside rule again, at the moment it can have changed its answer:
+    /// the live file `file_idx` of `info_hash` has lost its last read, and
+    /// another file of the torrent is still being read. That file is what
+    /// is playing, and it takes the cell and the selection.
+    ///
+    /// The rule is decided at each open from a count of reads, and a player
+    /// that opens episode two before the server has seen episode one's
+    /// connection close finds episode one still read: the open is an aside,
+    /// the cell stays on episode one, and episode two -- the one being
+    /// watched -- is protected only while a read of it is open. Its first
+    /// seek gap handed its whole extent to the next tick's slack pass.
+    ///
+    /// Read after the engine lookup and written with nothing awaited in
+    /// between ([`Self::switch_to`]'s rule), and the write moves the cell
+    /// only off the file this was decided about ([`Live::hand_on`]): the end
+    /// of a read of any other file moves nothing, and an open that moved
+    /// the cell meanwhile stands.
+    ///
+    /// [`Live::hand_on`]: crate::retention::live::Live::hand_on
+    async fn hand_live_on(&self, info_hash: &str, file_idx: usize) {
+        let Some(engine) = self.peek_engine(info_hash).await else {
+            return;
+        };
+        if engine.retention.readers_of(&file_idx) > 0 {
+            return;
+        }
+        let Some(next) = engine
+            .retention
+            .keys()
+            .into_iter()
+            .filter(|key| *key != file_idx && engine.retention.readers_of(key) > 0)
+            .min()
+        else {
+            return;
+        };
+        let torrent = |file_idx| crate::retention::live::LiveEntity::Torrent {
+            info_hash: info_hash.to_string(),
+            file_idx,
+        };
+        let Some(switch) = self.live.hand_on(&torrent(file_idx), torrent(next)) else {
+            return;
+        };
+        tracing::debug!(
+            info_hash = %info_hash,
+            file_idx = next,
+            from = ?switch.from,
+            "the live file's last read closed while another file of it is read; that one is playing"
+        );
+        self.activate_multifile_file(info_hash, next, None, "hand-on")
+            .await;
     }
 
     async fn schedule_file_cleanup(&self, info_hash: String, file_idx: usize) {
@@ -13702,6 +13755,62 @@ mod tests {
             ),
             (Some(1), None)
         );
+    }
+
+    /// **The next episode, opened before the last one's read closed, takes
+    /// the cell once that read has closed.**
+    ///
+    /// A player opens episode two before the server has seen episode one's
+    /// connection close, so the open finds episode one still read and is
+    /// an aside. Nothing asked again: the cell stayed on episode one, and
+    /// episode two, the one being watched, was protected only while a read
+    /// of it was open -- its first seek gap handed it to the slack pass.
+    /// The end of a read that is not the live file's moves nothing, and
+    /// neither does one while the live file is still read elsewhere.
+    #[tokio::test]
+    async fn the_live_files_last_read_closing_hands_the_cell_to_the_file_still_read() {
+        let (enginefs, counters) = test_enginefs_with_file_count(3);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        enginefs.on_stream_start(TEST_HASH, 0).await;
+        engine.begin_retention(0).await;
+        let first = engine.retention.reader_on(&0).expect("an entity");
+        first.promises(0..1);
+        let second = engine.retention.reader_on(&0).expect("an entity");
+        second.promises(0..1);
+
+        enginefs.on_stream_start(TEST_HASH, 1).await;
+        engine.begin_retention(1).await;
+        let next = engine.retention.reader_on(&1).expect("an entity");
+        next.promises(0..1);
+        assert_eq!(enginefs.live().reading().file_of(TEST_HASH), Some(0));
+
+        // A subtitle fetched and done: not the live file's read.
+        enginefs.on_stream_start(TEST_HASH, 2).await;
+        enginefs.on_stream_end(TEST_HASH, 2).await;
+        assert_eq!(enginefs.live().reading().file_of(TEST_HASH), Some(0));
+
+        // One of episode one's reads ends, and another is still open.
+        drop(first);
+        enginefs.on_stream_end(TEST_HASH, 0).await;
+        assert_eq!(enginefs.live().reading().file_of(TEST_HASH), Some(0));
+
+        drop(second);
+        enginefs.on_stream_end(TEST_HASH, 0).await;
+        assert_eq!(
+            enginefs.live().reading().file_of(TEST_HASH),
+            Some(1),
+            "episode one's last read closed and episode two kept its aside"
+        );
+        assert_eq!(
+            (
+                *counters.last_active_file.lock().unwrap(),
+                *counters.last_hot_file.lock().unwrap()
+            ),
+            (Some(1), None),
+            "and the selection moved with it"
+        );
+        drop(next);
     }
 
     /// **And the aside rule is asked of the cell as it stands when the open

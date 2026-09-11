@@ -15,6 +15,13 @@
 //! after the server saw it opened still moved the live entity, because the
 //! predecessor's bytes really are the ones nobody is playing any more.
 //!
+//! One correction is made to what an open decided, and only through
+//! [`Live::hand_on`]: an open the aside rule kept off the cell because the
+//! live file was still being read, once that read has closed and the
+//! aside's has not. The player that opens the next episode before the
+//! server has seen the last one's connection close looks like a subtitle
+//! fetch at the moment it opens, and like a viewer moving on a moment later.
+//!
 //! **Nothing here remembers a time.** The previous design measured
 //! liveness with two clocks -- an idle grace on the torrent and a 90-second
 //! grace on the proxy -- and both were the same mistake: a stream that has
@@ -105,6 +112,26 @@ impl Live {
         let mut switch = None;
         self.0.send_if_modified(|current| {
             if keep_current || current.as_ref() == Some(&to) {
+                return false;
+            }
+            switch = Some(Switch {
+                from: current.take(),
+                to: to.clone(),
+            });
+            *current = Some(to);
+            true
+        });
+        switch
+    }
+
+    /// Move the cell from `from` to `to`, and only if it still names `from`:
+    /// the aside rule asked again once the live file's last read has closed
+    /// while `to` is still being read. An open that moved the cell since is
+    /// newer than the reading this was decided from, and it stands.
+    pub fn hand_on(&self, from: &LiveEntity, to: LiveEntity) -> Option<Switch> {
+        let mut switch = None;
+        self.0.send_if_modified(|current| {
+            if current.as_ref() != Some(from) || *from == to {
                 return false;
             }
             switch = Some(Switch {
@@ -269,6 +296,33 @@ mod tests {
             })
         );
         assert!(!live.is_torrent("aa"));
+    }
+
+    /// A hand-on moves the cell only off the entity it names.
+    #[test]
+    fn a_hand_on_moves_only_the_entity_it_was_decided_from() {
+        let live = Live::new();
+        live.open(torrent("aa", 0), false);
+        assert_eq!(
+            live.hand_on(&torrent("aa", 2), torrent("aa", 1)),
+            None,
+            "the cell names another file"
+        );
+        assert_eq!(live.reading().file_of("aa"), Some(0));
+        let watcher = live.changed();
+        assert_eq!(live.hand_on(&torrent("aa", 0), torrent("aa", 0)), None);
+        assert!(
+            !watcher.has_changed().expect("the sender is alive"),
+            "a hand-on onto itself woke a watcher"
+        );
+        assert_eq!(
+            live.hand_on(&torrent("aa", 0), torrent("aa", 1)),
+            Some(Switch {
+                from: Some(torrent("aa", 0)),
+                to: torrent("aa", 1)
+            })
+        );
+        assert_eq!(live.reading().file_of("aa"), Some(1));
     }
 
     /// The aside rule, as the caller spells it: an open that says "keep
