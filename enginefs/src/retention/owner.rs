@@ -1516,13 +1516,16 @@ impl<B: Backing> Retention<B> {
         } else {
             // The hold-back first, if the backend has rebuilt the record
             // that carried it: everything of this policy that is not
-            // committed goes back out of what we announce before a piece
-            // of it is committed or reclaimed, which is the order the
-            // install used and for the same reason -- a piece announced
-            // once is announced to every peer already connected. See
-            // [`Installed::asserted_epoch`] for what `None` is, and why
-            // this is a re-issue and not a repair: the Haves librqbit sent
-            // as it came back cannot be recalled.
+            // committed goes back out of what we announce before the pass
+            // announces anything, which is the install's own order. It is
+            // not what keeps a committed piece announced -- the committed
+            // half is read off the policy this pass has just advanced, so
+            // the two sets are disjoint whichever way round the two acts
+            // run -- it is what keeps the hold-back the pass's first act,
+            // as it is the install's. See [`Installed::asserted_epoch`]
+            // for what `None` is, and why this is a re-issue and not a
+            // repair: the Haves librqbit sent as it came back cannot be
+            // recalled.
             let epoch = self.backing.epoch(store);
             if asserted != Some(epoch) {
                 let committed: Vec<u32> = door_policy.advertised().iter().copied().collect();
@@ -4020,6 +4023,82 @@ mod tests {
         let claim = owner.turn(&0).await.expect("the turn");
         owner.pass(&0, &(), claim, Mode::Live).await;
         assert_eq!(backing.advertised.lock().len(), 4);
+    }
+
+    /// **The re-issued hold-back is the pass's first announcement.**
+    ///
+    /// A pass that finds the epoch moved is also a pass that may commit a
+    /// piece, and it makes the two announcements in the install's order:
+    /// the policy's range less its committed half held back, then the
+    /// pieces the window released announced. Which piece ends up announced
+    /// is the same either way round -- the committed half the re-issue
+    /// leaves out is read off the policy this pass has already advanced --
+    /// so nothing but this says which act is the pass's first, and the
+    /// module doc, [`Installed::asserted_epoch`] and the install all say
+    /// the hold-back is.
+    #[tokio::test]
+    async fn the_re_issued_hold_back_goes_out_before_the_pass_commits_a_piece() {
+        let (backing, owner, _budget) = torrent();
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        owner.note_position(&0, (0, 0));
+        let claim = owner.turn(&0).await.expect("the turn");
+        owner.pass(&0, &(), claim, Mode::Live).await;
+
+        // The restart, and then a pass with something of its own to
+        // announce: playback has walked to piece 1, which leaves piece 0
+        // behind the window and commits it.
+        backing.epoch.fetch_add(1, Ordering::SeqCst);
+        owner.note_position(&0, (0, PIECE));
+        let claim = owner.turn(&0).await.expect("the turn");
+        owner.pass(&0, &(), claim, Mode::Live).await;
+        assert_eq!(
+            *backing.advertised.lock(),
+            vec![(0..8, false), (1..8, false), (0..1, true)],
+            "the install's hold-back, then the re-issue, then the commit"
+        );
+    }
+
+    /// **A rebuild between the install and the first pass is recorded, not
+    /// re-issued.**
+    ///
+    /// The install held the range back and could not read the epoch it did
+    /// it under -- the store is the pass's, handed to it by the driver --
+    /// so the first pass over the entity records the epoch it finds and
+    /// announces nothing. Re-issuing under `None` instead would repeat
+    /// every install's hold-back one pass later, for every entity that ever
+    /// opens, to close a window one pass wide.
+    ///
+    /// That window is what this pins, deliberately: a backend that rebuilt
+    /// its record between the install and the first pass is recorded as
+    /// though the hold-back had gone out under the new one, and nothing
+    /// here notices. See [`Installed::asserted_epoch`].
+    #[tokio::test]
+    async fn a_rebuild_before_the_first_pass_is_recorded_and_not_re_issued() {
+        let (backing, owner, _budget) = torrent();
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        // The backend threw away what it was holding back between the
+        // install's hold-back and the first pass over the entity.
+        backing.epoch.fetch_add(1, Ordering::SeqCst);
+        owner.note_position(&0, (0, 0));
+        let claim = owner.turn(&0).await.expect("the turn");
+        owner.pass(&0, &(), claim, Mode::Live).await;
+        assert_eq!(
+            *backing.advertised.lock(),
+            vec![(0..8, false)],
+            "the install's hold-back alone: the first pass records what it \
+             finds rather than repeating what went out a moment ago"
+        );
+
+        // And what it recorded is the epoch in force, so the pass after it
+        // -- and every pass until the epoch moves again -- says nothing.
+        owner.note_position(&0, (0, PIECE));
+        let claim = owner.turn(&0).await.expect("the turn");
+        owner.pass(&0, &(), claim, Mode::Live).await;
+        assert_eq!(
+            *backing.advertised.lock(),
+            vec![(0..8, false), (0..1, true)],
+            "the commit, and no re-issue"
+        );
     }
 
     /// **A reader reports what it holds**: its promise shrinks from the

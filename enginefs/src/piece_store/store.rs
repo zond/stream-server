@@ -2787,9 +2787,16 @@ mod tests {
 
     /// `init` is where a check begins and `take` is where it ends -- the
     /// initializing state takes the storage into the paused one when it has
-    /// read everything it means to claim -- and every `init` moves the
-    /// epoch, which is how a reader that held pieces back can tell that
-    /// librqbit has rebuilt its tracker and forgotten the hold-back.
+    /// read everything it means to claim.
+    ///
+    /// The epoch moving with each seed here is an **unregistered** store's:
+    /// it counts its own, because there is nobody for it to be told apart
+    /// from. Every store a reader ever sees is numbered by the registry at
+    /// its registration and keeps that number across a re-seed, which is
+    /// what makes it answer the question it is asked -- whether the chunk
+    /// tracker that was told what to hold back is still the one beside the
+    /// store. A restart out of an error answers no with a *fresh* store;
+    /// see [`StoreRegistry::insert`].
     #[test]
     fn init_begins_a_check_that_take_ends_and_moves_the_epoch() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2811,10 +2818,15 @@ mod tests {
         );
         drop(successor);
 
-        // A restart out of error seeds again -- on a fresh store in
-        // production; here the same one, so the epoch can be seen to move.
+        // Seeding again. In production a restart out of error seeds a
+        // fresh store, which the registry numbers; this one is registered
+        // nowhere, so it counts.
         store.seed_from_disk().unwrap();
-        assert_eq!(store.epoch(), 2, "every seed moves the epoch");
+        assert_eq!(
+            store.epoch(),
+            2,
+            "an unregistered store counts its own seeds"
+        );
         assert!(store.is_checking());
     }
 
