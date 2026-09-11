@@ -99,14 +99,16 @@ RAR streaming is **on by default** and pure Rust — no libclang or C++ toolchai
 ## 🚀 Quick Start
 
 ```bash
-# Run the server
-./stream-server
+# Run the binary built above (the release packages install it as `stream-server`)
+./target/release/server
 
 # Or with cargo
 cargo run --release -p server
 ```
 
-The server starts on `http://localhost:11470` by default (compatible with standard streaming server port). Every control route requires a bearer token for this launch; the binary chooses it from its command line:
+The binary listens on **every interface**, on the standard streaming-server port: `ServerConfig::binary_default()` binds `0.0.0.0:11470` and advertises `http://127.0.0.1:11470` as its base URL, and an HTTPS listener on `0.0.0.0:12470` runs once a certificate is on disk (see `/get-https` below). So on the standalone binary the open media routes — `/proxy` and `/ftp` among them, which fetch whatever URL they are handed — are reachable from the network, and the control routes are guarded by the bearer token alone. An embedder's `ServerConfig::embedded()` binds `127.0.0.1:11470` only. One binary runs per machine: a second one finds `stream-server.lock` in the system temp dir held, and exits. Settings (`settings.json`) and logs (`logs/`) live in `<platform config dir>/stremio-server`, torrent data under `<platform cache dir>/stremio-server` unless `settings.cacheRoot` names another root.
+
+Every control route requires a bearer token for this launch; the binary chooses it from its command line:
 
 | Flag / variable | Effect |
 |---|---|
@@ -116,7 +118,7 @@ The server starts on `http://localhost:11470` by default (compatible with standa
 | `--no-auth` | Run the control API open (every route answers without a token). Wins over `STREAM_SERVER_TOKEN`; contradicts an explicit `--token` and is rejected together with it |
 | `--tui` | A terminal UI in place of the log on stdout. Only in a build with the `tui` feature (`cargo build --release --features server/tui`); any other build refuses the flag |
 
-The `stremio-runtime` stub spawns the server with `--no-auth`: it is the compatibility shim for legacy clients that speak plain HTTP and cannot send the header. See [API](#-api).
+The `stremio-runtime` stub spawns the server with `--no-auth`: it is the compatibility shim for legacy clients that speak plain HTTP and cannot send the header. With the binary's all-interfaces bind, that leaves every control route open to the local network while the stub runs it. See [API](#-api).
 
 ### Startup phases in `stats.json`
 
@@ -246,7 +248,7 @@ The HTTP surface is deliberately small and split in two by `build_router()` (`se
 | GET, HEAD | `/stream/{infoHash}/{fileIdx}` | OPEN | players (alias of the above) |
 | GET, POST | `/{rar\|zip\|7zip\|tar\|tgz}/create`, `/{…}/create/{key}` | OPEN | players — archive session creation via `?lz=` (stremio-core builds these URLs) |
 | GET | `/{rar\|zip\|7zip\|tar\|tgz}/stream`, `/{…}/stream/{key}`, `/{…}/stream/{key}/{*file}` | OPEN | players — archive member bytes |
-| GET | `/ftp/{filename}?lz=…` | OPEN | players (FTP/FTPS passthrough via `curl`; any other scheme is `400`) |
+| GET | `/ftp/{filename}?lz=…` | OPEN | players (FTP/FTPS passthrough through a spawned `curl`, which must be on `PATH` — without it the answer is `500`; any other scheme is `400`) |
 | GET, HEAD, OPTIONS | `/proxy/{*rest}`, `/proxy`, `/proxy/` | OPEN | players — a remote stream fetched on their behalf, with the headers the addon asked for, and cached in whole chunks so a seek back into it is answered from disk. Any other method is `405` with `Allow`. See [Proxied remote streams](#proxied-remote-streams) |
 | GET | `/local-addon/manifest.json` | OPEN | stremio-core default profile — **stub**: a valid manifest (`org.stremio.local`, "Local Files") declaring no types, resources or catalogs |
 | GET | `/local-addon/stream/{type}/{id}`, `/local-addon/stream/{type}/{id}.json` | OPEN | stremio-core default profile — **stub**: always `{"streams": []}` |
@@ -254,13 +256,13 @@ The HTTP surface is deliberately small and split in two by `build_router()` (`se
 | GET | `/local-addon/meta/{type}/{id}` | OPEN | stremio-core default profile — **stub**: `404`, logged at debug level only |
 | any | anything else under `/local-addon/` | OPEN | **stub**: deliberate `404`, logged at debug level only (never the ERROR-level unhandled-request line) |
 | GET | `/heartbeat` | TOKEN | app / tests |
-| GET | `/stats.json` (always carries `dht`; `?sys=1` adds `loadavg`/`cpus`) | TOKEN | app |
+| GET | `/stats.json` (always carries `dht`; `?sys=1` adds a `sys` object with `loadavg`/`cpus`) | TOKEN | app |
 | GET | `/{infoHash}/stats.json`, `/{infoHash}/{fileIdx}/stats.json` | TOKEN | stremio-core `Statistics`; accept `tr=`/`f=` like the stream route |
 | POST | `/create` | TOKEN | stremio-core `CreateTorrent` (torrent blob / URL) |
 | POST | `/{infoHash}/create` | TOKEN | stremio-core `CreateTorrent` (magnet) |
 | GET, POST | `/settings` | TOKEN | stremio-core `StreamingServer` (`{ baseUrl, options, values }` / `{ success }`) |
 | GET | `/network-info`, `/device-info` | TOKEN | stremio-core `StreamingServer` |
-| GET | `/casting` | TOKEN | stremio-core playback devices (always `[]` — no casting). No trailing slash: `/casting/` is an unknown path (`404`) |
+| GET | `/casting` | TOKEN | stremio-core playback devices: what SSDP discovery has found. Only the binary runs discovery (`binary_default()`), so an embedded server answers `[]`; nothing can be cast to a listed device either (next row). No trailing slash: `/casting/` is an unknown path (`404`) |
 | POST | `/casting/{devID}/player` | TOKEN | stremio-core `play_on_device`; answers `501` because casting is not implemented |
 | GET | `/get-https?authKey=…&ipAddress=…` | TOKEN | stremio-core remote-HTTPS certificate fetch: fetches the certificate, writes it to the config dir, starts (or restarts) the HTTPS listener on `ServerConfig::https_addr` with it, and answers with **that listener's** port. `501` when no HTTPS address is configured (`embedded()`, the Android embed) — nothing is written and no network call is made |
 | POST | `/{infoHash}/{fileIdx}/download` | TOKEN | offline downloads — pin the file; optional body `{"trackers":[…]}` (`sources`/`announce` accepted too), answer is a `DownloadInfo`. See [Offline downloads](#offline-downloads) |
@@ -390,7 +392,7 @@ Both share their functions with `ServerHandle::{cache_usage, clean_cache_now}` (
 
 ### Proxied remote streams
 
-`/proxy` fetches a URL the caller names and relays it to the player, adding the headers the addon said it needs. It is how an addon stream that is not a torrent reaches the player at all, and it is open (players cannot send a bearer header) but loopback-only — deliberately absent from the [LAN media listener](#lan-media-listener), because it will fetch any URL whoever reaches it names.
+`/proxy` fetches a URL the caller names and relays it to the player, adding the headers the addon said it needs. It is how an addon stream that is not a torrent reaches the player at all, and it is open (players cannot send a bearer header). It is deliberately absent from the [LAN media listener](#lan-media-listener), because it will fetch any URL whoever reaches it names; on an embedded server (`127.0.0.1`) only this device can reach it, but the standalone binary's main listener is on every interface (see [Quick Start](#-quick-start)).
 
 Two URL shapes, and both carry the same four parameters of the proxy's own:
 
@@ -475,7 +477,7 @@ So the client names them. It mints a token per player and puts it in the `/proxy
 
 The token is the proxy's own parameter, like `d=`, `h=` and `r=`: it is never sent to the origin. Any string the client can generate works — it is a name, not a credential, and the call that uses it is token-protected. Every playlist this proxy rewrites carries the token into the segment URLs it writes, so an HLS player's segment fetches belong to the same token as its playlist.
 
-Then `POST /proxy-streams/{token}/close` (`ServerHandle::close_proxy_streams`) ends every live stream carrying that token and answers `{"closed": n}`. Zero is an ordinary answer — the player may already have finished — and closing twice is harmless. It is a **control** route: bearer token, loopback listener, and absent from the LAN media listener like every other control route, because the ability to cut playback is not something to hand the network.
+Then `POST /proxy-streams/{token}/close` (`ServerHandle::close_proxy_streams`) ends every live stream carrying that token and answers `{"closed": n}`. Zero is an ordinary answer — the player may already have finished — and closing twice is harmless. It is a **control** route: bearer token on the main listener, and absent from the LAN media listener like every other control route, because the ability to cut playback is not something to hand the network.
 
 **What it ends is the read *and the token*.** The closed stream's body yields an error, so the connection drops and the player's demuxer sees its source fail at once rather than at timeout. On its own that would not end the stream: ffmpeg runs with `reconnect=1` and re-fetches the aborted body through the very same URL, token and all — measured, three closes on one live reader gave three `{"closed": 1}` answers and three fresh origin fetches at the offsets they interrupted. So the token is retired at the same time: every later `/proxy` request carrying it is answered **`410 Gone`** — gone, not `404`, because the stream was here and was deliberately ended. The pair is what ends a stream.
 
@@ -587,9 +589,11 @@ for whoever can reach it. So do the archive `/create` routes, which
 download an archive from a caller-named URL, and the loopback stream route's first request for
 an info hash, which starts a torrent with the caller's trackers on this
 device's disk and connection; the LAN's stream route only looks a hash up.
-That is fine on the loopback listener, where only this host's own
-stremio-core can reach it, but not on a listener the whole LAN can reach, so
-neither is on the LAN allow-list. The consequence is deliberate, not an
+That is acceptable on an embedded server's loopback listener, where only this
+device can reach it, but not on a listener the whole LAN can reach, so neither
+is on the LAN allow-list. (The standalone binary's main listener is on
+`0.0.0.0`, so there they are reachable from the LAN anyway — see
+[Quick Start](#-quick-start).) The consequence is deliberate, not an
 oversight: a stream stremio-core plays *through* `/proxy` — an addon stream
 that needs custom request headers, which a player cannot attach itself —
 cannot be cast directly while the LAN media listener is the source, because
@@ -620,9 +624,9 @@ Everything below existed for server.js compatibility and had no consumer in stre
 - `/local-addon/*` — the local-files Stremio addon (scanned `localFiles/` directory, catalogs, `bt:`/`local:` metas). **A stub remains** (see the table above), because stremio-core's `OFFICIAL_ADDONS` carries a *protected* descriptor for `http://127.0.0.1:11470/local-addon/manifest.json` with a `stream` resource for `tt` movies/series: a stock profile requests `/local-addon/stream/{type}/{id}.json` on every details page, and a `404` there shows up as an error group in the client and an ERROR-level unhandled-request log line each time. A profile synced from a Stremio account carries an older descriptor for the same addon that *also* declares an `other`/`local` catalog, so core requests `/local-addon/catalog/other/local.json` (and `/local-addon/catalog/other/local/{extra}.json` once the board pages or a filter is applied — the two shapes `AddonHTTPTransport::resource` builds); a `404` there broke the catalog row and logged an ERROR on every refresh. The stub answers an empty manifest, `{"streams": []}` and `{"metas": []}` instead and serves no local files; `meta` (only ever asked for `local:`/`bt:` ids) is a quiet `404`, and so is every other path under the prefix — the stub has its own fallback so a 404 it *intends* is logged at debug, not through the ERROR-level unhandled-request path. The served manifest still declares no catalogs, so a profile that does not already carry one gains no empty row.
 - `/casting/transcode`, `/casting/convert`, `GET /casting/{devID}` and the `501` stubs for `/ftp/create*` and `/ftp/stream*`.
 
-**Usenet (NZB)**: `/nzb/create*` and `/nzb/stream*` are gone, with the NNTP client and yEnc decoder behind them. stremio-core still builds `/nzb/create` for an addon's `nzbUrl` streams, and this server now answers those as it answers any path it does not serve. The feature never worked end to end: article bodies were read as UTF-8 text, so binary data did not survive, and the connection pool was never refilled. Its routes were also open, fetching a caller-named URL and opening connections to caller-named news servers.
+**Usenet (NZB)**: `/nzb/create*` and `/nzb/stream*` are gone, with the NNTP client and yEnc decoder behind them. stremio-core still builds `/nzb/create` for an addon's `nzbUrl` streams; no route here serves it, and as a two-segment path it lands in the `/{infoHash}/{fileIdx}` stream route, which tries to add `nzb` as an info hash and answers with an error, never media. The feature never worked end to end: article bodies were read as UTF-8 text, so binary data did not survive, and the connection pool was never refilled. Its routes were also open, fetching a caller-named URL and opening connections to caller-named news servers.
 
-**YouTube**: stremio-core builds `/yt/{id}` URLs for `StreamSource::YouTube` when a streaming server is configured; this server has no `/yt` route (that needed yt-dlp/ffmpeg upstream). YouTube-via-server is unsupported — the client opens YouTube streams itself (`404` from the server signals it).
+**YouTube**: stremio-core builds `/yt/{id}` URLs for `StreamSource::YouTube` when a streaming server is configured; this server has no `/yt` route, so YouTube-via-server is unsupported and a client has to open YouTube streams itself. `/yt/{id}` is two segments as well, so it too lands in the stream route and gets an error, not media.
 
 ---
 
