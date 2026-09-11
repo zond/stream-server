@@ -46,6 +46,18 @@ pub enum Decision {
     Run,
     /// The torrent should not be running.
     Stop,
+    /// The torrent is in the backend's error state, the error was the
+    /// volume filling up, and the volume has room again: take it out of
+    /// that state ([`crate::backend::TorrentHandle::restart_from_error`]),
+    /// which re-checks its storage and puts it back to work.
+    ///
+    /// Its own decision and not a [`Self::Run`], because the call is a
+    /// different one: `start_torrent` on a torrent in the error state
+    /// starts nothing. It is also the one decision that is allowed to fail
+    /// into the same state it started from -- a restart onto a volume that
+    /// fills again errors again -- which is why the actuator holds it to
+    /// the dwell.
+    RestartFromError,
     /// Not ours: whatever state it is in, this reconcile has no opinion and
     /// must issue no call.
     Leave,
@@ -125,6 +137,17 @@ pub struct Conditions {
     pub playing: bool,
     /// Some file of it is pinned as an offline download.
     pub pinned: bool,
+    /// The backend stopped this torrent because a write hit `ENOSPC`
+    /// ([`crate::backend::TorrentHandle::is_out_of_space`]), rather than
+    /// for any of the other reasons it calls fatal.
+    ///
+    /// Read by the `Error` arm alone, and meaningless above it: a torrent
+    /// that is not in the error state is not stopped for anything. It is
+    /// what tells the one error this process knows how to undo from every
+    /// error it does not -- a storage that failed its check, a write past
+    /// what the platform can address -- because restarting one of those
+    /// puts it straight back where it was.
+    pub out_of_space: bool,
     /// The user's seeding setting (session-wide).
     pub seeding_enabled: bool,
     /// The info dictionary is known. A magnet that is still resolving one
@@ -166,11 +189,27 @@ pub struct Conditions {
 ///    the two answers differ only in that this one also lets a read refusal
 ///    lapse -- which is right, since a torrent nobody has settled is not a
 ///    statement about a disk.
-/// 3. **`Error` -> [`Decision::Leave`].** A torrent the backend stopped
-///    with an error is the cache cleaner's business
-///    (`recover_out_of_space_torrents` reclaims space and restarts it) or
-///    nobody's. Pausing it is meaningless and starting it would race the
-///    cleaner.
+/// 3. **`Error` -> [`Decision::RestartFromError`] or
+///    [`Decision::Leave`].** A torrent the backend stopped with an error
+///    is running nothing and writing nothing, so there is no call to make
+///    -- except the one that undoes it, and exactly one error is undoable
+///    from out here: the volume filled up. Three things have to hold
+///    together for that, on top of the settled reading this arm is already
+///    guarded by. The error has to be that one
+///    ([`Conditions::out_of_space`]); the volume has to be over the resume
+///    line, not merely over the floor, because a restart re-checks the
+///    storage and goes straight back to writing; and somebody has to want
+///    it -- playing or pinned -- since a torrent nobody wants is one whose
+///    bytes the retention owner is taking anyway (`EngineFS::retain_engine`
+///    removes an unwanted errored torrent with its files). Anything else
+///    is `Leave`: not ours, no call, and no read refusal lifted.
+///
+///    It used to be the cache cleaner's, which restarted a stopped torrent
+///    after a pass that freed something. That made the restart a
+///    consequence of *an eviction having happened* rather than of the
+///    device having room, so a device that gained a gigabyte by any other
+///    means left the torrent dead, and a pass that freed a byte restarted
+///    one onto a volume still under the floor.
 /// 4. **No metadata -> [`Decision::Run`].** A resolving magnet must stay
 ///    connected to the swarm: the thing it is fetching is the info
 ///    dictionary, it writes no file data while it does, and stopping it is
@@ -233,7 +272,19 @@ pub fn verdict(conditions: &Conditions, trigger: Trigger) -> Verdict {
     };
     match conditions.run_state {
         RunState::Initializing { .. } | RunState::Gone => return arm(Decision::Stop),
-        RunState::Error if conditions.settled => return arm(Decision::Leave),
+        RunState::Error if conditions.settled => {
+            let has_room = conditions
+                .available
+                .is_some_and(|available| available >= resume_line());
+            return arm(
+                if conditions.out_of_space && has_room && (conditions.playing || conditions.pinned)
+                {
+                    Decision::RestartFromError
+                } else {
+                    Decision::Leave
+                },
+            );
+        }
         RunState::Error | RunState::Live | RunState::Paused => {}
     }
     if !conditions.settled {
@@ -458,8 +509,11 @@ impl Volumes {
 }
 
 /// The line a volume has to clear before a stopped torrent is started
-/// again, which is [`floor`]'s upper arm.
-fn resume_line() -> u64 {
+/// again, which is [`line`]'s upper arm -- and the line the running-low
+/// bell is rung under ([`crate::retention::SlackBell`]), so that the slack
+/// is given back while the volume is still inside the band rather than
+/// once it is under the floor.
+pub(crate) fn resume_line() -> u64 {
     CACHE_FREE_SPACE_FLOOR.saturating_add(FREE_SPACE_RESUME_MARGIN)
 }
 
@@ -685,6 +739,7 @@ mod tests {
             has_metadata: true,
             finished: false,
             available: Some(u64::MAX),
+            out_of_space: false,
         }
     }
 
@@ -790,6 +845,92 @@ mod tests {
         };
         assert_eq!(desired(&unsettled, Trigger::Timer), Decision::Stop);
         assert_eq!(desired(&unsettled, Trigger::PlaybackStart), Decision::Stop);
+    }
+
+    /// The one error this process knows how to undo, and the four things
+    /// that have to hold together before it says so.
+    ///
+    /// A restart re-checks the torrent's storage and puts it straight back
+    /// to writing, which is why none of the four is optional: an error that
+    /// was not the volume filling comes back the moment the torrent runs
+    /// (a storage that failed its check, a write past what the platform can
+    /// address); a volume merely over the floor has no room to run into and
+    /// fills again within seconds; and a torrent nobody is playing and
+    /// nobody pinned has no reason to run at all -- its bytes are the
+    /// retention owner's to take.
+    #[test]
+    fn an_errored_torrent_is_restarted_only_when_a_full_volume_killed_it_and_has_cleared() {
+        let killed = Conditions {
+            run_state: RunState::Error,
+            out_of_space: true,
+            playing: true,
+            available: Some(CACHE_FREE_SPACE_FLOOR + FREE_SPACE_RESUME_MARGIN),
+            ..healthy()
+        };
+        assert_eq!(desired(&killed, Trigger::Timer), Decision::RestartFromError);
+        assert_eq!(
+            desired(&killed, Trigger::PlaybackStart),
+            Decision::RestartFromError,
+            "the same answer to everyone: what is playing is a value, not a trigger"
+        );
+        assert_eq!(
+            desired(
+                &Conditions {
+                    playing: false,
+                    pinned: true,
+                    ..killed
+                },
+                Trigger::Timer
+            ),
+            Decision::RestartFromError,
+            "a pin is a reason to run it too"
+        );
+
+        for (why, left) in [
+            (
+                "some other fatal error; restarting reproduces it",
+                Conditions {
+                    out_of_space: false,
+                    ..killed
+                },
+            ),
+            (
+                "inside the band: over the floor, with nothing to run into",
+                Conditions {
+                    available: Some(CACHE_FREE_SPACE_FLOOR + FREE_SPACE_RESUME_MARGIN - 1),
+                    ..killed
+                },
+            ),
+            (
+                "an unreadable volume is not evidence that it cleared",
+                Conditions {
+                    available: None,
+                    ..killed
+                },
+            ),
+            (
+                "nobody is playing it and nobody pinned it",
+                Conditions {
+                    playing: false,
+                    ..killed
+                },
+            ),
+            (
+                "its want-set is not back, so it is not a statement about a disk",
+                Conditions {
+                    settled: false,
+                    ..killed
+                },
+            ),
+        ] {
+            let expected = if left.settled {
+                Decision::Leave
+            } else {
+                Decision::Stop
+            };
+            assert_eq!(desired(&left, Trigger::Timer), expected, "{why}");
+            assert_eq!(desired(&left, Trigger::PlaybackStart), expected, "{why}");
+        }
     }
 
     /// A magnet that has not resolved its info dictionary is fetching that
@@ -934,7 +1075,7 @@ mod tests {
                     Trigger::Timer,
                 );
                 observed = match decision {
-                    Decision::Run => RunState::Live,
+                    Decision::Run | Decision::RestartFromError => RunState::Live,
                     Decision::Stop => RunState::Paused,
                     Decision::Leave => observed,
                 };

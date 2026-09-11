@@ -2,13 +2,13 @@
 //! and `POST /cache/clean`, and the functions they share with the matching
 //! `ServerHandle` methods (`cache_usage`, `clean_cache_now`).
 //!
-//! `POST /cache/clean` runs exactly the same eviction pass the background
-//! cleaner runs on its own schedule (`cache_cleaner::clean_cache`) -- same
-//! protections, same occupancy accounting -- only on demand: nothing a live
-//! engine is writing or a pin protects is ever touched, however far over
-//! the limit the cache is. It exists so a client can offer a "clean now"
-//! action without restarting the server just to make the cleaner's
-//! start-up tick fire.
+//! `POST /cache/clean` gives back everything nobody is playing and nobody
+//! is reading (`cache_cleaner::drop_slack`) -- the same passes the
+//! reconciler's tick and a viewer opening something else run, on demand.
+//! Nothing a live engine is writing or a pin protects is ever touched,
+//! however far over the limit the cache is. It exists so a client can offer
+//! a "clean now" action, and what it can honestly promise is that the
+//! disposable bytes are gone by the time it answers.
 
 use crate::cache_cleaner::{self, CacheUsage, EvictionReport};
 use crate::state::AppState;
@@ -27,12 +27,19 @@ pub async fn cache_usage(state: &AppState) -> CacheUsage {
     cache_cleaner::usage(state).await
 }
 
-/// Run one eviction pass immediately and report what it freed, exactly
+/// Drop both owners' slack immediately and report what is left, exactly
 /// what `POST /cache/clean` answers. See [`EvictionReport`] for the shape
-/// and `cache_cleaner::clean_cache` for the pass itself, which this shares
-/// with the background scheduler.
+/// and `cache_cleaner::drop_slack` for the passes themselves, which this
+/// shares with the switch task and the reconciler's tick.
+///
+/// Fallible in its signature and infallible in fact: a pass that cannot
+/// unlink a file leaves the bytes for the next one and says so in the
+/// figures it reports. The `Result` is the boundary
+/// `ServerHandle::clean_cache_now` and the route were built on and it is
+/// left as it is, because narrowing it is a change to an API this slice is
+/// not about.
 pub async fn clean_cache_now(state: &AppState) -> anyhow::Result<EvictionReport> {
-    cache_cleaner::clean_cache(state).await
+    Ok(cache_cleaner::drop_slack(state).await)
 }
 
 pub async fn get_cache_usage(State(state): State<AppState>) -> Response {

@@ -635,6 +635,10 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     /// space, for the cache cleaner to run a pass at once rather than on its
     /// next poll -- see [`Self::out_of_space_signal`].
     out_of_space_notify: Arc<tokio::sync::Notify>,
+    /// Rung by the tick's own reading of the volume whenever it is under
+    /// the line, for the owners that hold disposable bytes and have no
+    /// tick of their own. See [`crate::retention::SlackBell`].
+    slack_bell: Arc<crate::retention::SlackBell>,
     /// One lock per info hash, serialising the reconciler's decisions about
     /// one torrent without serialising them across torrents. See
     /// [`crate::reconcile::HashLocks`].
@@ -1040,6 +1044,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             clock,
             sweep_task: parking_lot::Mutex::new(None),
             out_of_space_notify: Arc::new(tokio::sync::Notify::new()),
+            slack_bell: Arc::default(),
             reconcile_locks: Default::default(),
             volumes,
             budget,
@@ -1443,6 +1448,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             has_metadata: engine.handle.has_metadata().await,
             finished: engine.handle.is_finished().await,
             available: self.volumes.available(),
+            // One lock read of the state librqbit already holds, like the
+            // run state beside it. Only the `Error` arm reads it, and only
+            // the error state can make it true.
+            out_of_space: engine.handle.is_out_of_space().await,
         };
         let verdict = crate::reconcile::verdict(&conditions, trigger);
         // Every input, so a field log answers *why* on its own: a decision
@@ -1460,6 +1469,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             finished = conditions.finished,
             available = ?conditions.available,
             settled = conditions.settled,
+            out_of_space = conditions.out_of_space,
             "torrent_reconciled"
         );
 
@@ -1492,10 +1502,14 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     .await;
                 self.let_reads_park_again(engine);
             }
-            // `Error`, and a probe that failed on a timer pass. Both are
-            // "no opinion", and lifting a refusal is an opinion: a torrent
-            // the backend killed has its refusal lifted by
-            // `restart_from_error` when the cleaner puts it back to work,
+            crate::reconcile::Decision::RestartFromError => {
+                self.restart_if_the_dwell_allows(engine, &conditions, now)
+                    .await;
+            }
+            // `Error` with no way out of it, and a probe that failed on a
+            // timer pass. Both are "no opinion", and lifting a refusal is
+            // an opinion: a torrent the backend killed has its refusal
+            // lifted by the restart above once the volume clears the line,
             // and a `statvfs` that stopped answering is evidence neither
             // that the volume filled nor that it cleared -- the same reason
             // `reconcile::Volumes::record` leaves the stall clock alone for
@@ -1672,6 +1686,66 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
     }
 
+    /// Act on a [`crate::reconcile::Decision::RestartFromError`]: take the
+    /// torrent out of the backend's error state, at most once per
+    /// [`RECONCILE_MIN_DWELL`].
+    ///
+    /// **The dwell is the whole of what keeps this from being a loop**, and
+    /// it binds whoever is asking -- a `PlaybackStart` included, which is
+    /// the one place this differs from [`Self::start_if_stopped`]. A
+    /// restart re-checks the storage and goes back to writing, so a restart
+    /// onto a volume that is still filling errors again within seconds; a
+    /// player retrying a dead stream would then ask for one restart per
+    /// request, each of them a re-check of every piece on disk. Fifteen
+    /// seconds between attempts is what the anti-flap dwell is already for,
+    /// and the reading it is taken from is the one the backend's state
+    /// machine and this engine already share, so there is no clock here of
+    /// its own.
+    ///
+    /// The transition is recorded on success only: a restart the backend
+    /// refused moved nothing, and holding the next attempt off for a dwell
+    /// because of one would be remembering a failure.
+    async fn restart_if_the_dwell_allows(
+        &self,
+        engine: &Arc<Engine<B::Handle>>,
+        conditions: &crate::reconcile::Conditions,
+        now: u64,
+    ) {
+        if let Some(moved_at) = engine.last_transition_at() {
+            let since_transition = Duration::from_secs(now.saturating_sub(moved_at));
+            if since_transition < RECONCILE_MIN_DWELL {
+                debug!(
+                    info_hash = %engine.info_hash,
+                    since_secs = since_transition.as_secs(),
+                    "not restarting an errored torrent this soon after the last time it was moved"
+                );
+                return;
+            }
+        }
+        match self.restart_from_error(&engine.info_hash).await {
+            Ok(true) => {
+                engine.record_transition(now);
+                tracing::info!(
+                    info_hash = %engine.info_hash,
+                    available = ?conditions.available,
+                    "restarted a torrent a full volume had killed"
+                );
+            }
+            // The state machine settled between the reading and the call:
+            // the torrent is not in the error state any more, or the engine
+            // is gone. Neither is a failure and neither is a move.
+            Ok(false) => debug!(
+                info_hash = %engine.info_hash,
+                "the torrent was no longer in the backend's error state; nothing restarted"
+            ),
+            Err(error) => tracing::warn!(
+                info_hash = %engine.info_hash,
+                error = %format!("{error:#}"),
+                "could not restart a torrent a full volume had stopped"
+            ),
+        }
+    }
+
     /// Let reads through this engine park again rather than fail with
     /// `StorageFull` ([`Engine::allow_reads`]).
     ///
@@ -1710,6 +1784,15 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// every later asker ([`crate::reconcile::Volumes`]). A probe that
     /// failed is recorded as `None`, which the ladder reads as unknown and
     /// never as full.
+    ///
+    /// **And rings the running-low bell if the reading is under the line.**
+    /// This is the one `statvfs` of the session, so it is also the only
+    /// place that can notice; a second reading taken by whoever wanted to
+    /// know would be a second opinion about one device. The line is the
+    /// resume line rather than the floor, so the bell rings while the
+    /// volume is still inside the band -- the slack has to be gone *before*
+    /// the floor is reached, not after. A probe that failed rings nothing:
+    /// an unreadable volume is not a full one.
     fn probe_volume(&self, folder: &std::path::Path, now: u64) {
         let available = match probe_at_existing_ancestor(&*self.free_space_probe, folder) {
             Ok(available) => Some(available),
@@ -1723,7 +1806,32 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 None
             }
         };
+        if available.is_some_and(|available| available < crate::reconcile::resume_line()) {
+            self.slack_bell.ring();
+        }
         self.volumes.record(available, now);
+    }
+
+    /// Take a fresh reading of the volume the pieces land on, now, and ring
+    /// the bell if it is short ([`Self::probe_volume`]).
+    ///
+    /// For a caller that has just given bytes back and must not be judged
+    /// by the reading taken before it: the recorded one is at most one
+    /// [`crate::reconcile::RECONCILE_INTERVAL`] old, which is a whole tick
+    /// of a device the caller has just changed. The stream route's disk
+    /// gate is the caller -- it drops every owner's slack and then asks
+    /// [`Engine::is_stopped_for_space`] again, and that question is
+    /// answered from this reading.
+    pub fn reread_volume(&self) {
+        let folder = self.volumes.data_folder().to_path_buf();
+        self.probe_volume(&folder, self.clock.now_secs());
+    }
+
+    /// The bell the tick's reading of the volume rings when it is running
+    /// low, for the owners that answer by dropping their slack. See
+    /// [`crate::retention::SlackBell`].
+    pub fn slack_bell(&self) -> &Arc<crate::retention::SlackBell> {
+        &self.slack_bell
     }
 
     /// Whether anything is using this torrent right now: a response body
@@ -2321,20 +2429,24 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     }
 
     /// Every entity nobody is playing and nobody is reading, taken off the
-    /// disk now rather than at the next tick.
+    /// disk now rather than at the next tick; the number of piece files
+    /// that left it.
     ///
     /// Called where the answer is wanted at once: the moment a viewer opens
     /// something else (the switch task), the moment the volume runs low,
-    /// and `POST /cache/clean`. It is the same pass the tick would run, so
-    /// there is nothing here a tick would not have done -- what it buys is
-    /// the two seconds between them, which on a switch is the difference
-    /// between a stream that fits and a `507`.
-    pub async fn drop_slack(&self) {
+    /// the disk gate in front of a refused stream, and `POST /cache/clean`.
+    /// It is the same pass the tick would run, so there is nothing here a
+    /// tick would not have done -- what it buys is the two seconds between
+    /// them, which on a switch is the difference between a stream that fits
+    /// and a `507`.
+    pub async fn drop_slack(&self) -> usize {
         let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
+        let mut reclaimed = 0;
         for engine in engines {
             if let Some(pass) = engine.drop_slack(&self.registry).await
                 && pass != crate::retention::RetentionPass::default()
             {
+                reclaimed += pass.reclaimed;
                 debug!(
                     info_hash = %engine.info_hash,
                     reclaimed = pass.reclaimed,
@@ -2342,6 +2454,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 );
             }
         }
+        reclaimed
     }
 
     /// The liveness cell: which entity this server is playing. Handed to
@@ -2684,18 +2797,20 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// hash any more (it was swept while space was being reclaimed) and when
     /// the torrent is not in the error state; neither is a failure.
     ///
-    /// The cache cleaner calls this over the torrents it has just made room
-    /// for, which are of two kinds. The ones librqbit stopped with its own
-    /// ENOSPC error are this method's: restarting one re-checks its storage
-    /// and goes live again, and it is the one transition the reconciler
-    /// will not make (its ladder answers `Leave` for the error state,
-    /// because a restart before the room exists would only fail again). The
-    /// ones the reconciler stopped are *not*: it starts them itself on its
-    /// next pass, from the volume reading it takes then, and having a
-    /// second caller unpause them from a reading nobody rechecked is the
-    /// shape of bug this whole design is closing. So this refuses them, and
-    /// the guard is the state machine's answer rather than any note about
-    /// who stopped what.
+    /// **The reconciler is the caller**, off
+    /// [`crate::reconcile::Decision::RestartFromError`]: an ENOSPC error on
+    /// a volume that has room again, held to the dwell
+    /// ([`Self::restart_if_the_dwell_allows`]). Restarting re-checks the
+    /// torrent's storage and takes it live, which is the one transition the
+    /// rest of the ladder cannot make -- `start_torrent` on a torrent in
+    /// the error state starts nothing.
+    ///
+    /// A torrent the *reconciler* stopped is not this method's: it starts
+    /// those itself on its next pass, from the volume reading it takes
+    /// then, and having a second path unpause them from a reading nobody
+    /// rechecked is the shape of bug this whole design is closing. So this
+    /// refuses them, and the guard is the state machine's answer rather
+    /// than any note about who stopped what.
     pub async fn restart_from_error(&self, info_hash: &str) -> Result<bool> {
         let engine = self.engines.read().await.get(info_hash).cloned();
         let Some(engine) = engine else {
@@ -6743,30 +6858,86 @@ mod tests {
         assert!(enginefs.pin_locks.lock().is_empty(), "no lock left behind");
     }
 
-    /// A torrent the backend stopped for want of disk space is listed for the
-    /// cleaner, and restarting it is what takes it off the list -- so the
-    /// cleaner can find it, reclaim space, and put it back to work instead of
-    /// leaving playback dead against a healthy swarm.
-    #[tokio::test]
-    async fn out_of_space_torrents_are_listed_and_can_be_restarted() {
-        let (enginefs, counters) = test_enginefs_with_file_count(2);
+    /// A torrent the backend stopped for want of disk space is listed for
+    /// the cleaner to make room for, and **the reconciler is what puts it
+    /// back to work**: once the volume is over the line a stopped torrent
+    /// has to clear, and at most once per dwell.
+    ///
+    /// The line is the resume line and not the floor, and the dwell is what
+    /// keeps the recovery from being a loop. A restart re-checks the
+    /// torrent's storage and takes it straight back to writing, so one made
+    /// at the floor fills the volume again within seconds -- and a restart
+    /// per tick is a re-check of every piece on the disk every two seconds,
+    /// for as long as the device is full. It used to be conditional on an
+    /// eviction pass having freed *something*, which is neither: a device
+    /// that gained a gigabyte by any other means left the torrent dead, and
+    /// one freed byte restarted it into the same wall.
+    #[tokio::test(start_paused = true)]
+    async fn the_reconciler_restarts_an_out_of_space_torrent_over_the_resume_line() {
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
+        let available = Arc::new(AtomicU64::new(u64::MAX));
+        let probe_available = available.clone();
+        enginefs.set_free_space_probe(move |_| Ok(probe_available.load(Ordering::SeqCst)));
 
         // A healthy torrent is nobody's business.
         assert!(enginefs.out_of_space_torrents().await.is_empty());
         assert_eq!(counters.restart_from_error.load(Ordering::SeqCst), 0);
 
+        // The backend kills it: a write hit ENOSPC. The cleaner is told,
+        // because making room is still its half of this.
         counters.out_of_space.store(true, Ordering::SeqCst);
         assert_eq!(
             enginefs.out_of_space_torrents().await,
             vec![TEST_HASH.to_string()]
         );
 
-        assert!(enginefs.restart_from_error(TEST_HASH).await.unwrap());
+        // Inside the band -- over the floor, under the resume line -- it is
+        // left where it is: there is not enough room to run into.
+        available.store(
+            CACHE_FREE_SPACE_FLOOR + FREE_SPACE_RESUME_MARGIN - 1,
+            Ordering::SeqCst,
+        );
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), Decision::Leave)]
+        );
+        assert_eq!(counters.restart_from_error.load(Ordering::SeqCst), 0);
+
+        // Over it, and it goes back to work.
+        available.store(
+            CACHE_FREE_SPACE_FLOOR + FREE_SPACE_RESUME_MARGIN,
+            Ordering::SeqCst,
+        );
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), Decision::RestartFromError)]
+        );
         assert_eq!(counters.restart_from_error.load(Ordering::SeqCst), 1);
+        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
         assert!(
             enginefs.out_of_space_torrents().await.is_empty(),
             "a restarted torrent is no longer stopped"
         );
+
+        // And it dies again at once, as a torrent on a volume this short
+        // will. The tick that sees it is inside the dwell of the restart
+        // that put it there, and makes no second attempt.
+        counters.out_of_space.store(true, Ordering::SeqCst);
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), Decision::RestartFromError)],
+            "the ladder still wants it restarted; it is the actuator that waits"
+        );
+        assert_eq!(
+            counters.restart_from_error.load(Ordering::SeqCst),
+            1,
+            "not twice inside a dwell"
+        );
+
+        // Past the dwell, it tries again.
+        tokio::time::advance(RECONCILE_MIN_DWELL).await;
+        enginefs.reconcile_tick().await;
+        assert_eq!(counters.restart_from_error.load(Ordering::SeqCst), 2);
 
         // A hash no engine holds any more -- swept while space was being
         // reclaimed -- is not an error, and restarts nothing.
@@ -6776,7 +6947,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        assert_eq!(counters.restart_from_error.load(Ordering::SeqCst), 1);
+        assert_eq!(counters.restart_from_error.load(Ordering::SeqCst), 2);
     }
 
     /// A torrent the backend stopped with an error nothing will retry is
@@ -7749,6 +7920,79 @@ mod tests {
         assert_eq!(counters.start_torrent.load(Ordering::SeqCst), 1);
     }
 
+    /// The running-low bell, and the line it is rung at.
+    ///
+    /// It is rung by the tick's own reading of the volume -- the one
+    /// `statvfs` of the session -- while that reading is **inside the
+    /// band**: over the floor, under the line a stopped torrent has to
+    /// clear. Not at the floor, which is where a stream is already being
+    /// refused: the slack has to be given back while there is still room
+    /// left to give it into. A reading over the line rings nothing, and so
+    /// does a probe that failed -- an unreadable volume is not a full one,
+    /// here as everywhere else.
+    #[tokio::test(start_paused = true)]
+    async fn the_bell_rings_while_the_volume_is_inside_the_band() {
+        let (mut enginefs, _counters) = test_enginefs_for_reconciler(1);
+        let available = Arc::new(AtomicU64::new(u64::MAX));
+        let probe_available = available.clone();
+        enginefs.set_free_space_probe(move |_| {
+            match probe_available.load(Ordering::SeqCst) {
+                // The one reading that is not a number: a probe that could
+                // not read the volume at all.
+                u64::MAX => Err(std::io::Error::other("no reading")),
+                bytes => Ok(bytes),
+            }
+        });
+        let rung = || {
+            let bell = enginefs.slack_bell().clone();
+            async move {
+                tokio::time::timeout(Duration::from_millis(10), bell.rung())
+                    .await
+                    .is_ok()
+            }
+        };
+
+        // A volume nobody can read rings nothing.
+        enginefs.reconcile_tick().await;
+        assert!(!rung().await, "an unreadable volume is not a short one");
+
+        // Well over the line: nothing to give back.
+        available.store(
+            CACHE_FREE_SPACE_FLOOR + FREE_SPACE_RESUME_MARGIN,
+            Ordering::SeqCst,
+        );
+        enginefs.reconcile_tick().await;
+        assert!(!rung().await, "a volume with room rings nothing");
+
+        // One byte under it -- inside the band, still over the floor.
+        available.store(
+            CACHE_FREE_SPACE_FLOOR + FREE_SPACE_RESUME_MARGIN - 1,
+            Ordering::SeqCst,
+        );
+        enginefs.reconcile_tick().await;
+        assert!(
+            rung().await,
+            "the slack is wanted back before the floor is reached"
+        );
+        assert!(
+            !rung().await,
+            "and one permit, not a counter: the ring was taken"
+        );
+
+        // And the same reading, taken on demand by a caller that has just
+        // given bytes back rather than by the tick: the recorded reading
+        // moves and the bell rings, without waiting two seconds for a pass
+        // that would have answered about the volume as it was.
+        available.store(u64::MAX - 1, Ordering::SeqCst);
+        enginefs.reread_volume();
+        assert_eq!(enginefs.volumes.available(), Some(u64::MAX - 1));
+        assert!(!rung().await, "a volume with room rings nothing");
+        available.store(0, Ordering::SeqCst);
+        enginefs.reread_volume();
+        assert_eq!(enginefs.volumes.available(), Some(0));
+        assert!(rung().await, "and a short one does");
+    }
+
     /// The defect that four rounds of this work kept re-introducing, and it
     /// is a property of librqbit rather than of any policy: `Session::unpause`
     /// writes `paused = false` and returns success, and if an initial check
@@ -7797,11 +8041,18 @@ mod tests {
         );
     }
 
-    /// A stop rings the cleaner, and what the cleaner then does is make
-    /// room; the reconciler's next pass is what starts the torrent, from a
-    /// volume reading it takes itself.
+    /// A stop rings the cleaner and the reading behind it rings the
+    /// running-low bell; the reconciler's next pass is what starts the
+    /// torrent, from a volume reading it takes itself.
     ///
-    /// `restart_from_error` is deliberately not that path any more. It is
+    /// Two signals off one `statvfs`, for two different answers. The
+    /// cleaner's is "come and look for bytes"; the bell's is "give back
+    /// what is already disposable", which is what the owners of the cache
+    /// answer without choosing a victim. Neither of them starts anything:
+    /// that is the ladder's, and it reads the volume rather than either
+    /// signal.
+    ///
+    /// `restart_from_error` is deliberately not that path either. It is
     /// the transition out of the backend's error state and nothing else, so
     /// it refuses a torrent that is merely stopped -- one method that meant
     /// "the error was dealt with" to one caller and "the space came back" to
@@ -7821,6 +8072,9 @@ mod tests {
         tokio::time::timeout(TEST_WAIT_BOUND, enginefs.out_of_space_signal())
             .await
             .expect("the stop rang the cleaner");
+        tokio::time::timeout(TEST_WAIT_BOUND, enginefs.slack_bell().rung())
+            .await
+            .expect("and the reading behind it rang the running-low bell");
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
         assert!(engine.is_stopped_for_space().await);
 
@@ -7841,17 +8095,18 @@ mod tests {
     }
 
     /// The other half of that: a torrent the backend really did stop with
-    /// an error is the cleaner's to restart, and the reconciler will not
-    /// touch it however much room there is.
+    /// an error goes back to work on the reconciler's own next pass, from
+    /// the volume reading that pass takes -- there is no second owner of
+    /// the transition and nothing to wait for.
     ///
     /// The restart also lets its reads park again. A torrent whose volume
     /// was short long enough for the stall bound to fail its readers, and
     /// which then died of the ENOSPC the bound was waiting out, comes back
     /// through here -- and a reader opened on it afterwards must wait for
     /// pieces that are being fetched again rather than be handed
-    /// `StorageFull` for a disk the cleaner has since emptied.
+    /// `StorageFull` for a volume that has since cleared.
     #[tokio::test(start_paused = true)]
-    async fn the_error_restart_is_the_cleaners_and_the_reconciler_leaves_it() {
+    async fn the_reconciler_restarts_an_errored_torrent_and_its_reads_park_again() {
         let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
         let available = Arc::new(AtomicU64::new(0));
         let probe_available = available.clone();
@@ -7864,18 +8119,19 @@ mod tests {
         enginefs.reconcile_tick().await;
         assert!(engine.reads_refused());
 
-        // And then the backend kills it outright.
+        // And then the backend kills it outright, on a volume that has
+        // room again by the time the next pass reads it.
         available.store(u64::MAX, Ordering::SeqCst);
         counters.out_of_space.store(true, Ordering::SeqCst);
         assert_eq!(
             enginefs.reconcile_tick().await,
-            vec![(TEST_HASH.to_string(), Decision::Leave)]
+            vec![(TEST_HASH.to_string(), Decision::RestartFromError)]
         );
-        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Error);
-        assert_eq!(counters.start_torrent.load(Ordering::SeqCst), 0);
-        assert!(engine.reads_refused(), "and nothing has fetched for them");
-
-        assert!(enginefs.restart_from_error(TEST_HASH).await.unwrap());
+        assert_eq!(
+            counters.start_torrent.load(Ordering::SeqCst),
+            0,
+            "and not through the start call, which starts nothing on an errored torrent"
+        );
         assert_eq!(counters.restart_from_error.load(Ordering::SeqCst), 1);
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
         assert!(
@@ -7891,17 +8147,22 @@ mod tests {
     /// torrent this process has not put its want-set back on is not a
     /// statement about a disk, so the ladder answers `Stop` for it -- which
     /// calls nothing (there is nothing running to stop) but does let its
-    /// reads park again. Hand the whole `Error` state to the cleaner and
-    /// that lift never happens: `restart_from_error` is the only other
-    /// thing that lifts one, and the cleaner will not restart a torrent
+    /// reads park again. Leave the whole `Error` state on the `Leave` arm
+    /// and that lift never happens: the only other thing that lifts a
+    /// refusal is the restart, and the restart will not touch a torrent
     /// whose want-set is not back either, so a reader opened on it is
     /// handed `StorageFull` on a volume with room to spare, for good.
+    ///
+    /// The volume stays short throughout, which is what keeps this about
+    /// the want-set: a settled errored torrent on a volume that has cleared
+    /// the resume line is restarted rather than left, which is
+    /// `the_reconciler_restarts_an_out_of_space_torrent_over_the_resume_line`.
     ///
     /// Asserted through [`poll_a_read`] rather than on `reads_refused`,
     /// which is the flag the code under test writes; what a player gets is
     /// this.
     #[tokio::test(start_paused = true)]
-    async fn an_errored_torrent_is_the_cleaners_only_once_its_want_set_is_back() {
+    async fn an_errored_torrent_is_left_alone_only_once_its_want_set_is_back() {
         let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
         let available = Arc::new(AtomicU64::new(0));
         let probe_available = available.clone();
@@ -7913,13 +8174,12 @@ mod tests {
         enginefs.reconcile_tick().await;
         tokio::time::advance(STOPPED_READ_STALL_BOUND).await;
         enginefs.reconcile_tick().await;
-        available.store(u64::MAX, Ordering::SeqCst);
         counters.out_of_space.store(true, Ordering::SeqCst);
         enginefs.reconcile_tick().await;
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Error);
 
-        // Settled: the cleaner owns it, and its refusal is held for the
-        // cleaner to lift by restarting it.
+        // Settled, on a volume with no room to restart it into: it is left
+        // where it is, and its refusal stands until the volume clears.
         assert_eq!(
             enginefs.reconcile_tick().await,
             vec![(TEST_HASH.to_string(), Decision::Leave)]

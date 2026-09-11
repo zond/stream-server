@@ -1548,40 +1548,82 @@ fn nothing_the_rules_refuse_is_cached() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Cached proxy bytes are ordinary cache: the cleaner walks them, counts
-/// them and evicts them, with no protection and no pin anywhere near them. A
-/// proxied stream nobody is reading is the first thing that should go.
+/// **What `POST /cache/clean` takes is the slack, and only the slack.**
+///
+/// Cached proxy bytes are ordinary cache and a proxied stream the viewer
+/// has left is the first thing that should go -- a clean is one of the four
+/// things that takes it, beside the tick, the switch and the running-low
+/// bell. What it may not take is the entity being played. There is no age
+/// rule and no size rule left to weigh the two against each other: the one
+/// stream somebody is inside keeps its window however far over the cap the
+/// cache is, and what the report says about that is `over_limit`.
+///
+/// Which of the two deleters got there first is deliberately not asserted.
+/// Opening the second stream is itself what makes the first disposable, so
+/// the switch task may have taken those chunks before the clean was asked
+/// -- it is the same pass over the same entity under the same turn, and a
+/// test that pinned the winner would be pinning a race rather than a rule.
+/// What is asserted is the state a client sees when the clean answers.
 #[test]
-fn the_cleaner_evicts_cached_proxy_bytes() -> anyhow::Result<()> {
+fn cleaning_now_takes_the_proxied_stream_the_viewer_left_and_not_the_one_playing()
+-> anyhow::Result<()> {
     let fixture = fixture()?;
     let origin = format!("http://{}", fixture.origin.addr);
-    let url = format!("{}/proxy/d={}/movie.mp4", fixture.base, encode(&origin));
+    let proxied = |path: &str| format!("{}/proxy/d={}{path}", fixture.base, encode(&origin));
     let client = reqwest::blocking::Client::new();
 
     let response = client
-        .get(&url)
+        .get(proxied("/left.mp4"))
         .header(reqwest::header::RANGE, "bytes=0-")
         .send()?;
     assert_eq!(response.bytes()?.len(), ORIGIN_LENGTH);
     fixture.origin.next_request();
-    wait_for_chunks(&fixture, 4);
+    let left = wait_for_new_entity(&fixture, &Default::default(), 4);
     // And nobody is reading it any more. The client has every byte, but the
     // read that delivered them lives until hyper drops the response, and
-    // while it does the gate answers the cleaner "a player is inside all of
-    // this" -- which is true, and is the subject of another test.
+    // while it does those bytes are promised to a body in flight -- which
+    // is true, and is the subject of another test.
     nothing_is_reading(&fixture);
 
-    // A cap under what is cached, so the pass has something to do. Well
-    // above one chunk, so the "a single file bigger than the whole cap is
-    // kept" rule is not what is being measured.
+    // The viewer opens something else, which is the whole of what makes the
+    // first one disposable.
+    let response = client
+        .get(proxied("/playing.mp4"))
+        .header(reqwest::header::RANGE, "bytes=0-")
+        .send()?;
+    assert_eq!(response.bytes()?.len(), ORIGIN_LENGTH);
+    fixture.origin.next_request();
+    let playing = wait_for_new_entity(
+        &fixture,
+        &std::collections::BTreeSet::from([left.clone()]),
+        4,
+    );
+    nothing_is_reading(&fixture);
+
+    // A cap under what is cached, so there is something for a clean to be
+    // unable to get under. Well above one chunk, so nothing here is about a
+    // single file being bigger than the whole cap.
     fixture
         .handle
         .update_settings(serde_json::json!({ "cacheSize": (CHUNK as f64) * 1.5 }))?;
     let report = fixture.handle.clean_cache_now()?;
-    assert!(report.freed > 0, "{report:?}");
+    settled(&fixture);
 
-    let left = cached_chunks(&fixture).len();
-    assert!(left < 4, "the cleaner took cached proxy bytes: {left} left");
+    let held = cached_chunks_by_entity(&fixture);
+    assert_eq!(
+        held.get(&left),
+        None,
+        "every chunk of the stream the viewer left is gone: {held:?} ({report:?})"
+    );
+    assert_eq!(
+        held.get(&playing).copied(),
+        Some(4),
+        "and the one being played kept its window: {held:?} ({report:?})"
+    );
+    assert!(
+        report.over_limit > 0,
+        "so the clean says it is still over the cap rather than taking what is playing: {report:?}"
+    );
 
     drop(fixture.handle);
     Ok(())
@@ -1656,24 +1698,24 @@ fn the_cache_figure_follows_the_chunks_the_proxy_wrote() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// **A chunk the cleaner unlinks comes off the count that booked it.**
+/// **A chunk a clean unlinks comes off the count that booked it, and a
+/// byte no owner ever booked is neither counted nor taken.**
 ///
-/// The cache cleaner is not one of the owners: it walks this root and
-/// unlinks a proxy chunk by path, the last deleter of a cached byte that
-/// does not come through the owner. A count that never heard those
-/// deletions would keep the bytes booked for the life of the process -- and
-/// the cap this process publishes is `occupied + available - floor`, so an
-/// over-counted occupancy states a *larger* cap, the windows are sized to
-/// it, the cache refills past the floor and the next pass has more to take.
-/// There is no term in that loop that brings the count back down.
+/// A count that never heard the deletions would keep those bytes booked for
+/// the life of the process -- and the cap this process publishes is
+/// `occupied + available - floor`, so an over-counted occupancy states a
+/// *larger* cap, the windows are sized to it, the cache refills past the
+/// floor and the next pass has more to take. There is no term in that loop
+/// that brings the count back down.
+///
+/// The whole-file download an earlier version of this server left under the
+/// same root is the other half. It belongs to no owner: nothing here booked
+/// it, so it is in no count, and a clean that is the owners' own passes has
+/// no way to reach it and takes nothing off any count for it. Nothing old
+/// matters -- what bounds this cache is what this process wrote.
 #[test]
-fn the_count_hears_the_cleaners_unlink() -> anyhow::Result<()> {
+fn the_count_hears_the_clean_and_ignores_what_no_owner_booked() -> anyhow::Result<()> {
     let fixture = fixture()?;
-    // One file under the same root that belongs to no owner at all: a
-    // whole-file download an earlier version of this server left behind,
-    // written first so the pass's age order reaches it first. Its bytes are
-    // in nobody's count, so a subtraction addressed to the proxy's count
-    // for it would take that figure below what the proxy really holds.
     let legacy = fixture
         .cache_root
         .path()
@@ -1685,44 +1727,50 @@ fn the_count_hears_the_cleaners_unlink() -> anyhow::Result<()> {
     std::fs::write(&legacy, vec![9u8; 64 * 1024])?;
 
     let origin = format!("http://{}", fixture.origin.addr);
-    let url = format!("{}/proxy/d={}/movie.mp4", fixture.base, encode(&origin));
-    let response = reqwest::blocking::Client::new()
-        .get(&url)
+    let proxied = |path: &str| format!("{}/proxy/d={}{path}", fixture.base, encode(&origin));
+    let client = reqwest::blocking::Client::new();
+
+    let response = client
+        .get(proxied("/left.mp4"))
         .header(reqwest::header::RANGE, "bytes=0-")
         .send()?;
     assert_eq!(response.bytes()?.len(), ORIGIN_LENGTH);
     fixture.origin.next_request();
-    wait_for_chunks(&fixture, 4);
-    nothing_is_reading(&fixture);
-
     let cached = cached_chunks(&fixture).len() as u64;
+    nothing_is_reading(&fixture);
     assert_eq!(
         fixture.handle.cache_usage()?.total_bytes,
         cached * CHUNK,
-        "what the fill booked, before anything has taken any of it"
+        "what the fill booked, before anything has taken any of it -- and \
+         not the legacy file, which no owner booked"
     );
 
-    // A cap under what is cached, so the pass has something to do, and well
-    // above one chunk, so the "a single file bigger than the whole cap is
-    // kept" rule is not what is being measured.
-    fixture
-        .handle
-        .update_settings(serde_json::json!({ "cacheSize": (CHUNK as f64) * 1.5 }))?;
-    let report = fixture.handle.clean_cache_now()?;
-    assert!(report.freed > 0, "the pass took chunks: {report:?}");
+    // The viewer opens something else, so the first entity is disposable,
+    // and a clean takes it.
+    let response = client
+        .get(proxied("/playing.mp4"))
+        .header(reqwest::header::RANGE, "bytes=0-")
+        .send()?;
+    assert_eq!(response.bytes()?.len(), ORIGIN_LENGTH);
+    fixture.origin.next_request();
+    wait_for_new_entity(&fixture, &Default::default(), 4);
+    nothing_is_reading(&fixture);
+    fixture.handle.clean_cache_now()?;
     settled(&fixture);
 
     let left = cached_chunks(&fixture).len() as u64;
-    assert!(left < cached, "the pass really unlinked some: {left} left");
     assert!(
-        !legacy.exists(),
-        "and the legacy copy with them: {report:?}"
+        left < cached * 2,
+        "the clean really unlinked the entity the viewer left: {left} chunks left"
     );
     assert_eq!(
         fixture.handle.cache_usage()?.total_bytes,
         left * CHUNK,
-        "and the count is what the disk holds, not what it held before the \
-         pass walked it"
+        "and the count is what the disk holds, not what it held before"
+    );
+    assert!(
+        legacy.exists(),
+        "the legacy copy is nobody's: no owner booked it and no owner takes it"
     );
 
     drop(fixture.handle);
@@ -2481,23 +2529,25 @@ fn a_second_player_fetching_does_not_truncate_the_first_ones_read() -> anyhow::R
     Ok(())
 }
 
-/// **The cleaner asks the one policy about everything it walks.**
+/// **A clean is refused the chunks a proxied player is inside.**
 ///
-/// A torrent's reader is protected from the cleaner's delete by librqbit:
-/// the delete goes through `drop_pieces`, which will not forget a piece a
-/// reader is waiting on. A proxied stream has no backend to refuse, and the
-/// cleaner holds the path -- so before the gate could answer for a walked
-/// file, a pass under a tight cap unlinked the chunk under the player's head
-/// and the player found out by failing (`proxy_cache::Cached::body` ends the
-/// body in an error rather than serving a hole).
+/// A torrent's reader is protected from a delete by librqbit: it goes
+/// through `drop_pieces`, which will not forget a piece a reader is waiting
+/// on. A proxied stream has no backend to refuse for it, so what protects
+/// its bytes is the owner itself -- the entity being played is not slack,
+/// and the window and the promises of a body in flight are what a pass may
+/// not take. Before that was so, a pass under a tight cap unlinked the
+/// chunk under the player's head and the player found out by failing
+/// (`proxy_cache::Cached::body` ends the body in an error rather than
+/// serving a hole).
 ///
-/// So the cap is set below what one live window holds and the cleaner is run
-/// on purpose. It leaves the chunks somebody is inside, and it says it could
-/// not get under the cap -- which is the honest answer, and the same one it
-/// gives for a torrent whose pieces the have-set will not give up. That it
-/// takes what nobody is reading is the other half of the claim and it has a
-/// test of its own above (`the_cleaner_evicts_cached_proxy_bytes` -- a cache
-/// with no reader in it goes down to nothing).
+/// So the cap is set below what one live window holds and the clean is run
+/// on purpose. It leaves the chunks somebody is inside, and it says it
+/// could not get under the cap -- which is the honest answer, and the same
+/// one it gives for a torrent whose pieces the have-set will not give up.
+/// That it takes what nobody is playing is the other half of the claim and
+/// it has a test of its own above
+/// (`cleaning_now_takes_the_proxied_stream_the_viewer_left_and_not_the_one_playing`).
 ///
 /// **The chunks are named, and that is the whole point of the shape of this
 /// test.** It used to count the files before the pass and after it and

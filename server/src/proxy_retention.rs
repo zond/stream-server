@@ -948,14 +948,16 @@ impl ProxyRetention {
     }
 
     /// Every entity nobody is playing and nobody is reading, taken off the
-    /// disk now.
+    /// disk now; the number of chunks that left it.
     ///
     /// **The whole of what ends a proxied entity.** The torrent's slack
     /// passes ride the reconciler's tick because the swarm fills a torrent
     /// whether or not anybody reads it; a proxied entity grows only as its
     /// own body is relayed, so it needs no tick -- what it needs is the
     /// moment the viewer opened something else, which is exactly when this
-    /// is called (the switch task on `Live::changed`).
+    /// is called (the switch task on `Live::changed`), the moment the
+    /// volume runs low (the same task, on the running-low bell), and
+    /// `POST /cache/clean`.
     ///
     /// One reading of the cell for the whole sweep, and every entity it
     /// does not name with no read open on it is slack. The reading is not
@@ -970,8 +972,9 @@ impl ProxyRetention {
     /// The ticket is taken for the whole sweep, so
     /// `ServerHandle::proxy_cache_settled` covers it: these unlinks are the
     /// cache moving as much as a fill is.
-    pub async fn drop_slack(&self) {
+    pub async fn drop_slack(&self) -> usize {
         let _ticket = self.work.start();
+        let mut reclaimed = 0;
         let live = self.live.reading();
         for key in self.owner.keys() {
             // What this driver means by slack, said before it asks for a
@@ -1000,6 +1003,7 @@ impl ProxyRetention {
             if let Some(conclusion) = &outcome.concluded
                 && conclusion.reclaimed > 0
             {
+                reclaimed += conclusion.reclaimed;
                 tracing::debug!(
                     dir = %key.display(),
                     freed = conclusion.reclaimed,
@@ -1007,6 +1011,7 @@ impl ProxyRetention {
                 );
             }
         }
+        reclaimed
     }
 
     /// Tell the cache cleaner's gate what live readers are holding.
@@ -2548,6 +2553,49 @@ mod tests {
             second.held().unwrap().len(),
             4,
             "while the one being played is untouched"
+        );
+        drop(watching);
+    }
+
+    /// **Two drops at once free each chunk once.**
+    ///
+    /// Two streams refused for want of space inside the same instant is two
+    /// disk gates asking both owners for their slack at the same time, and
+    /// they are asking about the same entity. Nothing serialises the
+    /// callers -- a request holds no lock on the cache -- so what has to
+    /// hold is the entity's own turn: one pass inside it at a time, and the
+    /// second finds nothing left to take rather than offering the same
+    /// chunks a second time. A chunk unlinked twice is a byte subtracted
+    /// twice from the running count the cap is stated from, which is the
+    /// count telling the process it has room it has not got.
+    #[tokio::test]
+    async fn two_drops_at_once_free_each_chunk_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let left = ChunkDir::new(tmp.path().join("left"));
+        write_chunks(&left, 0..16);
+        let retention = retention(Some(12 * CHUNK_BYTES));
+
+        // Played, then left for something else: the sixteen chunks are
+        // slack and both drops below are about them.
+        let played = retention.reader(&left, TOTAL, TARGET.into());
+        played.note(0);
+        settled(&retention, "the playing body's own pass ran", |_| {
+            left.held().is_ok_and(|held| held.len() == 12)
+        })
+        .await;
+        drop(played);
+        let opened = ChunkDir::new(tmp.path().join("opened"));
+        let watching = retention.reader(&opened, TOTAL, "https://origin.example/next.mkv".into());
+
+        let (first, second) = tokio::join!(retention.drop_slack(), retention.drop_slack());
+        assert_eq!(
+            first + second,
+            12,
+            "the chunks the entity held were offered twice: {first} and {second}"
+        );
+        assert!(
+            left.held().unwrap().is_empty(),
+            "and every one of them is off the disk"
         );
         drop(watching);
     }

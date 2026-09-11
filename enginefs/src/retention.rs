@@ -96,6 +96,42 @@ impl RetentionBudget {
     }
 }
 
+/// The bell the volume rings when it is running low.
+///
+/// One reading of one device, so one bell: the reconciler's tick takes the
+/// session's single `statvfs` ([`crate::reconcile::Volumes`]) and rings
+/// this whenever what it read is under the line a stopped torrent has to
+/// see cleared. Everybody who can give bytes back answers by dropping
+/// their slack -- everything nobody is playing and nobody is reading --
+/// and nobody chooses a victim: the answer to a volume running low is to
+/// stop holding what is already disposable, not to pick something to take.
+///
+/// **The torrent side has no listener and needs none**: its slack passes
+/// ride the same tick that takes the reading. What this is for is the
+/// proxy cache, which has no tick of its own -- its entities are only ever
+/// ended by a viewer opening something else, and a volume filling under a
+/// paused player is the one case where nothing opens.
+///
+/// One permit and not a counter, like every other signal here: a ring
+/// while nobody is waiting is remembered once, because the pass the waiter
+/// runs covers every slack entity there is and running it twice for two
+/// rings would find nothing the second time.
+#[derive(Debug, Default)]
+pub struct SlackBell(tokio::sync::Notify);
+
+impl SlackBell {
+    /// The volume is short: whoever holds slack should give it back now.
+    pub fn ring(&self) {
+        self.0.notify_one();
+    }
+
+    /// Completes at the next ring, or at once if one was rung since the
+    /// last time this completed.
+    pub async fn rung(&self) {
+        self.0.notified().await
+    }
+}
+
 /// The torrent piece a reader at `offset_in_file` of the file `span`
 /// describes is sitting on.
 pub(crate) fn playhead_piece(span: &FilePieceSpan, piece_length: u64, offset_in_file: u64) -> u32 {

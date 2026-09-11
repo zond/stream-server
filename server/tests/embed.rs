@@ -1797,23 +1797,24 @@ fn the_cache_root_setting_decides_where_the_next_session_opens() -> anyhow::Resu
         "the running session cannot be moved onto it"
     );
 
-    // And the cleaner goes on walking the root the session opened on, not
-    // the one the setting now names: it takes the root from the engine.
-    // Read from the setting instead, this pass would walk an empty
-    // directory and report a cache of nothing while the disk fills up.
-    let stale = default_root
+    // And the cache figure goes on describing the root the session opened
+    // on, not the one the setting now names: it takes the root from the
+    // engine. Read from the setting instead, this would answer about a
+    // directory nothing has ever written to and report a cache of nothing
+    // while the disk fills up.
+    let stray = default_root
         .join("rqbit-downloads")
-        .join("Stale")
-        .join("e1.bin");
-    std::fs::create_dir_all(stale.parent().unwrap())?;
-    write_payload(&stale, 16 * 1024);
-    std::fs::File::options()
-        .write(true)
-        .open(&stale)?
-        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86400))?;
-    let report = handle.clean_cache_now()?;
-    assert!(!stale.exists(), "the stale file under the live root goes");
-    assert!(report.freed >= 16 * 1024, "{report:?}");
+        .join(".pieces")
+        .join("ffffffffffffffffffffffffffffffffffffffff")
+        .join("00")
+        .join("0");
+    std::fs::create_dir_all(stray.parent().unwrap())?;
+    write_payload(&stray, 16 * 1024);
+    assert!(
+        handle.cache_usage()?.total_bytes >= 16 * 1024,
+        "the piece directory under the live root is in the figure: {:?}",
+        handle.cache_usage()?
+    );
     handle.shutdown()?;
     handle.join()?;
 
@@ -2746,26 +2747,25 @@ fn a_panels_numbers_are_about_the_file_the_url_resolved_to() -> anyhow::Result<(
 
     // A first read, so this torrent has an engine streaming it before the
     // budget arrives. Nothing bounds it yet, so it announces everything it
-    // holds and the cleaner may take none of it -- which is what makes the
-    // pass below publish a budget without emptying the cache it is about to
-    // be measured against.
+    // holds and nothing takes any of it -- which is what leaves the cache
+    // the setting below is about to be measured against whole.
     assert_eq!(
         play(&auto_url, 0)?,
         PICKED_PIECES * PIECE,
         "the auto-select serves the largest video of the pack"
     );
     handle.update_settings(serde_json::json!({ "cacheSize": BUDGET as f64 }))?;
-    let report = handle.clean_cache_now()?;
     assert_eq!(
-        report.limit,
+        handle.cache_usage()?.limit_bytes,
         Some(BUDGET),
-        "the cleaner published a different cap than the one configured; the \
+        "the process states a different cap than the one configured; the \
          volume this test runs on cannot give {BUDGET} bytes"
     );
     assert_eq!(
         pieces_held(&cache_root, &info_hash) as u64,
         PICKED_PIECES + FILTERED_PIECES,
-        "and it took nothing: this torrent announces every piece it holds"
+        "and stating it took nothing: what bounds a torrent's bytes is the \
+         pass over the file being played"
     );
 
     // The player seeks on and reads. Opening the reader is what installs a
@@ -2882,22 +2882,21 @@ fn a_panel_asking_about_a_torrent_stream_is_told_what_is_on_the_disk() -> anyhow
 
     // A first read, so this torrent has an engine streaming it before the
     // budget arrives. Nothing bounds it yet, so it announces everything it
-    // holds and the cleaner may take none of it -- which is what makes the
-    // pass below publish a budget without emptying the cache it is about to
-    // be measured against.
+    // holds and nothing takes any of it -- which is what leaves the cache
+    // the setting below is about to be measured against whole.
     play(0)?;
     handle.update_settings(serde_json::json!({ "cacheSize": BUDGET as f64 }))?;
-    let report = handle.clean_cache_now()?;
     assert_eq!(
-        report.limit,
+        handle.cache_usage()?.limit_bytes,
         Some(BUDGET),
-        "the cleaner published a different cap than the one configured; the \
+        "the process states a different cap than the one configured; the \
          volume this test runs on cannot give {BUDGET} bytes"
     );
     assert_eq!(
         pieces_held(&cache_root, &info_hash) as u64,
         PIECES,
-        "and it took nothing: this torrent announces every piece it holds"
+        "and stating it took nothing: what bounds a torrent's bytes is the \
+         pass over the file being played"
     );
 
     // The player seeks on and reads. Opening the reader is what installs a
@@ -3074,21 +3073,21 @@ fn the_minute_publishers_cap_follows_the_owners_occupancy() -> anyhow::Result<()
 }
 
 /// `GET /cache.json` and `POST /cache/clean` share their functions with
-/// `ServerHandle::{cache_usage, clean_cache_now}` -- the replacement for a
-/// client restarting the server just to make the cache cleaner's start-up
-/// tick fire. A pinned download's engine stays live and protects its data;
-/// an idle leftover with no engine at all is ordinary, evictable cache.
+/// `ServerHandle::{cache_usage, clean_cache_now}`, and the two surfaces
+/// answer the same bytes: the report the route returns is the report the
+/// library call returns, field for field.
 ///
-/// And so is the **whole-file copy an earlier version of this server left
-/// behind**, which is what makes this the migration test. There is no
-/// migration by decision: a plain-file download is neither converted nor
-/// read, the torrent that owns it re-downloads as pieces, and the only thing
-/// that ever reclaims those bytes is this cleaner. It can only do that if the
-/// live engine over that very torrent does not protect them -- protection is
-/// `starts_with`, and the engine used to name `<output folder>/<file>`. So
-/// the fixture puts a legacy copy of a *pinned* torrent's own files where an
-/// earlier version would have written them, and the pass takes them while the
-/// pin's real bytes stay.
+/// What a clean does is give back both owners' slack, so on this fixture it
+/// gives back **nothing**, and that is the claim. A pinned download is kept
+/// until it is unpinned, however far over the cap the cache is; and the
+/// **whole-file copies an earlier version of this server left behind**
+/// belong to no owner at all -- nothing here booked those bytes, nothing
+/// counts them and nothing takes them. There is no migration by decision: a
+/// plain-file download is neither converted nor read, and the torrent that
+/// owns it re-downloads as pieces. Nothing old matters.
+///
+/// So the honest answer to "clean now" here is `overLimit`, and a client
+/// that wants those bytes back unpins something.
 #[test]
 fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -3163,15 +3162,12 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
     handle.pin_download(&info_hash, idx, &[])?;
     stats_after_check(&client, &base, &info_hash)?;
 
-    // Read usage() before touching the limit, to learn exactly how many
-    // bytes the pinned torrent's two files occupy: `evict` never takes a
-    // single file whose own size exceeds the limit (see
-    // `cache_soft_limit_exceeded_by_single_retained_file` in
-    // `cache_cleaner::evict`), so a limit of, say, `1` would make every
-    // real file -- pinned or not -- too big to touch and evict nothing at
-    // all. The limit below sits just above the protected bytes: over what
-    // the pin alone needs, but under the idle leftover's own size added to
-    // it, so only that leftover is evictable.
+    // Read usage() before touching the limit, to learn how many bytes the
+    // pinned file occupies. The limit below sits one byte over that, so the
+    // cache is really over its cap while the clean runs -- otherwise
+    // "nothing was taken" would be the uninteresting answer of a cache with
+    // room to spare rather than the answer of one that has nothing
+    // disposable in it.
     let baseline = handle.cache_usage()?;
     assert_eq!(
         baseline.protected_files, 1,
@@ -3207,67 +3203,52 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
         "{http_usage}"
     );
 
-    // Everything this pass can take, counted before it runs: the idle
-    // leftover and the two legacy whole-file copies, in the occupancy
-    // accounting the report is in.
-    let evictable: u64 = [
-        idle.clone(),
-        root_folder.join("movie.mkv"),
-        root_folder.join("subtitle.srt"),
-    ]
-    .iter()
-    .map(|path| {
-        enginefs::chunk_store::occupied_bytes(
-            &std::fs::metadata(path).expect("a file this test wrote"),
-        )
-    })
-    .sum();
-    // What it cannot: the pinned torrent's own pieces, every one of which
-    // the gate refuses.
-    let pinned_bytes = piece_store(&cache_root).stat(&info_hash).occupancy();
-
-    // clean_cache_now() over HTTP: the idle file goes, the pinned one does
-    // not, and the run ends over the limit rather than at it -- the limit
-    // is the pinned *file*'s bytes plus one, while what the walk may not
-    // take is the whole torrent's pieces.
+    // POST /cache/clean over HTTP: both owners give back their slack, and
+    // there is none to give. The pin is kept, and the whole-file copies an
+    // earlier version left behind are nobody's -- in no count and in no
+    // pass -- so every byte this test put on the disk is still there
+    // afterwards.
     let report: serde_json::Value = client
         .post(format!("{base}/cache/clean"))
         .send()?
         .error_for_status()?
         .json()?;
-    assert!(!idle.exists(), "unpinned idle cache is evictable: {report}");
     assert!(
-        !root_folder.join("movie.mkv").exists() && !root_folder.join("subtitle.srt").exists(),
-        "and so is the pinned torrent's own superseded whole-file copy, \
-         which nothing reads and nothing else would ever reclaim: {report}"
+        idle.is_file(),
+        "a byte no owner ever booked is no clean's to take: {report}"
+    );
+    assert!(
+        root_folder.join("movie.mkv").is_file() && root_folder.join("subtitle.srt").is_file(),
+        "the legacy whole-file copies with it: {report}"
     );
     assert_eq!(
         pieces_held(&cache_root, &info_hash),
         seeded_pieces,
-        "while the pin's real bytes are untouched: {report}"
+        "and the pin's real bytes are untouched: {report}"
     );
-    assert_eq!(report["deleted"], 3, "{report}");
-    // The pass's own numbers are the walk's, and the walk counts piece
-    // files where `GET /cache.json` counts what the owners hold -- so they
-    // are read against what this test put on the disk rather than against
-    // the usage figures above: everything the walk could take, it took, and
-    // what is left is what the gate refused.
-    assert_eq!(report["freed"], evictable, "{report}");
-    assert_eq!(report["protected"], pinned_bytes, "{report}");
+    assert_eq!(report["deleted"], 0, "{report}");
+    assert_eq!(report["freed"], 0, "{report}");
+    // The figures are the owners' own, which is what makes them the same
+    // figures `GET /cache.json` answers: the pinned file, counted as a
+    // file, and the cap the process has just restated.
+    assert_eq!(report["protectedFiles"], 1, "{report}");
+    assert_eq!(report["protected"], baseline.protected_bytes, "{report}");
+    assert_eq!(report["limit"], limit, "{report}");
+    assert!(
+        report["overLimit"].as_u64().unwrap() > 0,
+        "and it says it is still over the cap rather than pretending otherwise: {report}"
+    );
     assert_eq!(
-        report["total"], report["protected"],
-        "nothing but the pinned torrent's own pieces is left: {report}"
+        report["total"],
+        handle.cache_usage()?.total_bytes,
+        "the clean's total is the figure the usage route answers: {report}"
     );
-    assert_eq!(report["protectedFiles"], seeded_pieces, "{report}");
 
     // clean_cache_now() == POST /cache/clean, run right after over the
-    // library instead: nothing is left to evict, but the pinned torrent's
-    // bytes still show up as protected -- the same function underneath
-    // both surfaces, so the two can never disagree about it.
+    // library instead -- the same function underneath both surfaces, so the
+    // two can never disagree about a field.
     let api_report = handle.clean_cache_now()?;
-    assert_eq!(api_report.deleted, 0, "nothing left to evict");
-    assert_eq!(api_report.freed, 0);
-    assert_eq!(api_report.protected_files, seeded_pieces);
+    assert_eq!(serde_json::to_value(&api_report)?, report);
     assert_eq!(pieces_held(&cache_root, &info_hash), seeded_pieces);
 
     handle.shutdown()?;
@@ -4180,6 +4161,111 @@ fn a_stream_below_the_free_space_floor_is_refused_not_degraded() -> anyhow::Resu
         // itself the proof that it was not refused.
         Err(error) => assert!(error.is_timeout(), "{error}"),
     }
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
+/// **A stream refused for space takes back what the viewer just left, and
+/// asks the volume again.**
+///
+/// This request is the switch: registering the stream is what makes the
+/// film the viewer was watching disposable, and those bytes are ours. So a
+/// gate that answered `507` from the reading it took first would refuse a
+/// stream for room it was about to have -- which on a full phone is every
+/// switch, for ever. It drops both cache owners' slack instead, re-reads
+/// the volume, and refuses only what is still short.
+///
+/// And when it is still short, it refuses. Nothing below the slack is ever
+/// taken: no pin, no window somebody is inside. When what is left does not
+/// fit, `507` is the answer and a viewer who wants that stream unpins
+/// something -- and the answer comes back rather than hanging on the disk
+/// (`SLACK_DROP_BOUND`).
+///
+/// The volume is declared as a *sequence* (`pretend_available_space_readings`),
+/// which is the only honest way to say "it read short, and by the time it
+/// was read again the bytes had come back": flipping one declared number
+/// from another thread would pin the race rather than the rule.
+#[test]
+fn a_stream_refused_for_space_frees_the_slack_and_asks_again() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    let (handle, base, info_hash, idx, payload) =
+        lan_media_server(config_dir.path(), cache_dir.path(), src.path(), None)?;
+    let cache_root = resolved(&cache_dir.path().join("cache"));
+    let client = bearer_client(&handle)?;
+    let anonymous = reqwest::blocking::Client::new();
+
+    // The film the viewer is watching. It is the live one when its response
+    // ends, so its bytes stay on the disk until something else opens.
+    let response = anonymous
+        .get(format!("{base}/{info_hash}/{idx}"))
+        .send()?
+        .error_for_status()?;
+    assert_eq!(response.bytes()?.as_ref(), payload.as_slice());
+    let watched = pieces_held(&cache_root, &info_hash);
+    assert!(watched > 0, "the film is on the disk to be given back");
+
+    // A second torrent, whose data is deliberately not in the cache: it
+    // still wants every byte of itself, which is what the floor is about.
+    let wanting = src.path().join("Wanted");
+    std::fs::create_dir_all(&wanting)?;
+    write_payload(&wanting.join("wanted.bin"), 64 * 1024);
+    let (wanting_torrent, wanting_hash) = real_torrent(&wanting);
+    client
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": hex::encode(&wanting_torrent) }))
+        .send()?
+        .error_for_status()?;
+    let wanting_stats = stats_after_check(&client, &base, &wanting_hash)?;
+    let wanting_idx = file_index(&wanting_stats, "wanted.bin");
+    let wanting_url = format!("{base}/{wanting_hash}/{wanting_idx}");
+
+    // Nothing free when the gate first asks; room by the time it asks
+    // again, which is what dropping the slack did.
+    stream_server::pretend_available_space_readings(&cache_root, vec![0, u64::MAX]);
+    match anonymous
+        .get(&wanting_url)
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+    {
+        Ok(response) => assert_ne!(
+            response.status(),
+            reqwest::StatusCode::INSUFFICIENT_STORAGE,
+            "the gate refused a stream for room it had just taken back"
+        ),
+        // No peer will ever bring these bytes, so a request that got past
+        // the gate waits for them until this client gives up -- which is
+        // itself the proof that it was not refused.
+        Err(error) => assert!(error.is_timeout(), "{error}"),
+    }
+    assert_eq!(
+        pieces_held(&cache_root, &info_hash),
+        0,
+        "and what it took back was the film the viewer left"
+    );
+
+    // Still short however often it is asked, and there is nothing
+    // disposable left: the answer is `507`, with the fixed body, and it
+    // comes back rather than sitting on the disk.
+    stream_server::pretend_available_space(&cache_root, 0);
+    let started = std::time::Instant::now();
+    let response = anonymous
+        .get(&wanting_url)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::INSUFFICIENT_STORAGE);
+    assert_eq!(
+        response.text()?,
+        "Insufficient disk space for this stream; free some space and retry"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the refusal waited out the whole slack-drop bound: {:?}",
+        started.elapsed()
+    );
 
     handle.shutdown()?;
     handle.join()?;

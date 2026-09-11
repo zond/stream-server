@@ -33,14 +33,14 @@ const DISK_FULL_POLL_INTERVAL: Duration = Duration::from_secs(15);
 const CLEAN_FALLBACK_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// How far under the cap a pass run on behalf of a stopped torrent evicts
-/// ([`recover_out_of_space_torrents`]), so the torrent it restarts has room
-/// to run before it is stopped again. The watch stops a torrent a few MB
-/// under the floor and the cap is the floor, so a pass to the cap alone
-/// would free those few MB, restart the torrent, and be rung again within
-/// the second -- a full cache walk per second for as long as there is old
-/// cache to drain a proxy chunk at a time. At least the engine's resume
-/// margin, so the watch agrees the volume has recovered; more, so the walks
-/// are seconds apart at the least.
+/// ([`recover_out_of_space_torrents`]), so the reconciler has room to
+/// restart the torrent into before it is stopped again. The watch stops a
+/// torrent a few MB under the floor and the cap is the floor, so a pass to
+/// the cap alone would free those few MB and be rung again within the
+/// second -- a full cache walk per second for as long as there is old cache
+/// to drain a proxy chunk at a time. At least the engine's resume margin,
+/// which is the line the ladder restarts an errored torrent over; more, so
+/// the walks are seconds apart at the least.
 const RECOVERY_HEADROOM: u64 = 4 * enginefs::FREE_SPACE_RESUME_MARGIN;
 
 /// Whether a debounced clean is already due.
@@ -237,8 +237,10 @@ pub fn start(state: Arc<AppState>) -> JoinHandle<()> {
                 // 3. A torrent the backend stopped for want of disk space,
                 //    found by the poll -- or, 3a, one the reconciler
                 //    just stopped, which rings this the moment it does: the
-                //    torrent's readers are parked until the pass restarts it,
-                //    and a poll interval of parking is a player buffering.
+                //    torrent's readers are parked until there is room for
+                //    it again, and a poll interval of parking is a player
+                //    buffering. Making the room is all that happens here;
+                //    the ladder reads the volume and restarts the torrent.
                 _ = disk_full_poll.tick() => {
                     recover_out_of_space_torrents(&state, &mut disk_full_recovery).await;
                 }
@@ -261,21 +263,6 @@ pub fn start(state: Arc<AppState>) -> JoinHandle<()> {
     })
 }
 
-/// A full disk is a signal to clean, not to stop.
-///
-/// librqbit treats a write that hits ENOSPC as fatal: it stops the torrent and
-/// leaves it in an error state. That is what killed a film ninety minutes in
-/// against a swarm of 459 seeds -- nothing was wrong with the swarm, the
-/// device was simply out of room. So when a torrent is stopped for that
-/// reason, evict what the cleaner would have evicted anyway and put it back to
-/// work.
-///
-/// The restart is conditional on the clean actually reclaiming something. A
-/// torrent restarted onto a disk that is still full errors again within
-/// seconds, and that is a loop rather than a recovery; when there is nothing
-/// left to evict, [`EvictionReport::shortfall_message`] has already said what
-/// protection is holding, and the torrent stays stopped where a client can
-/// report it honestly.
 /// What the disk-full poll has already tried and failed to make room for.
 ///
 /// A stopped torrent stays stopped and stays in the backend's error state,
@@ -321,6 +308,21 @@ impl DiskFullRecovery {
     }
 }
 
+/// A full disk is a signal to clean, not to stop.
+///
+/// librqbit treats a write that hits ENOSPC as fatal: it stops the torrent and
+/// leaves it in an error state. That is what killed a film ninety minutes in
+/// against a swarm of 459 seeds -- nothing was wrong with the swarm, the
+/// device was simply out of room. So when a torrent is stopped for that
+/// reason, evict what the cleaner would have evicted anyway.
+///
+/// **And that is all this does now.** Putting the torrent back to work is
+/// the reconciler's (`enginefs::reconcile::Decision::RestartFromError`),
+/// measured against the volume rather than against this pass: a restart
+/// conditional on *an eviction having happened* left a torrent dead on a
+/// device that gained a gigabyte by any other means, and restarted one onto
+/// a volume a single freed byte had not lifted over the floor. What is left
+/// here is the making of room, which the ladder then reads for itself.
 async fn recover_out_of_space_torrents(state: &AppState, recovery: &mut DiskFullRecovery) {
     let stopped: Vec<String> = state.engine.out_of_space_torrents().await;
     if stopped.is_empty() {
@@ -355,32 +357,11 @@ async fn recover_out_of_space_torrents(state: &AppState, recovery: &mut DiskFull
         return;
     }
     recovery.room_was_made();
-
-    for info_hash in stopped {
-        match state.engine.restart_from_error(&info_hash).await {
-            Ok(true) => info!(
-                info_hash = %info_hash,
-                freed = report.freed,
-                "restarted a torrent a full disk had killed"
-            ),
-            // Two ordinary outcomes share this arm and neither is a
-            // failure: the torrent was gone by the time space had been
-            // reclaimed (evicted whole, or swept), or it is merely stopped
-            // rather than dead -- and a stopped one is the reconciler's to
-            // start again, from a reading of the volume it takes itself on
-            // its next pass, which is the whole reason there is only one
-            // caller of `Session::unpause` for that case.
-            Ok(false) => debug!(
-                info_hash = %info_hash,
-                "the torrent was not in the backend's error state; nothing restarted from here"
-            ),
-            Err(e) => warn!(
-                info_hash = %info_hash,
-                error = %format!("{e:#}"),
-                "could not restart a torrent a full disk had stopped"
-            ),
-        }
-    }
+    info!(
+        torrents = stopped.len(),
+        freed = report.freed,
+        "made room on the volume a stopped torrent writes to; the reconciler restarts it"
+    );
 }
 
 /// The root, its cap and the protections one [`clean_cache`] pass needs,
@@ -587,6 +568,45 @@ async fn clean_cache_with_headroom(
     Ok(report)
 }
 
+/// Give back everything nobody is playing and nobody is reading, now, and
+/// report what is left -- what `POST /cache/clean` and
+/// `ServerHandle::clean_cache_now` answer.
+///
+/// **"Clean" is no longer a choice of victims.** It used to be a walk of
+/// the root that sorted what it found by age and size and evicted until it
+/// was under the cap, which meant a user pressing "clean now" could lose
+/// the film they were about to resume while a stale one survived on a
+/// tie-break. Every byte under the root now has an owner that knows
+/// whether anybody wants it, so this asks both of them for their slack --
+/// the same passes the tick and the switch run -- and nothing else is
+/// touched: a pin is kept until it is unpinned, and the window of the one
+/// entity being played is kept until something else is.
+///
+/// So a clean that frees nothing is the ordinary answer on a device with
+/// one film playing and one pinned, and [`EvictionReport::over_limit`] is
+/// what says the cache is still over its cap. The cap is restated first
+/// ([`crate::cache_budget::publish_now`]), so the number this reports is
+/// the number the owners are now sized against and the one `GET
+/// /cache.json` answers.
+pub(crate) async fn drop_slack(state: &AppState) -> EvictionReport {
+    let before = usage(state).await;
+    let deleted =
+        state.engine.drop_slack().await + state.proxy_cache.retention().drop_slack().await;
+    crate::cache_budget::publish_now(state).await;
+    let after = usage(state).await;
+    EvictionReport {
+        total: after.total_bytes,
+        protected: after.protected_bytes,
+        protected_files: after.protected_files,
+        freed: before.total_bytes.saturating_sub(after.total_bytes),
+        deleted,
+        limit: after.limit_bytes,
+        over_limit: after
+            .total_bytes
+            .saturating_sub(after.limit_bytes.unwrap_or(u64::MAX)),
+    }
+}
+
 /// What the cache currently occupies against its configured limit
 /// ([`CacheUsage`]), from the owners that hold it rather than from a walk
 /// of it.
@@ -764,11 +784,12 @@ pub struct EvictionReport {
 }
 
 impl EvictionReport {
-    /// Whether this run reclaimed anything -- the condition
-    /// [`recover_out_of_space_torrents`] restarts a stopped torrent on. A
-    /// clean that freed nothing has not changed the device's mind, so
-    /// restarting into it would only reproduce the error the torrent already
-    /// has.
+    /// Whether this run reclaimed anything -- what
+    /// [`recover_out_of_space_torrents`] reads to decide whether it has
+    /// anything new to say about a device it has already failed to make
+    /// room on. A clean that freed nothing has not changed the device's
+    /// mind, and the reconciler measures the volume itself before it
+    /// restarts anything.
     pub fn made_room(&self) -> bool {
         self.freed > 0
     }
@@ -813,8 +834,9 @@ impl EvictionReport {
 /// stands between the user and their next stream (their retry of the same
 /// title included). "Nothing else could go" is read from this pass -- the
 /// age rule and the size rule freed nothing -- rather than from the cap
-/// alone, so a pass that freed *something* restarts the torrent into that
-/// room and the next pass, if there is one, gets to judge again.
+/// alone, so a pass that freed *something* has made room for the ladder to
+/// restart the torrent into, and the next pass, if there is one, gets to
+/// judge again.
 ///
 /// `headroom` lowers the cap this run evicts to (see [`RECOVERY_HEADROOM`]).
 /// Sizes are occupancy, not apparent length (see [`occupied_bytes`]).

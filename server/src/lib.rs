@@ -11,9 +11,10 @@ pub use enginefs::backend::{EngineStats, TorrentListenPort};
 #[doc(hidden)]
 pub use enginefs::pretend_volume_space;
 pub use enginefs::{PIN_FREE_SPACE_MARGIN, PinDownloadError, UnpinOutcome};
+use futures_util::future::BoxFuture;
 pub use routes::downloads::DownloadInfo;
 #[doc(hidden)]
-pub use routes::stream::pretend_available_space;
+pub use routes::stream::{pretend_available_space, pretend_available_space_readings};
 pub use routes::system::{FileNotFound, ServerSettings, resolved_path};
 pub use state::AppState;
 use std::{
@@ -1230,29 +1231,31 @@ pub async fn run(
     background_tasks.push(state.engine.start_reconciler());
     // And the switch task: the moment a viewer opens something else, what
     // they left is disposable, and this is what takes it off the disk
-    // without waiting for the next tick. Two seconds does not sound like
-    // much until the thing waiting for the room is the stream that caused
-    // the switch. It watches the one liveness cell
-    // (`enginefs::retention::live`) and calls the same slack passes the
-    // tick would have run.
-    //
-    // Both owners, because the cell is one cell: a proxied body opening
-    // makes a torrent's file slack and a torrent stream opening makes the
-    // proxied body slack, and the proxy has no tick of its own -- this is
-    // the only thing that ever ends one of its entities.
+    // without waiting for the next tick. See `drop_slack_on_switch_and_bell`
+    // for what it listens to and why each owner answers which signal.
     background_tasks.push({
         let engine = state.engine.clone();
         let proxy_cache = state.proxy_cache.clone();
-        let mut changed = engine.live().changed();
-        tokio::spawn(async move {
-            // The value as it is now is not a change; the first `changed`
-            // is the first switch after this task started.
-            changed.mark_unchanged();
-            while changed.changed().await.is_ok() {
-                engine.drop_slack().await;
-                proxy_cache.retention().drop_slack().await;
+        let changed = engine.live().changed();
+        let bell = engine.slack_bell().clone();
+        let torrents = {
+            let engine = engine.clone();
+            move || {
+                let engine = engine.clone();
+                Box::pin(async move {
+                    engine.drop_slack().await;
+                }) as BoxFuture<'static, ()>
             }
-        })
+        };
+        let proxied = move || {
+            let proxy_cache = proxy_cache.clone();
+            Box::pin(async move {
+                proxy_cache.retention().drop_slack().await;
+            }) as BoxFuture<'static, ()>
+        };
+        tokio::spawn(drop_slack_on_switch_and_bell(
+            changed, bell, torrents, proxied,
+        ))
     });
     // And the cache budget, which is not the cleaner's even though the
     // cleaner used to be the only thing that ever stated one. Unconditional
@@ -1397,6 +1400,56 @@ pub async fn run(
     https_listener.stop().await;
 
     Ok(shutdown_source)
+}
+
+/// The slack drops that do not wait for the reconciler's tick: one when the
+/// viewer opens something else, one when the volume is running low.
+///
+/// **Both owners answer a switch**, because the liveness cell is one cell:
+/// a proxied body opening makes a torrent's file slack and a torrent stream
+/// opening makes the proxied body slack, and the proxy has no tick of its
+/// own -- this is the only thing that ever ends one of its entities.
+///
+/// **Only the proxy answers the bell.** The torrent side's slack passes
+/// ride the same tick that takes the volume reading the bell is rung from
+/// (`enginefs::retention::SlackBell`), so running them here as well would
+/// be the same pass twice in the same instant; the proxy has no such tick,
+/// and a volume filling under a paused player is exactly the case where
+/// nothing opens and so nothing switches.
+///
+/// One task and one `select!`, so the two never run at once: the passes
+/// take each entity's turn and would be safe concurrently, but a bell that
+/// rings while a switch is mid-pass has nothing to add -- the switch's own
+/// pass covers every slack entity there is.
+///
+/// The two passes are taken as closures rather than as the owners
+/// themselves so that this shape can be tested for what it does with each
+/// signal, which is the whole of what it is.
+///
+/// The receiver is made by the caller, and `watch::Sender::subscribe` marks
+/// the value it was made on as seen: the first wake-up is the first real
+/// switch after that, including one that lands before this task is first
+/// polled -- which a `mark_unchanged()` in here would swallow.
+async fn drop_slack_on_switch_and_bell(
+    mut switched: tokio::sync::watch::Receiver<Option<enginefs::retention::live::LiveEntity>>,
+    bell: Arc<enginefs::retention::SlackBell>,
+    torrents: impl Fn() -> BoxFuture<'static, ()>,
+    proxied: impl Fn() -> BoxFuture<'static, ()>,
+) {
+    loop {
+        tokio::select! {
+            moved = switched.changed() => {
+                // The cell is gone, which means the engine is: there is
+                // nothing left to drop the slack of.
+                if moved.is_err() {
+                    return;
+                }
+                torrents().await;
+                proxied().await;
+            }
+            () = bell.rung() => proxied().await,
+        }
+    }
 }
 
 async fn maybe_ctrl_c(enabled: bool) {
@@ -1767,6 +1820,91 @@ fn control_router() -> Router<AppState> {
         .route("/cache.json", get(routes::cache::get_cache_usage))
         .route("/cache/clean", post(routes::cache::post_clean_cache))
         .nest("/casting", routes::casting::router())
+}
+
+#[cfg(test)]
+mod slack_task_tests {
+    use super::drop_slack_on_switch_and_bell;
+    use enginefs::retention::SlackBell;
+    use enginefs::retention::live::{Live, LiveEntity};
+    use futures_util::future::BoxFuture;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Which signal makes which owner give its slack back.
+    ///
+    /// A **switch** is both: the cell is one cell, so a proxied body opening
+    /// makes a torrent's file disposable and a torrent stream opening makes
+    /// a proxied body disposable. The **bell** is the proxy's alone -- the
+    /// torrent's slack passes ride the same tick that takes the volume
+    /// reading the bell was rung from, and running them here as well would
+    /// be that pass twice in one instant, while the proxy has no tick at
+    /// all.
+    ///
+    /// Asserted on the passes rather than on the owners, because that is
+    /// the whole of what this task is: two signals and which call each of
+    /// them makes.
+    #[tokio::test]
+    async fn a_switch_drops_both_owners_slack_and_the_bell_drops_the_proxys() {
+        let live = Arc::new(Live::new());
+        let bell = Arc::new(SlackBell::default());
+        let torrents = Arc::new(AtomicUsize::new(0));
+        let proxied = Arc::new(AtomicUsize::new(0));
+        let count = |counter: &Arc<AtomicUsize>| {
+            let counter = counter.clone();
+            move || {
+                let counter = counter.clone();
+                Box::pin(async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }) as BoxFuture<'static, ()>
+            }
+        };
+        let task = tokio::spawn(drop_slack_on_switch_and_bell(
+            live.changed(),
+            bell.clone(),
+            count(&torrents),
+            count(&proxied),
+        ));
+        let until = |counter: &Arc<AtomicUsize>, want: usize| {
+            let counter = counter.clone();
+            async move {
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while counter.load(Ordering::SeqCst) < want {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| panic!("only {} passes ran", counter.load(Ordering::SeqCst)));
+            }
+        };
+
+        live.open(LiveEntity::Proxy { dir: "/one".into() }, false);
+        until(&torrents, 1).await;
+        until(&proxied, 1).await;
+
+        bell.ring();
+        until(&proxied, 2).await;
+        assert_eq!(
+            torrents.load(Ordering::SeqCst),
+            1,
+            "the torrent side answers the tick the reading came from, not the bell"
+        );
+
+        // And the value as it stands when the task starts is not a change:
+        // a task that treated it as one would drop the slack of whatever
+        // was playing when the server came up.
+        let quiet = tokio::spawn(drop_slack_on_switch_and_bell(
+            live.changed(),
+            Arc::new(SlackBell::default()),
+            count(&torrents),
+            count(&proxied),
+        ));
+        tokio::task::yield_now().await;
+        assert_eq!(torrents.load(Ordering::SeqCst), 1, "nothing switched");
+
+        task.abort();
+        quiet.abort();
+    }
 }
 
 #[cfg(test)]

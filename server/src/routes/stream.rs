@@ -476,27 +476,45 @@ const INSUFFICIENT_DISK_SPACE_BODY: &str =
     "Insufficient disk space for this stream; free some space and retry";
 
 /// Free space a test has declared for a root and everything under it,
-/// standing in for the volume probe -- see [`pretend_available_space`].
-type DiskSpaceOverrides = std::sync::Mutex<Vec<(std::path::PathBuf, u64)>>;
+/// standing in for the volume probe. The readings are used in order and
+/// the last one stands for ever after -- see [`pretend_available_space`].
+type DiskSpaceOverrides =
+    std::sync::Mutex<Vec<(std::path::PathBuf, std::collections::VecDeque<u64>)>>;
 static DISK_SPACE_OVERRIDES: std::sync::OnceLock<DiskSpaceOverrides> = std::sync::OnceLock::new();
 
 /// Declare how much free space the volume under `root` has, for every
 /// readiness check on a path below it from now on.
 ///
 /// A test seam and nothing else: a volume cannot be filled on demand, so
-/// without this the low-disk refusal and the cleaner pass in front of it
+/// without this the low-disk refusal and the slack drop in front of it
 /// (`ensure_disk_ready_or_refuse`) could not be exercised end to end. Keyed
 /// by root so parallel tests, each with its own temp cache root, never see
 /// each other's declaration.
 #[doc(hidden)]
 pub fn pretend_available_space(root: impl Into<std::path::PathBuf>, bytes: u64) {
+    pretend_available_space_readings(root, vec![bytes]);
+}
+
+/// [`pretend_available_space`] with a **volume that changes**: `readings`
+/// are answered one per check, in order, and the last one answers every
+/// check after them.
+///
+/// The disk gate asks twice -- once before it drops the cache owners' slack
+/// and once after -- and the whole of what the second ask is for is that
+/// the volume may have changed in between. A single declared number cannot
+/// express that, and a test that flipped it from another thread would be
+/// pinning a race: what this says instead is "the volume read short, and by
+/// the time it was read again the bytes had come back", which is exactly
+/// the situation the gate exists to handle.
+#[doc(hidden)]
+pub fn pretend_available_space_readings(root: impl Into<std::path::PathBuf>, readings: Vec<u64>) {
     let root = root.into();
     if let Ok(mut overrides) = DISK_SPACE_OVERRIDES
         .get_or_init(|| std::sync::Mutex::new(Vec::new()))
         .lock()
     {
         overrides.retain(|(declared, _)| *declared != root);
-        overrides.push((root, bytes));
+        overrides.push((root, readings.into()));
     }
 }
 
@@ -513,10 +531,20 @@ fn forget_available_space(path: &FsPath) {
 
 fn available_space_for_path(path: &FsPath) -> Option<u64> {
     if let Some(overrides) = DISK_SPACE_OVERRIDES.get()
-        && let Ok(overrides) = overrides.lock()
-        && let Some((_, bytes)) = overrides.iter().find(|(root, _)| path.starts_with(root))
+        && let Ok(mut overrides) = overrides.lock()
+        && let Some((_, readings)) = overrides
+            .iter_mut()
+            .find(|(root, _)| path.starts_with(root))
     {
-        return Some(*bytes);
+        // The last reading is never taken: a declaration of one number is a
+        // volume that stays that size, which is what nearly every caller of
+        // the seam means.
+        let bytes = if readings.len() > 1 {
+            readings.pop_front()
+        } else {
+            readings.front().copied()
+        };
+        return bytes;
     }
     let cache =
         DISK_SPACE_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -616,10 +644,10 @@ fn ensure_download_disk_ready(root: &FsPath) -> Result<(), String> {
     Ok(())
 }
 
-/// The readiness check the stream route runs before it streams to disk, and
-/// what happens when the disk is not ready: one cache-cleaner pass, the check
-/// again, and a `507` if the disk is still short. `Err` is the status and
-/// body to answer.
+/// The disk gate the stream route runs before it streams to disk, and what
+/// happens when the disk is not ready: both cache owners give back their
+/// slack, the volume is read again, and a `507` if it is still short. `Err`
+/// is the status and body to answer.
 ///
 /// This used to "degrade the request to memory-only" by re-selecting
 /// `state.engine` -- which was the engine it already had: there was a
@@ -632,19 +660,26 @@ fn ensure_download_disk_ready(root: &FsPath) -> Result<(), String> {
 /// librqbit's ENOSPC fatal error, exactly as if the check did not exist.
 ///
 /// Refusing at once is not right either, on the device the floor is about.
-/// The cleaner is what keeps the floor free, by evicting stale cache, but it
-/// runs debounced after filesystem events and hourly otherwise, and a
-/// refused request writes nothing to arm it with -- a phone with 300 MiB
-/// free and gigabytes of old cache would sit refused until the hourly pass.
-/// So a failed check runs the cleaner now (`cache_cleaner::clean_cache`, the
-/// same pass `POST /cache/clean` takes, with the same protections) and asks
-/// again with a fresh free-space reading; only a disk still short after that
-/// is answered `507 Insufficient Storage` -- the status the pin route already
-/// uses for a full disk -- with a fixed body, because the check's own message
-/// names the cache root and no response may carry a path.
+/// **This request has just made its predecessor disposable** -- the stream
+/// is registered before this gate, so the film the viewer left is slack by
+/// now -- and those bytes are ours to take back. So a failed check drops
+/// every owner's slack ([`EngineFS::drop_slack`] and the proxy cache's,
+/// the same passes `POST /cache/clean` runs), re-reads the volume and asks
+/// both questions again; only a disk still short after that is answered
+/// `507 Insufficient Storage` -- the status the pin route already uses for
+/// a full disk -- with a fixed body, because the check's own message names
+/// the cache root and no response may carry a path.
+///
+/// **Nothing but slack is ever taken, so the refusal is real.** There is no
+/// tier below it that starts choosing between a pin and a window: when what
+/// is left is pins plus the one live window and it does not fit, the answer
+/// is `507`, and a viewer who wants that stream unpins something. That is
+/// the whole of the storage policy in one sentence, and it is why this gate
+/// has no eviction in it any more.
 async fn ensure_disk_ready_or_refuse(
     state: &AppState,
     engine_fs: &EngineFS,
+    engine: &Arc<Engine<LibrqbitHandle>>,
     stream_id: u64,
     info_hash: &str,
     file_idx: usize,
@@ -677,47 +712,108 @@ async fn ensure_disk_ready_or_refuse(
                 })
         }
     };
-    let Err(first) = check().await else {
-        return Ok(());
+    // Both gates, in the order they cost: a torrent the reconciler is
+    // already holding stopped for want of space is answered from the
+    // reading it took (no syscall), and the floor probe runs only for a
+    // request that got past it.
+    let stopped_for_space = engine.is_stopped_for_space().await;
+    let short = match (stopped_for_space, check().await) {
+        (false, Ok(())) => return Ok(()),
+        (true, _) => "the volume this torrent's pieces land on has no room".to_string(),
+        (false, Err(error)) => error,
     };
     tracing::warn!(
         stream_id,
         info_hash = %info_hash,
         file_idx,
-        error = %first,
-        "disk not ready for this stream; running a cache-cleaner pass before giving up on it"
+        error = %short,
+        "disk not ready for this stream; dropping every owner's slack before giving up on it"
     );
-    match crate::cache_cleaner::clean_cache(state).await {
-        Ok(report) => tracing::info!(
-            stream_id,
-            freed = report.freed,
-            deleted = report.deleted,
-            "cache-cleaner pass on behalf of a stream request"
-        ),
-        Err(error) => tracing::warn!(
-            stream_id,
-            error = %format!("{error:#}"),
-            "cache-cleaner pass on behalf of a stream request failed"
-        ),
-    }
-    // The free-space reading is cached for a few seconds against a player's
-    // burst of probes; a pass that just freed space must not be judged by
-    // the reading taken before it.
+    let deleted = free_the_slack_within(
+        SLACK_DROP_BOUND,
+        {
+            let engine = state.engine.clone();
+            async move { engine.drop_slack().await }
+        },
+        {
+            let proxy = state.proxy_cache.clone();
+            async move { proxy.retention().drop_slack().await }
+        },
+    )
+    .await;
+    tracing::info!(
+        stream_id,
+        deleted,
+        "dropped the slack of both cache owners on behalf of a stream request"
+    );
+    // Two readings of the same volume, both of them stale by now and for
+    // two different reasons: this route caches its probe for a few seconds
+    // against a player's burst of requests, and the engine records the
+    // reconciler's, which is up to one tick old. A pass that just freed
+    // space must not be judged by either.
     forget_available_space(&engine_fs.download_dir);
-    match check().await {
-        Ok(()) => Ok(()),
-        Err(error) => {
+    engine_fs.reread_volume();
+    if !engine.is_stopped_for_space().await
+        && let Ok(()) = check().await
+    {
+        return Ok(());
+    }
+    tracing::warn!(
+        stream_id,
+        info_hash = %info_hash,
+        file_idx,
+        "disk still not ready once the slack was gone; refusing the stream"
+    );
+    Err((
+        StatusCode::INSUFFICIENT_STORAGE,
+        INSUFFICIENT_DISK_SPACE_BODY,
+    ))
+}
+
+/// How long the disk gate waits for the two owners to give their slack
+/// back before it answers the request anyway.
+///
+/// A bound and not a deadline for the passes themselves: what is behind
+/// them is a run of `unlink`s on the blocking pool, and a device that has
+/// stopped answering is exactly the device this gate is about. Ten seconds
+/// is far longer than a pass over a full cache takes and far shorter than a
+/// player waits before it gives up, so the only request it ever ends is one
+/// that would otherwise have hung. The passes are not cancelled by it --
+/// they hold their entities' turns and finish in their own time; what the
+/// bound ends is this request's waiting for them.
+const SLACK_DROP_BOUND: Duration = Duration::from_secs(10);
+
+/// Run both owners' slack passes together, and give up waiting after
+/// `bound`. The number of files they took off the disk, or 0 if the bound
+/// ran out first.
+///
+/// Together rather than one after the other: they are two different
+/// devices' worth of work in the general case and neither waits on the
+/// other, and a request holding a `507` is waiting for the sum. The bound
+/// covers the pair, because what it protects against is the disk itself
+/// stalling, and a stalled disk stalls both.
+async fn free_the_slack_within(
+    bound: Duration,
+    torrents: impl std::future::Future<Output = usize> + Send + 'static,
+    proxied: impl std::future::Future<Output = usize> + Send + 'static,
+) -> usize {
+    // Spawned, and that is what makes the bound a bound on the *waiting*
+    // rather than on the passes. A timeout drops what it is waiting on, and
+    // a pass dropped between an unlink and the booking of it is bytes off
+    // the disk that the owner still counts as held -- the count the cap is
+    // stated from, wrong in the direction that says there is room. A
+    // request that gives up, or a client that hangs up, leaves them
+    // running: they are the same passes the next tick would have run.
+    let passes = futures_util::future::join(tokio::spawn(torrents), tokio::spawn(proxied));
+    match tokio::time::timeout(bound, passes).await {
+        Ok((torrents, proxied)) => torrents.unwrap_or(0) + proxied.unwrap_or(0),
+        Err(_) => {
             tracing::warn!(
-                stream_id,
-                info_hash = %info_hash,
-                file_idx,
-                error = %error,
-                "disk still not ready after a cache-cleaner pass; refusing the stream"
+                bound_secs = bound.as_secs(),
+                "the cache owners did not finish giving their slack back in time; \
+                 answering the request from the volume as it stands"
             );
-            Err((
-                StatusCode::INSUFFICIENT_STORAGE,
-                INSUFFICIENT_DISK_SPACE_BODY,
-            ))
+            0
         }
     }
 }
@@ -1055,41 +1151,12 @@ async fn stream_video_with(
     } else {
         end.saturating_sub(start) + 1
     };
-    // A torrent the ladder is already holding stopped for want of disk,
-    // answered from the reading the reconciler took rather than by walking
-    // the cache again.
-    //
-    // This used to be here because the two gates measured two devices: a
-    // pinned download was placed under the removed `downloadsDir` setting,
-    // while `ensure_disk_ready_or_refuse` probes `engine_fs.download_dir`
-    // and nothing else. That gap is closed three times over: the piece
-    // store is the session's default storage and its root is inside
-    // `download_dir`, nothing places a torrent anywhere any more, and there
-    // is one torrent-data root to place it under.
-    //
-    // What is left is a short circuit, and it is worth keeping as one. The
-    // gate below answers a refusal by running a whole cache-cleaner pass
-    // and asking again, which is right for a request that has just met a
-    // full disk -- and wrong to repeat for a player retrying a torrent this
-    // process already stopped for space and already rang the cleaner for
-    // (`out_of_space_signal`): that is a walk of the whole cache root per
-    // retry, several a second, for an answer nothing has changed. This
-    // costs a lookup of the last reading instead. It can only be reached
-    // while the ladder holds the stop, which it lifts within one
-    // `RECONCILE_INTERVAL` of the volume clearing.
-    //
-    // `Engine::is_stopped_for_space` recomputes the predicate from the run
-    // state and that reading, at the same floor a `PlaybackStart` is
-    // measured against (`reconcile::line`), so the gate and the ladder
-    // cannot disagree about this request -- which is what the stored
-    // `stopped_for_space` bit this replaced could not manage.
-    //
-    // --- Stream Lifecycle: registered before either disk gate. ---
+    // --- Stream Lifecycle: registered before the disk gate. ---
     // Registration and the guard that ends it, with no await between them,
     // so a cancelled request never leaves a stream registered that nothing
     // is holding. See `StreamLifecycleGuard::start`.
     //
-    // **Before the gates, and that is the point.** Registering the stream
+    // **Before the gate, and that is the point.** Registering the stream
     // is what makes the file the viewer just left slack, and a slack entity
     // is bytes this server is about to give back. Asking "is there room?"
     // first asked it of a volume still holding the previous film, so a
@@ -1100,22 +1167,10 @@ async fn stream_video_with(
     // old one.
     let lifecycle =
         StreamLifecycleGuard::start(engine_fs.clone(), info_hash.clone(), idx, stream_id).await;
-    if engine.is_stopped_for_space().await {
-        tracing::warn!(
-            stream_id,
-            info_hash = %info_hash,
-            file_idx = idx,
-            "stream refused: the volume this torrent's pieces land on has no room"
-        );
-        return (
-            StatusCode::INSUFFICIENT_STORAGE,
-            INSUFFICIENT_DISK_SPACE_BODY,
-        )
-            .into_response();
-    }
     if let Err(refusal) = ensure_disk_ready_or_refuse(
         &state,
         &engine_fs,
+        &engine,
         stream_id,
         &info_hash,
         idx,
@@ -1392,6 +1447,32 @@ fn stream_open_failure_status(err: &GetFileError) -> (StatusCode, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bound is on the *request*, not on the passes: a reclaim parked
+    /// on a disk that has stopped answering must not hold a player's
+    /// request with it.
+    ///
+    /// One owner finishing and the other never doing is the case the bound
+    /// exists for -- a proxy chunk mid-unlink on a stalled mount -- and
+    /// what the request gets then is the volume as it stands, which is the
+    /// same answer it would have got had there been no slack at all. The
+    /// passes are not cancelled; they hold their entities' turns and finish
+    /// in their own time.
+    #[tokio::test(start_paused = true)]
+    async fn a_parked_pass_does_not_hold_the_request_past_the_bound() {
+        let bound = Duration::from_secs(10);
+        let both = free_the_slack_within(bound, async { 3 }, async { 4 }).await;
+        assert_eq!(both, 7, "the files both owners took, when both answered");
+
+        let started = tokio::time::Instant::now();
+        let parked = free_the_slack_within(bound, async { 3 }, std::future::pending::<usize>());
+        assert_eq!(parked.await, 0, "nothing is claimed for a pass that parked");
+        assert_eq!(
+            started.elapsed(),
+            bound,
+            "and the request waited the bound and no longer"
+        );
+    }
 
     #[test]
     fn stream_open_failure_maps_to_clear_non_2xx_statuses() {
