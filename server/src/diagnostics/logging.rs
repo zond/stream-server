@@ -17,13 +17,19 @@ static ACTIVE_DIRECT_STREAMS: AtomicU64 = AtomicU64::new(0);
 
 pub struct LogWriters {
     pub human_writer: NonBlocking,
-    pub archive_writer: NonBlocking,
     pub json_writer: NonBlocking,
     pub human_path: PathBuf,
-    pub archive_path: PathBuf,
     pub json_path: PathBuf,
     pub guards: Vec<WorkerGuard>,
 }
+
+/// The human-readable log of the running launch. The one before it is
+/// renamed to `server_<when it last wrote>.log` as this one opens.
+const CURRENT_LOG: &str = "server_current.log";
+
+/// How many launches' logs a start leaves on disk, per kind (text and
+/// JSON), this launch's included. Nothing else deletes them.
+pub const KEPT_LAUNCHES: usize = 10;
 
 pub fn init_process_start() {
     let _ = PROCESS_START.set(Instant::now());
@@ -129,45 +135,96 @@ pub fn direct_stream_ended() {
         .ok();
 }
 
+/// Open this launch's two log files: `server_current.log` for people and
+/// `server_<launch>.jsonl` for tools.
+///
+/// Nothing else ever deletes a log, so this start does: the previous
+/// launch's `server_current.log` becomes its archive by rename (so a text
+/// line is written once, not again into a per-launch copy), and all but the
+/// newest [`KEPT_LAUNCHES`] launches of either kind are removed. What one
+/// launch writes is not bounded.
 pub fn open_log_writers(log_dir: &Path) -> std::io::Result<LogWriters> {
     std::fs::create_dir_all(log_dir)?;
 
-    let human_path = log_dir.join("server_current.log");
-    let archive_path = log_dir.join(format!(
-        "server_{}.log",
-        Local::now().format("%Y-%m-%d_%H-%M-%S")
-    ));
+    let human_path = log_dir.join(CURRENT_LOG);
+    let append_to_current = rotate_current_log(log_dir, &human_path);
     let json_path = log_dir.join(format!(
         "server_{}.jsonl",
-        Local::now().format("%Y-%m-%d_%H")
+        Local::now().format("%Y-%m-%d_%H-%M-%S")
     ));
-
     let human_file = std::fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .append(append_to_current)
+        .truncate(!append_to_current)
         .open(&human_path)?;
-    let archive_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&archive_path)?;
     let json_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&json_path)?;
 
+    // After the opens, so this launch's own `.jsonl` is one of the kept,
+    // and the text archives are the kept less the one `server_current.log`
+    // now is.
+    prune_launches(log_dir, ".jsonl", KEPT_LAUNCHES);
+    prune_launches(log_dir, ".log", KEPT_LAUNCHES - 1);
+
     let (human_writer, human_guard) = tracing_appender::non_blocking(human_file);
-    let (archive_writer, archive_guard) = tracing_appender::non_blocking(archive_file);
     let (json_writer, json_guard) = tracing_appender::non_blocking(json_file);
 
     Ok(LogWriters {
         human_writer,
-        archive_writer,
         json_writer,
         human_path,
-        archive_path,
         json_path,
-        guards: vec![human_guard, archive_guard, json_guard],
+        guards: vec![human_guard, json_guard],
     })
+}
+
+/// Rename the previous launch's `server_current.log` to
+/// `server_<its last write>.log`. Answers whether the new launch has to
+/// append to it instead: when the rename failed (on Windows, another
+/// process still has the file open), truncating would destroy that
+/// launch's log rather than archive it.
+fn rotate_current_log(log_dir: &Path, current: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(current) else {
+        return false;
+    };
+    let last_write: chrono::DateTime<Local> = metadata
+        .modified()
+        .map(Into::into)
+        .unwrap_or_else(|_| Local::now());
+    let stamp = last_write.format("%Y-%m-%d_%H-%M-%S").to_string();
+    // Two launches that end in the same second would otherwise have the
+    // second rename replace the first's archive.
+    let mut archive = log_dir.join(format!("server_{stamp}.log"));
+    let mut n = 1;
+    while archive.exists() {
+        archive = log_dir.join(format!("server_{stamp}-{n}.log"));
+        n += 1;
+    }
+    std::fs::rename(current, &archive).is_err()
+}
+
+/// Delete all but the newest `keep` files named `server_*<suffix>` in
+/// `log_dir`, newest by name: every such name carries a time as
+/// `%Y-%m-%d_%H-%M-%S`, which sorts as the time does.
+/// `server_current.log` is never one of them.
+fn prune_launches(log_dir: &Path, suffix: &str, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(log_dir) else {
+        return;
+    };
+    let mut launches: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.starts_with("server_") && name.ends_with(suffix))
+        .filter(|name| name != CURRENT_LOG)
+        .collect();
+    launches.sort_unstable();
+    let excess = launches.len().saturating_sub(keep);
+    for name in &launches[..excess] {
+        let _ = std::fs::remove_file(log_dir.join(name));
+    }
 }
 
 pub fn store_log_guards(guards: Vec<WorkerGuard>) {
@@ -237,14 +294,12 @@ where
 }
 
 /// The one INFO line that says what this process is: version, paths, and the
-/// command line it was started with. Written to every log file, the
-/// append-only archive included.
+/// command line it was started with. Written to both log files.
 pub fn log_startup_context(
     config_dir: &Path,
     cache_dir: &Path,
     log_dir: &Path,
     human_log: &Path,
-    archive_log: &Path,
     json_log: &Path,
 ) {
     log_startup_context_with_args(
@@ -252,7 +307,6 @@ pub fn log_startup_context(
         cache_dir,
         log_dir,
         human_log,
-        archive_log,
         json_log,
         std::env::args(),
     );
@@ -272,7 +326,6 @@ fn log_startup_context_with_args(
     cache_dir: &Path,
     log_dir: &Path,
     human_log: &Path,
-    archive_log: &Path,
     json_log: &Path,
     args: impl IntoIterator<Item = String>,
 ) {
@@ -290,7 +343,6 @@ fn log_startup_context_with_args(
         cache_dir = %cache_dir.display(),
         log_dir = %log_dir.display(),
         human_log = %human_log.display(),
-        archive_log = %archive_log.display(),
         json_log = %json_log.display(),
         args = ?args,
         "server startup context"
@@ -451,6 +503,107 @@ mod tests {
         args.iter().map(|arg| arg.to_string()).collect()
     }
 
+    fn names_in(dir: &Path, suffix: &str) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.ends_with(suffix))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A start archives the previous launch's `server_current.log` rather
+    /// than appending to it, and opens nothing else that repeats its text.
+    #[test]
+    fn a_start_archives_the_previous_current_log_and_starts_it_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join(CURRENT_LOG);
+        std::fs::write(&current, "the previous launch\n").unwrap();
+
+        let writers = open_log_writers(dir.path()).unwrap();
+        drop(writers);
+
+        assert_eq!(std::fs::read_to_string(&current).unwrap(), "");
+        let archives: Vec<String> = names_in(dir.path(), ".log")
+            .into_iter()
+            .filter(|name| name != CURRENT_LOG)
+            .collect();
+        assert_eq!(archives.len(), 1, "{archives:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(&archives[0])).unwrap(),
+            "the previous launch\n"
+        );
+    }
+
+    /// Two launches whose logs end in the same second both keep their
+    /// archive.
+    #[test]
+    fn an_archive_with_the_same_stamp_is_not_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join(CURRENT_LOG);
+        std::fs::write(&current, "the second launch\n").unwrap();
+        let when = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&current)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+        let stamp = chrono::DateTime::<Local>::from(when).format("%Y-%m-%d_%H-%M-%S");
+        let first = dir.path().join(format!("server_{stamp}.log"));
+        std::fs::write(&first, "the first launch\n").unwrap();
+
+        drop(open_log_writers(dir.path()).unwrap());
+
+        assert_eq!(
+            std::fs::read_to_string(&first).unwrap(),
+            "the first launch\n"
+        );
+        let second = dir.path().join(format!("server_{stamp}-1.log"));
+        assert_eq!(
+            std::fs::read_to_string(&second).unwrap(),
+            "the second launch\n"
+        );
+    }
+
+    /// Each start leaves [`KEPT_LAUNCHES`] launches of each kind, the
+    /// newest, and deletes the rest.
+    #[test]
+    fn a_start_keeps_only_the_newest_launches() {
+        let dir = tempfile::tempdir().unwrap();
+        for second in 10..30 {
+            for suffix in [".log", ".jsonl"] {
+                let name = format!("server_2020-01-01_00-00-{second}{suffix}");
+                std::fs::write(dir.path().join(name), "old").unwrap();
+            }
+        }
+
+        let writers = open_log_writers(dir.path()).unwrap();
+        drop(writers);
+
+        let texts = names_in(dir.path(), ".log");
+        assert_eq!(texts.len(), KEPT_LAUNCHES, "{texts:?}");
+        assert!(texts.contains(&CURRENT_LOG.to_string()), "{texts:?}");
+        assert!(
+            texts.contains(&"server_2020-01-01_00-00-29.log".to_string()),
+            "the newest archive stays: {texts:?}"
+        );
+        assert!(
+            !texts.contains(&"server_2020-01-01_00-00-20.log".to_string()),
+            "{texts:?}"
+        );
+        let jsons = names_in(dir.path(), ".jsonl");
+        assert_eq!(jsons.len(), KEPT_LAUNCHES, "{jsons:?}");
+        assert!(
+            !jsons
+                .iter()
+                .any(|name| name.starts_with("server_2020-01-01_00-00-20")),
+            "{jsons:?}"
+        );
+    }
+
     #[test]
     fn the_token_is_redacted_in_both_spellings_and_nothing_else_is_touched() {
         assert_eq!(
@@ -481,7 +634,6 @@ mod tests {
         let dir = Path::new("nowhere");
         tracing::subscriber::with_default(subscriber, || {
             log_startup_context_with_args(
-                dir,
                 dir,
                 dir,
                 dir,

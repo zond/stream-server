@@ -962,10 +962,8 @@ pub async fn run(
     if cfg.init_logging {
         let log_writers = diagnostics::logging::open_log_writers(&log_dir)?;
         let human_log_path = log_writers.human_path.clone();
-        let archive_log_path = log_writers.archive_path.clone();
         let json_log_path = log_writers.json_path.clone();
         let human_writer = log_writers.human_writer;
-        let archive_writer = log_writers.archive_writer;
         let json_writer = log_writers.json_writer;
         let guards = log_writers.guards;
 
@@ -978,9 +976,6 @@ pub async fn run(
         let human_file_layer = tracing_subscriber::fmt::layer()
             .with_writer(human_writer)
             .with_ansi(false);
-        let archive_file_layer = tracing_subscriber::fmt::layer()
-            .with_writer(archive_writer)
-            .with_ansi(false);
         let json_file_layer = tracing_subscriber::fmt::layer()
             .json()
             .with_writer(json_writer)
@@ -989,28 +984,25 @@ pub async fn run(
         let init_result = if let Some(layer) = tui_log_layer {
             registry
                 .with(human_file_layer)
-                .with(archive_file_layer)
                 .with(json_file_layer)
                 .with(layer)
                 .try_init()
         } else if std::io::stdout().is_terminal() {
             registry
                 .with(human_file_layer)
-                .with(archive_file_layer)
                 .with(json_file_layer)
                 .with(tracing_subscriber::fmt::layer())
                 .try_init()
         } else {
             registry
                 .with(human_file_layer)
-                .with(archive_file_layer)
                 .with(json_file_layer)
                 .try_init()
         };
 
         if init_result.is_ok() {
             diagnostics::logging::store_log_guards(guards);
-            startup_log_paths = Some((human_log_path, archive_log_path, json_log_path));
+            startup_log_paths = Some((human_log_path, json_log_path));
         }
     }
 
@@ -1023,13 +1015,12 @@ pub async fn run(
     if cfg.manage_process_globals {
         diagnostics::logging::install_native_crash_handler(&log_dir);
     }
-    if let Some((human_log_path, archive_log_path, json_log_path)) = startup_log_paths {
+    if let Some((human_log_path, json_log_path)) = startup_log_paths {
         diagnostics::logging::log_startup_context(
             &config_dir,
             &cache_dir,
             &log_dir,
             &human_log_path,
-            &archive_log_path,
             &json_log_path,
         );
     }
@@ -1167,7 +1158,7 @@ pub async fn run(
         Some(token) => {
             tracing::info!("control API requires `Authorization: Bearer <token>`");
             // The token is a secret and must never reach `tracing`: the log
-            // files (the append-only archive included) would keep it. A
+            // files would keep it, and the kept launches' archives with them. A
             // generated token has no other way to reach the operator of the
             // standalone binary, so it goes to stdout once; a `--token` /
             // `STREAM_SERVER_TOKEN` token is already known to whoever set it,
