@@ -1316,8 +1316,10 @@ pub async fn run(
     {
         tui::start_tui(Arc::new(state.clone()), rx, shutdown_tx);
     }
-    // Moved, not dropped (as `let _ =` would): a closed channel reads as the
-    // TUI's quit and shuts the server down at once.
+    // Nothing sends on it without the TUI, but it must live to the end of
+    // `run`: a `drop(shutdown_tx)` would close the channel, which the
+    // select below reads as the TUI's quit, and shut the server down at
+    // once. The binding only names it for the unused-variable lint.
     #[cfg(not(feature = "tui"))]
     let _no_tui_quits = shutdown_tx;
 
