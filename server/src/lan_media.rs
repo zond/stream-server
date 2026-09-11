@@ -55,6 +55,10 @@ pub struct LanMedia {
     /// from the serving task on every request and read from whatever thread
     /// asks, and neither cares to be ordered against anything else.
     requests: AtomicU64,
+    /// The address in `running`, mirrored where a reader needs no await:
+    /// written under that lock, read without it. See
+    /// [`LanMedia::bound_addr`].
+    bound: std::sync::Mutex<Option<SocketAddr>>,
 }
 
 struct Running {
@@ -68,6 +72,7 @@ impl LanMedia {
             configured_addr,
             running: tokio::sync::Mutex::new(None),
             requests: AtomicU64::new(0),
+            bound: std::sync::Mutex::new(None),
         }
     }
 
@@ -80,12 +85,18 @@ impl LanMedia {
     /// not running. With a configured port of 0 this is the OS-assigned port,
     /// which is why the answer comes from the listener and not from the
     /// configuration.
-    pub async fn bound_addr(&self) -> Option<SocketAddr> {
-        self.running
-            .lock()
-            .await
-            .as_ref()
-            .map(|running| running.bound)
+    ///
+    /// Synchronous, and never behind the listener's lock: it used to wait
+    /// for that lock, which a start holds for the whole of its bind, and
+    /// `ServerHandle::lan_media_running` reached it through a hop onto the
+    /// server's runtime -- a question an embedder asks from a UI thread,
+    /// with no await of its own to give up.
+    pub fn bound_addr(&self) -> Option<SocketAddr> {
+        *self.bound.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn publish_bound(&self, bound: Option<SocketAddr>) {
+        *self.bound.lock().unwrap_or_else(|e| e.into_inner()) = bound;
     }
 
     /// Bind the listener and start serving media routes on it. Idempotent:
@@ -146,6 +157,7 @@ impl LanMedia {
             "LAN media listener started; media routes only, no control API"
         );
         *running = Some(Running { bound, task });
+        self.publish_bound(Some(bound));
         Ok(bound)
     }
 
@@ -187,6 +199,7 @@ impl LanMedia {
     pub async fn stop(&self) {
         let mut running = self.running.lock().await;
         if let Some(running) = running.take() {
+            self.publish_bound(None);
             running.task.abort();
             // Awaiting the aborted task is what makes the stop observable:
             // the task owns the `TcpListener`, so the port is only released
@@ -248,7 +261,7 @@ impl LanMedia {
     /// nothing on either side says why. The address is a private one on the
     /// user's own LAN, not a secret.
     pub async fn base_url_for(&self, peer: IpAddr) -> Option<Url> {
-        let Some(bound) = self.bound_addr().await else {
+        let Some(bound) = self.bound_addr() else {
             tracing::info!(%peer, "no LAN media URL: the listener is not running");
             return None;
         };

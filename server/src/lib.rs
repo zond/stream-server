@@ -768,14 +768,14 @@ impl ServerHandle {
     /// The address the LAN media listener is bound to, or `None` when it is
     /// not running. With a configured port of `0` this is the port the OS
     /// assigned.
+    ///
+    /// Cheap: no runtime hop, and never waits for a start or a stop.
     pub fn lan_media_addr(&self) -> Option<SocketAddr> {
-        let state = self.state.clone();
-        self.block_on_server(async move { state.lan_media.bound_addr().await })
-            .ok()
-            .flatten()
+        self.state.lan_media.bound_addr()
     }
 
-    /// Whether the LAN media listener is running right now.
+    /// Whether the LAN media listener is running right now. Cheap, like
+    /// [`Self::lan_media_addr`].
     pub fn lan_media_running(&self) -> bool {
         self.lan_media_addr().is_some()
     }
