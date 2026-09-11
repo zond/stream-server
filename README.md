@@ -69,7 +69,7 @@ No releases have been published from this fork yet — build from source (see be
 
 ### Build from Source
 
-**The build needs zero system libraries** — no libtorrent, no libclang, no FFmpeg, no GUI toolkits, for any feature combination this repo has; the one tool beyond Rust is a C compiler, for the C `aws-lc-sys` and `libmimalloc-sys` build from source. The pinned toolchain in `rust-toolchain.toml` (Rust 1.98.0) is picked up automatically by rustup, and this is exactly what CI verifies with no `apt install` step at all:
+**The build needs zero system libraries** — no libtorrent, no libclang, no FFmpeg, no GUI toolkits, for any feature combination this repo has; the one tool beyond Rust is a C compiler, for the C `aws-lc-sys` and `libmimalloc-sys` build from source (and, on macOS, a one-file shim `network-interface` compiles). The pinned toolchain in `rust-toolchain.toml` (Rust 1.98.0) is picked up automatically by rustup, and this is exactly what CI verifies with no `apt install` step at all:
 
 ```bash
 # Default build: pure-Rust librqbit backend (the only backend) + pure-Rust RAR.
