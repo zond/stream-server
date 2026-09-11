@@ -4429,6 +4429,18 @@ fn a_stream_refused_for_space_frees_the_slack_and_asks_again() -> anyhow::Result
 /// `totalBytes`, plus `verified`, which is the only field that means the
 /// piece can actually be served.
 ///
+/// The piece named is the one at the offset the reader was opened at, which
+/// is what a player starting up waits on (see `StreamPositions` in the
+/// librqbit backend), and it is named only while that reader is open.
+///
+/// So the fixture leaves piece 1 out, and no peer will ever bring it: a read
+/// from the head is sent piece 0 and then waits at piece 1 for as long as
+/// the test holds the response, which keeps the reader open while the stats
+/// are asked. A fully seeded file would not do -- its body fits in the
+/// socket buffers, the server finishes writing it whatever the client reads,
+/// and the reader has closed (and taken its piece with it) before the stats
+/// are asked.
+///
 /// Absence is a state of its own: before anything opens the file there is
 /// no reader and so no piece anybody waits on, and that must read as `null`
 /// rather than as a piece with nothing downloaded. The library API sees
@@ -4438,41 +4450,78 @@ fn stats_json_reports_the_piece_the_open_reader_waits_for() -> anyhow::Result<()
     let config_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
     let src = tempfile::tempdir()?;
-    let (handle, base, info_hash, idx, payload) =
-        lan_media_server(config_dir.path(), cache_dir.path(), src.path(), None)?;
+
+    // One file, four 16 KiB pieces, and piece 1 never seeded.
+    let content = src.path().join("Movie");
+    std::fs::create_dir_all(&content)?;
+    write_payload(&content.join("movie.bin"), 64 * 1024);
+    let payload = std::fs::read(content.join("movie.bin"))?;
+    let (torrent, info_hash) = real_torrent(&content);
+    let cache_root = resolved(&cache_dir.path().join("cache"));
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_root.clone()),
+        ..offline_config()
+    })?;
+    // After the start (see `seed_piece_store_pieces`).
+    seed_piece_store_pieces(
+        &cache_root,
+        &torrent,
+        &content,
+        None,
+        Some(16 * 1024..32 * 1024),
+    );
+    let base = format!("http://{}", handle.http_addr());
     let client = bearer_client(&handle)?;
+    client
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
+        .send()?
+        .error_for_status()?;
+    let stats = stats_after_check(&client, &base, &info_hash)?;
+    let idx = file_index(&stats, "movie.bin");
 
     // Polling stats is not opening a stream: nothing is in flight yet.
     let stats = file_stats_after_check(&client, &base, &info_hash, idx)?;
     assert_eq!(stats["inFlightPiece"], serde_json::Value::Null, "{stats}");
     let piece_length = stats["pieceLength"].as_u64().expect("metadata resolved");
-    // The file's own offset decides which torrent piece its head is in, and
-    // the fixture does not control the torrent's file order.
-    let file_offset = stats["files"][idx]["offset"].as_u64().expect("file offset");
+    assert_eq!(piece_length, 16 * 1024, "{stats}");
     assert_eq!(
         serde_json::to_value(handle.file_stats(&info_hash, idx, &[])?)?["inFlightPiece"],
         serde_json::Value::Null,
         "the library API reports the same absence"
     );
 
-    // A `Range` request opens a reader at the file's head, which is what
-    // makes a piece the one being waited for.
+    // A read from the head: piece 0 is there and is sent, and the reader
+    // then parks at piece 1. The response is held for the rest of the test.
     let anonymous = reqwest::blocking::Client::new();
-    let response = anonymous
+    let mut response = anonymous
         .get(format!("{base}/{info_hash}/{idx}"))
-        .header(reqwest::header::RANGE, "bytes=0-15")
+        .header(reqwest::header::RANGE, "bytes=0-")
         .send()?;
     assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
-    assert_eq!(response.bytes()?.as_ref(), &payload[0..16]);
+    let mut head = [0u8; 16];
+    std::io::Read::read_exact(&mut response, &mut head)?;
+    assert_eq!(&head, &payload[0..16]);
 
-    let stats = file_stats_after_check(&client, &base, &info_hash, idx)?;
-    let piece = stats["inFlightPiece"]
-        .as_object()
-        .unwrap_or_else(|| panic!("a reader is open: {stats}"));
-    assert_eq!(piece["index"], file_offset / piece_length, "{stats}");
+    let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
+    let stats = loop {
+        let stats = file_stats_after_check(&client, &base, &info_hash, idx)?;
+        if !stats["inFlightPiece"].is_null() {
+            break stats;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the open reader's piece never showed: {stats}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let piece = &stats["inFlightPiece"];
+    assert_eq!(piece["index"], 0, "the piece it was opened in: {stats}");
     assert_eq!(piece["totalBytes"], piece_length, "{stats}");
-    // The fixture is pre-seeded, so the piece is on disk and hash-checked:
-    // the one state in which a client may treat it as ready.
+    // The fixture seeded it, so it is on disk and hash-checked: the one
+    // state in which a client may treat it as ready.
     assert_eq!(piece["downloadedBytes"], piece_length, "{stats}");
     assert_eq!(piece["verified"], true, "{stats}");
     // Per file as well as at the top level, for the same file.
@@ -4484,6 +4533,7 @@ fn stats_json_reports_the_piece_the_open_reader_waits_for() -> anyhow::Result<()
         assert_eq!(api[key], stats[key], "{key}");
     }
 
+    drop(response);
     handle.shutdown()?;
     handle.join()?;
     Ok(())
