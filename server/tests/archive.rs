@@ -443,3 +443,20 @@ fn an_empty_member_is_empty_and_a_range_past_the_end_is_refused() -> anyhow::Res
 
     fixture.finish()
 }
+
+/// A 7z inside a torrent is refused as a format the torrent form cannot
+/// read, before anything looks for the torrent. It used to go through the
+/// torrent's file list, register a stream -- which starts a torrent the
+/// reconciler had stopped -- and open a reader, and then answer 404 for any
+/// member at all, because the 7z handler refuses a stream at its first open.
+#[test]
+fn a_7z_inside_a_torrent_is_refused_as_unreadable_rather_than_missing() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let response = reqwest::blocking::get(format!(
+        "{}/7zip/stream/torrent:{}%2Ffixture.7z/first.txt",
+        fixture.base,
+        "ab".repeat(20)
+    ))?;
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_IMPLEMENTED);
+    fixture.finish()
+}

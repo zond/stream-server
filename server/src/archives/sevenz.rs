@@ -1,12 +1,10 @@
 use super::{
-    ArchiveEntry, ArchiveReader, AsyncSeekableReader, CacheConfig, OpenedMember,
+    ArchiveEntry, ArchiveReader, CacheConfig, OpenedMember,
     cache::{ProgressiveCache, SyncCacheWriter},
 };
 use anyhow::{Result, anyhow};
 use sevenz_rust2::{Archive, ArchiveReader as SevenZReader, BlockDecoder, Password};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use tokio::sync::Mutex;
 
 /// 7z archive handler backed by the pure-Rust `sevenz-rust2` crate.
 ///
@@ -14,29 +12,13 @@ use tokio::sync::Mutex;
 /// thread pool. Extracted data is streamed into a [`ProgressiveCache`] whose
 /// reader supports the range/seek semantics the HTTP layer expects.
 pub struct SevenZHandler {
-    path: Option<PathBuf>,
-    _reader: Arc<Mutex<Option<Box<dyn AsyncSeekableReader>>>>,
+    path: PathBuf,
     cache_config: CacheConfig,
 }
 
 impl SevenZHandler {
     pub fn new_with_config(path: PathBuf, cache_config: CacheConfig) -> Self {
-        Self {
-            path: Some(path),
-            _reader: Arc::new(Mutex::new(None)),
-            cache_config,
-        }
-    }
-
-    pub fn new_with_reader(
-        reader: Box<dyn AsyncSeekableReader>,
-        cache_config: CacheConfig,
-    ) -> Self {
-        Self {
-            path: None,
-            _reader: Arc::new(Mutex::new(Some(reader))),
-            cache_config,
-        }
+        Self { path, cache_config }
     }
 }
 
@@ -129,13 +111,7 @@ fn extract_entry(archive_path: &Path, entry_name: &str, out: &mut SyncCacheWrite
 #[async_trait::async_trait]
 impl ArchiveReader for SevenZHandler {
     async fn list_files(&self) -> Result<Vec<ArchiveEntry>> {
-        let Some(path) = self.path.clone() else {
-            // Stream-based access would require a sync Read + Seek bridge over
-            // the async reader; the server always goes through a local path.
-            return Err(anyhow!(
-                "Listing files from generic stream not supported yet"
-            ));
-        };
+        let path = self.path.clone();
 
         tokio::task::spawn_blocking(move || {
             let reader = SevenZReader::open(&path, Password::empty())
@@ -156,10 +132,7 @@ impl ArchiveReader for SevenZHandler {
     }
 
     async fn open_file(&self, path: &str) -> Result<OpenedMember> {
-        let Some(archive_path) = self.path.clone() else {
-            // Stream-based access not yet supported (see list_files).
-            return Err(anyhow!("Streaming 7z from remote source not supported yet"));
-        };
+        let archive_path = self.path.clone();
         let target = path.to_string();
 
         // Metadata pass: verify the entry exists and get its uncompressed size
@@ -215,6 +188,7 @@ mod tests {
     use super::*;
     use sevenz_rust2::{ArchiveEntry as SevenZEntry, ArchiveWriter, SourceReader};
     use std::io::Cursor;
+    use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
     const FIRST_CONTENT: &[u8] = b"hello from the first entry\n";

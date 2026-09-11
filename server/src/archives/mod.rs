@@ -273,26 +273,28 @@ pub async fn get_archive_reader_with_config(
     }
 }
 
+/// Whether [`get_archive_reader_from_stream`] can read archives with this
+/// extension (without its dot, any case): zip alone. 7z's decoder wants a
+/// seekable `std` file, and its handler was handed a stream only to refuse
+/// it at the first open.
+pub fn streams_from_a_reader(extension: &str) -> bool {
+    extension.eq_ignore_ascii_case("zip")
+}
+
 pub fn get_archive_reader_from_stream(
     reader: Box<dyn AsyncSeekableReader>,
     extension: &str,
     cache_config: CacheConfig,
 ) -> Result<Box<dyn ArchiveReader>> {
-    let ext = extension.to_lowercase();
-    if ext == "zip" {
+    if streams_from_a_reader(extension) {
         Ok(Box::new(zip::ZipHandler::new_with_reader(
-            reader,
-            cache_config,
-        )))
-    } else if ext == "7z" {
-        Ok(Box::new(sevenz::SevenZHandler::new_with_reader(
             reader,
             cache_config,
         )))
     } else {
         Err(anyhow::anyhow!(
             "Unsupported archive type for streaming: .{}",
-            ext
+            extension
         ))
     }
 }

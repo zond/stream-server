@@ -623,6 +623,24 @@ async fn stream_file(
         let hash_part = parts[0].strip_prefix("torrent:").unwrap();
         // The path part inside the torrent:
         let archive_internal_path = parts.iter().skip(1).copied().collect::<Vec<_>>().join("/");
+        // The reader is chosen by the archive's extension, not its whole
+        // path -- and asked for before the torrent is looked at. A format
+        // no stream reader exists for (7z needs a seekable file; its handler
+        // refused a stream after the fact) used to go through the lookup,
+        // register a stream -- which starts a torrent the reconciler had
+        // stopped -- and open a reader, only to answer 404 for a member
+        // that may well be there.
+        let extension = archive_internal_path
+            .rsplit_once('.')
+            .map(|(_, extension)| extension)
+            .unwrap_or("");
+        if !crate::archives::streams_from_a_reader(extension) {
+            return Ok((
+                StatusCode::NOT_IMPLEMENTED,
+                format!("Archives of type .{extension} cannot be read from inside a torrent"),
+            )
+                .into_response());
+        }
 
         let engine = &state.engine;
         // EngineFS uses string info_hash
@@ -634,9 +652,10 @@ async fn stream_file(
             // Engine has `handle`.
             let handle = &engine_instance.handle;
 
-            // handle is `H: TorrentHandle`.
-            let stats = handle.stats().await;
-            let files = stats.files;
+            // The file list alone: `stats()` builds the whole stats
+            // snapshot -- per-file progress, trackers, a scrape scheduled --
+            // for a name lookup.
+            let files = handle.get_files().await;
 
             // Find index
             if let Some(idx) = files.iter().position(|f| f.name == archive_internal_path) {
@@ -709,12 +728,6 @@ async fn stream_file(
                 // We need to ensure wrapped_reader is `AsyncSeekableReader`.
                 // Ideally `ArchiveReader` accepts `Box<dyn AsyncSeekableReader>`.
 
-                // The reader is chosen by the archive's extension, not its
-                // whole path.
-                let extension = archive_internal_path
-                    .rsplit_once('.')
-                    .map(|(_, extension)| extension)
-                    .unwrap_or("");
                 let archive_reader = crate::archives::get_archive_reader_from_stream(
                     wrapped_reader,
                     extension,
