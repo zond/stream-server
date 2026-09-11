@@ -852,8 +852,9 @@ pub struct StatsFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_window_bytes: Option<u64>,
     /// Byte progress of the piece an open reader on *this* file is sitting
-    /// on, see [`InFlightPiece`]. Omitted unless a reader has been opened on
-    /// the file and the torrent has a chunk map (live or paused).
+    /// on, see [`InFlightPiece`]. Omitted unless a reader is open on the
+    /// file -- one that has closed is sitting on nothing -- and the torrent
+    /// has a chunk map (live or paused).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_flight_piece: Option<InFlightPiece>,
     /// The file is pinned as an offline download (`TorrentHandle::pin_file`):

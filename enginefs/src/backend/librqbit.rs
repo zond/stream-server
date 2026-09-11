@@ -2372,7 +2372,7 @@ impl TorrentHandle for LibrqbitHandle {
                     )
                 });
                 // Sub-piece progress for the piece this file's reader is
-                // waiting on. Only for a file somebody has actually opened
+                // waiting on. Only for a file a reader is open on
                 // (`read_from`): otherwise there is no reader, nothing is in
                 // flight for it, and absence is the honest answer -- and it
                 // keeps the per-poll cost at one cheap bit-count per open

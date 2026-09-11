@@ -2555,21 +2555,25 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// finished, which on a television with sixteen thousand cache files is
     /// minutes after the first stream opened.
     ///
-    /// What it does **not** count is what no store speaks for: strays, and
-    /// a torrent held in Error. Those are read by
+    /// What it does **not** count is what no store speaks for -- strays,
+    /// and a torrent held in Error -- nor a registered store's staged
+    /// copies, which a held bit does not price. Those are read by
     /// [`Self::cache_holdings`], on demand, because reading them costs a
-    /// `read_dir`.
+    /// `read_dir` and a `stat` each.
     pub fn cache_occupancy(&self) -> u64 {
         self.registry.occupancy()
     }
 
     /// What the piece store holds and what nothing may take from it, whole:
-    /// [`Self::cache_occupancy`] plus the bytes no store speaks for, and
-    /// the pins and live windows that keep part of it.
+    /// [`Self::cache_occupancy`] plus the bytes no store speaks for and the
+    /// registered stores' staged copies, and the pins and live windows that
+    /// keep part of it.
     ///
     /// The reading behind `GET /cache.json`. It is the on-demand half of
-    /// the pair: one `read_dir` of the store root on the blocking pool for
-    /// the unregistered bytes, and a copy-out per engine for the
+    /// the pair: one `read_dir` of the store root and a `stat` per staged
+    /// copy on the blocking pool for the bytes the held bits do not price
+    /// ([`crate::piece_store::StoreRegistry::unregistered_bytes`]), and a
+    /// copy-out per engine for the
     /// protections. Nothing here is on a tick, and nothing here walks the
     /// tree.
     ///

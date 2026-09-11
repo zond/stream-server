@@ -204,8 +204,9 @@ pub use sweep::{SweepReport, sweep_before_session, sweep_legacy_downloads, sweep
 
 /// The store's directory inside a torrent cache root.
 ///
-/// Dot-prefixed like the engine's other private subdirectories (`.cache`,
-/// `.metadata`) so that a torrent named `pieces` cannot land on top of it.
+/// Dot-prefixed, like the proxy cache's `.proxy` and the archive scratch's
+/// `.archives` beside it, so that a torrent named `pieces` cannot land on
+/// top of it.
 ///
 /// Inside the cache root rather than beside it, deliberately: piece files
 /// are cache, and whoever is counting the cache has to be able to see them
