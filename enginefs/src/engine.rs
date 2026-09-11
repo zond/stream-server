@@ -761,6 +761,46 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
     }
 }
 
+/// Give every pinned file of `pinned` that has no entity one, by installing
+/// on it under the pin.
+///
+/// A pin is a write to the engine's pin set and a `pin_file` on the
+/// backend, and neither makes an entity, so a pinned file nothing has
+/// opened in this process is in no pass's list: not the passes, which walk
+/// entities, and not `reclaim_rest`, which a pinned torrent is exempt from.
+/// That is the right shape for a file that was never touched -- there is
+/// nothing to undo -- and the wrong one for a file a slack pass had dropped
+/// the pieces of and then forgotten, or that `reclaim_rest` had dropped as
+/// outside every entity. The fork's `pin_file` re-queues only pieces of a
+/// file that was not selected before, and a file whose pieces a reclaim
+/// dropped is still selected, so the pin queues nothing; every piece the
+/// reclaim took stays neither had nor wanted, and the download the user
+/// asked for stands still until something wants the file again. The only
+/// thing that does is [`Backing::want_all`], reached through
+/// [`Retention::install`] -- which is what an open would do, so this does
+/// what an open would: install, once, and let the pin exit of the passes
+/// do the rest. Under a pin the install holds nothing back, gives back
+/// whatever the forgotten entity or `reclaim_rest` was holding back, and
+/// wants the whole file. Once, because the entity it makes stays -- a
+/// pinned entity's passes take the pin exit and never forget it -- and a
+/// file it makes no entity for (no metadata yet) is asked again next tick.
+async fn adopt_pins<H: TorrentHandle>(
+    retention: &Retention<TorrentBacking<H>>,
+    pinned: &[usize],
+    info_hash: &str,
+) {
+    let known: BTreeSet<usize> = retention.keys().into_iter().collect();
+    for &file_idx in pinned.iter().filter(|idx| !known.contains(idx)) {
+        let outcome = retention.install(file_idx, file_idx).await;
+        tracing::debug!(
+            info_hash,
+            file_idx,
+            ?outcome,
+            "a pinned file nothing has opened gets an entity, and every piece of it wanted again"
+        );
+    }
+}
+
 pub struct Engine<H: TorrentHandle> {
     pub info_hash: String,
     pub handle: H,
@@ -1432,6 +1472,14 @@ impl<H: TorrentHandle> Engine<H> {
         ) {
             return None;
         }
+        // The pinned files nothing has opened first, so that the entities
+        // this makes are among the ones this tick passes over.
+        adopt_pins(
+            &self.retention,
+            &self.pinned_file_indices(),
+            &self.info_hash,
+        )
+        .await;
         let mut total = self.pass_over(store, &self.files_to_pass(live)).await;
         // And the files nothing has opened in this process. They have no
         // entity, so no pass walks them and no window is drawn round them;
@@ -1805,5 +1853,166 @@ impl<H: TorrentHandle> Engine<H> {
             file_idx,
             start_offset,
         ))
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+    use crate::backend::{BackendFileInfo, FileStreamTrait, RunState, TransferTotals};
+    use crate::retention::RetentionBudget;
+    use std::time::Duration;
+
+    const PIECE: u64 = 1000;
+
+    /// The least a handle can be for the owner to install on it: two files
+    /// of eight pieces, live, recording every range it is asked to want
+    /// again.
+    #[derive(Clone)]
+    struct PinnedHandle {
+        reselected: Arc<parking_lot::Mutex<Vec<Range<u32>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TorrentHandle for PinnedHandle {
+        fn info_hash(&self) -> String {
+            "pinned".to_string()
+        }
+
+        fn name(&self) -> Option<String> {
+            None
+        }
+
+        async fn stats(&self) -> EngineStats {
+            EngineStats::resolving_metadata("pinned", &[])
+        }
+
+        fn transfer_totals(&self) -> Option<TransferTotals> {
+            None
+        }
+
+        async fn add_trackers(&self, _trackers: Vec<String>) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn run_state(&self) -> RunState {
+            RunState::Live
+        }
+
+        async fn get_file_reader(
+            &self,
+            _file_idx: usize,
+            _start_offset: u64,
+            _priority: u8,
+            _bitrate: Option<u64>,
+            _lookahead_bytes: u64,
+        ) -> anyhow::Result<Box<dyn FileStreamTrait>> {
+            anyhow::bail!("nothing here is read")
+        }
+
+        async fn get_files(&self) -> Vec<BackendFileInfo> {
+            Vec::new()
+        }
+
+        async fn prepare_file_for_streaming(&self, _file_idx: usize) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn clear_file_streaming(&self, _file_idx: usize) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn wait_for_piece_ready(
+            &self,
+            _file_idx: usize,
+            _offset: u64,
+            _timeout: Duration,
+            _lookahead_bytes: u64,
+        ) -> anyhow::Result<crate::backend::PieceReadiness> {
+            anyhow::bail!("nothing here is waited for")
+        }
+
+        async fn file_pieces(&self, file_idx: usize) -> Option<FilePieceSpan> {
+            (file_idx < 2).then(|| {
+                let start = file_idx as u32 * 8;
+                FilePieceSpan {
+                    pieces: start..start + 8,
+                    offset: u64::from(start) * PIECE,
+                    bytes: 8 * PIECE,
+                }
+            })
+        }
+
+        fn piece_length(&self) -> Option<u64> {
+            Some(PIECE)
+        }
+
+        async fn reselect_pieces(&self, pieces: Range<u32>) -> anyhow::Result<usize> {
+            self.reselected.lock().push(pieces.clone());
+            Ok((pieces.end - pieces.start) as usize)
+        }
+    }
+
+    fn owner(
+        handle: PinnedHandle,
+        pinned: Arc<parking_lot::RwLock<BTreeSet<usize>>>,
+    ) -> Arc<Retention<TorrentBacking<PinnedHandle>>> {
+        Retention::new(
+            Arc::new(TorrentBacking {
+                handle,
+                info_hash: "pinned".to_string(),
+                live: Arc::new(Live::new()),
+                pinned,
+                pins_unknown: Arc::default(),
+                refused: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(RetentionBudget::default()),
+        )
+    }
+
+    /// **A pinned file with no entity is wanted whole, once.**
+    ///
+    /// The case no pass reaches: a slack pass dropped the file's pieces,
+    /// emptied it and forgot its entity (or `reclaim_rest` dropped them,
+    /// and there never was one), and then the user pinned the file without
+    /// opening it. The fork's `pin_file` re-queues nothing for a file that
+    /// was selected all along, the passes walk entities and it has none,
+    /// and `reclaim_rest` leaves a pinned torrent alone -- so nothing
+    /// wanted the pieces again and the download stood still. The tick's
+    /// adoption installs on it under the pin, which wants the whole file,
+    /// and the entity it leaves is what stops it doing so again.
+    #[tokio::test]
+    async fn a_pinned_file_with_no_entity_is_wanted_whole_once() {
+        let handle = PinnedHandle {
+            reselected: Arc::default(),
+        };
+        let pinned = Arc::new(parking_lot::RwLock::new(BTreeSet::new()));
+        let owner = owner(handle.clone(), pinned.clone());
+
+        adopt_pins(&owner, &[], "pinned").await;
+        assert!(
+            handle.reselected.lock().is_empty(),
+            "nothing pinned, nothing adopted"
+        );
+
+        pinned.write().insert(1);
+        adopt_pins(&owner, &[1], "pinned").await;
+        assert_eq!(
+            *handle.reselected.lock(),
+            vec![8..16],
+            "the pinned file is wanted whole"
+        );
+        assert!(owner.holding(&1).is_some(), "and has an entity now");
+        assert!(
+            owner.holding(&0).is_none(),
+            "the file nobody pinned or opened still has none"
+        );
+
+        adopt_pins(&owner, &[1], "pinned").await;
+        assert_eq!(
+            *handle.reselected.lock(),
+            vec![8..16],
+            "once: the entity it made is what every later tick's pass reaches it through"
+        );
     }
 }
