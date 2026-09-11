@@ -973,7 +973,7 @@ pub async fn run(
     }
 
     let mut startup_log_paths = None;
-    if cfg.init_logging {
+    if cfg.init_logging && !diagnostics::logging::log_files_installed() {
         let log_writers = diagnostics::logging::open_log_writers(&log_dir)?;
         let human_log_path = log_writers.human_path.clone();
         let json_log_path = log_writers.json_path.clone();

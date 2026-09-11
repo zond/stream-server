@@ -231,6 +231,17 @@ pub fn store_log_guards(guards: Vec<WorkerGuard>) {
     let _ = LOG_GUARDS.set(guards);
 }
 
+/// Whether this process has already installed its log files. Once it has,
+/// they are the process's for good: the global subscriber cannot be
+/// replaced, and it goes on appending to the file it opened. So a second
+/// start in one process (the JNI surface's stop, then start) must not open
+/// them again -- the rotation would rename `server_current.log` out from
+/// under that writer, leaving the fresh `server_current.log` empty and the
+/// live log under an archive's name for the prune to delete.
+pub fn log_files_installed() -> bool {
+    LOG_GUARDS.get().is_some()
+}
+
 pub fn install_panic_hook() {
     static PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
     if PANIC_HOOK_INSTALLED.set(()).is_err() {
