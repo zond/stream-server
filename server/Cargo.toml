@@ -19,7 +19,7 @@ path = "src/main.rs"
 enginefs = { path = "../enginefs" }
 axum = { version = "0.8.8", features = ["default"] }
 tokio = { version = "1.42", features = ["full"] }
-tower-http = { version = "0.7.0", features = ["cors", "trace", "fs", "limit"] }
+tower-http = { version = "0.7.0", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2.4"
