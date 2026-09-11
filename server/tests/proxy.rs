@@ -1652,6 +1652,14 @@ fn holds_no_more_than(fixture: &Fixture, chunks: usize) {
 /// playhead playback really ended at; what that pass leaves is what the
 /// bound is about.
 fn holds_no_more_than_after_the_last_byte(fixture: &Fixture, url: &str, at: u64, chunks: usize) {
+    // Settled *first*, and this is the whole of why: the byte below has to be
+    // served from the cache, and the last chunk of a body that has just ended
+    // may still be on its way to the disk. Asked too early it misses, goes to
+    // the origin, and the next `next_request()` in the test gets this probe
+    // instead of the fetch it was waiting for -- which is how this helper
+    // broke `a_second_player_fetching_does_not_truncate_the_first_ones_read`
+    // on a Windows runner while passing here.
+    settled(fixture);
     let byte = reqwest::blocking::Client::new()
         .get(url)
         .header(reqwest::header::RANGE, format!("bytes={at}-{at}"))
@@ -1659,6 +1667,12 @@ fn holds_no_more_than_after_the_last_byte(fixture: &Fixture, url: &str, at: u64,
         .expect("the cache answers a byte it holds");
     assert_eq!(byte.status(), reqwest::StatusCode::PARTIAL_CONTENT);
     assert_eq!(byte.bytes().expect("the byte").len(), 1);
+    assert!(
+        fixture.origin.was_asked_for_nothing_more(),
+        "the probe byte came out of the cache: a fetch here would be this \
+         helper's own request, and the test's next `next_request` would get it"
+    );
+    // And settled again, for the pass the byte armed.
     holds_no_more_than(fixture, chunks);
 }
 
