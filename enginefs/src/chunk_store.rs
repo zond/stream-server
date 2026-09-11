@@ -282,6 +282,25 @@ impl ChunkDir {
         }
     }
 
+    /// Force the addressable staged copy's bytes to the device, for a caller
+    /// about to [`Self::commit`] it and holding no handle of its own to
+    /// flush through.
+    ///
+    /// Opened for writing and never created: Windows refuses a flush
+    /// through a read-only handle, and a staged copy that is not there has
+    /// to stay not there -- what an absent one means is `commit`'s
+    /// decision, so this reports it as nothing to flush.
+    pub fn sync_staged(&self, index: u64) -> io::Result<()> {
+        match OpenOptions::new()
+            .write(true)
+            .open(self.staging_path(index))
+        {
+            Ok(file) => file.sync_data(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Promote the addressable staged copy to the complete one: one rename
     /// within one directory, which is the single instant at which the
     /// have-record for a chunk comes into being.
@@ -911,6 +930,32 @@ mod tests {
         assert_eq!(chunks.chunk_path(999), tmp.path().join("d/0/999"));
         assert_eq!(chunks.chunk_path(1000), tmp.path().join("d/1/1000"));
         assert_eq!(chunks.staging_path(1000), tmp.path().join("d/1/1000.part"));
+    }
+
+    /// The flush before a commit has to reach a staged copy whose handle
+    /// nobody holds any more, and it must not conjure one: an absent staged
+    /// copy is `commit`'s idempotent case and is reported as nothing to
+    /// flush, where a created empty file would be renamed over the complete
+    /// one. A staged name that cannot be opened for writing is an error, not
+    /// a silent "done" -- the bytes it stands for were not confirmed.
+    #[test]
+    fn a_staged_copy_is_flushed_by_name_and_never_created_by_it() {
+        let (_tmp, chunks) = dir();
+        use std::io::Write;
+        let mut staged = chunks.open_staged_for_write(3).unwrap();
+        staged.write_all(b"abcd").unwrap();
+        drop(staged);
+        chunks.sync_staged(3).unwrap();
+        assert_eq!(std::fs::read(chunks.staging_path(3)).unwrap(), b"abcd");
+
+        chunks.sync_staged(4).unwrap();
+        assert!(
+            !chunks.staging_path(4).exists(),
+            "nothing staged, nothing made"
+        );
+
+        std::fs::create_dir_all(chunks.staging_path(5)).unwrap();
+        assert!(chunks.sync_staged(5).is_err());
     }
 
     /// A `/proxy` fill and a piece-store write of the same index are the

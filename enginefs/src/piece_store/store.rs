@@ -198,6 +198,11 @@ pub(super) struct Inner {
     opens: AtomicUsize,
     #[cfg(test)]
     staging_probes: AtomicUsize,
+    /// Flushes asked of the device at `complete_piece`, for the test that
+    /// pins one per piece: the durability itself is not something a test
+    /// can cut the power to check.
+    #[cfg(test)]
+    syncs: AtomicUsize,
 }
 
 /// The registry a store reports to and the key it reports under.
@@ -432,6 +437,8 @@ impl PieceStore {
                 opens: AtomicUsize::new(0),
                 #[cfg(test)]
                 staging_probes: AtomicUsize::new(0),
+                #[cfg(test)]
+                syncs: AtomicUsize::new(0),
             }),
             live: AtomicBool::new(true),
         }
@@ -667,6 +674,39 @@ impl Inner {
     }
 
     fn complete_piece(&self, piece: u32) -> anyhow::Result<()> {
+        // Before anything else, the staged bytes go to the device. The
+        // rename below is metadata, and the journal makes it durable at its
+        // next commit; the piece's data are dirty pages with no such
+        // promise, and a power cut between the two leaves the final name
+        // standing over blocks that were never written. Nothing in the
+        // filesystem closes that window for us: ext4's `auto_da_alloc`
+        // flushes data for a rename *over an existing* name, and this
+        // rename is to a new one; f2fs has nothing like it. The final name
+        // is the have-record -- `seed_from_disk` reads it back as a bit at
+        // the next launch and `has_piece` is `is_file()` -- so the zeros
+        // would go to the player and to peers as a verified piece, and the
+        // resume bitfield librqbit `sync_all`s would vouch for them.
+        //
+        // What it costs: one fdatasync per piece, of 256 KiB to 4 MiB, at
+        // the rate a playback downloads -- a few pieces a second at the
+        // most, which is well inside what even an SD card commits in that
+        // time, and it is the data alone; the metadata rides the journal.
+        // The cached staged handle is the write handle when the piece was
+        // written through this store a moment ago; a piece whose handle
+        // has left the cache, or whose cached handle was a read's -- which
+        // Windows will not flush through -- is reopened by name.
+        let index = u64::from(piece);
+        let synced = match self.handles.get(index, true) {
+            Some(file) if file.sync_data().is_ok() => Ok(()),
+            _ => self.chunks.sync_staged(index),
+        };
+        self.count_sync();
+        synced.with_context(|| {
+            format!(
+                "could not flush the completed piece {} to the device before moving it into place",
+                self.staging_path(piece).display()
+            )
+        })?;
         // Before the rename: the staged handle names a file about to become
         // the complete one, and a cached complete handle -- the old copy a
         // re-download is replacing -- names bytes about to be unlinked.
@@ -798,6 +838,14 @@ impl Inner {
 
     #[cfg(not(test))]
     fn count_staging_probe(&self) {}
+
+    #[cfg(test)]
+    fn count_sync(&self) {
+        self.syncs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(not(test))]
+    fn count_sync(&self) {}
 
     /// The staged copy of a piece, open for writing -- the cached handle
     /// when there is one, otherwise the file, created along with its bucket
@@ -1535,7 +1583,7 @@ fn pwrite_all_at(file: &File, mut offset: u64, mut buf: &[u8]) -> io::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chunk_store::{CHUNKS_PER_DIRECTORY, STAGING_SUFFIX};
+    use crate::chunk_store::{CHUNKS_PER_DIRECTORY, OPEN_HANDLES, STAGING_SUFFIX};
     use crate::piece_store::layout::FileSpec;
 
     /// A torrent shaped to exercise every case at once over 8-byte pieces:
@@ -2335,6 +2383,53 @@ mod tests {
             0,
             "a complete piece nothing is re-writing is never probed for a staged copy"
         );
+    }
+
+    /// The rename is metadata and the journal makes it durable; the bytes
+    /// under it are dirty pages with no such promise, and a power cut
+    /// between the two leaves the final name -- the have-record
+    /// `seed_from_disk` reads back as a bit -- standing over blocks nothing
+    /// wrote. No test can cut the power, so the durability itself is not
+    /// proved here. What is pinned is that every completion asks the device
+    /// for the bytes first, exactly once, whether the staged handle is still
+    /// in the cache or has to be reopened by name -- and that a completion
+    /// with nothing staged still goes through, since librqbit marks the
+    /// piece have whatever this returns.
+    #[test]
+    fn a_piece_is_flushed_to_the_device_once_before_it_is_renamed_into_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let piece_length = 16u64;
+        // One more piece than the handle cache holds, so piece 0's write
+        // handle has been evicted by the time it is completed.
+        let pieces = OPEN_HANDLES as u64 + 1;
+        let specs = [FileSpec::payload(piece_length * pieces)];
+        let store = open_store(tmp.path(), piece_length, &specs);
+        let last = pieces as u32 - 1;
+        let payload: Vec<u8> = (0..piece_length * pieces).map(|i| i as u8).collect();
+        store.pwrite_all(0, 0, &payload).unwrap();
+        assert!(
+            store.inner.handles.get(0, true).is_none(),
+            "piece 0's staged handle left the cache"
+        );
+        assert!(store.inner.handles.get(u64::from(last), true).is_some());
+
+        store.complete_piece(0).unwrap();
+        assert_eq!(
+            store.inner.syncs.load(Ordering::Relaxed),
+            1,
+            "a piece whose handle is gone is reopened and flushed once"
+        );
+        store.complete_piece(last).unwrap();
+        assert_eq!(
+            store.inner.syncs.load(Ordering::Relaxed),
+            2,
+            "a piece whose handle is cached is flushed through it, once"
+        );
+        assert_eq!(std::fs::read(store.piece_path(0)).unwrap(), &payload[..16]);
+
+        // Nothing staged any more: the idempotent completion is still one.
+        store.complete_piece(0).unwrap();
+        assert!(store.has_piece(0));
     }
 
     /// A cached handle keeps a deleted file's bytes readable for as long as
