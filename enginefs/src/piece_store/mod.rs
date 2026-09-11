@@ -144,16 +144,15 @@
 //! **There is no migration, by decision.** A whole-file download an earlier
 //! version wrote is neither converted nor read: the torrent that owns it
 //! comes up with an empty have-set and re-downloads as pieces. The old
-//! bytes belong to nobody, and they are the one category under the root
-//! that is **neither counted nor reclaimed** -- they sit beside the store
+//! bytes belong to nobody. They sit beside the store
 //! (`<download dir>/<torrent name>/<file>`), not under it, so
 //! [`store::StoreRoot::unregistered_bytes`] never reads them (it is one
-//! `read_dir` of `.pieces`) and [`sweep`] never reaches them (it sweeps
-//! `.pieces` too). The one thing that still takes one is an unpin asked to
-//! delete that file's data, which knows the path from the backend. Named
-//! here rather than left to be discovered: a category of byte with no
-//! deleter is how a disk becomes unbounded, and this one is bounded only
-//! by being finite and never written again.
+//! `read_dir` of `.pieces`) and no usage figure counts them -- and so
+//! [`sweep_legacy_downloads`] removes them whole, on the first launch that
+//! is handed a pin set, on the same hop as [`sweep_before_session`]'s sweep
+//! of `.pieces`. Named here rather than left to be discovered: a category
+//! of byte with no owner and no deleter is how a disk becomes unbounded,
+//! and the launch is this one's deleter.
 //!
 //! Nothing else has a stake in the default factory. The client's activity
 //! signal briefly did -- its counters were a storage wrapper around the
