@@ -4350,25 +4350,49 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// watched -- is protected only while a read of it is open. Its first
     /// seek gap handed its whole extent to the next tick's slack pass.
     ///
-    /// Read after the engine lookup and written with nothing awaited in
-    /// between ([`Self::switch_to`]'s rule), and the write moves the cell
-    /// only off the file this was decided about ([`Live::hand_on`]): the end
-    /// of a read of any other file moves nothing, and an open that moved
-    /// the cell meanwhile stands.
+    /// **A file is read here while a response of it is open, whether or
+    /// not that response has read a byte yet.** Episode two's own read
+    /// opens only once its gate, its reconcile and the wait for its first
+    /// piece are behind it -- seconds on a file nothing has fetched --
+    /// while episode one's connection closes milliseconds after the open:
+    /// asked of reads alone, this found nothing else read and left the cell
+    /// on episode one for good. And the live file's own open response is a
+    /// seek, not a viewer gone: its old read has closed and its new one has
+    /// not begun, and handed on, the cell went to a subtitle beside it.
+    ///
+    /// Read after the engine lookup and under the stream counts' guard,
+    /// and written with nothing awaited in between ([`Self::switch_to`]'s
+    /// rule), and the write moves the cell only off the file this was
+    /// decided about ([`Live::hand_on`]): the end of a read of any other
+    /// file moves nothing, and an open that moved the cell meanwhile
+    /// stands.
     ///
     /// [`Live::hand_on`]: crate::retention::live::Live::hand_on
     async fn hand_live_on(&self, info_hash: &str, file_idx: usize) {
         let Some(engine) = self.peek_engine(info_hash).await else {
             return;
         };
-        if engine.retention.readers_of(&file_idx) > 0 {
+        let streams = self.active_file_streams.read().await;
+        let open = |file: usize| {
+            engine.retention.readers_of(&file) > 0
+                || streams
+                    .get(&(info_hash.to_string(), file))
+                    .is_some_and(|count| *count > 0)
+        };
+        if open(file_idx) {
             return;
         }
         let Some(next) = engine
             .retention
             .keys()
             .into_iter()
-            .filter(|key| *key != file_idx && engine.retention.readers_of(key) > 0)
+            .chain(
+                streams
+                    .keys()
+                    .filter(|(hash, _)| hash == info_hash)
+                    .map(|(_, file)| *file),
+            )
+            .filter(|file| *file != file_idx && open(*file))
             .min()
         else {
             return;
@@ -4377,7 +4401,9 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             info_hash: info_hash.to_string(),
             file_idx,
         };
-        let Some(switch) = self.live.hand_on(&torrent(file_idx), torrent(next)) else {
+        let switch = self.live.hand_on(&torrent(file_idx), torrent(next));
+        drop(streams);
+        let Some(switch) = switch else {
             return;
         };
         tracing::debug!(
@@ -13916,6 +13942,75 @@ mod tests {
             "and the selection moved with it"
         );
         drop(next);
+    }
+
+    /// **The next episode takes the cell when the last one's read closes,
+    /// though no byte of it has been read yet.**
+    ///
+    /// Episode two's open found episode one still read and was an aside;
+    /// its own read opens only once the gate, the reconcile and the wait
+    /// for its first piece are behind it -- seconds on a file nothing has
+    /// fetched -- and episode one's connection closes milliseconds after
+    /// the open. Asked of reads alone, the hand-on found no other file
+    /// read at that moment and left the cell on episode one for good. An
+    /// open response is the viewer's, whether or not it has read yet.
+    #[tokio::test]
+    async fn the_live_files_last_read_closing_hands_the_cell_to_a_file_opened_but_not_yet_read() {
+        let (enginefs, counters) = test_enginefs_with_file_count(3);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        enginefs.on_stream_start(TEST_HASH, 0).await;
+        engine.begin_retention(0).await;
+        let first = engine.retention.reader_on(&0).expect("an entity");
+        first.promises(0..1);
+
+        enginefs.on_stream_start(TEST_HASH, 1).await;
+        assert_eq!(enginefs.live().reading().file_of(TEST_HASH), Some(0));
+
+        drop(first);
+        enginefs.on_stream_end(TEST_HASH, 0).await;
+        assert_eq!(
+            enginefs.live().reading().file_of(TEST_HASH),
+            Some(1),
+            "episode one's last read closed and episode two, opened but not yet read, kept its aside"
+        );
+        assert_eq!(
+            (
+                *counters.last_active_file.lock().unwrap(),
+                *counters.last_hot_file.lock().unwrap()
+            ),
+            (Some(1), None),
+            "and the selection moved with it"
+        );
+    }
+
+    /// **A seek on the live file is not a hand-on**, though its old read
+    /// has closed and its new one has not begun: the new response is open,
+    /// and the file is still the one being played. Handed on, the cell went
+    /// to the subtitle open beside it, and the film was slack until the
+    /// subtitle's response closed.
+    #[tokio::test]
+    async fn a_seek_on_the_live_file_keeps_the_cell_beside_an_open_aside() {
+        let (enginefs, _counters) = test_enginefs_with_file_count(3);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        enginefs.on_stream_start(TEST_HASH, 0).await;
+        engine.begin_retention(0).await;
+        let before = engine.retention.reader_on(&0).expect("an entity");
+        before.promises(0..1);
+        // A subtitle opened beside the film.
+        enginefs.on_stream_start(TEST_HASH, 2).await;
+        assert_eq!(enginefs.live().reading().file_of(TEST_HASH), Some(0));
+
+        // The seek: the new response opens, then the old one closes.
+        enginefs.on_stream_start(TEST_HASH, 0).await;
+        drop(before);
+        enginefs.on_stream_end(TEST_HASH, 0).await;
+        assert_eq!(
+            enginefs.live().reading().file_of(TEST_HASH),
+            Some(0),
+            "a seek handed the film's cell to the subtitle beside it"
+        );
     }
 
     /// **And the aside rule is asked of the cell as it stands when the open
