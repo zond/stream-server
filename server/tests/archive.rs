@@ -54,13 +54,14 @@ fn fixture_7z(dir: &Path) -> Vec<u8> {
     std::fs::read(&path).expect("read fixture back")
 }
 
-/// The same two members as a `.tar.gz`.
+/// The same two members as a `.tar.gz`, and an empty one.
 fn fixture_tgz() -> Vec<u8> {
     let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
     let mut builder = tar::Builder::new(encoder);
     for (name, data) in [
         ("first.txt", FIRST_CONTENT.to_vec()),
         ("videos/second.bin", second_content()),
+        ("empty.txt", Vec::new()),
     ] {
         let mut header = tar::Header::new_gnu();
         header.set_size(data.len() as u64);
@@ -397,6 +398,48 @@ fn a_tgz_member_is_served_whole_and_by_range() -> anyhow::Result<()> {
         .send()?;
     assert_eq!(ranged.status(), reqwest::StatusCode::PARTIAL_CONTENT);
     assert_eq!(ranged.bytes()?.as_ref(), &expected[40000..41000]);
+
+    fixture.finish()
+}
+
+/// An empty member is an empty body with a length of 0 -- it was answered
+/// `Content-Length: 1` over a body that ended at once -- and a range past
+/// the end of a member is a `416` naming its length, not the whole member
+/// under a `200`.
+#[test]
+fn an_empty_member_is_empty_and_a_range_past_the_end_is_refused() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let key = fixture.create_key(&fixture.origin.url("/fixture.tgz"))?;
+    let client = reqwest::blocking::Client::new();
+
+    let empty = client
+        .get(format!("{}/tgz/stream/{key}/empty.txt", fixture.base))
+        .send()?;
+    assert_eq!(empty.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        empty
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok()),
+        Some("0")
+    );
+    assert!(empty.bytes()?.is_empty());
+
+    let len = second_content().len();
+    let past = client
+        .get(format!(
+            "{}/tgz/stream/{key}/videos/second.bin",
+            fixture.base
+        ))
+        .header(reqwest::header::RANGE, format!("bytes={len}-"))
+        .send()?;
+    assert_eq!(past.status(), reqwest::StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(
+        past.headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok()),
+        Some(format!("bytes */{len}").as_str())
+    );
 
     fixture.finish()
 }

@@ -777,25 +777,38 @@ async fn stream_file(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // 4. Handle Range Requests
-    let mut start = 0;
-    let mut end = file_size.saturating_sub(1);
-    let mut is_partial = false;
-
-    if let Some(range_header) = headers.get(header::RANGE).and_then(|h| h.to_str().ok())
-        && let Some(parsed) = parse_range(range_header, file_size)
-    {
-        start = parsed.0;
-        end = parsed.1;
-        is_partial = true;
-    }
+    // 4. Handle Range Requests. A `Range` this member cannot satisfy is a
+    // `416` naming the length, as the torrent stream route answers it: it
+    // used to be ignored, and the player that asked for bytes past the end
+    // got the whole member under a `200` it had not asked for.
+    let range = match headers.get(header::RANGE) {
+        None => None,
+        Some(value) => match value.to_str().ok().and_then(|v| parse_range(v, file_size)) {
+            Some(range) => Some(range),
+            None => {
+                return Ok(Response::builder()
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .header(header::CONTENT_RANGE, format!("bytes */{file_size}"))
+                    .body(Body::empty())
+                    .unwrap());
+            }
+        },
+    };
+    let is_partial = range.is_some();
+    // `(start, len)`. An empty member is `(0, 0)`: the inclusive `end` it
+    // used to be computed from saturated to 0 and made a length of one --
+    // a `Content-Length: 1` over a body that ends at once, which a client
+    // reads as a truncated response.
+    let (start, len) = match range {
+        Some((start, end)) => (start, end - start + 1),
+        None => (0, file_size),
+    };
 
     // Seek to start
     reader
         .seek(tokio::io::SeekFrom::Start(start))
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let len = end - start + 1;
 
     // Limit reader
     let limited_reader = reader.take(len);
@@ -824,7 +837,7 @@ async fn stream_file(
     if is_partial {
         builder = builder.status(StatusCode::PARTIAL_CONTENT).header(
             header::CONTENT_RANGE,
-            format!("bytes {}-{}/{}", start, end, file_size),
+            format!("bytes {}-{}/{}", start, start + len - 1, file_size),
         );
     } else {
         builder = builder.status(StatusCode::OK);
