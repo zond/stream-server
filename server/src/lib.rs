@@ -1221,8 +1221,14 @@ pub async fn run(
     // the switch. It watches the one liveness cell
     // (`enginefs::retention::live`) and calls the same slack passes the
     // tick would have run.
+    //
+    // Both owners, because the cell is one cell: a proxied body opening
+    // makes a torrent's file slack and a torrent stream opening makes the
+    // proxied body slack, and the proxy has no tick of its own -- this is
+    // the only thing that ever ends one of its entities.
     background_tasks.push({
         let engine = state.engine.clone();
+        let proxy_cache = state.proxy_cache.clone();
         let mut changed = engine.live().changed();
         tokio::spawn(async move {
             // The value as it is now is not a change; the first `changed`
@@ -1230,6 +1236,7 @@ pub async fn run(
             changed.mark_unchanged();
             while changed.changed().await.is_ok() {
                 engine.drop_slack().await;
+                proxy_cache.retention().drop_slack().await;
             }
         })
     });

@@ -106,6 +106,29 @@
 //! is the task that runs the pass under it, and every pass the first one
 //! says it owes.
 //!
+//! # What ends an entity
+//!
+//! Another one being opened, and nothing else. A proxied body is live from
+//! the moment [`ProxyRetention::reader`] is called on it until a stream
+//! opens on something else -- another URL, or a torrent file, since it is
+//! one cell for the whole server ([`enginefs::retention::live`]) -- and
+//! from then on it is slack: every chunk of it goes at the next
+//! [`ProxyRetention::drop_slack`], which the switch itself calls. There is
+//! no clock in it. The 90-second grace this module used to keep an ended
+//! read's windows for was the same mistake the torrent's idle arm was: a
+//! player that has paused has not stopped playing, and a player that has
+//! opened something else has stopped playing whatever the clock says. What
+//! a slack pass will not take is what an open read was already promised --
+//! the body is served every byte of it -- and the entity stands until it
+//! holds nothing.
+//!
+//! One HLS playback is many URLs, so each segment makes the one before it
+//! slack. That is the intended reading and not a casualty of it: a finished
+//! segment is disposable, a segment still being read is held by its own
+//! reader's promise, and a cached playlist is never served from the cache
+//! anyway (`crate::routes::proxy` re-fetches it to rewrite). What it costs
+//! is a backward seek across a segment boundary, which refetches.
+//!
 //! # What is protected when nothing needs bounding
 //!
 //! A policy is installed only when the budget really splits the entity. For
@@ -129,6 +152,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
 use std::time::Duration;
 #[cfg(test)]
 use std::time::Instant;
@@ -136,40 +160,11 @@ use std::time::Instant;
 use anyhow::Context as _;
 use enginefs::chunk_store::ChunkDir;
 use enginefs::piece_store::{RetentionPolicy, Share};
-use enginefs::retention::owner::{Backing, Claim, Door, Install, Liveness, Retention, Trigger};
+use enginefs::retention::live::{Live, LiveEntity};
+use enginefs::retention::owner::{Backing, Claim, Door, Install, Mode, Retention, Trigger};
 use enginefs::retention::{ReclaimGate, RetentionBudget};
 
 use crate::proxy_cache::CHUNK_BYTES;
-
-/// How long after its last delivered byte an entity nothing is reading any
-/// more keeps its entry, and with it the windows the last pass over it
-/// chose.
-///
-/// While a reader is open its promise and its window stand whatever the
-/// clock says -- a paused player is still going to read the body it has --
-/// so this is the grace *between* reads: the gap between one request of a
-/// player and its next, and a demuxer that is reconnecting. Once it passes
-/// with no reader open, every byte of the entity is ordinary cache again --
-/// which is what the proxy cache has always been, and what a proxied stream
-/// nobody is reading should be.
-///
-/// **What it does not do is outlast the next pass.** What stands during the
-/// grace is the windows the last pass concluded, and a pass writes those
-/// wholesale from the readers that were live when it ran; a read that has
-/// ended is not one of those, and its playhead is nowhere in the protection
-/// path. So this is a grace for a player between two of its own requests,
-/// where no other read of the entity runs a pass in the gap, and not against
-/// one that does: a seek is two readers, and when the body the seek left
-/// behind ends, the first pass for the new position drops the region that
-/// was just played rather than holding it for the time here. Scrubbing back
-/// into it then refetches from the origin.
-///
-/// That is a deliberate trade and not an oversight. Holding it would mean
-/// keeping a window round every playhead a read left behind until this
-/// elapsed -- a whole extra window's worth of chunks per ended read, on the
-/// device whose disk is the reason any of this exists -- to protect a
-/// position the player has just deliberately left. The bound is the point.
-const IDLE: Duration = Duration::from_secs(90);
 
 /// How many passes one window's worth of playback gets: the pass runs when
 /// the playhead has moved a window over this.
@@ -226,12 +221,17 @@ impl ProxyDomain {
 ///
 /// Nothing shared, so `advertise` is unreachable; installed on the delivered
 /// byte, because that is the only moment a proxied entity is known to be
-/// read; a grace once no reader is left. The reclaim is the proxy adapter's
-/// own `remove_file` of its own chunk -- the chunk store's delete is
-/// `pub(crate)` to `enginefs`, deliberately, so nothing outside it can unlink
-/// a torrent piece behind librqbit's back, and there is no have-set here to
-/// disagree with.
+/// read; live while the cell names it and slack from the moment it does
+/// not. The reclaim is the proxy adapter's own `remove_file` of its own
+/// chunk -- the chunk store's delete is `pub(crate)` to `enginefs`,
+/// deliberately, so nothing outside it can unlink a torrent piece behind
+/// librqbit's back, and there is no have-set here to disagree with.
 struct ProxyBacking {
+    /// Which entity the server is playing, the one cell the whole process
+    /// reads ([`enginefs::retention::live`]). Asked at the top of every
+    /// slack pass and once per run at its [`Door`], so a body that opens on
+    /// an entity while its bytes are going stops the run where it stands.
+    live: Arc<Live>,
     /// The threads the blocking halves of a pass really ran on.
     ///
     /// A `#[tokio::test]` drives its runtime on the test's own thread, so
@@ -279,7 +279,6 @@ impl Backing for ProxyBacking {
         passes_per_window: PASSES_PER_WINDOW,
     };
     const INSTALL: Install = Install::OnDeliveredByte;
-    const LIVENESS: Liveness = Liveness::Grace(IDLE);
 
     /// Nothing calls [`Retention::install`] on the proxy, and `()` names no
     /// directory to resolve.
@@ -317,6 +316,13 @@ impl Backing for ProxyBacking {
     /// per reader and the owner's own.
     fn keeps_everything(&self, _key: &PathBuf) -> bool {
         false
+    }
+
+    /// Whether this directory is the entity the server is playing. The
+    /// whole of what keeps a proxied stream's chunks: everything else is
+    /// slack.
+    fn is_live(&self, key: &PathBuf) -> bool {
+        self.live.is_proxy(key)
     }
 
     /// The listing, on the blocking pool: one `read_dir` of the entity's
@@ -421,6 +427,7 @@ impl ProxyBacking {
     /// the probe, and in the shipped build nothing.
     fn probe(&self) -> ProxyBacking {
         ProxyBacking {
+            live: self.live.clone(),
             #[cfg(test)]
             disk_threads: self.disk_threads.clone(),
         }
@@ -454,6 +461,13 @@ type Interleave = Mutex<Option<Arc<dyn Fn() + Send + Sync>>>;
 /// `Engine` delegates to.
 pub struct ProxyRetention {
     owner: Arc<Retention<ProxyBacking>>,
+    /// Which entity the server is playing: written here every time a body
+    /// opens ([`Self::reader`]), read to decide which entities are slack
+    /// ([`Self::drop_slack`]) and which one a panel is asking about
+    /// ([`Self::window`]). The server's one cell, shared with the engine --
+    /// a torrent opening is what makes the proxied stream slack, and the
+    /// other way round.
+    live: Arc<Live>,
     /// The passes below while they are running, counted beside the cache's
     /// chunk writes: `crate::proxy_cache::DiskWork`. A pass is spawned and
     /// never joined, so it is the other half of what makes a listing of the
@@ -508,11 +522,16 @@ pub struct Reader {
 }
 
 impl ProxyRetention {
-    pub fn new(budget: Arc<RetentionBudget>, work: Arc<crate::proxy_cache::DiskWork>) -> Self {
+    pub fn new(
+        budget: Arc<RetentionBudget>,
+        work: Arc<crate::proxy_cache::DiskWork>,
+        live: Arc<Live>,
+    ) -> Self {
         #[cfg(test)]
         let disk_threads: Arc<Mutex<Vec<std::thread::ThreadId>>> = Arc::default();
         let owner = Retention::new(
             Arc::new(ProxyBacking {
+                live: live.clone(),
                 #[cfg(test)]
                 disk_threads: disk_threads.clone(),
             }),
@@ -537,6 +556,7 @@ impl ProxyRetention {
         });
         Self {
             owner,
+            live,
             work,
             #[cfg(test)]
             interleave,
@@ -551,9 +571,34 @@ impl ProxyRetention {
     ///
     /// It records nothing by itself: a reader that never promises and never
     /// delivers a byte is a reader nothing has observed, and it holds
-    /// nothing.
+    /// nothing. What it *does* do before it records anything is move the
+    /// liveness cell onto this entity -- **this is the proxy's one writer of
+    /// it**, and this is the only place a proxied read comes into being
+    /// (the look-up and the fill both arrive here). A body opening is the
+    /// event: whatever was being played before is what nobody is playing
+    /// any more, and the switch task takes its bytes without waiting for
+    /// anything.
+    ///
+    /// The cell is written *first*, before the entity exists, so there is
+    /// no instant in which a slack pass on this directory could take the
+    /// bytes the read about to open is for: a pass in flight is refused at
+    /// its [`Door`] from here on, and one that has not started re-asks
+    /// under the turn. No aside rule: two proxied URLs are two streams, and
+    /// a player reading a subtitle through `/proxy` while a film plays
+    /// through `/proxy` is the HLS case -- a switch, and the finished
+    /// segment is disposable.
     pub fn reader(self: &Arc<Self>, dir: &ChunkDir, total: u64, target: Arc<str>) -> Reader {
         let key = dir.path().to_path_buf();
+        if let Some(switch) = self
+            .live
+            .open(LiveEntity::Proxy { dir: key.clone() }, false)
+        {
+            tracing::debug!(
+                dir = %dir.path().display(),
+                from = ?switch.from,
+                "the live entity moved to a proxied body"
+            );
+        }
         Reader {
             retention: self.clone(),
             inner: self.owner.reader(
@@ -595,14 +640,16 @@ impl ProxyRetention {
             while let Some(claim) = next {
                 #[cfg(test)]
                 retention.passes.fetch_add(1, Ordering::Relaxed);
-                // Always the live pass until the proxy has a writer for
-                // the liveness cell: what makes a proxied entity slack is
-                // another entity being opened, and nothing here tells it
-                // yet. Until then the grace below is what ends one.
-                let outcome = retention
-                    .owner
-                    .pass(&key, &(), claim, enginefs::retention::owner::Mode::Live)
-                    .await;
+                // The live pass, and not because nothing here knows what is
+                // playing: a pass on this path was armed by a byte reaching
+                // a player, so a read is open on the entity and a read being
+                // delivered is [`Mode::Live`] whether or not the cell names
+                // it -- the same rule the torrent's `Engine::mode_of` uses.
+                // Taking the bytes out from under an open body is a broken
+                // read for the player and the same fetch again for the
+                // origin. What makes an entity slack is
+                // [`ProxyRetention::drop_slack`], which the switch calls.
+                let outcome = retention.owner.pass(&key, &(), claim, Mode::Live).await;
                 if let Some(conclusion) = &outcome.concluded
                     && conclusion.reclaimed > 0
                 {
@@ -621,32 +668,30 @@ impl ProxyRetention {
     /// What this cache holds of the stream `target` names, split at the
     /// playhead -- the proxy half of `crate::stream_numbers`.
     ///
-    /// `None` is "nothing here is about that URL", and it covers three
+    /// `None` is "nothing here is about that URL", and it covers four
     /// different truths that a client shows the same way, by drawing no
     /// row: no reader of this process has ever been opened on that target,
-    /// no byte of it has reached a player yet so there is no playhead to
-    /// split at, and -- the case that is a policy statement rather than an
-    /// absence -- nothing is *bounding* this entity, because the budget
-    /// covers it or no budget has been published. What is on the disk then
-    /// is not a window, it is whatever the cleaner has not yet aged out,
-    /// and putting that under the same label would give one row two
-    /// meanings.
+    /// nothing of this process is *playing* it, no byte of it has reached a
+    /// player yet so there is no playhead to split at, and -- the case that
+    /// is a policy statement rather than an absence -- nothing is *bounding*
+    /// this entity, because the budget covers it or no budget has been
+    /// published. What is on the disk then is not a window, it is whatever
+    /// the cleaner has not yet aged out, and putting that under the same
+    /// label would give one row two meanings.
     ///
     /// Two entities can carry one target -- the key covers the player
-    /// headers that reach the origin too -- so the most recently read of
-    /// them answers: that is the one a player is inside now.
+    /// headers that reach the origin too -- and the one the liveness cell
+    /// names is the one that answers: that is the one a player is inside,
+    /// and the other is slack with its chunks on their way off the disk.
     ///
     /// Blocking: it lists the entity's bucket directories, one `getdents`
     /// per thousand chunks. Call it off the reactor. No lock is held across
     /// the listing.
     pub fn window(&self, target: &str) -> Option<enginefs::retention::CacheWindow> {
-        let holding = self
-            .owner
-            .holdings()
-            .into_iter()
-            .map(|(_, holding)| holding)
-            .filter(|holding| &*holding.domain.target == target && holding.installed.is_some())
-            .max_by_key(|holding| holding.last_seen)?;
+        let live = self.live.reading();
+        let (_, holding) = self.owner.holdings().into_iter().find(|(key, holding)| {
+            &*holding.domain.target == target && holding.installed.is_some() && live.is_proxy(key)
+        })?;
         let at = holding.last_position? / CHUNK_BYTES;
         let dir = holding.domain.dir;
         let mut window = enginefs::retention::CacheWindow::default();
@@ -699,8 +744,69 @@ impl ProxyRetention {
         gate.releases_file(path)
     }
 
-    /// Tell the cache cleaner's gate what live readers are holding, and
-    /// forget the entities nothing is reading any more.
+    /// Every entity nobody is playing and nobody is reading, taken off the
+    /// disk now.
+    ///
+    /// **The whole of what ends a proxied entity.** The torrent's slack
+    /// passes ride the reconciler's tick because the swarm fills a torrent
+    /// whether or not anybody reads it; a proxied entity grows only as its
+    /// own body is relayed, so it needs no tick -- what it needs is the
+    /// moment the viewer opened something else, which is exactly when this
+    /// is called (the switch task on `Live::changed`).
+    ///
+    /// One reading of the cell for the whole sweep, and every entity it
+    /// does not name with no read open on it is slack. The reading is not
+    /// what the delete trusts: the pass re-asks under the entity's turn and
+    /// its [`Door`] re-asks at every unlink, so a body that opens on one of
+    /// these while its bytes are going stops the run where it stands. The
+    /// `opens` count the mode carries is the torrent's interlock and is
+    /// always zero here -- nothing calls `Retention::install` on the proxy,
+    /// since the delivered byte is what installs -- which is why
+    /// [`ProxyBacking::is_live`] is the one that has to be right.
+    ///
+    /// The ticket is taken for the whole sweep, so
+    /// `ServerHandle::proxy_cache_settled` covers it: these unlinks are the
+    /// cache moving as much as a fill is.
+    pub async fn drop_slack(&self) {
+        let _ticket = self.work.start();
+        let live = self.live.reading();
+        for key in self.owner.keys() {
+            // What this driver means by slack, said before it asks for a
+            // slack pass: not the entity being played, and no body reading
+            // it. Both are re-asked inside the pass under the entity's turn
+            // -- it is the pass that may not be wrong, not this -- and this
+            // is what keeps the playing stream's turn out of a sweep that
+            // has nothing to do with it.
+            if live.is_proxy(&key) || self.owner.readers_of(&key) > 0 {
+                continue;
+            }
+            // Read before the turn is taken, which is what makes it worth
+            // reading at all: an open that lands in the gap moves it. It is
+            // always zero on this side -- a proxied entity is installed on
+            // its first delivered byte and never through
+            // `Retention::install` -- so it is carried for the shape of the
+            // mode and not as the interlock, which is `is_live` above.
+            let opens = self.owner.opens_of(&key);
+            let Some(claim) = self.owner.turn(&key).await else {
+                continue;
+            };
+            let outcome = self
+                .owner
+                .pass(&key, &(), claim, Mode::Slack { opens })
+                .await;
+            if let Some(conclusion) = &outcome.concluded
+                && conclusion.reclaimed > 0
+            {
+                tracing::debug!(
+                    dir = %key.display(),
+                    freed = conclusion.reclaimed,
+                    "the proxied stream nobody is playing was dropped"
+                );
+            }
+        }
+    }
+
+    /// Tell the cache cleaner's gate what live readers are holding.
     ///
     /// Two things are inserted and they are different claims. A **window**
     /// is where a playhead is and what playback is about to want; a
@@ -709,25 +815,12 @@ impl ProxyRetention {
     /// gate about everything it walks, so both are put where it can read
     /// them.
     ///
-    /// The pruning is the owner's, on this call, because this is the one
-    /// call that happens once per cleaner pass rather than once per
-    /// delivered chunk, and that cadence is enough on its own: writing a
-    /// chunk is a filesystem event, and a filesystem event under the cache
-    /// root is what arms the cleaner's debounce, so the case where entries
-    /// are being added is exactly the case where this runs often. A
-    /// reader's entry goes with the body it belongs to; an entity's goes
-    /// once no reader is open on it and [`IDLE`] has passed since its last
-    /// delivered byte.
+    /// Nothing is pruned here any more: an entity goes when a slack pass
+    /// has taken the last of it off the disk, which is a fact about the
+    /// entity and not an age. A reader's entry goes with the body it
+    /// belongs to.
     pub fn fill_gate(&self, gate: &mut ReclaimGate) {
         self.fill_holdings(gate, self.owner.holdings());
-    }
-
-    /// [`Self::fill_gate`] against a clock the test supplies: the grace is a
-    /// minute and a half, and a test that slept through it would be a test
-    /// of nothing but the runner's patience.
-    #[cfg(test)]
-    fn fill_gate_at(&self, gate: &mut ReclaimGate, now: Instant) {
-        self.fill_holdings(gate, self.owner.holdings_at(now));
     }
 
     fn fill_holdings(
@@ -746,8 +839,8 @@ impl ProxyRetention {
             // that made this a playhead. Both are "we have measured nothing
             // to give up", and what a live reader may not lose is the chunk
             // under its head. Once the last reader has gone, what stands is
-            // the windows a pass really chose, for the grace above -- a
-            // stream nobody is reading is the first thing that should go.
+            // the windows a pass really chose, until a stream opens on
+            // something else and [`Self::drop_slack`] takes the lot.
             if (holding.installed.is_none() || holding.windows.is_empty()) && holding.live_playhead
             {
                 gate.insert_window(dir.clone(), 0..holding.domain.chunks());
@@ -857,7 +950,7 @@ mod tests {
         if let Some(limit) = limit {
             budget.set(Some(limit));
         }
-        Arc::new(ProxyRetention::new(budget, Arc::default()))
+        Arc::new(ProxyRetention::new(budget, Arc::default(), Arc::default()))
     }
 
     fn write_chunks(dir: &ChunkDir, indices: impl IntoIterator<Item = u64>) {
@@ -1479,7 +1572,11 @@ mod tests {
 
         let budget = Arc::new(RetentionBudget::default());
         budget.set(Some(12 * CHUNK_BYTES));
-        let retention = Arc::new(ProxyRetention::new(budget.clone(), Arc::default()));
+        let retention = Arc::new(ProxyRetention::new(
+            budget.clone(),
+            Arc::default(),
+            Arc::default(),
+        ));
         let reader = Arc::new(retention.reader(&dir, TOTAL, TARGET.into()));
         reader.note(0);
         settled(&retention, "the published cap was applied", |_| {
@@ -1779,39 +1876,6 @@ mod tests {
         drop(reader);
     }
 
-    /// **The grace is for a stream nobody is reading, and an open reader is
-    /// somebody reading.**
-    ///
-    /// A player that pauses keeps its body open and stops reading it, for as
-    /// long as the person is away; nothing about that makes the bytes it has
-    /// already been promised anybody else's. So the age of the last
-    /// delivered byte decides only when an entity *no reader is open on* is
-    /// forgotten.
-    ///
-    /// The clock is moved by hand rather than waited on -- the grace is a
-    /// minute and a half, and a test that slept through it would be a test
-    /// of nothing but the runner's patience.
-    #[tokio::test]
-    async fn a_reader_quiet_longer_than_the_grace_still_holds_what_it_promised() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = ChunkDir::new(tmp.path().join("entity"));
-        write_chunks(&dir, 0..16);
-
-        let retention = retention(Some(8 * CHUNK_BYTES));
-        let reader = retention.reader(&dir, TOTAL, TARGET.into());
-        reader.promises(0..16);
-        reader.note(0);
-
-        // Longer than the grace: an entity nothing was reading would be
-        // forgotten here, every byte of it ordinary cache again.
-        let mut gate = ReclaimGate::default();
-        retention.fill_gate_at(&mut gate, Instant::now() + IDLE + Duration::from_secs(1));
-        assert!(
-            !gate.releases_file(&dir.chunk_path(15)),
-            "the paused player is still owed the tail of the body it has open"
-        );
-    }
-
     /// **A pass that dies before its unlinks leaves the policy where it was,
     /// and the next delivered byte's pass reclaims.**
     ///
@@ -1954,20 +2018,22 @@ mod tests {
         .await;
     }
 
-    /// **The grace holds against the clock and not against the next pass.**
+    /// **What a read that ended was holding is the next pass's to replace.**
     ///
     /// What a read that ended leaves behind is the windows the last pass
     /// chose, and a pass writes those whole from the readers live when it
     /// ran. So a second read of the same entity -- which an ordinary seek
     /// makes, the new range request opening while the old body drains --
-    /// replaces them the first time its own playhead moves a stride, well
-    /// inside [`IDLE`], and the region that was just played is ordinary
-    /// cache again. Scrubbing back into it refetches from the origin.
+    /// replaces them the first time its own playhead moves a stride, and
+    /// the region that was just played is ordinary cache again. Scrubbing
+    /// back into it refetches from the origin.
     ///
-    /// This is the trade [`IDLE`] states, pinned so that it is a decision
-    /// rather than a surprise: holding that region would mean a window per
-    /// playhead every ended read left behind, kept for a minute and a half,
-    /// on the device whose disk is the reason there is a budget at all.
+    /// The seek is not a switch: it is a second body on the entity that is
+    /// already being played, so nothing here makes the entity slack and
+    /// what moves is only the window. Pinned so that the trade is a
+    /// decision rather than a surprise: holding the old region would mean a
+    /// window per playhead every ended read left behind, on the device
+    /// whose disk is the reason there is a budget at all.
     #[tokio::test]
     async fn a_second_players_pass_replaces_what_a_read_that_ended_was_holding() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1997,8 +2063,7 @@ mod tests {
         );
 
         // The seek: a new body at the head of the film, and the old one is
-        // gone. Nothing here waits on a clock -- the grace is a minute and a
-        // half away, and this is what happens instead of it.
+        // gone.
         let seeked = retention.reader(&dir, TOTAL, TARGET.into());
         seeked.note(0);
         settled(
@@ -2008,67 +2073,60 @@ mod tests {
         )
         .await;
 
-        let held = retention.owner.holding(&dir.path().to_path_buf());
-        let stream = held.as_ref().expect("the entity is being read");
         assert!(
-            stream.last_seen.elapsed() < IDLE,
-            "and it went well inside the grace, which is the point of this \
-             test: the clock never came into it"
+            retention.live.is_proxy(dir.path()),
+            "the seek opened a second body on the entity already being \
+             played, which is not a switch"
         );
         assert!(
             !dir.chunk_path(15).exists(),
             "the chunk the player was inside a moment ago is gone from the \
              disk, so scrubbing back to it costs the origin fetch again"
         );
-        drop(held);
         drop(seeked);
     }
 
     /// **Two entities can carry one target, and the panel is told about the
-    /// one a player is inside now.**
+    /// one being played.**
     ///
     /// A cache key covers the player headers that reach the origin -- an
-    /// origin may answer two of them with two entities -- so one `d=` URL can
-    /// have more than one directory under it, and an entry outlives the read
-    /// that made it by the [`IDLE`] grace. A session that has *ended*
-    /// therefore sits in the map beside the one being played now, both
-    /// bounded and both naming that target, and only one of them has a
-    /// playhead anybody is at. Answering from the other draws the panel a
-    /// window round a position playback left behind, and round the wrong
-    /// directory's chunks as well.
+    /// origin may answer two of them with two entities -- so one `d=` URL
+    /// can have more than one directory under it, and the one a player left
+    /// stands in the map beside the one being played until its slack pass
+    /// empties it. Both are bounded and both name that target, and only one
+    /// of them has a playhead anybody is at. Answering from the other draws
+    /// the panel a window round a position playback left behind, and round
+    /// the wrong directory's chunks as well.
     ///
     /// The situation is built again and again because the order the map
-    /// yields its entries in is not ours to choose and is not the same twice:
-    /// one store answering rightly is a coin that landed face up, and what is
-    /// claimed here is that the answer comes from which entity was read last
-    /// rather than from where the two of them happen to sit. Nothing waits on
-    /// a clock for that -- the later `last_seen` is the later `note`, which is
-    /// the order the bytes really went out in.
+    /// yields its entries in is not ours to choose and is not the same
+    /// twice: one store answering rightly is a coin that landed face up,
+    /// and what is claimed here is that the answer comes from the liveness
+    /// cell rather than from where the two of them happen to sit.
     #[tokio::test]
-    async fn a_panel_is_told_about_the_entity_being_read_and_not_a_session_that_ended() {
+    async fn a_panel_is_told_about_the_entity_being_played() {
         for _ in 0..24 {
             let tmp = tempfile::tempdir().unwrap();
             // Twelve chunks of budget over a sixteen-chunk entity: a policy
-            // is installed, so both of these are bounded and have a window to
-            // show at all -- and both playheads below have a window covering
-            // every chunk on their own disk, so what is asserted is the
-            // reading and not a race with a pass.
+            // is installed, so both of these are bounded and have a window
+            // to show at all -- and both playheads below have a window
+            // covering every chunk on their own disk, so what is asserted
+            // is the reading and not a race with a pass.
             let retention = retention(Some(12 * CHUNK_BYTES));
 
-            // The session that is over: one player played out the end of the
-            // film and its body finished. Its entry stays for the grace,
-            // because a request ending is the ordinary gap between two
-            // requests of a player.
+            // The session that is over: one player played out the end of
+            // the film and its body finished.
             let ended = ChunkDir::new(tmp.path().join("ended"));
             write_chunks(&ended, 12..16);
             let finished = retention.reader(&ended, TOTAL, TARGET.into());
             finished.note(15 * CHUNK_BYTES);
             drop(finished);
 
-            // Then the same stream is opened again under other player headers
-            // -- a second entity of the one target -- and this is the read a
-            // player is inside. Its byte reaches a player after the other's,
-            // which is the whole of what makes it the more recent.
+            // Then the same stream is opened again under other player
+            // headers -- a second entity of the one target -- and this is
+            // the body a player is inside. Opening it is what moved the
+            // cell, which is the whole of what makes it the one to answer
+            // from.
             let live = ChunkDir::new(tmp.path().join("live"));
             write_chunks(&live, 3..10);
             let reader = retention.reader(&live, TOTAL, TARGET.into());
@@ -2080,12 +2138,226 @@ mod tests {
                     behind_bytes: CHUNK_BYTES,
                     ahead_bytes: 6 * CHUNK_BYTES,
                 }),
-                "the seven chunks of the entity being read, split at its \
-                 playhead -- and not the four the finished session left round \
-                 the end of the film, which would be three behind and one \
-                 ahead of a playhead nobody is at"
+                "the seven chunks of the entity being played, split at its \
+                 playhead -- and not the four the finished session left \
+                 round the end of the film, which would be three behind and \
+                 one ahead of a playhead nobody is at"
             );
             drop(reader);
         }
+    }
+
+    /// **A stream opening on another URL is what makes the one it left
+    /// disposable -- and a second body on the same one is not.**
+    ///
+    /// The cache used to keep what a player had left until a clock ran out
+    /// on it: ninety seconds after the last delivered byte, an entity
+    /// nothing was reading was forgotten and its chunks became the
+    /// cleaner's. This is what replaced it, and it is a fact rather than an
+    /// age -- the moment a body opens on something else, everything the
+    /// player left is disposable and goes at the switch. A seek is a second
+    /// body on the entity that is already being played and moves nothing:
+    /// [`Live::open`] answers `None` for it, so no switch is even reported.
+    ///
+    /// One HLS playback is many URLs, so a finished segment is exactly this
+    /// case -- which is the decision, not a casualty of it.
+    #[tokio::test]
+    async fn an_open_on_another_url_empties_the_entity_it_left_and_a_seek_does_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = ChunkDir::new(tmp.path().join("first"));
+        write_chunks(&first, 0..16);
+        let retention = retention(Some(12 * CHUNK_BYTES));
+
+        // The body that played it. Its own pass keeps the twelve chunks of
+        // window round the head and takes the four beyond it, which is the
+        // measurement the slack below is read against: what a drop of slack
+        // does to the entity being played is nothing at all, and a test
+        // that could not tell the two deletes apart would not say so.
+        let played = retention.reader(&first, TOTAL, TARGET.into());
+        played.note(0);
+        settled(&retention, "the playing body's own pass ran", |_| {
+            first.held().is_ok_and(|held| held.len() == 12)
+        })
+        .await;
+        drop(played);
+
+        // The seek: a second body on the entity already being played, which
+        // moves nothing.
+        let seeked = retention.reader(&first, TOTAL, TARGET.into());
+        drop(seeked);
+
+        retention.drop_slack().await;
+        assert_eq!(
+            first.held().unwrap().len(),
+            12,
+            "the entity being played keeps its window, however long nothing \
+             is reading it"
+        );
+
+        // And then the player opens something else.
+        let second = ChunkDir::new(tmp.path().join("second"));
+        write_chunks(&second, 0..4);
+        let watching = retention.reader(&second, TOTAL, "https://origin.example/next.mkv".into());
+
+        retention.drop_slack().await;
+        assert!(
+            first.held().unwrap().is_empty(),
+            "every chunk of what the player left is gone"
+        );
+        assert!(
+            retention
+                .owner
+                .holding(&first.path().to_path_buf())
+                .is_none(),
+            "and the entity with it: it holds nothing and nothing reads it"
+        );
+        assert_eq!(
+            second.held().unwrap().len(),
+            4,
+            "while the one being played is untouched"
+        );
+        drop(watching);
+    }
+
+    /// **The cell is the server's, not the proxy's: a torrent stream
+    /// opening ends a proxied one, and the other way round.**
+    ///
+    /// `EngineFS::on_stream_start` writes the same cell this module's
+    /// [`ProxyRetention::reader`] writes -- one server plays one thing --
+    /// so the two owners cannot both think they are live. A viewer who
+    /// leaves a proxied stream for a torrent leaves the proxied chunks
+    /// disposable, and a viewer who leaves a torrent for a proxied stream
+    /// leaves the torrent file with no liveness for `Engine::mode_of` to
+    /// read, which is what makes its pass a slack one.
+    #[tokio::test]
+    async fn a_torrent_opening_ends_the_proxied_stream_and_the_other_way_round() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = ChunkDir::new(tmp.path().join("entity"));
+        write_chunks(&dir, 0..16);
+        let retention = retention(Some(12 * CHUNK_BYTES));
+        let live = retention.live.clone();
+
+        let reader = retention.reader(&dir, TOTAL, TARGET.into());
+        reader.note(0);
+        drop(reader);
+        assert_eq!(
+            live.reading().file_of(HASH),
+            None,
+            "the proxied body took the torrent's place: nothing of that \
+             torrent is being played, so its files are slack"
+        );
+
+        // What `on_stream_start` does when the viewer opens a torrent file.
+        live.open(
+            enginefs::retention::live::LiveEntity::Torrent {
+                info_hash: HASH.to_string(),
+                file_idx: 0,
+            },
+            false,
+        );
+        assert_eq!(live.reading().file_of(HASH), Some(0));
+
+        retention.drop_slack().await;
+        assert!(
+            dir.held().unwrap().is_empty(),
+            "and the proxied stream the viewer left is gone from the disk"
+        );
+    }
+
+    /// The info hash the torrent half of the cell names. Nothing here has a
+    /// torrent; what the test needs is that the cell can hold one.
+    const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// **A body that opens while the bytes are going stops the run where it
+    /// stands.**
+    ///
+    /// The mode was decided from a reading taken before the pass, and a
+    /// player can ask for this very stream again in the meantime -- the same
+    /// URL, a moment after leaving it. The pass asks the cell again under
+    /// the turn before it destroys anything, and its [`Door`] asks once per
+    /// chunk after that, so what a reopened entity loses is at most the
+    /// chunks already unlinked and never the window the new body is reading.
+    #[tokio::test]
+    async fn a_slack_pass_stops_when_a_body_opens_on_the_entity_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let left = ChunkDir::new(tmp.path().join("left"));
+        write_chunks(&left, 0..16);
+        let retention = retention(Some(12 * CHUNK_BYTES));
+
+        let played = retention.reader(&left, TOTAL, TARGET.into());
+        drop(played);
+        let opened = ChunkDir::new(tmp.path().join("opened"));
+        let watching = retention.reader(&opened, TOTAL, "https://origin.example/next.mkv".into());
+
+        // The player comes back to the stream it left, while the pass that
+        // is taking it is inside itself.
+        let reopened: Arc<Mutex<Option<Reader>>> = Arc::default();
+        let once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *retention.interleave.lock().unwrap() = Some(Arc::new({
+            let retention = retention.clone();
+            let left = left.clone();
+            let reopened = reopened.clone();
+            move || {
+                if once.swap(true, Ordering::Relaxed) {
+                    return;
+                }
+                *reopened.lock().unwrap() = Some(retention.reader(&left, TOTAL, TARGET.into()));
+            }
+        }));
+
+        retention.drop_slack().await;
+        assert!(
+            reopened.lock().unwrap().is_some(),
+            "the pass really did run with a body opening inside it"
+        );
+        assert_eq!(
+            left.held().unwrap().len(),
+            16,
+            "the stream the player came back to kept every byte it had"
+        );
+        drop(watching);
+    }
+
+    /// **A body still being delivered keeps every byte it was promised,
+    /// even after the viewer opened something else.**
+    ///
+    /// The switch says nobody is *playing* these bytes any more. It does
+    /// not say nobody is reading them: a response is framed before its
+    /// first byte goes out, so what it has yet to deliver is already
+    /// promised, and taking that is a truncated read for the player and the
+    /// same fetch again for the origin. So an entity with a read open on it
+    /// is not slack, however long ago the viewer left it -- and the pass
+    /// that takes it runs when the body ends, which is the next switch, the
+    /// bell, or a clean.
+    #[tokio::test]
+    async fn a_body_still_being_delivered_survives_the_switch_away_from_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let leaving = ChunkDir::new(tmp.path().join("leaving"));
+        write_chunks(&leaving, 0..16);
+        let retention = retention(Some(4 * CHUNK_BYTES));
+
+        // A body framed round the tail of the film, four chunks past any
+        // window a playhead at the head of it would draw.
+        let reading = retention.reader(&leaving, TOTAL, TARGET.into());
+        reading.promises(12..16);
+
+        let opened = ChunkDir::new(tmp.path().join("opened"));
+        let watching = retention.reader(&opened, TOTAL, "https://origin.example/next.mkv".into());
+        retention.drop_slack().await;
+
+        assert_eq!(
+            leaving.held().unwrap().len(),
+            16,
+            "nothing of an entity a body is still reading is taken"
+        );
+
+        // And when that body ends, the entity is what the viewer left.
+        drop(reading);
+        retention.drop_slack().await;
+        assert!(
+            leaving.held().unwrap().is_empty(),
+            "the read that was holding it has ended, so it goes"
+        );
+        drop(watching);
     }
 }

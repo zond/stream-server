@@ -101,6 +101,7 @@ impl AppState {
         let proxy_cache = Arc::new(crate::proxy_cache::ProxyCache::new(
             &engine.download_dir,
             engine.cache_budget(),
+            engine.live().clone(),
         ));
         let https = Arc::new(crate::https::HttpsListener::new(None, &config_dir));
 

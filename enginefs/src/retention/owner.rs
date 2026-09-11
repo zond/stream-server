@@ -43,7 +43,7 @@
 //! * **X** -- locks outside the owner: `pinned_files`, [`RetentionBudget`],
 //!   the liveness cell, librqbit's own, the filesystem.
 //!
-//! 1. L1 → L2 only, and only inside [`Retention::holdings_at`] and
+//! 1. L1 → L2 only, and only inside [`Retention::holdings`] and
 //!    [`Retention::forget_empty`], which take L1 and read each entity's L2
 //!    under it; never L2 → L1. An entity holds its own `Arc` and never
 //!    reaches the map. (Every other reader of the map --
@@ -175,9 +175,7 @@
 //! * Step 2 snapshots `{domain, budget}` and the head's piece, and reads
 //!   heads and promises afresh at step 5 with no fallback to a step-2 copy:
 //!   an entity cannot vanish under a pass, because the pass holds its `Arc`.
-//! * [`Backing`] has a `Sized` bound (RPITIT with `Door<Self>` needs it),
-//!   and [`Retention::holdings_at`] is `pub` (the proxy's grace test needs a
-//!   clock it supplies).
+//! * [`Backing`] has a `Sized` bound (RPITIT with `Door<Self>` needs it).
 //! * `install` creates the entity for a fresh key before its checks, so an
 //!   install that answers `Unbounded` (a pin, a budget that covers the
 //!   file) leaves an entity with nothing installed in the map until a
@@ -206,7 +204,6 @@ use std::hash::Hash;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
 
 use crate::piece_store::{Decision, RetentionPolicy, Shape, Share};
 use crate::retention::{CacheBudget, RetentionBudget, runs};
@@ -275,19 +272,6 @@ pub enum Mode {
     Slack { opens: u64 },
 }
 
-/// How long an entity nobody is reading keeps what its last pass concluded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Liveness {
-    /// Pruned by [`Retention::holdings`] once no reader has been seen for
-    /// this long. The proxy's grace between one request of a player and its
-    /// next; measured from the last delivered byte, and only once no
-    /// [`Reader`] is open.
-    Grace(Duration),
-    /// Until a sibling is installed over it, it is cleared, or the owner
-    /// is dropped. The torrent: a policy lives as long as the active file.
-    UntilReplaced,
-}
-
 /// The world outside the owner, for one kind of entity.
 ///
 /// Small on purpose: describe the entity's index space, list what the disk
@@ -329,7 +313,6 @@ pub trait Backing: Sized + Send + Sync + 'static {
     const SHARE: Share;
     const TRIGGER: Trigger;
     const INSTALL: Install;
-    const LIVENESS: Liveness;
 
     /// Resolve what `want` names, or `None` when it names nothing that can
     /// be bounded -- a torrent with no metadata. May do I/O; called with the
@@ -561,9 +544,6 @@ struct State<B: Backing> {
     /// asked has ended, and what [`Door::window_now`] draws the window
     /// round.
     last_position: Option<B::Position>,
-    /// When a byte last reached a player, which is what [`Liveness::Grace`]
-    /// is measured from once no reader is left.
-    last_seen: Instant,
     /// Whether this entity's range is held back from what we announce with
     /// nothing installed to put it back.
     ///
@@ -736,8 +716,6 @@ pub struct Holding<B: Backing> {
     pub live_playhead: bool,
     /// The entity's last delivered byte, and `None` until one has gone out.
     pub last_position: Option<B::Position>,
-    /// When a byte last reached a player.
-    pub last_seen: Instant,
     /// The budget the entity was last decided under, on the delivered byte;
     /// `None` before any decision and under [`Install::OnOpen`].
     pub decided: Option<CacheBudget>,
@@ -837,7 +815,6 @@ impl<B: Backing> Retention<B> {
                         windows: Vec::new(),
                         readers: HashMap::new(),
                         last_position: None,
-                        last_seen: Instant::now(),
                         held_back: false,
                         doomed: Vec::new(),
                         opens: 0,
@@ -894,7 +871,6 @@ impl<B: Backing> Retention<B> {
             return;
         };
         let mut state = entity.state.lock();
-        state.last_seen = Instant::now();
         state.last_position = Some(at);
     }
 
@@ -1113,14 +1089,14 @@ impl<B: Backing> Retention<B> {
     /// Forget the entity for `key` once its slack pass has taken the last
     /// of it off the disk and no read is open on it.
     ///
-    /// The replacement for [`Liveness::Grace`]'s pruning, and it prunes on
+    /// The replacement for the proxy's old 90-second grace, and it prunes on
     /// a fact rather than on a clock: an entity that holds nothing and that
     /// nobody is reading has no window to keep, no head worth remembering
     /// and nothing for a later pass to do. A [`Reader`]'s drop never calls
     /// it -- a read that ends is not a stream that has been replaced, and
     /// the entity it read is kept until something else is played.
     ///
-    /// L1 → L2, as [`Self::holdings_at`] is (rule 1), and never from inside
+    /// L1 → L2, as [`Self::holdings`] is (rule 1), and never from inside
     /// a pass: the caller holds no [`Claim`] and no `Arc` of the entity by
     /// the time it asks, so an entity a later reader has opened in the gap
     /// keeps itself.
@@ -1673,31 +1649,12 @@ impl<B: Backing> Retention<B> {
         }
     }
 
-    /// Every entity's holding, as of `Instant::now()`. Prunes
-    /// [`Liveness::Grace`] entities first; L1 → L2, no I/O.
+    /// Every entity's holding. L1 → L2, no I/O, and nothing is pruned
+    /// here: an entity goes when a [`Mode::Slack`] pass has taken the last
+    /// of it off the disk ([`Self::forget_empty`]), which is a fact about
+    /// the entity rather than an age.
     pub fn holdings(&self) -> Vec<(B::Key, Holding<B>)> {
-        self.holdings_at(Instant::now())
-    }
-
-    /// [`Self::holdings`] against a clock the caller supplies.
-    ///
-    /// The pruning is here because this is the call that happens once per
-    /// cleaner pass rather than once per delivered chunk, and that cadence
-    /// is enough: writing a chunk is a filesystem event, and a filesystem
-    /// event under the cache root is what arms the cleaner. An entity goes
-    /// once nothing but this map holds it -- no [`Reader`] open on it, no
-    /// pass in flight -- and the grace has passed since its last delivered
-    /// byte. A reader that is open and has delivered nothing keeps its
-    /// entity; it also keeps no window and no playhead, so the gate is
-    /// told nothing about it.
-    pub fn holdings_at(&self, now: Instant) -> Vec<(B::Key, Holding<B>)> {
-        let mut entities = self.entities.lock();
-        if let Liveness::Grace(grace) = B::LIVENESS {
-            entities.retain(|_, entity| {
-                Arc::strong_count(entity) > 1
-                    || now.duration_since(entity.state.lock().last_seen) < grace
-            });
-        }
+        let entities = self.entities.lock();
         entities
             .iter()
             .map(|(key, entity)| (key.clone(), entity.state.lock().holding()))
@@ -2000,7 +1957,6 @@ impl<B: Backing> State<B> {
                 .values()
                 .any(|reader| reader.playhead.is_some()),
             last_position: self.last_position,
-            last_seen: self.last_seen,
             decided: self.decided,
         }
     }
@@ -2066,7 +2022,7 @@ impl<B: Backing> Reader<B> {
     /// A byte at `at` of this entity has reached a player.
     ///
     /// The budget is read before L2 (a copy-out of a foreign lock, rule 2);
-    /// under L2 the entity's `last_seen` and `last_position`, an
+    /// under L2 the entity's `last_position`, an
     /// [`Install::OnDeliveredByte`] decide when the budget moved, this
     /// reader's playhead and the shrink of its promise; and, for
     /// [`Trigger::OnMove`], whether the byte moved a stride since this
@@ -2079,7 +2035,6 @@ impl<B: Backing> Reader<B> {
         let budget = self.owner.budget.get();
         let (claim, refused) = {
             let mut state = self.entity.state.lock();
-            state.last_seen = Instant::now();
             state.last_position = Some(at);
             let refused = if B::INSTALL == Install::OnDeliveredByte && state.decided != Some(budget)
             {
@@ -2131,7 +2086,8 @@ impl<B: Backing> Reader<B> {
 impl<B: Backing> Drop for Reader<B> {
     /// The read is over: its promise is released and its playhead is not a
     /// live reader's any more. The entity and the windows its last pass
-    /// chose stay for [`Liveness`] to decide.
+    /// chose stay: a read that ends is not a stream that has been replaced,
+    /// and what ends one is [`Mode::Slack`].
     fn drop(&mut self) {
         self.entity.state.lock().readers.remove(&self.id);
     }
@@ -2281,30 +2237,26 @@ mod tests {
         const SHARE: Share;
         const TRIGGER: Trigger;
         const INSTALL: Install;
-        const LIVENESS: Liveness;
     }
 
     /// The torrent's shape: half the budget shared, the tick as trigger,
-    /// installed before the reader opens, kept until replaced.
+    /// installed before the reader opens.
     struct TorrentSide;
     impl Side for TorrentSide {
         const SHARE: Share = Share::Half;
         const TRIGGER: Trigger = Trigger::External;
         const INSTALL: Install = Install::OnOpen;
-        const LIVENESS: Liveness = Liveness::UntilReplaced;
     }
 
     /// The proxy's shape: nothing shared, the delivered byte as trigger,
-    /// installed on that byte, a grace once no reader is left.
+    /// installed on that byte.
     struct ProxySide;
-    const GRACE: Duration = Duration::from_secs(90);
     impl Side for ProxySide {
         const SHARE: Share = Share::Nothing;
         const TRIGGER: Trigger = Trigger::OnMove {
             passes_per_window: 20,
         };
         const INSTALL: Install = Install::OnDeliveredByte;
-        const LIVENESS: Liveness = Liveness::Grace(GRACE);
     }
 
     /// One file of full pieces, `PIECE` bytes each.
@@ -2482,7 +2434,6 @@ mod tests {
         const SHARE: Share = S::SHARE;
         const TRIGGER: Trigger = S::TRIGGER;
         const INSTALL: Install = S::INSTALL;
-        const LIVENESS: Liveness = S::LIVENESS;
 
         async fn resolve(&self, want: usize) -> Option<FakeDomain> {
             self.domains.lock().get(&want).cloned()
@@ -4104,22 +4055,19 @@ mod tests {
     /// **A reader reports what it holds**: its promise shrinks from the
     /// front as bytes go out and an empty promise records nothing; a seek
     /// back a stride is as due as playing on; the holding says what is
-    /// promised, whether a playhead is live, the extent, and when a byte
-    /// last went out.
+    /// promised, whether a playhead is live, and the extent.
     #[tokio::test]
     async fn a_reader_reports_what_it_holds() {
         let (_backing, owner, _budget) = proxy();
         let reader = owner.reader(0, domain(0, 0..8));
         reader.promises(0..0);
         assert_eq!(owner.readers(), 0, "an empty promise was recorded");
-        let made = owner.holding(&0).unwrap().last_seen;
         reader.promises(2..6);
         let holding = owner.holding(&0).unwrap();
         assert_eq!(holding.promised, vec![2..6]);
         assert_eq!(holding.extent, 0..8);
         assert!(!holding.live_playhead, "a promise is not a delivered byte");
         assert_eq!(owner.readers(), 1);
-        while Instant::now() == made {}
         let claim = reader.note((0, 3 * PIECE)).expect("due");
         let holding = owner.holding(&0).unwrap();
         assert_eq!(
@@ -4128,10 +4076,6 @@ mod tests {
             "the delivered piece is still promised"
         );
         assert!(holding.live_playhead);
-        assert!(
-            holding.last_seen > made,
-            "a delivered byte did not move last_seen"
-        );
         assert_eq!(holding.last_position, Some((0, 3 * PIECE)));
         let outcome = owner.pass(&0, &(), claim, Mode::Live).await;
         assert!(outcome.concluded.is_some() && outcome.again.is_none());
@@ -4359,31 +4303,6 @@ mod tests {
             reader.note((0, 5 * PIECE)).is_some(),
             "the overtaken pass wrote its measurement over a reader the new budget made due"
         );
-    }
-
-    /// An entity nobody holds and nobody has delivered to for the grace is
-    /// pruned; one with a reader open, however quiet, is not; the torrent's
-    /// are never pruned.
-    #[tokio::test]
-    async fn the_grace_prunes_only_what_nothing_holds() {
-        let (_backing, owner, _budget) = proxy();
-        let reader = owner.reader(0, domain(0, 0..8));
-        reader.note((0, 0));
-        let later = Instant::now() + GRACE + Duration::from_secs(1);
-        assert_eq!(
-            owner.holdings_at(later).len(),
-            1,
-            "an open reader's entity was pruned"
-        );
-        assert_eq!(owner.readers(), 1);
-        drop(reader);
-        assert_eq!(owner.readers(), 0, "a dropped reader is still counted");
-        assert_eq!(owner.holdings_at(Instant::now()).len(), 1);
-        assert_eq!(owner.holdings_at(later).len(), 0);
-
-        let (_backing, owner, _budget) = torrent();
-        owner.install(0, 0).await;
-        assert_eq!(owner.holdings_at(later).len(), 1);
     }
 
     /// The pass future and the door can be sent to another thread, which

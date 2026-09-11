@@ -282,11 +282,22 @@ impl ProxyCache {
     /// `cache_cleaner::cache_roots` already walks -- bounded by the cache
     /// cleaner's cap, which is the *same* cell the torrent half reads
     /// (`EngineFS::cache_budget`) and not a second copy of the number.
-    pub fn new(download_dir: &Path, budget: Arc<enginefs::retention::RetentionBudget>) -> Self {
+    ///
+    /// `live` is shared the same way and for the same reason
+    /// (`EngineFS::live`): what is being played is one fact about the
+    /// server, not one per owner. A torrent stream opening is what makes
+    /// the proxied body slack, and a proxied body opening is what makes the
+    /// torrent's file slack, and neither could say so through a cell of its
+    /// own.
+    pub fn new(
+        download_dir: &Path,
+        budget: Arc<enginefs::retention::RetentionBudget>,
+        live: Arc<enginefs::retention::live::Live>,
+    ) -> Self {
         let work = Arc::new(DiskWork::default());
         Self {
             root: download_dir.join(PROXY_CACHE_DIR),
-            retention: Arc::new(ProxyRetention::new(budget, work.clone())),
+            retention: Arc::new(ProxyRetention::new(budget, work.clone(), live)),
             work,
         }
     }
@@ -1054,7 +1065,7 @@ mod tests {
         // No budget: nothing has published one, which is what these tests
         // are about anyway -- they are about the key, the entity and the
         // arithmetic, and no chunk here is ever reclaimed by the window.
-        let cache = ProxyCache::new(dir.path(), Arc::default());
+        let cache = ProxyCache::new(dir.path(), Arc::default(), Arc::default());
         (dir, cache)
     }
 
@@ -1359,7 +1370,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("a scratch root");
         let budget = Arc::new(enginefs::retention::RetentionBudget::default());
         budget.set(Some(4 * CHUNK_BYTES));
-        let cache = ProxyCache::new(dir.path(), budget);
+        let cache = ProxyCache::new(dir.path(), budget, Arc::default());
         let entry = entry_of(&cache, "https://host/film.mkv");
 
         let total = 16 * CHUNK_BYTES;
@@ -1430,7 +1441,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("a scratch root");
         let budget = Arc::new(enginefs::retention::RetentionBudget::default());
         budget.set(Some(4 * CHUNK_BYTES));
-        let cache = ProxyCache::new(dir.path(), budget);
+        let cache = ProxyCache::new(dir.path(), budget, Arc::default());
         let entry = entry_of(&cache, "https://host/film.mkv");
 
         let total = 20 * CHUNK_BYTES;

@@ -20,6 +20,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::PathBuf;
 
 /// The config every test here spreads from: no DHT bootstrap name
 /// resolution, so starting a server makes no DNS query (see `embed.rs`).
@@ -1259,6 +1260,14 @@ fn a_body_that_stops_mid_chunk_leaves_no_chunk_to_serve() -> anyhow::Result<()> 
 /// paths were refused for a rule none of them was written to exercise and the
 /// test passed with every one of those rules deleted.
 ///
+/// The accounting is per entity and not a running total over the cache,
+/// because the cache does not accumulate across URLs any more: each of these
+/// requests opens a stream on a URL of its own, and opening one is what makes
+/// the one before it disposable (`server::proxy_retention`). So what a pair
+/// claims is that the defective response added no entity of its own and the
+/// control's own directory holds its chunks -- which is the claim the running
+/// total was standing in for.
+///
 /// The refusals are deliberately more than the letter of HTTP asks for. A
 /// store that never revalidates cannot honour `no-cache` or a `max-age` of
 /// zero any other way; an origin that has not said it answers ranges must not
@@ -1357,9 +1366,9 @@ fn nothing_the_rules_refuse_is_cached() -> anyhow::Result<()> {
     let proxied = |path: &str| format!("{}/proxy/d={}{path}", fixture.base, encode(&origin));
 
     // Each defect against the same response without it, in the same shape.
-    // `held` is what the store held before the pair, so both halves are
-    // counted against the same starting point.
-    let mut held = 0;
+    // The entities the cache holds before the pair are what both halves are
+    // read against: a directory that was not among them and holds chunks is
+    // a response that was cached.
     for (shape, defect) in [
         ("whole", "no-store"),
         ("whole", "no-cache"),
@@ -1374,17 +1383,16 @@ fn nothing_the_rules_refuse_is_cached() -> anyhow::Result<()> {
         // Three chunks in a fragment a byte short of the entity, four in a
         // whole one.
         let kept = if shape == "fragment" { 3 } else { 4 };
+        settled(&fixture);
+        let before = cached_entities(&fixture);
         let response = client
             .get(proxied(&format!("/{shape}/{defect}/film.mp4")))
             .send()?;
         assert!(response.status().is_success(), "{defect}");
         assert!(!response.bytes()?.is_empty(), "{defect}");
         fixture.origin.next_request();
-        assert_eq!(
-            cached_chunks(&fixture).len(),
-            held,
-            "{defect} must not be cached"
-        );
+        settled(&fixture);
+        assert_nothing_new_is_cached(&fixture, &before, &format!("{defect} must not be cached"));
 
         // The same response, the same shape, the same length, the same
         // everything but the defect -- and it is kept. So the assertion
@@ -1395,12 +1403,11 @@ fn nothing_the_rules_refuse_is_cached() -> anyhow::Result<()> {
             .send()?;
         assert!(!control.bytes()?.is_empty(), "{defect} control");
         fixture.origin.next_request();
-        held += kept;
-        wait_for_chunks(&fixture, held);
+        let entity = wait_for_new_entity(&fixture, &before, kept);
         assert_eq!(
-            cached_chunks(&fixture).len(),
-            held,
-            "{defect} control caches its chunks and nothing else does"
+            cached_chunks_by_entity(&fixture).get(&entity).copied(),
+            Some(kept),
+            "{defect} control caches its chunks and nothing else"
         );
     }
 
@@ -1422,24 +1429,25 @@ fn nothing_the_rules_refuse_is_cached() -> anyhow::Result<()> {
     // store that holds the whole of it. A rule that stopped working would
     // answer that request off disk, and the origin would never hear it.
     //
+    // Each case is finished before the next one is filled, because filling
+    // the next is what makes this one's chunks disposable.
+    //
     // A `HEAD` describes a body it does not carry; an `If-Range` is a
     // conditional, and answering one out of a store that never revalidates
     // would be inventing the condition's answer; an `h=` naming a credential
     // is refused outright rather than keyed, since `/proxy` takes no bearer
     // token of its own and an entry one caller's secret filled is one any
     // other caller could name.
-    for path in [
-        "/whole/none/head.mp4",
-        "/whole/none/conditional.mp4",
-        "/whole/none/authenticated.mp4",
-    ] {
+    let fill = |path: &str| -> anyhow::Result<std::path::PathBuf> {
+        settled(&fixture);
+        let before = cached_entities(&fixture);
         let response = client.get(proxied(path)).send()?;
         assert_eq!(response.bytes()?.len(), ORIGIN_LENGTH);
         fixture.origin.next_request();
-        held += 4;
-        wait_for_chunks(&fixture, held);
-    }
+        Ok(wait_for_new_entity(&fixture, &before, 4))
+    };
 
+    let filled = fill("/whole/none/head.mp4")?;
     let head = client.head(proxied("/whole/none/head.mp4")).send()?;
     assert_eq!(head.status(), reqwest::StatusCode::OK);
     assert!(
@@ -1450,7 +1458,30 @@ fn nothing_the_rules_refuse_is_cached() -> anyhow::Result<()> {
         fixture.origin.next_request().line.starts_with("HEAD"),
         "a HEAD has no body to keep, so it has no entry to read from either"
     );
+    assert_eq!(
+        cached_chunks_by_entity(&fixture).get(&filled).copied(),
+        Some(4),
+        "and it left the entity the GET filled exactly as it found it"
+    );
 
+    // A request with no `Range` is answered from the cache only when the
+    // whole entity is there -- which for this one it now is, and it is still
+    // the stream being played, so nothing has taken it.
+    let response = client.get(proxied("/whole/none/head.mp4")).send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        header(response.headers(), "content-length"),
+        Some(ORIGIN_LENGTH.to_string()).as_deref()
+    );
+    assert_eq!(
+        header(response.headers(), "etag"),
+        Some(ORIGIN_ETAG),
+        "and labelled with the validator the entity is filed under"
+    );
+    assert_eq!(response.bytes()?.len(), ORIGIN_LENGTH);
+    assert!(fixture.origin.was_asked_for_nothing_more());
+
+    let filled = fill("/whole/none/conditional.mp4")?;
     let conditional = client
         .get(proxied("/whole/none/conditional.mp4"))
         .header(reqwest::header::RANGE, "bytes=0-")
@@ -1461,7 +1492,14 @@ fn nothing_the_rules_refuse_is_cached() -> anyhow::Result<()> {
         fixture.origin.next_request().header("if-range").is_some(),
         "a conditional cannot be answered by a store that never revalidates"
     );
+    assert_eq!(
+        cached_chunks_by_entity(&fixture).get(&filled).copied(),
+        Some(4),
+        "and it left nothing of its own behind either"
+    );
 
+    let before = cached_entities(&fixture);
+    fill("/whole/none/authenticated.mp4")?;
     let authenticated = format!(
         "{}/proxy/d={}&h={}/whole/none/authenticated.mp4",
         fixture.base,
@@ -1476,28 +1514,14 @@ fn nothing_the_rules_refuse_is_cached() -> anyhow::Result<()> {
         "the credential still travels; it is the entry that is refused, both \
          the writing of one and the reading of one"
     );
-
+    settled(&fixture);
+    let mut credentialled = cached_entities(&fixture);
+    credentialled.retain(|entity| !before.contains(entity));
     assert_eq!(
-        cached_chunks(&fixture).len(),
-        held,
-        "and none of the three left anything behind either"
+        credentialled.len(),
+        1,
+        "the plain GET's entity, and no second one keyed by the credential"
     );
-
-    // A request with no `Range` is answered from the cache only when the
-    // whole entity is there -- which for this one it now is.
-    let response = client.get(proxied("/whole/none/head.mp4")).send()?;
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
-    assert_eq!(
-        header(response.headers(), "content-length"),
-        Some(ORIGIN_LENGTH.to_string()).as_deref()
-    );
-    assert_eq!(
-        header(response.headers(), "etag"),
-        Some(ORIGIN_ETAG),
-        "and labelled with the validator the entity is filed under"
-    );
-    assert_eq!(response.bytes()?.len(), ORIGIN_LENGTH);
-    assert!(fixture.origin.was_asked_for_nothing_more());
 
     drop(fixture.handle);
     Ok(())
@@ -1537,6 +1561,70 @@ fn the_cleaner_evicts_cached_proxy_bytes() -> anyhow::Result<()> {
 
     let left = cached_chunks(&fixture).len();
     assert!(left < 4, "the cleaner took cached proxy bytes: {left} left");
+
+    drop(fixture.handle);
+    Ok(())
+}
+
+/// **What empties a proxied stream's cache is another one being opened.**
+///
+/// Not a clock, which is what it used to be: an entity nothing was reading
+/// was forgotten ninety seconds after its last delivered byte and its chunks
+/// became the cleaner's to find. A viewer who pauses for an hour has not
+/// stopped playing, and a viewer who opens something else has stopped playing
+/// whatever the clock says -- so the cache keeps the one stream being played
+/// and drops what was left, at the moment it is left.
+///
+/// This runs through the whole server, which is the point of it being here:
+/// the cell the proxy writes when a body opens is the engine's own
+/// (`AppState::new_with_shared_settings_and_log_dir`), and what wakes on it
+/// is the switch task in `server::serve`. Either of those wired to a cell of
+/// its own would leave the first stream's chunks on the disk for ever.
+#[test]
+fn opening_another_proxied_stream_takes_the_one_it_left_off_the_disk() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let origin = format!("http://{}", fixture.origin.addr);
+    let client = reqwest::blocking::Client::new();
+    let proxied = |path: &str| format!("{}/proxy/d={}{path}", fixture.base, encode(&origin));
+
+    let first = client.get(proxied("/first.mp4")).send()?;
+    assert_eq!(first.bytes()?.len(), ORIGIN_LENGTH);
+    fixture.origin.next_request();
+    let left = wait_for_new_entity(&fixture, &Default::default(), 4);
+    // The body has to be over before the switch, because a body still being
+    // delivered keeps the bytes it was framed round however long ago the
+    // viewer left: what the switch drops is slack, and an open read is not.
+    nothing_is_reading(&fixture);
+
+    // A second later or an hour later -- there is no clock in this -- the
+    // viewer opens something else.
+    let second = client.get(proxied("/second.mp4")).send()?;
+    assert_eq!(second.bytes()?.len(), ORIGIN_LENGTH);
+    fixture.origin.next_request();
+    let playing = wait_for_new_entity(
+        &fixture,
+        &std::collections::BTreeSet::from([left.clone()]),
+        4,
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if !cached_chunks_by_entity(&fixture).contains_key(&left) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let held = cached_chunks_by_entity(&fixture);
+    assert_eq!(
+        held.get(&left),
+        None,
+        "every chunk of the stream the viewer left is gone: {held:?}"
+    );
+    assert_eq!(
+        held.get(&playing).copied(),
+        Some(4),
+        "and the one being played is untouched"
+    );
 
     drop(fixture.handle);
     Ok(())
@@ -6030,6 +6118,72 @@ fn cached_chunks(fixture: &Fixture) -> Vec<std::path::PathBuf> {
                 && !path.to_string_lossy().ends_with(".part")
         })
         .collect()
+}
+
+/// The chunk files the proxy cache holds, grouped by the entity directory
+/// they are in: the bucket directories are per thousand chunks, and their
+/// parent is the one directory a response's chunks share and no other
+/// response's are in (`server::proxy_cache`'s key, then the framing the
+/// entity is filed under).
+///
+/// What the cache holds is read this way wherever more than one URL is
+/// fetched, because a total over the whole root is a moving number now: one
+/// stream opening makes the one before it disposable, and its chunks go
+/// while the next response is still arriving.
+fn cached_chunks_by_entity(fixture: &Fixture) -> std::collections::BTreeMap<PathBuf, usize> {
+    let mut by_entity = std::collections::BTreeMap::new();
+    for path in cached_chunks(fixture) {
+        if let Some(entity) = path.parent().and_then(|bucket| bucket.parent()) {
+            *by_entity.entry(entity.to_path_buf()).or_insert(0usize) += 1;
+        }
+    }
+    by_entity
+}
+
+/// The entity directories holding at least one chunk right now.
+fn cached_entities(fixture: &Fixture) -> std::collections::BTreeSet<PathBuf> {
+    cached_chunks_by_entity(fixture).into_keys().collect()
+}
+
+/// Nothing outside `before` holds a chunk: the response under test was not
+/// cached. Said of the entities rather than of a count, so an entity being
+/// deleted meanwhile -- which a stream opening starts -- cannot make a
+/// refusal look like one.
+fn assert_nothing_new_is_cached(
+    fixture: &Fixture,
+    before: &std::collections::BTreeSet<PathBuf>,
+    what: &str,
+) {
+    for (entity, chunks) in cached_chunks_by_entity(fixture) {
+        assert!(
+            before.contains(&entity),
+            "{what}: {} holds {chunks} chunks",
+            entity.display()
+        );
+    }
+}
+
+/// Wait until an entity directory that was not in `before` holds `chunks`
+/// chunks, and say which it is. Bounded so a regression fails instead of
+/// hanging.
+fn wait_for_new_entity(
+    fixture: &Fixture,
+    before: &std::collections::BTreeSet<PathBuf>,
+    chunks: usize,
+) -> PathBuf {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        for (entity, held) in cached_chunks_by_entity(fixture) {
+            if !before.contains(&entity) && held >= chunks {
+                return entity;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!(
+        "no new entity ever held {chunks} chunks; the cache holds {:?}",
+        cached_chunks_by_entity(fixture)
+    );
 }
 
 /// The chunk indices the proxy cache holds, ascending. A chunk file is named

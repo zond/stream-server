@@ -37,7 +37,7 @@
 //! they are asked once per reclaim run, on a blocking thread, and a
 //! `String` per ask would be an allocation per unlink.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The one entity being played.
 ///
@@ -143,6 +143,17 @@ impl Live {
         )
     }
 
+    /// Whether the proxied entity in `dir` is the one being played, off the
+    /// watch's own lock with nothing cloned. Asked once per reclaim run,
+    /// from a blocking thread, so a `PathBuf` per ask would be an
+    /// allocation per unlink.
+    pub fn is_proxy(&self, dir: &Path) -> bool {
+        matches!(
+            &*self.0.borrow(),
+            Some(LiveEntity::Proxy { dir: playing }) if playing == dir
+        )
+    }
+
     /// A receiver that is woken every time the value really changes: what a
     /// task drops the predecessor's slack from.
     pub fn changed(&self) -> tokio::sync::watch::Receiver<Option<LiveEntity>> {
@@ -185,6 +196,11 @@ impl Reading {
             }) => Some((info_hash.as_str(), *file_idx)),
             _ => None,
         }
+    }
+
+    /// Whether the proxied entity in `dir` is the one being played.
+    pub fn is_proxy(&self, dir: &Path) -> bool {
+        matches!(&self.0, Some(LiveEntity::Proxy { dir: playing }) if playing == dir)
     }
 
     /// Which file of `info_hash` is being played, and `None` when the

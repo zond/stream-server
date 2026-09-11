@@ -5,9 +5,7 @@ use crate::backend::{
 use crate::cache::DataCache;
 use crate::piece_store::{RetentionPolicy, Share, StoreRegistry};
 use crate::retention::live::{Live, Reading};
-use crate::retention::owner::{
-    Backing, Door, Install, InstalledView, Liveness, Mode, Retention, Trigger,
-};
+use crate::retention::owner::{Backing, Door, Install, InstalledView, Mode, Retention, Trigger};
 use anyhow::Context;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ops::Range;
@@ -409,9 +407,6 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
     /// Before the reader opens, so the hold-back precedes the pieces: there
     /// is no un-Have in BitTorrent.
     const INSTALL: Install = Install::OnOpen;
-    /// A policy lives as long as the active file: the next file's install
-    /// clears it, and nothing else does.
-    const LIVENESS: Liveness = Liveness::UntilReplaced;
 
     /// What the backend says the file is, now. `None` is a torrent with no
     /// metadata to name its pieces by, or a piece length of nothing, and
