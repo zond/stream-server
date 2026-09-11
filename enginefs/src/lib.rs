@@ -5476,7 +5476,15 @@ mod tests {
     fn fake_engine_root() -> std::path::PathBuf {
         static ROOTS: AtomicUsize = AtomicUsize::new(0);
         static WIPE: std::sync::Once = std::sync::Once::new();
-        let parent = std::env::temp_dir().join("enginefs-fake-engine-tests");
+        // Per *process*, not per machine: the wipe below removes the whole
+        // parent, and two test binaries running at once -- `cargo test`
+        // running enginefs's lib tests beside anything else that links it,
+        // or two `cargo test -p enginefs` invocations -- would each wipe the
+        // other's roots mid-test, taking piece files their fixtures had just
+        // written. Measured: three file-existence failures in a run that was
+        // green on its own.
+        let parent =
+            std::env::temp_dir().join(format!("enginefs-fake-engine-tests-{}", std::process::id()));
         WIPE.call_once(|| {
             let _ = std::fs::remove_dir_all(&parent);
         });
