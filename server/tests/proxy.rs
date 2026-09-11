@@ -304,6 +304,48 @@ fn the_core_path_format_relays_the_target() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `/proxy` relays reads and nothing else: a `POST`, `PUT` or `DELETE` is
+/// `405` and the origin is asked for nothing. The route is open, under a
+/// wildcard CORS, so a relay that took any method would let any page or
+/// app on the device write to wherever the device can reach.
+#[test]
+fn only_reads_are_relayed() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let target = format!("http://{}/dir/movie.mp4", fixture.origin.addr);
+    let client = reqwest::blocking::Client::new();
+    for method in [
+        reqwest::Method::POST,
+        reqwest::Method::PUT,
+        reqwest::Method::DELETE,
+        reqwest::Method::PATCH,
+    ] {
+        let response = client
+            .request(
+                method.clone(),
+                format!("{}/proxy/?d={}", fixture.base, encode(&target)),
+            )
+            .body("payload")
+            .send()?;
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::METHOD_NOT_ALLOWED,
+            "{method}"
+        );
+    }
+    assert!(
+        fixture.origin.was_asked_for_nothing_more(),
+        "a refused method reached the origin"
+    );
+
+    let head = client
+        .head(format!("{}/proxy/?d={}", fixture.base, encode(&target)))
+        .send()?;
+    assert_eq!(head.status(), reqwest::StatusCode::OK);
+
+    drop(fixture.handle);
+    Ok(())
+}
+
 /// The query format. Not what the playlist rewrite writes any more -- that
 /// has been the path format since a rewritten line needed a directory of
 /// its own -- but callers still send it, so the route still reads it, and

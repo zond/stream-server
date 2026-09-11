@@ -1322,6 +1322,22 @@ async fn proxy(
     // Format 1: ?d=URL (standard)
     // Format 2: /<query_params>/<path> (Core) where query_params contains d=ORIGIN&h=HEADER&r=RESPONSE_HEADER
 
+    // Reads, and nothing else. The route is open and answers under a
+    // wildcard CORS, and it used to relay whatever method it was called
+    // with, the caller's headers and body along with it -- so any page a
+    // browser on this device had open, and on Android any app at all, could
+    // make it `POST` or `DELETE` to whatever the device can reach, in its
+    // name. "Only stremio-core can reach loopback" is not true on a phone.
+    // Players fetch media with `GET` and probe with `HEAD`; `OPTIONS` is
+    // relayed for a player that asks.
+    if !matches!(method, Method::GET | Method::HEAD | Method::OPTIONS) {
+        return Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .header(header::ALLOW, "GET, HEAD, OPTIONS")
+            .body(axum::body::Body::empty())
+            .unwrap();
+    }
+
     let Some((params, url)) = requested(rest.as_deref(), raw_query.as_deref()) else {
         return (StatusCode::BAD_REQUEST, "Invalid target URL").into_response();
     };
