@@ -678,6 +678,9 @@ pub enum InstallOutcome {
     /// The policy already installed describes this entity under this
     /// budget, so nothing was touched and nothing re-held-back.
     Kept,
+    /// The policy standing over this entity was resized to a budget that
+    /// moved, keeping what it had committed; nothing was given back.
+    Resized,
     /// Nothing bounds the entity: no budget yet, no cap, a budget that
     /// covers it, nothing to resolve, a pin, or a hold-back the backend
     /// refused (logged). Whatever was installed before has been given back.
@@ -930,9 +933,10 @@ impl<B: Backing> Retention<B> {
     ///
     /// Under this key's turn alone: a pin clears; a policy that already
     /// describes this domain under this budget is kept untouched (nothing
-    /// re-held-back); otherwise the old policy is cleared -- advertised back
-    /// first, and only on success forgotten -- the new range held back, and
-    /// the policy installed. A hold-back the backend refuses installs
+    /// re-held-back); one over this domain under another budget is resized
+    /// in place ([`InstallOutcome::Resized`]); otherwise the old policy is
+    /// cleared -- advertised back first, and only on success forgotten --
+    /// the new range held back, and the policy installed. A hold-back the backend refuses installs
     /// nothing: without it every window piece would be announced and
     /// withdrawn seconds later, which is worse than bounding nothing.
     pub async fn install(&self, key: B::Key, want: B::Want) -> InstallOutcome {
@@ -993,7 +997,7 @@ impl<B: Backing> Retention<B> {
             Some(domain) => Some(domain),
             None => self.backing.resolve(want).await,
         };
-        let policy = resolved.as_ref().and_then(|domain| match budget {
+        let mut policy = resolved.as_ref().and_then(|domain| match budget {
             CacheBudget::Bytes(bytes) => match B::policy(domain, bytes) {
                 Ok(policy) if policy.shape() != Shape::Whole => Some(policy),
                 // The budget covers the file. Keep all of it, share all of
@@ -1012,6 +1016,32 @@ impl<B: Backing> Retention<B> {
             },
             CacheBudget::Unknown | CacheBudget::Unbounded => None,
         });
+        // A budget that moved under a policy still standing over this very
+        // domain. The budget is republished every minute from the free
+        // space, so this is most opens, not a rare one: rebuilt, every open
+        // gave the whole range back (a Have for each piece of the window) to
+        // hold it back again one call later, and the fresh policy's first
+        // pass reclaimed everything the old one had committed -- announced,
+        // then deleted. Resized in place, the range stays held back and the
+        // committed half stays announced.
+        let over = match (&resolved, policy.as_mut()) {
+            (Some(domain), Some(next)) => {
+                let state = entity.state.lock();
+                state
+                    .installed
+                    .as_ref()
+                    .filter(|_| state.domain == *domain)
+                    .map(|installed| installed.policy.carry_into(next))
+            }
+            _ => None,
+        };
+        if let Some(over) = over
+            && let Some(next) = policy.take()
+        {
+            return self
+                .resize_under(&entity, &mut claim, budget, next, over)
+                .await;
+        }
         // Whatever was held back before goes back into what we announce
         // first, whether or not a new policy is going in. Otherwise an
         // entity whose reader moved on would leave the old range announced
@@ -1068,6 +1098,48 @@ impl<B: Backing> Retention<B> {
             .lock()
             .install_policy(&mut claim.guard, domain, budget, policy);
         InstallOutcome::Installed
+    }
+
+    /// Put `next` in place of the standing policy, which it has already
+    /// been carried onto ([`RetentionPolicy::carry_into`]). Under the turn.
+    ///
+    /// The committed pieces a smaller budget has no room for are held back
+    /// before they leave the committed set, so no pass reclaims a piece we
+    /// still announce; one the backend would not hold back stays committed.
+    /// The doomed runs and the epoch the hold-back went out under stay:
+    /// nothing here gave anything back or held the range back anew.
+    async fn resize_under(
+        &self,
+        entity: &Entity<B>,
+        claim: &mut Claim,
+        budget: CacheBudget,
+        mut next: RetentionPolicy,
+        over: Vec<u32>,
+    ) -> InstallOutcome {
+        if B::SHARE == Share::Half {
+            for run in runs(&over) {
+                match self.backing.advertise(run.clone(), false).await {
+                    Ok(()) => next.uncommit(&run.collect::<Vec<_>>()),
+                    Err(error) => tracing::warn!(
+                        key = ?entity.key,
+                        error = %format!("{error:#}"),
+                        "could not hold back what a smaller budget stops sharing; it stays shared"
+                    ),
+                }
+            }
+        } else {
+            next.uncommit(&over);
+        }
+        tracing::debug!(
+            key = ?entity.key,
+            shape = ?next.shape(),
+            "resizing an entity's policy to a budget that moved"
+        );
+        entity
+            .state
+            .lock()
+            .resize_policy(&mut claim.guard, budget, next);
+        InstallOutcome::Resized
     }
 
     /// Forget the policy for `key` and put back what it was holding back.
@@ -1929,6 +2001,29 @@ impl<B: Backing> State<B> {
             asserted_epoch: None,
         });
         Ok(())
+    }
+
+    /// Replace the standing policy with `policy`, the same domain under
+    /// `budget`, keeping what was recorded about the one it replaces: the
+    /// runs its pass doomed are still going, and the hold-back it asserted
+    /// is still the one in force. Under the turn.
+    fn resize_policy(&mut self, _turn: &mut Turn, budget: CacheBudget, policy: RetentionPolicy) {
+        self.stride = match policy.shape() {
+            Shape::Split { window, .. } => stride_for::<B>(window),
+            Shape::Whole => 1,
+        };
+        for reader in self.readers.values_mut() {
+            reader.passed_at = None;
+        }
+        let asserted_epoch = self
+            .installed
+            .as_ref()
+            .and_then(|installed| installed.asserted_epoch);
+        self.installed = Some(Installed {
+            budget,
+            policy,
+            asserted_epoch,
+        });
     }
 
     /// Put a resolved policy in its cell. Under the turn.
@@ -4096,9 +4191,9 @@ mod tests {
     /// **What `install` answers when it installs nothing, and when the old
     /// policy will not go**: no budget, a budget that covers the file, a
     /// want that resolves to nothing, a pin; `Kept` only under the same
-    /// budget; the domain resolved afresh under the turn; and `OldStands`
-    /// from both of its sites -- a refused clear under a new budget, and
-    /// under a pin.
+    /// budget, `Resized` under another over the same domain; the domain
+    /// resolved afresh under the turn; and `OldStands` from both of its
+    /// sites -- a refused clear under a new domain, and under a pin.
     #[tokio::test]
     async fn an_install_that_bounds_nothing_says_so_and_a_policy_that_will_not_go_stands() {
         let (backing, owner, budget) = torrent();
@@ -4134,34 +4229,33 @@ mod tests {
             vec![(0..8, true), (0..8, false), (0..8, true)]
         );
         backing.keeps_everything.store(false, Ordering::SeqCst);
-        // The same key under a new budget is not kept: given back, and
-        // held back afresh.
+        // The same key under a new budget is resized in place: nothing
+        // given back, nothing held back afresh.
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         budget.set(Some(6 * PIECE));
-        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Resized);
         assert_eq!(
             owner.holding(&0).unwrap().installed.map(|i| i.budget),
             Some(CacheBudget::Bytes(6 * PIECE))
         );
         assert_eq!(
             *backing.advertised.lock(),
-            vec![
-                (0..8, true),
-                (0..8, false),
-                (0..8, true),
-                (0..8, false),
-                (0..8, true),
-                (0..8, false)
-            ]
+            vec![(0..8, true), (0..8, false), (0..8, true), (0..8, false)]
         );
-        // The domain is what the backend says the file is now.
+        // The domain is what the backend says the file is now, and a
+        // policy over another domain is given back and held back afresh.
         backing.domains.lock().insert(0, domain(0, 0..6));
         budget.set(Some(4 * PIECE));
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         assert_eq!(owner.holding(&0).unwrap().domain, domain(0, 0..6));
+        assert_eq!(
+            backing.advertised.lock()[4..],
+            [(0..8, true), (0..6, false)]
+        );
         // The old policy will not go: nothing new is installed and the old
         // one stands, under a new budget and under a pin alike.
         backing.fail_advertise.store(true, Ordering::SeqCst);
+        backing.domains.lock().insert(0, domain(0, 0..7));
         budget.set(Some(2 * PIECE));
         assert_eq!(owner.install(0, 0).await, InstallOutcome::OldStands);
         assert_eq!(
@@ -4252,6 +4346,84 @@ mod tests {
             "a refused announce stopped the pass"
         );
         assert_eq!(*backing.advertised.lock(), vec![(0..8, false)]);
+    }
+
+    /// **A budget that moved resizes the policy in place: nothing is given
+    /// back, and what it committed stays committed.**
+    ///
+    /// The budget is republished every minute from the free space, and
+    /// every open installs. Rebuilt on each one, the install gave the whole
+    /// range back -- a Have for every held piece, the window's included --
+    /// to hold it back again a call later, and the new policy's first pass
+    /// reclaimed the piece the old one had committed and announced. A
+    /// smaller budget still takes back what it has no room for, but holds
+    /// it back first.
+    #[tokio::test]
+    async fn a_budget_that_moved_resizes_the_policy_and_keeps_what_it_committed() {
+        let (backing, owner, budget) = torrent();
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        for piece in 0..3u64 {
+            owner.note_position(&0, (0, piece * PIECE));
+            let claim = owner.turn(&0).await.expect("the turn");
+            owner.pass(&0, &(), claim, Mode::Live).await;
+        }
+        let committed = |owner: &Retention<Torrent>| {
+            owner
+                .holding(&0)
+                .unwrap()
+                .installed
+                .unwrap()
+                .committed
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(committed(&owner), vec![0, 1]);
+        assert_eq!(
+            *backing.advertised.lock(),
+            vec![(0..8, false), (0..1, true), (1..2, true)]
+        );
+
+        // A restart out of an error threw the hold-back away, and the
+        // resize is no new hold-back: the pass after it still owes one.
+        backing.epoch.fetch_add(1, Ordering::SeqCst);
+        budget.set(Some(6 * PIECE));
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Resized);
+        assert_eq!(
+            backing.advertised.lock().len(),
+            3,
+            "a resize gave the range back or held it back again"
+        );
+        // Straight on to piece 3, from the window the old shape last
+        // chose: piece 2 was in it, so playback walked past it.
+        backing.holds([2]);
+        owner.note_position(&0, (0, 3 * PIECE));
+        let claim = owner.turn(&0).await.expect("the turn");
+        owner.pass(&0, &(), claim, Mode::Live).await;
+        assert_eq!(committed(&owner), vec![0, 1, 2]);
+        assert!(
+            backing.on_disk().starts_with(&[0, 1, 2]),
+            "a committed piece was reclaimed"
+        );
+        assert_eq!(
+            backing.advertised.lock()[3..],
+            [(3..8, false), (2..3, true)],
+            "the re-issue and the commit"
+        );
+
+        // Two pieces: a window of one and one committed. Pieces 1 and 2 no
+        // longer fit, so they are held back, and only then left to the
+        // reclaim.
+        budget.set(Some(2 * PIECE));
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Resized);
+        assert_eq!(backing.advertised.lock()[5..], [(1..3, false)]);
+        assert_eq!(committed(&owner), vec![0]);
+        let claim = owner.turn(&0).await.expect("the turn");
+        owner.pass(&0, &(), claim, Mode::Live).await;
+        assert!(
+            backing.on_disk().starts_with(&[0, 8]),
+            "{:?}",
+            backing.on_disk()
+        );
     }
 
     /// **A backend that threw away what it was holding back is told again,

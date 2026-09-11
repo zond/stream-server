@@ -371,6 +371,45 @@ impl RetentionPolicy {
         self.committed.contains(&piece)
     }
 
+    /// Move what this policy has learned onto `next`, a policy over the same
+    /// pieces under another budget, and say which committed pieces `next`
+    /// has no room for: the highest, since the lowest were offered first.
+    ///
+    /// The committed set is what we announce, and a policy built afresh
+    /// starts with none of it, so its first pass finds every piece this one
+    /// committed outside its window, in no committed set, and reclaims it --
+    /// pieces a peer was told about minutes ago, deleted under it. And the
+    /// window it last chose goes too, or the next advance takes the
+    /// playhead to have jumped and commits nothing it releases.
+    ///
+    /// The pieces over `next`'s capacity are left committed in it. The
+    /// caller takes them out with [`Self::uncommit`] once it has held them
+    /// back from what we announce, which is the order the hold-back rule
+    /// asks for; one it could not hold back stays committed, over the
+    /// budget, rather than deleted while announced.
+    pub fn carry_into(&self, next: &mut Self) -> Vec<u32> {
+        debug_assert_eq!(
+            self.pieces, next.pieces,
+            "a policy carried onto another file's pieces"
+        );
+        next.committed = self.committed.clone();
+        next.covered = self.covered.clone();
+        let capacity = match next.shape {
+            Shape::Whole => usize::MAX,
+            Shape::Split { committed, .. } => committed as usize,
+        };
+        next.committed.iter().copied().skip(capacity).collect()
+    }
+
+    /// Take `pieces` out of the committed set: they are no longer announced,
+    /// and the next [`Self::advance`] treats them like any other piece
+    /// outside the window.
+    pub fn uncommit(&mut self, pieces: &[u32]) {
+        for piece in pieces {
+            self.committed.remove(piece);
+        }
+    }
+
     /// Where the rolling window sits for a playhead on `piece`.
     ///
     /// The window keeps its size and slides to stay inside the file, so a
