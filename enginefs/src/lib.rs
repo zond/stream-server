@@ -1038,8 +1038,19 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 }
 
                 {
-                    let read = engines_clone.read().await;
-                    for (hash, engine) in read.iter() {
+                    // Cloned out and the guard dropped before the first
+                    // `.await`: the registry is a write-preferring `RwLock`,
+                    // and a read guard held across the three activity maps'
+                    // locks below parks every writer -- an add, a removal --
+                    // and every reader queued behind it, for as long as any
+                    // of those maps is held.
+                    let engines: Vec<(String, Arc<Engine<B::Handle>>)> = engines_clone
+                        .read()
+                        .await
+                        .iter()
+                        .map(|(hash, engine)| (hash.clone(), engine.clone()))
+                        .collect();
+                    for (hash, engine) in &engines {
                         let engine_active_streams = engine
                             .active_streams
                             .load(std::sync::atomic::Ordering::SeqCst);
@@ -14717,6 +14728,30 @@ mod tests {
         );
         assert!(!present(OTHER_HASH).await, "the idle one is removed");
         assert_eq!(*removed.lock().unwrap(), vec![OTHER_HASH.to_string()]);
+    }
+
+    /// **The sweep does not hold the engine registry across its awaits.**
+    ///
+    /// It read the registry under one read guard for the whole decision,
+    /// across the three activity maps' locks, and the registry is a
+    /// write-preferring `RwLock`: while any of those maps was held, every
+    /// writer on the registry -- an add, a removal -- was parked behind
+    /// the sweep, and every reader after it behind that writer.
+    #[tokio::test(start_paused = true)]
+    async fn the_housekeeping_sweep_does_not_hold_the_registry_across_its_awaits() {
+        let (enginefs, _counters) = test_enginefs();
+        nothing_torrent_is_playing(&enginefs);
+        // The sweep that finds the engine idle parks behind this guard.
+        let park = enginefs.active_multifile_files.write().await;
+        tokio::time::sleep(INACTIVE_TORRENT_REMOVE_TIMEOUT + Duration::from_secs(30)).await;
+
+        let engines = enginefs.engines.clone();
+        let writer = tokio::spawn(async move { drop(engines.write().await) });
+        assert!(
+            wait_until(TEST_WAIT_BOUND, || writer.is_finished()).await,
+            "a writer on the engine registry is parked behind the sweep"
+        );
+        drop(park);
     }
 
     /// **A stream that opens between the sweep's decision and its removal
