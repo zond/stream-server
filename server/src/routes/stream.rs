@@ -186,7 +186,12 @@ impl StreamLifecycleGuard {
         file_idx: usize,
         stream_id: u64,
     ) -> Self {
-        engine.on_stream_start(&info_hash, file_idx).await;
+        // Unreconciled: the route asks the reconciler once, after its disk
+        // gate ([`EngineFS::focus_torrent`]), because that is the reading
+        // that can restart a torrent the gate has just made room for.
+        engine
+            .on_stream_start_unreconciled(&info_hash, file_idx)
+            .await;
         Self::new(engine.clone(), info_hash, file_idx, stream_id)
     }
 

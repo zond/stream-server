@@ -2979,6 +2979,23 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// and must end it with [`Self::on_stream_end`]; the two never both
     /// fire, because returning is what disarms the rollback.
     pub async fn on_stream_start(&self, info_hash: &str, file_idx: usize) {
+        self.start_stream(info_hash, file_idx, true).await;
+    }
+
+    /// [`Self::on_stream_start`] without its `PlaybackStart` reconcile, for
+    /// a caller that asks the reconciler itself once its disk gate has run
+    /// (`routes::stream`, through [`Self::focus_torrent`]). The gate may
+    /// free space, and the reconcile after it is the one that can start a
+    /// torrent stopped at the floor; one before it as well was a second
+    /// ladder and a second volume probe on every request, deciding nothing
+    /// the later one would not.
+    ///
+    /// Cancel-safe and handed over exactly as `on_stream_start` is.
+    pub async fn on_stream_start_unreconciled(&self, info_hash: &str, file_idx: usize) {
+        self.start_stream(info_hash, file_idx, false).await;
+    }
+
+    async fn start_stream(&self, info_hash: &str, file_idx: usize, reconcile: bool) {
         let info_hash = info_hash.to_lowercase();
         // First, before anything this call could fail at: **the server saw
         // a stream open**, and that is the event the liveness cell records.
@@ -3037,8 +3054,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         // is what this trigger is measured against, and nothing else in
         // the request can do it: starting a stopped torrent is the
         // reconciler's and only the reconciler's.
-        self.reconcile_hash(&info_hash, crate::reconcile::Trigger::PlaybackStart)
-            .await;
+        if reconcile {
+            self.reconcile_hash(&info_hash, crate::reconcile::Trigger::PlaybackStart)
+                .await;
+        }
 
         // Handed over: from here the caller's guard owns the registration.
         rollback.handed_over();
@@ -7020,6 +7039,28 @@ mod tests {
             vec![(TEST_HASH.to_string(), Decision::Run)]
         );
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
+    }
+
+    /// **The stream route's registration asks the reconciler nothing.**
+    ///
+    /// The route asks it once, after its disk gate, through `focus_torrent`
+    /// -- that is the reading that can start a torrent the gate has just
+    /// made room for. A reconcile inside the registration as well was a
+    /// second ladder and a second volume probe on every Range request. The
+    /// archive route has no gate and no reconcile of its own, and
+    /// `on_stream_start` still asks for it.
+    #[tokio::test(start_paused = true)]
+    async fn only_the_reconciled_stream_start_asks_the_reconciler() {
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(CACHE_FREE_SPACE_FLOOR - 1));
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 0).await;
+        assert_eq!(
+            counters.stop_torrent.load(Ordering::SeqCst),
+            0,
+            "the registration reconciled"
+        );
+        enginefs.on_stream_start(TEST_HASH, 0).await;
+        assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), 1);
     }
 
     /// A volume that cannot be probed is not a full one: the timer says
