@@ -332,6 +332,18 @@ pub struct SyncCacheWriter {
 }
 
 impl SyncCacheWriter {
+    /// `Err` -- and the cache failed with it -- once nobody has read the
+    /// cache for [`ABANDONED_AFTER`], for work towards the member that
+    /// writes nothing: a decoder draining the entries stored before it.
+    /// Every write checks the same thing itself.
+    pub fn check_abandoned(&mut self) -> io::Result<()> {
+        if let Err(abandoned) = self.abandonment.check() {
+            self.set_error(abandoned.to_string());
+            return Err(abandoned);
+        }
+        Ok(())
+    }
+
     pub fn finish(&self) {
         self.state_tx.send_modify(|state| {
             state.is_complete = true;
@@ -350,10 +362,7 @@ impl SyncCacheWriter {
 
 impl std::io::Write for SyncCacheWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if let Err(abandoned) = self.abandonment.check() {
-            self.set_error(abandoned.to_string());
-            return Err(abandoned);
-        }
+        self.check_abandoned()?;
         let n = self.file.write(buf)?;
         if n > 0 {
             self.state_tx.send_modify(|state| {

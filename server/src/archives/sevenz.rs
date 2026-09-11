@@ -40,6 +40,27 @@ impl SevenZHandler {
     }
 }
 
+/// What a drain's error says when the cache it was draining towards was
+/// abandoned.
+const SKIP_ABANDONED: &str = "abandoned while skipping to the member";
+
+/// A sink for the bytes stored before the member, that fails once nobody
+/// reads the cache the member is for.
+struct Skip<'a>(&'a mut SyncCacheWriter);
+
+impl std::io::Write for Skip<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .check_abandoned()
+            .map_err(|e| std::io::Error::new(e.kind(), format!("{SKIP_ABANDONED}: {e}")))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Decompress a single entry into the progressive cache's sync writer.
 ///
 /// Runs on the blocking pool. Only the block containing the target entry is
@@ -80,8 +101,13 @@ fn extract_entry(archive_path: &Path, entry_name: &str, out: &mut SyncCacheWrite
                 } else {
                     // A preceding entry in a solid block: its bytes come first
                     // in the shared stream and must be fully drained, or the
-                    // target would be read from the wrong offset.
-                    std::io::copy(entry_reader, &mut std::io::sink())?;
+                    // target would be read from the wrong offset. Drained
+                    // through the writer's abandonment check, because a
+                    // drain writes nothing to the cache: a player that left
+                    // while gigabytes of earlier members were decoded used
+                    // to keep the decoder going to the member, and only its
+                    // first write gave up.
+                    std::io::copy(entry_reader, &mut Skip(out))?;
                     Ok(true)
                 }
             })
@@ -431,6 +457,28 @@ mod tests {
             assert_eq!(first, FIRST_CONTENT);
             assert_eq!(second, expected_second);
         }
+    }
+
+    /// A solid block's drain towards the member stops once nobody reads the
+    /// cache, rather than decoding every earlier member for a player that
+    /// has gone.
+    #[tokio::test]
+    async fn a_drain_nobody_waits_for_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = write_solid_fixture(dir.path());
+        let (cache, mut writer) = ProgressiveCache::new_in_dir(&dir.path().join("scratch"), None)
+            .await
+            .unwrap();
+        writer.abandon_after(std::time::Duration::ZERO);
+        let mut out = writer.try_clone_sync().unwrap();
+        drop(cache);
+        let err = tokio::task::spawn_blocking(move || {
+            extract_entry(&archive, "videos/second.bin", &mut out)
+        })
+        .await
+        .unwrap()
+        .expect_err("an abandoned extraction finished");
+        assert!(err.to_string().contains(SKIP_ABANDONED), "{err}");
     }
 
     #[tokio::test]
