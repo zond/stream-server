@@ -1736,8 +1736,15 @@ fn the_count_hears_the_clean_and_ignores_what_no_owner_booked() -> anyhow::Resul
         .send()?;
     assert_eq!(response.bytes()?.len(), ORIGIN_LENGTH);
     fixture.origin.next_request();
-    let cached = cached_chunks(&fixture).len() as u64;
+    // Both readings taken once the cache has stopped moving, and in that
+    // order: the usage figure is what the fills booked, and counting the
+    // files first compares a disk that is still being written to against a
+    // count that has heard every write. On this box every chunk had landed
+    // by then anyway; on a Windows runner one had, and the two figures were
+    // a megabyte apart.
     nothing_is_reading(&fixture);
+    settled(&fixture);
+    let cached = cached_chunks(&fixture).len() as u64;
     assert_eq!(
         fixture.handle.cache_usage()?.total_bytes,
         cached * CHUNK,
