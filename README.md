@@ -279,6 +279,23 @@ RAR routes return a `501` JSON error in a `--no-default-features` build.
 
 **Archive members.** A member of a ZIP, TAR or tgz (`.tar.gz`/`.tgz`) archive is served with ranges; a tgz member streams as it is decompressed, its length read from its tar header first. An unsatisfiable `Range` on a member is `416` with `Content-Range: bytes */<len>`, and an empty member is an empty body. The `torrent:` form (`/{format}/stream/torrent:<infoHash>%2F<path>/{member}`) reads a ZIP inside a torrent and nothing else: any other format there — a 7z, whose decoder wants a seekable file — is `501` before the torrent is looked at. An archive named by URL is downloaded by `/create` into `<cacheRoot>/.archives`, with a 30 s connect timeout and a 60 s timeout between reads (the whole has no bound: an archive is gigabytes over whatever link the origin has); it is refused with `507` when the volume has no room for it above the 512 MiB free-space floor — before the body when the origin states a length that will not fit, and otherwise when the download reaches the floor.
 
+### Settings
+
+`GET /settings` answers `{ baseUrl, options: [], values }`; `POST /settings` takes any subset of the keys below, merges it, applies it and saves `settings.json` in the config dir, answering `{ success, btSettings }`. A value of the wrong type leaves that setting as it was, and a key the server does not know is ignored; `cacheRoot` is the one validated key, and an unusable one fails the whole update.
+
+| Key | Default | Effect |
+|---|---|---|
+| `cacheRoot` | the configured cache directory | The one torrent-data root. A change applies at the next start — see [Offline downloads](#offline-downloads) |
+| `cacheSize` | `10737418240` (10 GiB) | Bytes the cache may hold; `null` is unlimited. The cap actually enforced is the smaller of this and what the volume can give — see *What bounds the cache* |
+| `bufferProfile` | `"normal"` | See [Buffer profiles](#buffer-profiles) |
+| `seedingEnabled` | `true` | Sharing. `false` chokes every upload while no player is reading from this server, and lets uploads run while one is (a paused player still holds its response open, so it counts as reading). It is a session-wide upload switch: downloads are not affected, no torrent is paused and no peer dropped. See [Background activity](#background-activity) |
+| `lanMediaEnabled` | `false` | Whether the [LAN media listener](#lan-media-listener) may run at all; setting it to `false` also stops a running one |
+| `dhtBootstrapNodes` | `null` (built-in list) | DHT bootstrap `host:port` entries; read when the session opens, so a change applies at the next start. See [BitTorrent Settings](docs/bittorrent-settings.md) |
+| `bt*` (27 keys) | see [BitTorrent Settings](docs/bittorrent-settings.md) | Torrent session knobs; the response's `btSettings` says which applied live, which wait for a restart and which librqbit has no knob for |
+| `trackersSourceUrl`, `cachedTrackers`, `trackersLastUpdated` | [ngosang `trackers_best.txt`](https://github.com/ngosang/trackerslist), `[]`, `0` | The public tracker list: fetched from `trackersSourceUrl` when the cached one is more than a day old (checked hourly), the 20 fastest by RTT cached in `cachedTrackers`, and added to every torrent the server adds. `POST /settings` does not change these; they live in `settings.json` |
+| `proxyStreamsEnabled`, `remoteHttps` | `false`, `null` | Accepted and persisted for stremio-core's settings shape; nothing in the server reads them |
+| `appPath`, `serverVersion` | the executable's path, the crate version | Reported, not settable |
+
 ### Buffer profiles
 
 How far ahead playback reads is a choice, not a constant. A spotty connection — or a receiver whose own buffer is shallower than mpv's — wants more of the file fetched before it is needed; a fast link on a metered phone wants less. The choice is one of three profiles, and it is offered twice:
@@ -304,7 +321,7 @@ Only the torrent stream route reads the profile: archive members and offline dow
 
 ### Library API
 
-An embedder holds a `ServerHandle` (from `stream_server::start`) and never needs an HTTP client for control calls. Every method runs on the server's own runtime and blocks the calling thread until done; all returned types are `serde`-serializable, so they can be passed as JSON over FFI:
+An embedder holds a `ServerHandle` (from `stream_server::start`) and never needs an HTTP client for control calls. A method that needs the server's runtime runs on it and blocks the calling thread until done (a few — `set_background`, `close_proxy_streams`, `dht_status`, `proxy_streams_live` — answer synchronously without one); all returned types are `serde`-serializable, so they can be passed as JSON over FFI:
 
 | Method | Same as |
 |---|---|
@@ -312,6 +329,7 @@ An embedder holds a `ServerHandle` (from `stream_server::start`) and never needs
 | `base_url() -> &str` | `settings.baseUrl` |
 | `settings() -> Result<ServerSettings>` | `GET /settings` → `values` |
 | `update_settings(patch: serde_json::Value) -> Result<ServerSettings>` | `POST /settings` (same keys, validation, engine update and persistence); returns the settings afterwards |
+| `update_settings_with_report(patch) -> Result<(ServerSettings, BtSettingsReport)>` | the same, plus the `btSettings` report the HTTP response carries |
 | `install_https_certificate(cert_pem: &str, key_pem: &str) -> Result<SocketAddr>` | the serving half of `GET /get-https`: write the PEMs to the config dir and start — or restart, so the new certificate is the one presented — the HTTPS listener on `ServerConfig::https_addr`; returns its bound address. Refused when no HTTPS address is configured |
 | `https_addr() -> Option<SocketAddr>` | where the HTTPS listener is bound; `None` until a certificate has been installed (or found on disk at startup), after a boot whose HTTPS start failed (a certificate that will not load, a busy port: logged, and the server serves plain HTTP until the next `/get-https`), and always when `https_addr` is unset |
 | `engine_stats(info_hash, trackers: &[String]) -> Result<EngineStats>` | `GET /{infoHash}/stats.json?tr=…` — including creating the engine with `trackers` when it is the first request for the hash and answering `resolvingMetadata` at once. `trackers` are normalised inside the shared function exactly like `tr=` (`tracker:` prefix stripped, `dht:` dropped, trimmed), so a stream's `sources` array can be passed as is |
@@ -324,12 +342,16 @@ An embedder holds a `ServerHandle` (from `stream_server::start`) and never needs
 | `clean_cache_now() -> Result<EvictionReport>` | `POST /cache/clean` — drop both owners' slack immediately and report what is left; a pin and the window of the stream being played are never touched. See [Cache usage and cleaning](#cache-usage-and-cleaning) |
 | `stream_numbers(url: &str) -> Result<Option<StreamNumbers>>` | `GET /stream-numbers.json?url=…` — the cache around the playhead and, for a torrent, the committed set and this session's transfer totals (each absent where there is no such number, never zeroed). `None` is a stream this server does not hold, which is not an error. See [What a panel is told about a stream](#what-a-panel-is-told-about-a-stream) |
 | `close_proxy_streams(token: &str) -> usize` | `POST /proxy-streams/{token}/close` — end every proxied stream the client marked with `token`, retire the token, and answer how many streams that was. See [Ending a proxied stream](#ending-a-proxied-stream) |
+| `dht_status() -> DhtStatus` | the `dht` key of `GET /stats.json` — see [DHT health](#dht-health-the-dht-key-on-statsjson) |
+| `set_background(background: bool)` / `is_background() -> bool` | no route — the app's lifecycle hook. `true` puts the torrent session on a lean footprint: every torrent keeps running, with `LEAN_PEER_LIMIT` (8) peers instead of the configured limit (the surplus hung up) and its peer table pruned; nothing is paused and nothing on disk is touched. `false` restores the configured limit |
 | `background_traffic() -> Result<BackgroundTraffic>` | no route — the one signal a client's "working in the background" indicator reads: `{active, downloading, uploading, playing, bytes_downloaded, bytes_uploaded, window_secs}`. See [Background activity](#background-activity) |
 | `proxy_streams_live() -> usize` | how many proxied streams are being read right now, over all tokens — the number of players attached through `/proxy` |
 | `set_lan_media(enabled: bool) -> Result<Option<SocketAddr>>` | start/stop the [LAN media listener](#lan-media-listener); returns its bound address afterwards. Refused while the `lanMediaEnabled` setting is false or `ServerConfig::lan_media_addr` is unset |
 | `lan_media_addr() -> Option<SocketAddr>` / `lan_media_running() -> bool` | where that listener is bound right now, and whether it is running at all |
 | `lan_media_requests_served() -> u64` | how many requests have reached that listener since the current cast session began — per session, reset by every start (an already-running listener included) and by every stop. Zero after a load is the receiver never having asked for the stream. See [LAN media listener](#lan-media-listener) |
 | `lan_media_base_url(for_peer: IpAddr) -> Option<Url>` | the base URL to hand a receiver at `for_peer` — host = the local interface on its subnet, or the best-ranked one when nothing matches. `None` while the listener is off |
+| `http_addr()` / `bound_http_addr()` / `torrent_listen_addr()` | the connectable and the bound HTTP address, and the address librqbit accepts peers on (`None` when it is not listening) |
+| `shutdown()` / `join()` | stop the server / wait for it to stop |
 
 The HTTP handlers and these methods call the same functions (`routes::system::{engine_stats, file_stats, update_settings}`, `routes::downloads::{pin_download, unpin_download, downloads, download_path}`, `routes::cache::{cache_usage, clean_cache_now}`, `routes::stream_numbers::stream_numbers`, `proxy_streams::ProxyStreams::close`), so they cannot drift; `server/tests/embed.rs` compares them.
 
@@ -363,6 +385,7 @@ It is one call rather than two on purpose. Traffic and playback are measured dif
 - **What is counted**: the connection, not the disk. Each torrent's own peer counters as librqbit keeps them — bytes received from peers and bytes sent to them — summed over the torrents that exist (`bytes_downloaded`, `bytes_uploaded`) in the one librqbit session, offline downloads included. The first version counted bytes through the torrent storage instead, and lit up on every restart: librqbit's initial check reads every restored torrent back off the local disk to hash it, with no network involved. The counters are the live state's, so a torrent that pauses or is removed takes its bytes out of the sum; less than before is not growth.
 - **Over what window**: five seconds (`window_secs`). A counter that has not grown since the last reading is the measurement; a single sample of a total is not a rate. So nothing is reported until one window has closed — the first call is a baseline — and a torrent that is connected but stalled reads as idle, because this is a light about traffic. If nobody asks for a long stretch (a backgrounded app, a suspended phone) the reading is used as a fresh baseline instead of a verdict about minutes nobody observed.
 - **What "not watching" means**: no open stream, over the window as well as right now. The bytes a player's own stream pulled in stay in the counters after playback ends, so a signal that only asked about *now* would accuse the background of the viewer's own film every time they stopped it. The cost of getting that right is that after playback ends the light can take up to two windows to come on for traffic that really is unattended.
+- **The sharing setting and the light cannot disagree.** With `seedingEnabled: false` the session's upload switch is off exactly while nothing is playing — decided from the same playback reading (`BackendEngineFS::apply_upload_switch`), recomputed when a stream opens, when the setting moves and on every reconciler tick — and that is the only time the light can be lit, so it never shows an upload the setting has ruled out.
 - `downloading` / `uploading`: that direction's counter grew over the last closed window and nothing was playing over it or since. `active` is `downloading || uploading`; `playing` is what the server sees right now, offered so the answer can be explained rather than only shown.
 
 Asking is cheap — per torrent that exists, one read of librqbit's live stats snapshot (a handful of counters, no file list, no tracker scrape) and the three live playback fields, nothing built — and it is a peek, not a poll: it touches no torrent's idle clock, so it cannot keep anything out of the idle sweep, and it creates nothing: no engine, no magnet add. Polling once a second or two is fine. The verdict changes when a window closes, or the moment playback is seen, whichever comes first; asking faster than the window is otherwise answered from the standing reading.
