@@ -3949,7 +3949,16 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// reported as pinned for the life of the process. Treating silence as
     /// an empty set is what would delete every offline download the
     /// embedder meant to keep.
-    pub async fn apply_pins(&self, pins: Option<crate::piece_store::PinSet>) -> usize {
+    ///
+    /// **Boot's alone, and that is why it writes `pinned_files` without the
+    /// per-hash pin lock.** [`Self::boot`] calls it before it hands the
+    /// engine to anyone, so no pin, unpin or delete can be running: each is
+    /// a method on an engine nobody else holds yet. The one task that
+    /// exists by then, the idle sweep, writes no pin and removes only an
+    /// engine idle for [`INACTIVE_TORRENT_REMOVE_TIMEOUT`], which an engine
+    /// restored a moment ago is not. Crate-private so that stays true: a
+    /// caller holding a published engine would have to take the lock.
+    pub(crate) async fn apply_pins(&self, pins: Option<crate::piece_store::PinSet>) -> usize {
         if pins.is_none() {
             tracing::warn!("nobody named the pin set; treating every restored torrent as pinned");
             self.pins_unknown.set("the embedder named no pin set");
