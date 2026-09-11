@@ -193,6 +193,20 @@ pub(crate) fn available_space(path: &std::path::Path) -> Option<u64> {
     }
 }
 
+/// [`available_space`] on the blocking pool, for an async caller.
+///
+/// A `statvfs` is one syscall, and on a spun-down disk or a mount that has
+/// stopped answering it is one that does not return: taken on a reactor
+/// worker it parks every task scheduled there. The engine takes its own
+/// readings this way for the same reason (`EngineFS::reread_volume`). A
+/// probe task that failed is an unreadable volume.
+pub(crate) async fn available_space_off_the_reactor(path: std::path::PathBuf) -> Option<u64> {
+    tokio::task::spawn_blocking(move || available_space(&path))
+        .await
+        .ok()
+        .flatten()
+}
+
 /// How often the process restates the budget on its own, with nothing
 /// writing to the cache and no pass running.
 ///
@@ -267,10 +281,11 @@ pub(crate) async fn publish_now(state: &AppState) -> Option<u64> {
             // The root the session was opened on, not `settings.cacheRoot`:
             // the setting is where the data will be after the next start,
             // the engine is where it is now.
-            let root = &state.engine.download_dir;
+            let available =
+                available_space_off_the_reactor(state.engine.download_dir.clone()).await;
             let occupied =
                 state.engine.cache_occupancy() + state.proxy_cache.retention().occupancy();
-            (configured, available_space(root), occupied)
+            (configured, available, occupied)
         },
     )
     .await

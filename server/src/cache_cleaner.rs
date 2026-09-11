@@ -18,7 +18,7 @@
 //! [`EvictionReport`]) and the two functions behind `GET /cache.json` and
 //! `POST /cache/clean`.
 
-use crate::cache_budget::{CacheLimit, available_space};
+use crate::cache_budget::CacheLimit;
 use crate::state::AppState;
 
 /// Give back everything nobody is playing and nobody is reading, now, and
@@ -96,7 +96,10 @@ pub(crate) async fn usage(state: &AppState) -> CacheUsage {
     // engine is where it is now.
     let limit = CacheLimit {
         configured,
-        available: available_space(&state.engine.download_dir),
+        available: crate::cache_budget::available_space_off_the_reactor(
+            state.engine.download_dir.clone(),
+        )
+        .await,
     };
     let torrents = state.engine.cache_holdings().await;
     let proxy = state.proxy_cache.retention();

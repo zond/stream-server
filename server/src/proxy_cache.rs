@@ -1069,14 +1069,6 @@ impl Filler {
             let within = self.offset - index * CHUNK_BYTES;
             let take = (want - within).min(bytes.len() as u64) as usize;
             if self.collecting != Some(index) && within == 0 {
-                // A chunk already on disk is not written again: the fill is
-                // only ever asked for what the lookup did not hold, but a
-                // second reader of the same stream can overlap it.
-                if self.dir.has_chunk(index) {
-                    self.offset += take as u64;
-                    bytes = &bytes[take..];
-                    continue;
-                }
                 self.collecting = Some(index);
                 self.buffer.clear();
                 // The whole chunk's room, once. The finished buffer is handed
@@ -1099,6 +1091,15 @@ impl Filler {
                     let floor = self.floor.clone();
                     tokio::task::spawn_blocking(move || {
                         let _ticket = ticket;
+                        // A chunk already on disk is not written again: the
+                        // fill is only ever asked for what the lookup did
+                        // not hold, but a second reader of the same stream
+                        // can overlap it. Asked here and not as the bytes
+                        // arrive: that was a `statx` per chunk on a reactor
+                        // worker, in the body's poll.
+                        if dir.has_chunk(index) {
+                            return;
+                        }
                         if !floor.allows(want) {
                             tracing::debug!(
                                 path = %dir.path().display(),
@@ -1994,6 +1995,35 @@ mod tests {
         cache.settled().await;
         let held: HashSet<u64> = committed_chunks(&entity, 0);
         assert_eq!(held.len(), 2, "two chunks fit above the floor: {held:?}");
+    }
+
+    /// **A fill leaves a chunk that is already on disk alone**, rather than
+    /// writing its own copy over it: the fill of a second reader overlaps
+    /// what the first one wrote.
+    #[tokio::test]
+    async fn a_fill_does_not_write_over_a_chunk_already_held() {
+        let (_root, cache) = cache();
+        let entry = entry_of(&cache, "https://host/film.mkv");
+        let total = 2 * CHUNK_BYTES;
+        let entity = entry
+            .dir
+            .join(entity_dir_name(total, "video/mp4", VALIDATOR));
+        write_chunk(&entity, 0, &vec![1u8; CHUNK_BYTES as usize]);
+
+        let mut filler = entry.fill(total, "video/mp4", VALIDATOR, 0);
+        filler.take(&vec![2u8; total as usize]);
+        cache.settled().await;
+        let byte_of = |index| {
+            let bytes = std::fs::read(chunk_path(&entity, index)).unwrap();
+            assert_eq!(bytes.len() as u64, CHUNK_BYTES);
+            bytes[0]
+        };
+        assert_eq!(
+            byte_of(0),
+            1,
+            "the chunk that was there is the one still there"
+        );
+        assert_eq!(byte_of(1), 2, "and the one that was not was written");
     }
 
     /// **A chunk written where one already is gains the cache nothing.**

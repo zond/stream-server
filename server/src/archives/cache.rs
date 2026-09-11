@@ -114,13 +114,18 @@ impl ProgressiveCache {
         dir: &std::path::Path,
         total_size: Option<u64>,
     ) -> io::Result<(Self, CacheWriter)> {
-        // Ensure directory exists
-        if !dir.exists() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let temp_file = tempfile::Builder::new()
-            .prefix("archive_extract_")
-            .tempfile_in(dir)?;
+        // On the blocking pool: a `stat`, a `mkdir` and an `open` on the
+        // cache volume, which on the flash of a slow device or a mount that
+        // has stopped answering park whatever reactor worker runs them.
+        let dir = dir.to_path_buf();
+        let temp_file = tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(&dir)?;
+            tempfile::Builder::new()
+                .prefix("archive_extract_")
+                .tempfile_in(&dir)
+        })
+        .await
+        .map_err(io::Error::other)??;
         Self::from_temp_file(temp_file, total_size).await
     }
 
