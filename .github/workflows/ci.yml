@@ -94,6 +94,42 @@ jobs:
       - name: Build MIT escape hatch (no rar)
         run: cargo build -p server --no-default-features
 
+  android:
+    name: Android check (armv7, aarch64)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: armv7-linux-androideabi,aarch64-linux-android
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      # The app ships to 32-bit ARM (a Chromecast is armeabi-v7a), where
+      # usize is 32 bits and off_t can be, and nothing else here builds for
+      # it; the jni exports and every other cfg(target_os = "android") path
+      # are only compiled here. A check, not a build: nothing links, and no
+      # test runs, so a 32-bit arithmetic bug that compiles still gets past.
+      #
+      # It needs the NDK even so. Build scripts compile C for the target
+      # (aws-lc-sys under rustls and librqbit's sha1, libmimalloc-sys), so
+      # cargo-ndk points cc at the NDK's clang; the runner image carries an
+      # NDK at $ANDROID_NDK_LATEST_HOME.
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      - name: Check
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          cargo ndk -t armeabi-v7a -t arm64-v8a check -p server --all-targets --locked
+
   windows:
     name: Windows Build and Test
     runs-on: windows-2022
