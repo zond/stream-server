@@ -149,8 +149,8 @@ impl AppState {
 /// So writes go through one place, and that place does two things. It
 /// writes to a uniquely named temporary file beside the target and renames
 /// it into place, so the file on disk is always a whole serialization --
-/// the old one or the new one, never a mixture and never empty -- the same
-/// shape `enginefs`'s `pinned-downloads.json` writer has. And it holds a
+/// the old one or the new one, never a mixture and never empty. And it holds
+/// a
 /// mutex from serialization through rename, which the rename alone does
 /// not buy: two atomic writers racing can still land the *older*
 /// serialization last, and a user's change would be undone by a tracker

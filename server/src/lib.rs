@@ -8,6 +8,7 @@ use axum::{
 pub use cache_cleaner::{CacheUsage, EvictionReport};
 use enginefs::EngineFS;
 pub use enginefs::backend::{EngineStats, TorrentListenPort};
+pub use enginefs::piece_store::PinSet;
 #[doc(hidden)]
 pub use enginefs::pretend_volume_space;
 pub use enginefs::{PIN_FREE_SPACE_MARGIN, PinDownloadError, UnpinOutcome};
@@ -115,6 +116,21 @@ pub struct ServerConfig {
     /// How the control API authenticates (media routes are always open).
     /// Defaults to a per-launch generated token; see [`ServerAuth`].
     pub auth: ServerAuth,
+    /// What the embedder says is pinned for offline: info hash to the file
+    /// indices it wants kept. Handed in rather than read from a file,
+    /// because the one client that pins already keeps that list as the
+    /// downloads the user asked for, and two records of one fact are two
+    /// records that can disagree -- see `enginefs::piece_store::pin_record`.
+    ///
+    /// **`None` is "nobody told me", and it is not an empty set.** The
+    /// launch sweep deletes everything the set does not claim, before the
+    /// session opens, so silence has to mean *keep everything*: nothing is
+    /// swept, every restored torrent is kept and reported as pinned, and
+    /// nothing is deleted for want of a claim. An embedder whose own record
+    /// would not read passes `None` and warns its user; passing an empty
+    /// map instead says "the user has pinned nothing", which deletes their
+    /// downloads.
+    pub pins: Option<enginefs::piece_store::PinSet>,
     /// The port librqbit's incoming BitTorrent listener binds:
     /// [`TorrentListenPort::Ephemeral`] for [`Self::embedded`] (any number of
     /// embedded servers coexist), the fixed `42000..42010` range for
@@ -160,6 +176,7 @@ impl ServerConfig {
     pub fn embedded() -> Self {
         Self {
             http_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, DEFAULT_HTTP_PORT)),
+            pins: None,
             https_addr: None,
             public_base_url: None,
             config_dir: None,
@@ -183,6 +200,7 @@ impl ServerConfig {
     pub fn binary_default() -> Self {
         Self {
             http_addr: SocketAddr::from(([0, 0, 0, 0], DEFAULT_HTTP_PORT)),
+            pins: None,
             https_addr: Some(SocketAddr::from(([0, 0, 0, 0], DEFAULT_HTTPS_PORT))),
             public_base_url: Some(format!("http://127.0.0.1:{DEFAULT_HTTP_PORT}")),
             config_dir: None,
@@ -1128,6 +1146,7 @@ pub async fn run(
             torrent_data_root.clone(),
             backend_config,
             Some(tracker_storage),
+            cfg.pins.clone(),
         )
         .await?,
     );

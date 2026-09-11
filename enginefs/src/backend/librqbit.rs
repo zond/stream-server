@@ -202,9 +202,9 @@ type DeferredSelections = Arc<Mutex<HashMap<String, Arc<DeferredSelection<Deferr
 /// `DeferredSelections`. Consulted by every want-set update so a pinned file
 /// survives playback switching. The map itself is not persisted: librqbit
 /// persists the resulting `only_files` (so the file keeps downloading
-/// across a restart) and `BackendEngineFS::restore_pinned_downloads`
-/// rebuilds the map at startup from its `pinned-downloads.json` by calling
-/// `pin_file` again for every restored torrent.
+/// across a restart) and `BackendEngineFS::apply_pins` rebuilds the map at
+/// startup from the set the embedder hands in, by calling `pin_file` again
+/// for every restored torrent it names.
 type PinnedFiles = Arc<Mutex<HashMap<String, BTreeSet<usize>>>>;
 
 /// The last error text reported to the log for a torrent, keyed by info
@@ -4383,7 +4383,8 @@ mod tests {
             dir.to_path_buf(),
         );
         efs.set_free_space_probe(|_| Ok(u64::MAX));
-        efs.restore_pinned_downloads().await;
+        efs.apply_pins(Some(crate::piece_store::PinSet::new()))
+            .await;
         (efs, hash)
     }
 
@@ -7024,7 +7025,7 @@ mod tests {
     /// and it finishes.
     ///
     /// The order is the whole of `reconcile::Conditions::settled`. Before
-    /// `restore_pinned_downloads` the ladder answers `Stop` for this
+    /// `apply_pins` the ladder answers `Stop` for this
     /// torrent, because a reclaim torrent restored without its want-set
     /// wants every hole in its storage and a seeder reaching it would refill
     /// holes the caller is about to drop; after it, `Run`. Both halves are
@@ -7130,7 +7131,8 @@ mod tests {
         );
 
         // The want-set goes back on, and the next pass starts it.
-        efs.restore_pinned_downloads().await;
+        efs.apply_pins(Some(crate::piece_store::PinSet::new()))
+            .await;
         assert_eq!(
             efs.reconcile_tick().await,
             vec![(hash.clone(), crate::reconcile::Decision::Run)]
@@ -7211,7 +7213,7 @@ mod tests {
     /// **The restored torrent is paused, and the reconciler is what starts
     /// it.** This factory can release a piece, so every add sets
     /// `piece_reclaim`, and librqbit restores such a torrent paused whatever
-    /// it was doing at shutdown. Before `restore_pinned_downloads` the
+    /// it was doing at shutdown. Before `apply_pins` the
     /// ladder answers `Stop` (the want-set is not back); after it, `Run`.
     /// Asserted on `run_state`, never on `is_paused()`.
     #[tokio::test(flavor = "multi_thread")]
@@ -7348,7 +7350,8 @@ mod tests {
         let engine = efs.get_engine(&hash).await.expect("the restored engine");
         assert_eq!(engine.handle.run_state(), RunState::Paused);
 
-        efs.restore_pinned_downloads().await;
+        efs.apply_pins(Some(crate::piece_store::PinSet::new()))
+            .await;
         assert_eq!(
             efs.reconcile_tick().await,
             vec![(hash.clone(), crate::reconcile::Decision::Run)]

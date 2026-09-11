@@ -57,30 +57,6 @@ pub struct DownloadInfo {
 pub const DORMANT_DOWNLOAD_ERROR: &str = "the torrent is not managed right now; \
      the pin is kept and applies when it comes back";
 
-/// What every download reports as its `error` while this process could not
-/// read the pin record (`enginefs::BackendEngineFS::pins_unknown`).
-///
-/// The pin record is the only place a pin lives across a restart, so a boot
-/// that could not read it does not know which of these the user asked to
-/// keep. It keeps all of them and says so, here and in
-/// [`PIN_RECORD_HEADER`]: the downloads listed are every file of every
-/// torrent the session restored, not a pin set, and a client that shows them
-/// as pinned is showing what is true of the disk. The next pin or unpin
-/// writes a true record and the condition ends.
-pub const PIN_RECORD_UNREADABLE: &str = "PIN_RECORD_UNREADABLE";
-
-/// The response header `GET /downloads.json` carries while the pin set is
-/// unknown: `X-Pin-Record: unreadable`.
-///
-/// The per-download `error` cannot say it on its own -- a session that
-/// restored nothing has no download to hang it on, and an empty list is
-/// exactly what a lost pin record looks like from the outside. The header is
-/// there either way.
-pub const PIN_RECORD_HEADER: &str = "x-pin-record";
-
-/// [`PIN_RECORD_HEADER`]'s value while the pin set is unknown.
-pub const PIN_RECORD_UNREADABLE_HEADER_VALUE: &str = "unreadable";
-
 /// Pin `file_idx` of `info_hash` as an offline download, exactly what
 /// `POST /{infoHash}/{fileIdx}/download` will answer: the engine is created
 /// through the magnet registry with `trackers` (normalised like the stats
@@ -152,28 +128,19 @@ pub async fn unpin_download(
 /// dormant ones (torrent not restored, [`DORMANT_DOWNLOAD_ERROR`]) after
 /// them. One stats call per torrent, not per file.
 ///
-/// While the pin record is unreadable the list is every file of every
-/// torrent the session restored, each with [`PIN_RECORD_UNREADABLE`] as its
-/// error: that is what is being kept, and reporting the empty in-memory pin
-/// set instead would tell the user their downloads are gone while the bytes
-/// are still on the disk.
-pub async fn downloads(state: &AppState) -> Vec<DownloadInfo> {
-    downloads_and_pin_state(state).await.0
-}
-
-/// [`downloads`] and the pin-record condition the listing was built under,
-/// for the handler that has to put the second in a header.
+/// When the embedder named no pin set
+/// ([`enginefs::piece_store::PinsUnknown`]) the list is every file of every
+/// torrent the session restored, because that is what is being kept, and
+/// reporting the empty in-memory pin set instead would tell the caller the
+/// downloads are gone while the bytes are still on the disk.
 ///
-/// **One read of the condition, for the whole response.** It is cleared by
-/// the first pin or unpin, from another task, at any await in here -- and
-/// the repair that clears it fills the in-memory pin set on its way, so
-/// asking again mid-listing is how a response comes back with a file
-/// listed twice (once because the set was unknown, once because it is now
-/// pinned) or with a header that says "unreadable" over entries that do not
-/// say so. A value read once and trusted for the rest of the answer is the
-/// shape [`enginefs::piece_store::PinsUnknown`] is documented against;
-/// reading it repeatedly inside one answer is that shape, not its cure.
-pub async fn downloads_and_pin_state(state: &AppState) -> (Vec<DownloadInfo>, bool) {
+/// **One read of the condition, for the whole listing.** Asking again
+/// mid-listing is how a response comes back with a file listed twice: once
+/// because the set was unknown, once because a pin taken meanwhile names it.
+/// A value read once and trusted for the rest of the answer is the shape
+/// `PinsUnknown` is documented against; reading it repeatedly inside one
+/// answer is that shape, not its cure.
+pub async fn downloads(state: &AppState) -> Vec<DownloadInfo> {
     let engine_fs = state.engine.clone();
     let unknown = engine_fs.pins_unknown();
     // A set, not a list: both sources can name the same file, and a
@@ -205,11 +172,7 @@ pub async fn downloads_and_pin_state(state: &AppState) -> (Vec<DownloadInfo>, bo
         let stats = engine.get_statistics().await;
         for file_idx in file_indices {
             let path = engine.handle.get_file_path(file_idx).await;
-            let mut info = live_download(&info_hash, file_idx, path, &stats);
-            if unknown {
-                info.error = Some(PIN_RECORD_UNREADABLE.to_string());
-            }
-            downloads.push(info);
+            downloads.push(live_download(&info_hash, file_idx, path, &stats));
         }
     }
     downloads.extend(
@@ -228,7 +191,7 @@ pub async fn downloads_and_pin_state(state: &AppState) -> (Vec<DownloadInfo>, bo
                 error: Some(DORMANT_DOWNLOAD_ERROR.to_string()),
             }),
     );
-    (downloads, unknown)
+    downloads
 }
 
 /// One pinned file of a live torrent. A torrent still resolving its
@@ -350,17 +313,7 @@ pub async fn delete_download(
 }
 
 pub async fn get_downloads(State(state): State<AppState>) -> Response {
-    // The header and the entries' error slots are the same answer said
-    // twice, so they come from one reading of the condition.
-    let (downloads, unknown) = downloads_and_pin_state(&state).await;
-    let mut response = Json(downloads).into_response();
-    if unknown {
-        response.headers_mut().insert(
-            axum::http::HeaderName::from_static(PIN_RECORD_HEADER),
-            axum::http::HeaderValue::from_static(PIN_RECORD_UNREADABLE_HEADER_VALUE),
-        );
-    }
-    response
+    Json(downloads(&state).await).into_response()
 }
 
 #[cfg(test)]

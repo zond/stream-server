@@ -253,8 +253,8 @@ pub(crate) fn publish(budget: &enginefs::retention::RetentionBudget, limit: Opti
 /// out of `available`, so the volume arm stays exact and it is only
 /// `cacheSize` that is a bound on the owners' half rather than on every
 /// byte under the root. What bounds the rest is the launch sweep, which
-/// takes every directory the pin record does not name before the session
-/// opens.
+/// takes every directory the embedder's pin set does not name before the
+/// session opens.
 pub(crate) async fn publish_now(state: &AppState) -> Option<u64> {
     let configured = {
         let settings = state.settings.read().await;

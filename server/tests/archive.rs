@@ -11,6 +11,13 @@ use std::sync::{Arc, Mutex};
 fn offline_config() -> stream_server::ServerConfig {
     stream_server::ServerConfig {
         resolve_dht_bootstrap_names: false,
+        // An embedder that keeps a pin record and has nothing in it yet.
+        // `None` is not the same thing -- it is "nobody said", which keeps
+        // every torrent's data and reports it all as pinned -- and it has a
+        // test of its own; spreading it here would turn every retention and
+        // idle-pause test in the file into one about a cache that may not be
+        // touched.
+        pins: Some(Default::default()),
         ..stream_server::ServerConfig::default()
     }
 }

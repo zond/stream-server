@@ -96,7 +96,7 @@ pub trait TorrentBackend: Send + Sync {
     /// doing at shutdown -- its per-session want-set did not survive, so
     /// librqbit forces it paused until the caller re-applies the want-set --
     /// and the engine layer starts it again once the want-set is back
-    /// (`BackendEngineFS::restore_pinned_downloads`, which is what marks
+    /// (`BackendEngineFS::apply_pins`, which is what marks
     /// each restored engine settled -- see
     /// [`crate::reconcile::Conditions::settled`]).
     ///

@@ -138,7 +138,7 @@
 //! every add sets `piece_reclaim` and `drop_file_pieces` works. It also means
 //! librqbit restores **every** torrent paused -- the piece-level want-set is
 //! not in the persisted record -- and the engine layer is what starts them
-//! again, once `BackendEngineFS::restore_pinned_downloads` has put the
+//! again, once `BackendEngineFS::apply_pins` has put the
 //! want-set back (see [`crate::reconcile::Conditions::settled`]).
 //!
 //! **There is no migration, by decision.** A whole-file download an earlier
@@ -195,7 +195,7 @@ pub mod sweep;
 
 pub use crate::chunk_store::StoredChunk as StoredPiece;
 pub use layout::{FileSpec, PieceLayout, Segment};
-pub use pin_record::{PinRecord, PinsUnknown};
+pub use pin_record::{PinSet, PinsUnknown};
 pub use policy::{Decision, RetentionPolicy, Shape, Share};
 pub use registry::{DeleteOutcome, StoreRegistry};
 pub use store::{

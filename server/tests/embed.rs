@@ -33,6 +33,13 @@ fn bearer_client(handle: &ServerHandle) -> anyhow::Result<reqwest::blocking::Cli
 fn offline_config() -> ServerConfig {
     ServerConfig {
         resolve_dht_bootstrap_names: false,
+        // An embedder that keeps a pin record and has nothing in it yet.
+        // `None` is not the same thing -- it is "nobody said", which keeps
+        // every torrent's data and reports it all as pinned -- and it has a
+        // test of its own; spreading it here would turn every retention and
+        // idle-pause test in the file into one about a cache that may not be
+        // touched.
+        pins: Some(Default::default()),
         ..ServerConfig::default()
     }
 }
@@ -1376,7 +1383,7 @@ fn seed_piece_store_files(
 ///
 /// **Call this after the server has started**, never before. The launch-time
 /// sweep (`enginefs::piece_store::sweep_before_session`) deletes every piece
-/// directory the pin record does not name, and a directory seeded before the
+/// directory the embedder's pin set does not name, and one seeded before the
 /// process comes up is exactly that: the server would start, delete it, and
 /// the torrent would then check as empty. Which is the sweep working.
 fn seed_piece_store_pieces(
@@ -1849,7 +1856,8 @@ fn the_cache_root_setting_decides_where_the_next_session_opens() -> anyhow::Resu
 /// exactly where it is: `pin_download` reports the same path the backend
 /// reported before, every piece it had it still has, and no second copy
 /// appears anywhere -- there is one root and a pin is not a location. A
-/// restart on the same dirs restores the torrent with its pin.
+/// restart on the same dirs, with the embedder handing the pin back in,
+/// restores the torrent with its pin and its pieces.
 #[test]
 fn a_pin_moves_nothing_and_survives_a_restart() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -1865,13 +1873,15 @@ fn a_pin_moves_nothing_and_survives_a_restart() -> anyhow::Result<()> {
     let cache_root = resolved(&cache_dir.path().join("cache"));
     let root_folder = cache_root.join("rqbit-downloads").join("Show Season 1");
 
-    let config = || stream_server::ServerConfig {
-        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
-        config_dir: Some(config_dir.path().join("config")),
-        cache_dir: Some(cache_root.clone()),
-        ..offline_config()
-    };
-    let handle = stream_server::start(config())?;
+    let config =
+        |pins: std::collections::BTreeMap<String, Vec<usize>>| stream_server::ServerConfig {
+            http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            config_dir: Some(config_dir.path().join("config")),
+            cache_dir: Some(cache_root.clone()),
+            pins: Some(pins),
+            ..offline_config()
+        };
+    let handle = stream_server::start(config(Default::default()))?;
     // "Streamed before": the data already sits in the piece store, which is
     // where a torrent added without a placement puts it -- and where one
     // *with* a placement puts it too.
@@ -1935,19 +1945,16 @@ fn a_pin_moves_nothing_and_survives_a_restart() -> anyhow::Result<()> {
         "{missing:?}"
     );
 
-    let pins_file = cache_root
-        .join("rqbit-downloads")
-        .join("pinned-downloads.json");
-    let pins: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&pins_file)?)?;
-    assert_eq!(pins, serde_json::json!({ &info_hash: [idx] }));
-
     handle.shutdown()?;
     handle.join()?;
 
     // Restart on the same dirs: librqbit restores the torrent where it
     // always was (its persisted output folder / only_files) and the pin
-    // comes back from the persisted pin set.
-    let handle = stream_server::start(config())?;
+    // comes back because the embedder names it again.
+    let handle = stream_server::start(config(std::collections::BTreeMap::from([(
+        info_hash.clone(),
+        vec![idx],
+    )])))?;
     let base = format!("http://{}", handle.http_addr());
     let client = bearer_client(&handle)?;
     let stats = handle.engine_stats(&info_hash, &[])?;
@@ -1975,22 +1982,20 @@ fn a_pin_moves_nothing_and_survives_a_restart() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// **An unreadable pin record takes nothing and says so.**
+/// **An embedder that names no pin set takes nothing.**
 ///
-/// The pin record is the only place a pin lives across a restart, and the
-/// startup sweep now deletes every piece directory it does not name -- so a
-/// boot that cannot read it is one keystroke away from deleting every offline
-/// download the user has. It does not: nothing is swept, every restored file
-/// is reported as kept with `PIN_RECORD_UNREADABLE` and the response carries
-/// `X-Pin-Record: unreadable` (which is the only way to say it at all when the
-/// session restored nothing to list), and the record itself is left exactly as
-/// it was found -- writing the empty in-memory set back is what would turn one
-/// bad flush into the permanent loss.
+/// The launch sweep deletes every piece directory the set does not name, so
+/// a boot told nothing is one keystroke away from deleting every offline
+/// download the user has. It does not: nothing is swept, the disk keeps what
+/// it held, and `GET /downloads.json` lists every file of every restored
+/// torrent, because that is what is being kept -- reporting the empty
+/// in-memory pin set instead would tell the caller their downloads are gone
+/// while the bytes are still on the disk.
 ///
-/// The way out is the user's next pin or unpin, which materialises what is
-/// actually here into a true record and ends the condition.
+/// There is no way out of it within the process: the embedder holds the
+/// record, and a boot it said nothing to learns nothing later.
 #[test]
-fn an_unreadable_pin_record_keeps_every_download_and_says_so() -> anyhow::Result<()> {
+fn an_unnamed_pin_set_keeps_every_download_and_lists_it() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
     let src = tempfile::tempdir()?;
@@ -2002,17 +2007,17 @@ fn an_unreadable_pin_record_keeps_every_download_and_says_so() -> anyhow::Result
     let (torrent, info_hash) = real_torrent(&content);
 
     let cache_root = resolved(&cache_dir.path().join("cache"));
-    let config = || stream_server::ServerConfig {
-        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
-        config_dir: Some(config_dir.path().join("config")),
-        cache_dir: Some(cache_root.clone()),
-        ..offline_config()
+    let config = |pins: Option<std::collections::BTreeMap<String, Vec<usize>>>| {
+        stream_server::ServerConfig {
+            http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            config_dir: Some(config_dir.path().join("config")),
+            cache_dir: Some(cache_root.clone()),
+            pins,
+            ..offline_config()
+        }
     };
-    let pins_file = cache_root
-        .join("rqbit-downloads")
-        .join("pinned-downloads.json");
 
-    let handle = stream_server::start(config())?;
+    let handle = stream_server::start(config(Some(Default::default())))?;
     seed_piece_store(&cache_root, &torrent, &content);
     let seeded_pieces = pieces_held(&cache_root, &info_hash);
     assert!(seeded_pieces > 0, "the fixture seeded something");
@@ -2029,37 +2034,21 @@ fn an_unreadable_pin_record_keeps_every_download_and_says_so() -> anyhow::Result
     handle.shutdown()?;
     handle.join()?;
 
-    // What a flush interrupted by a kill leaves: a file that is there and
-    // will not parse.
-    std::fs::write(&pins_file, b"{\"")?;
-
-    let handle = stream_server::start(config())?;
+    // What an embedder whose own record would not read hands in: nothing.
+    let handle = stream_server::start(config(None))?;
     let base = format!("http://{}", handle.http_addr());
     let client = bearer_client(&handle)?;
     assert_eq!(
         pieces_held(&cache_root, &info_hash),
         seeded_pieces,
-        "nothing was swept on a boot that could not read the record"
-    );
-    assert_eq!(
-        std::fs::read(&pins_file)?,
-        b"{\"",
-        "and the record the next boot will read is the one this boot could not"
+        "nothing was swept on a boot nobody named a pin set to"
     );
 
-    let response = client
+    let listed: Vec<serde_json::Value> = client
         .get(format!("{base}/downloads.json"))
         .send()?
-        .error_for_status()?;
-    assert_eq!(
-        response
-            .headers()
-            .get("x-pin-record")
-            .and_then(|value| value.to_str().ok()),
-        Some("unreadable"),
-        "needed when the session holds nothing to list at all"
-    );
-    let listed: Vec<serde_json::Value> = response.json()?;
+        .error_for_status()?
+        .json()?;
     assert_eq!(
         listed.len(),
         2,
@@ -2067,24 +2056,7 @@ fn an_unreadable_pin_record_keeps_every_download_and_says_so() -> anyhow::Result
     );
     for entry in &listed {
         assert_eq!(entry["infoHash"], info_hash);
-        assert_eq!(entry["error"], "PIN_RECORD_UNREADABLE", "{entry}");
     }
-
-    // The way out: an unpin writes the true set -- everything restored,
-    // minus the file the user just took out -- and the condition ends.
-    let unpinned_idx = file_index(&stats, "e1.bin");
-    handle.unpin_download(&info_hash, unpinned_idx, false)?;
-    let pins: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&pins_file)?)?;
-    assert_eq!(pins, serde_json::json!({ &info_hash: [pinned_idx] }));
-    let response = client
-        .get(format!("{base}/downloads.json"))
-        .send()?
-        .error_for_status()?;
-    assert!(response.headers().get("x-pin-record").is_none());
-    let listed: Vec<serde_json::Value> = response.json()?;
-    assert_eq!(listed.len(), 1, "{listed:?}");
-    assert_eq!(listed[0]["fileIdx"], pinned_idx);
-    assert_eq!(listed[0]["error"], serde_json::Value::Null);
 
     handle.shutdown()?;
     handle.join()?;
@@ -2142,13 +2114,15 @@ fn fastresume_persists_piece_bitfields_for_a_pinned_torrent_too() -> anyhow::Res
     let cache_root = resolved(&cache_dir.path().join("cache"));
     let session_dir = cache_root.join("rqbit-downloads");
 
-    let config = || stream_server::ServerConfig {
-        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
-        config_dir: Some(config_dir.path().join("config")),
-        cache_dir: Some(cache_root.clone()),
-        ..offline_config()
-    };
-    let handle = stream_server::start(config())?;
+    let config =
+        |pins: std::collections::BTreeMap<String, Vec<usize>>| stream_server::ServerConfig {
+            http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            config_dir: Some(config_dir.path().join("config")),
+            cache_dir: Some(cache_root.clone()),
+            pins: Some(pins),
+            ..offline_config()
+        };
+    let handle = stream_server::start(config(Default::default()))?;
     // Both torrents' data is in the one piece store, seeded after the launch
     // sweep: the streamed torrent whole, the pinned one only where the pin
     // will be. There is no second store anywhere -- the store takes one
@@ -2207,8 +2181,12 @@ fn fastresume_persists_piece_bitfields_for_a_pinned_torrent_too() -> anyhow::Res
     handle.join()?;
 
     // Restart: both torrents come back from the session with their
-    // bitfields, ready and complete.
-    let handle = stream_server::start(config())?;
+    // bitfields, ready and complete. The embedder names the pins it kept,
+    // so the launch sweep leaves both torrents' pieces where they are.
+    let handle = stream_server::start(config(std::collections::BTreeMap::from([
+        (streamed_hash.clone(), vec![0, 1]),
+        (pinned_hash.clone(), vec![p2]),
+    ])))?;
     let base = format!("http://{}", handle.http_addr());
     let client = bearer_client(&handle)?;
     let stats = stats_after_check(&client, &base, &streamed_hash)?;

@@ -360,11 +360,10 @@ pub(crate) struct TorrentBacking<H: TorrentHandle> {
     /// property, and the owner asks about it before every pass and at every
     /// door.
     pinned: Arc<parking_lot::RwLock<BTreeSet<usize>>>,
-    /// Whether the pin record was unreadable at boot, shared with the whole
+    /// Whether the embedder named a pin set at boot, shared with the whole
     /// process ([`crate::piece_store::PinsUnknown`]). While it holds, the
     /// pin set is not "empty", it is *unknown*, and an owner that reclaimed
-    /// on that reading would delete the offline downloads the record was
-    /// the only description of.
+    /// on that reading would delete the offline downloads nobody described.
     pins_unknown: Arc<crate::piece_store::PinsUnknown>,
     /// Pieces a reclaim asked the backend to forget and did not get back --
     /// a peer mid-flight on them, or a stream's lookahead over them. Shared
@@ -468,11 +467,11 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
     /// Any pin on the torrent: a pin is a retention property, the user asked
     /// for those bytes, and they are shared like any other bytes we keep.
     ///
-    /// True for everything while the pin set is unknown. A boot that could
-    /// not read the pin record knows only that some of this may be pinned,
-    /// and the safe reading of "some" is "all": the bytes are still there
-    /// to unpin, where a pass that had taken them would have destroyed the
-    /// download the unreadable file was the only record of.
+    /// True for everything while the pin set is unknown. A boot the embedder
+    /// named no set to knows only that some of this may be pinned, and the
+    /// safe reading of "some" is "all": the bytes are still there to unpin,
+    /// where a pass that had taken them would have destroyed a download only
+    /// the embedder could have named.
     fn keeps_everything(&self, _file_idx: &usize) -> bool {
         self.pins_unknown.is_set() || !self.pinned.read().is_empty()
     }
@@ -811,12 +810,12 @@ pub struct Engine<H: TorrentHandle> {
     /// add and an add carries the want-set with it. A *restored* engine on
     /// a backend that sets piece reclaim is marked unsettled by
     /// [`BackendEngineFS::new_with_backend_and_storage`] and settled again
-    /// by [`BackendEngineFS::restore_pinned_downloads`], which is the call
-    /// that puts the want-set back.
+    /// by [`BackendEngineFS::apply_pins`], which is the call that puts the
+    /// want-set back.
     ///
     /// [`BackendEngineFS`]: crate::BackendEngineFS
     /// [`BackendEngineFS::new_with_backend_and_storage`]: crate::BackendEngineFS::new_with_backend_and_storage
-    /// [`BackendEngineFS::restore_pinned_downloads`]: crate::BackendEngineFS::restore_pinned_downloads
+    /// [`BackendEngineFS::apply_pins`]: crate::BackendEngineFS::apply_pins
     settled: AtomicBool,
     /// The clock reading at the last start or stop the reconciler made on
     /// this torrent, or [`NEVER_MOVED`] for a torrent it has never moved:
@@ -831,10 +830,10 @@ pub struct Engine<H: TorrentHandle> {
     /// [`TorrentBacking`], which is how the retention owner learns of a
     /// pin: read as a copy-out, never under any lock of the owner's.
     pub pinned_files: Arc<parking_lot::RwLock<BTreeSet<usize>>>,
-    /// The process-wide "the pin record would not read" condition, shared
-    /// with every engine and every backing. [`Self::is_pinned`] answers
-    /// from it, which is how one unreadable file at boot keeps every
-    /// restored torrent running and keeps every byte of it on the disk.
+    /// The process-wide "nobody named the pin set" condition, shared with
+    /// every engine and every backing. [`Self::is_pinned`] answers from it,
+    /// which is how a boot the embedder said nothing to keeps every restored
+    /// torrent running and keeps every byte of it on the disk.
     pins_unknown: Arc<crate::piece_store::PinsUnknown>,
     /// The last free-space reading of every volume, shared with the
     /// `BackendEngineFS` that made this engine and written by its
@@ -1602,11 +1601,10 @@ impl<H: TorrentHandle> Engine<H> {
     /// reconciler run it.
     ///
     /// Always true while the pin set is unknown ([`Self::pins_unknown`]):
-    /// the pin record is the only place a pin lives across a restart, and a
-    /// boot that could not read it must report and treat every restored
-    /// torrent as pinned rather than as unpinned. The user is told so on
-    /// the wire, and the first pin or unpin writes a true record and ends
-    /// it.
+    /// the embedder is the only thing that can say what a pin is, and a boot
+    /// it said nothing to must report and treat every restored torrent as
+    /// pinned rather than as unpinned. There is no way out of it inside the
+    /// process -- the next boot is told, or it is not.
     pub fn is_pinned(&self) -> bool {
         self.pins_unknown.is_set() || !self.pinned_files.read().is_empty()
     }

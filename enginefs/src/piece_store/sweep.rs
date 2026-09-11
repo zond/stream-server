@@ -8,7 +8,7 @@
 //! asks the engine what it holds, and is never reclaimed: exactly the
 //! invisible disk usage this design exists to stop producing.
 //!
-//! So the store is reconciled against the pin record once, at launch, before
+//! So the store is reconciled against the embedder's pin set once, at launch, before
 //! the session opens: every directory under the piece root whose info hash no
 //! pin claims is removed outright. Running before the session is what makes
 //! that safe -- a torrent being restored or added concurrently would have a
@@ -22,20 +22,20 @@
 //! a window round a playhead, the committed half a peer is served from, a
 //! slack file the next tick takes -- and none of it is worth a byte across a
 //! restart, because nothing is playing in a process that has served nothing.
-//! So the claim set is the pin record's keys ([`super::pin_record`]) and the
+//! So the claim set is the embedder's keys ([`super::pin_record`]) and the
 //! sweep runs *before the session opens*, while no store is registered and no
 //! torrent can be mid-check: what it deletes, it deletes with nothing holding
 //! a handle on it.
 //!
-//! The one state it refuses to run in is a pin record that would not read.
-//! An unreadable record names no pins, and sweeping on that would delete
-//! every offline download the user has -- so it is skipped for that boot and
-//! the disk keeps what it held; see [`super::pin_record::PinsUnknown`].
+//! The one state it refuses to run in is one where nobody named the pins.
+//! Silence names no pins, and sweeping on that would delete every offline
+//! download the user has -- so it is skipped for that boot and the disk keeps
+//! what it held; see [`super::pin_record::PinsUnknown`].
 
 use std::collections::HashSet;
 use std::path::Path;
 
-use super::pin_record::PinRecord;
+use super::pin_record::PinSet;
 use super::store::StoreRoot;
 
 /// What one sweep did.
@@ -121,27 +121,24 @@ pub fn sweep_unadopted(root: &StoreRoot, adopted: &HashSet<String>) -> SweepRepo
 /// claims is kept and everything else under the piece root goes, before the
 /// session opens.
 ///
-/// Skipped outright for a record that would not read. An unreadable record
-/// claims nothing, and a sweep on nothing is `remove_dir_all` over every
-/// offline download the user has -- so the disk keeps what it held for that
-/// boot, the condition is reported instead
-/// ([`super::pin_record::PinsUnknown`]), and the next boot with a readable
-/// record sweeps what this one left.
+/// Skipped outright when nobody named a set. Silence claims nothing, and a
+/// sweep on nothing is `remove_dir_all` over every offline download the user
+/// has -- so the disk keeps what it held for that boot, the condition is
+/// reported instead ([`super::pin_record::PinsUnknown`]), and the next boot
+/// that is told a set sweeps what this one left.
 ///
 /// On the blocking pool: it is `read_dir` plus `remove_dir_all` over a tree
 /// that can be the whole cache, and it runs on the thread that is opening the
 /// session.
-pub async fn sweep_before_session(download_dir: &Path, record: &PinRecord) -> SweepReport {
-    if let Some(why) = record.unreadable() {
+pub async fn sweep_before_session(download_dir: &Path, pins: Option<&PinSet>) -> SweepReport {
+    let Some(pins) = pins else {
         tracing::warn!(
-            path = %super::pin_record::path(download_dir).display(),
-            error = %why,
-            "the pin record could not be read; keeping every torrent's data and sweeping nothing this boot"
+            "nobody named the pin set; keeping every torrent's data and sweeping nothing this boot"
         );
         return SweepReport::default();
-    }
+    };
     let root = StoreRoot::in_download_dir(download_dir);
-    let claims = record.claims();
+    let claims: HashSet<String> = pins.keys().map(|hash| hash.to_lowercase()).collect();
     let legacy_root = download_dir.to_path_buf();
     match tokio::task::spawn_blocking(move || {
         let mut report = sweep_unadopted(&root, &claims);
@@ -168,8 +165,8 @@ pub async fn sweep_before_session(download_dir: &Path, record: &PinRecord) -> Sw
 /// Directories under the download root that belong to something else, each
 /// of which reconciles itself.
 ///
-/// `.pieces` is [`sweep_unadopted`]'s, and it is the pin record that decides
-/// what survives there. `.proxy` is the proxy cache's, emptied by its own
+/// `.pieces` is [`sweep_unadopted`]'s, and it is the embedder's pin set that
+/// decides what survives there. `.proxy` is the proxy cache's, emptied by its own
 /// launch sweep. `.archives` is the archive scratch's, which has a lifetime
 /// of its own. Handing any of them to [`sweep_legacy_downloads`] would be
 /// one sweep deciding another's business, and for `.pieces` it would delete
@@ -180,7 +177,12 @@ const NOT_OURS: [&str; 5] = [".pieces", ".proxy", ".archives", ".metadata", ".ca
 /// session writes and reads.
 ///
 /// Taken from the cache cleaner's `is_session_artifact`, which is what
-/// exempted these from its walk for as long as it had one. librqbit keeps
+/// exempted these from its walk for as long as it had one.
+///
+/// `pinned-downloads.json` is on the list although this server no longer
+/// writes one: an install upgraded from a build that did still has the file,
+/// and sweeping it as a previous release's *data* would be this sweep
+/// deleting a record while a user might still get something out of it. librqbit keeps
 /// its resume data beside the data itself -- `session.json`, a `.torrent`
 /// and a `.bitv` per info hash -- and the DHT its bootstrap; the pin record
 /// is this crate's own, and its atomic write leaves a `pinned-downloads
@@ -229,7 +231,7 @@ fn is_session_artifact(name: &str) -> bool {
 /// directory is this server's, and the alternative to deleting what we do
 /// not recognise is keeping it for ever.
 ///
-/// Skipped for an unreadable pin record, like [`sweep_before_session`] and
+/// Skipped when nobody named a pin set, like [`sweep_before_session`] and
 /// for the same reason: that boot keeps what the disk held.
 pub fn sweep_legacy_downloads(download_dir: &Path) -> SweepReport {
     let mut report = SweepReport::default();
@@ -488,11 +490,11 @@ mod tests {
         assert!(!root.join(ADOPTED).exists());
     }
 
-    /// The claim set is the pin record's keys and nothing else: a torrent
-    /// the session will restore in a moment, and whose pieces are right
-    /// there, is cache unless it is pinned.
+    /// The claim set is the embedder's keys and nothing else: a torrent the
+    /// session will restore in a moment, and whose pieces are right there,
+    /// is cache unless the embedder named it.
     #[tokio::test]
-    async fn the_sweep_keeps_what_the_pin_record_names_and_takes_the_rest() {
+    async fn the_sweep_keeps_what_the_embedder_names_and_takes_the_rest() {
         let tmp = tempfile::tempdir().unwrap();
         let download_dir = tmp.path().to_path_buf();
         let root = StoreRoot::in_download_dir(&download_dir)
@@ -501,20 +503,17 @@ mod tests {
         piece(&root, ADOPTED, "0", "1", 4096);
         piece(&root, ORPHAN, "0", "0", 8192);
 
-        let record = PinRecord::Pins(std::collections::BTreeMap::from([(
-            ADOPTED.to_string(),
-            vec![0usize],
-        )]));
-        let report = sweep_before_session(&download_dir, &record).await;
+        let pins = PinSet::from([(ADOPTED.to_string(), vec![0usize])]);
+        let report = sweep_before_session(&download_dir, Some(&pins)).await;
         assert_eq!(report.removed, 1, "{report:?}");
         assert!(root.join(ADOPTED).join("0").join("1").is_file(), "pinned");
         assert!(!root.join(ORPHAN).exists(), "and nothing else is claimed");
     }
 
-    /// No record at all is an empty claim set -- first launch, or a user who
-    /// has never pinned -- and the sweep runs on it.
+    /// An embedder that names an empty set has said something -- the user
+    /// has pinned nothing -- and the sweep acts on it.
     #[tokio::test]
-    async fn an_absent_record_claims_nothing_and_the_sweep_runs() {
+    async fn an_empty_set_claims_nothing_and_the_sweep_runs() {
         let tmp = tempfile::tempdir().unwrap();
         let download_dir = tmp.path().to_path_buf();
         let root = StoreRoot::in_download_dir(&download_dir)
@@ -522,15 +521,16 @@ mod tests {
             .to_path_buf();
         piece(&root, ADOPTED, "0", "1", 4096);
 
-        let report = sweep_before_session(&download_dir, &PinRecord::Absent).await;
+        let report = sweep_before_session(&download_dir, Some(&PinSet::new())).await;
         assert_eq!(report.removed, 1, "{report:?}");
         assert!(!root.join(ADOPTED).exists());
     }
 
-    /// And a record that would not read is not an empty claim set: nothing
-    /// is swept at all, because the pins it named are exactly what would go.
+    /// And an embedder that names no set at all is not an empty claim set:
+    /// nothing is swept, because what it would have claimed is exactly what
+    /// would go.
     #[tokio::test]
-    async fn an_unreadable_record_sweeps_nothing() {
+    async fn an_unnamed_pin_set_sweeps_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let download_dir = tmp.path().to_path_buf();
         let root = StoreRoot::in_download_dir(&download_dir)
@@ -543,16 +543,14 @@ mod tests {
         std::fs::create_dir_all(&legacy).unwrap();
         std::fs::write(legacy.join("film.mkv"), vec![7u8; 4096]).unwrap();
 
-        let report =
-            sweep_before_session(&download_dir, &PinRecord::Unreadable("broken".into())).await;
+        let report = sweep_before_session(&download_dir, None).await;
         assert_eq!(report, SweepReport::default());
         assert!(root.join(ADOPTED).join("0").join("1").is_file());
         assert!(root.join(ORPHAN).join("0").join("0").is_file());
         assert!(
             legacy.join("film.mkv").is_file(),
             "and a previous release's download is kept with everything else \
-             that boot: the record we could not read is the one that says \
-             which torrents the user meant to keep"
+             that boot: nobody has said which torrents the user meant to keep"
         );
     }
 
@@ -575,11 +573,8 @@ mod tests {
         std::fs::write(legacy.join("film.mkv"), vec![7u8; 8192]).unwrap();
         std::fs::write(download_dir.join("session.json"), b"{}").unwrap();
 
-        let record = PinRecord::Pins(std::collections::BTreeMap::from([(
-            ADOPTED.to_string(),
-            vec![0usize],
-        )]));
-        let report = sweep_before_session(&download_dir, &record).await;
+        let pins = PinSet::from([(ADOPTED.to_string(), vec![0usize])]);
+        let report = sweep_before_session(&download_dir, Some(&pins)).await;
 
         assert_eq!(report.removed, 1, "the legacy download: {report:?}");
         assert!(report.freed_bytes >= 8192, "{report:?}");
