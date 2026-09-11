@@ -3223,11 +3223,12 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 .map(|selection| selection.file_idx)
         };
 
-        {
-            let mut streams = self.active_file_streams.write().await;
-            streams.retain(|(hash, idx), _| hash.as_str() != info_hash || *idx == file_idx);
-        }
-
+        // The other files' stream counts stay. They are counts of responses
+        // still open, ended one by one by `on_stream_end`, and a selection
+        // is not a response ending: wiping them here -- what this did, from
+        // when one file per torrent was the rule -- left a film's count at
+        // nothing while its subtitle's open selected it, or while the next
+        // episode was opened before the last one's body closed.
         engine.touch();
         // No reconcile here. Its caller reaches it through `activate_file`
         // and asks the reconciler for itself once it has finished
@@ -4146,9 +4147,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     }
 
     /// Forget that `file_idx` of `info_hash` is being played: its active
-    /// selection, its lease and its stream count go, as
-    /// `activate_multifile_file` drops them for the files a new selection
-    /// supersedes. What a delete needs before it reconciles -- the want-set
+    /// selection and its stream count go. What a delete needs before it reconciles -- the want-set
     /// is planned from this bookkeeping, and a file still registered as the
     /// active one is unioned back into `only_files` however it was deleted.
     /// A selection naming another file of the torrent is left alone: that
@@ -5995,12 +5994,15 @@ mod tests {
         assert_eq!(snapshot.active_multifile_selections.len(), 1);
         assert_eq!(snapshot.active_multifile_selections[0].file_idx, 2);
         assert_eq!(*counters.last_active_file.lock().unwrap(), Some(2));
-        assert!(
-            snapshot
-                .active_file_streams
-                .iter()
-                .all(|stream| stream.file_idx == 2)
-        );
+        // The selection is the latest request's, and file 1's response --
+        // which nothing has ended -- is still counted.
+        let mut open: Vec<usize> = snapshot
+            .active_file_streams
+            .iter()
+            .map(|stream| stream.file_idx)
+            .collect();
+        open.sort_unstable();
+        assert_eq!(open, vec![1, 2]);
         assert_eq!(counters.reconcile_file_priorities.load(Ordering::SeqCst), 2);
     }
 
@@ -13709,6 +13711,40 @@ mod tests {
             ),
             (Some(1), None)
         );
+    }
+
+    /// **A selection leaves the other files' stream counts alone.**
+    ///
+    /// Selecting a file used to wipe the count of every other file of the
+    /// torrent -- a rule from when one file per torrent was playing. The
+    /// counts are of responses still open, and each is ended by its own
+    /// `on_stream_end`: wiped, a film's count read nothing while its body
+    /// was still being delivered, and the delayed cleanup that asks it
+    /// thought the film was done.
+    #[tokio::test]
+    async fn opening_another_file_leaves_the_first_ones_stream_count() {
+        let (enginefs, _counters) = test_enginefs_with_file_count(2);
+        let count = |file_idx: usize| {
+            let enginefs = &enginefs;
+            async move {
+                enginefs
+                    .active_file_streams
+                    .read()
+                    .await
+                    .get(&(TEST_HASH.to_string(), file_idx))
+                    .copied()
+                    .unwrap_or(0)
+            }
+        };
+        enginefs.on_stream_start(TEST_HASH, 0).await;
+        enginefs.on_stream_start(TEST_HASH, 1).await;
+        assert_eq!(
+            (count(0).await, count(1).await),
+            (1, 1),
+            "the second file's selection wiped the first one's open response"
+        );
+        enginefs.on_stream_end(TEST_HASH, 0).await;
+        assert_eq!((count(0).await, count(1).await), (0, 1));
     }
 
     /// **The next episode, opened before the last one's read closed, takes
