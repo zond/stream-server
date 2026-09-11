@@ -4539,22 +4539,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                         active_file = active_selection.as_ref().map(|selection| selection.file_idx),
                         "Delayed cleanup: reconciled multi-file priorities"
                     );
-                    return;
-                }
-
-                if let Err(e) = engine.handle.clear_file_streaming(file_idx).await {
-                    tracing::warn!(
-                        "Failed to clear file priorities for {} idx={}: {}",
-                        info_hash,
-                        file_idx,
-                        e
-                    );
-                } else {
-                    tracing::info!(
-                        "Delayed cleanup: cleared file priorities for {} idx={}",
-                        info_hash,
-                        file_idx
-                    );
                 }
             }
         }))
@@ -4758,7 +4742,6 @@ mod tests {
 
     #[derive(Default)]
     struct FakeCounters {
-        clear_file_streaming: AtomicUsize,
         reconcile_file_priorities: AtomicUsize,
         prepare_file_for_streaming: AtomicUsize,
         get_file_reader: AtomicUsize,
@@ -5585,13 +5568,6 @@ mod tests {
             self.gate().await?;
             self.counters
                 .prepare_file_for_streaming
-                .fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-
-        async fn clear_file_streaming(&self, _file_idx: usize) -> Result<()> {
-            self.counters
-                .clear_file_streaming
                 .fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -6438,7 +6414,6 @@ mod tests {
         assert_eq!(snapshot.active_multifile_selections.len(), 1);
         assert_eq!(snapshot.active_multifile_selections[0].file_idx, 2);
         assert_eq!(*counters.last_active_file.lock().unwrap(), Some(2));
-        assert_eq!(counters.clear_file_streaming.load(Ordering::SeqCst), 0);
     }
 
     /// Which of the snapshot's fields mean "somebody is watching". The

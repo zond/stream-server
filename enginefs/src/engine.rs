@@ -2043,10 +2043,6 @@ mod pin_tests {
             Ok(())
         }
 
-        async fn clear_file_streaming(&self, _file_idx: usize) -> anyhow::Result<()> {
-            Ok(())
-        }
-
         async fn file_pieces(&self, file_idx: usize) -> Option<FilePieceSpan> {
             (file_idx < 2).then(|| {
                 let start = file_idx as u32 * 8;

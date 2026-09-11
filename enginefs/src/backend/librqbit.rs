@@ -390,8 +390,6 @@ enum InitPolicy {
     /// Return immediately and apply once initialized. Used for reconcile,
     /// which is also driven from background cleanup loops that must not stall.
     Defer,
-    /// Skip: a deselect while nothing has started downloading is moot.
-    Skip,
 }
 
 /// Public BitTorrent mainline DHT bootstrap nodes used to seed librqbit's
@@ -1688,9 +1686,6 @@ fn file_progress_fields(len: u64, have: u64) -> (u64, f64) {
 enum SelectionOp {
     /// Exclusive selection of one file for streaming (plus the pinned set).
     Prepare(usize),
-    /// Deselect one file, keeping the rest of the selection (a pinned file
-    /// is never deselected).
-    Clear(usize),
     /// Want exactly the union of the active and hot files (plus the pinned
     /// set).
     Reconcile {
@@ -1710,12 +1705,8 @@ enum SelectionOp {
 /// - Single-file torrents are always fully wanted: never touch selection.
 /// - The result is never an empty set (that would make nothing wanted and
 ///   starve playback).
-/// - `Clear` of a file that is not currently selected (a newer `Prepare`
-///   already switched away) is a no-op, so late delayed-cleanup and HLS-lease
-///   expiry cannot clobber the active selection.
-/// - Every in-range pinned index is in every result, and `Clear` of a pinned
-///   index is a no-op: playback switching never deselects an offline
-///   download.
+/// - Every in-range pinned index is in every result: playback switching
+///   never deselects an offline download.
 /// - Out-of-range indices are dropped; a plan left empty by that is a no-op.
 /// - A plan equal to the current selection is a no-op.
 fn plan_only_files(
@@ -1759,18 +1750,6 @@ fn plan_selection(
                 return None;
             }
             with_pinned(std::iter::once(idx).collect())
-        }
-        SelectionOp::Clear(idx) => {
-            let current = current?;
-            if !current.contains(&idx) || pinned.contains(&idx) {
-                return None;
-            }
-            let remainder: HashSet<usize> = current.iter().copied().filter(|i| *i != idx).collect();
-            if remainder.is_empty() {
-                None
-            } else {
-                with_pinned(remainder)
-            }
         }
         SelectionOp::Reconcile { active, hot } => {
             with_pinned(active.into_iter().chain(hot).collect())
@@ -2816,24 +2795,6 @@ impl TorrentHandle for LibrqbitHandle {
         .await
     }
 
-    /// Deselect `file_idx`, keeping the rest of the current selection. Called
-    /// from delayed cleanup, possibly AFTER a newer file was prepared -- the
-    /// planner refuses to clear a file that is no longer
-    /// selected and refuses to produce an empty want-set, so stale cleanups
-    /// can never clobber the active selection.
-    async fn clear_file_streaming(&self, file_idx: usize) -> Result<()> {
-        let Some(file_count) = self.file_count_from_metadata() else {
-            return Ok(());
-        };
-        self.apply_selection(
-            SelectionOp::Clear(file_idx),
-            file_count,
-            "clear_file_streaming",
-            InitPolicy::Skip,
-        )
-        .await
-    }
-
     /// Pin `file_idx` (see the trait doc): record it in the backend-wide pin
     /// set, which every later planner run unions in, and add it to the
     /// current selection right away. Deferred like `reconcile_file_priorities`
@@ -3284,25 +3245,13 @@ impl LibrqbitHandle {
                     self.defer_selection(op, context);
                     return Ok(());
                 }
-                InitPolicy::Skip => {
-                    debug!(
-                        info_hash = %self.info_hash,
-                        ?op,
-                        context,
-                        "torrent is initializing; skipping file selection update"
-                    );
-                    return Ok(());
-                }
             }
         }
-        // A direct Prepare/Reconcile sets the whole selection and so supersedes
-        // anything still parked from before the torrent became ready. A Clear
-        // only removes one file and must not discard a parked reconcile. Use
-        // the non-inserting lookup: a torrent that never deferred anything
-        // has no slot, and checking should not create one.
-        if !matches!(op, SelectionOp::Clear(_))
-            && let Some(slot) = self.deferred_selection_if_present()
-        {
+        // A direct op sets the selection and so supersedes anything still
+        // parked from before the torrent became ready. Use the non-inserting
+        // lookup: a torrent that never deferred anything has no slot, and
+        // checking should not create one.
+        if let Some(slot) = self.deferred_selection_if_present() {
             slot.supersede();
         }
         if !self.apply_selection_now(op, file_count, context).await
@@ -6238,7 +6187,6 @@ mod tests {
 
         // Single-file torrents: never touch selection, for any op.
         assert_eq!(plan(None, 1, Prepare(0)), None);
-        assert_eq!(plan(Some(&[0]), 1, Clear(0)), None);
         assert_eq!(
             plan(
                 None,
@@ -6256,15 +6204,6 @@ mod tests {
         assert_eq!(plan(Some(&[0, 2]), 3, Prepare(1)), set(&[1]));
         // Prepare out of range: apply nothing.
         assert_eq!(plan(None, 3, Prepare(3)), None);
-
-        // Clear: refuse to empty the set.
-        assert_eq!(plan(Some(&[1]), 3, Clear(1)), None);
-        // Clear of a stale file after a switch: no-op.
-        assert_eq!(plan(Some(&[0]), 3, Clear(1)), None);
-        // Clear with no selection at all: no-op.
-        assert_eq!(plan(None, 3, Clear(1)), None);
-        // Clear leaving a non-empty remainder applies it.
-        assert_eq!(plan(Some(&[0, 1]), 3, Clear(1)), set(&[0]));
 
         // Reconcile: union of active and hot, never empty.
         assert_eq!(
@@ -6338,8 +6277,8 @@ mod tests {
     }
 
     /// The pinned set is unioned into every plan, so playback switching
-    /// (exclusive `Prepare`, `Reconcile` to another file, `Clear` after a
-    /// stream ends) never deselects an offline download.
+    /// (exclusive `Prepare`, `Reconcile` to another file) never deselects an
+    /// offline download.
     #[test]
     fn plan_only_files_unions_pinned_into_every_branch() {
         use SelectionOp::*;
@@ -6356,14 +6295,6 @@ mod tests {
         // Prepare is exclusive *plus* the pin.
         assert_eq!(plan(None, 3, Prepare(1)), set(&[0, 1]));
         assert_eq!(plan(Some(&[2]), 3, Prepare(0)), set(&[0]));
-
-        // Clear never drops the pinned file, even when it is the only one
-        // selected or a stale cleanup targets it.
-        assert_eq!(plan(Some(&[0, 1]), 3, Clear(0)), None);
-        assert_eq!(plan(Some(&[0]), 3, Clear(0)), None);
-        // Clearing another file keeps the pin in the remainder.
-        assert_eq!(plan(Some(&[0, 1]), 3, Clear(1)), set(&[0]));
-        assert_eq!(plan(Some(&[1, 2]), 3, Clear(1)), set(&[0, 2]));
 
         // Reconcile chains the pin; with no active/hot file the pin alone
         // is the want-set instead of "apply nothing".
@@ -6463,11 +6394,8 @@ mod tests {
         // Playback of another file: exclusive prepare keeps the pin ...
         handle.prepare_file_for_streaming(1).await.unwrap();
         assert_eq!(selection(&handle), vec![0, 1]);
-        // ... reconcile to yet another file keeps it ...
+        // ... and so does reconcile to yet another file.
         reconcile(handle.clone(), Some(2)).await;
-        assert_eq!(selection(&handle), vec![0, 2]);
-        // ... and clearing the pinned file is refused.
-        handle.clear_file_streaming(0).await.unwrap();
         assert_eq!(selection(&handle), vec![0, 2]);
 
         // A handle re-created by get_torrent shares the pin set.
@@ -7752,10 +7680,6 @@ mod tests {
         handle.prepare_file_for_streaming(1).await.unwrap();
         assert_eq!(selection(&handle), vec![1]);
 
-        // Clearing the only selected file would empty the set -> no-op.
-        handle.clear_file_streaming(1).await.unwrap();
-        assert_eq!(selection(&handle), vec![1]);
-
         // Reconcile switches to the active file.
         handle
             .reconcile_file_priorities(TorrentFilePriorityPlan {
@@ -7766,10 +7690,6 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(selection(&handle), vec![0]);
-
-        // Stale clear of a file that is no longer selected -> no-op.
-        handle.clear_file_streaming(1).await.unwrap();
         assert_eq!(selection(&handle), vec![0]);
 
         // Gating must not starve the selected, streamed file.
@@ -7811,7 +7731,6 @@ mod tests {
         handle.handle.wait_until_initialized().await.unwrap();
 
         handle.prepare_file_for_streaming(0).await.unwrap();
-        handle.clear_file_streaming(0).await.unwrap();
         assert_eq!(handle.handle.only_files(), None);
     }
 

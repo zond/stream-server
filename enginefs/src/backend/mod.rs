@@ -475,8 +475,8 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
         Ok(())
     }
     /// Keep `file_idx` wanted regardless of playback selection: every later
-    /// `prepare_file_for_streaming` / `clear_file_streaming` /
-    /// `reconcile_file_priorities` keeps it in the want-set until
+    /// `prepare_file_for_streaming` / `reconcile_file_priorities` keeps it in
+    /// the want-set until
     /// `unpin_file`. This is the backend half of an offline download; the
     /// engine layer (`BackendEngineFS::pin_download`) also exempts the torrent
     /// from idle removal and the seeding-disabled pause. Backends that cannot
@@ -629,9 +629,6 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
     /// This should be called BEFORE reading from the file.
     /// Returns Ok(()) when initial pieces are available, or Err on timeout.
     async fn prepare_file_for_streaming(&self, file_idx: usize) -> Result<()>;
-    /// Clear streaming state for a file (set priority to 0, clear piece deadlines).
-    /// Called when switching to a different file to ensure exclusive downloading.
-    async fn clear_file_streaming(&self, file_idx: usize) -> Result<()>;
 }
 
 #[derive(Debug, Clone)]
