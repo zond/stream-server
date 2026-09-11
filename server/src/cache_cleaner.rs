@@ -1375,12 +1375,14 @@ impl WalkInputs {
 /// **`Ok(false)` is not success and it is not failure: it is "there were no
 /// bytes here to take".** The walk's answer and the delete's are two
 /// readings of the disk taken a moment apart, and nothing serialises passes
-/// -- a 507'd stream runs a whole `clean_cache` on the request task while
-/// the background loop is in one -- so both may scan the same piece and only
-/// one of them can take it. Whichever loses must not book the bytes: what
-/// `EvictionReport::freed` decides is whether a torrent stopped by ENOSPC is
-/// restarted, and restarting it onto a disk that gained nothing is the loop
-/// `DiskFullRecovery` exists to stop. A piece the backend refuses to forget
+/// -- the background loop's fallback tick and its debounce are two triggers
+/// over one root -- so both may scan the same piece and only one of them
+/// can take it. Whichever loses must not book the bytes: what
+/// `EvictionReport::freed` decides is whether the disk-full poll believes
+/// it has anything new to say about a device it has already failed to make
+/// room on, and a pass that "made room" by double-counting another pass's
+/// unlink clears `DiskFullRecovery`'s exhausted set for nothing, once per
+/// tick, for ever. A piece the backend refuses to forget
 /// answers the same way, and for a reason of the same shape: the bytes are
 /// still there and no delete of ours may reach them.
 async fn reclaim<R, S, F>(
@@ -2060,16 +2062,15 @@ mod tests {
 
     /// Two passes over one disk book its bytes once.
     ///
-    /// Nothing serialises passes: `routes::stream` runs a whole
-    /// `clean_cache` on the request task every time `ensure_download_disk_ready`
-    /// refuses a stream -- i.e. on a full disk, for every 507 -- while the
-    /// background loop is in one of its own. Both scan, both see the same
-    /// piece, and only one of them can take it. What the loser must not do is
-    /// report the bytes as freed: `EvictionReport::freed` is the whole of
-    /// `made_room()`, `DiskFullRecovery` clears its exhausted set on that and
-    /// `restart_from_error` puts the ENOSPC torrents back on a disk that
-    /// gained nothing -- the restart loop the guard exists to stop, with the
-    /// guard unable to latch because every pass "made room".
+    /// Nothing serialises passes: the background loop's fallback tick and
+    /// its debounced trigger are two passes over one root, and the
+    /// disk-full poll runs a third with a headroom of its own. Both scan,
+    /// both see the same piece, and only one of them can take it. What the
+    /// loser must not do is report the bytes as freed: `EvictionReport::freed`
+    /// is the whole of `made_room()`, and `DiskFullRecovery` clears its
+    /// exhausted set on that -- so a pass that books another pass's unlink
+    /// tells the poll it has something new to try every time it is asked,
+    /// which is the walk-per-tick the guard exists to stop.
     ///
     /// Both eviction rules are here: the aged-out piece goes by the 30-day
     /// rule and the fresh ones by the size rule, and each books what it took
@@ -3228,7 +3229,7 @@ mod tests {
         assert_eq!(report.freed, occupancy(&live));
         assert!(
             report.made_room(),
-            "so the torrent a full disk stopped can be restarted"
+            "so the volume a full disk stopped a torrent on is worth asking about again"
         );
         assert!(
             report.shortfall_message().is_some(),
@@ -3238,9 +3239,10 @@ mod tests {
 
     /// The 30-day rule reclaims space too, and `made_room` has to see it.
     /// Otherwise a pass that deleted a stale film reported `freed: 0`, the
-    /// torrent a full disk had stopped was left stopped, and the next tick
-    /// had nothing left to age out and a cache now under its cap -- so the
-    /// torrent stayed dead on a volume the cleaner had just emptied for it.
+    /// disk-full poll wrote the volume off as one it could do nothing more
+    /// for, and the next tick had nothing left to age out and a cache now
+    /// under its cap -- so nothing ever asked again about a volume the
+    /// cleaner had just emptied.
     #[tokio::test]
     async fn what_the_age_rule_reclaimed_counts_as_room_made() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3265,16 +3267,19 @@ mod tests {
         assert_eq!(report.total, 0);
         assert!(
             report.made_room(),
-            "so the torrent a full disk stopped is restarted"
+            "so the volume a full disk stopped a torrent on is worth asking about again"
         );
     }
 
-    /// A stopped torrent is restarted only when the clean actually reclaimed
-    /// something. Restarting onto a disk that is still full reproduces the
-    /// same ENOSPC within seconds, and a loop is worse than a stopped torrent
-    /// a client can report honestly.
+    /// A volume is worth asking about again only when the clean actually
+    /// reclaimed something. A pass that freed nothing has not changed the
+    /// device's mind, and a poll that believed otherwise would walk the
+    /// whole root every fifteen seconds for as long as a torrent stayed
+    /// dead -- which is worse than a stopped torrent a client can report
+    /// honestly. What the room is then *for* is the ladder's to decide, off
+    /// its own reading of the volume.
     #[test]
-    fn a_torrent_is_restarted_only_when_the_clean_made_room() {
+    fn a_volume_is_worth_asking_about_again_only_when_the_clean_made_room() {
         let freed_nothing = EvictionReport {
             total: 4096,
             protected: 4096,

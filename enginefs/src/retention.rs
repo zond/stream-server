@@ -99,9 +99,12 @@ impl RetentionBudget {
 /// The bell the volume rings when it is running low.
 ///
 /// One reading of one device, so one bell: the reconciler's tick takes the
-/// session's single `statvfs` ([`crate::reconcile::Volumes`]) and rings
+/// reading every owner acts on ([`crate::reconcile::Volumes`]) and rings
 /// this whenever what it read is under the line a stopped torrent has to
-/// see cleared. Everybody who can give bytes back answers by dropping
+/// see cleared. That reading is the tick's own and not any torrent's --
+/// the tick takes it before it looks at what there is to decide about, so
+/// a session holding nothing but proxied chunks still rings. Everybody who
+/// can give bytes back answers by dropping
 /// their slack -- everything nobody is playing and nobody is reading --
 /// and nobody chooses a victim: the answer to a volume running low is to
 /// stop holding what is already disposable, not to pick something to take.

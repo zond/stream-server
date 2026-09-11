@@ -3072,6 +3072,99 @@ fn the_minute_publishers_cap_follows_the_owners_occupancy() -> anyhow::Result<()
     Ok(())
 }
 
+/// **A clean restates the cap before it reports one.**
+///
+/// The number a clean answers with is the number the owners are now sized
+/// against, and that is only true if the clean says it: the cap is
+/// published by the minute timer and by `POST /settings`, and a clean that
+/// moved the occupancy without restating it would answer a client a figure
+/// nothing in the process was enforcing -- for up to a minute, which is
+/// several windows.
+///
+/// Read where the policies read it (`ServerHandle::published_cache_budget`)
+/// and not off `GET /cache.json`, which runs the arithmetic again for the
+/// client: a clean that stopped restating would still answer that route
+/// correctly while every window stayed sized to the cap of a minute ago.
+///
+/// The occupancy is moved here by the session registering a store over
+/// bytes that were already on the volume -- the same motion
+/// `the_minute_publishers_cap_follows_the_owners_occupancy` uses, and for
+/// the same reason: it is a change no `statvfs` can see, so only a
+/// publication that reads the owners can carry it.
+///
+/// The claim is the *agreement* of the two numbers and not the direction
+/// either moved: the disk arm is `occupied + available - floor`, and
+/// `available` is a real volume that the rest of this test binary is
+/// writing to meanwhile. Both readings here are taken inside the one call,
+/// microseconds apart, so nothing the volume does can separate them --
+/// while a cap last stated before the store registered is short by the
+/// whole of the seeded film.
+#[test]
+fn a_clean_restates_the_cap_before_it_reports_it() -> anyhow::Result<()> {
+    /// Enough that the difference is nothing like the noise of a session
+    /// writing its own records while this runs.
+    const SEEDED: usize = 16 * 1024 * 1024;
+    /// `cacheSize` above anything a volume could offer, so the cap under
+    /// test is the disk arm -- the one occupancy is a term of.
+    const UNCAPPED: f64 = 1024.0 * 1024.0 * 1024.0 * 1024.0;
+
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    let content = src.path().join("Movie");
+    std::fs::create_dir_all(&content)?;
+    write_payload(&content.join("film.mkv"), SEEDED);
+    let (torrent, info_hash) = real_torrent(&content);
+
+    let cache_root = resolved(&cache_dir.path().join("cache"));
+    let handle = stream_server::start(ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_root.clone()),
+        // The walk is still in the process at this slice and it publishes
+        // nothing; left running it would only add a second deleter to a
+        // test about who states the cap.
+        enable_cache_cleaner: false,
+        ..offline_config()
+    })?;
+    seed_piece_store(&cache_root, &torrent, &content);
+    handle.update_settings(serde_json::json!({ "cacheSize": UNCAPPED }))?;
+    assert!(
+        handle.published_cache_budget().is_some(),
+        "a cap from the volume, stated before the store that holds the film exists"
+    );
+
+    // The session picks the seeded pieces up, which is the whole of what
+    // moves the occupancy. Pinned, so the clean below has nothing to take
+    // and the only thing it can change is the published number.
+    let base = format!("http://{}", handle.http_addr());
+    let client = bearer_client(&handle)?;
+    client
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
+        .send()?
+        .error_for_status()?;
+    let stats = stats_after_check(&client, &base, &info_hash)?;
+    handle.pin_download(&info_hash, file_index(&stats, "film.mkv"), &[])?;
+
+    let report = handle.clean_cache_now()?;
+    assert_eq!(report.freed, 0, "a pin is nobody's slack: {report:?}");
+    let in_force = handle
+        .published_cache_budget()
+        .expect("a cap from the volume");
+    let reported = report.limit.expect("a cap from the volume");
+    assert!(
+        in_force.abs_diff(reported) < SEEDED as u64 / 2,
+        "the cap in force is not the cap the clean reported: {in_force} against \
+         {reported}, which is the film's {SEEDED} bytes of occupancy missing from \
+         a cap nothing restated"
+    );
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
 /// `GET /cache.json` and `POST /cache/clean` share their functions with
 /// `ServerHandle::{cache_usage, clean_cache_now}`, and the two surfaces
 /// answer the same bytes: the report the route returns is the report the
@@ -3131,6 +3224,12 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         config_dir: Some(config_dir.path().join("config")),
         cache_dir: Some(cache_root.clone()),
+        // Every assertion below is that a byte is still on the disk, and
+        // the background walk that is still in the process at this point
+        // takes bytes on a debounce nothing in this test controls. What is
+        // under test is what a clean does, so the only deleter here is the
+        // clean this test asks for.
+        enable_cache_cleaner: false,
         ..offline_config()
     })?;
     // Already "streamed": the data sits in the piece store, as it would

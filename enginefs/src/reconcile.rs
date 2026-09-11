@@ -821,11 +821,13 @@ mod tests {
         }
     }
 
-    /// A torrent the backend stopped with an error belongs to the cache
-    /// cleaner's recovery, which reclaims space and restarts it. Starting it
-    /// here would race that; pausing it means nothing.
+    /// A torrent the backend stopped with an error on a volume that is
+    /// still full is left exactly where it is: there is nowhere to restart
+    /// it into, and pausing a torrent that is not running means nothing.
+    /// The arm above this one is what puts it back to work, and only once
+    /// the volume has cleared -- this is the reading where it has not.
     #[test]
-    fn an_errored_torrent_is_left_to_the_cleaner() {
+    fn an_errored_torrent_with_no_room_to_restart_into_is_left_alone() {
         let dead = Conditions {
             run_state: RunState::Error,
             playing: true,
@@ -835,10 +837,10 @@ mod tests {
         assert_eq!(desired(&dead, Trigger::Timer), Decision::Leave);
         assert_eq!(desired(&dead, Trigger::PlaybackStart), Decision::Leave);
 
-        // Only once its want-set is back, though. Until then the torrent is
-        // not the cleaner's either -- the cleaner will not restart one it
-        // cannot give a want-set to -- and `Leave` would hold a read
-        // refusal that nothing was ever going to lift.
+        // And only while its want-set is back. Without it nothing would
+        // restart the torrent whatever the volume said -- an unsettled
+        // reading is never read as "this should be running" -- and `Leave`
+        // would hold a read refusal that nothing was ever going to lift.
         let unsettled = Conditions {
             settled: false,
             ..dead

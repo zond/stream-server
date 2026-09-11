@@ -423,11 +423,13 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
     /// worth a paragraph: one method reached from two places that meant
     /// different things ("the error was dealt with" and "the space came
     /// back") could be made correct for neither, and the second of those
-    /// callers is now [`Self::start_torrent`]. A torrent in the error state
-    /// is the one thing the reconciler will not touch (its ladder answers
-    /// `Leave`), because restarting it means re-running a storage check
-    /// that would only fail again unless the cache cleaner has made room
-    /// first -- so this is the cleaner's call and nobody else's.
+    /// callers is now [`Self::start_torrent`]. What is left has exactly one
+    /// caller, the reconciler's ladder
+    /// (`crate::reconcile::Decision::RestartFromError`), which takes it
+    /// only for an error a full volume caused and only once the volume has
+    /// cleared the resume line: restarting means re-running a storage check
+    /// that would fail again on a device that has not actually gained
+    /// anything.
     async fn restart_from_error(&self) -> Result<()> {
         anyhow::bail!("this backend cannot restart a stopped torrent")
     }

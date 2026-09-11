@@ -712,15 +712,9 @@ async fn ensure_disk_ready_or_refuse(
                 })
         }
     };
-    // Both gates, in the order they cost: a torrent the reconciler is
-    // already holding stopped for want of space is answered from the
-    // reading it took (no syscall), and the floor probe runs only for a
-    // request that got past it.
-    let stopped_for_space = engine.is_stopped_for_space().await;
-    let short = match (stopped_for_space, check().await) {
-        (false, Ok(())) => return Ok(()),
-        (true, _) => "the volume this torrent's pieces land on has no room".to_string(),
-        (false, Err(error)) => error,
+    // Both gates, in the order they cost.
+    let Some(short) = first_complaint(engine.is_stopped_for_space().await, &check).await else {
+        return Ok(());
     };
     tracing::warn!(
         stream_id,
@@ -752,9 +746,10 @@ async fn ensure_disk_ready_or_refuse(
     // reconciler's, which is up to one tick old. A pass that just freed
     // space must not be judged by either.
     forget_available_space(&engine_fs.download_dir);
-    engine_fs.reread_volume();
-    if !engine.is_stopped_for_space().await
-        && let Ok(()) = check().await
+    engine_fs.reread_volume().await;
+    if first_complaint(engine.is_stopped_for_space().await, &check)
+        .await
+        .is_none()
     {
         return Ok(());
     }
@@ -768,6 +763,28 @@ async fn ensure_disk_ready_or_refuse(
         StatusCode::INSUFFICIENT_STORAGE,
         INSUFFICIENT_DISK_SPACE_BODY,
     ))
+}
+
+/// The gate's two questions, in the order they cost, and the first
+/// complaint either of them makes -- `None` when the disk is ready.
+///
+/// `probe` is a closure and not an answer, and that is the whole of this
+/// function: the floor probe is a `create_dir_all`, a write and an unlink
+/// on the blocking pool, and it must not be taken at all for a request the
+/// cheap question has already refused. A torrent the reconciler is holding
+/// stopped for want of space is answered from the reading it took, and a
+/// player retrying that stream four times a second is what the order is
+/// worth. Written as a `match` over a tuple, both were evaluated -- the
+/// ordering the comment claimed was not the ordering the code had.
+async fn first_complaint<P, F>(stopped_for_space: bool, probe: P) -> Option<String>
+where
+    P: FnOnce() -> F,
+    F: std::future::Future<Output = Result<(), String>>,
+{
+    if stopped_for_space {
+        return Some("the volume this torrent's pieces land on has no room".to_string());
+    }
+    probe().await.err()
 }
 
 /// How long the disk gate waits for the two owners to give their slack
@@ -1447,6 +1464,7 @@ fn stream_open_failure_status(err: &GetFileError) -> (StatusCode, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
 
     /// The bound is on the *request*, not on the passes: a reclaim parked
     /// on a disk that has stopped answering must not hold a player's
@@ -1471,6 +1489,73 @@ mod tests {
             started.elapsed(),
             bound,
             "and the request waited the bound and no longer"
+        );
+
+        // And the pass the request stopped waiting for runs to its end. A
+        // timeout drops what it is waiting on, and a pass dropped between
+        // an unlink and the booking of it leaves bytes off the disk that
+        // the owner still counts as held -- the figure the published cap
+        // is stated from, wrong in the direction that says there is room.
+        let finished = Arc::new(AtomicBool::new(false));
+        let slow = {
+            let finished = finished.clone();
+            async move {
+                tokio::time::sleep(bound * 2).await;
+                finished.store(true, Ordering::SeqCst);
+                1
+            }
+        };
+        assert_eq!(free_the_slack_within(bound, async { 0 }, slow).await, 0);
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "the request left while the pass was still in it"
+        );
+        tokio::time::sleep(bound * 2).await;
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "a pass the bound left behind is still a pass: it finished on its own time"
+        );
+    }
+
+    /// The gate's two questions, in the order they cost.
+    ///
+    /// The floor probe is a `create_dir_all`, a write and an unlink on the
+    /// blocking pool, and a player retrying a torrent this process is
+    /// already holding stopped for want of space asks four times a second.
+    /// Every one of those is answered from the reading the reconciler
+    /// already took, and the probe is not taken at all.
+    #[tokio::test]
+    async fn a_torrent_stopped_for_space_is_answered_without_the_floor_probe() {
+        let probes = AtomicUsize::new(0);
+        let probe = || {
+            probes.fetch_add(1, Ordering::SeqCst);
+            async { Ok(()) }
+        };
+
+        assert_eq!(
+            first_complaint(true, &probe).await.as_deref(),
+            Some("the volume this torrent's pieces land on has no room"),
+            "the cheap question refuses on its own"
+        );
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            0,
+            "and nothing touched the disk to find that out"
+        );
+
+        assert_eq!(
+            first_complaint(false, &probe).await,
+            None,
+            "a request that got past it is answered by the probe"
+        );
+        assert_eq!(probes.load(Ordering::SeqCst), 1, "which was taken once");
+
+        assert_eq!(
+            first_complaint(false, || async { Err("no room".to_string()) })
+                .await
+                .as_deref(),
+            Some("no room"),
+            "and the probe's own complaint is what the gate then logs"
         );
     }
 

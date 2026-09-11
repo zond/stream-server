@@ -1325,7 +1325,15 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         // await parks every later reader behind any writer that queues
         // meanwhile.
         let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
-        let mut probed = false;
+        // The volume is the session's, not any one torrent's, so the tick
+        // reads it before it looks at what there is to decide about -- and
+        // reads it even when there is nothing. Taken inside the loop it was
+        // skipped entirely by a session with no engines, which is exactly
+        // the session the bell it rings exists for: a viewer who only ever
+        // proxies, and one whose torrents the sweep has all removed, both
+        // hold cache and never open a torrent.
+        self.probe_volume(self.volumes.data_folder(), now);
+        let mut probed = true;
         let mut decisions = Vec::with_capacity(engines.len());
         let mut stopped_any = false;
         // Taken once, before the first engine, and handed to both consumers
@@ -1786,15 +1794,28 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// never as full.
     ///
     /// **And rings the running-low bell if the reading is under the line.**
-    /// This is the one `statvfs` of the session, so it is also the only
-    /// place that can notice; a second reading taken by whoever wanted to
-    /// know would be a second opinion about one device. The line is the
+    /// This is the reading every owner acts on, so it is where the noticing
+    /// belongs; a second reading taken by whoever wanted to know would be a
+    /// second opinion about one device. (The cache budget's minute
+    /// publisher takes a reading of its own, and deliberately decides
+    /// nothing from it -- it states a cap and rings nothing.) The line is the
     /// resume line rather than the floor, so the bell rings while the
     /// volume is still inside the band -- the slack has to be gone *before*
     /// the floor is reached, not after. A probe that failed rings nothing:
     /// an unreadable volume is not a full one.
     fn probe_volume(&self, folder: &std::path::Path, now: u64) {
-        let available = match probe_at_existing_ancestor(&*self.free_space_probe, folder) {
+        let reading = probe_at_existing_ancestor(&*self.free_space_probe, folder);
+        self.record_volume(folder, reading, now);
+    }
+
+    /// Record a reading somebody else has already taken, and ring the bell
+    /// if it is under the line ([`Self::probe_volume`]).
+    ///
+    /// Split out for the one caller that cannot take the reading where it
+    /// stands: [`Self::reread_volume`] runs on a request's task, and a
+    /// `statvfs` of a stalled mount taken there parks the whole worker.
+    fn record_volume(&self, folder: &std::path::Path, reading: std::io::Result<u64>, now: u64) {
+        let available = match reading {
             Ok(available) => Some(available),
             Err(error) => {
                 debug!(
@@ -1822,9 +1843,28 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// gate is the caller -- it drops every owner's slack and then asks
     /// [`Engine::is_stopped_for_space`] again, and that question is
     /// answered from this reading.
-    pub fn reread_volume(&self) {
+    ///
+    /// **The `statvfs` is taken on the blocking pool, never inline.** This
+    /// runs on a request's own task, and the device it reads is by
+    /// construction one that has just run out of room -- a spun-down HDD,
+    /// an SMB mount that has stopped answering. Taken where it stands it
+    /// would park that worker thread, and with it every other stream and
+    /// API task scheduled on it, which is the very thing
+    /// `SLACK_DROP_BOUND` had just bounded the request's waiting for.
+    pub async fn reread_volume(&self) {
         let folder = self.volumes.data_folder().to_path_buf();
-        self.probe_volume(&folder, self.clock.now_secs());
+        let probe = Arc::clone(&self.free_space_probe);
+        let reading = {
+            let folder = folder.clone();
+            tokio::task::spawn_blocking(move || probe_at_existing_ancestor(&*probe, &folder)).await
+        };
+        let reading = match reading {
+            Ok(reading) => reading,
+            Err(join) => Err(std::io::Error::other(format!(
+                "the volume probe task failed: {join}"
+            ))),
+        };
+        self.record_volume(&folder, reading, self.clock.now_secs());
     }
 
     /// The bell the tick's reading of the volume rings when it is running
@@ -6954,9 +6994,10 @@ mod tests {
     /// dead, and its data is the cleaner's to take first -- it used to be
     /// protected like a live engine's, which on a full television kept
     /// 700 MB of two dead torrents' bytes from every later stream. One that
-    /// died of a full disk is not dead (the cleaner's recovery restarts it
-    /// once there is room), and a pinned one stays protected however it
-    /// died: an unpin is how the user gives those bytes up.
+    /// died of a full disk is not dead (the ladder restarts it once the
+    /// volume is over the resume line again), and a pinned one stays
+    /// protected however it died: an unpin is how the user gives those
+    /// bytes up.
     #[tokio::test]
     async fn a_dead_torrents_files_are_the_cleaners_to_take_first() {
         let (enginefs, counters) = test_enginefs_with_file_count(2);
@@ -6978,7 +7019,7 @@ mod tests {
         assert!(dead.gate.goes_first(&hash), "and its data goes first");
 
         // Out of space is not dead: that one is listed whole, for the
-        // recovery to restart or the cleaner to take as a last resort, and
+        // ladder to restart or the cleaner to take as a last resort, and
         // its pieces are still announced.
         counters.out_of_space.store(true, Ordering::SeqCst);
         let stopped = enginefs.reclaim_verdicts().await;
@@ -7984,13 +8025,85 @@ mod tests {
         // moves and the bell rings, without waiting two seconds for a pass
         // that would have answered about the volume as it was.
         available.store(u64::MAX - 1, Ordering::SeqCst);
-        enginefs.reread_volume();
+        enginefs.reread_volume().await;
         assert_eq!(enginefs.volumes.available(), Some(u64::MAX - 1));
         assert!(!rung().await, "a volume with room rings nothing");
         available.store(0, Ordering::SeqCst);
-        enginefs.reread_volume();
+        enginefs.reread_volume().await;
         assert_eq!(enginefs.volumes.available(), Some(0));
         assert!(rung().await, "and a short one does");
+    }
+
+    /// The tick reads the volume even when there is no torrent to decide
+    /// about, and rings from that reading.
+    ///
+    /// The bell's own consumer is the proxy cache, and a session that has
+    /// only ever proxied has no engines at all -- nor has one whose
+    /// torrents the housekeeping sweep has removed. Both hold cached bytes
+    /// and neither will ever open a torrent, which makes them exactly the
+    /// population the bell exists for: nothing switches, so nothing else
+    /// asks the proxy for its slack. Read inside the loop over the
+    /// engines, the `statvfs` was never taken for them and the bell could
+    /// not ring at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_tick_with_no_torrents_still_reads_the_volume_and_rings() {
+        let (mut enginefs, _counters) = test_enginefs_for_reconciler(1);
+        enginefs.remove_engine(TEST_HASH).await;
+        assert!(
+            enginefs.peek_engine(TEST_HASH).await.is_none(),
+            "the session holds no torrent at all"
+        );
+        enginefs.set_free_space_probe(|_| Ok(0));
+
+        assert!(
+            enginefs.reconcile_tick().await.is_empty(),
+            "there is nothing to decide about"
+        );
+        assert_eq!(
+            enginefs.volumes.available(),
+            Some(0),
+            "and the volume was read anyway"
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                enginefs.slack_bell().clone().rung()
+            )
+            .await
+            .is_ok(),
+            "so the one owner that answers the bell is told"
+        );
+    }
+
+    /// The on-demand re-read takes its `statvfs` on the blocking pool.
+    ///
+    /// It runs on a stream request's own task, and the device it reads is
+    /// by construction one that has just run out of room. Taken inline it
+    /// would park that worker thread -- and every other stream and API task
+    /// scheduled on it -- on a spun-down disk or a mount that has stopped
+    /// answering, which is the very wait the request's slack-drop bound had
+    /// just ended.
+    ///
+    /// Asserted on the thread the probe ran on, because that is the claim:
+    /// a timing test would only say that this particular probe was quick.
+    #[tokio::test]
+    async fn a_re_read_of_the_volume_is_taken_off_the_worker_that_asked_for_it() {
+        let (mut enginefs, _counters) = test_enginefs_for_reconciler(1);
+        let worker = std::thread::current().id();
+        let probed_on = Arc::new(parking_lot::Mutex::new(None));
+        let recorder = probed_on.clone();
+        enginefs.set_free_space_probe(move |_| {
+            *recorder.lock() = Some(std::thread::current().id());
+            Ok(u64::MAX)
+        });
+
+        enginefs.reread_volume().await;
+
+        assert_ne!(
+            probed_on.lock().expect("the volume was read"),
+            worker,
+            "the re-read parked the async worker it was asked on"
+        );
     }
 
     /// The defect that four rounds of this work kept re-introducing, and it
@@ -8193,7 +8306,8 @@ mod tests {
         );
 
         // Unsettled -- a torrent restored without its want-set, which the
-        // cleaner will not restart either. The refusal lapses.
+        // ladder will not restart either: an unsettled reading is never
+        // read as "this should be running". The refusal lapses.
         engine.mark_unsettled();
         assert_eq!(
             enginefs.reconcile_tick().await,
