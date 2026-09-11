@@ -38,9 +38,15 @@ use crate::state::AppState;
 /// So a clean that frees nothing is the ordinary answer on a device with
 /// one film playing and one pinned, and [`EvictionReport::over_limit`] is
 /// what says the cache is still over its cap. The cap is restated first
-/// ([`crate::cache_budget::publish_now`]), so the number this reports is
-/// the number the owners are now sized against and the one `GET
-/// /cache.json` answers.
+/// ([`crate::cache_budget::publish_now`]), so the owners are sized against
+/// the volume as the clean left it. The `limit` reported is the one `GET
+/// /cache.json` answers, which is the same rule applied to a different
+/// figure: [`usage`]'s total also counts the bytes no owner holds -- a
+/// torrent held in Error, a directory a previous process left -- and the
+/// published cap does not. With any of those on the disk the reported
+/// limit is larger than the cap the owners are sized against, by up to
+/// those bytes (not when `cacheSize` is what binds), so `over_limit` is
+/// the excess of the whole root and not of what the owners hold.
 pub(crate) async fn drop_slack(state: &AppState) -> EvictionReport {
     let before = usage(state).await;
     let deleted =
@@ -208,11 +214,11 @@ pub struct EvictionReport {
     /// The limit in force when this answered: the smaller of
     /// `settings.cacheSize` and what the volume could give while keeping
     /// [`crate::cache_budget::CACHE_FREE_SPACE_FLOOR`] free, so on a device
-    /// with no `cacheSize` set this is still a number. Restated by
-    /// [`drop_slack`] before it reads, so it is the number the owners are
-    /// now sized against. `None` only when neither caps anything --
-    /// `cacheSize` unlimited *and* the volume's free space unreadable,
-    /// matching [`CacheUsage::limit_bytes`].
+    /// with no `cacheSize` set this is still a number. Worked out over
+    /// [`Self::total`], which is not quite the cap the owners are sized
+    /// against (see `drop_slack`). `None` only when neither caps
+    /// anything -- `cacheSize` unlimited *and* the volume's free space
+    /// unreadable, matching [`CacheUsage::limit_bytes`].
     ///
     /// Not a `u64` with 0 for "none": a cap of exactly 0 is reachable -- any
     /// volume whose occupancy plus free space is under the floor gets one --
