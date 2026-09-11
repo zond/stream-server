@@ -1649,11 +1649,7 @@ fn set_background_caps_the_torrent_and_still_streams() -> anyhow::Result<()> {
 
     // Before any torrent exists: safe, idempotent, and only the footprint
     // moves. Its own server, because the fixture below hands one back with
-    // its torrent already created -- and stopped at the end with that one
-    // rather than here, because a server stopped within milliseconds of
-    // starting trips the tracker-refresher shutdown race
-    // `TrackerManager::take_refresh_task` documents: noise on a worker
-    // thread, but noise a real panic could hide in.
+    // its torrent already created; it is stopped at the end, with that one.
     let bare_config = tempfile::tempdir()?;
     let bare_cache = tempfile::tempdir()?;
     let bare = stream_server::start(stream_server::ServerConfig {
