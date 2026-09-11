@@ -765,9 +765,9 @@ There is no `bindings/` directory and no vcpkg apparatus: the optional C++ `libt
 
 ## 📄 License
 
-**The source in this repository is MIT** — see [LICENSE](LICENSE). It contains no GPL code; the `LICENSE` file is unchanged and stays MIT.
+**The source in this repository is MIT** — see [LICENSE](LICENSE). It contains no GPL code; `LICENSE-GPL-3.0` is only the licence text the binaries ship with.
 
-**The stream-server binaries this project distributes are under the GNU GPL, version 3 or later** — see [LICENSE-GPL-3.0](LICENSE-GPL-3.0). RAR streaming is on by default and is powered by the [`unrar-rs`](https://crates.io/crates/unrar-rs) crate, which is licensed **GPL-3.0-or-later**. That crate is fetched and linked only at build time, but linking it means a **default-built binary of stream-server, with RAR support, is distributed under GPL-3.0-or-later** — every release download, the `.deb`, the `.msi`, the AppImage and the Arch package included. This is a deliberate choice: RAR support is wanted on by default, and the project is released openly.
+**The stream-server binaries this project distributes are under the GNU GPL, version 3 or later** — see [LICENSE-GPL-3.0](LICENSE-GPL-3.0). RAR streaming is on by default and is powered by the [`unrar-rs`](https://crates.io/crates/unrar-rs) crate, which is licensed **GPL-3.0-or-later**. That crate is fetched and linked only at build time, but linking it means a **default-built binary of stream-server, with RAR support, is distributed under GPL-3.0-or-later** — every server binary the release workflow publishes, the portable executables, the `.deb`, the `.msi`, the AppImage and the Arch package included. This is a deliberate choice: RAR support is wanted on by default, and the project is released openly.
 
 Each package carries both texts: the GPL, which the binary is distributed under, and the MIT notice, which the source it is built from carries (`/usr/share/doc/server/` in the `.deb`, `/usr/share/licenses/stream-server/` in the Arch package, `/usr/share/doc/stream-server/` in the AppImage, the install folder for the `.msi`). The release page lists both as `LICENSE-GPL-3.0.txt` and `LICENSE-MIT.txt`, for the portable binaries. The `stremio-runtime` stub links no GPL code and is MIT.
 
