@@ -64,7 +64,7 @@ pub enum Decision {
 }
 
 /// What made a decision be taken now. It changes two things -- which
-/// free-space line the volume is measured against ([`line`]) and whether
+/// free-space line the volume is measured against (`line`) and whether
 /// the anti-flap dwell applies -- and both differences are the same
 /// difference: a decision taken because *somebody is waiting for it* is
 /// answering a person, while a decision taken by the timer is answering
@@ -76,8 +76,6 @@ pub enum Decision {
 /// below the free-space arm reads the trigger now -- what is playing is a
 /// value written before anything asks ([`crate::retention::live`]) -- so
 /// the ladder answers the same question to everyone.
-///
-/// [`line`]: line
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trigger {
     /// The reconciler's own tick, over every torrent.
@@ -346,7 +344,7 @@ pub fn verdict(conditions: &Conditions, trigger: Trigger) -> Verdict {
 ///
 /// **The line is the caller's, and the two callers do not want the same
 /// one.** The ladder asks "should I start this torrent?" and takes its line
-/// from [`line`], which is the hysteresis; everything that asks "is this
+/// from `line`, which is the hysteresis; everything that asks "is this
 /// device short?" -- the statistics a client reads, the stream route's
 /// gate -- asks at [`CACHE_FREE_SPACE_FLOOR`], the same number
 /// `ensure_download_disk_ready` answers `507` under and the published cap
@@ -503,7 +501,7 @@ impl Volumes {
 }
 
 /// The line a volume has to clear before a stopped torrent is started
-/// again, which is [`line`]'s upper arm -- and the line the running-low
+/// again, which is `line`'s upper arm -- and the line the running-low
 /// bell is rung under ([`crate::retention::SlackBell`]), so that the slack
 /// is given back while the volume is still inside the band rather than
 /// once it is under the floor.

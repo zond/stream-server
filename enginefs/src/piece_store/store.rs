@@ -1367,7 +1367,7 @@ impl TorrentStorage for PieceStore {
 
     /// Make a downloaded piece ours. Called after the hash check, so this is
     /// where the staged bytes become the have-record -- see
-    /// [`Self::complete_piece`] and [`STAGING_SUFFIX`].
+    /// [`Self::complete_piece`] and [`crate::chunk_store::STAGING_SUFFIX`].
     ///
     /// At the pinned rev librqbit runs this *before* it sets the piece's
     /// have-bit, and treats an `Err` here as fatal to the torrent rather

@@ -1398,9 +1398,9 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// defects, and what is left instead is one ladder, one actuator and
     /// no record of who stopped what.
     ///
-    /// Only [`Verdict::for_space`] separates the two stops afterwards, and
-    /// only for the one thing that is a statement about the *device*: the
-    /// read refusal. The stop call itself is the same call.
+    /// Only [`crate::reconcile::Verdict::for_space`] separates the two stops
+    /// afterwards, and only for the one thing that is a statement about the
+    /// *device*: the read refusal. The stop call itself is the same call.
     async fn reconcile_engine(
         &self,
         engine: &Arc<Engine<B::Handle>>,
@@ -1629,7 +1629,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// that question is asked of [`Engine::last_transition_at`] as a
     /// `None` rather than as a reading of zero: the clock answers zero for
     /// the whole first second of the process, and a stop made in it is a
-    /// stop like any other -- see [`crate::engine::NEVER_MOVED`].
+    /// stop like any other -- see `engine::NEVER_MOVED`.
     async fn start_if_stopped(
         &self,
         engine: &Arc<Engine<B::Handle>>,

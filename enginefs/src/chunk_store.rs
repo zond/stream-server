@@ -755,7 +755,7 @@ impl ChunkDir {
 
 impl ChunkDir {
     /// **Every `read_dir` this type makes of its directory or a bucket goes
-    /// through here**, so that [`LISTINGS`] counts all of them. The tests
+    /// through here**, so that `LISTINGS` counts all of them. The tests
     /// that pin "the pass lists nothing" read that counter, and a listing
     /// that reached the disk by any door this type has -- [`Self::held`],
     /// [`Self::stat`], [`Self::walk`], a bucket on its own -- has to move

@@ -562,7 +562,7 @@ struct State<B: Backing> {
     /// only thing that gives a range back, and with no policy to read the
     /// range off it used to return at once -- leaving the pieces the user
     /// had just asked us to keep held back from every peer while
-    /// [`crate::engine::Engine::standing`], finding no policy, told the
+    /// `Engine::standing`, finding no policy, told the
     /// cleaner the torrent announces them. Held back and protected at once
     /// is the one combination that is never right, and there was no pass
     /// left to undo it. So the fact is recorded, and `clear_under` reads it.

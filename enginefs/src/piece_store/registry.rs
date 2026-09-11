@@ -26,6 +26,9 @@
 //! Error. In that gap the hash still answers a set and a delete through it
 //! still goes; nothing here reads the run state, and nothing that reads it
 //! may trust one reading across an unlink.
+//!
+//! [`PieceStore`]: super::PieceStore
+//! [`PieceStore::held`]: super::PieceStore::held
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

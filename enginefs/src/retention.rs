@@ -310,8 +310,9 @@ pub struct RetentionPass {
 /// neighbour's bytes and the swarm's, over and over.
 ///
 /// So the reclaim is narrowed here, by the rule
-/// [`crate::piece_store::PieceStore::remove_file`] deletes a boundary piece
-/// by: a piece another wanted file owns bytes in stays.
+/// [`PieceStore`](crate::piece_store::PieceStore)'s
+/// `TorrentStorage::remove_file` deletes a boundary piece by: a piece
+/// another wanted file owns bytes in stays.
 ///
 /// Every unlink of a policy's pieces comes through here: the pass asks it
 /// ([`owner::Backing::alone`] for the torrent, reclaiming under its own

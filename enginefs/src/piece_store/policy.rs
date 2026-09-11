@@ -235,7 +235,8 @@ pub struct Decision {
 /// tell: its reclaim set includes the file's first and last piece whoever
 /// else owns bytes in them, and [`crate::retention`] is what takes those
 /// back out before anything is deleted. The unpin path has its own answer to
-/// the same question in [`super::store::PieceStore::remove_file`], which
+/// the same question in [`PieceStore`](super::store::PieceStore)'s
+/// `TorrentStorage::remove_file`, which
 /// deletes a boundary piece only once every file that owns bytes in it is
 /// gone.
 #[derive(Debug, Clone)]
