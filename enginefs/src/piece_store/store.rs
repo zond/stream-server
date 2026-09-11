@@ -911,8 +911,9 @@ impl Inner {
 ///
 /// What this type does *not* decide is which pieces may go. That is
 /// [`super::policy`]'s, and a caller that deletes a piece of a torrent the
-/// session still holds owes the have-set interlock -- see
-/// [`Self::delete_pieces`].
+/// session still holds owes the have-set interlock -- which is why the
+/// by-path delete is `#[cfg(test)]` now and every unlink in the process
+/// goes through [`super::registry::StoreRegistry::delete`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoreRoot {
     /// Shared, because the storage factory is one of these and librqbit
@@ -920,34 +921,22 @@ pub struct StoreRoot {
     root: Arc<PathBuf>,
 }
 
-/// Everything one [`StoreRoot::scan`] found.
-#[derive(Debug, Default)]
-pub struct StoreContents {
-    /// One entry per directory under the root, whether or not any torrent
-    /// still claims it.
-    pub torrents: Vec<StoredTorrent>,
-    /// Metadata of what lies directly under the root and is not a directory:
-    /// debris from an interrupted write. Reported so that nothing in the
-    /// store is invisible to whoever is counting the disk, and left where it
-    /// is -- [`super::sweep`] takes it at the next launch.
-    pub strays: Vec<std::fs::Metadata>,
-}
-
-/// One directory under the root, as a scan found it.
+/// One directory under the root, as [`StoreRoot::stat`] found it.
 #[derive(Debug)]
 pub struct StoredTorrent {
     /// The directory's name. For anything this store wrote that is a
     /// torrent's lowercase info hash, which is how a caller addresses it
-    /// back ([`StoreRoot::delete_pieces`]).
+    /// back ([`StoreRoot::torrent_dir`]).
     pub info_hash: String,
     /// Every piece with a file, in ascending index order. Never one whose
-    /// index a `u32` could not hold: nothing addressable by
-    /// [`StoreRoot::delete_pieces`] is, so such a file is a stray.
+    /// index a `u32` could not hold: no piece this store ever wrote is, so
+    /// such a file is a stray.
     pub pieces: Vec<StoredChunk>,
     /// Metadata of the files under it that are not piece files -- a name
-    /// this store never wrote, or a piece file in the wrong bucket. Same
-    /// reason as [`StoreContents::strays`]: counted, never silently
-    /// reclaimed.
+    /// this store never wrote, or a piece file in the wrong bucket.
+    /// Counted, because they occupy the volume, and never offered as
+    /// pieces: a delete addressed to one would look under the name the
+    /// store writes and free nothing.
     pub strays: Vec<std::fs::Metadata>,
 }
 
@@ -997,56 +986,15 @@ impl StoreRoot {
         self.root.join(info_hash.to_ascii_lowercase())
     }
 
-    /// Everything the store holds: one entry per directory under the root,
-    /// each with the pieces in it.
+    /// What one directory under the root holds, named as
+    /// [`StoreRoot::torrent_dir`] names it.
     ///
     /// One `read_dir` per bucket and one `metadata` per file -- the same
     /// filesystem work walking the tree would cost -- but the caller is
     /// handed piece indices rather than paths, so whatever it means to do
-    /// next it has to ask this type to do.
-    ///
-    /// An unreadable entry is skipped, not reported as an error: a scan is a
-    /// reading of what is there, and a caller counting the disk must not be
-    /// stopped by one directory it may not enter. A root that does not exist
-    /// yet scans empty, which is the ordinary state before the first add.
-    pub fn scan(&self) -> StoreContents {
-        let mut contents = StoreContents::default();
-        let Ok(entries) = std::fs::read_dir(self.root.as_path()) else {
-            return contents;
-        };
-        for entry in entries.flatten() {
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if !file_type.is_dir() {
-                if let Ok(metadata) = entry.metadata() {
-                    contents.strays.push(metadata);
-                }
-                continue;
-            }
-            // A directory name this store would not have written --
-            // [`Self::torrent_dir`] lowercases, so `<HASH>` names a
-            // directory no `delete_pieces` could ever address, and a name
-            // that is not UTF-8 is not an info hash at all. Its bytes are
-            // on the volume, so they are counted; its files are never
-            // offered as pieces, because a delete addressed to them would
-            // look under the lowercase name and free nothing. The same
-            // rule as [`crate::chunk_store::canonical_index`], one level up.
-            let name = entry.file_name();
-            let Some(name) = name
-                .to_str()
-                .filter(|name| !name.bytes().any(|b| b.is_ascii_uppercase()))
-            else {
-                collect_strays(&entry.path(), &mut contents.strays);
-                continue;
-            };
-            contents.torrents.push(self.stat(name));
-        }
-        contents
-    }
-
-    /// [`Self::scan`] for one directory under the root, named as
-    /// [`StoreRoot::torrent_dir`] names it.
+    /// next it has to ask this type to do. An unreadable entry is skipped
+    /// rather than reported as an error: a caller counting the disk must
+    /// not be stopped by one directory it may not enter.
     ///
     /// A torrent with no directory -- nothing of it has ever been written,
     /// or it has all been reclaimed -- stats as one with no pieces, not as
@@ -1106,10 +1054,14 @@ impl StoreRoot {
                 }
                 continue;
             }
-            // [`Self::scan`]'s naming rule, and for its reason: a name this
-            // store would never have written addresses no torrent, so no
-            // registration can speak for it and a `stat` of it would read
-            // the lowercase directory beside it instead.
+            // A name this store would never have written addresses no
+            // torrent -- [`Self::torrent_dir`] lowercases, and a name that
+            // is not UTF-8 is not an info hash at all -- so no registration
+            // can speak for it and a `stat` of it would read the lowercase
+            // directory beside it instead, counting that torrent's pieces
+            // twice. Its bytes are on the volume, so they are counted here
+            // as strays. The same rule as
+            // [`crate::chunk_store::canonical_index`], one level up.
             let name = entry.file_name();
             match name
                 .to_str()
@@ -1707,19 +1659,19 @@ mod tests {
         }
     }
 
-    /// The scan is the store's answer to "what is on the disk", and it is
+    /// The stat is the store's answer to "what is on the disk", and it is
     /// the only answer anything outside this module gets: what it omits is
     /// disk nothing will ever count and what it mis-names is a delete that
     /// frees nothing.
     ///
     /// Three things it has to get right. Both copies of a piece are **one**
-    /// entry, because `delete_pieces` takes them together. A name the store
-    /// would never have written is a stray, reported so the bytes are
-    /// visible and *not* as a piece, since a delete addressed to that index
-    /// would look somewhere else and free nothing. And a torrent it holds
-    /// nothing of stats empty rather than failing.
+    /// entry, because a delete takes them together. A name the store would
+    /// never have written is a stray, reported so the bytes are visible and
+    /// *not* as a piece, since a delete addressed to that index would look
+    /// somewhere else and free nothing. And a torrent it holds nothing of
+    /// stats empty rather than failing.
     #[test]
-    fn a_scan_reports_both_copies_of_a_piece_as_one_and_names_the_rest_strays() {
+    fn a_stat_reports_both_copies_of_a_piece_as_one_and_names_the_rest_strays() {
         let tmp = tempfile::tempdir().unwrap();
         let root = StoreRoot::new(tmp.path().join(".pieces"));
         let hash = "0123456789abcdef0123456789abcdef01234567";
@@ -1769,20 +1721,19 @@ mod tests {
             "and the misplaced name did not pass itself off as piece 0"
         );
 
-        // And a scan of the root finds that torrent by the name a caller
-        // addresses it back with.
-        let contents = root.scan();
+        // And the count over the root finds that torrent by the name a
+        // caller addresses it back with: told that nothing speaks for it,
+        // the root's own figure is exactly what the directory holds --
+        // pieces and debris alike -- and told that something does, it is
+        // nothing.
+        assert_eq!(root.unregistered_bytes(|_| false), stored.occupancy());
         assert_eq!(
-            contents
-                .torrents
-                .iter()
-                .map(|t| t.info_hash.as_str())
-                .collect::<Vec<_>>(),
-            vec![hash]
+            root.unregistered_bytes(|name| name == hash),
+            0,
+            "a registered store counts its own bytes; the root counts nobody's twice"
         );
-        assert_eq!(contents.torrents[0].pieces.len(), 2);
 
-        // Deleting one piece takes both its copies, and the scan says so.
+        // Deleting one piece takes both its copies, and the stat says so.
         assert_eq!(root.delete_pieces(hash, [2500]), 1);
         assert_eq!(
             root.stat(hash)
@@ -1822,7 +1773,7 @@ mod tests {
         std::fs::write(&real, b"0123456789").unwrap();
 
         // Debris that parses as piece 0 at one level or the other, each
-        // with its own length so the scan's answer says which is which.
+        // with its own length so the stat's answer says which is which.
         let debris = [
             (dir.join("00").join("0"), 1),
             (dir.join("+0").join("0"), 2),
@@ -1858,7 +1809,7 @@ mod tests {
             "every one of them is on the disk, so every one of them is counted"
         );
 
-        // What the scan promised, the delete keeps: piece 0's bytes come
+        // What the stat promised, the delete keeps: piece 0's bytes come
         // back once, and nothing else does -- so nothing here can be booked
         // as freed twice.
         assert_eq!(root.delete_pieces(hash, [0]), 1);
@@ -1880,11 +1831,13 @@ mod tests {
     /// debris too, for the same reason one level down.
     ///
     /// [`StoreRoot::torrent_dir`] lowercases, so `<HASH>` is a directory no
-    /// `delete_pieces` can address: reported as a torrent it would be scanned
-    /// *and* stat'd under the lowercase name, counting the real torrent's
-    /// pieces twice and offering a delete that frees nothing.
+    /// registration can ever speak for: read as a torrent's name it would
+    /// be stat'd under the lowercase spelling instead, counting the real
+    /// torrent's pieces a second time. Counted as debris, its bytes are in
+    /// the figure exactly once and under nobody's name.
     #[test]
-    fn a_torrent_directory_the_store_could_not_have_made_is_counted_and_never_scanned() {
+    fn a_torrent_directory_the_store_could_not_have_made_is_counted_and_never_taken_for_the_torrent()
+     {
         let tmp = tempfile::tempdir().unwrap();
         let root = StoreRoot::new(tmp.path().join(".pieces"));
         let hash = "0123456789abcdef0123456789abcdef01234567";
@@ -1892,7 +1845,10 @@ mod tests {
         let store = PieceStore::new(root.torrent_dir(hash), Arc::new(layout_for(1)));
         let real = store.piece_path(0);
         std::fs::create_dir_all(real.parent().unwrap()).unwrap();
-        std::fs::write(&real, b"0123456789").unwrap();
+        // Many blocks, where every stray below is one: a directory read as
+        // this torrent's by mistake would move the figure by a number no
+        // stray can account for, which is what the assertions below turn on.
+        std::fs::write(&real, vec![0x5au8; 64 * 1024]).unwrap();
 
         // The same hash, spelled the way the store never spells it, with a
         // file of its own inside -- but only where the filesystem can hold
@@ -1902,35 +1858,30 @@ mod tests {
         // cannot arise, rather than arising and being handled wrongly.
         // Asked of the disk rather than of `cfg!`, because it is a property
         // of the volume the test is running on and not of the target.
+        let occupancy_of = |path: &std::path::Path| {
+            crate::chunk_store::occupied_bytes(&std::fs::metadata(path).unwrap())
+        };
+        let torrent = root.stat(hash).occupancy();
         let upper = root.path().join(hash.to_ascii_uppercase());
         let case_sensitive = !upper.exists();
-        let mut expected_strays: Vec<u64> = Vec::new();
+        let mut unaddressable = 0u64;
         if case_sensitive {
             let shouting = upper.join("0");
             std::fs::create_dir_all(&shouting).unwrap();
             std::fs::write(shouting.join("0"), b"xxx").unwrap();
-            expected_strays.push(3);
+            unaddressable += occupancy_of(&shouting.join("0"));
         }
 
-        let contents = root.scan();
         assert_eq!(
-            contents
-                .torrents
-                .iter()
-                .map(|t| t.info_hash.as_str())
-                .collect::<Vec<_>>(),
-            vec![hash],
-            "one torrent, not the same one twice"
+            root.unregistered_bytes(|_| false),
+            torrent + unaddressable,
+            "one torrent, not the same one twice, and the shouting name's bytes beside it"
         );
-        assert_eq!(contents.torrents[0].pieces.len(), 1);
         assert_eq!(
-            contents
-                .strays
-                .iter()
-                .map(std::fs::Metadata::len)
-                .collect::<Vec<_>>(),
-            expected_strays,
-            "and the bytes under the name nothing can address are still counted"
+            root.unregistered_bytes(|name| name == hash),
+            unaddressable,
+            "and the bytes under the name nothing can address are still counted, \
+             since no registration can ever claim them"
         );
 
         // A name that is not UTF-8 is not an info hash either, and its
@@ -1944,20 +1895,17 @@ mod tests {
                 .join(std::ffi::OsStr::from_bytes(b"\xff\xfe.pieces"));
             std::fs::create_dir_all(raw.join("0")).unwrap();
             std::fs::write(raw.join("0").join("0"), b"xxxx").unwrap();
+            unaddressable += occupancy_of(&raw.join("0").join("0"));
 
-            let contents = root.scan();
-            assert_eq!(contents.torrents.len(), 1, "still the one torrent");
-            let mut strays = contents
-                .strays
-                .iter()
-                .map(std::fs::Metadata::len)
-                .collect::<Vec<_>>();
-            strays.sort_unstable();
-            expected_strays.push(4);
-            expected_strays.sort_unstable();
             assert_eq!(
-                strays, expected_strays,
+                root.unregistered_bytes(|name| name == hash),
+                unaddressable,
                 "and what is under a name this store cannot even print is counted as well"
+            );
+            assert_eq!(
+                root.unregistered_bytes(|_| false),
+                torrent + unaddressable,
+                "still the one torrent"
             );
         }
     }

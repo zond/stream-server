@@ -54,8 +54,8 @@
 //!   stream (the budget covers it, or none has been published yet), or no
 //!   reader has been anywhere inside it in this process. Where nothing is
 //!   bounding a stream, what is on the disk is not a window: it is whatever
-//!   the cleaner has not yet aged out, which is a different quantity, and one
-//!   row cannot honestly carry both;
+//!   has been fetched and not yet given back, which is a different
+//!   quantity, and one row cannot honestly carry both;
 //! * **no [`StreamNumbers::sharing`]** -- a proxied response is not seeded.
 //!   There is no swarm, so there is no committed set and no ratio, and the
 //!   row is absent rather than a line of zeroes;

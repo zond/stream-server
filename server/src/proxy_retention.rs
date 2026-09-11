@@ -176,8 +176,8 @@ use crate::proxy_cache::CHUNK_BYTES;
 /// subtler than that: what is on the disk when a pass measures it is the
 /// window plus whatever the fill wrote since the last pass, which is a
 /// stride. A twentieth of the budget is a small enough overhang to be
-/// invisible against the cleaner's own margin, and twenty directory
-/// listings per window of playback is a cheap way to buy it.
+/// invisible against the free-space floor the cap keeps back, and twenty
+/// directory listings per window of playback is a cheap way to buy it.
 const PASSES_PER_WINDOW: u64 = 20;
 
 /// A proxied entity, as the owner sees it: a chunk directory, its length,
@@ -310,7 +310,9 @@ impl Backing for ProxyBacking {
     /// The policy for the entity under `budget` bytes. An entity of more
     /// chunks than a `u32` can index is an error and not a clamp: a policy
     /// over a truncated index space would draw its window over the wrong
-    /// chunks, so it is left to the cleaner, which counts bytes.
+    /// chunks, so no policy is installed at all: what bounds such an entity
+    /// is being slack the moment anything else is played, and the launch
+    /// sweep before that.
     fn policy(domain: &ProxyDomain, budget: u64) -> anyhow::Result<RetentionPolicy> {
         let chunks = u32::try_from(domain.chunks())
             .context("an entity of more chunks than a retention policy can index")?;
@@ -392,8 +394,8 @@ impl Backing for ProxyBacking {
     /// run this pass is walking -- so the loop is one thing and goes to the
     /// pool whole. Splitting the asking from the taking is the one
     /// rearrangement of this that would change what a pass deletes. It is
-    /// the same refusal the cleaner's own delete makes
-    /// (the second asking the pass makes at its door), for the
+    /// the same refusal the Door makes at each unlink (the second asking
+    /// the pass makes of its own cells), for the
     /// same reason: a chunk somebody is inside costs the player a broken
     /// read and the origin the same fetch again, while a chunk left standing
     /// costs a few bytes until the next pass.
@@ -513,8 +515,8 @@ impl Occupancy {
     /// count that hears every deleter but did not hear every writer: chunks
     /// a *previous* process left are on the disk and in nobody's count, so
     /// the first thing that takes them -- a fill replacing the entity under
-    /// a key (`proxy_cache::remove_other_entities`), a pass
-    /// reclaiming outside the window, the cleaner's own unlink -- prices
+    /// a key (`proxy_cache::remove_other_entities`), a pass reclaiming
+    /// outside the window, a slack pass taking an entity whole -- prices
     /// bytes this process never booked. A count that went negative would
     /// wrap to the whole of a `u64` and state a cap of everything.
     fn take(&self, bytes: u64) {
@@ -779,8 +781,8 @@ impl ProxyRetention {
     /// is a policy statement rather than an absence -- nothing is *bounding*
     /// this entity, because the budget covers it or no budget has been
     /// published. What is on the disk then is not a window, it is whatever
-    /// the cleaner has not yet aged out, and putting that under the same
-    /// label would give one row two meanings.
+    /// has been fetched and not yet given back, and putting that under the
+    /// same label would give one row two meanings.
     ///
     /// Two entities can carry one target -- the key covers the player
     /// headers that reach the origin too -- and the one the liveness cell
@@ -816,7 +818,7 @@ impl ProxyRetention {
     /// How many open bodies this cache is answering: reads that have
     /// promised chunks or delivered a byte and have not ended.
     ///
-    /// The gate's own reason for refusing the cleaner a byte, counted. It
+    /// The Door's own reason for refusing a reclaim a byte, counted. It
     /// is *not* `crate::proxy_streams::ProxyStreams::live`, which counts
     /// what a client can close by token and lets its registration go the
     /// instant the body ends -- while the read itself, and the window and
@@ -1035,9 +1037,9 @@ mod tests {
     /// concluded, a promise an open body has still to deliver, or the whole
     /// of an entity a reader is inside and no pass has measured.
     ///
-    /// **This is what the cache cleaner's gate was filled with**, asked of
-    /// the owner's own cells now that nothing walks the disk with a
-    /// snapshot in its hand. The answer is the same one
+    /// **This is what the deleted cache cleaner's gate was filled with**,
+    /// asked of the owner's own cells now that nothing walks the disk with
+    /// a snapshot in its hand. The answer is the same one
     /// [`ProxyRetention::drop_slack`] and [`ProxyRetention::protected`]
     /// give; it is spelled out here so a test can name one chunk.
     fn inside_something_live(retention: &Arc<ProxyRetention>, dir: &ChunkDir, chunk: u64) -> bool {

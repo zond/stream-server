@@ -577,4 +577,59 @@ mod tests {
             "a run the window has covered entirely is not the pass's to take"
         );
     }
+
+    /// **The claimless door never goes through a registered store.**
+    ///
+    /// Its caller read the torrent as one with no have-set for the deletion
+    /// to disagree with, and that reading is older than the unlink by a
+    /// `spawn_blocking` at least. A store registered by the time the pool
+    /// picks the work up is a torrent librqbit holds *now*, with a have-set
+    /// over these pieces that nobody has edited and, if `init` is still
+    /// running, a check reading them: the pieces are not this door's to
+    /// take, so it takes none of them and says so. Only the claimed door
+    /// may edit a registered store's files.
+    #[tokio::test]
+    async fn a_claimless_unlink_takes_nothing_from_a_registered_store() {
+        use crate::piece_store::layout::{FileSpec, PieceLayout};
+        use crate::piece_store::{PieceStore, StoreRoot};
+        use librqbit::storage::TorrentStorage;
+
+        const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = Arc::new(StoreRegistry::new(StoreRoot::new(
+            tmp.path().join(".pieces"),
+        )));
+        let layout = Arc::new(PieceLayout::new(8, 24, [FileSpec::payload(24)]).expect("layout"));
+        let store = PieceStore::under(Arc::clone(&registry), HASH, Arc::clone(&layout));
+        std::fs::create_dir_all(store.dir()).unwrap();
+        store.pwrite_all(0, 8, &[7u8; 8]).expect("write");
+        store.complete_piece(1).expect("complete");
+        store.init_for_tests().expect("seed and register");
+        let piece = store.piece_path(1);
+        assert!(piece.is_file() && registry.is_registered(HASH));
+
+        assert_eq!(
+            unlink(&registry, HASH, vec![1], None).await,
+            0,
+            "a store is registered, so the claimless door frees nothing"
+        );
+        assert!(piece.is_file(), "and the file is still there");
+        assert!(
+            registry
+                .held(HASH)
+                .expect("registered")
+                .in_range(0..3)
+                .contains(&1),
+            "with the bit that says so"
+        );
+
+        // The storage really gone -- what a torrent in Error is once
+        // librqbit's handles have dropped -- and the door still frees
+        // nothing, because there is no store left to unlink through: the
+        // directory is the next launch's sweep.
+        drop(store);
+        assert!(!registry.is_registered(HASH));
+        assert_eq!(unlink(&registry, HASH, vec![1], None).await, 0);
+        assert!(piece.is_file());
+    }
 }

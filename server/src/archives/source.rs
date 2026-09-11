@@ -88,9 +88,10 @@ impl ArchiveSource {
     /// Two things replace an entry. A cache that has failed -- decoding
     /// failed, or nothing read it for long enough that the writer gave up
     /// (`cache::ABANDONED_AFTER`) -- would only tell a new reader so, and is
-    /// extracted again. And a cache whose file is gone: the file is under
-    /// the cache root, where the cleaner is free to evict it, and a reader
-    /// opens it by path.
+    /// extracted again. And a cache whose file is gone: the file is a
+    /// scratch file under the cache root that a reader opens by path, so
+    /// anything that unlinks it -- a session sweep racing a request, an
+    /// operator clearing the root -- leaves a name with nothing behind it.
     pub async fn open_member(&self, member: &str) -> Result<Box<dyn AsyncSeekableReader>> {
         let mut members = self.members.lock().await;
         members.retain(|_, cache| !cache.is_failed());
@@ -285,9 +286,9 @@ mod tests {
         assert!(extractions(root.path()).is_empty(), "gone with the source");
     }
 
-    /// The cleaner may evict an extraction file from under the source; the
-    /// next request extracts again rather than answering 404 for the rest
-    /// of the session.
+    /// An extraction file can go from under the source -- it is a scratch
+    /// file opened by path -- and the next request extracts again rather
+    /// than answering 404 for the rest of the session.
     #[tokio::test]
     async fn an_evicted_extraction_is_redone() {
         let root = tempfile::tempdir().unwrap();

@@ -209,9 +209,9 @@ pub struct ServerSettings {
     /// (`<cacheRoot>/rqbit-downloads/.pieces/<infoHash>`, one file per
     /// piece, for the streaming cache and offline downloads alike), the
     /// session's own records beside it, and what `/proxy` cached. It is
-    /// the only root the cache cleaner walks, and pinning is a retention
-    /// property rather than a location, so there is nowhere else for a
-    /// download to be.
+    /// the only root the cache is counted and capped over, and pinning is
+    /// a retention property rather than a location, so there is nowhere
+    /// else for a download to be.
     ///
     /// Set through `POST /settings` with an absolute path
     /// ([`prepare_torrent_data_root`]: trimmed, created if missing, must be
@@ -227,9 +227,9 @@ pub struct ServerSettings {
     /// is configuration all the same, not an observation: a change through
     /// `POST /settings` names where torrent data will live from the next
     /// start -- a running librqbit session cannot be moved -- so nothing
-    /// asks this string where the bytes are. The cleaner, the free-space
-    /// ladder and the diagnostics all read the live root from the engine
-    /// (`state.engine.download_dir`).
+    /// asks this string where the bytes are. The usage figure, the
+    /// free-space ladder and the diagnostics all read the live root from
+    /// the engine (`state.engine.download_dir`).
     ///
     /// It replaces `downloadsDir`, which was a second location for pinned
     /// downloads. There is no second location: a pin does not move a
@@ -397,12 +397,12 @@ pub struct ServerSettings {
 /// what the setting stores.
 ///
 /// This is the only root there is: the piece store, the session's records
-/// and the proxy cache all live under it, and it is the only tree the cache
-/// cleaner walks. It used to have a companion, `downloadsDir`, which was
-/// refused at or above a cache root -- the roots the cleaner walks are the
-/// roots it evicts from, and a second root above the first would have handed
-/// it a tree the engine does not own. With one root there is nothing for it
-/// to be above.
+/// and the proxy cache all live under it, and it is the one volume the cap
+/// is a statement about. It used to have a companion, `downloadsDir`, which
+/// was refused at or above a cache root -- a free-space cap is a statement
+/// about *one* volume, and a second root above the first would have put a
+/// tree the engine does not own inside the figure. With one root there is
+/// nothing for it to be above.
 ///
 /// Checked before it is created, so a refused setting leaves no directory
 /// behind; and resolved before it is returned, because the stored value is
@@ -1050,8 +1050,8 @@ pub async fn update_settings(
     // `cacheRoot` is not pushed to the engine: a librqbit session's storage
     // root is fixed when the session opens, so a new one takes effect at the
     // next start. Nothing reads this string for where the bytes are -- the
-    // cleaner, the free-space ladder and the diagnostics all take the live
-    // root from the engine.
+    // usage figure, the free-space ladder and the diagnostics all take the
+    // live root from the engine.
 
     // Save to disk
     state.save_settings().await?;
@@ -1482,10 +1482,10 @@ mod tests {
         );
     }
 
-    /// The stored root is the resolved path: the session is opened on it and
-    /// the cleaner walks it, and a spelling that reaches the same directory
-    /// through a symlinked prefix would compare unequal to what the engine
-    /// then reports its files at.
+    /// The stored root is the resolved path: the session is opened on it
+    /// and the volume is measured at it, and a spelling that reaches the
+    /// same directory through a symlinked prefix would compare unequal to
+    /// what the engine then reports its files at.
     #[cfg(unix)]
     #[tokio::test]
     async fn prepare_torrent_data_root_stores_the_resolved_path() {

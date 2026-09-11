@@ -73,11 +73,16 @@ pub(crate) async fn drop_slack(state: &AppState) -> EvictionReport {
 /// a `statx` of sixteen thousand files, and the answer is current rather
 /// than as old as the walk that produced it.
 ///
-/// What it no longer counts is a **legacy whole-file download** left by an
-/// earlier version of this server, which lives beside the store rather than
-/// in it. Nothing owns those bytes and nothing here ever wrote them; the
-/// cache cleaner's walk is what finds and reclaims them, for as long as it
-/// still walks.
+/// What it does not count is a **legacy whole-file download** left by an
+/// earlier version of this server, which lives beside the store
+/// (`<download dir>/<torrent name>/<file>`) rather than under it. Nothing
+/// owns those bytes: no store speaks for them, the launch sweep never
+/// leaves `.pieces`, and nothing here ever wrote them. They are neither
+/// counted nor reclaimed, by decision -- "there is no migration" (see
+/// `enginefs::piece_store`) -- and the one thing that still takes one is
+/// an unpin asked to delete the file's data. Named rather than hidden:
+/// adding a category of byte with no deleter is how the disk becomes
+/// unbounded again.
 ///
 /// Shared by `routes::cache::cache_usage` (`ServerHandle::cache_usage` and
 /// `GET /cache.json`).
@@ -86,8 +91,9 @@ pub(crate) async fn usage(state: &AppState) -> CacheUsage {
         let settings = state.settings.read().await;
         crate::routes::system::cache_size_bytes(settings.cache_size)
     };
-    // The root the session was opened on, not `settings.cacheRoot`, for the
-    // reason [`cache_roots`] gives.
+    // The root the session was opened on, not `settings.cacheRoot`: the
+    // setting is where the data will be after the next start, and the
+    // engine is where it is now.
     let limit = CacheLimit {
         configured,
         available: available_space(&state.engine.download_dir),
@@ -150,9 +156,9 @@ pub struct CacheUsage {
     pub total_bytes: u64,
     /// The limit actually enforced, in the same accounting: the smaller of
     /// `settings.cacheSize` and what the volume can give while keeping
-    /// [`CACHE_FREE_SPACE_FLOOR`] free. `None` only when neither caps
-    /// anything -- `cacheSize` unlimited (JSON `null`) *and* the volume's
-    /// free space unreadable.
+    /// [`crate::cache_budget::CACHE_FREE_SPACE_FLOOR`] free. `None` only
+    /// when neither caps anything -- `cacheSize` unlimited (JSON `null`)
+    /// *and* the volume's free space unreadable.
     pub limit_bytes: Option<u64>,
     /// How much of `total_bytes` nothing may take right now: a pin keeps
     /// it, or it is inside the window of the one stream being played. When
@@ -169,36 +175,41 @@ pub struct CacheUsage {
     pub protected_files: usize,
 }
 
-/// What one [`evict`] run found and did, in occupancy bytes
-/// ([`occupied_bytes`]) throughout. `serde`-serializable so it crosses the
-/// `POST /cache/clean` / `ServerHandle::clean_cache_now` boundary as is.
+/// What one [`drop_slack`] call left behind, in occupancy bytes
+/// ([`enginefs::chunk_store::occupied_bytes`]) throughout.
+/// `serde`-serializable so it crosses the `POST /cache/clean` /
+/// `ServerHandle::clean_cache_now` boundary as is.
+///
+/// The name is the wire's and stays: nothing is evicted here any more --
+/// the owners are asked for their slack and report what is left -- but the
+/// JSON an app already reads is the same JSON.
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EvictionReport {
-    /// Occupancy of the walked root once eviction finished.
+    /// Occupancy of the cache once the owners had given their slack back,
+    /// as [`CacheUsage::total_bytes`] counts it.
     pub total: u64,
-    /// How much of `total` eviction may never touch: files a live engine
-    /// reports (a pinned download's engine is never swept, so its files are
-    /// in here for as long as the pin holds), plus the download folder of
-    /// every dormant pin, which has no engine to report anything.
+    /// How much of `total` nothing may take: a pin keeps it, or it is
+    /// inside the window of the one entity being played, or an open body
+    /// was framed to deliver it. Same reading as
+    /// [`CacheUsage::protected_bytes`], taken after the passes ran.
     pub protected: u64,
-    /// How many files that is.
+    /// How many files and proxied entities that is.
     pub protected_files: usize,
-    /// Occupancy this run reclaimed, by either rule: the 30-day sweep and
-    /// the size rule both count here. They were the size rule's alone until
-    /// [`Self::made_room`] started deciding whether a torrent a full disk
-    /// stopped goes back to work -- a pass that aged out a stale film has
-    /// made room for it, and reporting 0 left the torrent stopped on a
-    /// device that had just gained a gigabyte.
+    /// How far `total` fell across the call -- what the two passes really
+    /// took off the volume. Zero is the ordinary answer on a device with
+    /// one film playing and one pinned: there was no slack to give.
     pub freed: u64,
-    /// How many files that took.
+    /// How many piece files and chunks that took.
     pub deleted: usize,
-    /// The limit this run enforced: the smaller of `settings.cacheSize` and
-    /// what the volume could give while keeping [`CACHE_FREE_SPACE_FLOOR`]
-    /// free, so on a device with no `cacheSize` set this is still a number.
-    /// `None` only when neither caps anything -- `cacheSize` unlimited *and*
-    /// the volume's free space unreadable, matching
-    /// [`CacheUsage::limit_bytes`].
+    /// The limit in force when this answered: the smaller of
+    /// `settings.cacheSize` and what the volume could give while keeping
+    /// [`crate::cache_budget::CACHE_FREE_SPACE_FLOOR`] free, so on a device
+    /// with no `cacheSize` set this is still a number. Restated by
+    /// [`drop_slack`] before it reads, so it is the number the owners are
+    /// now sized against. `None` only when neither caps anything --
+    /// `cacheSize` unlimited *and* the volume's free space unreadable,
+    /// matching [`CacheUsage::limit_bytes`].
     ///
     /// Not a `u64` with 0 for "none": a cap of exactly 0 is reachable -- any
     /// volume whose occupancy plus free space is under the floor gets one --
@@ -206,30 +217,32 @@ pub struct EvictionReport {
     /// the sentinel it silenced [`Self::shortfall_message`] on the one
     /// device that needed it and told a client the cache was unlimited.
     pub limit: Option<u64>,
-    /// How far over its cap this run ended (`total - limit`), and the only
-    /// thing [`Self::shortfall_message`] reads. Reported rather than left to
-    /// the client to derive, so that "still stuck" is one field and not a
-    /// comparison every reader has to get right.
+    /// How far over its cap the cache still is (`total - limit`), and the
+    /// only thing [`Self::shortfall_message`] reads. Reported rather than
+    /// left to the client to derive, so that "still stuck" is one field
+    /// and not a comparison every reader has to get right. With no walk
+    /// left to choose victims, this is what says a cache over its cap is
+    /// over it because a pin and a live window are holding it.
     pub over_limit: u64,
 }
 
 impl EvictionReport {
-    /// Whether this run reclaimed anything. Nothing in this process reads
-    /// it any more -- what decides whether a torrent a full disk stopped
-    /// goes back to work is the reconciler's own reading of the volume, and
-    /// never whether some pass happened to free a byte first -- but it is
-    /// part of the type an embedder is handed, and a clean that freed
-    /// nothing is still the thing it wants to know about.
+    /// Whether this call reclaimed anything. Nothing in this process reads
+    /// it -- what decides whether a torrent a full disk stopped goes back
+    /// to work is the reconciler's own reading of the volume, and never
+    /// whether some pass happened to free a byte first -- but it is part of
+    /// the type an embedder is handed, and a clean that freed nothing is
+    /// still the thing a storage screen wants to know about.
     pub fn made_room(&self) -> bool {
         self.freed > 0
     }
 
-    /// The line to log when the run ended still over the limit, naming what
+    /// The line to log when the cache is still over the limit, naming what
     /// protection kept -- "cleaned up 0 files, freed 0 bytes" on a phone
     /// that is filling up says nothing about *why*, and the why is always
-    /// that the rest of the cache belongs to a live or pinned torrent.
-    /// That includes a pinned download the user has not unpinned. `None`
-    /// when the run got under its limit (or had none).
+    /// that the rest of the cache belongs to a live or pinned entity. That
+    /// includes a pinned download the user has not unpinned. `None` when
+    /// the cache is under its limit (or has none).
     pub fn shortfall_message(&self) -> Option<String> {
         if self.over_limit == 0 {
             return None;
@@ -592,5 +605,41 @@ mod tests {
                 serde_json::from_value(serde_json::to_value(&report).unwrap()).unwrap();
             assert_eq!(round_tripped, report);
         }
+    }
+
+    /// A clean is worth reporting as having done something only when it
+    /// actually reclaimed bytes. Nothing in this process reads the answer
+    /// -- what decides whether a torrent a full disk stopped goes back to
+    /// work is the reconciler's own reading of the volume, never whether
+    /// some pass happened to free a byte first -- but it is part of the
+    /// type an embedder is handed, and "clean freed nothing" is the answer
+    /// a storage screen has to be able to tell from "clean freed
+    /// something". A run that freed nothing still says what protection
+    /// held instead.
+    #[test]
+    fn a_clean_made_room_only_when_it_actually_reclaimed_something() {
+        let freed_nothing = EvictionReport {
+            total: 4096,
+            protected: 4096,
+            protected_files: 1,
+            limit: Some(1024),
+            over_limit: 3072,
+            ..EvictionReport::default()
+        };
+        assert!(!freed_nothing.made_room());
+        assert!(
+            freed_nothing.shortfall_message().is_some(),
+            "and the run says what protection held instead"
+        );
+
+        let freed_something = EvictionReport {
+            total: 1024,
+            freed: 4096,
+            deleted: 1,
+            limit: Some(2048),
+            ..EvictionReport::default()
+        };
+        assert!(freed_something.made_room());
+        assert!(freed_something.shortfall_message().is_none());
     }
 }

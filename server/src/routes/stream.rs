@@ -519,7 +519,8 @@ pub fn pretend_available_space_readings(root: impl Into<std::path::PathBuf>, rea
 }
 
 /// Drop the cached free-space reading for `path`, so the next check probes
-/// the volume again -- for the check that follows a cache-cleaner pass, which
+/// the volume again -- for the check that follows the drop-slack pass
+/// [`ensure_disk_ready_or_refuse`] runs before it refuses a stream, which
 /// must not be judged by the reading taken before it.
 fn forget_available_space(path: &FsPath) {
     if let Some(cache) = DISK_SPACE_CACHE.get()
@@ -602,7 +603,7 @@ fn available_space_for_path_uncached(path: &FsPath) -> Option<u64> {
 ///
 /// A volume that cannot be probed is an error here rather than a pass,
 /// unlike in the reconciler: this runs before a byte is written, and the
-/// caller retries with a cleaner pass in between.
+/// caller retries once the volume has been probed again.
 fn ensure_download_disk_ready(root: &FsPath) -> Result<(), String> {
     std::fs::create_dir_all(root).map_err(|e| {
         format!(
@@ -622,8 +623,9 @@ fn ensure_download_disk_ready(root: &FsPath) -> Result<(), String> {
     })?;
     let _ = std::fs::remove_file(&probe_path);
 
-    // The same floor the cache cleaner keeps free (`CacheLimit::effective`)
-    // and the same one the engine's reconciler stops a torrent at.
+    // The same floor the published cap keeps free
+    // (`CacheLimit::effective`) and the same one the engine's reconciler
+    // stops a torrent at.
     let required = crate::cache_budget::CACHE_FREE_SPACE_FLOOR;
     let available = available_space_for_path(root).ok_or_else(|| {
         format!(

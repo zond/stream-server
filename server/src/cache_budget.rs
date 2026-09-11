@@ -243,6 +243,18 @@ pub(crate) fn publish(budget: &enginefs::retention::RetentionBudget, limit: Opti
 /// behind it. Returns the cap it stated, or `None` for no cap -- which is
 /// not the same as having published nothing, since a publication of `None`
 /// is still a publication.
+///
+/// **`occupied` is what the owners hold, and deliberately not the whole
+/// figure `GET /cache.json` reports.** That one adds
+/// `StoreRoot::unregistered_bytes` -- a torrent the session is holding in
+/// Error, a directory a previous process left -- which costs a `read_dir`
+/// and cannot be on a minute timer, and which no owner can give back
+/// anyway. The difference never loosens the cap: those bytes are already
+/// out of `available`, so the volume arm stays exact and it is only
+/// `cacheSize` that is a bound on the owners' half rather than on every
+/// byte under the root. What bounds the rest is the launch sweep, which
+/// takes every directory the pin record does not name before the session
+/// opens.
 pub(crate) async fn publish_now(state: &AppState) -> Option<u64> {
     let configured = {
         let settings = state.settings.read().await;

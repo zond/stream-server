@@ -48,12 +48,12 @@
 //!   length, the type the origin labelled it with, and the validator the
 //!   origin identified it by, the last two percent-encoded. All three are in
 //!   the directory name rather than in a metadata file beside the chunks, and
-//!   that is deliberate. The cache cleaner evicts file by file, oldest mtime
-//!   first; a metadata file is written once at the start of a fill and never
-//!   touched again, so it is the *first* thing in an entry the cleaner would
-//!   take -- and losing it would leave a directory of chunks nothing could
-//!   state the length, type or identity of. A directory name cannot be
-//!   evicted out from under the files it describes. An entity that differs
+//!   that is deliberate. What reclaims here reclaims *files*, and a
+//!   metadata file is a file no playhead is ever inside: it would be the
+//!   first thing in an entry to go, and losing it would leave a directory
+//!   of chunks nothing could state the length, type or identity of. A
+//!   directory name cannot be reclaimed out from under the files it
+//!   describes. An entity that differs
 //!   from the one before it in any of the three gets a new directory, and the
 //!   fill that discovers it removes the old one.
 //! * **The validator is the only one of the three that can tell two
@@ -110,7 +110,7 @@
 //!
 //! * **Nothing here is revalidated.** No `If-None-Match`, no
 //!   `If-Modified-Since`, no freshness lifetime, no `Age`. An entry is served
-//!   until the cleaner evicts it. The origin's validator *is* kept -- it is a
+//!   until its owner reclaims it. The origin's validator *is* kept -- it is a
 //!   third of the entity's directory name -- but it is only ever compared
 //!   when the origin is being asked for something anyway, and a read this
 //!   store answers in full asks the origin nothing. So a resource that
@@ -157,9 +157,8 @@ pub const PROXY_CACHE_DIR: &str = ".proxy";
 
 /// How many bytes one chunk file holds, except the last of an entity.
 ///
-/// 256 KiB. Small enough that the cleaner's single-file rule -- a file
-/// bigger than the whole cap is kept rather than evicted -- can never see one
-/// (`cacheSize` is megabytes at the very least), that eviction is
+/// 256 KiB. Small enough that a chunk is never an appreciable fraction of
+/// the cap (`cacheSize` is megabytes at the very least), that a reclaim is
 /// fine-grained, and that the two places a chunk boundary costs something
 /// bound it to this much: a fetch that starts mid-chunk drops what it carries
 /// of that chunk, and a chunk buffered but never completed is this much
@@ -260,7 +259,8 @@ impl Drop for DiskTicket {
     }
 }
 
-/// One cache, rooted where the cleaner can find it.
+/// One cache, rooted inside the one torrent-data root so that every byte
+/// of it is in the one usage figure.
 pub struct ProxyCache {
     root: PathBuf,
     /// Where playback has got to in each entity being read, and the window
@@ -303,8 +303,9 @@ impl ProxyCache {
         &self.root
     }
 
-    /// The playheads and windows of what is being read right now, for the
-    /// cache cleaner's gate.
+    /// The playheads and windows of what is being read right now: this
+    /// cache's retention owner, which is what reclaims its chunks and what
+    /// `GET /cache.json` asks for the protected half of the figure.
     pub fn retention(&self) -> &Arc<ProxyRetention> {
         &self.retention
     }
@@ -776,8 +777,8 @@ impl Cached {
 
     /// The cached bytes themselves, `first..=held_to`, a chunk at a time.
     ///
-    /// A read that fails -- the cleaner took the chunk between the lookup and
-    /// here, which is an ordinary race and not a fault -- ends the stream with
+    /// A read that fails -- the retention pass took the chunk between the
+    /// lookup and here, which is an ordinary race and not a fault -- ends the stream with
     /// an error rather than a short body, so the player sees a broken source
     /// instead of a file that ended early.
     ///
@@ -790,8 +791,8 @@ impl Cached {
     /// lookup the better arrangement and not merely the cheaper one. The
     /// lookup used to measure every chunk and read a wrong one as absent,
     /// and the fill skips a chunk whose name is taken, so such a file was
-    /// skipped by every lookup and every fill for as long as the cleaner
-    /// left it, and the origin was asked for those bytes at every play.
+    /// skipped by every lookup and every fill for as long as it sat there,
+    /// and the origin was asked for those bytes at every play.
     /// Taken here, it costs the player one broken read, the next lookup
     /// finds the gap, and the next fill writes the chunk again.
     pub fn body(&self) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static {
@@ -1421,8 +1422,8 @@ mod tests {
     /// origin's on its way past, and only one of them is on the path that
     /// matters here: a rewatch off a warm cache asks the origin nothing at
     /// all, so if a cached read moved no playhead there would be no window
-    /// over the very stream a player is inside, and the cache cleaner would
-    /// be free to take the chunk under its head.
+    /// over the very stream a player is inside, and the retention pass
+    /// would be free to take the chunk under its head.
     ///
     /// Sixteen chunks on disk, a budget of four, and a read of the first
     /// three: what is left afterwards is a window round where the read got
@@ -1491,8 +1492,8 @@ mod tests {
     ///
     /// The `Content-Length` and `Content-Range` of a hit are a promise about
     /// chunks that are still on the disk when the player gets to them, and
-    /// the thing most likely to take one is not the cleaner: it is the
-    /// retention pass this very body's playhead is driving. A window is 90%
+    /// the thing most likely to take one is the retention pass this very
+    /// body's playhead is driving. A window is 90%
     /// ahead of the playhead, so a body longer than that has its own tail
     /// outside the window from its first chunk onwards.
     ///

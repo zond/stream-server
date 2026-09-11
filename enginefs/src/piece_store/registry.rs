@@ -105,9 +105,9 @@ impl StoreRegistry {
     /// files; or say why not.
     ///
     /// **Only for a caller that has already had the backend forget the
-    /// pieces** and is holding that claim across this call -- the same
-    /// interlock [`StoreRoot::delete_pieces`] documents, which this is the
-    /// registered half of. Refused outright while the store is under its
+    /// pieces** and is holding that claim across this call -- the interlock
+    /// [`crate::retention::take_claimed`] imposes, and the one way into the
+    /// store's files there is. Refused outright while the store is under its
     /// initial check, asked at this instant and not earlier: the check
     /// reads every piece it means to claim, and a piece unlinked from under
     /// it becomes a have-bit over nothing.

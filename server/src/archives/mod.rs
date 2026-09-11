@@ -28,8 +28,10 @@ pub use source::{ArchiveSession, ArchiveSource};
 /// the URL it holds and nothing else can mint that key again, so a session
 /// swept under it is a failed resume. Ten minutes is long for a pause that
 /// stays paused and short against what a session costs while it waits --
-/// files under the cache root the cleaner may take anyway, and for NZB a
-/// pool of idle connections the news server is likelier to close first.
+/// scratch files under the cache root that **only this sweep** unlinks
+/// (see [`SCRATCH_DIR_NAME`]: nothing else in the process speaks for
+/// them), and for NZB a pool of idle connections the news server is
+/// likelier to close first.
 pub const SESSION_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// Error message used when a RAR archive is requested but this binary was
@@ -51,7 +53,9 @@ pub struct ArchiveEntry {
 /// directory everything of theirs goes in.
 #[derive(Debug, Clone)]
 pub struct CacheConfig {
-    /// The cache root -- the directory the cache cleaner walks.
+    /// The cache root, from `settings.cacheRoot`. The archive scratch dir
+    /// goes directly under it ([`CacheConfig::scratch_dir`]) -- beside the
+    /// torrent-data root, not inside it.
     pub cache_dir: PathBuf,
     /// Maximum cache size in bytes (0 = disabled)
     pub _cache_size: u64,
@@ -62,23 +66,27 @@ pub struct CacheConfig {
 ///
 /// Under the cache root, and not the system temp dir, on purpose. Nothing
 /// here is precious -- every byte can be fetched or extracted again from
-/// what the session names -- so it belongs where the rest of the cache is,
-/// on the volume the server counts and caps rather than on one it knows
-/// nothing about. The system temp dir gave none of that and, on Android, is
-/// not writable by an app at all. The name may not be `.cache` or
-/// `.metadata`: those were the two components the old cache cleaner's walk
-/// exempted as session records, and a directory that exempts itself is
-/// unbounded disk nobody counts.
+/// what the session names -- so it belongs on the volume the server sizes
+/// its cap against rather than on one it knows nothing about. The system
+/// temp dir gave none of that and, on Android, is not writable by an app
+/// at all.
 ///
-/// **What is under it owns itself.** Every file here is a
-/// `tempfile::NamedTempFile` -- the download's and the extraction's alike --
-/// so it is unlinked when the session holding it drops, which is when the
-/// idle sweep takes that session (`crate::archives::sessions`). No
-/// retention owner speaks for these bytes: they are neither a torrent's
-/// pieces nor a proxied entity. What a *crash* leaves behind is therefore
-/// the one thing under the cache root with no deleter at all, now that
-/// nothing walks it; it is bounded by how often this process dies rather
-/// than by anything here.
+/// **It is beside the torrent-data root, not inside it.** `cache_dir` is
+/// `settings.cacheRoot`, and the store's root is
+/// `<cacheRoot>/rqbit-downloads/.pieces`, so nothing that counts the cache
+/// has ever counted a byte of this: not `GET /cache.json`, and not the
+/// walk that used to run over `<cacheRoot>/rqbit-downloads` before it was
+/// deleted -- that walk never came in here either.
+///
+/// **What is under it owns itself, and that is the whole of its bound.**
+/// Every file here is a `tempfile::NamedTempFile` -- the download's and the
+/// extraction's alike -- so it is unlinked when the session holding it
+/// drops, which is when the idle sweep takes that session
+/// ([`SESSION_IDLE_TIMEOUT`], `crate::archives::sessions`). No retention
+/// owner speaks for these bytes: they are neither a torrent's pieces nor a
+/// proxied entity. What a *crash* leaves behind has therefore never had a
+/// deleter and still has none; it is bounded by how often this process
+/// dies rather than by anything here.
 pub const SCRATCH_DIR_NAME: &str = ".archives";
 
 impl CacheConfig {
