@@ -16,11 +16,13 @@
 
 ## 💡 About
 
-Stream Server is a hard fork of [perpetus/stream-server](https://github.com/perpetus/stream-server) (itself an open-source alternative to Stremio's closed-source `server.js`). This fork has a narrower, sharper goal: a **headless torrent-streaming server with zero external binary or system-library requirements**. `cargo build` on a machine with a Rust toolchain and a C compiler — no libtorrent, no libclang, no FFmpeg, no GUI toolkits — is enough to produce a working server, whether you build the default binary or the `--no-default-features` one. The server itself is Rust; the C compiler is for the C some dependencies bundle and build from source (`aws-lc-sys` under rustls, `libmimalloc-sys`).
+Stream Server is zond's hard fork of [stremio-native/stream-server](https://github.com/stremio-native/stream-server) (formerly `perpetus/stream-server`, itself an open-source alternative to Stremio's closed-source `server.js`), rewritten around a fork of `librqbit`. It has **no ambition to merge back upstream**: the API, the engine and the licensing have all diverged, and it is shaped by one client. That client is [xtremio](https://github.com/zond/xtremio), a Flutter Stremio client that embeds this server in-process as a Rust library (`stream_server::start`, see [Library API](#library-api)); the same crate also builds a standalone `server` binary that runs on its own.
 
-To get there, this fork **deliberately drops Stremio server.js API compatibility**: there is no HLS transcoding, no FFmpeg/FFprobe integration, and no video-probing endpoints. Those existed to reformat video for Stremio's web-based player. This server instead sits behind a **new native client app** (Flutter, with `libmpv`/`media_kit` for playback, currently in development) that does direct play and handles codecs and subtitles itself — so the server's only job is getting torrent and archive bytes onto an HTTP connection efficiently, not transcoding them.
+Its goal is narrower than upstream's: a **headless torrent-streaming server with no system-library requirements**. `cargo build` on a machine with a Rust toolchain and a C compiler — no libtorrent, no libclang, no FFmpeg, no GUI toolkits — is enough to produce a working server, whether you build the default binary or the `--no-default-features` one. The server itself is Rust; the C compiler is for the C some dependencies bundle and build from source (`aws-lc-sys` under rustls, `libmimalloc-sys`). The one external program the server runs is `curl`, and only for the `/ftp` route (see [Routes](#routes)).
 
-The torrent engine is [`librqbit`](https://github.com/ikatson/rqbit) — the **sole** torrent backend, in Rust, no system libraries — consumed via a fork ([`zond/rqbit`](https://github.com/zond/rqbit)) that follows upstream and adds what a bounded streaming cache needs from the engine: a configurable per-stream lookahead window; piece reclaim (the engine forgets a piece so its storage may delete it, and the storage decides the have-set at startup); holding pieces back from what a torrent announces; a runtime per-torrent peer cap; a session-wide upload switch; Mozilla's compiled-in TLS roots; and the fixes found on the way (a write past 2 GiB on a 32-bit `off_t` among them). There used to be an optional C++ `libtorrent` backend; it has been removed entirely, along with its vcpkg build apparatus, so there is nothing left in this repo that pulls in a C or C++ toolchain for torrenting.
+To get there, this fork **deliberately drops Stremio server.js API compatibility**: there is no HLS transcoding, no FFmpeg/FFprobe integration, and no video-probing endpoints. Those existed to reformat video for Stremio's web-based player. This server instead sits behind a native client (xtremio: Flutter, with `media_kit`/`libmpv` for playback) that does direct play and handles codecs and subtitles itself — so the server's only job is getting torrent and archive bytes onto an HTTP connection efficiently, not transcoding them.
+
+The torrent engine is [`librqbit`](https://github.com/ikatson/rqbit) — the **sole** torrent backend, in Rust, no system libraries — consumed via a fork ([`zond/rqbit`](https://github.com/zond/rqbit), pinned to one git rev in `enginefs/Cargo.toml`) that follows upstream and adds what a bounded streaming cache needs from the engine: a configurable per-stream lookahead window; piece reclaim (the engine forgets a piece so its storage may delete it, and the storage decides the have-set at startup); holding pieces back from what a torrent announces; a runtime per-torrent peer cap; a session-wide upload switch; per-piece chunk progress and a count of the connected peers that are seeders (what `inFlightPiece` and `connectedSeeders` below are read from); Mozilla's compiled-in TLS roots; and the fixes found on the way (a write past 2 GiB on a 32-bit `off_t` among them). There used to be an optional C++ `libtorrent` backend; it has been removed entirely, along with its vcpkg build apparatus, so there is nothing left in this repo that pulls in a C or C++ toolchain for torrenting.
 
 ---
 
@@ -32,8 +34,7 @@ The torrent engine is [`librqbit`](https://github.com/ikatson/rqbit) — the **s
 | **Transcoding** | ❌ Not the server's job — client plays containers/codecs directly | ✅ HLS transcoding via FFmpeg |
 | **Torrent backend** | Pure-Rust `librqbit`, the only backend | Native libtorrent (or Node bindings) |
 | **Open Source** | ✅ Source is MIT; default binary is GPL-3.0 (see [License](#-license)) | Upstream `server.js` is closed source |
-| **Seekable Streams** | ✅ Instant, via HTTP range requests | ⚠️ Variable |
-| **Archive Streaming** | ✅ ZIP/7Z/TAR/RAR built in (pure Rust) | ✅ |
+| **Archive Streaming** | ✅ ZIP/7Z/TAR/TGZ/RAR built in (pure Rust) | ✅ |
 | **Headless** | ✅ No tray, no desktop GUI in this repo | Varies |
 
 This is not a drop-in replacement for `server.js` — the API surface it exposes is intentionally smaller. It's built to be the backend of one specific client, not a generic Stremio-compatible service.
@@ -48,7 +49,7 @@ This is not a drop-in replacement for `server.js` — the API surface it exposes
 - **📡 HTTP Range Requests**: torrent pieces are streamed straight to HTTP range requests for instant seeking — direct play, no transcoding step in between
 
 ### Media & Archives
-- **📦 Archive Streaming**: direct playback from ZIP, 7Z, TAR, and RAR archives out of the box (all pure Rust). RAR is **on by default** via `unrar-rs`, which is GPL-3.0-or-later, so the default binary is GPL-3.0-or-later — see [License](#-license); build `--no-default-features` for an MIT binary without RAR
+- **📦 Archive Streaming**: direct playback from ZIP, 7Z, TAR, tgz (`.tar.gz`) and RAR archives out of the box (all pure Rust). RAR is **on by default** via `unrar-rs`, which is GPL-3.0-or-later, so the default binary is GPL-3.0-or-later — see [License](#-license); build `--no-default-features` for an MIT binary without RAR
 - Subtitles are the client's job: there is no subtitle conversion, track discovery or OpenSubtitles hashing in the server (see [Removed routes](#removed-routes))
 
 ### Control API
@@ -91,7 +92,7 @@ cargo build --release --no-default-features
 | `rar` | RAR archive streaming via pure-Rust `unrar-rs` (**on by default**) | None |
 | `tui` | The binary's `--tui` terminal UI (ratatui/crossterm). **Off by default**, so the library an app embeds carries no terminal stack; the release builds turn it on with `--features server/tui`, and a binary built without it refuses `--tui` | None |
 
-RAR streaming is **on by default** and pure Rust — no libclang or C++ toolchain. ZIP, 7Z, and TAR streaming are always built in too, and are not gated by any feature. Because `unrar-rs` is GPL-3.0-or-later, the default binary is GPL-3.0-or-later; drop the `rar` feature (`--no-default-features`) for an MIT binary, where RAR requests then return a 501 JSON error.
+RAR streaming is **on by default** and pure Rust — no libclang or C++ toolchain. ZIP, 7Z, TAR and tgz streaming are always built in too, and are not gated by any feature. Because `unrar-rs` is GPL-3.0-or-later, the default binary is GPL-3.0-or-later; drop the `rar` feature (`--no-default-features`) for an MIT binary, where RAR requests then return a 501 JSON error.
 
 ---
 
