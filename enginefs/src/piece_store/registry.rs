@@ -581,23 +581,34 @@ mod tests {
         // instead. It is on the volume, so what is in it is counted, and it
         // is counted the one way that cannot address the wrong files --
         // everything under the name, as a stray.
+        //
+        // Only where the filesystem tells the two names apart. On a
+        // case-insensitive volume -- Windows, and macOS by default -- the
+        // shouted name *is* the lowercase directory, there is no second
+        // entry for a rule to get wrong, and writing through it would just
+        // overwrite the piece written above. Asked there, this half of the
+        // test would be asserting something about the filesystem.
         let shouted = tmp
             .path()
             .join(".pieces")
             .join("89ABCDEF0123456789ABCDEF0123456789ABCDEF");
-        std::fs::create_dir_all(shouted.join("0")).unwrap();
-        // Deliberately a different size from the lowercase directory's
-        // piece: a rule that let this name through would `stat` the
-        // *lowercase* directory beside it, and the two would only add up if
-        // both held the same bytes.
-        std::fs::write(shouted.join("0").join("0"), [3u8; 40960]).unwrap();
-        let expected = crate::chunk_store::occupied_bytes(
+        let case_matters = std::fs::metadata(&shouted).is_err();
+        let mut expected = crate::chunk_store::occupied_bytes(
             &std::fs::metadata(left.join("0").join("0")).unwrap(),
         ) + crate::chunk_store::occupied_bytes(
             &std::fs::metadata(tmp.path().join(".pieces").join("stray")).unwrap(),
-        ) + crate::chunk_store::occupied_bytes(
-            &std::fs::metadata(shouted.join("0").join("0")).unwrap(),
         );
+        if case_matters {
+            std::fs::create_dir_all(shouted.join("0")).unwrap();
+            // Deliberately a different size from the lowercase directory's
+            // piece: a rule that let this name through would `stat` the
+            // *lowercase* directory beside it, and the two would only add
+            // up if both held the same bytes.
+            std::fs::write(shouted.join("0").join("0"), [3u8; 40960]).unwrap();
+            expected += crate::chunk_store::occupied_bytes(
+                &std::fs::metadata(shouted.join("0").join("0")).unwrap(),
+            );
+        }
         assert_eq!(registry.unregistered_bytes(), expected);
         assert_eq!(
             registry.occupancy(),
