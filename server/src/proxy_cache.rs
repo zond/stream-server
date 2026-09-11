@@ -1391,14 +1391,16 @@ mod tests {
         headers
     }
 
-    /// The key is the directory name every entry already on disk lives
-    /// under, so it must come out the same from one build to the next: a
-    /// key that moved (a digest crate bumped, a field encoded differently)
-    /// would leave every kept entity unreachable. The literal is SHA-256
-    /// over the URL's length as a little-endian u64 and its bytes, computed
-    /// outside this code.
+    /// The key is a SHA-256 of the length-prefixed fields, and not some
+    /// cheaper hash: two requests whose keys collide share an entity, which
+    /// is one caller's bytes served to another. The literal is SHA-256 over
+    /// the URL's length as a little-endian u64 and its bytes, computed
+    /// outside this code. Nothing needs the key to stay the same from one
+    /// build to the next -- the launch sweep empties the cache before
+    /// anything is served (`sweep`) -- so a change to what goes into it
+    /// only has to update this literal.
     #[test]
-    fn the_key_of_a_plain_get_does_not_move_between_builds() {
+    fn the_key_of_a_plain_get_is_the_sha_256_of_its_url() {
         let (_root, cache) = cache();
         assert_eq!(
             key_of(&cache, &entry_of(&cache, "https://host/film.mkv")),
