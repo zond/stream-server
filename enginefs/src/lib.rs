@@ -765,10 +765,10 @@ pub type EngineFS = BackendEngineFS<LibrqbitBackend>;
 /// housekeeping sweep never removes the engine, and with seeding off the
 /// torrent downloads a film nobody is watching until the server restarts.
 ///
-/// The window is not small. `on_stream_start` increments both counters and
-/// then **awaits** the reconcile, which is inside the backend for as long
-/// as starting a torrent takes; before that it awaits `activate_file`,
-/// which for a multi-file torrent awaits the backend again. Dropping that
+/// The window is not small. `on_stream_start` increments both counters
+/// first and then **awaits** `activate_file`, which for a multi-file
+/// torrent awaits the backend, and the reconcile, which is inside the
+/// backend for as long as starting a torrent takes. Dropping that
 /// future is not an edge case either -- it is how every one of these
 /// handlers ends when a player closes the connection.
 ///
@@ -2983,14 +2983,34 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
 
     async fn start_stream(&self, info_hash: &str, file_idx: usize, reconcile: bool) {
         let info_hash = info_hash.to_lowercase();
-        // First, before anything this call could fail at: **the server saw
+        let mut rollback = StreamStartRollback::armed(self, info_hash.clone(), file_idx);
+        // Counted before the aside rule is asked, and not after the
+        // selection: an open the rule calls an aside is handed the cell
+        // when the live file's last read closes (`hand_live_on`), which
+        // asks the counts. Counted after, the last episode's connection
+        // closing inside this open's selection -- a backend update and a
+        // persistence write, where milliseconds after the open is exactly
+        // when a player closes it -- found this file neither read nor
+        // opened, and the cell stayed on the episode nobody was watching.
+        {
+            let mut streams = self.active_streams.write().await;
+            let count = streams.entry(info_hash.clone()).or_insert(0);
+            *count += 1;
+        }
+        rollback.counted_stream();
+        {
+            let mut streams = self.active_file_streams.write().await;
+            let count = streams.entry((info_hash.clone(), file_idx)).or_insert(0);
+            *count += 1;
+        }
+        rollback.counted_file_stream();
+        // Then, before anything this call could fail at: **the server saw
         // a stream open**, and that is the event the liveness cell records.
         // What was playing before is what nobody is playing now, whatever
         // becomes of this request -- the disk gate that refuses it for want
         // of space is refusing it *after* the predecessor became slack,
         // which is what gives it room to be admitted at all.
         let beside = self.switch_to(&info_hash, file_idx).await;
-        let mut rollback = StreamStartRollback::armed(self, info_hash.clone(), file_idx);
         let native_lifecycle = self
             .get_engine(&info_hash)
             .await
@@ -3004,19 +3024,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 .await;
         }
 
-        // Also update legacy active_streams counter
-        {
-            let mut streams = self.active_streams.write().await;
-            let count = streams.entry(info_hash.clone()).or_insert(0);
-            *count += 1;
-        }
-        rollback.counted_stream();
-        {
-            let mut streams = self.active_file_streams.write().await;
-            let count = streams.entry((info_hash.clone(), file_idx)).or_insert(0);
-            *count += 1;
-        }
-        rollback.counted_file_stream();
         // Registered, so this reads a player: sharing starts with the
         // stream rather than at the next tick.
         self.apply_upload_switch().await;
@@ -13987,6 +13994,64 @@ mod tests {
             ),
             (Some(1), None),
             "and the selection moved with it"
+        );
+    }
+
+    /// **The next episode's open is counted before it asks the aside rule**,
+    /// so the last episode's read closing while the open is still under
+    /// way hands the cell on.
+    ///
+    /// The open decided it was an aside -- episode one was still read --
+    /// and then planned its selection, a backend update and a write of the
+    /// session's persistence file, before it counted its stream. Episode
+    /// one's connection closed in that update, and the hand-on found no
+    /// other file read or opened: the cell stayed on episode one for good,
+    /// and the episode being watched was protected only while a read of it
+    /// was open.
+    #[tokio::test(start_paused = true)]
+    async fn an_open_still_under_way_is_what_the_last_read_closing_hands_the_cell_to() {
+        let (enginefs, _counters) = test_enginefs_with_file_count(3);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        enginefs.on_stream_start(TEST_HASH, 0).await;
+        engine.begin_retention(0).await;
+        let first = engine.retention.reader_on(&0).expect("an entity");
+        first.promises(0..1);
+        let enginefs = Arc::new(enginefs);
+
+        // Episode two's open, parked in its selection.
+        let selections = enginefs.active_multifile_files.write().await;
+        let planned = enginefs.priority_generation.load(Ordering::SeqCst);
+        let second = tokio::spawn({
+            let enginefs = enginefs.clone();
+            async move { enginefs.on_stream_start(TEST_HASH, 1).await }
+        });
+        assert!(
+            wait_until(TEST_WAIT_BOUND, || enginefs
+                .priority_generation
+                .load(Ordering::SeqCst)
+                > planned)
+            .await,
+            "episode two's open reached its selection"
+        );
+        assert_eq!(enginefs.live().reading().file_of(TEST_HASH), Some(0));
+
+        // Episode one's connection closes in that wait.
+        drop(first);
+        let end = tokio::spawn({
+            let enginefs = enginefs.clone();
+            async move { enginefs.on_stream_end(TEST_HASH, 0).await }
+        });
+        let handed_on = wait_until(TEST_WAIT_BOUND, || {
+            enginefs.live().reading().file_of(TEST_HASH) == Some(1)
+        })
+        .await;
+        drop(selections);
+        second.await.expect("episode two's open");
+        end.await.expect("episode one's end");
+        assert!(
+            handed_on,
+            "episode one's last read closed while episode two's open was under way, and the cell stayed"
         );
     }
 
