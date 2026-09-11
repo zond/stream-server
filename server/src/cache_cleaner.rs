@@ -41,9 +41,10 @@ use crate::state::AppState;
 /// ([`crate::cache_budget::publish_now`]), so the owners are sized against
 /// the volume as the clean left it. The `limit` reported is the one `GET
 /// /cache.json` answers, which is the same rule applied to a different
-/// figure: [`usage`]'s total also counts the bytes no owner holds -- a
-/// torrent held in Error, a directory a previous process left -- and the
-/// published cap does not. With any of those on the disk the reported
+/// figure: [`usage`]'s total also counts the bytes no owner's count prices
+/// -- a torrent held in Error, a directory a previous process left, the
+/// staged copies of pieces being written -- and the published cap does
+/// not. With any of those on the disk the reported
 /// limit is larger than the cap the owners are sized against, by up to
 /// those bytes (not when `cacheSize` is what binds), so `over_limit` is
 /// the excess of the whole root and not of what the owners hold.
@@ -72,21 +73,27 @@ pub(crate) async fn drop_slack(state: &AppState) -> EvictionReport {
 ///
 /// **No listing of the root, and none of the tree.** The piece store counts
 /// its own bytes from the bits it keeps, the proxy cache counts its chunks
-/// as they land and as they go, and the only filesystem work left is one
-/// `read_dir` of the store root for what belongs to no live store at all --
-/// a torrent held in Error, a directory a previous process left. On the
+/// as they land and as they go, and the only filesystem work left is
+/// `enginefs::piece_store::StoreRegistry::unregistered_bytes`: one
+/// `read_dir` of the store root and a `stat` of each directory no live
+/// store speaks for -- a torrent held in Error, a directory a previous
+/// process left -- plus a `stat` of each staged (`.part`) copy a registered
+/// store has, because its held bits price complete pieces only. On the
 /// device this exists for that is a handful of syscalls where it used to be
 /// a `statx` of sixteen thousand files, and the answer is current rather
 /// than as old as the walk that produced it.
 ///
 /// What it does not count is a **legacy whole-file download** left by an
 /// earlier version of this server, which lives beside the store
-/// (`<download dir>/<torrent name>/<file>`) rather than under it. Nothing
-/// owns those bytes: no store speaks for them, the launch sweep never
-/// leaves `.pieces`, and nothing here ever wrote them. They are neither
-/// counted nor reclaimed, by decision -- "there is no migration" (see
-/// `enginefs::piece_store`) -- and the one thing that still takes one is
-/// an unpin asked to delete the file's data. Named rather than hidden:
+/// (`<download dir>/<torrent name>/<file>`) rather than under it: no store
+/// speaks for it and nothing here wrote it. It is not converted -- "there
+/// is no migration" (see `enginefs::piece_store`) -- but it is deleted:
+/// `enginefs::piece_store::sweep_legacy_downloads` removes whatever under
+/// the download root is not another component's directory or a session
+/// file, at launch, on every boot that is handed a pin set. On a boot with
+/// none the sweep does not run, and an unpin asked to delete the file's
+/// data is then the only thing that takes one -- as it always is for a
+/// copy in an output folder outside the root. Named rather than hidden:
 /// adding a category of byte with no deleter is how the disk becomes
 /// unbounded again.
 ///

@@ -544,7 +544,8 @@ impl ServerHandle {
     ///
     /// Walks nothing: the owners of the cache count what they hold as they
     /// write it, and the only filesystem work is one `read_dir` of the
-    /// store root for what no live store speaks for. Cheap enough for a
+    /// store root for what no live store speaks for and a `stat` of each
+    /// staged copy a live store is writing. Cheap enough for a
     /// "Storage" screen open or a manual refresh; it is not cached here, so
     /// do not poll it on a sub-second timer.
     pub fn cache_usage(&self) -> anyhow::Result<CacheUsage> {

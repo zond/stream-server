@@ -43,12 +43,14 @@
 //! were the whole of a film. The owners' count has no such window: a
 //! process that has held a piece for a millisecond can say so.
 //!
-//! What it does not count is what nothing in this process wrote -- a
-//! torrent held in Error, a directory a previous run left, the strays.
-//! Reading those costs a `read_dir`, so they are read on demand for
+//! What it does not count is what the held bits do not price -- a torrent
+//! held in Error, a directory a previous run left, the strays, and the
+//! staged copies of the pieces being written. Reading those costs a
+//! `read_dir` and a `stat` each, so they are read on demand for
 //! `GET /cache.json` (`enginefs::EngineFS::cache_holdings`) and not on the
-//! minute timer. The cap is therefore stated over what this session holds,
-//! which understates the volume by whatever an earlier one left -- the safe
+//! minute timer. The cap is therefore stated over the complete pieces this
+//! session holds, which understates the volume by whatever an earlier one
+//! left and by the pieces in flight -- the safe
 //! direction, since a smaller `occupied` is a tighter cap, and **the claim
 //! above is a claim about a cache this process filled**: on a warm cache the
 //! first minute is still the volume's headroom alone. The proxy cache is not
@@ -73,8 +75,11 @@ use crate::state::AppState;
 /// both owners for their slack and, if the disk is still short, answers the
 /// stream `507 Insufficient Storage`. Below this line the server has
 /// therefore already decided the disk is unusable, so it is exactly the line
-/// [`CacheLimit::effective`] must keep the cache out of. Both read it the
-/// same way, through [`available_space`] (`statvfs` on the path).
+/// [`CacheLimit::effective`] must keep the cache out of. Both read the
+/// volume with the same call, [`available_space`] (`fs4`'s, a `statvfs` of
+/// the path on Unix), and both on the blocking pool: the gate inside its
+/// `spawn_blocking`, the publisher through
+/// [`available_space_off_the_reactor`]. Neither writes to the volume to ask.
 ///
 /// The third reader is the engine's reconciler, whose free-space arm this
 /// is (`enginefs::reconcile::desired`), and it is what turns the target into
@@ -254,15 +259,16 @@ pub(crate) fn publish(budget: &enginefs::retention::RetentionBudget, limit: Opti
 ///
 /// **`occupied` is what the owners hold, and deliberately not the whole
 /// figure `GET /cache.json` reports.** That one adds
-/// `StoreRoot::unregistered_bytes` -- a torrent the session is holding in
-/// Error, a directory a previous process left -- which costs a `read_dir`
-/// and cannot be on a minute timer, and which no owner can give back
-/// anyway. The difference never loosens the cap: those bytes are already
-/// out of `available`, so the volume arm stays exact and it is only
-/// `cacheSize` that is a bound on the owners' half rather than on every
-/// byte under the root. What bounds the rest is the launch sweep, which
-/// takes every directory the embedder's pin set does not name before the
-/// session opens.
+/// `StoreRegistry::unregistered_bytes` -- a torrent the session is holding
+/// in Error, a directory a previous process left, and the staged copies of
+/// the pieces a live store is writing -- which costs a `read_dir` and a
+/// `stat` each and cannot be on a minute timer. The difference never
+/// loosens the cap: those bytes are already out of `available`, so the
+/// volume arm stays exact and it is only `cacheSize` that is a bound on the
+/// owners' half rather than on every byte under the root. What bounds the
+/// first two is the launch sweep, which takes every directory the
+/// embedder's pin set does not name before the session opens; the staged
+/// copies are the pieces being fetched at that moment.
 pub(crate) async fn publish_now(state: &AppState) -> Option<u64> {
     publish_in_turn(
         &state.budget_publication,
