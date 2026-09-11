@@ -226,16 +226,109 @@ type ReportedErrors = Arc<Mutex<HashMap<String, String>>>;
 /// that, bytes the reader will never ask the swarm for. `get_file_reader`
 /// records the offset it was opened at and the lookahead it was opened
 /// with (a `Range` request, a seek and a re-open all arrive as a fresh
-/// reader), and `stats` reads both back.
-type StreamPositions = Arc<Mutex<HashMap<(String, usize), StreamPosition>>>;
+/// reader), and `stats` reads back the newest of a file's readers still
+/// open.
+///
+/// **Only while the reader is open.** A record that outlived its reader
+/// had the stats go on naming the piece a closed stream last waited on as
+/// the one in flight, and the startup window as measured from where it
+/// was opened, with nobody reading there -- and it stayed in the map for
+/// every file ever opened, torrents removed long ago included. Each open
+/// reader has its own entry, which [`OpenPosition`] takes out when the
+/// reader is dropped: a player's second connection (the index at the
+/// file's tail, say) closing hands the stats back to the first, and not
+/// to nothing.
+type StreamPositions = Arc<Mutex<HashMap<(String, usize), Vec<StreamPosition>>>>;
+
+/// Tells one reader's [`StreamPosition`] from another's.
+static NEXT_READER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// One reader's opening: see [`StreamPositions`].
 #[derive(Debug, Clone, Copy)]
 struct StreamPosition {
+    /// Which reader opened here.
+    reader: u64,
     /// The offset in the file the reader was opened at.
     offset: u64,
     /// How far ahead of itself the reader fetches.
     lookahead_bytes: u64,
+}
+
+/// A reader's entry in [`StreamPositions`], for as long as the reader.
+struct OpenPosition {
+    positions: StreamPositions,
+    key: (String, usize),
+    reader: u64,
+}
+
+impl OpenPosition {
+    fn record(
+        positions: &StreamPositions,
+        key: (String, usize),
+        offset: u64,
+        lookahead_bytes: u64,
+    ) -> Self {
+        let reader = NEXT_READER.fetch_add(1, Ordering::Relaxed);
+        positions
+            .lock()
+            .entry(key.clone())
+            .or_default()
+            .push(StreamPosition {
+                reader,
+                offset,
+                lookahead_bytes,
+            });
+        Self {
+            positions: positions.clone(),
+            key,
+            reader,
+        }
+    }
+}
+
+impl Drop for OpenPosition {
+    fn drop(&mut self) {
+        let mut positions = self.positions.lock();
+        if let Some(open) = positions.get_mut(&self.key) {
+            open.retain(|position| position.reader != self.reader);
+            if open.is_empty() {
+                positions.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// librqbit's stream, carrying its [`OpenPosition`] out to whoever reads
+/// it and dropping it with the stream.
+struct PositionedStream<S> {
+    stream: S,
+    _position: OpenPosition,
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for PositionedStream<S> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().stream).poll_read(cx, buf)
+    }
+}
+
+impl<S: tokio::io::AsyncSeek + Unpin> tokio::io::AsyncSeek for PositionedStream<S> {
+    fn start_seek(
+        self: std::pin::Pin<&mut Self>,
+        position: std::io::SeekFrom,
+    ) -> std::io::Result<()> {
+        std::pin::Pin::new(&mut self.get_mut().stream).start_seek(position)
+    }
+
+    fn poll_complete(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<u64>> {
+        std::pin::Pin::new(&mut self.get_mut().stream).poll_complete(cx)
+    }
 }
 
 /// What a client is told about a torrent librqbit put in an error state.
@@ -2249,7 +2342,14 @@ impl TorrentHandle for LibrqbitHandle {
         );
 
         let pinned = self.pinned_set();
-        let positions = self.stream_positions.lock().clone();
+        // The newest open reader of each file of this torrent.
+        let positions: HashMap<usize, StreamPosition> = self
+            .stream_positions
+            .lock()
+            .iter()
+            .filter(|((info_hash, _), _)| *info_hash == self.info_hash)
+            .filter_map(|((_, file_idx), open)| Some((*file_idx, *open.last()?)))
+            .collect();
         let mut torrent_piece_length = None;
         let mut files = Vec::new();
         let mut total_size = 0u64;
@@ -2277,7 +2377,7 @@ impl TorrentHandle for LibrqbitHandle {
                 // without a piece map yet (empty file_progress) reports 0
                 // and so never claims completion of a non-empty file.
                 let complete = file_downloaded == f.len;
-                let opened = positions.get(&(self.info_hash.clone(), i)).copied();
+                let opened = positions.get(&i).copied();
                 let read_from = opened.map(|position| position.offset);
                 let startup_window = opened.map_or(startup_cap, |position| {
                     startup_cap.min(position.lookahead_bytes)
@@ -2619,13 +2719,13 @@ impl TorrentHandle for LibrqbitHandle {
         // ahead of it this reader fetches. A `Range` request, a seek and a
         // re-open all reach the backend as a fresh reader at the new offset,
         // so this is the whole of "follow the reader" (see
-        // [`StreamPositions`]).
-        self.stream_positions.lock().insert(
+        // [`StreamPositions`]). Taken out when the reader is dropped, or
+        // when an open that fails below returns.
+        let position = OpenPosition::record(
+            &self.stream_positions,
             (self.info_hash.clone(), file_idx),
-            StreamPosition {
-                offset: start_offset,
-                lookahead_bytes,
-            },
+            start_offset,
+            lookahead_bytes,
         );
         // librqbit's FileStream requires the Paused or Live state; opening it
         // while the torrent is still Initializing fails immediately, which the
@@ -2640,7 +2740,10 @@ impl TorrentHandle for LibrqbitHandle {
             .stream_with_options(file_idx, opts)
             .await
             .context("Failed to stream from librqbit")?;
-        Ok(Box::new(stream))
+        Ok(Box::new(PositionedStream {
+            stream,
+            _position: position,
+        }))
     }
 
     async fn get_files(&self) -> Vec<BackendFileInfo> {
@@ -5671,6 +5774,60 @@ mod tests {
         assert_eq!(tail.total_bytes, last_piece_len);
         assert_eq!(tail.downloaded_bytes, last_piece_len);
         assert!(tail.verified);
+    }
+
+    /// **A closed reader is not in the stats.** Its opening was recorded
+    /// for good: the stats went on naming the piece a closed stream last
+    /// waited on as the one in flight, and a player's second connection
+    /// (the index at the file's tail) closing left the stats on the tail
+    /// while the first connection read on at the head.
+    #[tokio::test]
+    async fn stats_follow_the_readers_still_open() {
+        use crate::backend::TorrentHandle;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let payload = dir.join("payload.bin");
+        let piece_length = 64 * 1024u64;
+        let payload_len = 3 * piece_length;
+        write_payload(&payload, payload_len as usize).await;
+        let (torrent_bytes, _hash) =
+            make_torrent_with_piece_length(&payload, piece_length as u32).await;
+        let (_backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
+        handle.handle.wait_until_initialized().await.unwrap();
+        let lookahead = crate::backend::priorities::librqbit_stream_lookahead_bytes(
+            crate::backend::priorities::PlaybackIntent::DirectSeek,
+            crate::backend::priorities::BufferProfile::Normal,
+        );
+        let in_flight =
+            |stats: EngineStats| stats.files[0].in_flight_piece.map(|piece| piece.index);
+
+        let head = handle
+            .get_file_reader(0, 0, 0, None, lookahead)
+            .await
+            .unwrap();
+        let tail = handle
+            .get_file_reader(0, payload_len - 1, 0, None, lookahead)
+            .await
+            .unwrap();
+        assert_eq!(in_flight(TorrentHandle::stats(&handle).await), Some(2));
+
+        drop(tail);
+        assert_eq!(
+            in_flight(TorrentHandle::stats(&handle).await),
+            Some(0),
+            "the tail's connection closed; the head's reads on"
+        );
+
+        drop(head);
+        assert_eq!(
+            in_flight(TorrentHandle::stats(&handle).await),
+            None,
+            "nobody reads the file"
+        );
+        assert!(
+            handle.stream_positions.lock().is_empty(),
+            "and nothing of either reader is left behind"
+        );
     }
 
     /// A piece nobody has sent us yet is reported as a real 0-of-N, with
