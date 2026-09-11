@@ -3,7 +3,7 @@ name = "server"
 version = "0.1.8"
 edition = "2024"
 license = "MIT"
-description = "High-performance torrent streaming server"
+description = "Headless torrent and archive streaming server for Stremio clients"
 authors = ["Perpetus <perpetus@example.com>"]
 
 [lib]
@@ -156,7 +156,7 @@ tui = ["dep:ratatui", "dep:crossterm", "dep:crossbeam-channel"]
 maintainer = "stream-server maintainers"
 copyright = "2025"
 license-file = ["../LICENSE", "0"]
-extended-description = "High-performance torrent streaming server with HLS transcoding support"
+extended-description = "Headless torrent and archive streaming server for Stremio clients: streams torrents, ZIP/7Z/TAR/RAR members and cached HTTP sources over a local HTTP API."
 section = "net"
 priority = "optional"
 assets = [

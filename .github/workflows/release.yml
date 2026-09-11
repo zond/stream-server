@@ -123,10 +123,12 @@ jobs:
           EOF
 
           # Create simple icon (placeholder)
-          convert -size 256x256 xc:steelblue -gravity center -pointsize 48 -fill white -annotate 0 "SS" AppDir/usr/share/icons/hicolor/256x256/apps/stream-server.png || echo "ImageMagick not available, using placeholder"
+          convert -size 256x256 xc:steelblue -gravity center -pointsize 48 -fill white -annotate 0 "SS" AppDir/usr/share/icons/hicolor/256x256/apps/stream-server.png
 
-          # Build AppImage
-          ./linuxdeploy-x86_64.AppImage --appdir AppDir --output appimage || true
+          # Build AppImage. No `|| true`, and the upload errors on a missing
+          # file: a release without its AppImage fails here rather than
+          # going out without it.
+          ./linuxdeploy-x86_64.AppImage --appdir AppDir --output appimage
 
       - name: Upload Binary
         uses: actions/upload-artifact@v7
@@ -146,7 +148,7 @@ jobs:
         with:
           name: server-linux-appimage
           path: "*.AppImage"
-          if-no-files-found: ignore
+          if-no-files-found: error
 
   build-arch:
     name: Build Arch Linux
@@ -159,7 +161,7 @@ jobs:
       - name: Install dependencies
         run: |
           pacman -Syu --noconfirm
-          pacman -S --needed --noconfirm base-devel cmake curl rust git openssl pkg-config
+          pacman -S --needed --noconfirm base-devel cmake curl rust git
 
       - name: Cargo Cache
         uses: actions/cache@v6
@@ -181,13 +183,13 @@ jobs:
           cat > pkg/PKGBUILD << 'EOF'
           # Maintainer: stream-server maintainers
           pkgname=stream-server
-          pkgver=0.1.0
+          pkgver=@VERSION@
           pkgrel=1
           pkgdesc="Pure-Rust headless torrent streaming server"
           arch=('x86_64')
           url="https://github.com/zond/stream-server"
           license=('GPL3')
-          depends=('openssl')
+          depends=('gcc-libs' 'glibc')
           source=("stream-server")
           sha256sums=('SKIP')
 
@@ -195,6 +197,11 @@ jobs:
               install -Dm755 "$srcdir/stream-server" "$pkgdir/usr/bin/stream-server"
           }
           EOF
+          # The crate's version, so the package cannot fall behind the
+          # binary it carries (a literal here sat at 0.1.0 through 0.1.8).
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' server/Cargo.toml | head -n 1)
+          test -n "$version"
+          sed -i "s/@VERSION@/$version/" pkg/PKGBUILD
 
           cp target/release/server pkg/stream-server
 
