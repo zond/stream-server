@@ -463,16 +463,6 @@ fn content_type_for_name(name: &str) -> &'static str {
     }
 }
 
-// Refreshing the full disk list is a relatively expensive syscall sweep over
-// every mounted volume. A player fires a burst of probe requests at stream
-// start, each of which would otherwise re-run it on a tokio worker thread.
-// Free space does not change meaningfully between those, so cache the result
-// per root with a short TTL.
-type DiskSpaceCache =
-    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (Instant, Option<u64>)>>;
-static DISK_SPACE_CACHE: std::sync::OnceLock<DiskSpaceCache> = std::sync::OnceLock::new();
-const DISK_SPACE_CACHE_TTL: Duration = Duration::from_secs(3);
-
 /// The body of every `507` the stream route answers: a fixed sentence,
 /// because the conditions behind it (`ensure_download_disk_ready`'s own
 /// message, the engine's reason for a stop) name the cache root, and no
@@ -523,18 +513,15 @@ pub fn pretend_available_space_readings(root: impl Into<std::path::PathBuf>, rea
     }
 }
 
-/// Drop the cached free-space reading for `path`, so the next check probes
-/// the volume again -- for the check that follows the drop-slack pass
-/// [`ensure_disk_ready_or_refuse`] runs before it refuses a stream, which
-/// must not be judged by the reading taken before it.
-fn forget_available_space(path: &FsPath) {
-    if let Some(cache) = DISK_SPACE_CACHE.get()
-        && let Ok(mut map) = cache.lock()
-    {
-        map.remove(path);
-    }
-}
-
+/// The free space of the volume under `path`: the cap's own reading
+/// ([`crate::cache_budget::available_space`], one `statvfs` of the path), or
+/// what a test declared for it.
+///
+/// It used to match the path against `sysinfo`'s list of every mounted
+/// volume, refreshed per request behind a 3-second cache -- a different
+/// syscall from the cap's, a sweep that cost enough to need the cache, and a
+/// cache the gate then had to forget after freeing space. One `statvfs`
+/// needs none of that.
 fn available_space_for_path(path: &FsPath) -> Option<u64> {
     if let Some(overrides) = DISK_SPACE_OVERRIDES.get()
         && let Ok(mut overrides) = overrides.lock()
@@ -552,43 +539,11 @@ fn available_space_for_path(path: &FsPath) -> Option<u64> {
         };
         return bytes;
     }
-    let cache =
-        DISK_SPACE_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    if let Ok(map) = cache.lock()
-        && let Some((at, value)) = map.get(path)
-        && at.elapsed() < DISK_SPACE_CACHE_TTL
-    {
-        return *value;
-    }
-
-    let value = available_space_for_path_uncached(path);
-    if let Ok(mut map) = cache.lock() {
-        map.insert(path.to_path_buf(), (Instant::now(), value));
-    }
-    value
+    crate::cache_budget::available_space(path)
 }
 
-fn available_space_for_path_uncached(path: &FsPath) -> Option<u64> {
-    let disks = sysinfo::Disks::new_with_refreshed_list();
-    let mut best_match_len = 0usize;
-    let mut best_available = None;
-
-    for disk in disks.list() {
-        let mount = disk.mount_point();
-        if path.starts_with(mount) {
-            let len = mount.as_os_str().len();
-            if len >= best_match_len {
-                best_match_len = len;
-                best_available = Some(disk.available_space());
-            }
-        }
-    }
-
-    best_available
-}
-
-/// Whether the cache root can be written to at all, and whether the volume
-/// under it has the floor free.
+/// Whether the cache root exists (it is made if not), and whether the
+/// volume under it has the floor free.
 ///
 /// **One line, and it is the reconciler's.** `available <
 /// CACHE_FREE_SPACE_FLOOR` is the free-space arm of
@@ -609,24 +564,19 @@ fn available_space_for_path_uncached(path: &FsPath) -> Option<u64> {
 /// A volume that cannot be probed is an error here rather than a pass,
 /// unlike in the reconciler: this runs before a byte is written, and the
 /// caller retries once the volume has been probed again.
+///
+/// It writes nothing. It used to write and unlink a `.write-test` file on
+/// every request and every seek, a create and a delete on the device the
+/// check is about, to ask whether the root was writable -- which librqbit's
+/// own first write answers anyway, and which is not what the floor is for.
 fn ensure_download_disk_ready(root: &FsPath) -> Result<(), String> {
     std::fs::create_dir_all(root).map_err(|e| {
         format!(
-            "download cache path is not writable: {} ({})",
+            "download cache path cannot be made: {} ({})",
             root.display(),
             e
         )
     })?;
-
-    let probe_path = root.join(".write-test");
-    std::fs::write(&probe_path, b"ok").map_err(|e| {
-        format!(
-            "download cache path is not writable: {} ({})",
-            root.display(),
-            e
-        )
-    })?;
-    let _ = std::fs::remove_file(&probe_path);
 
     // The same floor the published cap keeps free
     // (`CacheLimit::effective`) and the same one the engine's reconciler
@@ -703,9 +653,8 @@ async fn ensure_disk_ready_or_refuse(
     if !wants_to_write {
         return Ok(());
     }
-    // The check performs blocking std::fs syscalls (create_dir_all, a write
-    // probe, and a metadata stat) that are re-run on every request and every
-    // seek. Run them on the blocking pool so they never stall an async worker
+    // The check performs blocking std::fs syscalls (create_dir_all and a
+    // statvfs) that are re-run on every request and every seek. Run them on the blocking pool so they never stall an async worker
     // thread inline -- which would also block any other stream/API task
     // scheduled on that same worker -- e.g. when the cache lives on a
     // spun-down HDD or a slow network/SMB mount.
@@ -747,12 +696,9 @@ async fn ensure_disk_ready_or_refuse(
         deleted,
         "dropped the slack of both cache owners on behalf of a stream request"
     );
-    // Two readings of the same volume, both of them stale by now and for
-    // two different reasons: this route caches its probe for a few seconds
-    // against a player's burst of requests, and the engine records the
-    // reconciler's, which is up to one tick old. A pass that just freed
-    // space must not be judged by either.
-    forget_available_space(&engine_fs.download_dir);
+    // The engine's reading of the volume is the reconciler's, up to one
+    // tick old, and a pass that just freed space must not be judged by it.
+    // This route's own probe is taken afresh by the check below.
     engine_fs.reread_volume().await;
     if first_complaint(engine.is_stopped_for_space().await, &check)
         .await
@@ -776,8 +722,8 @@ async fn ensure_disk_ready_or_refuse(
 /// complaint either of them makes -- `None` when the disk is ready.
 ///
 /// `probe` is a closure and not an answer, and that is the whole of this
-/// function: the floor probe is a `create_dir_all`, a write and an unlink
-/// on the blocking pool, and it must not be taken at all for a request the
+/// function: the floor probe is a `create_dir_all` and a `statvfs` on the
+/// blocking pool, and it must not be taken at all for a request the
 /// cheap question has already refused. A torrent the reconciler is holding
 /// stopped for want of space is answered from the reading it took, and a
 /// player retrying that stream four times a second is what the order is
@@ -1517,7 +1463,7 @@ mod tests {
 
     /// The gate's two questions, in the order they cost.
     ///
-    /// The floor probe is a `create_dir_all`, a write and an unlink on the
+    /// The floor probe is a `create_dir_all` and a `statvfs` on the
     /// blocking pool, and a player retrying a torrent this process is
     /// already holding stopped for want of space asks four times a second.
     /// Every one of those is answered from the reading the reconciler
@@ -1611,6 +1557,30 @@ mod tests {
             assert_eq!(active_readers.load(Ordering::SeqCst), 1);
         }
         assert_eq!(active_readers.load(Ordering::SeqCst), 0);
+    }
+
+    /// **The gate writes nothing.** It asks the volume for its free space
+    /// and nothing else: a root this process cannot create a file in passes
+    /// on its room, where the per-request `.write-test` it used to write
+    /// refused it (and cost a create and an unlink on the very device being
+    /// asked about, every request and every seek). A process that can write
+    /// anywhere -- root -- proves nothing here, and the test says so.
+    #[cfg(unix)]
+    #[test]
+    fn the_floor_check_writes_nothing_to_the_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().join("cache");
+        std::fs::create_dir(&root).expect("the root");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).expect("read-only");
+        if std::fs::write(root.join("probe"), b"").is_ok() {
+            eprintln!("this process writes through a read-only directory; nothing to prove");
+            return;
+        }
+        let outcome = ensure_download_disk_ready(&root);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755))
+            .expect("writable again");
+        outcome.expect("a root with room on it, read-only or not");
     }
 
     #[test]
