@@ -42,7 +42,7 @@ if-addrs = "0.15.0"
 fs4 = "1.1.0"
 urlencoding = "2.1"
 regex = "1.11"
-reqwest = { version = "0.13", features = ["blocking", "json", "stream"] }
+reqwest = { version = "0.13", features = ["json", "stream"] }
 futures-util = "0.3.31"
 async-trait = "0.1.89"
 async_zip = { version = "0.0.18", features = ["deflate", "tokio"] }
@@ -100,6 +100,8 @@ enginefs = { path = "../enginefs", features = [
 # self-signed CA certificate used as an end entity, which rustls refuses
 # whatever it is trusted as, so it could only ever be the unverifiable case.
 rcgen = "0.13"
+# The integration tests' HTTP client. Only they block; the server never does.
+reqwest = { version = "0.13", features = ["blocking"] }
 
 # Paused-clock machinery for `#[tokio::test(start_paused = true)]`, as in
 # enginefs; nothing in the shipped crate uses it.
