@@ -1000,7 +1000,17 @@ impl Cached {
                 let bytes = match tokio::fs::read(&path).await {
                     Ok(bytes) if bytes.len() as u64 == want => bytes,
                     Ok(_) => {
-                        let _ = tokio::fs::remove_file(&path).await;
+                        // Off the count as well as off the disk, like every
+                        // other deletion of a chunk: bytes the count still
+                        // held would read as a larger cap for the life of
+                        // the process (`ProxyRetention::occupancy`).
+                        let occupied = tokio::fs::metadata(&path)
+                            .await
+                            .map(|metadata| enginefs::chunk_store::occupied_bytes(&metadata))
+                            .unwrap_or(0);
+                        if tokio::fs::remove_file(&path).await.is_ok() {
+                            reader.retention().uncounted(occupied);
+                        }
                         return Some((
                             Err(io::Error::other("a cached chunk is not the length it was")),
                             last + 1,
@@ -2024,6 +2034,44 @@ mod tests {
             "the chunk that was there is the one still there"
         );
         assert_eq!(byte_of(1), 2, "and the one that was not was written");
+    }
+
+    /// **A chunk the read refuses for its length comes off the count with
+    /// the file.** Every other deleter of a chunk is booked; one the count
+    /// did not hear would stay in it, and in the cap, for the life of the
+    /// process.
+    #[tokio::test]
+    async fn a_chunk_refused_for_its_length_comes_off_the_count() {
+        use futures_util::StreamExt as _;
+
+        let (_root, cache) = cache();
+        let entry = entry_of(&cache, "https://host/film.mkv");
+        let total = 2 * CHUNK_BYTES;
+        let dir = entry
+            .dir
+            .join(entity_dir_name(total, "video/mp4", VALIDATOR));
+        let mut filler = entry.fill(total, "video/mp4", VALIDATOR, 0);
+        filler.take(&vec![7u8; total as usize]);
+        cache.settled().await;
+        drop(filler);
+
+        // Chunk 1 is not the length it was written at any more.
+        std::fs::write(chunk_path(&dir, 1), vec![7u8; CHUNK_BYTES as usize / 2]).unwrap();
+        let impostor =
+            enginefs::chunk_store::occupied_bytes(&std::fs::metadata(chunk_path(&dir, 1)).unwrap());
+        let before = cache.retention().occupancy();
+
+        let cached = entry
+            .look_up(Some("bytes=0-"))
+            .expect("both chunks are named");
+        let served: Vec<Result<Bytes, io::Error>> = cached.body().collect().await;
+        assert!(served[1].is_err(), "the impostor is refused");
+        assert!(!chunk_path(&dir, 1).exists(), "and removed");
+        assert_eq!(
+            cache.retention().occupancy(),
+            before - impostor,
+            "and what it occupied is off the count"
+        );
     }
 
     /// **A chunk written where one already is gains the cache nothing.**
