@@ -147,7 +147,12 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: server-linux-appimage
-          path: "*.AppImage"
+          # Not the linuxdeploy tool downloaded beside it, which is an
+          # AppImage too: matched, it went into the artifact, and it alone
+          # satisfied if-no-files-found when the real one was missing.
+          path: |
+            *.AppImage
+            !linuxdeploy-x86_64.AppImage
           if-no-files-found: error
 
   build-arch:
