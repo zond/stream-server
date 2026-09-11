@@ -531,8 +531,8 @@ So there is a **second listener** instead, and it serves media routes only.
 | **When it runs** | `ServerHandle::set_lan_media(true)` starts it, `set_lan_media(false)` stops it — meant to bracket a cast session, so the LAN surface exists only while something is casting. Nothing is bound at startup, whatever the configuration: a port already in use fails the cast that asked for the listener, never the server |
 | **How it is switched off entirely** | The `lanMediaEnabled` setting (`POST /settings`, **`false` by default**). While it is false, `set_lan_media(true)` is refused; setting it back to false also stops a listener that is already running |
 
-`ServerHandle::lan_media_base_url(peer_ip)` builds the URL to hand a receiver:
-the host is the local interface that shares `peer_ip`'s subnet, taken from the
+`ServerHandle::lan_media_base_url(for_peer)` builds the URL to hand a receiver:
+the host is the local interface that shares `for_peer`'s subnet, taken from the
 same interface enumeration `GET /network-info` answers from — on a host with a
 VPN or a container bridge the first interface in the list is regularly one the
 receiver cannot route back to. A listener bound to one specific address
