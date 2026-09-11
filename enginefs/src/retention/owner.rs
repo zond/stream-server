@@ -1798,6 +1798,30 @@ impl<B: Backing> Retention<B> {
             .map(|entity| entity.state.lock().opens)
             .unwrap_or(0)
     }
+
+    /// [`Self::readers_of`] and [`Self::opens_of`] as one reading, for the
+    /// driver deciding a [`Mode`]: how many open reads of `key` have
+    /// promised or delivered and not ended, and how many streams have ever
+    /// been opened on it. `(0, 0)` for a key with no entity.
+    ///
+    /// One L2 acquisition, and it has to be one. The count travels with
+    /// [`Mode::Slack`] so the pass can tell whether a stream opened between
+    /// the driver's reading and the pass's turn, and it can only tell that
+    /// about the reading it was taken beside. Read as two acquisitions --
+    /// "no reader" first, the count second -- an install that lands between
+    /// them is inside the count: the pass compares, finds it equal, finds
+    /// no reader open yet, because an aside's install completes before its
+    /// reader opens and moves no liveness cell, and takes the bytes the
+    /// stream is about to read. The gap the count exists to close, reopened
+    /// one lock-release wide by the reading of it.
+    pub fn readers_and_opens_of(&self, key: &B::Key) -> (usize, u64) {
+        self.lookup(key)
+            .map(|entity| {
+                let state = entity.state.lock();
+                (state.readers.len(), state.opens)
+            })
+            .unwrap_or((0, 0))
+    }
 }
 
 impl<B: Backing> State<B> {
@@ -3617,6 +3641,42 @@ mod tests {
                 "tick {tick}: wanted whole by the pass that cleared the policy, and by no other"
             );
         }
+    }
+
+    /// **The driver's two counts come as one reading**: no reader and no
+    /// open for a key with no entity, and then the reads that have
+    /// delivered beside the streams that have opened, off one lock.
+    ///
+    /// What this pins is the values. That they are read under one
+    /// acquisition is the shape of the method -- one guard, two fields --
+    /// and no interleaving a test can construct gets between two reads
+    /// that are not there.
+    #[tokio::test]
+    async fn the_readers_and_the_opens_are_one_reading() {
+        let (_backing, owner, _budget) = torrent();
+        assert_eq!(owner.readers_and_opens_of(&0), (0, 0));
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        assert_eq!(
+            owner.readers_and_opens_of(&0),
+            (0, 1),
+            "opened, nothing read"
+        );
+        let reader = owner.reader_on(&0).expect("the entity");
+        assert!(reader.note((0, 0)).is_none());
+        assert_eq!(owner.readers_and_opens_of(&0), (1, 1), "a read delivering");
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Kept);
+        assert_eq!(
+            owner.readers_and_opens_of(&0),
+            (1, 2),
+            "an aside's open counts before its reader does"
+        );
+        drop(reader);
+        assert_eq!(owner.readers_and_opens_of(&0), (0, 2), "the read ended");
+        assert_eq!(
+            (owner.readers_of(&0), owner.opens_of(&0)),
+            owner.readers_and_opens_of(&0),
+            "the same two facts the two readings give"
+        );
     }
 
     /// **An entity a reader is open on is never forgotten, even emptied.**

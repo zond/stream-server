@@ -1398,18 +1398,23 @@ impl<H: TorrentHandle> Engine<H> {
     /// stopped is not a stream that has been replaced, and pausing for an
     /// hour changes nothing here.
     fn mode_of(&self, live: &Reading, file_idx: usize) -> Mode {
-        if live.file_of(&self.info_hash) == Some(file_idx)
-            || self.retention.readers_of(&file_idx) > 0
-        {
+        // The readers and the count of opens off one lock: the pass compares
+        // the count against the entity's to find a stream that opened after
+        // this reading, and an install that landed between a reading of the
+        // readers and a separate reading of the count would be inside the
+        // count and not yet a reader -- an aside's install completes before
+        // its reader opens -- so the pass would find the count unchanged
+        // and delete under the stream. See
+        // [`Retention::readers_and_opens_of`].
+        let (readers, opens) = self.retention.readers_and_opens_of(&file_idx);
+        if live.file_of(&self.info_hash) == Some(file_idx) || readers > 0 {
             Mode::Live
         } else {
             // The count of opens this reading was taken beside, so the pass
             // can tell a file nobody has opened from one a viewer started
             // while this tick was walking the file before it. See
             // [`Mode::Slack`].
-            Mode::Slack {
-                opens: self.retention.opens_of(&file_idx),
-            }
+            Mode::Slack { opens }
         }
     }
 
