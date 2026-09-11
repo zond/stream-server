@@ -558,9 +558,12 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     pin_locks: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Pins the embedder named for torrents the backend did not have at
     /// startup (see [`Self::apply_pins`]): held here for the life of the
-    /// process and applied by the next `pin_download` of the torrent, or
-    /// dropped by `unpin_download`. Never held across an `.await`.
-    dormant_pins: parking_lot::Mutex<BTreeMap<String, std::collections::BTreeSet<usize>>>,
+    /// process and applied by whatever next puts an engine for the torrent
+    /// in the registry ([`Self::register_engine`] -- a stream's add as much
+    /// as a pin's), or dropped by `unpin_download`. Never held across an
+    /// `.await`. Shared with [`EngineParts`], which is how the registration
+    /// reaches it without `&self`.
+    dormant_pins: DormantPins,
     /// Available-bytes probe for the free-space check in `pin_download` and
     /// for the reconciler's arm (`fs4::available_space`; tests substitute
     /// one). Both ask it about one folder: the piece store's root.
@@ -618,7 +621,12 @@ struct EngineParts {
     budget: Arc<crate::retention::RetentionBudget>,
     live: Arc<crate::retention::live::Live>,
     pins_unknown: Arc<crate::piece_store::PinsUnknown>,
+    dormant_pins: DormantPins,
 }
+
+/// The pins waiting for their torrent to come back: see
+/// `BackendEngineFS::dormant_pins`.
+type DormantPins = Arc<parking_lot::Mutex<BTreeMap<String, std::collections::BTreeSet<usize>>>>;
 
 #[derive(Debug, Clone)]
 struct MultiFileActiveSelection {
@@ -944,7 +952,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             seeding_enabled: Arc::new(AtomicBool::new(true)),
             magnet_adds: Arc::new(RwLock::new(HashMap::new())),
             pin_locks: parking_lot::Mutex::new(HashMap::new()),
-            dormant_pins: parking_lot::Mutex::new(BTreeMap::new()),
+            dormant_pins: Arc::new(parking_lot::Mutex::new(BTreeMap::new())),
             free_space_probe: Arc::new(|path| match declared_volume_space(path) {
                 Some(bytes) => Ok(bytes),
                 None => fs4::available_space(path),
@@ -1831,11 +1839,34 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             budget: self.budget.clone(),
             live: self.live.clone(),
             pins_unknown: self.pins_unknown.clone(),
+            dormant_pins: self.dormant_pins.clone(),
         }
     }
 
     /// Wrap a backend handle in an `Engine` and publish it, or return the
     /// engine already registered for the same info hash.
+    ///
+    /// **A new engine is pinned before it is visible.** The pins the
+    /// embedder named for this torrent while the backend did not have it
+    /// (`dormant_pins`) go into the engine's pin set under the registry's
+    /// write lock, so there is no instant at which the registry holds an
+    /// unpinned engine for a pinned torrent. There used to be: only
+    /// `pin_download` applied them, and a *stream* of the torrent -- the
+    /// ordinary way a torrent librqbit did not restore comes back -- went
+    /// through here and published an engine whose `is_pinned()` was false.
+    /// Its store was then seeded from the kept directory into an engine
+    /// nothing protected: the passes reclaimed outside the window, the
+    /// idle sweep removed the torrent and its files five minutes after
+    /// the stream ended, and `cache_holdings` reported the bytes protected
+    /// throughout, because the dormant record still named them.
+    ///
+    /// The handle's own copy of each pin (`TorrentHandle::pin_file`, what
+    /// the want-set planner reads) is applied after the lock is dropped: a
+    /// backend call under the registry's write lock parks every reader in
+    /// the process behind it. The engine's pin set is what the sweep and
+    /// the passes read, and that is what has to be there first; a pin the
+    /// handle refuses -- a file index the torrent turns out not to have --
+    /// is taken out of the set again, as `apply_pins` drops it.
     async fn register_engine(
         engines: &EngineRegistry<B::Handle>,
         handle: B::Handle,
@@ -1856,7 +1887,29 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             parts.live,
             parts.pins_unknown,
         ));
-        engines.insert(info_hash, engine.clone());
+        let dormant = parts
+            .dormant_pins
+            .lock()
+            .remove(&info_hash)
+            .unwrap_or_default();
+        if !dormant.is_empty() {
+            engine.pinned_files.write().extend(dormant.iter().copied());
+        }
+        engines.insert(info_hash.clone(), engine.clone());
+        drop(engines);
+        for &file_idx in &dormant {
+            if let Err(error) = engine.handle.pin_file(file_idx).await {
+                tracing::warn!(info_hash, file_idx, %error, "could not re-apply a dormant pin");
+                engine.pinned_files.write().remove(&file_idx);
+            }
+        }
+        if !dormant.is_empty() {
+            tracing::info!(
+                info_hash,
+                pinned = ?engine.pinned_file_indices(),
+                "dormant pins applied to the torrent that came back"
+            );
+        }
         engine
     }
 
@@ -10109,6 +10162,90 @@ mod tests {
             ),
             (bytes, bytes, 1),
             "the user asked for those bytes and nothing here may take them: {pinned:?}"
+        );
+    }
+
+    /// **A torrent that comes back through a stream, not a pin, comes back
+    /// pinned.**
+    ///
+    /// librqbit skips a torrent it cannot re-add at startup, the embedder's
+    /// record still names its pin, and `apply_pins` keeps that pin dormant
+    /// for whatever brings the torrent back. Only `pin_download` used to
+    /// apply it. The ordinary way back is a viewer pressing play: the
+    /// stream route adds the magnet, the store is seeded from the kept
+    /// directory, and the engine that was published for it had no pin --
+    /// so the pass reclaimed the pinned file outside the window, the idle
+    /// sweep removed the torrent with its files once the stream ended, and
+    /// `cache_holdings` reported the bytes protected the whole time,
+    /// because the dormant record still spoke for them.
+    ///
+    /// The pin goes into the engine under the registry's write lock, so
+    /// the engine is never visible unpinned; the handle's copy follows.
+    #[tokio::test(start_paused = true)]
+    async fn a_torrent_streamed_back_with_a_dormant_pin_is_pinned_before_it_is_seen() {
+        let (mut enginefs, counters) = test_enginefs_unmanaged();
+        if let Some(sweep) = enginefs.take_sweep_task() {
+            sweep.abort();
+        }
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        // The boot: the record names file 0, and the backend restored no
+        // engine for the torrent.
+        let pins = crate::piece_store::PinSet::from([(TEST_HASH.to_string(), vec![0usize])]);
+        assert_eq!(enginefs.apply_pins(Some(pins)).await, 0);
+        assert_eq!(enginefs.dormant_pinned_downloads().len(), 1);
+
+        // The viewer streams it: the stream route's add, not a pin.
+        let engine = enginefs
+            .get_or_add_magnet(TEST_HASH, None)
+            .await
+            .expect("the stream's add");
+        assert!(
+            engine.is_pinned(),
+            "the engine the stream published carries the pin the record named"
+        );
+        assert_eq!(engine.pinned_file_indices(), vec![0]);
+        assert_eq!(
+            counters.pin_file.load(Ordering::SeqCst),
+            1,
+            "and the handle's want-set planner was told"
+        );
+        assert!(enginefs.dormant_pinned_downloads().is_empty());
+        assert_eq!(
+            enginefs.pinned_downloads().await,
+            vec![PinnedDownload {
+                info_hash: TEST_HASH.to_string(),
+                file_idx: 0,
+            }]
+        );
+
+        // The kept directory has the whole file; playback opens at its
+        // head under a one-piece window. Unpinned, the pass would take
+        // every piece the window does not cover.
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in [0u32, 1, 2, 3] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let _store = seeded_store(&enginefs, &engine);
+        enginefs.set_cache_budget(Some(50));
+        enginefs.on_stream_start(TEST_HASH, 0).await;
+        engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
+
+        enginefs.reconcile_tick().await;
+        for piece in [0u32, 1, 2, 3] {
+            assert!(
+                bucket.join(piece.to_string()).is_file(),
+                "piece {piece} of the pinned file is still on the disk after the tick"
+            );
+        }
+        assert!(
+            counters.dropped_ranges.lock().unwrap().is_empty(),
+            "and the backend was not asked to forget a piece of it"
         );
     }
 
