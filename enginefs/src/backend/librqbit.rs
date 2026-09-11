@@ -831,8 +831,9 @@ pub struct LibrqbitBackend {
 /// what turns `piece_reclaim` on for every add (see
 /// [`session_can_release_pieces`] and [`LibrqbitBackend::sets_piece_reclaim`]).
 ///
-/// The root is inside the cache root on purpose: piece files are cache, and
-/// `cache_cleaner` has to be able to walk, count and evict them.
+/// The root is inside the cache root on purpose: piece files are cache, so
+/// every byte of them is counted in the one usage figure and capped by the
+/// one published budget.
 ///
 /// Note what this does *not* do to a torrent's output folder. librqbit still
 /// records one per torrent and still reports file paths under it -- that is
@@ -2521,13 +2522,14 @@ impl TorrentHandle for LibrqbitHandle {
     }
 
     /// Whether the backend stopped this torrent because the volume ran out
-    /// of space, which the cache cleaner treats as a signal to evict rather
-    /// than as a dead torrent. The free `is_out_of_space` above is what
-    /// tells that error apart from every other fatal one, and says how the
-    /// needles were measured.
+    /// of space, which the reconciler reads as a torrent to start again
+    /// once the volume is over the resume line rather than as a dead one.
+    /// The free `is_out_of_space` above is what tells that error apart from
+    /// every other fatal one, and says how the needles were measured.
     ///
     /// Reads the state librqbit already holds behind one lock: no stats
-    /// rebuild, no syscall, cheap enough for the cleaner to ask on a timer.
+    /// rebuild, no syscall, cheap enough for the reconciler to ask on every
+    /// tick.
     async fn is_out_of_space(&self) -> bool {
         self.handle.with_state(|state| match state {
             ManagedTorrentState::Error(error) => is_out_of_space(error),
@@ -8474,7 +8476,7 @@ mod tests {
     ///
     /// This is the whole point of the policy being wired. Before it, the
     /// only thing between a stream and a full disk was the cache cleaner,
-    /// which walks the volume a minute after the last write at best; a
+    /// which walked the volume a minute after the last write at best; a
     /// torrent playing at 20 MB/s writes a gigabyte in that minute, and on
     /// the television this was written for the filesystem got there first
     /// and killed the torrent with ENOSPC ninety minutes into a film.
@@ -8501,7 +8503,7 @@ mod tests {
         let client_dir = tmp.path().join("client");
         let (efs, client_addr) = streaming_engine_fs(&client_dir).await;
 
-        // The cleaner's number, pushed in before anything opens a reader:
+        // The published cache budget, pushed in before anything opens a reader:
         // the policy is sized once, when the stream starts.
         efs.set_cache_budget(Some(RETENTION_BUDGET));
 

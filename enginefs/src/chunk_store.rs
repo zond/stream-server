@@ -378,8 +378,8 @@ impl ChunkDir {
     /// generic *public* `remove` on the shared store would be exactly the
     /// second door that interlock exists to refuse -- somewhere to unlink a
     /// torrent's piece behind the backend's back and have it go on
-    /// advertising bytes it no longer has -- so the `server` crate, cleaner
-    /// and routes and `/proxy` alike, cannot name this at all.
+    /// advertising bytes it no longer has -- so the `server` crate, routes
+    /// and `/proxy` alike, cannot name this at all.
     ///
     /// The bucket directory is left behind; it is pruned when the whole
     /// directory goes ([`Self::remove_if_empty`]). Removing it here would be

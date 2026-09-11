@@ -4151,7 +4151,7 @@ fn an_archive_member_read_lets_the_torrent_be_stopped_again_when_it_is_done() ->
 }
 
 /// A stream request below the free-space floor is refused with a `507`
-/// once a cleaner pass has had its chance -- not "degraded to memory-only",
+/// once a retention pass has had its chance -- not "degraded to memory-only",
 /// which re-selected the same disk-backed engine and streamed to the disk
 /// the check had just refused.
 ///

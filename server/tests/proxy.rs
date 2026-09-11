@@ -1998,7 +1998,7 @@ fn holds_no_more_than_after_the_last_byte(fixture: &Fixture, url: &str, at: u64,
 /// a torrent, and it is the same policy making it true. Before the playhead
 /// existed there was nothing here for a window to follow: the only thing
 /// between a proxied stream and a full disk was the cache cleaner, which
-/// walks the volume a minute after the last write at best, and a stream at
+/// walked the volume a minute after the last write at best, and a stream at
 /// 20 MB/s writes a gigabyte in that minute.
 ///
 /// Measured, not asserted about: the occupancy is the chunk files really on
@@ -2609,7 +2609,7 @@ fn the_cleaner_leaves_the_chunks_a_proxied_player_is_inside() -> anyhow::Result<
     // does arms no pass of its own, because a pass is armed by a byte
     // reaching a player and there are no bytes left to deliver. So the run
     // can be wider than the window by whatever the final stride wrote, and
-    // that surplus is the cleaner's to take: it is over the cap and nobody
+    // that surplus is the pass's to take: it is over the cap and nobody
     // is inside it. Asserting the whole run is protected would be asserting
     // that retention leaves no overshoot, which is a different claim, and
     // one this test would make only on the platforms where the last pass
@@ -2619,7 +2619,7 @@ fn the_cleaner_leaves_the_chunks_a_proxied_player_is_inside() -> anyhow::Result<
     let before = cached_chunk_indices(&fixture);
 
     // A cap of one chunk: everything on the disk is over it, so the only
-    // thing that can keep a byte is the gate.
+    // thing that can keep a byte is a window or a promise.
     fixture
         .handle
         .update_settings(serde_json::json!({ "cacheSize": CHUNK as f64 }))?;
@@ -2646,7 +2646,7 @@ fn the_cleaner_leaves_the_chunks_a_proxied_player_is_inside() -> anyhow::Result<
     // them with a body open: the response is framed round the window, which
     // is a promise about chunks that have to still be there when it reads
     // them. The window and not the run, for the reason given above: the
-    // run's surplus over the window was the cleaner's to take, and on the
+    // run's surplus over the window was the pass's to take, and on the
     // platforms where the last pass left one it did take it -- so a request
     // for the whole run is a request for bytes this test has just agreed
     // may be gone, and the origin answering for them is not a failure of
@@ -2676,7 +2676,7 @@ fn the_cleaner_leaves_the_chunks_a_proxied_player_is_inside() -> anyhow::Result<
     // more thing on its way round the disk.
     settled(&fixture);
 
-    // The cleaner goes round again with that body open. What it may not take
+    // The clean goes round again with that body open. What it may not take
     // now is what the body has yet to deliver -- and *that* is asserted in
     // bytes rather than in file names, because the chunks still owed are not
     // the test's to name: the socket takes bytes ahead of the reader, and a

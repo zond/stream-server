@@ -1372,8 +1372,9 @@ mod tests {
     /// A reader that has delivered nothing has no playhead to split at --
     /// the freshness rule this whole module is built on -- and a stream
     /// nothing is *bounding* has no window at all: what is on its disk is
-    /// then whatever the cleaner has not yet aged out, which is a different
-    /// quantity, and one row cannot honestly carry both.
+    /// then everything that was fetched, until a switch or a slack pass
+    /// takes the lot -- a different quantity, and one row cannot honestly
+    /// carry both.
     #[tokio::test]
     async fn a_stream_with_no_playhead_or_no_policy_has_no_window_to_show() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1401,8 +1402,11 @@ mod tests {
         drop(reader);
     }
 
-    /// And once a byte has gone out, the window round it is the cleaner's to
-    /// leave alone -- while the chunks the playhead has left behind are not.
+    /// And once a byte has gone out, the window round it is refused to
+    /// whatever asks -- while the chunks the playhead has left behind are
+    /// not. The cache cleaner's gate is what used to ask; the owner's own
+    /// cells answer now ([`inside_something_live`]), and the name is from
+    /// then.
     #[tokio::test]
     async fn a_window_a_player_is_inside_is_not_the_cleaners_to_take() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1436,10 +1440,10 @@ mod tests {
     /// No policy is installed when there is nothing to reclaim, and the hole
     /// that left was in the *other* answer: with no policy there was no
     /// window, so the gate released every chunk of a stream a player was
-    /// inside. The cleaner's cap is a per-volume number -- a 500 MB episode
-    /// under a 10 GB cap with 12 GB of other cache beside it is the ordinary
-    /// case -- so "the budget covers this entity" says nothing whatever
-    /// about whether the cleaner is about to take it.
+    /// inside. The cap is a per-volume number -- a 500 MB episode under a
+    /// 10 GB cap with 12 GB of other cache beside it is the ordinary case
+    /// -- so "the budget covers this entity" says nothing whatever about
+    /// whether anything is about to take it.
     #[tokio::test]
     async fn a_budget_that_covers_the_entity_still_holds_the_chunk_under_the_head() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1468,8 +1472,8 @@ mod tests {
     /// volume may hold. Reading that as zero would have the first proxied
     /// stream of every boot reclaim every chunk behind its playhead before
     /// anything had measured the disk -- and reading it as "no protection
-    /// either" would have the cleaner's first pass, which is the very pass
-    /// that publishes the budget, free to take the chunk under the head.
+    /// either" would leave the chunk under the head free for the taking
+    /// until the first publication landed.
     #[tokio::test]
     async fn nothing_is_reclaimed_before_a_budget_has_been_published() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1781,9 +1785,10 @@ mod tests {
     /// holds.**
     ///
     /// A pass measures against one budget for the length of it, and the
-    /// cleaner publishes a budget after every walk -- `min(configured,
-    /// occupied + available - floor)`, which moves whenever the volume does,
-    /// and which is an absence again the moment the volume cannot be read.
+    /// budget is restated on the minute and at every settings change --
+    /// `min(configured, occupied + available - floor)`, which moves whenever
+    /// the volume does, and which is an absence again the moment the volume
+    /// cannot be read.
     /// Letting the finishing pass conclude over that would go on
     /// reclaiming to a cap nobody has published, which is the one thing
     /// [`CacheBudget::Unbounded`] says not to do -- and nothing would ever
@@ -1814,9 +1819,9 @@ mod tests {
         // Playback fills what it passes over, as it does.
         write_chunks(&dir, 0..16);
 
-        // While the next pass is working: the cleaner's walk finds no cap at
-        // all -- no `cacheSize` set and a volume whose free space it could
-        // not read -- and a byte goes out under it.
+        // While the next pass is working: the next publication finds no cap
+        // at all -- no `cacheSize` set and a volume whose free space it
+        // could not read -- and a byte goes out under it.
         let into_hook = reader.clone();
         let published = budget.clone();
         *retention.interleave.lock().unwrap() = Some(Arc::new(move || {
@@ -1859,11 +1864,10 @@ mod tests {
     /// just been played.
     ///
     /// So the playheads are read after the listing, and asked about again
-    /// at each unlink -- the same second asking the cleaner's own delete
-    /// makes. Playback moves here at both of those moments, which is what
-    /// says both are load-bearing: with either reading taken early, the
-    /// chunks it did not see are reclaimed, and the pass that the movement
-    /// arms then takes the rest.
+    /// at each unlink. Playback moves here at both of those moments, which
+    /// is what says both are load-bearing: with either reading taken early,
+    /// the chunks it did not see are reclaimed, and the pass that the
+    /// movement arms then takes the rest.
     #[tokio::test]
     async fn a_pass_reclaims_round_where_playback_has_got_to_while_it_ran() {
         const CHUNKS: u64 = 32;
@@ -2039,12 +2043,12 @@ mod tests {
     ///
     /// What that left behind was not a fraction of a window. Every chunk
     /// written since the running pass took its listing stayed on the disk,
-    /// over the budget, until the cleaner's hourly walk got to it -- and
-    /// [`ProxyRetention::fill_gate`] went on answering the cleaner with the
-    /// window that pass had measured, which names where the player *was*
-    /// rather than where it stopped. So the cleaner was offered the bytes
-    /// round the playhead and refused the ones the player had left behind,
-    /// which is the grace exactly inside out.
+    /// over the budget, until the hourly walk of the cache cleaner that
+    /// then existed got to it -- and the fill's own gate went on answering
+    /// that walk with the window the parked pass had measured, which names
+    /// where the player *was* rather than where it stopped. So the walk was
+    /// offered the bytes round the playhead and refused the ones the player
+    /// had left behind, which is the grace exactly inside out.
     ///
     /// The last byte lands from inside the pass -- the hook delivers it once
     /// the pass has measured the head of the film and is about to unlink --

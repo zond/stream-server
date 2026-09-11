@@ -153,8 +153,9 @@ impl ArchiveReader for SevenZHandler {
         })
         .await??;
 
-        // The extracted member lands under the cache root, where the cleaner
-        // counts it (see `CacheConfig::scratch_dir`).
+        // The extracted member lands in the archive scratch dir, which
+        // nothing counts and whose session unlinks it (see
+        // `archives::SCRATCH_DIR_NAME`).
         let (cache, writer) =
             ProgressiveCache::new_in_dir(&self.cache_config.scratch_dir(), Some(file_size)).await?;
 

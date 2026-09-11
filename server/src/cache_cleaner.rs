@@ -426,10 +426,10 @@ mod tests {
 
         // `u64::MAX` is what `cache_size_bytes(None)` produces for an
         // unlimited cache -- the only value [`cache_usage`] treats as "no
-        // limit" (unlike `evict`'s own `limit == 0` shortfall check: `0` is
-        // a distinct, explicit zero-size cap, per `ServerSettings.cache_size`
-        // -- `Some(0.0)`, not `None` -- and `CacheUsage` must not blur the
-        // two the way `EvictionReport::shortfall_message` does).
+        // limit". `0` is a distinct, explicit zero-size cap, per
+        // `ServerSettings.cache_size` -- `Some(0.0)`, not `None` -- and
+        // `CacheUsage` must not blur the two the way
+        // `EvictionReport::shortfall_message` does.
         // What the proxy owner would hand up beside it: one chunk of a
         // stream a player is inside.
         const CHUNK: u64 = crate::proxy_cache::CHUNK_BYTES;

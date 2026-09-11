@@ -621,7 +621,7 @@ fn with_cors(builder: Builder) -> Builder {
 /// sentence), so for it they say the same thing.
 ///
 /// Nothing else in the header is read. There is no freshness lifetime here
-/// to compute: an entry is served until the cleaner evicts it, and a
+/// to compute: an entry is served until a retention pass takes it, and a
 /// `max-age` of an hour would not make that true any earlier.
 ///
 /// **This header was read nowhere in this file before the cache existed.**

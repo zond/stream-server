@@ -512,7 +512,7 @@ fn resolve_cache_size(v: &Value) -> Option<Option<f64>> {
 }
 
 /// Convert the client-facing `cacheSize` (bytes, `None` = unlimited) into a
-/// byte cap for the engine/eviction code. `None` (and any out-of-range or
+/// byte cap for the engine's retention code. `None` (and any out-of-range or
 /// non-finite value) saturates to `u64::MAX`, which is effectively
 /// unbounded for every downstream size comparison.
 pub fn cache_size_bytes(cache_size: Option<f64>) -> u64 {
@@ -1041,9 +1041,9 @@ pub async fn update_settings(
     // `cacheSize` is half of what caps the cache, so a client that changed
     // it has changed the cap -- and that cap is the budget the retention
     // policy over the piece store and the proxy cache is sized from. Stated
-    // here rather than left to the next eviction pass: a pass runs a minute
-    // after the last write at best, and until one did, everything already
-    // playing stayed bounded by the number the client has just replaced.
+    // here rather than left to the next budget tick: that is a minute away
+    // at worst, and until it came, everything already playing stayed bounded
+    // by the number the client has just replaced.
     // Ordered against every other reading of the volume, like all of them
     // (`crate::cache_budget`).
     crate::cache_budget::publish_now(state).await;

@@ -21,10 +21,10 @@
 //! is never held across an await, and it is never taken out: a pass advances
 //! it in place. What a pass holds instead is the entity's **turn**, a tokio
 //! mutex over a zero-sized [`Turn`] token -- `Engine::announce` made per
-//! entity and given to the proxy too. Whoever holds the turn is the one party
-//! installing, clearing, passing or cleaner-deleting on that entity, and the
-//! turn *is* held across that party's I/O, because that is what keeps
-//! "nothing becomes announced between the decision and the unlink" true.
+//! entity and given to the proxy too. Whoever holds the turn is the one
+//! party installing, clearing or passing on that entity, and the turn *is*
+//! held across that party's I/O, because that is what keeps "nothing
+//! becomes announced between the decision and the unlink" true.
 //! The guard is the [`Claim`], and a dead pass drops it like any other
 //! local: the entity is passable again, and the policy is still in its cell.
 //!
@@ -60,9 +60,9 @@
 //!    (`pinned_files.read()`) is asked before L2 is taken, in the [`Door`]
 //!    and in the pass.
 //! 3. T is awaited (`lock().await`) only with NO owner lock held:
-//!    [`Retention::pass`]'s callers, [`Retention::install`],
-//!    [`Retention::clear`] and the cleaner's delete take it first. T → L2
-//!    briefly is allowed. `try_lock` on T IS allowed under L2 -- deliberately:
+//!    [`Retention::pass`]'s callers, [`Retention::install`] and
+//!    [`Retention::clear`] take it first. T → L2 briefly is allowed.
+//!    `try_lock` on T IS allowed under L2 -- deliberately:
 //!    "is a pass running" and "is this byte due" must be one reading (today
 //!    `running` and `moved` are read under one map lock), and **every exit
 //!    of the pass** must decide `again` and either hand the claim on or drop
@@ -116,9 +116,9 @@
 //! is [`Mode::Live`].
 //!
 //! One body with two entries. [`Retention::turn`] queues on T for the
-//! torrent's tick and the cleaner's delete; [`Reader::note`] claims T with a
-//! `try_lock` when a delivered byte moved a stride, which is the proxy's
-//! trigger. Both hand a [`Claim`] to [`Retention::pass`], whose steps are:
+//! torrent's tick and the proxy's slack sweep; [`Reader::note`] claims T
+//! with a `try_lock` when a delivered byte moved a stride, which is the
+//! proxy's trigger. Both hand a [`Claim`] to [`Retention::pass`], whose steps are:
 //!
 //! 1. [`Backing::keeps_everything`] → clear, conclude nothing.
 //! 2. Snapshot heads and promises under L2.
@@ -464,8 +464,8 @@ pub trait Backing: Sized + Send + Sync + 'static {
 /// policy and its turn. One per proxy cache; one per torrent engine.
 pub struct Retention<B: Backing> {
     backing: Arc<B>,
-    /// The cleaner's cap, the one cell both sides read. Read before L2 and
-    /// never under it.
+    /// The published cache budget, the one cell both sides read. Read before
+    /// L2 and never under it.
     budget: Arc<RetentionBudget>,
     /// L1. The entities by key. Held for lookup, insert, prune and
     /// iterate-for-holdings only.
@@ -749,8 +749,8 @@ struct Begin<B: Backing> {
 }
 
 impl<B: Backing> Retention<B> {
-    /// An owner with no entities, over `backing`, reading the cleaner's cap
-    /// from `budget`. `Arc`, because every [`Reader`] holds its owner.
+    /// An owner with no entities, over `backing`, reading its cap from
+    /// `budget`. `Arc`, because every [`Reader`] holds its owner.
     pub fn new(backing: Arc<B>, budget: Arc<RetentionBudget>) -> Arc<Self> {
         // `install_now` swaps a policy under L2 alone, with no backend call;
         // that is only sound for a backing that held nothing back for the
@@ -977,9 +977,8 @@ impl<B: Backing> Retention<B> {
         // Whatever was held back before goes back into what we announce
         // first, whether or not a new policy is going in. Otherwise an
         // entity whose reader moved on would leave the old range announced
-        // to nobody for the life of the owner, while the cleaner's gate --
-        // which reads "no policy covers this piece" as "we announce it" --
-        // called those same pieces protected.
+        // to nobody for the life of the owner, with no policy left to say
+        // that it was held back.
         if !self.clear_under(&entity, &mut claim).await {
             return InstallOutcome::OldStands;
         }
@@ -1036,12 +1035,12 @@ impl<B: Backing> Retention<B> {
     /// **The range is advertised back first, and the policy forgotten only
     /// when that succeeded.** Today's order is the reverse -- slot to
     /// `None`, then re-advertise, and a backend that refuses leaves the
-    /// pieces held back beside an empty slot, which the cleaner's gate reads
-    /// as announced: held back and protected at once, the one combination
-    /// that is never right, logged at debug. Here a refusal keeps the policy
-    /// (still bounding, still holding back, still telling the gate the
-    /// truth), warns, and the next clear -- the next pass under a pin, the
-    /// next install -- retries. Under [`Share::Nothing`] nothing was held
+    /// pieces held back beside an empty slot, which the deleted cache
+    /// cleaner's gate read as announced: held back and protected at once,
+    /// the one combination that is never right, logged at debug. Here a
+    /// refusal keeps the policy (still bounding, still holding back, still
+    /// telling the truth about it), warns, and the next clear -- the next
+    /// pass under a pin, the next install -- retries. Under [`Share::Nothing`] nothing was held
     /// back and there is nothing to put back.
     ///
     /// What the policy stopped wanting is not wanted again here: that is
@@ -1126,8 +1125,8 @@ impl<B: Backing> Retention<B> {
         self.backing.want_all(&domain).await;
     }
 
-    /// The entity's turn, awaited: the torrent's tick and the cleaner's
-    /// delete queue here, with no owner lock held (rule 3). `None` is a key
+    /// The entity's turn, awaited: the torrent's tick and the proxy's slack
+    /// sweep queue here, with no owner lock held (rule 3). `None` is a key
     /// with no entity, so nothing to serialise against.
     pub async fn turn(&self, key: &B::Key) -> Option<Claim> {
         let entity = self.lookup(key)?;
@@ -1685,7 +1684,8 @@ impl<B: Backing> Retention<B> {
     }
 
     /// How many open reads have promised pieces or delivered a byte and have
-    /// not ended: the gate's own reason for refusing the cleaner, counted.
+    /// not ended: what says an entity is still being read when nothing is
+    /// playing it.
     pub fn readers(&self) -> usize {
         let entities: Vec<Arc<Entity<B>>> = self.entities.lock().values().cloned().collect();
         entities
@@ -1919,7 +1919,7 @@ impl<B: Backing> State<B> {
     ///
     /// The windows go with the policy, deliberately: a window is what a
     /// pass measured round a head somebody was at, and an entity nobody is
-    /// playing has none. Left standing they would tell the cleaner's gate
+    /// playing has none. Left standing they would tell a protection reading
     /// that a left file's pieces are protected, which is how a switch used
     /// to leave the previous film on the disk under two owners' protection
     /// and neither one's deleter.
@@ -3227,10 +3227,9 @@ mod tests {
     /// The pass drops the policy under the turn whether or not the unlinks
     /// that follow succeed, and the windows go with it. A window is what
     /// some pass measured round a head somebody was at; left standing on an
-    /// entity nobody is playing it tells the cleaner's gate that the left
-    /// file's pieces are protected -- which is a piece with two owners'
-    /// protection and neither one's deleter, the shape this slice exists to
-    /// remove.
+    /// entity nobody is playing it tells [`Retention::holdings`] that the
+    /// left file's pieces are protected -- which is a piece with protection
+    /// and no deleter, the shape this slice exists to remove.
     #[tokio::test]
     async fn a_slack_pass_that_took_nothing_leaves_no_window_standing() {
         let (backing, owner, _budget) = torrent();
@@ -3591,10 +3590,10 @@ mod tests {
     /// listing gets its pass.**
     ///
     /// The interleaving: the reader's byte at piece 2 claims the turn and
-    /// its pass parks at the listing; the cleaner publishes a smaller
-    /// budget; the body's last byte, piece 6, lands -- it decides the new
-    /// policy under L2, is due (every reader is), tries the turn, finds it
-    /// taken, and the body ends. The pass resumes and refuses at its
+    /// its pass parks at the listing; a smaller budget is published; the
+    /// body's last byte, piece 6, lands -- it decides the new policy under
+    /// L2, is due (every reader is), tries the turn, finds it taken, and
+    /// the body ends. The pass resumes and refuses at its
     /// re-read, correctly: it measured for a budget nobody holds. Dropped
     /// there with no `again`, the claim takes the last byte's pass with it,
     /// and the tail the fill wrote stays over budget until the grace prunes

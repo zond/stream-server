@@ -6495,7 +6495,7 @@ mod tests {
     /// `<downloadsDir>/<info hash>`, with the hash parked as an in-flight
     /// add for the length of the move and the engine rebuilt on the far
     /// side. The pin is a retention property: what it changes is the
-    /// want-set and what the cleaner may take, never a location.
+    /// want-set and what a retention pass may take, never a location.
     #[tokio::test]
     async fn pin_download_leaves_a_managed_torrent_exactly_where_it_is() {
         let (enginefs, counters) = test_enginefs_with_file_count(3);
@@ -7804,8 +7804,8 @@ mod tests {
     /// player spinning for ever. Refusing reads wakes the parked one to
     /// fail with `StorageFull`, fails a new one at its first poll, and the
     /// reconciler does the refusing itself once the volume has been short
-    /// for [`STOPPED_READ_STALL_BOUND`] -- the bound for a cleaner that is
-    /// not there to settle it sooner.
+    /// for [`STOPPED_READ_STALL_BOUND`] -- the bound for a volume nothing
+    /// here can free.
     #[tokio::test(start_paused = true)]
     async fn readers_of_a_torrent_stopped_for_space_are_failed_rather_than_parked() {
         use tokio::io::{AsyncRead, AsyncReadExt};
@@ -7836,8 +7836,8 @@ mod tests {
         .await;
         assert!(parked, "a read on a missing piece parks");
 
-        // Stopped, inside the stall bound: the read stays parked (the
-        // cleaner is expected to settle it), so a task on it does not end.
+        // Stopped, inside the stall bound: the read stays parked (a slack
+        // pass may still give the room back), so a task on it does not end.
         enginefs.reconcile_tick().await;
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
         assert!(engine.is_stopped_for_space().await);
@@ -8014,7 +8014,7 @@ mod tests {
     /// the volume then falls under the floor and stays there past the stall
     /// bound, so the free-space arm -- which sits above the idle arm and
     /// does not care why the torrent is stopped -- fails its readers; the
-    /// cleaner empties the volume; and the user presses play. The playback
+    /// volume gets its room back; and the user presses play. The playback
     /// start's own reconcile is what starts it, and on the *next* pass the
     /// torrent is already `Live`, so there is no start left to hang the
     /// lift on. Every read on that engine then failed with `StorageFull`,
@@ -8040,7 +8040,7 @@ mod tests {
             std::io::ErrorKind::StorageFull
         );
 
-        // The cleaner empties the volume; the user presses play.
+        // The volume gets its room back; the user presses play.
         available.store(u64::MAX, Ordering::SeqCst);
         enginefs.on_stream_start(TEST_HASH, 0).await;
         assert_eq!(
@@ -8129,7 +8129,8 @@ mod tests {
         // been short for `STOPPED_READ_STALL_BOUND`. So the readers that
         // report a condition are asked at the ladder's own line: a client
         // that is about to be told `StorageFull` is not told everything is
-        // fine, and the cleaner is asked for the room that would end it.
+        // fine, and the running-low bell has been rung for the room that
+        // would end it.
         //
         // This asserted the opposite, on the rule that the hysteresis was
         // the ladder's line and nobody else's. That rule made the band an
@@ -8806,7 +8807,7 @@ mod tests {
     /// disk: the refusal comes before anything is downloaded, so the add
     /// wrote nothing of its own, and what the store already holds for the
     /// hash was fetched by an earlier stream or an earlier session whose
-    /// backend records are gone. Those bytes are cache for the cleaner, not
+    /// backend records are gone. Those bytes are the retention owner's, not
     /// a failed pin's to delete.
     ///
     /// The pin used to take the files whenever `<downloadsDir>/<info hash>`
@@ -10475,8 +10476,8 @@ mod tests {
     /// no registered store, so its directory is in the unregistered half of
     /// the total -- `stat`ed, because nothing holds bits for it -- and
     /// nothing in the engines' loop above ever names it. Nothing can take
-    /// those bytes either: the pin stands, the cleaner is told they are
-    /// announced (`Self::reclaim_verdicts`) and the sweep at launch keeps
+    /// those bytes either: the pin stands, every unlink goes through a
+    /// registered store and there is none, and the sweep at launch keeps
     /// the pin set. So reporting them as reclaimable tells a client a
     /// shortfall has a remedy it has not got, which is the same wrong
     /// answer as calling slack protected, in the other direction.
@@ -12546,8 +12547,7 @@ mod tests {
     /// file the torrent has stopped wanting will not fetch the piece again,
     /// so there is no loop to avoid and no data anybody asked for to lose.
     /// A rule that refused every boundary piece instead would leave two
-    /// pieces of every file on the disk for ever, and the cache cleaner
-    /// walking a volume of them.
+    /// pieces of every file on the disk for ever.
     #[tokio::test]
     async fn a_shared_piece_goes_once_the_file_that_shares_it_is_out_of_the_want_set() {
         let (enginefs, counters) = test_enginefs_with_files(vec![
@@ -14283,10 +14283,10 @@ mod tests {
 
     /// A dormant pin's bytes are its pieces, and an unpin that asks to take
     /// the data goes and takes them: the store's directory for the hash,
-    /// which `protected_paths` holds the cleaner off for as long as the pin
-    /// stands -- and the entry leaves `downloads.json` with the pin, so no
-    /// client could ask again either. The directory stays while another file
-    /// of the same torrent is still pinned: it holds that file's pieces too.
+    /// which nothing may take for as long as the pin stands -- and the
+    /// entry leaves `downloads.json` with the pin, so no client could ask
+    /// again either. The directory stays while another file of the same
+    /// torrent is still pinned: it holds that file's pieces too.
     ///
     /// This used to delete `<downloadsDir>/<info hash>`, and so deleted
     /// nothing at all on an install with no separate downloads directory

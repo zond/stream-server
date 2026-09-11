@@ -284,7 +284,7 @@ pub(crate) async fn publish_now(state: &AppState) -> Option<u64> {
 /// `run` builds the router, so the first request of the process is served
 /// by a bounded cache rather than by one that will be bounded shortly.
 /// That is the whole point on a device with sixteen thousand cache files,
-/// where the first walk of the root is minutes away
+/// where the first walk of the root used to be minutes away
 /// (`server/tests/proxy.rs`,
 /// `a_stream_relayed_before_anything_has_walked_the_cache_is_still_bounded`).
 pub async fn start(state: Arc<AppState>) -> JoinHandle<()> {
@@ -574,10 +574,9 @@ mod tests {
 
     /// **The cap is restated on the minute, and not before the first one.**
     ///
-    /// The interval is set by how long the cap may be wrong for -- the
-    /// number it re-reads is what the rest of the device did to the volume
-    /// -- and a walk longer than it is overtaken with certainty, which the
-    /// module doc leans on. So the value is pinned, not only the loop: a
+    /// The interval is set by how long the cap may be wrong for: the
+    /// number it re-reads is what the rest of the device did to the volume.
+    /// So the value is pinned, not only the loop: a
     /// longer interval is a cap wrong for longer, a shorter one is a
     /// `statvfs` the device does not need.
     #[tokio::test(start_paused = true)]

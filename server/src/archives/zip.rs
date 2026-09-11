@@ -120,8 +120,8 @@ impl ArchiveReader for ZipHandler {
         let size = entry.uncompressed_size();
 
         // Use ProgressiveCache for robust seeking. The extracted member lands
-        // under the cache root, where the cleaner counts it (see
-        // `CacheConfig::scratch_dir`).
+        // in the archive scratch dir, which nothing counts and whose session
+        // unlinks it (see `archives::SCRATCH_DIR_NAME`).
         let (cache, mut writer) =
             ProgressiveCache::new_in_dir(&self.cache_config.scratch_dir(), Some(size)).await?;
 
