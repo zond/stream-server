@@ -3004,12 +3004,20 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// The two readings it is made of are taken here, before the cell is
     /// written, because the cell's writer may not read a second lock under
     /// it ([`crate::retention::live::Live::open`]).
+    ///
+    /// **And they are taken after the engine is looked up, with nothing
+    /// awaited between them and the write.** The lookup waits on the
+    /// registry, and another open can move the cell in that wait. Read
+    /// before it, the cell named a file that was no longer the one playing,
+    /// and the count of its readers was asked of that file: a subtitle's
+    /// open that had read "episode one, nobody reading it" took the cell
+    /// off episode two, which had opened and begun delivering meanwhile.
     async fn switch_to(&self, info_hash: &str, file_idx: usize) {
+        let engine = self.peek_engine(info_hash).await;
         let keep_current = match self.live.reading().file_of(info_hash) {
-            Some(playing) if playing != file_idx => self
-                .peek_engine(info_hash)
-                .await
-                .is_some_and(|engine| engine.retention.readers_of(&playing) > 0),
+            Some(playing) if playing != file_idx => {
+                engine.is_some_and(|engine| engine.retention.readers_of(&playing) > 0)
+            }
             _ => false,
         };
         let switch = self.live.open(
@@ -13129,6 +13137,57 @@ mod tests {
             enginefs.live().reading().file_of(TEST_HASH),
             Some(1),
             "with nothing left reading file 0, this is the viewer moving on"
+        );
+    }
+
+    /// **And the aside rule is asked of the cell as it stands when the open
+    /// writes it, not as it stood before the open looked the engine up.**
+    ///
+    /// Episode one has ended and nothing reads it. The player opens episode
+    /// two and, at once, its subtitle. The subtitle's open read the cell --
+    /// episode one -- and then waited on the registry; episode two's open
+    /// moved the cell and its response began delivering in that wait. The
+    /// subtitle then asked whether anything still read *episode one*,
+    /// heard no, called itself a move and took the cell off the episode
+    /// being watched: the next tick's slack pass is due over it, and takes
+    /// its bytes the first time the player is between two responses.
+    #[tokio::test(start_paused = true)]
+    async fn an_open_asks_the_aside_rule_of_the_cell_it_is_about_to_write() {
+        let (enginefs, _counters) = test_enginefs_with_file_count(3);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        engine.begin_retention(0).await;
+        engine.begin_retention(1).await;
+        let torrent = |file_idx| crate::retention::live::LiveEntity::Torrent {
+            info_hash: TEST_HASH.to_string(),
+            file_idx,
+        };
+        enginefs.live().open(torrent(0), false);
+        let enginefs = Arc::new(enginefs);
+
+        // The subtitle's open, waiting on the registry behind a writer.
+        let registry = enginefs.engines.write().await;
+        let subtitle = tokio::spawn({
+            let enginefs = enginefs.clone();
+            async move { enginefs.switch_to(TEST_HASH, 2).await }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Episode two opens in that wait, and a response starts on it.
+        enginefs.live().open(torrent(1), false);
+        let reader = engine
+            .retention
+            .reader_on(&1)
+            .expect("file 1 has an entity");
+        reader.promises(0..1);
+        drop(registry);
+        subtitle.await.expect("the subtitle's open");
+
+        assert_eq!(
+            enginefs.live().reading().file_of(TEST_HASH),
+            Some(1),
+            "an open decided against the episode that had ended took the cell off the one being read"
         );
     }
 
