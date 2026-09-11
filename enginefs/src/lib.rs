@@ -1134,11 +1134,20 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     let mut removed = Vec::with_capacity(to_remove.len());
                     for engine in to_remove {
                         let hash = &engine.info_hash;
-                        let current = write.get(hash).is_some_and(|current| Arc::ptr_eq(current, &engine));
-                        let age_secs = now.saturating_sub(engine.last_accessed.load(std::sync::atomic::Ordering::SeqCst));
+                        let current = write
+                            .get(hash)
+                            .is_some_and(|current| Arc::ptr_eq(current, &engine));
+                        let age_secs = now.saturating_sub(
+                            engine
+                                .last_accessed
+                                .load(std::sync::atomic::Ordering::SeqCst),
+                        );
                         let still_idle = current
                             && !engine.is_pinned()
-                            && engine.active_streams.load(std::sync::atomic::Ordering::SeqCst) == 0
+                            && engine
+                                .active_streams
+                                .load(std::sync::atomic::Ordering::SeqCst)
+                                == 0
                             && age_secs > INACTIVE_TORRENT_REMOVE_TIMEOUT.as_secs()
                             && !live_clone.is_torrent(hash);
                         if !still_idle {
@@ -4777,15 +4786,15 @@ mod tests {
         /// on the first channel as it enters the call and waits on the
         /// second before returning, so a test can ask what a pin does
         /// while a removal is inside the backend. Runs once and is gone.
-        remove_gate: Arc<
-            Mutex<
-                Option<(
-                    tokio::sync::oneshot::Sender<()>,
-                    tokio::sync::oneshot::Receiver<()>,
-                )>,
-            >,
-        >,
+        remove_gate: Arc<Mutex<Option<Gate>>>,
     }
+
+    /// A parked backend call's two ends, as the fake holds them: it sends
+    /// on the first as it enters the call and waits on the second.
+    type Gate = (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    );
 
     impl FakeBackend {
         fn new(handles: Vec<FakeHandle>) -> Self {
