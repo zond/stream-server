@@ -229,8 +229,14 @@ impl ProxyDomain {
 struct ProxyBacking {
     /// Which entity the server is playing, the one cell the whole process
     /// reads ([`enginefs::retention::live`]). Asked at the top of every
-    /// slack pass and once per run at its [`Door`], so a body that opens on
-    /// an entity while its bytes are going stops the run where it stands.
+    /// slack pass, and then once per candidate chunk at its [`Door`]: this
+    /// backing reclaims chunk by chunk ([`ProxyBacking::reclaim`]) rather
+    /// than run by run through `Door::windows_now`, which is the torrent's
+    /// shape, so every unlink it is about to make asks the cell again and a
+    /// body that opens on an entity while its bytes are going stops the run
+    /// where it stands. That is a read of the watch's lock from a blocking
+    /// thread per chunk, which is why [`Live::is_proxy`] borrows rather
+    /// than clones.
     live: Arc<Live>,
     /// The threads the blocking halves of a pass really ran on.
     ///
@@ -2219,6 +2225,51 @@ mod tests {
         drop(watching);
     }
 
+    /// **A sweep is the cache moving, and it is counted as such.**
+    ///
+    /// `ServerHandle::proxy_cache_settled` is how anything outside this
+    /// module waits for the cache root to hold still before it lists it,
+    /// and what it waits on is `crate::proxy_cache::DiskWork`. A sweep that
+    /// took no ticket would be unlinks nobody had counted: the wait would
+    /// return while a pass was still deciding what to take, and the listing
+    /// after it would be of a directory mid-delete. The interleave hook
+    /// runs inside the pass with the entity's turn held, which is exactly
+    /// where the count may not read zero.
+    #[tokio::test]
+    async fn a_sweep_is_counted_as_disk_work_while_it_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let left = ChunkDir::new(tmp.path().join("left"));
+        write_chunks(&left, 0..16);
+        let retention = retention(Some(12 * CHUNK_BYTES));
+
+        let played = retention.reader(&left, TOTAL, TARGET.into());
+        played.note(0);
+        drop(played);
+        // The open that makes `left` slack, and then a wait for every pass
+        // the delivered byte armed: what the sweep is measured by has to be
+        // the sweep's own ticket and nobody else's.
+        let opened = ChunkDir::new(tmp.path().join("opened"));
+        let watching = retention.reader(&opened, TOTAL, "https://origin.example/next.mkv".into());
+        settled(&retention, "the playing body's own pass ran", |_| true).await;
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        *retention.interleave.lock().expect("the interleave slot") = Some(Arc::new({
+            let work = retention.work.clone();
+            let seen = seen.clone();
+            move || seen.lock().expect("the record").push(work.idle())
+        }));
+        retention.drop_slack().await;
+
+        let seen = seen.lock().expect("the record").clone();
+        assert!(!seen.is_empty(), "the sweep ran no pass to be counted");
+        assert!(
+            !seen.iter().any(|idle| *idle),
+            "the cache said it had stopped moving from inside a pass that \
+             had not yet unlinked anything"
+        );
+        drop(watching);
+    }
+
     /// **The cell is the server's, not the proxy's: a torrent stream
     /// opening ends a proxied one, and the other way round.**
     ///
@@ -2236,6 +2287,17 @@ mod tests {
         write_chunks(&dir, 0..16);
         let retention = retention(Some(12 * CHUNK_BYTES));
         let live = retention.live.clone();
+        // What `on_stream_start` does when the viewer opens a torrent file.
+        let torrent = || enginefs::retention::live::LiveEntity::Torrent {
+            info_hash: HASH.to_string(),
+            file_idx: 0,
+        };
+
+        // The torrent is what is playing *first*, so the proxied open below
+        // has something to take the cell from. Without this the assertion
+        // after it would hold of a cell nothing had ever written.
+        live.open(torrent(), false);
+        assert_eq!(live.reading().file_of(HASH), Some(0));
 
         let reader = retention.reader(&dir, TOTAL, TARGET.into());
         reader.note(0);
@@ -2247,14 +2309,7 @@ mod tests {
              torrent is being played, so its files are slack"
         );
 
-        // What `on_stream_start` does when the viewer opens a torrent file.
-        live.open(
-            enginefs::retention::live::LiveEntity::Torrent {
-                info_hash: HASH.to_string(),
-                file_idx: 0,
-            },
-            false,
-        );
+        live.open(torrent(), false);
         assert_eq!(live.reading().file_of(HASH), Some(0));
 
         retention.drop_slack().await;

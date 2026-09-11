@@ -144,9 +144,10 @@ impl Live {
     }
 
     /// Whether the proxied entity in `dir` is the one being played, off the
-    /// watch's own lock with nothing cloned. Asked once per reclaim run,
-    /// from a blocking thread, so a `PathBuf` per ask would be an
-    /// allocation per unlink.
+    /// watch's own lock with nothing cloned. Asked once per candidate chunk
+    /// of a proxy slack pass -- that backing reclaims chunk by chunk, not
+    /// run by run -- from a blocking thread, so a `PathBuf` per ask would
+    /// be an allocation per unlink.
     pub fn is_proxy(&self, dir: &Path) -> bool {
         matches!(
             &*self.0.borrow(),

@@ -1438,16 +1438,29 @@ fn nothing_the_rules_refuse_is_cached() -> anyhow::Result<()> {
     // is refused outright rather than keyed, since `/proxy` takes no bearer
     // token of its own and an entry one caller's secret filled is one any
     // other caller could name.
-    let fill = |path: &str| -> anyhow::Result<std::path::PathBuf> {
+    //
+    // Two claims per case, and the second is the one the running total used
+    // to carry: the filled entity is intact *and* nothing outside it holds a
+    // chunk. A refused request answered from disk would fail the first; one
+    // that quietly filed an entry of its own -- under the framing of a body
+    // it never carried, which is a directory of its own -- would fail the
+    // second and nothing else here would notice it.
+    //
+    // `fill` says which entity it filled and which entities may hold a chunk
+    // after it: what was there before, plus the one it made.
+    let fill = |path: &str| -> anyhow::Result<(PathBuf, std::collections::BTreeSet<PathBuf>)> {
         settled(&fixture);
         let before = cached_entities(&fixture);
         let response = client.get(proxied(path)).send()?;
         assert_eq!(response.bytes()?.len(), ORIGIN_LENGTH);
         fixture.origin.next_request();
-        Ok(wait_for_new_entity(&fixture, &before, 4))
+        let entity = wait_for_new_entity(&fixture, &before, 4);
+        let mut known = before;
+        known.insert(entity.clone());
+        Ok((entity, known))
     };
 
-    let filled = fill("/whole/none/head.mp4")?;
+    let (filled, known) = fill("/whole/none/head.mp4")?;
     let head = client.head(proxied("/whole/none/head.mp4")).send()?;
     assert_eq!(head.status(), reqwest::StatusCode::OK);
     assert!(
@@ -1458,6 +1471,8 @@ fn nothing_the_rules_refuse_is_cached() -> anyhow::Result<()> {
         fixture.origin.next_request().line.starts_with("HEAD"),
         "a HEAD has no body to keep, so it has no entry to read from either"
     );
+    settled(&fixture);
+    assert_nothing_new_is_cached(&fixture, &known, "a HEAD must file no entry of its own");
     assert_eq!(
         cached_chunks_by_entity(&fixture).get(&filled).copied(),
         Some(4),
@@ -1481,7 +1496,7 @@ fn nothing_the_rules_refuse_is_cached() -> anyhow::Result<()> {
     assert_eq!(response.bytes()?.len(), ORIGIN_LENGTH);
     assert!(fixture.origin.was_asked_for_nothing_more());
 
-    let filled = fill("/whole/none/conditional.mp4")?;
+    let (filled, known) = fill("/whole/none/conditional.mp4")?;
     let conditional = client
         .get(proxied("/whole/none/conditional.mp4"))
         .header(reqwest::header::RANGE, "bytes=0-")
@@ -1492,10 +1507,16 @@ fn nothing_the_rules_refuse_is_cached() -> anyhow::Result<()> {
         fixture.origin.next_request().header("if-range").is_some(),
         "a conditional cannot be answered by a store that never revalidates"
     );
+    settled(&fixture);
+    assert_nothing_new_is_cached(
+        &fixture,
+        &known,
+        "an If-Range must file no entry of its own",
+    );
     assert_eq!(
         cached_chunks_by_entity(&fixture).get(&filled).copied(),
         Some(4),
-        "and it left nothing of its own behind either"
+        "and it left the entity the GET filled exactly as it found it"
     );
 
     let before = cached_entities(&fixture);

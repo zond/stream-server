@@ -342,15 +342,18 @@ pub trait Backing: Sized + Send + Sync + 'static {
     /// Whether `key` is the entity being played **at this instant**
     /// ([`crate::retention::live`]).
     ///
-    /// Asked twice on a [`Mode::Slack`] pass, and by nothing else. Once at
-    /// the top, under the turn, before the pass destroys anything: the mode
-    /// was decided from a reading taken before the driver's first entity,
-    /// and a viewer can have started this file since. Then once per run of
-    /// the reclaim, at the [`Door`]: a player can open the file again while
-    /// its bytes are going, and the run has to stop at the piece it is on
-    /// rather than empty the window the new stream is already reading. A
-    /// copy-out read like [`Self::keeps_everything`], with no owner lock
-    /// held.
+    /// Asked on a [`Mode::Slack`] pass, and by nothing else. Once at the
+    /// top, under the turn, before the pass destroys anything: the mode was
+    /// decided from a reading taken before the driver's first entity, and a
+    /// viewer can have started this file since. Then again at the [`Door`],
+    /// as often as the backing's [`Self::reclaim`] asks it -- once per run
+    /// where that asks through [`Door::windows_now`], once per candidate
+    /// index where it asks through [`Door::refuses`] -- because a player
+    /// can open the file again while its bytes are going, and the run has
+    /// to stop where it is rather than empty the window the new stream is
+    /// already reading. A copy-out read like [`Self::keeps_everything`],
+    /// with no owner lock held, so it is on the path of every unlink the
+    /// per-index shape makes.
     ///
     /// The default is `false`: a backing with no liveness of its own has
     /// nothing that could interrupt a slack run.
