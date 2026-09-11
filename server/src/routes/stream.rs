@@ -167,13 +167,12 @@ impl StreamLifecycleGuard {
     /// end it; drop the handler's future in the gap, which is how every
     /// one of these handlers ends when a player closes the connection, and
     /// `active_streams` and `active_file_streams` stay up for the life of
-    /// the process. `torrent_activity_registers` then reads `playing` true
-    /// for that torrent for ever, so the idle arm can never fire, the
-    /// sweep never removes the engine, and with seeding off it downloads a
-    /// film nobody is watching until the server is restarted.
+    /// the process. `playback_is_live` then reads a player for ever, so
+    /// with sharing off the session uploads all the same, and the sweep
+    /// never removes the engine.
     ///
-    /// The handover is what this function is: `on_stream_start` undoes its
-    /// own registration if it is dropped before it returns (see
+    /// The handover is what this function is: `on_stream_start_unreconciled`
+    /// undoes its own registration if it is dropped before it returns (see
     /// `BackendEngineFS::on_stream_start`), and from the instant it does
     /// return the guard owns it. Putting the two in one function with no
     /// `.await` between them is what leaves no third state -- a cancel can

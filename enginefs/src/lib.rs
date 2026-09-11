@@ -751,8 +751,9 @@ pub struct CacheHoldings {
 
 pub type EngineFS = BackendEngineFS<LibrqbitBackend>;
 
-/// Undoes what [`BackendEngineFS::on_stream_start`] registered, if that call
-/// is dropped before it returns.
+/// Undoes what [`BackendEngineFS::on_stream_start`] (or
+/// [`BackendEngineFS::on_stream_start_unreconciled`]) registered, if that
+/// call is dropped before it returns.
 ///
 /// The registers a stream start writes -- the two stream counters, and for
 /// a multi-file torrent the active selection -- have **no expiry**. Nothing
@@ -760,17 +761,20 @@ pub type EngineFS = BackendEngineFS<LibrqbitBackend>;
 /// calling [`BackendEngineFS::on_stream_end`], and by nothing else. So a
 /// registration that outlives the call which wrote it is not a stale
 /// reading that corrects itself, it is a permanent one:
-/// `torrent_activity_registers` reads `playing` true for that torrent for
-/// the life of the process, the idle arm can therefore never fire, the
-/// housekeeping sweep never removes the engine, and with seeding off the
-/// torrent downloads a film nobody is watching until the server restarts.
+/// [`BackendEngineFS::playback_is_live`], which the activity light is drawn
+/// from, reads a player for the life of the process, so with sharing off
+/// the session uploads all the same; the housekeeping sweep never removes
+/// the engine; `hand_live_on` counts the file as open; and a selection left
+/// behind is unioned back into the want-set on every later reconcile of the
+/// torrent.
 ///
-/// The window is not small. `on_stream_start` increments both counters
-/// first and then **awaits** `activate_file`, which for a multi-file
-/// torrent awaits the backend, and the reconcile, which is inside the
-/// backend for as long as starting a torrent takes. Dropping that
-/// future is not an edge case either -- it is how every one of these
-/// handlers ends when a player closes the connection.
+/// The window is not small. The start increments both counters first and
+/// then **awaits** the engine lookup, `activate_file` -- which for a
+/// multi-file torrent awaits the backend -- the upload switch, and for
+/// `on_stream_start` the reconcile, which is inside the backend for as
+/// long as starting a torrent takes. Dropping that future is not an edge
+/// case either -- it is how every one of these handlers ends when a player
+/// closes the connection.
 ///
 /// It undoes only what it saw land, so it is correct under concurrency: it
 /// decrements the counters it incremented rather than removing the entries
@@ -1308,8 +1312,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// is separated for the same reason: a test that drives a **real**
     /// librqbit session cannot run under `tokio`'s paused clock (its
     /// sockets and its check threads need time to actually pass), so
-    /// without this the only way to reach the idle arm from one would be to
-    /// sit out [`INACTIVE_TORRENT_PAUSE_GRACE`] of wall time per test.
+    /// without this the only way to get past [`RECONCILE_MIN_DWELL`] from
+    /// one would be to sit it out in wall time.
     async fn reconcile_tick_at(&self, now: u64) -> Vec<(String, crate::reconcile::Decision)> {
         // Cloned out and the guard dropped before the first `.await`: this
         // is a write-preferring `RwLock`, so a read guard held across an
@@ -1360,15 +1364,16 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// there is no such engine, or when its backend owns its own lifecycle.
     ///
     /// Looks the engine up with [`Self::peek_engine`], never `get_engine`:
-    /// a reconcile is an observation, and counting it as a poll would both
-    /// keep an idle torrent from ever being removed and reset the very
-    /// idleness the decision is made of.
+    /// a reconcile is an observation, and counting it as a poll would keep
+    /// an idle torrent from ever being removed by the housekeeping sweep,
+    /// which reads the idle age `get_engine` resets.
     ///
     /// [`crate::reconcile::Trigger::PlaybackStart`] says why the decision is
     /// being taken, **not** that anything is playing: `playing` is read from
-    /// the activity registers like every other condition. A caller must
-    /// therefore register its stream before it asks, or it will be told what
-    /// to do with a torrent nobody is watching.
+    /// the liveness cell and the reads open on the torrent, like every other
+    /// condition. A caller must therefore have had its stream open write the
+    /// cell before it asks, or it will be told what to do with a torrent
+    /// nobody is watching.
     pub async fn reconcile_hash(
         &self,
         info_hash: &str,
@@ -1389,18 +1394,19 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// here would be a second owner of the same state -- which is the whole
     /// class of bug this reconciler exists to end.
     ///
-    /// **Every pause and every unpause in the process is made here.** Both
-    /// arms of the ladder are this reconciler's -- the free-space one and
-    /// the idle one -- and there is nowhere else left that calls the
-    /// backend's pause or unpause at all. That is the point of the whole
-    /// design: eight call sites each hand-rolling "set the flag, call
-    /// resume" in three different orders is what produced four consecutive
-    /// defects, and what is left instead is one ladder, one actuator and
-    /// no record of who stopped what.
+    /// **Every pause and every unpause in the process is made here.** Every
+    /// arm of the ladder that stops a torrent -- the free-space one and
+    /// "neither playing nor pinned" among them -- is this reconciler's, and
+    /// there is nowhere else left that calls the backend's pause or unpause
+    /// at all. That is the point of the whole design: eight call sites each
+    /// hand-rolling "set the flag, call resume" in three different orders
+    /// is what produced four consecutive defects, and what is left instead
+    /// is one ladder, one actuator and no record of who stopped what.
     ///
-    /// Only [`crate::reconcile::Verdict::for_space`] separates the two stops
-    /// afterwards, and only for the one thing that is a statement about the
-    /// *device*: the read refusal. The stop call itself is the same call.
+    /// Only [`crate::reconcile::Verdict::for_space`] tells a free-space stop
+    /// from any other afterwards, and only for the one thing that is a
+    /// statement about the *device*: the read refusal. The stop call itself
+    /// is the same call.
     async fn reconcile_engine(
         &self,
         engine: &Arc<Engine<B::Handle>>,
@@ -1437,8 +1443,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             // The torrent a viewer opened meanwhile has its cell written
             // (`on_stream_start` does that first) and no byte delivered
             // yet, so `readers()` is 0; read from the copy it is a torrent
-            // nobody is playing, the idle arm answers `Stop`, and the
-            // timer's next `Run` for it waits out `RECONCILE_MIN_DWELL`
+            // nobody is playing, the ladder's last arm answers `Stop`, and
+            // the timer's next `Run` for it waits out `RECONCILE_MIN_DWELL`
             // -- the episode just started, parked for fifteen seconds.
             playing: self.live.is_torrent(&engine.info_hash) || engine.retention.readers() > 0,
             pinned: engine.is_pinned(),
@@ -1853,10 +1859,9 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
 
     /// Whether anything is using this torrent right now: a response body
     /// open on it, a file stream, a multi-file selection, or a reader
-    /// parked inside the engine. These were questions asked in three
-    /// places -- the housekeeping sweep's idle pause, the per-stream
-    /// grace-period task and this -- and the first two are gone: the
-    /// ladder is the only thing that asks.
+    /// parked inside the engine. Asked by one caller, `pin_download`, of a
+    /// torrent it is about to drop for a refused pin; the housekeeping sweep
+    /// reads the same registers on its own before it removes an engine.
     ///
     /// **Nothing that decides whether a torrent runs reads them.** That was
     /// the reconciler's idle arm, and it is gone: a register is written by
@@ -1865,7 +1870,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// was ended too early stopped a torrent under a body still being
     /// delivered. What is playing is a value with one writer and no expiry
     /// ([`crate::retention::live`]); these count responses, for the
-    /// activity light and the housekeeping sweep.
+    /// activity light, the housekeeping sweep and this.
     async fn torrent_activity_registers(
         &self,
         info_hash: &str,
@@ -3112,35 +3117,32 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         beside
     }
 
-    /// Mark the torrent as active: librqbit has no session-wide streaming
-    /// mode, so what this can do is stamp the activity, touch the engine
-    /// and ask the reconciler whether the torrent should now be running.
+    /// Touch the engine and ask the reconciler, as somebody about to read,
+    /// whether the torrent should now be running: librqbit has no
+    /// session-wide streaming mode, so that is all focusing a torrent is.
+    ///
+    /// It is the stream route's one reconcile. The route registers with
+    /// [`Self::on_stream_start_unreconciled`] and calls this after its disk
+    /// gate, because the gate may free the room a torrent stopped at the
+    /// floor was waiting for, and only a reconcile after it can start that
+    /// torrent. The start it may issue also un-wedges a torrent the last
+    /// process left stopped, and the reader opens right after.
     ///
     /// It used to read `if engine.idle_paused.swap(false) && resume()`,
     /// which on a fresh process is `false && ...` -- dead code after every
     /// restart, and a restart is exactly when a torrent comes up stopped
     /// with nothing in this process able to say why.
     ///
-    /// **This call writes no activity register, and stamps no clock.** It
-    /// says a reader is about to be opened, which is
-    /// [`crate::reconcile::Trigger::PlaybackStart`] -- and the trigger says
-    /// only *why* the question is being asked, never that anything is
-    /// playing. So on the ladder's own conditions this is a torrent nobody
-    /// is using, and until the idle arm was made the timer's alone the
-    /// ladder could answer `Stop` for the very torrent it had been asked to
-    /// focus (seeding off, registers empty, `idle_for` `None`, which the
-    /// idle arm reads as quiet). That was latent only because the one
-    /// production caller happens to run `on_stream_start` two lines earlier
-    /// in `routes::stream`.
-    ///
-    /// The fix is not a stamp here. Stamping `Engine::last_active_at` from
-    /// a call that read no register invents the observation the idle arm
-    /// then measures its grace from -- the freshness mistake this whole
-    /// design keeps deleting -- and buys a whole
-    /// `INACTIVE_TORRENT_PAUSE_GRACE` of it on any torrent any caller
-    /// names. The arm is gated on [`crate::reconcile::Trigger::Timer`]
-    /// instead ([`crate::reconcile::verdict`]), so the ordering at the call
-    /// site does not matter and nothing is claimed that was not read.
+    /// **This call writes no activity register and no liveness cell.**
+    /// [`crate::reconcile::Trigger::PlaybackStart`] says only *why* the
+    /// question is being asked, never that anything is playing: the ladder
+    /// reads `playing` from the cell and the reads open on the torrent, and
+    /// answers `Stop` for a torrent that is neither playing nor pinned
+    /// ([`crate::reconcile::desired`], arm 6) whoever asks. In the stream
+    /// route the open has written the cell already, so the torrent asked
+    /// about is the one being played. Called for a torrent nobody opened,
+    /// it is answered as any torrent nobody is playing is: nothing is
+    /// claimed that was not read.
     pub async fn focus_torrent(&self, target_info_hash: &str) {
         let info_hash = target_info_hash.to_lowercase();
         let Some(engine) = self.get_engine(&info_hash).await else {
@@ -3443,9 +3445,9 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             // So the live registers are asked as well
             // ([`Self::torrent_activity_registers`]: the engine's own
             // stream count and the three activity maps), the same evidence
-            // the idle arm uses for "nobody is watching this". Without
-            // them a reader that opened inside that window had its torrent
-            // dropped from the session under it.
+            // the housekeeping sweep reads before it removes an engine.
+            // Without them a reader that opened inside that window had its
+            // torrent dropped from the session under it.
             //
             // It used to take the torrent's placement as the evidence
             // instead ("it sits in the folder only pins place under"),
@@ -4336,14 +4338,15 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         };
         self.hand_live_on(&info_hash, file_idx).await;
 
-        // Nothing schedules a pause here any more, and nothing stamps
-        // anything either. The last stream ending is not a decision, it is
-        // a change of condition: the reconciler reads `idle_for` from
-        // `Engine::last_active_at`, which was stamped while this stream was
-        // *running* -- by the reconcile its open asked for and by every
-        // tick that read the registers true since -- and stops the torrent
-        // on the first tick after `INACTIVE_TORRENT_PAUSE_GRACE` of quiet.
-        // One ladder, with no task per stream deciding a second time.
+        // Nothing schedules a pause here, and nothing stamps anything. The
+        // last stream ending is not a decision: it takes nothing off the
+        // liveness cell, so the torrent stays the one being played (a
+        // viewer who paused, or whose player dropped the connection) and
+        // keeps running until a stream of another torrent or a proxied URL
+        // is opened; the next tick then stops it (`reconcile::desired`, arm
+        // 6). The one thing a close can change is the aside rule's answer,
+        // which `hand_live_on` above has just asked. One ladder, with no
+        // task per stream deciding a second time.
 
         if !native_lifecycle && file_streams_remaining == 0 {
             self.schedule_file_cleanup(info_hash.clone(), file_idx)
@@ -7032,16 +7035,14 @@ mod tests {
     /// for a whole second, and the field the dwell reads used to start at 0
     /// as its "never moved" -- which the timer treats as exempt. A real
     /// transition recorded in that first second was therefore read as "this
-    /// reconciler has never moved it" and the dwell was skipped for it. The
-    /// startup path reaches it on any quick boot: `server::run` applies the
-    /// persisted seeding setting before the reconciler's timer starts, and
-    /// that call reconciles every engine there is -- on a volume under the
-    /// floor, stopping every torrent that wants to write.
+    /// reconciler has never moved it" and the dwell was skipped for it. Any
+    /// reconcile inside that second reaches it -- a quick boot's first tick,
+    /// or a stream opened at once -- on a volume under the floor, stopping
+    /// every torrent that wants to write.
     ///
-    /// The stop here is the free-space arm's, because the idle arm cannot
-    /// fire this early now that its grace runs from the process's own
-    /// start -- which is the point: the collision is about the *clock*, not
-    /// about which arm moved the torrent.
+    /// The stop here is the free-space arm's, and that is incidental: the
+    /// collision is about the *clock*, not about which arm moved the
+    /// torrent.
     #[tokio::test(start_paused = true)]
     async fn a_move_in_the_processs_first_second_still_holds_the_dwell() {
         let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
@@ -8277,10 +8278,10 @@ mod tests {
     ///
     /// The refusal used to be lifted only by the reconciler's own
     /// `start_torrent`, and this is the sequence that leaves no such start
-    /// to hang it on. It is all ordinary: the torrent is stopped (seeding
-    /// off and nothing playing is one way, a previous process is another);
-    /// the volume then falls under the floor and stays there past the stall
-    /// bound, so the free-space arm -- which sits above the idle arm and
+    /// to hang it on. It is all ordinary: the torrent is stopped (nothing
+    /// playing is one way, a previous process is another); the volume then
+    /// falls under the floor and stays there past the stall bound, so the
+    /// free-space arm -- which sits above the playing-or-pinned arm and
     /// does not care why the torrent is stopped -- fails its readers; the
     /// volume gets its room back; and the user presses play. The playback
     /// start's own reconcile is what starts it, and on the *next* pass the
@@ -8582,8 +8583,9 @@ mod tests {
     /// the caller's guard makes -- which does not exist yet, because
     /// `on_stream_start` has not returned. So a count left behind here is
     /// left behind for good, and the server answers "something is playing"
-    /// about this torrent for the rest of the process: the idle arm can
-    /// never fire and the sweep never removes the engine.
+    /// about this torrent for the rest of the process: `playback_is_live`
+    /// reads a player, so sharing stays on with the setting off, and the
+    /// sweep never removes the engine.
     ///
     /// Asserted through `playback_is_live`, which is what a client polls
     /// for its activity light, rather than through the counters themselves.
@@ -14980,11 +14982,12 @@ mod tests {
     /// switch task's unlink takes. A stream that opens meanwhile has its
     /// cell written first (`on_stream_start`) and no byte delivered yet, so
     /// `readers()` is 0: read from the copy it is a torrent nobody is
-    /// playing, the idle arm answers `Stop`, and the stop is made -- a stop
-    /// is never held by the dwell. The next timer's `Run` for it then *is*
-    /// held, for `RECONCILE_MIN_DWELL`: the episode the viewer just started
-    /// stands still for fifteen seconds. Roughly every other switch, since
-    /// the tick is two seconds and the unlink is of the same order.
+    /// playing, the ladder's last arm answers `Stop`, and the stop is made
+    /// -- a stop is never held by the dwell. The next timer's `Run` for it
+    /// then *is* held, for `RECONCILE_MIN_DWELL`: the episode the viewer
+    /// just started stands still for fifteen seconds. Roughly every other
+    /// switch, since the tick is two seconds and the unlink is of the same
+    /// order.
     ///
     /// So the ladder asks the cell under the hash lock, and only the pass
     /// keeps the tick's reading (its modes for one tick must agree). The

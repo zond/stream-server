@@ -259,13 +259,13 @@ impl GetFileError {
 /// moved this torrent", which exempts it from the dwell, and "this
 /// reconciler moved it just now", which is the strongest reason to apply
 /// one. The first second is not a corner. Two things reconcile inside it
-/// on an ordinary boot: `server::run` applies the persisted seeding
-/// setting before the reconciler's timer starts, and that call reconciles
-/// every engine there is synchronously -- on a volume under the floor it
-/// stops every torrent that wants to write, at reading zero -- and a
-/// client that asks for a stream as the server comes up reconciles its
-/// torrent again with `PlaybackStart`, which starts it, at reading zero.
-/// Either transition is one the next timer pass has to wait out.
+/// on an ordinary boot: the reconciler's first pass, which runs as soon as
+/// it is started (`BackendEngineFS::start_reconciler`'s interval completes
+/// its first tick at once) and on a volume under the floor stops every
+/// torrent that wants to write, at reading zero; and a client that asks
+/// for a stream as the server comes up, which reconciles its torrent with
+/// `PlaybackStart` and starts it, at reading zero. Either transition is one
+/// the next timer pass has to wait out.
 const NEVER_MOVED: u64 = u64::MAX;
 
 /// What `stats.error` says for a torrent the reconciler's free-space arm
