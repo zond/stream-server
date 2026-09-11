@@ -4731,8 +4731,7 @@ mod tests {
     use crate::backend::librqbit::{DeferredSelection, await_initialized};
     use crate::backend::{
         BackendFileInfo, EngineStats, FileStreamTrait, Growler, PeerDiscovery, PeerSearch,
-        PieceReadiness, RunState, StartupPhase, StatsFile, StatsOptions, SwarmCap,
-        TorrentFilePriorityPlan,
+        RunState, StartupPhase, StatsFile, StatsOptions, SwarmCap, TorrentFilePriorityPlan,
     };
     use crate::reconcile::{Decision, Trigger};
     use std::sync::Mutex;
@@ -5595,25 +5594,6 @@ mod tests {
                 .clear_file_streaming
                 .fetch_add(1, Ordering::SeqCst);
             Ok(())
-        }
-
-        async fn wait_for_piece_ready(
-            &self,
-            _file_idx: usize,
-            _offset: u64,
-            _timeout: Duration,
-            _lookahead_bytes: u64,
-        ) -> Result<PieceReadiness> {
-            Ok(PieceReadiness {
-                ready: true,
-                piece: 0,
-                ready_pieces: 1,
-                target_pieces: 1,
-                elapsed_ms: 0,
-                peers: 0,
-                download_rate: 0,
-                reason: "fake".to_string(),
-            })
         }
     }
 

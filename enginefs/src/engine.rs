@@ -1987,7 +1987,6 @@ mod pin_tests {
     use super::*;
     use crate::backend::{BackendFileInfo, FileStreamTrait, RunState, TransferTotals};
     use crate::retention::RetentionBudget;
-    use std::time::Duration;
 
     const PIECE: u64 = 1000;
 
@@ -2046,16 +2045,6 @@ mod pin_tests {
 
         async fn clear_file_streaming(&self, _file_idx: usize) -> anyhow::Result<()> {
             Ok(())
-        }
-
-        async fn wait_for_piece_ready(
-            &self,
-            _file_idx: usize,
-            _offset: u64,
-            _timeout: Duration,
-            _lookahead_bytes: u64,
-        ) -> anyhow::Result<crate::backend::PieceReadiness> {
-            anyhow::bail!("nothing here is waited for")
         }
 
         async fn file_pieces(&self, file_idx: usize) -> Option<FilePieceSpan> {

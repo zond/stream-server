@@ -1,6 +1,5 @@
 use anyhow::Result;
 use std::ops::Range;
-use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncSeek};
 
 use priorities::PlaybackIntent;
@@ -633,17 +632,6 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
     /// Clear streaming state for a file (set priority to 0, clear piece deadlines).
     /// Called when switching to a different file to ensure exclusive downloading.
     async fn clear_file_streaming(&self, file_idx: usize) -> Result<()>;
-    /// Wait until the first piece needed for the requested offset is readable.
-    /// `lookahead_bytes` sizes the probe's temporary stream exactly as
-    /// [`Self::get_file_reader`]'s does the real one, so the pieces the probe
-    /// pulls in are the ones the read that follows it will want.
-    async fn wait_for_piece_ready(
-        &self,
-        file_idx: usize,
-        offset: u64,
-        timeout: Duration,
-        lookahead_bytes: u64,
-    ) -> Result<PieceReadiness>;
 }
 
 #[derive(Debug, Clone)]
@@ -661,18 +649,6 @@ pub struct HotFilePriorityPlan {
     pub priority: u8,
     pub intent: PlaybackIntent,
     pub bitrate_bytes_per_sec: Option<u64>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct PieceReadiness {
-    pub ready: bool,
-    pub piece: i32,
-    pub ready_pieces: u32,
-    pub target_pieces: u32,
-    pub elapsed_ms: u64,
-    pub peers: u64,
-    pub download_rate: u64,
-    pub reason: String,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
