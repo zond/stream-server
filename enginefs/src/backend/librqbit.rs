@@ -984,7 +984,7 @@ impl LibrqbitBackend {
             configured: session.peer_limit.unwrap_or(librqbit::DEFAULT_PEER_LIMIT),
         };
         // Restore from session
-        let mut restored_handles = session.with_torrents(|iter| {
+        let restored_handles = session.with_torrents(|iter| {
             let mut map = HashMap::new();
             for (_id, handle) in iter {
                 let info_hash = handle.info_hash().as_string();
@@ -1004,48 +1004,6 @@ impl LibrqbitBackend {
             }
             map
         });
-
-        // Restore from .cache directory
-        let cache_dir = download_dir.join(".cache");
-        if let Ok(mut entries) = tokio::fs::read_dir(&cache_dir).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let path = entry.path();
-                if path.extension().is_some_and(|ext| ext == "torrent")
-                    && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
-                {
-                    let info_hash = stem.to_string();
-                    if !restored_handles.contains_key(&info_hash)
-                        && let Ok(bytes) = tokio::fs::read(&path).await
-                    {
-                        let bytes = bytes::Bytes::from(bytes);
-                        let add_torrent = librqbit::AddTorrent::from_bytes(bytes);
-                        match session.add_torrent(add_torrent, None).await {
-                            Ok(response) => {
-                                if let librqbit::AddTorrentResponse::Added(_, handle)
-                                | librqbit::AddTorrentResponse::AlreadyManaged(_, handle) =
-                                    response
-                                {
-                                    restored_handles.insert(
-                                        info_hash.clone(),
-                                        LibrqbitHandle {
-                                            handle,
-                                            info_hash,
-                                            session: session.clone(),
-                                            deferred_selections: deferred_selections.clone(),
-                                            pinned_files: pinned_files.clone(),
-                                            reported_errors: reported_errors.clone(),
-                                            stream_positions: stream_positions.clone(),
-                                            swarm_scraper: swarm_scraper.clone(),
-                                        },
-                                    );
-                                }
-                            }
-                            Err(e) => warn!(error = %e, "Failed to add torrent from cache"),
-                        }
-                    }
-                }
-            }
-        }
 
         Ok((
             Self {
@@ -1958,17 +1916,6 @@ impl LibrqbitBackend {
         {
             debug!(error = %e, path = ?folder, "Left the torrent's output folder in place");
         }
-        // Best-effort: drop the cached .torrent file so the restore path in
-        // `new()` does not resurrect the torrent on the next startup.
-        let cached = self
-            .download_dir
-            .join(".cache")
-            .join(format!("{info_hash}.torrent"));
-        if let Err(e) = tokio::fs::remove_file(&cached).await
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            warn!(error = %e, path = ?cached, "Failed to remove cached torrent file");
-        }
         Ok(())
     }
 }
@@ -2851,12 +2798,8 @@ impl TorrentHandle for LibrqbitHandle {
     /// every add it makes, since the session's default storage is the piece
     /// store and it can release one (see [`LibrqbitBackend`]'s
     /// `piece_reclaim` field), so the second refusal is left over from the
-    /// whole-file session this ran on before -- with **one** live exception,
-    /// named here because nothing else names it: the legacy
-    /// `<downloadDir>/.cache/<hash>.torrent` restore in
-    /// [`LibrqbitBackend::new_with_settings`] hands librqbit no options at
-    /// all, so a torrent resurrected from a pre-fork server's cache is added
-    /// without reclaim and refuses here.
+    /// whole-file session this ran on before: no add this backend makes
+    /// lands there.
     ///
     /// Both refusals are reported, not hidden: the caller deletes what bytes
     /// it can, and until the next restart librqbit believes it has the
@@ -7880,8 +7823,7 @@ mod tests {
     /// default storage is the piece store, which can release one -- so what
     /// this pins is the *other* side of the fork's contract, over a session
     /// whose storage cannot: a backend that cannot drop is named, not
-    /// hidden. The one production add that still lands here is the legacy
-    /// `.cache/<hash>.torrent` restore, which hands librqbit no options.
+    /// hidden.
     #[tokio::test(flavor = "multi_thread")]
     async fn dropping_pieces_without_reclaim_is_refused_by_name() {
         use crate::backend::TorrentHandle;
@@ -8466,28 +8408,6 @@ mod tests {
         assert!(!folder.exists(), "files and folder removed: {folder:?}");
         assert!(backend.list_torrents().await.is_empty());
         assert!(dl.is_dir(), "session root untouched");
-    }
-
-    #[tokio::test]
-    async fn remove_torrent_drops_cached_torrent_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().to_path_buf();
-        let payload = dir.join("payload.bin");
-        write_payload(&payload, 32 * 1024).await;
-        let (torrent_bytes, hash) = make_torrent(&payload).await;
-
-        let (backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
-        handle.handle.wait_until_initialized().await.unwrap();
-
-        let cache_dir = dir.join(".cache");
-        tokio::fs::create_dir_all(&cache_dir).await.unwrap();
-        let cached = cache_dir.join(format!("{hash}.torrent"));
-        tokio::fs::write(&cached, &torrent_bytes).await.unwrap();
-
-        backend.remove_torrent(&hash).await.unwrap();
-        assert!(!cached.exists(), "cached .torrent should be removed");
-        // Data files are kept (delete_files=false).
-        assert!(payload.exists(), "payload must survive remove_torrent");
     }
 
     // --- what the retention policy makes true ---
