@@ -111,6 +111,28 @@
                                 KeyPath='yes'/>
                         </Component>
                     </Directory>
+                    <!--
+                      stream-server.exe links unrar-rs and is distributed
+                      under the GPL, whose text goes with it; the MIT notice
+                      covers the source and the stremio-runtime stub. Both
+                      from the workspace root, the target directory's parent.
+                    -->
+                    <Component Id='LicenseGpl' Guid='*'>
+                        <File
+                            Id='LicenseGplFile'
+                            Name='LICENSE-GPL-3.0.txt'
+                            DiskId='1'
+                            Source='$(var.CargoTargetDir)\..\LICENSE-GPL-3.0'
+                            KeyPath='yes'/>
+                    </Component>
+                    <Component Id='LicenseMit' Guid='*'>
+                        <File
+                            Id='LicenseMitFile'
+                            Name='LICENSE-MIT.txt'
+                            DiskId='1'
+                            Source='$(var.CargoTargetDir)\..\LICENSE'
+                            KeyPath='yes'/>
+                    </Component>
                 </Directory>
             </Directory>
 
@@ -254,6 +276,8 @@
             Absent='disallow'>
 
             <ComponentRef Id='binary0'/>
+            <ComponentRef Id='LicenseGpl'/>
+            <ComponentRef Id='LicenseMit'/>
 
             <Feature
                 Id='Environment'

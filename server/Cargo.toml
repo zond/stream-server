@@ -2,7 +2,13 @@
 name = "server"
 version = "0.1.8"
 edition = "2024"
-license = "MIT"
+# What the default build distributes: this package's source is MIT (the
+# repository's LICENSE), and the `rar` feature links unrar-rs, which is
+# GPL-3.0-or-later, so the binary built from it is under the GPL
+# (LICENSE-GPL-3.0). cargo-deb writes this field into the package's
+# copyright file. A `--no-default-features` build links no GPL code and is
+# MIT alone; the field cannot say so per feature.
+license = "MIT AND GPL-3.0-or-later"
 description = "Headless torrent and archive streaming server for Stremio clients"
 authors = ["Perpetus <perpetus@example.com>"]
 
@@ -158,12 +164,16 @@ tui = ["dep:ratatui", "dep:crossterm", "dep:crossbeam-channel"]
 [package.metadata.deb]
 maintainer = "stream-server maintainers"
 copyright = "2025"
-license-file = ["../LICENSE", "0"]
+# The copyright file carries the GPL, which is what the packaged (default,
+# RAR-enabled) binary is distributed under; the MIT notice the source's
+# code needs goes beside it.
+license-file = ["../LICENSE-GPL-3.0", "0"]
 extended-description = "Headless torrent and archive streaming server for Stremio clients: streams torrents, ZIP/7Z/TAR/RAR members and cached HTTP sources over a local HTTP API."
 section = "net"
 priority = "optional"
 assets = [
     ["target/release/server", "usr/bin/stream-server", "755"],
+    ["../LICENSE", "usr/share/doc/server/LICENSE-MIT", "644"],
 ]
 
 [package.metadata.wix]

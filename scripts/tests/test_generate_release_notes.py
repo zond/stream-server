@@ -88,6 +88,22 @@ class GenerateReleaseNotesTests(unittest.TestCase):
         self.assertIn("Initial release.", body)
         self.assertNotIn("Full comparison", body)
 
+    def test_labels_the_license_texts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            asset_dir = Path(tmp)
+            for name in ["LICENSE-GPL-3.0.txt", "LICENSE-MIT.txt"]:
+                (asset_dir / name).write_text("license", encoding="utf-8")
+            body = generate_release_notes(
+                repo="perpetus/stream-server",
+                tag="v0.1.8",
+                previous_tag="v0.1.7",
+                asset_dir=asset_dir,
+                commits=[],
+            )
+
+        self.assertIn("| License of the binaries (GPL-3.0-or-later) | [Download](https://github.com/perpetus/stream-server/releases/download/v0.1.8/LICENSE-GPL-3.0.txt) |", body)
+        self.assertIn("| License of the source (MIT) | [Download](https://github.com/perpetus/stream-server/releases/download/v0.1.8/LICENSE-MIT.txt) |", body)
+
     def test_includes_unknown_extra_assets(self):
         with tempfile.TemporaryDirectory() as tmp:
             asset_dir = Path(tmp)

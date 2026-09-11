@@ -112,6 +112,12 @@ jobs:
           # Copy binary
           cp target/release/server AppDir/usr/bin/stream-server
 
+          # The binary links unrar-rs and is distributed under the GPL, so
+          # its text travels with it; the MIT notice is the source's.
+          mkdir -p AppDir/usr/share/doc/stream-server
+          cp LICENSE-GPL-3.0 AppDir/usr/share/doc/stream-server/LICENSE-GPL-3.0
+          cp LICENSE AppDir/usr/share/doc/stream-server/LICENSE-MIT
+
           # Create desktop file
           cat > AppDir/usr/share/applications/stream-server.desktop << EOF
           [Desktop Entry]
@@ -193,13 +199,16 @@ jobs:
           pkgdesc="Pure-Rust headless torrent streaming server"
           arch=('x86_64')
           url="https://github.com/zond/stream-server"
-          license=('GPL3')
+          # The binary links unrar-rs (GPL-3.0-or-later); the source is MIT.
+          license=('MIT AND GPL-3.0-or-later')
           depends=('gcc-libs' 'glibc')
-          source=("stream-server")
-          sha256sums=('SKIP')
+          source=("stream-server" "LICENSE-GPL-3.0" "LICENSE-MIT")
+          sha256sums=('SKIP' 'SKIP' 'SKIP')
 
           package() {
               install -Dm755 "$srcdir/stream-server" "$pkgdir/usr/bin/stream-server"
+              install -Dm644 "$srcdir/LICENSE-GPL-3.0" "$pkgdir/usr/share/licenses/$pkgname/LICENSE-GPL-3.0"
+              install -Dm644 "$srcdir/LICENSE-MIT" "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
           }
           EOF
           # The crate's version, so the package cannot fall behind the
@@ -209,6 +218,8 @@ jobs:
           sed -i "s/@VERSION@/$version/" pkg/PKGBUILD
 
           cp target/release/server pkg/stream-server
+          cp LICENSE-GPL-3.0 pkg/LICENSE-GPL-3.0
+          cp LICENSE pkg/LICENSE-MIT
 
       - name: Build package
         run: |
@@ -272,6 +283,13 @@ jobs:
           copy_latest artifacts/server-linux-appimage "*.AppImage" stream-server-linux-amd64.AppImage
           # Arch
           copy_latest artifacts/server-arch-pkg "stream-server-[0-9]*.pkg.tar.zst" stream-server-arch-x86_64.pkg.tar.zst
+          # The license texts, beside the portable binaries that carry none:
+          # stream-server links unrar-rs and is distributed under the GPL;
+          # the MIT notice covers the source and the stremio-runtime stub.
+          # From the checkout, not an artifact, so a release never goes out
+          # without them.
+          cp LICENSE-GPL-3.0 release/LICENSE-GPL-3.0.txt
+          cp LICENSE release/LICENSE-MIT.txt
           (cd release && sha256sum * > SHA256SUMS.txt)
           ls -la release/
 

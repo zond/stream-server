@@ -24,6 +24,8 @@ ASSET_LABELS = {
     "stream-server-linux-amd64": "Linux portable",
     "stream-server-linux-amd64.AppImage": "Linux AppImage",
     "stream-server-arch-x86_64.pkg.tar.zst": "Arch Linux",
+    "LICENSE-GPL-3.0.txt": "License of the binaries (GPL-3.0-or-later)",
+    "LICENSE-MIT.txt": "License of the source (MIT)",
     "SHA256SUMS.txt": "Checksums",
 }
 
