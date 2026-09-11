@@ -828,6 +828,15 @@ impl ProxyRetention {
         self.owner.readers()
     }
 
+    /// [`Self::reads`] for one entity directory: how many open reads of it
+    /// have promised or delivered and not ended. What a fill asks before it
+    /// removes a sibling entity under its key, for the same reason the
+    /// reclaim asks its door before each unlink -- an entity a body is
+    /// inside has a reader whose promised chunks nothing may take.
+    pub fn readers_of(&self, dir: &std::path::Path) -> usize {
+        self.owner.readers_of(&dir.to_path_buf())
+    }
+
     /// What this cache holds, in bytes, as it has been counted rather than
     /// as anything walked it.
     ///

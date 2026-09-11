@@ -808,6 +808,28 @@ struct CacheableEntity {
     validator: EntityValidator,
 }
 
+/// What the stitch reads of a cached head: the fields the entity is filed
+/// under and how far the head reaches. Borrowed off a
+/// [`crate::proxy_cache::Cached`] at the join, and stated outright by the
+/// tests of the join, which have no store to look one up in.
+struct StitchHead<'a> {
+    total: u64,
+    held_to: u64,
+    content_type: &'a str,
+    validator: &'a str,
+}
+
+impl<'a> StitchHead<'a> {
+    fn of(cached: &'a crate::proxy_cache::Cached) -> Self {
+        Self {
+            total: cached.total,
+            held_to: cached.held_to,
+            content_type: &cached.content_type,
+            validator: &cached.validator,
+        }
+    }
+}
+
 /// Why a cached head may **not** go in front of the body the origin just
 /// sent, or `None` when it may. One reason per condition, in the words the
 /// log then reports: every one of them ends the same way -- the head is
@@ -817,7 +839,7 @@ struct CacheableEntity {
 /// The conditions themselves are argued for where the join is made; this
 /// only names them.
 fn stitch_refusal(
-    cached: &crate::proxy_cache::Cached,
+    cached: StitchHead<'_>,
     status: StatusCode,
     res_headers: &HeaderMap,
     is_playlist: bool,
@@ -845,6 +867,18 @@ fn stitch_refusal(
         .is_some_and(|validator| validator.filed() == cached.validator)
     {
         return Some("the origin named a different entity than the cached head is filed under");
+    }
+    // The entity is filed under length, type and validator, and a head is
+    // joined to a tail only if all three agree: an origin that answers the
+    // same tag under another type has changed what the bytes are -- a
+    // transcode behind one `ETag`, say -- and the tail it sent is filed
+    // under a different entity name than the head was read from. The
+    // validator and the length are checked either side of this; the type
+    // was the one field of the name the join did not ask about.
+    if !origin_content_type(res_headers).eq_ignore_ascii_case(cached.content_type) {
+        return Some(
+            "the origin labelled the tail with a different content type than the cached head",
+        );
     }
     if !res_headers
         .get(header::CONTENT_RANGE)
@@ -1779,7 +1813,13 @@ async fn proxy(
     // playlist always is here.
     let stitched = match cached {
         Some(cached) => {
-            match stitch_refusal(&cached, status, &res_headers, is_playlist, encoded_body) {
+            match stitch_refusal(
+                StitchHead::of(&cached),
+                status,
+                &res_headers,
+                is_playlist,
+                encoded_body,
+            ) {
                 None => Some(cached),
                 // Which of the conditions failed, said in the log rather than
                 // left for a reader to work out from the fields -- a refusal
@@ -2395,6 +2435,95 @@ mod tests {
             );
         }
         EntityValidator::of(&map).map(|validator| validator.filed())
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(
+                HeaderName::from_bytes(name.as_bytes()).expect("a literal header name"),
+                HeaderValue::from_str(value).expect("a literal header value"),
+            );
+        }
+        map
+    }
+
+    /// A head is joined to a tail only when every field the entity is
+    /// filed under agrees. The name has three -- length, type, validator
+    /// -- and the join asked about two: an origin that answered the same
+    /// tag and the same length under another content type had its tail
+    /// stitched to a head of different bytes.
+    #[test]
+    fn a_tail_of_another_content_type_is_not_stitched_to_the_head() {
+        let head = StitchHead {
+            total: 1000,
+            held_to: 499,
+            content_type: "video/mp4",
+            validator: "etag:\"v1\"",
+        };
+        let tail = |content_type: Option<&str>| {
+            let mut pairs = vec![("etag", "\"v1\""), ("content-range", "bytes 500-999/1000")];
+            if let Some(content_type) = content_type {
+                pairs.push(("content-type", content_type));
+            }
+            headers(&pairs)
+        };
+        let refusal = |content_type: Option<&str>| {
+            stitch_refusal(
+                StitchHead { ..head },
+                StatusCode::PARTIAL_CONTENT,
+                &tail(content_type),
+                false,
+                false,
+            )
+        };
+        assert_eq!(
+            refusal(Some("video/mp4")),
+            None,
+            "the same entity, continued"
+        );
+        assert_eq!(
+            refusal(Some("Video/MP4")),
+            None,
+            "a type is compared the way the filing compares it, without case"
+        );
+        assert!(
+            refusal(Some("video/webm")).is_some_and(|reason| reason.contains("content type")),
+            "the same tag over other bytes is refused, and for that reason"
+        );
+        assert!(
+            refusal(None).is_some(),
+            "a tail the origin did not label is not the labelled head's"
+        );
+        // The two checks either side of it still stand.
+        assert!(
+            stitch_refusal(
+                StitchHead { ..head },
+                StatusCode::PARTIAL_CONTENT,
+                &headers(&[
+                    ("etag", "\"v2\""),
+                    ("content-range", "bytes 500-999/1000"),
+                    ("content-type", "video/mp4"),
+                ]),
+                false,
+                false,
+            )
+            .is_some_and(|reason| reason.contains("different entity"))
+        );
+        assert!(
+            stitch_refusal(
+                StitchHead { ..head },
+                StatusCode::PARTIAL_CONTENT,
+                &headers(&[
+                    ("etag", "\"v1\""),
+                    ("content-range", "bytes 500-999/2000"),
+                    ("content-type", "video/mp4"),
+                ]),
+                false,
+                false,
+            )
+            .is_some_and(|reason| reason.contains("content-range"))
+        );
     }
 
     /// Which of the two an entity is filed and compared under, and what

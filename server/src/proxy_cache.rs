@@ -585,7 +585,9 @@ impl Entry {
                 tracing::debug!(path = %fresh.display(), %error, "could not open a proxy cache entry");
                 return;
             }
-            retention.uncounted(remove_other_entities(&stale, &fresh));
+            retention.uncounted(remove_other_entities(&stale, &fresh, |entity| {
+                retention.readers_of(entity) > 0
+            }));
         });
         let dir = ChunkDir::new(dir);
         let reader = self.retention.reader(&dir, total, self.target.clone());
@@ -681,7 +683,17 @@ pub fn can_be_filed(total: u64, content_type: &str, validator: &str) -> bool {
 /// Remove every entity under `key_dir` but `keep`: the origin has just said
 /// what this resource is, and an entity of a different length, a different
 /// type or a different validator is not it any more.
-fn remove_other_entities(key_dir: &Path, keep: &Path) -> u64 {
+///
+/// Except one a body is still reading, which `is_read` says. A player
+/// inside the old entity was promised its chunks by a lookup, and the
+/// reclaim honours that promise at every unlink through its door; an
+/// `remove_dir_all` from here would take the same chunks behind the same
+/// player's back, and the read would fail mid-body for a reason the player
+/// cannot see. The stale entity is left for the next fill under this key,
+/// which asks again -- until then the key holds two entities and
+/// [`Entry::sole_entity`] sends every request to the origin, which is what
+/// two entities have always meant.
+fn remove_other_entities(key_dir: &Path, keep: &Path, is_read: impl Fn(&Path) -> bool) -> u64 {
     let Ok(entries) = std::fs::read_dir(key_dir) else {
         return 0;
     };
@@ -689,6 +701,13 @@ fn remove_other_entities(key_dir: &Path, keep: &Path) -> u64 {
     for entry in entries.flatten() {
         let path = entry.path();
         if path == keep || parse_entity_dir_name(&entry.file_name().to_string_lossy()).is_none() {
+            continue;
+        }
+        if is_read(&path) {
+            tracing::debug!(
+                path = %path.display(),
+                "the origin's entity changed, but a body is still reading the old one; leaving it"
+            );
             continue;
         }
         // Measured before the directory goes, because this is the one place
@@ -1864,6 +1883,44 @@ mod tests {
             "the old entity is not this resource any more"
         );
         assert!(filler.dir.path().is_dir());
+    }
+
+    /// The old entity is not removed from under a body that is reading it.
+    /// A lookup promised that body its chunks, and the reclaim keeps the
+    /// promise at every unlink; a fill's sibling removal is the one other
+    /// deleter of a proxied chunk, and it has to keep it too -- or the
+    /// player's read fails mid-body for a reason it cannot see. The fill
+    /// after the read has ended is what takes it.
+    #[tokio::test]
+    async fn an_entity_a_body_is_inside_outlives_the_fill_that_replaced_it() {
+        let (_root, cache) = cache();
+        let entry = entry_of(&cache, "https://host/film.mkv");
+        let old = entry
+            .dir
+            .join(entity_dir_name(CHUNK_BYTES * 2, "video/mp4", VALIDATOR));
+        write_chunk(&old, 0, &vec![1u8; CHUNK_BYTES as usize]);
+        write_chunk(&old, 1, &vec![1u8; CHUNK_BYTES as usize]);
+        let reading = entry
+            .look_up(Some("bytes=0-0"))
+            .expect("the old entity answers the range");
+        assert_eq!(cache.retention().readers_of(&old), 1);
+
+        let fresh = entry.fill(CHUNK_BYTES * 3, "video/mp4", VALIDATOR, 0);
+        cache.settled().await;
+        assert!(
+            old.is_dir() && chunk_path(&old, 0).is_file(),
+            "a body is inside the old entity, so the fill leaves it"
+        );
+        drop(fresh);
+
+        drop(reading);
+        assert_eq!(cache.retention().readers_of(&old), 0);
+        let _fresh = entry.fill(CHUNK_BYTES * 3, "video/mp4", VALIDATOR, 0);
+        cache.settled().await;
+        assert!(
+            !old.exists(),
+            "and the fill after the read has ended takes it"
+        );
     }
 
     /// Only whole chunks are written, and a body that stops mid-chunk leaves
