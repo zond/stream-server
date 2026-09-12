@@ -330,6 +330,10 @@ impl Backing for ProxyBacking {
         )
     }
 
+    fn position_at(_domain: &ProxyDomain, offset: u64) -> Option<u64> {
+        Some(offset)
+    }
+
     fn index_of(domain: &ProxyDomain, at: u64) -> Option<u32> {
         Some(domain.chunk(at))
     }

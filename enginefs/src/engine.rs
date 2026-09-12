@@ -452,6 +452,11 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
     /// its first and last pieces a neighbour owns -- eight mebibytes of a
     /// twenty-three gigabyte film, and the bitrate this divides into is not
     /// asked to three figures.
+    /// A byte offset into the file is a reader's position in it.
+    fn position_at(domain: &FileDomain, offset: u64) -> Option<(usize, u64)> {
+        Some((domain.file_idx, offset))
+    }
+
     fn bytes(domain: &FileDomain) -> Option<u64> {
         Some(domain.span.bytes).filter(|bytes| *bytes > 0)
     }
@@ -1350,12 +1355,10 @@ impl<H: TorrentHandle> Engine<H> {
     pub fn told_playhead(
         &self,
         file_idx: usize,
-        offset: u64,
-        film: Option<std::time::Duration>,
+        film: std::time::Duration,
         duration: Option<std::time::Duration>,
     ) {
-        self.retention
-            .note_playhead(&file_idx, (file_idx, offset), film, duration);
+        self.retention.note_playhead(&file_idx, film, duration);
     }
 
     /// What the retention policy says about `file_idx` right now, or `None`

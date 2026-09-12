@@ -3015,12 +3015,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         &self,
         info_hash: &str,
         file_idx: usize,
-        offset: u64,
-        film: Option<std::time::Duration>,
+        film: std::time::Duration,
         duration: Option<std::time::Duration>,
     ) {
         if let Some(engine) = self.peek_engine(info_hash).await {
-            engine.told_playhead(file_idx, offset, film, duration);
+            engine.told_playhead(file_idx, film, duration);
         }
     }
 
