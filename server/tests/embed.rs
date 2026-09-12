@@ -3676,8 +3676,15 @@ fn a_restart_leaves_a_torrent_stopped_and_a_stream_request_starts_it() -> anyhow
                 .send()?
                 .error_for_status()?
                 .json()?;
-            if stats["error"].as_str() == Some(stopped_message) {
-                assert_eq!(stats["swarmPaused"], serde_json::json!(true));
+            // Both, in one reading, rather than breaking on the message and
+            // asserting the flag after it: they are two fields of one
+            // snapshot and nothing makes them move together, so on a slow
+            // runner the message lands first and the flag a moment later.
+            // That is what failed the Windows job at 2eebbfb, and nowhere
+            // else.
+            if stats["error"].as_str() == Some(stopped_message)
+                && stats["swarmPaused"] == serde_json::json!(true)
+            {
                 break;
             }
             anyhow::ensure!(
