@@ -40,29 +40,33 @@ pub fn container_metadata_start(file_size: u64) -> u64 {
 /// `file_size` is a player fetching the container's index rather than
 /// somebody watching from there.
 ///
-/// **A probe is a BOUNDED range.** The geometry alone -- near the end,
-/// short enough -- cannot tell a Cues read from a viewer who dragged the
-/// scrubber into the last ten minutes, because an open-ended
-/// `Range: bytes=X-` arrives here with `requested_len` already resolved to
-/// `file_size - start` and is therefore "short" on any file whose last 10
-/// MiB is 10 MiB. It matters: a probe is [`crate::retention::owner::Reading::Probe`],
-/// which since the playhead fix means the retention window stays where
-/// playback was -- so a viewer who seeks into the tail of a film gets no
-/// window at all round where they are watching, and every pass reclaims
-/// what their stream has just fetched.
+/// **The geometry is the whole question, and the length clause is what
+/// makes it safe.** An open-ended `Range: bytes=X-` reaches here with
+/// `requested_len` already resolved to `file_size - start`, so asking for
+/// at most [`MAX_CONTAINER_METADATA_WINDOW_BYTES`] *is* asking to start
+/// within that far of the end: on a 23 GB film, the last 4.6 seconds. A
+/// viewer who drags the scrubber into the last ten minutes asks for the
+/// 2 GB that are left and is playback, by this clause, without needing to
+/// be asked whether the range named an end.
 ///
-/// A player reading an index asks for the bytes of that index and says how
-/// many; a player playing asks for the rest of the file. So `bounded` is
-/// the first question, and the geometry only narrows it: a bounded read is
-/// a probe only if it is also near the end and short.
-pub fn is_container_metadata_request(
-    start: u64,
-    requested_len: u64,
-    file_size: u64,
-    bounded: bool,
-) -> bool {
-    bounded
-        && start > 0
+/// It is deliberately not asked, because the answer is wrong. The player
+/// this serves reads the container index with an open-ended range like
+/// every other read it makes -- the field log has libmpv fetching 10.7 MB
+/// at EOF as `bytes=23335526369-` -- so requiring a bounded range made
+/// [`PlaybackIntent::ContainerMetadata`] unreachable and classified that
+/// read as a seek to the end of the film. What that cost is in
+/// [`crate::retention::owner::Reading`]: the index read became the newest
+/// playing read, the window relocated to the tail for the thirty seconds
+/// it was open, and the pieces the viewer was waiting on at the front of
+/// the film queued behind it.
+///
+/// What is traded for it is a viewer who seeks to within
+/// [`MAX_CONTAINER_METADATA_WINDOW_BYTES`] of the end -- a few seconds of
+/// a film, under a minute of a small file -- being read as a probe, and
+/// getting no retention window round the little there is left to watch.
+/// Their stream's own lookahead still fetches it.
+pub fn is_container_metadata_request(start: u64, requested_len: u64, file_size: u64) -> bool {
+    start > 0
         && file_size > 0
         && requested_len > 0
         && requested_len <= MAX_CONTAINER_METADATA_WINDOW_BYTES
@@ -357,47 +361,35 @@ mod tests {
     fn small_file_metadata_starts_at_final_five_percent() {
         let file_size = 8 * 1024 * 1024;
         assert_eq!(container_metadata_start(file_size), file_size * 95 / 100);
-        assert!(!is_container_metadata_request(
-            1024 * 1024,
-            1024,
-            file_size,
-            true
-        ));
+        assert!(!is_container_metadata_request(1024 * 1024, 1024, file_size));
         assert!(is_container_metadata_request(
             container_metadata_start(file_size),
             1024,
-            file_size,
-            true
+            file_size
         ));
     }
 
-    /// **An open-ended range is never a probe, wherever it starts.**
+    /// **Where an open-ended range stops being a seek and starts being an
+    /// index read**, which is the only thing separating the two.
     ///
-    /// `Range: bytes=X-` reaches the geometry with its length already
-    /// resolved to `file_size - start`, so a viewer who dragged the
-    /// scrubber into the last ten minutes of a film asked for "the rest of
-    /// it" and was read as a sixteen-megabyte index fetch. Since the
-    /// playhead fix that no longer moves the window to the tail -- it does
-    /// something quieter and worse: the window stays where playback *was*,
-    /// so the reader gets no window at all round what it is playing and
-    /// every pass reclaims what its stream has just fetched.
+    /// Both arrive as `Range: bytes=X-`, and both reach here with the
+    /// length resolved to `file_size - start`. So the length clause is the
+    /// question: a seek into the tail leaves gigabytes to play and an index
+    /// read leaves megabytes.
     #[test]
-    fn an_open_ended_range_near_the_end_is_playback_and_not_metadata() {
+    fn an_open_ended_range_is_an_index_read_only_within_a_window_of_the_end() {
         let file_size = 10 * 1024 * 1024 * 1024;
-        let start = container_metadata_start(file_size);
-        // The same geometry, twice: the only difference is whether the
-        // player said how many bytes it wanted.
-        assert!(is_container_metadata_request(start, 1024, file_size, true));
-        assert!(!is_container_metadata_request(
-            start, 1024, file_size, false
-        ));
-        // And the shape a seek into the tail really arrives in: open-ended,
-        // so its length is everything that is left.
-        assert!(!is_container_metadata_request(
-            start,
-            file_size - start,
-            file_size,
-            false
+        let open_ended =
+            |start: u64| is_container_metadata_request(start, file_size - start, file_size);
+        // A viewer who dragged the scrubber into the last ten minutes: the
+        // geometry says "near the end", and the half-gigabyte they asked
+        // for says they are watching it.
+        assert!(!open_ended(container_metadata_start(file_size)));
+        // libmpv reading the container index, which is the shape the field
+        // log caught being called a seek.
+        assert!(open_ended(file_size - MAX_CONTAINER_METADATA_WINDOW_BYTES));
+        assert!(!open_ended(
+            file_size - MAX_CONTAINER_METADATA_WINDOW_BYTES - 1
         ));
     }
 
@@ -409,14 +401,12 @@ mod tests {
         assert!(is_container_metadata_request(
             start,
             MAX_CONTAINER_METADATA_WINDOW_BYTES,
-            file_size,
-            true
+            file_size
         ));
         assert!(!is_container_metadata_request(
             start,
             MAX_CONTAINER_METADATA_WINDOW_BYTES + 1,
-            file_size,
-            true
+            file_size
         ));
     }
 
