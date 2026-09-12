@@ -248,6 +248,20 @@ impl<H: TorrentHandle> AsyncRead for FileHandle<H> {
                 self.engine
                     .register_read_waker(self.reader_id, cx.waker().clone());
                 self.cursor.park(Instant::now());
+                // **What this read is blocked on**, which is the one thing
+                // the swarm should be fetching before anything else.
+                //
+                // A parked read is waiting for exactly one piece: the one
+                // under its cursor. Said here, it becomes a promise the pass
+                // may not unlink and -- more to the point -- the want-set
+                // the pass orders ahead of every window it holds. Nothing
+                // said it before: `promises` had one production caller in
+                // the whole workspace, the proxy's, so on the torrent side
+                // the pass knew what readers were *near* and never what any
+                // of them was actually stuck on.
+                if let Some(reader) = &self.reader {
+                    reader.promises_at((self.file_idx, self.cursor.position));
+                }
             }
             Poll::Ready(ref result) => {
                 let delivered = if result.is_ok() {

@@ -2194,6 +2194,35 @@ impl<B: Backing> Retention<B> {
                     keep.push(run);
                 }
             }
+            // **What a read is actually blocked on comes first, alone.**
+            //
+            // A want-set is an order to the swarm, and an order for a
+            // thousand pieces is not an order at all: seventeen seeders
+            // delivering twelve megabytes a second took eighteen seconds to
+            // produce the one piece a player was parked on, because the
+            // other 1279 were equally wanted. Playing from an offset makes
+            // it three such waits in series -- the header, the container
+            // index at the far end, then the seek target -- which is the
+            // whole of a slow start.
+            //
+            // So while any read is parked on a piece the disk does not
+            // have, that piece and its fellows are the want-set, and the
+            // windows are not in it. Nothing competes with the bytes that
+            // are the difference between a picture and a spinner.
+            //
+            // It ends by itself, which is why it can be this blunt: a
+            // promise is made by a *parked* read and cleared by the byte
+            // that unparks it, so the moment the swarm delivers, the
+            // windows are wanted again. Nothing has to decide when
+            // start-up is over.
+            let blocked: Vec<Range<u32>> = promised
+                .iter()
+                .filter(|range| (range.start..range.end).any(|piece| !held.contains(&piece)))
+                .cloned()
+                .collect();
+            if !blocked.is_empty() {
+                want = blocked;
+            }
             // What this pass has decided to take is what it will never put
             // back into what we announce; see [`State::doomed`]. Written
             // here, under the decision's own lock, so a clear that runs
@@ -3017,6 +3046,23 @@ impl<B: Backing> Reader<B> {
     /// nothing may unlink them. The range shrinks from the front as
     /// [`Self::note`] reports bytes going out, and is released whole when
     /// this handle is dropped. An empty promise records nothing.
+    /// The piece at `at` is what this read is waiting for.
+    ///
+    /// [`Self::promises`] in the entity's own coordinates, so a caller that
+    /// has a position and not a piece index -- every reader of a torrent
+    /// file, whose cursor counts from the file and not from the torrent --
+    /// does not have to do the conversion itself and get it wrong on a file
+    /// that does not start at piece zero.
+    pub fn promises_at(&self, at: B::Position) {
+        let index = {
+            let state = self.entity.state.lock();
+            B::index_of(&state.domain, at)
+        };
+        if let Some(index) = index {
+            self.promises(index..index.saturating_add(1));
+        }
+    }
+
     pub fn promises(&self, pieces: Range<u32>) {
         if pieces.is_empty() {
             return;
@@ -6454,6 +6500,61 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// **A read parked on a piece the disk does not have is the whole
+    /// want-set**, and nothing else is ordered while it waits.
+    ///
+    /// A want-set is an order to the swarm, and an order for a thousand
+    /// pieces is not one. In the field, seventeen seeders delivering twelve
+    /// megabytes a second took eighteen seconds to produce the single piece
+    /// a player was parked on, because the rest of the window was wanted
+    /// just as much. Playing from an offset makes that three waits in
+    /// series -- header, container index, seek target.
+    #[tokio::test]
+    async fn a_read_parked_on_a_piece_the_disk_lacks_is_the_whole_want_set() {
+        let (backing, owner, _budget) = torrent();
+        // A disk without piece 6, so the promise below is unmet.
+        backing.held.lock().remove(&6);
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        let reader = owner
+            .reader_on(&0, (0, 0), Reading::Playback, Buffering::default())
+            .expect("the entity the install made");
+        reader.promises(6..7);
+
+        let claim = owner.turn(&0).await.expect("the turn");
+        owner.pass(&0, &(), claim, Mode::Live).await;
+        assert_eq!(
+            *backing.wanted.lock(),
+            vec![vec![6..7]],
+            "the piece the read is stuck on, and nothing to compete with it"
+        );
+        drop(reader);
+    }
+
+    /// **And the windows are wanted again the moment it arrives.**
+    ///
+    /// The narrowing ends by itself, which is why it can be as blunt as it
+    /// is: a promise is made by a parked read and cleared by the byte that
+    /// unparks it, so nothing has to decide when start-up is over.
+    #[tokio::test]
+    async fn a_promise_the_disk_can_meet_leaves_the_windows_wanted() {
+        let (backing, owner, _budget) = torrent();
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        let reader = owner
+            .reader_on(&0, (0, 0), Reading::Playback, Buffering::default())
+            .expect("the entity the install made");
+        // `torrent()` holds every piece, so this promise is already met.
+        reader.promises(6..7);
+
+        let claim = owner.turn(&0).await.expect("the turn");
+        owner.pass(&0, &(), claim, Mode::Live).await;
+        assert_eq!(
+            *backing.wanted.lock(),
+            vec![vec![0..2]],
+            "nothing is waiting, so the window is the order again"
+        );
+        drop(reader);
     }
 
     /// **An entity nothing has ever played is still bounded.** A download,

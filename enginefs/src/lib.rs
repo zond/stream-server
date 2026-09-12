@@ -8265,6 +8265,67 @@ mod tests {
         );
     }
 
+    /// **A read that parks says which piece it is parked on.**
+    ///
+    /// The retention pass orders that piece from the swarm ahead of every
+    /// window it holds, which is what makes a start-up wait on one piece
+    /// rather than on a thousand. Nothing said it before this: `promises`
+    /// had a single production caller in the workspace, the proxy's, so the
+    /// torrent side knew which readers were *near* a piece and never which
+    /// one was actually stuck.
+    #[tokio::test]
+    async fn a_read_that_parks_promises_the_piece_it_is_parked_on() {
+        let (enginefs, _counters) = test_enginefs_for_reconciler(1);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        // A policy, so the entity exists for a promise to land on.
+        enginefs.reconcile_tick().await;
+        engine.retention.install(0, 0).await;
+        assert!(
+            engine
+                .retention
+                .holding(&0)
+                .is_none_or(|holding| holding.promised.is_empty()),
+            "nothing is promised before a read parks"
+        );
+
+        // Inline rather than `poll_a_read`, which drops its handle before it
+        // returns -- and a closed read promises nothing, correctly.
+        use tokio::io::AsyncRead;
+        let mut reader = crate::files::FileHandle::new(
+            100,
+            "video-0.mkv".to_string(),
+            Box::new(ParkedStream),
+            engine.clone(),
+            crate::files::Opening {
+                file_idx: 0,
+                start_offset: 0,
+                intent: crate::backend::priorities::PlaybackIntent::DirectInitial,
+                lookahead_bytes: 0,
+                buffer: crate::backend::priorities::BufferProfile::Normal,
+            },
+        );
+        engine.active_streams.fetch_add(1, Ordering::SeqCst);
+        let mut buf = [0u8; 16];
+        let parked = std::future::poll_fn(|cx| {
+            let polled = std::pin::Pin::new(&mut reader)
+                .poll_read(cx, &mut tokio::io::ReadBuf::new(&mut buf));
+            std::task::Poll::Ready(matches!(polled, std::task::Poll::Pending))
+        })
+        .await;
+        assert!(parked, "`ParkedStream` never completes a read");
+        assert_eq!(
+            engine
+                .retention
+                .holding(&0)
+                .expect("the file's entity")
+                .promised,
+            vec![0..1],
+            "the piece under the parked read's cursor"
+        );
+        drop(reader);
+        drop(enginefs);
+    }
+
     /// One poll of a fresh reader on this engine: `None` when the read
     /// parks -- what a read on a piece that is still coming does -- and the
     /// error when it is refused outright.
