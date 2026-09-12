@@ -1593,7 +1593,6 @@ impl StorageFactory for PieceStoreFactory {
     }
 }
 
-#[cfg(unix)]
 /// Do `io` on what `open` gives, and if the handle turns out to be stale,
 /// `forget` it, open again and do it once more.
 ///
@@ -1630,6 +1629,7 @@ fn is_stale_handle(error: &io::Error) -> bool {
     ) || error.kind() == io::ErrorKind::NotFound
 }
 
+#[cfg(unix)]
 fn pread_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
     use std::os::unix::fs::FileExt;
     file.read_exact_at(buf, offset)
