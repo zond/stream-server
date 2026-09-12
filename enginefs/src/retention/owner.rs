@@ -625,6 +625,16 @@ struct State<B: Backing> {
     /// It lives exactly as long as the policy that made it: written at the
     /// pass's decision, cleared when a policy is installed or forgotten.
     doomed: Vec<Range<u32>>,
+    /// The draw that decides which of this entity's pieces this process
+    /// offers to the swarm ([`Buffering::seed`]).
+    ///
+    /// **Per entity and random, and that is the whole point of it.** A
+    /// peer cannot see the swarm, so it cannot coordinate; what it can do
+    /// is pick independently, and independent picks by many peers sum to
+    /// even coverage where one shared rule -- keep the first minute, keep
+    /// every k-th piece -- sums to a shared hole. Drawn once and kept: a
+    /// redraw would orphan pieces already announced.
+    seed: u64,
     /// How many streams have ever been opened on this entity: every
     /// [`Retention::install`] that reached the turn, whatever it decided
     /// there.
@@ -1032,6 +1042,7 @@ impl<B: Backing> Retention<B> {
                         held_back: B::SHARE == Share::Half,
                         doomed: Vec::new(),
                         opens: 0,
+                        seed: share_seed(),
                     })),
                 })
             })
@@ -1241,7 +1252,7 @@ impl<B: Backing> Retention<B> {
         // pass reclaimed everything the old one had committed -- announced,
         // then deleted. Resized in place, the range stays held back and the
         // committed half stays announced.
-        let over = match (&resolved, policy.as_mut()) {
+        let carried = match (&resolved, policy.as_mut()) {
             (Some(domain), Some(next)) => {
                 let state = entity.state.lock();
                 state
@@ -1249,15 +1260,12 @@ impl<B: Backing> Retention<B> {
                     .as_ref()
                     .filter(|_| state.domain == *domain)
                     .map(|installed| installed.policy.carry_into(next))
+                    .is_some()
             }
-            _ => None,
+            _ => false,
         };
-        if let Some(over) = over
-            && let Some(next) = policy.take()
-        {
-            return self
-                .resize_under(&entity, &mut claim, budget, next, over)
-                .await;
+        if carried && let Some(next) = policy.take() {
+            return self.resize_under(&entity, &mut claim, budget, next).await;
         }
         // Whatever was held back before goes back into what we announce
         // first, whether or not a new policy is going in. Otherwise an
@@ -1320,33 +1328,22 @@ impl<B: Backing> Retention<B> {
     /// Put `next` in place of the standing policy, which it has already
     /// been carried onto ([`RetentionPolicy::carry_into`]). Under the turn.
     ///
-    /// The committed pieces a smaller budget has no room for are held back
-    /// before they leave the committed set, so no pass reclaims a piece we
-    /// still announce; one the backend would not hold back stays committed.
-    /// The doomed runs and the epoch the hold-back went out under stay:
-    /// nothing here gave anything back or held the range back anew.
+    /// **Nothing is held back here, however much smaller the new budget
+    /// is.** A committed piece has been announced, and there is no un-have
+    /// in BitTorrent: hiding it changes only what a *new* peer is handed at
+    /// its handshake, while a peer that already has the Have can still ask
+    /// for it and, the bytes being gone, be hung up on. `carry_into` adopts
+    /// the whole committed set for that reason, so there is nothing over
+    /// capacity to take back. The doomed runs and the epoch the hold-back
+    /// went out under stay: nothing here gave anything back or held the
+    /// range back anew.
     async fn resize_under(
         &self,
         entity: &Entity<B>,
         claim: &mut Claim,
         budget: CacheBudget,
-        mut next: RetentionPolicy,
-        over: Vec<u32>,
+        next: RetentionPolicy,
     ) -> InstallOutcome {
-        if B::SHARE == Share::Half {
-            for run in runs(&over) {
-                match self.backing.advertise(run.clone(), false).await {
-                    Ok(()) => next.uncommit(&run.collect::<Vec<_>>()),
-                    Err(error) => tracing::warn!(
-                        key = ?entity.key,
-                        error = %format!("{error:#}"),
-                        "could not hold back what a smaller budget stops sharing; it stays shared"
-                    ),
-                }
-            }
-        } else {
-            next.uncommit(&over);
-        }
         tracing::debug!(
             key = ?entity.key,
             shape = ?next.shape(),
@@ -2163,7 +2160,10 @@ impl<B: Backing> State<B> {
     /// them. A reader that has ended is out of the map and out of this: its
     /// stream is not fetching anything.
     fn buffering(&self) -> Buffering {
-        let mut asked = Buffering::default();
+        let mut asked = Buffering {
+            seed: self.seed,
+            ..Buffering::default()
+        };
         // No reader at all asks for no time cap, which is the shape that
         // leaves the byte arithmetic alone: an entity nothing is reading is
         // not one to start capping in seconds.
@@ -2563,6 +2563,30 @@ fn without_all(ranges: Vec<Range<u32>>, holes: &[Range<u32>]) -> Vec<Range<u32>>
             .collect();
     }
     kept
+}
+
+/// A fresh draw for one entity's shared set ([`State::seed`]).
+///
+/// `RandomState` is seeded from the operating system once per process and
+/// is keyed per instance, so two `RandomState`s in one process disagree and
+/// two processes disagree -- which is exactly what is wanted here, and it
+/// costs no dependency. What is hashed is a counter, so two entities of one
+/// process never draw the same set either.
+#[cfg(not(test))]
+fn share_seed() -> u64 {
+    use std::hash::BuildHasher;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    std::collections::hash_map::RandomState::new().hash_one(NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Fixed under test: what the tests are about is which pieces a given draw
+/// keeps and that nothing ever takes one back, not that the draw is random
+/// -- that it *is* is one call to `RandomState`, above. The value is
+/// chosen so that the eight-piece fake files draw their first two pieces,
+/// which is where the tests that predate the draw had their windows.
+#[cfg(test)]
+fn share_seed() -> u64 {
+    692
 }
 
 /// How far a playhead must move before another pass is worth its listing:
@@ -3659,14 +3683,14 @@ mod tests {
             .await
             .concluded
             .expect("a pass");
-        assert_eq!(*backing.reclaims.lock(), vec![vec![0..3, 6..8]]);
+        assert_eq!(*backing.reclaims.lock(), vec![vec![2..3, 6..8]]);
         assert_eq!(
             *backing.asked.lock(),
-            vec![vec![0..3]],
+            vec![vec![2..3]],
             "the second run was asked about under a pin"
         );
-        assert_eq!(outcome.reclaimed, 3);
-        assert_eq!(backing.on_disk(), vec![6, 7]);
+        assert_eq!(outcome.reclaimed, 1);
+        assert_eq!(backing.on_disk(), vec![0, 1, 6, 7]);
         // The next pass finds the pin first: the policy goes, the range
         // goes back to the swarm, nothing is listed, and the claim is
         // released under the state lock like any other exit's.
@@ -3693,7 +3717,8 @@ mod tests {
         // whole. See [`State::doomed`].
         assert_eq!(
             *backing.advertised.lock(),
-            vec![(0..8, false), (3..6, true)]
+            vec![(0..8, false), (0..2, true), (0..2, true), (3..6, true)],
+            "the draw's pieces, which no reclaim may take and no pin un-announce"
         );
         assert_eq!(backing.reclaims.lock().len(), 1);
     }
@@ -4313,7 +4338,11 @@ mod tests {
         let holding = owner.holding(&0).unwrap();
         assert!(holding.installed.is_some());
         assert_eq!(holding.windows, vec![0..2], "the failed listing concluded");
-        assert_eq!(*backing.advertised.lock(), vec![(0..8, false)]);
+        assert_eq!(
+            *backing.advertised.lock(),
+            vec![(0..8, false), (0..2, true)],
+            "the hold-back, and the draw's pieces announced as the pass found them"
+        );
     }
 
     /// **A budget that changes under a pass replaces the policy on the
@@ -4722,7 +4751,8 @@ mod tests {
             .expect("a pass");
         assert_eq!(
             (first.committed, first.withdrawn, first.reclaimed),
-            (0, 0, 6)
+            (2, 0, 6),
+            "the two pieces of this file's draw were held already, so the first pass announces them"
         );
         // Playback walks to piece 1: piece 0 is behind it, was covered, and
         // is committed.
@@ -4734,15 +4764,19 @@ mod tests {
         let claim = owner.turn(&0).await.expect("the turn");
         let second = owner.pass(&0, &(), claim, Mode::Live).await;
         let conclusion = second.concluded.expect("a pass");
-        assert_eq!((conclusion.committed, conclusion.withdrawn), (1, 0));
+        assert_eq!(
+            (conclusion.committed, conclusion.withdrawn),
+            (0, 0),
+            "the draw was announced by the first pass; this one finds nothing new"
+        );
         assert!(second.again.is_none(), "the tick armed a pass");
         assert_eq!(
             *backing.advertised.lock(),
-            vec![(0..8, false), (0..1, true)]
+            vec![(0..8, false), (0..2, true)]
         );
         assert_eq!(
             owner.holding(&0).unwrap().installed.unwrap().committed,
-            [0].into_iter().collect()
+            [0, 1].into_iter().collect()
         );
         // The disk loses the committed piece behind our back.
         backing.held.lock().remove(&0);
@@ -4755,16 +4789,19 @@ mod tests {
         assert_eq!((third.committed, third.withdrawn), (0, 1));
         assert_eq!(
             *backing.advertised.lock(),
-            vec![(0..8, false), (0..1, true), (0..1, false)]
+            vec![(0..8, false), (0..2, true), (0..1, false)]
         );
         // A refused announce: the pass counts nothing committed and goes
-        // on to its reclaim.
+        // on to its reclaim. Piece 1 is in the draw and arrives under the
+        // refusal, so there is something to refuse.
         let (backing, owner, _budget) = torrent();
+        backing.held.lock().remove(&1);
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         owner.note_position(&0, (0, 0));
         let claim = owner.turn(&0).await.expect("the turn");
         owner.pass(&0, &(), claim, Mode::Live).await;
         owner.note_position(&0, (0, PIECE));
+        backing.holds([1]);
         backing.fail_advertise.store(true, Ordering::SeqCst);
         let claim = owner.turn(&0).await.expect("the turn");
         let outcome = owner
@@ -4778,7 +4815,10 @@ mod tests {
             2,
             "a refused announce stopped the pass"
         );
-        assert_eq!(*backing.advertised.lock(), vec![(0..8, false)]);
+        assert_eq!(
+            *backing.advertised.lock(),
+            vec![(0..8, false), (0..1, true)]
+        );
     }
 
     /// **A budget that moved resizes the policy in place: nothing is given
@@ -4788,9 +4828,14 @@ mod tests {
     /// every open installs. Rebuilt on each one, the install gave the whole
     /// range back -- a Have for every held piece, the window's included --
     /// to hold it back again a call later, and the new policy's first pass
-    /// reclaimed the piece the old one had committed and announced. A
-    /// smaller budget still takes back what it has no room for, but holds
-    /// it back first.
+    /// reclaimed the piece the old one had committed and announced.
+    ///
+    /// **And a smaller budget takes back nothing either.** There is no
+    /// un-have: a peer that already holds our Have can ask for the piece
+    /// whatever the bitfield a new peer would be handed says, and with the
+    /// bytes gone the only answer is to hang up. So the committed set is
+    /// carried whole, over the new capacity and all, and those bytes are
+    /// the price of having said we had them.
     #[tokio::test]
     async fn a_budget_that_moved_resizes_the_policy_and_keeps_what_it_committed() {
         let (backing, owner, budget) = torrent();
@@ -4813,7 +4858,7 @@ mod tests {
         assert_eq!(committed(&owner), vec![0, 1]);
         assert_eq!(
             *backing.advertised.lock(),
-            vec![(0..8, false), (0..1, true), (1..2, true)]
+            vec![(0..8, false), (0..2, true)]
         );
 
         // A restart out of an error threw the hold-back away, and the
@@ -4823,37 +4868,41 @@ mod tests {
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Resized);
         assert_eq!(
             backing.advertised.lock().len(),
-            3,
+            2,
             "a resize gave the range back or held it back again"
         );
-        // Straight on to piece 3, from the window the old shape last
-        // chose: piece 2 was in it, so playback walked past it.
-        backing.holds([2]);
+        // The roomier budget draws a third piece, 5. The earlier passes
+        // reclaimed it, and it comes back off the swarm.
+        backing.holds([5]);
         owner.note_position(&0, (0, 3 * PIECE));
         let claim = owner.turn(&0).await.expect("the turn");
         owner.pass(&0, &(), claim, Mode::Live).await;
-        assert_eq!(committed(&owner), vec![0, 1, 2]);
+        assert_eq!(committed(&owner), vec![0, 1, 5]);
         assert!(
-            backing.on_disk().starts_with(&[0, 1, 2]),
+            backing.on_disk().starts_with(&[0, 1]),
             "a committed piece was reclaimed"
         );
         assert_eq!(
-            backing.advertised.lock()[3..],
-            [(3..8, false), (2..3, true)],
-            "the re-issue and the commit"
+            backing.advertised.lock()[2..],
+            [(2..5, false), (6..8, false), (5..6, true)],
+            "the re-issue, in the runs the committed set leaves, and then the commit"
         );
 
-        // Two pieces: a window of one and one committed. Pieces 1 and 2 no
-        // longer fit, so they are held back, and only then left to the
-        // reclaim.
+        // Two pieces: a window of one and a committed capacity of one. The
+        // three pieces already announced are over that and stay announced
+        // and on the disk, because nothing here can un-say a Have.
         budget.set(Some(2 * PIECE));
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Resized);
-        assert_eq!(backing.advertised.lock()[5..], [(1..3, false)]);
-        assert_eq!(committed(&owner), vec![0]);
+        assert_eq!(
+            backing.advertised.lock().len(),
+            5,
+            "a resize said nothing to the backend"
+        );
+        assert_eq!(committed(&owner), vec![0, 1, 5]);
         let claim = owner.turn(&0).await.expect("the turn");
         owner.pass(&0, &(), claim, Mode::Live).await;
         assert!(
-            backing.on_disk().starts_with(&[0, 8]),
+            backing.on_disk().starts_with(&[0, 1, 5]),
             "{:?}",
             backing.on_disk()
         );
@@ -4887,8 +4936,8 @@ mod tests {
         owner.pass(&0, &(), claim, Mode::Live).await;
         assert_eq!(
             *backing.advertised.lock(),
-            vec![(0..8, false), (0..1, true)],
-            "the install's hold-back and the commit, and no re-issue: the first \
+            vec![(0..8, false), (0..2, true)],
+            "the install's hold-back and the draw, and no re-issue: the first \
              pass recorded the epoch the install went out under"
         );
 
@@ -4898,8 +4947,8 @@ mod tests {
         owner.pass(&0, &(), claim, Mode::Live).await;
         assert_eq!(
             *backing.advertised.lock(),
-            vec![(0..8, false), (0..1, true), (1..8, false)],
-            "everything but the committed piece is held back again"
+            vec![(0..8, false), (0..2, true), (2..8, false)],
+            "everything but the committed pieces is held back again"
         );
         let claim = owner.turn(&0).await.expect("the turn");
         owner.pass(&0, &(), claim, Mode::Live).await;
@@ -4921,7 +4970,7 @@ mod tests {
         owner.pass(&0, &(), claim, Mode::Live).await;
         assert_eq!(
             *backing.advertised.lock(),
-            vec![(0..8, false), (0..1, true), (1..8, false), (1..8, false)],
+            vec![(0..8, false), (0..2, true), (2..8, false), (2..8, false)],
             "the retry"
         );
         let claim = owner.turn(&0).await.expect("the turn");
@@ -4943,22 +4992,24 @@ mod tests {
     #[tokio::test]
     async fn the_re_issued_hold_back_goes_out_before_the_pass_commits_a_piece() {
         let (backing, owner, _budget) = torrent();
+        // Piece 1 is in this file's draw and the disk has not got it yet,
+        // so the second pass is the one with something of its own to
+        // announce.
+        backing.held.lock().remove(&1);
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         owner.note_position(&0, (0, 0));
         let claim = owner.turn(&0).await.expect("the turn");
         owner.pass(&0, &(), claim, Mode::Live).await;
 
-        // The restart, and then a pass with something of its own to
-        // announce: playback has walked to piece 1, which leaves piece 0
-        // behind the window and commits it.
+        // The restart, and the piece arriving under it.
         backing.epoch.fetch_add(1, Ordering::SeqCst);
-        owner.note_position(&0, (0, PIECE));
+        backing.holds([1]);
         let claim = owner.turn(&0).await.expect("the turn");
         owner.pass(&0, &(), claim, Mode::Live).await;
         assert_eq!(
             *backing.advertised.lock(),
-            vec![(0..8, false), (1..8, false), (0..1, true)],
-            "the install's hold-back, then the re-issue, then the commit"
+            vec![(0..8, false), (0..1, true), (2..8, false), (1..2, true)],
+            "the install's hold-back, the first commit, then the re-issue before the second"
         );
     }
 
@@ -4988,9 +5039,9 @@ mod tests {
         owner.pass(&0, &(), claim, Mode::Live).await;
         assert_eq!(
             *backing.advertised.lock(),
-            vec![(0..8, false)],
-            "the install's hold-back alone: the first pass records what it \
-             finds rather than repeating what went out a moment ago"
+            vec![(0..8, false), (0..2, true)],
+            "the install's hold-back and the draw, and no re-issue: the first pass \
+             records what it finds rather than repeating what went out a moment ago"
         );
 
         // And what it recorded is the epoch in force, so the pass after it
@@ -5000,8 +5051,8 @@ mod tests {
         owner.pass(&0, &(), claim, Mode::Live).await;
         assert_eq!(
             *backing.advertised.lock(),
-            vec![(0..8, false), (0..1, true)],
-            "the commit, and no re-issue"
+            vec![(0..8, false), (0..2, true)],
+            "the draw, and no re-issue"
         );
     }
 
@@ -5061,9 +5112,13 @@ mod tests {
             .await
             .concluded
             .expect("a pass");
-        assert_eq!(*backing.asked.lock(), vec![vec![0..3, 6..8]]);
-        assert_eq!(outcome.reclaimed, 5);
-        assert!(backing.on_disk().is_empty());
+        assert_eq!(*backing.asked.lock(), vec![vec![2..3, 6..8]]);
+        assert_eq!(outcome.reclaimed, 3);
+        assert_eq!(
+            backing.on_disk(),
+            vec![0, 1],
+            "the two pieces this file shares are never a reclaim's"
+        );
         assert_eq!(
             owner.holding(&0).unwrap().last_position,
             Some((0, 4 * PIECE)),
@@ -5403,8 +5458,8 @@ mod tests {
         );
         assert_eq!(
             backing.on_disk(),
-            vec![4, 5, 8, 9, 10, 11, 12, 13, 14, 15],
-            "and the pieces it is waiting for are the ones that stayed"
+            vec![0, 1, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15],
+            "and the pieces it is waiting for stayed, beside the two this file shares"
         );
         drop(reader);
     }

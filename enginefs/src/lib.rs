@@ -11236,17 +11236,22 @@ mod tests {
 
         let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
         std::fs::create_dir_all(&bucket).unwrap();
-        for piece in [0u32, 1, 2, 3] {
+        // Not piece 1: it is the piece this file's draw keeps, so holding it
+        // back until after the first pass is what leaves the second pass
+        // with something to announce, which is what parks it below.
+        for piece in [0u32, 2, 3] {
             std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
         }
 
-        let _store = seeded_store(&enginefs, &engine);
+        let store = seeded_store(&enginefs, &engine);
         engine.begin_retention(0).await;
         engine.note_playhead(0, 0);
         engine
             .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass");
+        std::fs::write(bucket.join("1"), [7u8; 25]).unwrap();
+        store.init_for_tests().unwrap();
         let settled = enginefs
             .torrent_stream_numbers(TEST_HASH, 0)
             .await
@@ -11538,7 +11543,10 @@ mod tests {
             .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass");
-        assert_eq!(pass.committed, 2, "{pass:?}");
+        assert_eq!(
+            pass.committed, 1,
+            "the one piece of the draw we hold: {pass:?}"
+        );
         assert_eq!(
             selected(),
             std::collections::BTreeSet::from([0, 1, 2, 3]),
@@ -11860,17 +11868,20 @@ mod tests {
             .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass ran");
-        assert_eq!(pass.reclaimed, 3, "the three outside the window: {pass:?}");
+        assert_eq!(
+            pass.reclaimed, 2,
+            "the two outside the window and outside the draw: {pass:?}"
+        );
         assert_eq!(
             enginefs
                 .store_registry()
                 .held(TEST_HASH)
                 .expect("registered")
                 .in_range(0..4),
-            std::collections::BTreeSet::from([0]),
+            std::collections::BTreeSet::from([0, 1]),
             "the set is the disk: the reclaimed pieces left it with their files"
         );
-        assert!(bucket.join("0").is_file() && !bucket.join("1").exists());
+        assert!(bucket.join("0").is_file() && bucket.join("1").is_file());
         assert_eq!(
             counters.dropped_ranges.lock().unwrap().len(),
             1,
@@ -11889,11 +11900,11 @@ mod tests {
         assert_eq!(
             *counters.dropped_ranges.lock().unwrap(),
             vec![
-                (1..4, crate::backend::AfterRelease::LeaveDropped),
-                (1..4, crate::backend::AfterRelease::LeaveDropped),
+                (2..4, crate::backend::AfterRelease::LeaveDropped),
+                (2..4, crate::backend::AfterRelease::LeaveDropped),
             ],
             "so it asked the backend to forget nothing more: the second ask is \
-             the want-set's, for the three pieces it gave back and does not \
+             the want-set's, for the two pieces it gave back and does not \
              want fetched again"
         );
     }
@@ -11930,11 +11941,12 @@ mod tests {
             .await
             .expect("a pass");
         assert_eq!(
-            pass.reclaimed, 3,
-            "the three outside the window go from a paused torrent: {pass:?}"
+            pass.reclaimed, 2,
+            "the two outside the window and outside the draw go from a paused \
+             torrent: {pass:?}"
         );
-        assert!((1..4).all(|piece| !bucket.join(piece.to_string()).exists()));
-        assert!(bucket.join("0").is_file());
+        assert!((2..4).all(|piece| !bucket.join(piece.to_string()).exists()));
+        assert!(bucket.join("0").is_file() && bucket.join("1").is_file());
     }
 
     /// **The held set the pass is handed is this file's, not the torrent's.**
@@ -12088,10 +12100,10 @@ mod tests {
             .await
             .expect("a pass");
         assert_eq!(
-            pass.reclaimed, 3,
-            "the three outside the window go: {pass:?}"
+            pass.reclaimed, 2,
+            "the two outside the window and outside the draw go: {pass:?}"
         );
-        assert!((1..4).all(|piece| !bucket.join(piece.to_string()).exists()));
+        assert!((2..4).all(|piece| !bucket.join(piece.to_string()).exists()));
         assert!(
             bucket.join("0").is_file(),
             "the piece under the playhead stays"
@@ -12434,8 +12446,9 @@ mod tests {
             counters.advertised.lock().unwrap()
         );
         assert!(
-            bucket.join("0").is_file() && bucket.join("1").is_file(),
-            "and reclaims nothing"
+            bucket.join("1").is_file(),
+            "and reclaims nothing -- piece 0 went to the pass before this one, \
+             being outside the window and not in this file's draw"
         );
     }
 
@@ -12483,14 +12496,16 @@ mod tests {
             .await
             .expect("a byte of another file stopped this file's pass");
         assert_eq!(
-            pass.reclaimed, 3,
-            "everything outside the one-piece window round piece 0: {pass:?}"
+            pass.reclaimed, 2,
+            "everything outside the one-piece window round piece 0, bar the \
+             piece this file's draw shares: {pass:?}"
         );
         assert!(
             bucket.join("0").is_file(),
             "the piece under this file's head"
         );
-        for piece in [1u32, 2, 3] {
+        assert!(bucket.join("1").is_file(), "the piece of the draw");
+        for piece in [2u32, 3] {
             assert!(!bucket.join(piece.to_string()).exists());
         }
         let holding = engine.retention.holding(&0).expect("file 0's entity");
@@ -12687,8 +12702,8 @@ mod tests {
             .expect("the pass task")
             .expect("a pass ran to the end");
         assert_eq!(
-            pass.reclaimed, 1,
-            "one of the two pieces it set out to take, not both: {pass:?}"
+            pass.reclaimed, 2,
+            "two of the three pieces it set out to take, not the third: {pass:?}"
         );
         assert!(
             bucket.join("3").is_file(),
@@ -12787,14 +12802,18 @@ mod tests {
             .collect();
         assert_eq!(
             dropped,
-            vec![1..8, 2..4],
+            vec![1..8, 0..1],
             "the first pass stopped wanting the seven pieces it did not have; \
              then the part before the window went, the pin landed inside that \
              drop, and nothing was asked for after it: {pass:?}"
         );
         assert!(
-            !bucket.join("2").exists() && !bucket.join("3").exists(),
+            !bucket.join("0").exists(),
             "the part released before the pin is gone"
+        );
+        assert!(
+            bucket.join("2").is_file() && bucket.join("3").is_file(),
+            "and the part after it was never asked for"
         );
         for piece in [5u32, 6, 7] {
             assert!(
@@ -13030,9 +13049,9 @@ mod tests {
                 .torrent_stream_numbers(TEST_HASH, 0)
                 .await
                 .and_then(|numbers| numbers.committed_bytes),
-            Some(0),
-            "the first pass of a stream commits nothing: no window has \
-             released a piece yet"
+            Some(25),
+            "the one piece of this file's draw, announced the moment we hold \
+             it rather than when the window lets go of it"
         );
 
         // Playback walks on to the second piece, which releases the first.
@@ -13086,12 +13105,15 @@ mod tests {
 
         let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
         std::fs::create_dir_all(&bucket).unwrap();
-        for piece in [4u32, 5, 8] {
+        // Piece six and not five: five is the piece this file's draw keeps,
+        // and what this test is about is an ordinary piece beside the shared
+        // one.
+        for piece in [4u32, 6, 8] {
             std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
         }
 
         // A reader at the top of episode two: piece four is the window, and
-        // pieces five and eight are outside it.
+        // pieces six and eight are outside it.
         engine.begin_retention(1).await;
         engine.note_playhead(1, 0);
         let _store = seeded_store(&enginefs, &engine);
@@ -13106,15 +13128,16 @@ mod tests {
              because the torrent still wants that episode"
         );
         assert!(
-            !bucket.join("5").exists(),
+            !bucket.join("6").exists(),
             "a piece of nobody else's still goes: this is a reclaim, not a refusal"
         );
         assert_eq!(pass.reclaimed, 1, "one piece was this file's alone to give");
         assert_eq!(
             *counters.dropped_ranges.lock().unwrap(),
             vec![
-                (6..8, crate::backend::AfterRelease::LeaveDropped),
                 (5..6, crate::backend::AfterRelease::LeaveDropped),
+                (7..8, crate::backend::AfterRelease::LeaveDropped),
+                (6..7, crate::backend::AfterRelease::LeaveDropped),
             ],
             "the backend is never even asked to forget the shared piece: it \
              would agree, and the bytes would go. The want-set's ask is for \
@@ -13166,10 +13189,10 @@ mod tests {
             .collect();
         assert_eq!(
             asked,
-            vec![6..8, 5..6],
+            vec![6..8],
             "pieces six and seven are this file's own and not wanted; piece \
              eight is the next episode's too and is never asked about; piece \
-             five is the reclaim's"
+             five is this file's draw and is never given back at all"
         );
     }
 
@@ -13200,7 +13223,8 @@ mod tests {
 
         let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
         std::fs::create_dir_all(&bucket).unwrap();
-        for piece in [4u32, 5, 8] {
+        // Piece six and not five, which is the piece this file's draw keeps.
+        for piece in [4u32, 6, 8] {
             std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
         }
 
@@ -13216,7 +13240,7 @@ mod tests {
             !bucket.join("8").exists(),
             "nothing else wants the piece, so it is cache like any other"
         );
-        assert!(!bucket.join("5").exists());
+        assert!(!bucket.join("6").exists());
         assert_eq!(
             pass.reclaimed, 2,
             "both pieces outside the window were this pass's to take"
@@ -13338,10 +13362,12 @@ mod tests {
             .await
             .expect("the next tick's pass runs: the dead one dropped the file's turn");
         assert_eq!(
-            pass.reclaimed, 2,
+            pass.reclaimed, 3,
             "and it gives back what the dead pass had decided to and never did: {pass:?}"
         );
-        assert!(!bucket.join("2").exists() && !bucket.join("3").exists());
+        assert!(
+            !bucket.join("0").exists() && !bucket.join("2").exists() && !bucket.join("3").exists()
+        );
         assert!(
             bucket.join("1").is_file(),
             "the piece under the playhead stays"
@@ -13497,7 +13523,7 @@ mod tests {
             vec![6..7, 0..1],
             "a window per head, the file's own first"
         );
-        assert_eq!(pass.reclaimed, 6, "{pass:?}");
+        assert_eq!(pass.reclaimed, 5, "{pass:?}");
         assert!(
             bucket.join("0").is_file(),
             "the piece under the first stream's head went with the run between the heads"
@@ -13506,7 +13532,7 @@ mod tests {
             bucket.join("6").is_file(),
             "the piece under the seek's head"
         );
-        for piece in [1u32, 2, 3, 4, 5, 7] {
+        for piece in [2u32, 3, 4, 5, 7] {
             assert!(
                 !bucket.join(piece.to_string()).exists(),
                 "piece {piece} is outside both windows and stayed"
@@ -13686,8 +13712,9 @@ mod tests {
         engine.begin_retention(1).await;
         assert_eq!(
             *counters.advertised.lock().unwrap(),
-            vec![(0..4, false), (0..1, true), (4..8, false)],
-            "file 0 held back and its piece 0 committed; file 1 held back;              nothing of file 0 put back"
+            vec![(0..4, false), (1..2, true), (4..8, false)],
+            "file 0 held back and the piece of its draw committed; file 1 held \
+             back; nothing of file 0 put back"
         );
         assert_eq!(
             engine
@@ -13755,7 +13782,7 @@ mod tests {
             .expect("a pass");
 
         assert_eq!(
-            pass.reclaimed, 2,
+            pass.reclaimed, 1,
             "every held piece of the file left behind: {pass:?}"
         );
         assert!(
@@ -13788,8 +13815,8 @@ mod tests {
         assert_eq!(pass.committed, 1, "{pass:?}");
         assert_eq!(
             counters.advertised.lock().unwrap().last(),
-            Some(&(4..5, true)),
-            "file 1's committed piece is announced"
+            Some(&(5..6, true)),
+            "the piece of file 1's draw is announced"
         );
     }
 
