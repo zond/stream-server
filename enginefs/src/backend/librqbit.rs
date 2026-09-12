@@ -9565,6 +9565,10 @@ mod tests {
 
     /// What a torrent's file 0 has committed for sharing, from the owner's
     /// own cells.
+    ///
+    /// Unix only, because its one caller is: the test above needs an
+    /// unwritable directory to put the torrent into error.
+    #[cfg(unix)]
     async fn committed_of(
         engine: &crate::engine::Engine<LibrqbitHandle>,
     ) -> std::collections::BTreeSet<u32> {

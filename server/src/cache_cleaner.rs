@@ -298,6 +298,9 @@ mod tests {
     /// would be a second copy of the very knowledge this layering exists to
     /// keep in one place, and would keep passing after the shape changed
     /// under it.
+    /// Unix only, because its one caller is: a sparse file is what that
+    /// test is about, and Windows does not make one the same way.
+    #[cfg(unix)]
     fn piece_store_for(root: &Path, info_hash: &str, pieces: u32) -> PieceStore {
         // One file spanning the whole torrent: the layout only has to be
         // wide enough to name the piece, since nothing here reads through it.
