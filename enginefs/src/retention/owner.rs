@@ -573,6 +573,29 @@ struct State<B: Backing> {
     /// asked has ended, and what [`Door::window_now`] draws the window
     /// round.
     last_position: Option<B::Position>,
+    /// **The pieces a container cannot be played without**, whatever the
+    /// playhead is over.
+    ///
+    /// A window is one contiguous range round one head, and playing from an
+    /// offset needs three: the header at the front, the index -- an mp4
+    /// `moov` at the tail, MKV Cues -- and the playback point itself. The
+    /// window holds one of those, so the other two are outside it and the
+    /// next pass reclaims them. The field log of 2026-09-12 is that: a film
+    /// opened at 939 s spent 34 s on the head piece and 67 s on the index,
+    /// and the index pieces were taken from under the read of them.
+    ///
+    /// Playing from the *start* hides it, because the playhead's own window
+    /// covers the header and only the tail is orphaned. It is the offset
+    /// case that needs all three at once.
+    ///
+    /// They are the entity's and not a reader's on purpose. Held by the
+    /// reader, they last exactly as long as the connection reading them --
+    /// and a player closes that connection the moment it has the index, so
+    /// the pieces are orphaned, reclaimed, and re-fetched when it opens the
+    /// next one. That loop is in every field log. Held here they are
+    /// settled once for the life of the stream, which is also all they cost:
+    /// [`STRUCTURAL_PIECES`] of a film's several thousand.
+    structural: std::collections::BTreeSet<u32>,
     /// What the player said about itself, and when it said it.
     ///
     /// Everything else here infers the playhead from the byte ranges the
@@ -906,6 +929,15 @@ struct Told<B: Backing> {
     when: std::time::Instant,
 }
 
+/// The most pieces one entity may call structural.
+///
+/// A container's header and index are a handful of pieces -- the field
+/// film's `moov` is 10.7 MB of a 23 GB file -- and this is a ceiling on a
+/// pathological one rather than a size anything is expected to reach. It
+/// bounds what a probe can pin: past it, further probe reads are ordinary
+/// reads that the window keeps while they are open and no longer.
+const STRUCTURAL_PIECES: usize = 8;
+
 /// How long the player's own word stands after it stops arriving.
 ///
 /// The app reports about once a second while a film is open. Going quiet
@@ -1194,6 +1226,7 @@ impl<B: Backing> Retention<B> {
                         windows: Vec::new(),
                         readers: HashMap::new(),
                         last_position: None,
+                        structural: std::collections::BTreeSet::new(),
                         told: None,
                         told_rate: None,
                         // Assumed held back until a clear says otherwise: an
@@ -2129,6 +2162,38 @@ impl<B: Backing> Retention<B> {
                     want.push(window);
                 }
             }
+            // **The container's own pieces, kept and not wanted**, after the
+            // readers' windows so a run one of them already covers is not
+            // repeated.
+            //
+            // Kept because a container without its index is a file nothing
+            // can play, whoever is or is not reading it this second -- and
+            // the reader that fetched it closes the moment it has it, which
+            // is exactly what leaves those pieces orphaned for the next pass
+            // to take. That loop is in every field log: fetch the index,
+            // close, lose it, open again, fetch it again.
+            //
+            // Not wanted, although these are the pieces a stream waits on
+            // before it can show a frame and ordering them first is the
+            // obvious thing. Measured, it is the wrong thing: a structural
+            // run sits outside the window, so every pass re-queues it,
+            // every re-queue is a `queued > 0` that wakes every peer, and
+            // the woken swarm fills the whole *playback* window behind it.
+            // On `a_tail_probe_over_a_paused_film_fetches_nothing_back` that
+            // is sixteen pieces pulled into a film nobody is watching, per
+            // pass, for as long as the torrent is up. The pieces arrive
+            // anyway: a stream's lookahead pulls what it reads whatever the
+            // selection says, which is the same reason a probe's own window
+            // has never been wanted.
+            let structural: Vec<u32> = state.structural.iter().copied().collect();
+            for run in runs(&structural) {
+                if !keep
+                    .iter()
+                    .any(|window| window.start <= run.start && window.end >= run.end)
+                {
+                    keep.push(run);
+                }
+            }
             // What this pass has decided to take is what it will never put
             // back into what we announce; see [`State::doomed`]. Written
             // here, under the decision's own lock, so a clear that runs
@@ -3007,6 +3072,20 @@ impl<B: Backing> Reader<B> {
                 None
             };
             let index = B::index_of(&state.domain, at);
+            // **What a probe reads is what the container is made of.** The
+            // geometry that made this read a probe is the server's only
+            // evidence of where a container keeps its index, and the pieces
+            // it actually touches are that evidence exactly -- no guess at
+            // an index's size, no piece pinned that was not read, and
+            // nothing assumed about a format. The header needs no entry of
+            // its own: a player reads it as playback, from the front, and
+            // the window is over it while it does.
+            if self.reading == Reading::Probe
+                && let Some(index) = index
+                && state.structural.len() < STRUCTURAL_PIECES
+            {
+                state.structural.insert(index);
+            }
             let offset = B::offset_of(&state.domain, at);
             let (bounded, stride) = (state.installed.is_some(), state.stride);
             let reader = state.readers.entry(self.id).or_insert_with(|| {
@@ -5584,13 +5663,17 @@ mod tests {
             .expect("a pass");
         assert_eq!(
             outcome.windows,
-            vec![0..2],
-            "the window a tick pass drew followed the probe to the tail"
+            vec![0..2, 7..8],
+            "the window a tick pass drew followed the probe to the tail -- and \
+             the piece the probe read is kept on its own account, which is \
+             what stops the next open fetching the index again"
         );
         assert_eq!(
             backing.on_disk(),
-            vec![0, 1, 8, 9, 10, 11, 12, 13, 14, 15],
-            "the pieces under the player were reclaimed and its stream will fetch them again"
+            vec![0, 1, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            "the pieces under the player were reclaimed and its stream will \
+             fetch them again -- but not piece 7, the index the probe read, \
+             which the entity keeps whether or not anything is reading it"
         );
     }
 
@@ -6161,8 +6244,9 @@ mod tests {
             .expect("a pass");
         assert_eq!(
             outcome.windows,
-            vec![5..7],
-            "a closed playback read outranks a probe that has been and gone"
+            vec![5..7, 0..1],
+            "a closed playback read outranks a probe that has been and gone, \
+             and the header piece is the container's either way"
         );
         assert!(
             backing.on_disk().contains(&5) && backing.on_disk().contains(&6),

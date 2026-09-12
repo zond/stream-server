@@ -8881,9 +8881,21 @@ mod tests {
         );
         drop(probe);
 
-        // Nothing of the film comes back.
-        let bound = settled + 2 * RETENTION_PIECE;
-        for _ in 0..20 {
+        // **A window's worth of the film does not come back.** The pieces
+        // the probe actually read do, once: they are the container's index,
+        // the entity keeps them for the life of the stream, and fetching
+        // them once is what stops every later open fetching them again. So
+        // the bound is the structural set and not zero -- and still two
+        // orders below the window this guards against, which is half the
+        // budget.
+        // Bounded, and then *stopped*: a window that followed the probe
+        // would keep pulling for as long as the torrent is up, which is the
+        // failure, where the container's pieces arrive once and are done.
+        let bound = settled + 16 * RETENTION_PIECE;
+        let mut last = 0;
+        let mut quiet = 0;
+        let quiet_at = std::time::Instant::now() + TEST_WAIT_BOUND;
+        while quiet < 3 {
             tokio::time::sleep(Duration::from_millis(50)).await;
             efs.reconcile_tick().await;
             let fetched = engine
@@ -8891,11 +8903,19 @@ mod tests {
                 .transfer_totals()
                 .expect("the torrent is still live")
                 .fetched;
+            quiet = if fetched == last { quiet + 1 } else { 0 };
+            last = fetched;
+            assert!(
+                std::time::Instant::now() < quiet_at,
+                "the swarm never stopped delivering after the probe closed: {} bytes \
+                 and still climbing",
+                fetched - settled
+            );
             assert!(
                 fetched <= bound,
                 "{} bytes came off the swarm after a probe of the tail closed over a \
-                 paused film: the window followed the probe and the pieces it left \
-                 are being fetched again",
+                 paused film: more than the container's own pieces, so the window \
+                 followed the probe and the pieces it left are being fetched again",
                 fetched - settled
             );
         }
