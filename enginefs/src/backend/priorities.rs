@@ -110,6 +110,37 @@ pub enum PlaybackIntent {
     Background,
 }
 
+impl PlaybackIntent {
+    /// Whether a read made with this intent is somebody *playing* the file,
+    /// and so whether its position is the file's own -- what the retention
+    /// window is drawn round, what the stats split behind and ahead at, and
+    /// what a paused film leaves behind. See [`Reading`].
+    ///
+    /// Only the three direct intents are. The others are all reads of a
+    /// region nobody is watching from: the container index at the tail
+    /// (`ContainerMetadata`, which is a *player's* request and delivers
+    /// bytes like any other), the server's own probe, a background fetch,
+    /// and a download -- a download walks the whole file at whatever rate
+    /// the swarm gives, and letting it carry the file's head would move the
+    /// window off the viewer who is watching the same file while it runs.
+    /// Each of them still gets a window of its own round where it is
+    /// reading while it is open ([`Reading::Probe`]); none of them leaves
+    /// one behind.
+    ///
+    /// [`Reading`]: crate::retention::owner::Reading
+    pub fn reading(self) -> crate::retention::owner::Reading {
+        use crate::retention::owner::Reading;
+        match self {
+            Self::DirectInitial | Self::DirectSeek | Self::DirectSequential => Reading::Playback,
+            Self::DownloadFull
+            | Self::DownloadRange
+            | Self::ContainerMetadata
+            | Self::InternalProbe
+            | Self::Background => Reading::Probe,
+        }
+    }
+}
+
 /// The most a stream reads ahead of itself, in bytes, by playback intent:
 /// the cap on librqbit's per-stream lookahead, in place of its fixed 32 MiB
 /// default.

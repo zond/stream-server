@@ -1331,7 +1331,13 @@ impl<H: TorrentHandle> Engine<H> {
     ) -> Option<crate::retention::PolicyReading> {
         let holding = self.retention.holding(&file_idx)?;
         let installed = holding.installed?;
-        let playhead = TorrentBacking::<H>::index_of(&holding.domain, holding.last_position?)?;
+        // The entity's head and not its last delivered byte: the two part
+        // company exactly when a probe is or has been open, and this is the
+        // reading a client draws the behind/ahead split from. On the
+        // television the split read 50.3 MB behind and 4.2 ahead with the
+        // player at 0:00, because mpv's read of the tail had left the
+        // file's head at the end of the file.
+        let playhead = TorrentBacking::<H>::index_of(&holding.domain, holding.head?)?;
         Some(crate::retention::PolicyReading::new(
             installed.pieces,
             holding.domain.piece_length,
@@ -1978,6 +1984,7 @@ impl<H: TorrentHandle> Engine<H> {
             self.clone(),
             file_idx,
             start_offset,
+            intent,
         ))
     }
 }

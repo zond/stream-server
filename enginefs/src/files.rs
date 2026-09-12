@@ -101,6 +101,21 @@ impl<H: TorrentHandle> FileHandle<H> {
     /// (`Engine::try_get_file_with_intent` does, before it asks the backend
     /// for the stream), so the reader this takes on the file's entity is
     /// there before the first byte is noted to it.
+    ///
+    /// `intent` reaches the owner as what the read is *for*
+    /// ([`PlaybackIntent::reading`]). The owner needs it: a player's read of
+    /// the container index at the tail delivers bytes exactly like the
+    /// response playing the film, and only the intent tells them apart
+    /// before the damage -- the probe's byte claiming the file's head and
+    /// the window sliding to the end of the file under a player still at
+    /// 0:00.
+    ///
+    /// And `start_offset` reaches it too, so the read has a head from the
+    /// open rather than from its first delivered byte: a reader parked on
+    /// the piece it is waiting for is the one the file is being buffered
+    /// for, and an entity with no head is one no pass draws a window for.
+    ///
+    /// [`PlaybackIntent::reading`]: crate::backend::priorities::PlaybackIntent::reading
     pub fn new(
         size: u64,
         name: String,
@@ -108,9 +123,13 @@ impl<H: TorrentHandle> FileHandle<H> {
         engine: Arc<crate::engine::Engine<H>>,
         file_idx: usize,
         start_offset: u64,
+        intent: crate::backend::priorities::PlaybackIntent,
     ) -> Self {
         let reader_id = engine.next_reader_id();
-        let reader = engine.retention.reader_on(&file_idx);
+        let reader =
+            engine
+                .retention
+                .reader_on(&file_idx, (file_idx, start_offset), intent.reading());
         Self {
             size,
             name,
