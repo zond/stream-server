@@ -36,11 +36,12 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 pub use url::Url;
 
 /// Default log directives, applied WITHOUT any environment variable. The
-/// application code lives in the `stream_server` lib crate (targets
-/// `stream_server::*`); `server` covers the thin `server` bin
-/// (src/main.rs). Both must be listed or the lib rename silently filters
-/// out every log line. `RUST_LOG` only overrides this when it is set to a
-/// non-empty value; an unset or blank `RUST_LOG` keeps this.
+/// application code lives in the `stream_server` lib crate, so its targets
+/// are `stream_server::*` and that is the name that must be listed here --
+/// the `server` directive beside it was the deleted `server` binary's, and
+/// a rename of the lib would silently filter out every log line the same
+/// way. `RUST_LOG` only overrides this when it is set to a non-empty
+/// value; an unset or blank `RUST_LOG` keeps this.
 ///
 /// `librqbit` is here at WARN because it is the only place a storage
 /// failure is reported at all: a piece that cannot be written (a full or
@@ -66,7 +67,7 @@ pub use url::Url;
 /// `TorrentListenPort::wants_upnp_forwarding`). ERROR rather than OFF so a
 /// genuinely fatal DHT error still lands: `librqbit_dht`'s persistence
 /// warnings are on a different target and keep their level.
-pub(crate) const DEFAULT_LOG_FILTER: &str = "server=info,stream_server=info,tower_http=info,\
+pub(crate) const DEFAULT_LOG_FILTER: &str = "stream_server=info,tower_http=info,\
      enginefs=info,librqbit=warn,librqbit_dht::dht=error,librqbit_upnp=error";
 
 pub const DEFAULT_HTTP_PORT: u16 = 11470;
@@ -1135,11 +1136,12 @@ pub async fn run(
         Some(token) => {
             tracing::info!("control API requires `Authorization: Bearer <token>`");
             // The token is a secret and must never reach `tracing`: the log
-            // files would keep it, and the kept launches' archives with them. A
-            // generated token has no other way to reach the operator of the
-            // standalone binary, so it goes to stdout once; a `--token` /
-            // `STREAM_SERVER_TOKEN` token is already known to whoever set it,
-            // and an embedder reads `ServerHandle::auth_token`.
+            // files would keep it, and the kept launches' archives with them.
+            // An embedder reads `ServerHandle::auth_token` instead; the
+            // stdout line is only for a host that asked for one by setting
+            // `print_startup`, and a token the caller supplied itself
+            // (`ServerAuth::Token`) is never printed, since whoever set it
+            // already knows it.
             if cfg.print_startup && cfg.auth == ServerAuth::Generated {
                 println!("control API token: {token}");
             }
@@ -1902,7 +1904,7 @@ mod default_log_filter_tests {
     /// volume becomes visible at all.
     #[test]
     fn the_default_directives_cover_every_crate_that_reports_trouble() {
-        for crate_name in ["server", "stream_server", "enginefs", "librqbit"] {
+        for crate_name in ["stream_server", "enginefs", "librqbit"] {
             assert!(
                 DEFAULT_LOG_FILTER
                     .split(',')

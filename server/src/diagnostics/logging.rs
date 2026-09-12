@@ -327,12 +327,12 @@ pub fn log_startup_context(
 /// [`log_startup_context`] over a given command line rather than the
 /// process's own, so a test can see what the line would carry.
 ///
-/// The command line goes through [`redacted_args`] first. `main`'s
-/// `parse_cli` consumes `--token`, but this reads argv from the OS again, so
-/// nothing upstream has scrubbed it; the value is a bearer token that grants
-/// the whole control API, and the diagnostics log is what a user pastes to
-/// a stranger when asking for help. Everything else on the line is a path
-/// or a version, all of which the log names elsewhere already.
+/// The command line goes through [`redacted_args`] first. This is the host
+/// process's own argv, read from the OS, and nothing here has scrubbed it;
+/// a `--token` value is a bearer token that grants the whole control API,
+/// and the diagnostics log is what a user pastes to a stranger when asking
+/// for help. Everything else on the line is a path or a version, all of
+/// which the log names elsewhere already.
 fn log_startup_context_with_args(
     config_dir: &Path,
     cache_dir: &Path,
@@ -364,10 +364,10 @@ fn log_startup_context_with_args(
 /// What stands in for a secret in the log.
 const REDACTED: &str = "<redacted>";
 
-/// The command line as the log may show it: the value of `--token`, in
-/// either spelling (`--token <t>`, `--token=<t>`), replaced by
-/// [`REDACTED`]. Redaction is by flag name, never by what the value looks
-/// like -- a token an operator chose can be short, or a word.
+/// The host process's command line as the log may show it: the value of
+/// `--token`, in either spelling (`--token <t>`, `--token=<t>`), replaced
+/// by [`REDACTED`]. Redaction is by flag name, never by what the value
+/// looks like -- a token an operator chose can be short, or a word.
 fn redacted_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
     let mut redacted = Vec::new();
     let mut value_is_secret = false;
@@ -626,9 +626,8 @@ mod tests {
             redacted_args(strings(&["--token=hunter2", "--no-auth"])),
             strings(&["--token=<redacted>", "--no-auth"])
         );
-        // A trailing `--token` with no value (parse_cli rejects it, but the
-        // process gets this far first) leaves nothing to redact and adds
-        // nothing.
+        // A trailing `--token` with no value leaves nothing to redact and
+        // adds nothing.
         assert_eq!(redacted_args(strings(&["--token"])), strings(&["--token"]));
     }
 

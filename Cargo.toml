@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "enginefs",
     "server",
-    "stremio-runtime-stub",
 ]
 # The workspace is pure Rust: librqbit is the sole torrent backend and RAR is
 # the pure-Rust `unrar-rs` crate (a direct `server` dependency behind the
@@ -12,7 +11,6 @@ members = [
 default-members = [
     "enginefs",
     "server",
-    "stremio-runtime-stub",
 ]
 
 [profile.release]

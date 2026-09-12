@@ -16,9 +16,9 @@
 
 ## 💡 About
 
-Stream Server is zond's hard fork of [stremio-native/stream-server](https://github.com/stremio-native/stream-server) (formerly `perpetus/stream-server`, itself an open-source alternative to Stremio's closed-source `server.js`), rewritten around a fork of `librqbit`. It has **no ambition to merge back upstream**: the API, the engine and the licensing have all diverged, and it is shaped by one client. That client is [xtremio](https://github.com/zond/xtremio), a Flutter Stremio client that embeds this server in-process as a Rust library (`stream_server::start`, see [Library API](#library-api)); the same crate also builds a standalone `server` binary that runs on its own.
+Stream Server is zond's hard fork of [stremio-native/stream-server](https://github.com/stremio-native/stream-server) (formerly `perpetus/stream-server`, itself an open-source alternative to Stremio's closed-source `server.js`), rewritten around a fork of `librqbit`. It has **no ambition to merge back upstream**: the API, the engine and the licensing have all diverged, and it is shaped by one client. That client is [xtremio](https://github.com/zond/xtremio), a Flutter Stremio client that embeds this server in-process as a Rust library (`stream_server::start`, see [Library API](#library-api)). **This crate is a library and nothing else**: there is no standalone daemon any more, so no other Stremio client can run it.
 
-Its goal is narrower than upstream's: a **headless torrent-streaming server with no system-library requirements**. `cargo build` on a machine with a Rust toolchain and a C compiler — no libtorrent, no libclang, no FFmpeg, no GUI toolkits — is enough to produce a working server, whether you build the default binary or the `--no-default-features` one. The server itself is Rust; the C compiler is for the C some dependencies bundle and build from source (`aws-lc-sys`, under rustls and librqbit's SHA-1, and `libmimalloc-sys`). The one external program the server runs is `curl`, and only for the `/ftp` route (see [Routes](#routes)).
+Its goal is narrower than upstream's: a **headless torrent-streaming server with no system-library requirements**. `cargo build` on a machine with a Rust toolchain and a C compiler — no libtorrent, no libclang, no FFmpeg, no GUI toolkits — is enough to compile it, with the default features or with `--no-default-features`. The server itself is Rust; the C compiler is for the C one dependency bundles and builds from source (`aws-lc-sys`, under rustls and librqbit's SHA-1). The one external program the server runs is `curl`, and only for the `/ftp` route (see [Routes](#routes)).
 
 To get there, this fork **deliberately drops Stremio server.js API compatibility**: there is no HLS transcoding, no FFmpeg/FFprobe integration, and no video-probing endpoints. Those existed to reformat video for Stremio's web-based player. This server instead sits behind a native client (xtremio: Flutter, with `media_kit`/`libmpv` for playback) that does direct play and handles codecs and subtitles itself — so the server's only job is getting torrent and archive bytes onto an HTTP connection efficiently, not transcoding them.
 
@@ -44,7 +44,7 @@ This is not a drop-in replacement for `server.js` — the API surface it exposes
 ## ✨ Features
 
 ### Core Streaming
-- **🚀 No system libraries, always**: the entire build — every feature combination — needs no system library and no tool but the pinned Rust toolchain and a C compiler, for the C that `aws-lc-sys` and `libmimalloc-sys` bundle. At run time the server runs one external program, and only for `/ftp`: `curl`
+- **🚀 No system libraries, always**: the entire build — every feature combination — needs no system library and no tool but the pinned Rust toolchain and a C compiler, for the C that `aws-lc-sys` bundles. At run time the server runs one external program, and only for `/ftp`: `curl`
 - **🔧 Single backend**: `librqbit` (Rust, via the `zond/rqbit` fork — see [About](#-about)) is the only torrent engine — there is no C++ alternative to opt into
 - **📡 HTTP Range Requests**: torrent pieces are streamed straight to HTTP range requests for instant seeking — direct play, no transcoding step in between
 
@@ -64,25 +64,24 @@ This is not a drop-in replacement for `server.js` — the API surface it exposes
 
 ## 📦 Installation
 
-### Pre-built Binaries
-
-No releases have been published from this fork yet — build from source (see below). The [`release.yml`](.github/workflows/release.yml) workflow is wired up to publish Windows/Linux/Arch binaries from a `v*` tag when that happens, but no tag has been pushed so far.
-
 ### Build from Source
 
-**The build needs zero system libraries** — no libtorrent, no libclang, no FFmpeg, no GUI toolkits, for any feature combination this repo has; the one tool beyond Rust is a C compiler, for the C `aws-lc-sys` and `libmimalloc-sys` build from source (and, on macOS, a one-file shim `network-interface` compiles). The pinned toolchain in `rust-toolchain.toml` (Rust 1.98.0) is picked up automatically by rustup, and this is exactly what CI verifies with no `apt install` step at all:
+There is nothing to install: this crate builds no program of its own. An embedder adds it as a path or git dependency and calls `stream_server::start` (see [Library API](#library-api)); `cargo build` here only checks that it compiles.
+
+**The build needs zero system libraries** — no libtorrent, no libclang, no FFmpeg, no GUI toolkits, for any feature combination this repo has; the one tool beyond Rust is a C compiler, for the C `aws-lc-sys` builds from source (and, on macOS, a one-file shim `network-interface` compiles). The pinned toolchain in `rust-toolchain.toml` (Rust 1.98.0) is picked up automatically by rustup, and this is exactly what CI verifies with no `apt install` step at all:
 
 ```bash
 # Default build: pure-Rust librqbit backend (the only backend) + pure-Rust RAR.
-# NOTE: this links unrar-rs (GPL-3.0-or-later), so this binary is
-# GPL-3.0-or-later — see the License section below.
+# NOTE: this links unrar-rs (GPL-3.0-or-later), so whoever distributes a
+# binary built from it distributes it under the GPL — see the License
+# section below.
 cargo build --release
 ```
 
 To get an MIT-licensed binary instead, drop RAR:
 
 ```bash
-# MIT binary: same librqbit backend, no RAR (no unrar-rs, no GPL)
+# MIT build: same librqbit backend, no RAR (no unrar-rs, no GPL)
 cargo build --release --no-default-features
 ```
 
@@ -91,32 +90,40 @@ cargo build --release --no-default-features
 | *(default)* | `rar` (pure-Rust RAR via `unrar-rs`) on top of the always-on `librqbit` backend | None |
 | `rar` | RAR archive streaming via pure-Rust `unrar-rs` (**on by default**) | None |
 
-RAR streaming is **on by default** and pure Rust — no libclang or C++ toolchain. ZIP, 7Z, TAR and tgz streaming are always built in too, and are not gated by any feature. Because `unrar-rs` is GPL-3.0-or-later, the default binary is GPL-3.0-or-later; drop the `rar` feature (`--no-default-features`) for an MIT binary, where RAR requests then return a 501 JSON error.
+RAR streaming is **on by default** and pure Rust — no libclang or C++ toolchain. ZIP, 7Z, TAR and tgz streaming are always built in too, and are not gated by any feature. Because `unrar-rs` is GPL-3.0-or-later, a binary that links this library with `rar` on is GPL-3.0-or-later; drop the feature (`--no-default-features`) for an MIT-only build, where RAR requests then return a 501 JSON error.
 
 ---
 
 ## 🚀 Quick Start
 
-```bash
-# Run the binary built above (the release packages install it as `stream-server`)
-./target/release/server
+There is no command to run: this crate builds no program. A host process links it and starts a server inside itself.
 
-# Or with cargo
-cargo run --release -p server
+```toml
+# In the embedder's Cargo.toml
+[dependencies]
+stream_server = { package = "server", path = "../stream-server/server" }
 ```
 
-The binary listens on **every interface**, on the standard streaming-server port: `ServerConfig::binary_default()` binds `0.0.0.0:11470` and advertises `http://127.0.0.1:11470` as its base URL, and an HTTPS listener on `0.0.0.0:12470` runs once a certificate is on disk (see `/get-https` below). So on the standalone binary the open media routes — `/proxy` and `/ftp` among them, which fetch whatever URL they are handed — are reachable from the network, and the control routes are guarded by the bearer token alone. An embedder's `ServerConfig::embedded()` binds `127.0.0.1:11470` only. One binary runs per machine: a second one finds `stream-server.lock` in the system temp dir held, and exits. Settings (`settings.json`) and logs (`logs/`) live in `<platform config dir>/stremio-server`, torrent data under `<platform cache dir>/stremio-server` unless `settings.cacheRoot` names another root.
+```rust
+let handle = stream_server::start(stream_server::ServerConfig {
+    // Where settings.json, logs/ and any HTTPS certificate go. An embedder
+    // must set this: the default reads the platform config dir, which needs
+    // HOME/XDG_* to be set.
+    config_dir: Some(config_dir),
+    // Torrent data, the proxy cache and the archive scratch. Defaults to
+    // `config_dir/cache`.
+    cache_dir: Some(cache_dir),
+    ..Default::default()
+})?;
+let base_url = handle.base_url().to_string();   // http://127.0.0.1:<port>
+let token = handle.auth_token().map(str::to_string); // control-route bearer
+```
 
-Every control route requires a bearer token for this launch; the binary chooses it from its command line:
+`ServerConfig::default()` is [`ServerConfig::embedded()`](#library-api): **loopback only** — `127.0.0.1:11470`, no HTTPS listener, no logging, no SSDP discovery, a freshly generated per-launch bearer token the embedder reads off the handle, and an ephemeral BitTorrent listen port so several servers (and the tests) coexist. Set `http_addr`'s port to `0` to let the OS pick the HTTP port too, and read the one it picked from `ServerHandle::bound_http_addr()`.
 
-| Flag / variable | Effect |
-|---|---|
-| *(nothing)* | A fresh random token is generated and printed **to stdout** as `control API token: <token>` — it is never written to the log files. |
-| `--token <t>` / `--token=<t>` | Use exactly this token (headless use: the operator already knows it, nothing is printed) |
-| `STREAM_SERVER_TOKEN=<t>` | Same as `--token`, from the environment; `--token` wins if both are given, a blank value counts as unset |
-| `--no-auth` | Run the control API open (every route answers without a token). Wins over `STREAM_SERVER_TOKEN`; contradicts an explicit `--token` and is rejected together with it |
+`ServerConfig::binary_default()` still exists beside it — all-interfaces `0.0.0.0:11470` with HTTPS on `0.0.0.0:12470`, logging, SSDP and the Ctrl+C handler on — but **nothing in this repository runs it**. It is what the deleted daemon used, and an embedder that selects it is putting the open media routes (`/proxy` and `/ftp` among them, which fetch whatever URL they are handed) on the local network, with the control routes behind the bearer token alone.
 
-The `stremio-runtime` stub spawns the server with `--no-auth`: it is the compatibility shim for legacy clients that speak plain HTTP and cannot send the header. With the binary's all-interfaces bind, that leaves every control route open to the local network while the stub runs it. See [API](#-api).
+Control routes require that token on every request (`Authorization: Bearer <token>`); media routes are open so a player can fetch bytes without one. `ServerHandle` calls the same functions the routes do, so an embedder needs no HTTP client for control at all — see [Library API](#library-api) and [Authentication](#authentication).
 
 ### Startup phases in `stats.json`
 
@@ -234,9 +241,9 @@ The HTTP surface is deliberately small and split in two by `build_router()` (`se
 
 | Variant | Meaning |
 |---|---|
-| `Generated` (**default** for both `ServerConfig::embedded()` and `ServerConfig::binary_default()`) | 32 random bytes, hex-encoded, fresh per launch. The standalone binary prints it once to stdout at startup (`control API token: <token>`) and never passes it to `tracing`, so it is in no log file; an embedder reads `ServerHandle::auth_token()` |
-| `Token(String)` | Use exactly this token (must not be empty). The binary's `--token <t>` flag and `STREAM_SERVER_TOKEN` variable select this |
-| `Disabled` | No authentication; every route is open. The binary's `--no-auth` flag selects this, and the `stremio-runtime` stub always passes it. |
+| `Generated` (**default** for both `ServerConfig::embedded()` and `ServerConfig::binary_default()`) | 32 random bytes, hex-encoded, fresh per launch. The embedder reads it off `ServerHandle::auth_token()`; it is never passed to `tracing`, so it is in no log file, and it reaches stdout (`control API token: <token>`) only for a host that asked for that by setting `ServerConfig::print_startup` |
+| `Token(String)` | Use exactly this token (must not be empty) — for a host that has its own secret and wants both ends to know it up front. Never printed |
+| `Disabled` | No authentication; every route is open. An explicit opt-out, for a host that cannot carry a header |
 
 ### Routes
 
@@ -260,7 +267,7 @@ The HTTP surface is deliberately small and split in two by `build_router()` (`se
 | POST | `/{infoHash}/create` | TOKEN | stremio-core `CreateTorrent` (magnet) |
 | GET, POST | `/settings` | TOKEN | stremio-core `StreamingServer` (`{ baseUrl, options, values }` / `{ success }`) |
 | GET | `/network-info`, `/device-info` | TOKEN | stremio-core `StreamingServer` |
-| GET | `/casting` | TOKEN | stremio-core playback devices: what SSDP discovery has found. Only the binary runs discovery (`binary_default()`), so an embedded server answers `[]`; nothing can be cast to a listed device either (next row). No trailing slash: `/casting/` is an unknown path (`404`) |
+| GET | `/casting` | TOKEN | stremio-core playback devices: what SSDP discovery has found. Discovery runs only where `ServerConfig::enable_ssdp_discovery` is set, which `embedded()` does not, so the server an embedder starts answers `[]`; nothing can be cast to a listed device either (next row). No trailing slash: `/casting/` is an unknown path (`404`) |
 | POST | `/casting/{devID}/player` | TOKEN | stremio-core `play_on_device`; answers `501` because casting is not implemented |
 | GET | `/get-https?authKey=…&ipAddress=…` | TOKEN | stremio-core remote-HTTPS certificate fetch: fetches the certificate, writes it to the config dir, starts (or restarts) the HTTPS listener on `ServerConfig::https_addr` with it, and answers with **that listener's** port. `501` when no HTTPS address is configured (`embedded()`, the Android embed) — nothing is written and no network call is made |
 | POST | `/{infoHash}/{fileIdx}/download` | TOKEN | offline downloads — pin the file; optional body `{"trackers":[…]}` (`sources`/`announce` accepted too), answer is a `DownloadInfo`. See [Offline downloads](#offline-downloads) |
@@ -399,7 +406,7 @@ A **pinned** file stays wanted no matter which file of the torrent is being play
 - **Free space**: a pin is refused (`PinDownloadError::InsufficientSpace`) when the volume its bytes land on has less than the pinned file's missing bytes plus a **500 MiB margin** (`PIN_FREE_SPACE_MARGIN`). That volume is the piece store's root, for every torrent, and there is no longer any other candidate: nothing places a torrent anywhere, so the one volume a pin can write to is the one the store is on. (It used to probe the pin's own placement folder, where no payload byte was ever written — passing a pin onto a full store and refusing one that had all the room it needed.) Only the missing bytes are asked for, because that is all a pin writes. Re-pinning a complete file needs nothing, and a torrent still `checking` data that may already be there (right after a restart, or a stream's add the pin joined) is not measured at all — its `downloaded` reads 0 until the check ends and its want-set is already librqbit's. A whole-file download an earlier version left on disk is *not* data in place: this session neither converts nor reads it, so a fresh pin over it is measured for the whole file. A refused pin **drops the torrent it added and leaves every byte where it is**: the refusal comes before anything is downloaded, so its own add wrote nothing, while what the store holds for that hash was fetched by an earlier stream or an earlier session and stays slack, to be given back at the next pass like any other unpinned byte. A torrent the pin merely joined — a stream request's in-flight add — is not dropped at all, since a reader is about to open on it; nor is one a reader took hold of *while the pin was checking*, which is a real window (the engine is published before the check, and the check reads the file list and the stats before it ever probes free space) and one that the join count cannot see, so the live activity registers are consulted as well.
 - **What bounds the cache**: **every entity under the one root — a file of a torrent, or one proxied body — has exactly one retention owner that knows whether anybody wants it** (the piece store's for torrents, the proxy cache's for proxied bodies), and nothing walks the disk looking for victims. The root is `settings.cacheRoot`, taken from the running engine rather than from the setting, since a root set for the next start is not where the bytes are now. **The cap is the smaller of `cacheSize` and what the filesystem can give**: `cacheSize` unset is `u64::MAX`, which on a 4 GB television meant nothing bounded the cache and librqbit wrote until the filesystem refused — an ENOSPC that arrives as a fatal torrent error, mid-film. So the server reads the volume's free space (`fs4::available_space` → `statvfs`: the raw `statfs` syscall on Linux, bionic's `statvfs` on Android, both `f_frsize * f_bavail`, i.e. `df`'s "Available") and caps the cache at `occupancy + available − 512 MiB`, keeping that 512 MiB floor free. The floor is the same number `routes::stream::ensure_download_disk_ready` demands before it will stream to disk at all — below it that check asks both owners for their slack and, if the disk is still short, answers the stream `507 Insufficient Storage`. A volume that cannot be probed is not read as "full": the configured `cacheSize` then stands alone. **A cap is a statement about one volume, and there is one root, so there is one cap.** `overLimit` stays as a field of its own — how far over the cap the cache still is — because it is what a client should read before telling a user that cleaning helped. **What keeps a byte, and what takes it**: a **pin** is kept until it is unpinned, whatever else is happening; the **one stream being played** keeps the window round its playhead and the half it has committed for sharing (and any file an open reader is still delivering); **everything else is slack** — the moment a viewer opens something else, what they left is disposable, and it goes at the reconciler's next two-second tick, at the switch itself, when the volume runs low, on `POST /cache/clean`, or at the next boot. So stopping playback changes nothing on disk and resuming inside the window plays from the cache, while starting something else really does throw the previous stream away. At boot, before the session opens, the launch sweep deletes every piece directory the embedder's pin set does not name, and a previous release's data beside the store (below); the proxy cache and the archive scratch directory are emptied after it, before the router serves a request. A boot handed no pin set sweeps no torrent data at all (see *Restarts*). **A stream that would not fit is refused rather than served by evicting something**: the `507` path drops every disposable byte, re-reads the volume and tries again, and if pins plus the live window still do not fit, the answer is `507` — never a pin or a playing stream taken to make room. What is nobody's is not kept: anything directly under `<cacheRoot>/rqbit-downloads` that is neither one of the owners' directories (`.pieces`, `.proxy`, `.archives`) nor a session record is a previous release's data — a plain-file download an earlier version of this server wrote (there is no migration — the torrent that owns it re-downloads as pieces), or the `.cache` and `.metadata` directories a pre-fork server kept, which nothing reads — and is never counted; the launch sweep (`piece_store::sweep_legacy_downloads`) removes it whole on every start that is handed a pin set — a start handed none keeps everything on the disk, that included. The session's records (`session.json`, `<infoHash>.torrent`, the `.bitv` bitfields, `dht.json`, `dht-bootstrap.json` and their temp files) are not cache and are never swept, and neither is a `pinned-downloads.json` an older build of this server left there. What `/proxy` cached is (`.proxy` under the cache root, see [Proxied remote streams](#proxied-remote-streams)): counted in the same figure, capped by the same number, and kept by the same question — is somebody inside these bytes right now? **Sizes are what a file occupies, not its apparent length**: librqbit's filesystem storage pre-allocated every file it wanted at full size, so a part-streamed film was a multi-gigabyte `length` over a handful of allocated blocks — counting `length` once reported 17 GB of cache on a phone holding 3.85 GB. The piece store this server runs on pre-allocates nothing, but the roots are still full of what earlier versions wrote and nothing migrates, so the rule stands: Unix uses `st_blocks`; Windows has no cheap equivalent through `std`, so the apparent length still stands in there. **A full disk is a signal to give slack back, not to stop**: librqbit treats a write that hits `ENOSPC` as fatal and leaves the torrent in an error state, which is how a film died ninety minutes in. **The engine stops a torrent before the filesystem has to**: the engine's free-space arm (the reconciler's, every 2 s, one `statvfs` of the volume every torrent's pieces land on) pauses a torrent that is writing (`Session::pause`: peers dropped, writes stopped, files and piece map kept — pinned torrents included, since a pin is a reason to keep the bytes, not a licence to run the disk out) the moment the volume falls under the floor, and rings the running-low bell so both owners drop their slack at once — so the torrent's readers see a buffering pause of a few seconds, not a dead stream. The reconciler restarts a torrent librqbit killed with ENOSPC once the volume is 64 MiB over the floor and somebody is playing or pinning it, at most once per 15 s. **A proxied stream stops writing at the floor too**: before each chunk a `/proxy` fill asks the volume (one `statvfs`, re-read at most every 2 s, less what it has written since), and a chunk that would take the volume under the floor is not written; the player keeps getting the body from the origin, and a later seek back into it fetches again. A torrent the free-space arm stopped says `phase: "error"` in its `stats.json`, with a fixed "stopped for want of disk space" message, for as long as it is stopped, and a `GET` for it drops both owners' slack and, if the volume is still short, is a `507`. **A film larger than the free space plays anyway**, which is what the rolling piece window is for. Torrent data is one file per piece (the piece store is the session's default storage), so reclaiming a single piece is a `remove_file`, and `enginefs/src/retention.rs` drives it from the playhead on the reconciler's two-second tick: half the cache budget is a window around where the player is, half is a set committed for sharing, and everything else of the file being streamed is given back — the backend told to forget it first, then the bytes, under one claim. **Only what is committed is announced to a peer**, so while a file is being played this server advertises no piece it is about to throw away (once the viewer moves on, the file is slack and its committed pieces go too). **The budget is published on its own timer**: `server/src/cache_budget.rs` states it from one `statvfs` and what the owners of the cache say they hold (a sum over the bits each piece store keeps, plus the proxy cache's running count — no walk, no syscall), on a minute timer, at startup before the router serves a request, and whenever a client changes `cacheSize`. `GET /cache.json` and `POST /cache/clean` are how a client reads the cache's state and asks for its slack back on demand. See [Cache usage and cleaning](#cache-usage-and-cleaning).
 - **Restarts**: librqbit persists each torrent's place and want-set and, with fastresume, its verified pieces (`<cacheRoot>/rqbit-downloads/<infoHash>.bitv`), so a pinned download resumes where it was without a full re-hash; the pin set itself is the embedder's, handed in at startup (`ServerConfig::pins`) and applied to the torrents the session brought back. A pin whose torrent the session did not bring back (a record librqbit could not restore — an unparseable `.torrent`, an add that errored) is held dormant for the run, until the torrent returns — on a later boot, or with the next pin of the same torrent, which applies the dormant pins alongside its own — or until it is unpinned.
-- **No pin set**: a server handed none (`ServerConfig::pins: None`, the default of both `embedded()` and `binary_default()` — so the standalone binary always runs this way) cannot tell a pin from cache, so for the life of the process it treats **every torrent as pinned** (`PinsUnknown`): the launch sweep deletes no torrent data, the retention owner reclaims none, the reconciler keeps every torrent running (the free-space arm aside) and the idle sweep removes none, and `downloads.json` lists every file of every torrent the server holds. Only the free-space floor bounds torrent data then; the proxy cache is bounded as always. An embedder that passes an empty map is saying the opposite — nothing is pinned — and the sweep takes everything unclaimed. xtremio passes the downloads the user asked for.
+- **No pin set**: a server handed none (`ServerConfig::pins: None`, the default of both `embedded()` and `binary_default()`, so an embedder that keeps no pin record gets this) cannot tell a pin from cache, so for the life of the process it treats **every torrent as pinned** (`PinsUnknown`): the launch sweep deletes no torrent data, the retention owner reclaims none, the reconciler keeps every torrent running (the free-space arm aside) and the idle sweep removes none, and `downloads.json` lists every file of every torrent the server holds. Only the free-space floor bounds torrent data then; the proxy cache is bounded as always. An embedder that passes an empty map is saying the opposite — nothing is pinned — and the sweep takes everything unclaimed. xtremio passes the downloads the user asked for.
 
 ### Cache usage and cleaning
 
@@ -613,8 +620,8 @@ an info hash, which starts a torrent with the caller's trackers on this
 device's disk and connection; the LAN's stream route only looks a hash up.
 That is acceptable on an embedded server's loopback listener, where only this
 device can reach it, but not on a listener the whole LAN can reach, so neither
-is on the LAN allow-list. (The standalone binary's main listener is on
-`0.0.0.0`, so there they are reachable from the LAN anyway — see
+is on the LAN allow-list. (A host that binds the main listener to
+`0.0.0.0` makes them reachable from the LAN anyway — see
 [Quick Start](#-quick-start).) The consequence is deliberate, not an
 oversight: a stream stremio-core plays *through* `/proxy` — an addon stream
 that needs custom request headers, which a player cannot attach itself —
@@ -654,7 +661,7 @@ Everything below existed for server.js compatibility and had no consumer in stre
 
 ## 🔧 Build Instructions
 
-What you need on any platform is Rust via [rustup](https://rustup.rs) — `rust-toolchain.toml` pins the exact toolchain (1.98.0) and rustup installs it on first build — and a C compiler for the C that `aws-lc-sys` and `libmimalloc-sys` bundle. No system libraries; the build itself is the same everywhere:
+What you need on any platform is Rust via [rustup](https://rustup.rs) — `rust-toolchain.toml` pins the exact toolchain (1.98.0) and rustup installs it on first build — and a C compiler for the C that `aws-lc-sys` bundles. No system libraries; the build itself is the same everywhere:
 
 ```bash
 cargo build --release
@@ -737,16 +744,17 @@ Nothing builds or tests macOS. [`release.yml`](.github/workflows/release.yml) is
 
 ```
 stream-server/
-├── server/           # HTTP server (media + token-protected control routers), embeddable library
+├── server/           # The library: HTTP server (media + token-protected control routers)
+│   ├── src/lib.rs    # ServerConfig, start/run, ServerHandle — the whole public API
 │   ├── src/auth.rs   # ServerAuth + the bearer middleware
 │   └── src/archives/ # ZIP/7Z/TAR/tgz (always on) + RAR (default-on "rar" feature), all pure Rust
 ├── enginefs/         # Torrent engine abstraction
 │   └── src/backend/
 │       └── librqbit.rs   # The sole torrent backend (pure Rust)
-├── stremio-runtime-stub/ # stands in for Stremio desktop's stremio-runtime; spawns stream-server.exe --no-auth
-├── docs/             # bittorrent-settings.md
-└── scripts/          # release-notes generator, the stub's Windows installer
+└── docs/             # bittorrent-settings.md
 ```
+
+Two crates, and neither builds a binary: `server` is the library an embedder links, `enginefs` is what it is built on.
 
 There is no `bindings/` directory and no vcpkg apparatus: the optional C++ `libtorrent` backend and everything it needed to build (the `libtorrent-sys` FFI crate, `triplets/`, `vcpkg-overlays/`, `vcpkg.json`) have been removed. RAR is handled by the pure-Rust `unrar-rs` crate — a direct `server` dependency behind the default-on `rar` feature — so there is no separate RAR binding crate either.
 
