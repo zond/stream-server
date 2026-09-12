@@ -2,7 +2,7 @@
 //! network.
 //!
 //! A Chromecast (or any other receiver on the LAN) cannot fetch anything from
-//! a loopback-only server, which is what [`ServerConfig::embedded`] binds. It
+//! a loopback-only server, which is what `ServerConfig`'s default binds. It
 //! also must not be handed the control API: a cast session needs media bytes
 //! and nothing else, while the control surface reaches settings, offline
 //! downloads, engine stats and the torrent session.
@@ -25,7 +25,6 @@
 //! `lanMediaEnabled` setting is the operator's veto, and since every start
 //! goes through `set_lan_media`, every start is subject to it.
 //!
-//! [`ServerConfig::embedded`]: crate::ServerConfig::embedded
 //! [`ServerConfig::lan_media_addr`]: crate::ServerConfig::lan_media_addr
 //! [`ServerHandle::set_lan_media`]: crate::ServerHandle::set_lan_media
 

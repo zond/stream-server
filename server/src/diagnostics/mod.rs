@@ -1,12 +1,8 @@
 pub mod dht_health;
 pub mod logging;
 
-use std::{collections::HashSet, time::Instant};
-
 use serde::Serialize;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
-
-use crate::state::AppState;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ProcessMemorySnapshot {
@@ -16,22 +12,13 @@ pub struct ProcessMemorySnapshot {
     pub thread_count: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct MemorySnapshot {
-    pub process: ProcessMemorySnapshot,
-    pub engine: enginefs::EngineDiagnosticsSnapshot,
-    pub active_disk_downloads: u64,
-    pub disk_download_root: String,
-    pub archive_session_count: usize,
-    pub active_direct_streams: u64,
-}
-
-/// This process's memory, and nothing else's.
+/// This process's memory, and nothing else's. Read by the panic hook, so it
+/// runs while something is already going wrong.
 ///
 /// `System::new_all()` + `refresh_all()` enumerated every process on the
 /// machine through `/proc` -- CPU, memory, disks, networks, the lot -- to
-/// read one pid's RSS, and did it every thirty seconds. Refreshing this pid
-/// alone, for memory alone, is a handful of reads of `/proc/self`.
+/// read one pid's RSS. Refreshing this pid alone, for memory alone, is a
+/// handful of reads of `/proc/self`.
 pub fn process_memory_snapshot() -> ProcessMemorySnapshot {
     let pid_u32 = std::process::id();
     let pid = Pid::from_u32(pid_u32);
@@ -98,98 +85,14 @@ fn current_thread_count_impl() -> u64 {
     0
 }
 
-/// Everything the periodic line reports besides the process figures, which
-/// the caller has already taken (they decide whether a line is logged at
-/// all). Async engine snapshots and a mutex read; no filesystem.
-async fn memory_snapshot_for_state(
-    state: &AppState,
-    process: ProcessMemorySnapshot,
-) -> MemorySnapshot {
-    let engine = state.engine.diagnostics_snapshot().await;
-    let mut active_disk_files = HashSet::new();
-    for stream in &engine.streams.active_file_streams {
-        if stream.count > 0 {
-            active_disk_files.insert((stream.info_hash.clone(), stream.file_idx));
-        }
-    }
-    for selection in &engine.streams.active_multifile_selections {
-        active_disk_files.insert((selection.info_hash.clone(), selection.file_idx));
-    }
-    let active_disk_downloads = active_disk_files.len() as u64;
-
-    MemorySnapshot {
-        process,
-        engine,
-        active_disk_downloads,
-        disk_download_root: state.engine.download_dir.display().to_string(),
-        archive_session_count: state.archive_cache.len(),
-        active_direct_streams: logging::active_direct_streams(),
-    }
-}
-
-pub fn start_memory_sampler(state: AppState) -> tokio::task::JoinHandle<()> {
-    logging::spawn_logged("memory-sampler", async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-        let mut last_snapshot_log = Instant::now()
-            .checked_sub(logging::MEMORY_SNAPSHOT_INTERVAL)
-            .unwrap_or_else(Instant::now);
-        let mut last_rss = 0u64;
-
-        loop {
-            interval.tick().await;
-            // The process figures decide whether anything is logged this
-            // tick, so they are all that is read on a tick that logs
-            // nothing -- which in steady state is every other one.
-            let process = process_memory_snapshot();
-            let rss = process.rss_bytes;
-            let growth = rss.saturating_sub(last_rss);
-            let should_log_periodic =
-                last_snapshot_log.elapsed() >= logging::MEMORY_SNAPSHOT_INTERVAL;
-            let should_log_growth = growth >= logging::MEMORY_GROWTH_ALERT_BYTES;
-
-            if should_log_periodic || should_log_growth {
-                let snapshot = memory_snapshot_for_state(&state, process).await;
-                tracing::info!(
-                    rss_bytes = snapshot.process.rss_bytes,
-                    virtual_memory_bytes = snapshot.process.virtual_memory_bytes,
-                    thread_count = snapshot.process.thread_count,
-                    engine_count = snapshot.engine.streams.engine_count,
-                    engine_active_streams = snapshot.engine.streams.engine_active_streams,
-                    active_file_priority_generation =
-                        snapshot.engine.streams.active_file_priority_generation,
-                    active_stream_hashes = snapshot.engine.streams.active_streams.len(),
-                    active_file_streams = snapshot.engine.streams.active_file_streams.len(),
-                    active_multifile_selections =
-                        snapshot.engine.streams.active_multifile_selections.len(),
-                    paused_torrents = snapshot.engine.streams.paused_torrents.len(),
-                    rust_piece_cache_entries = snapshot.engine.memory.rust_piece_cache_entries,
-                    rust_piece_cache_bytes = snapshot.engine.memory.rust_piece_cache_bytes,
-                    native_storage_bytes = snapshot.engine.memory.native_storage_bytes,
-                    native_storage_pieces = snapshot.engine.memory.native_storage_pieces,
-                    active_disk_downloads = snapshot.active_disk_downloads,
-                    disk_download_root = %snapshot.disk_download_root,
-                    waiter_keys = snapshot.engine.memory.waiter_keys,
-                    waiter_wakers = snapshot.engine.memory.waiter_wakers,
-                    archive_session_count = snapshot.archive_session_count,
-                    active_direct_streams = snapshot.active_direct_streams,
-                    growth_bytes = growth,
-                    growth_alert = should_log_growth,
-                    "memory diagnostics snapshot"
-                );
-                last_snapshot_log = Instant::now();
-                last_rss = rss;
-            }
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The single-process refresh reads what the periodic line needs: this
-    /// process's memory. A refresh kind without memory in it would leave the
-    /// figure at zero and the growth alert blind, quietly.
+    /// The single-process refresh reads what the panic line needs: this
+    /// process's memory. A refresh kind without memory in it would leave
+    /// both figures at zero, quietly -- and a panic report that says a
+    /// process used no memory is worse than one that says nothing.
     ///
     /// Both figures are asserted non-zero and nothing more. On Unix the
     /// virtual size is at least the resident set, but on Windows sysinfo's

@@ -3,9 +3,9 @@
 //! The HTTP surface is split in two (see `build_router`): the *media* routes
 //! that hand bytes to a player are open, because players (mpv, a Chromecast
 //! receiver) fetch plain URLs and cannot attach headers; every other route is
-//! *control* API and must carry `Authorization: Bearer <token>`, where the
-//! token is generated per launch (or supplied, or disabled) via
-//! [`ServerAuth`]. The token is only ever accepted from that header -- never
+//! *control* API and must carry `Authorization: Bearer <token>`, generated
+//! per launch (see [`ServerAuth`]). The token is only ever accepted from
+//! that header -- never
 //! from the query string, so it does not end up in access logs or in URLs a
 //! client hands to a third party.
 
@@ -20,42 +20,27 @@ use subtle::ConstantTimeEq;
 use crate::state::AppState;
 
 /// How the control routes authenticate. Media routes are always open.
-#[derive(Clone, Default, PartialEq, Eq)]
+///
+/// One variant, and every server has a token. There were two more --
+/// `Token(String)`, a token the caller chose, and `Disabled`, which opened
+/// every control route -- and both existed for the deleted daemon's command
+/// line (`--token`, `--no-auth`). An embedder has no command line: it reads
+/// the generated token off [`crate::ServerHandle::auth_token`] and attaches
+/// it, so a token it could pick itself buys nothing, and an open control API
+/// on a machine that also runs a browser is a hole no embedder asked for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ServerAuth {
-    /// A fresh random token for this launch (32 random bytes, hex). The
-    /// default for both [`crate::ServerConfig::embedded`] and
-    /// [`crate::ServerConfig::binary_default`]; embedders read it from
-    /// [`crate::ServerHandle::auth_token`], the binary prints it to stdout at
-    /// startup (never to the log).
+    /// A fresh random token for this launch (32 random bytes, hex).
+    /// Embedders read it from [`crate::ServerHandle::auth_token`].
     #[default]
     Generated,
-    /// Exactly this token (must not be empty).
-    Token(String),
-    /// No authentication at all: every route is open (`--no-auth`).
-    Disabled,
-}
-
-impl std::fmt::Debug for ServerAuth {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Generated => f.write_str("Generated"),
-            // Never print the secret via `{:?}` on a `ServerConfig`.
-            Self::Token(_) => f.write_str("Token(<redacted>)"),
-            Self::Disabled => f.write_str("Disabled"),
-        }
-    }
 }
 
 impl ServerAuth {
-    /// The token this launch requires, or `None` when authentication is off.
-    pub(crate) fn resolve(&self) -> anyhow::Result<Option<String>> {
+    /// The token this launch requires.
+    pub(crate) fn resolve(&self) -> anyhow::Result<String> {
         match self {
-            Self::Generated => generate_token().map(Some),
-            Self::Token(token) => {
-                anyhow::ensure!(!token.is_empty(), "ServerAuth::Token must not be empty");
-                Ok(Some(token.clone()))
-            }
-            Self::Disabled => Ok(None),
+            Self::Generated => generate_token(),
         }
     }
 }
@@ -97,15 +82,20 @@ fn unauthorized() -> Response {
 }
 
 /// `axum::middleware::from_fn_with_state` layer for the control router: lets
-/// the request through when no token is configured (`ServerAuth::Disabled`)
-/// or when it carries the right bearer token, 401s otherwise.
+/// the request through when it carries the right bearer token, 401s
+/// otherwise.
 pub(crate) async fn require_bearer(
     State(state): State<AppState>,
     req: Request,
     next: Next,
 ) -> Response {
+    // A state with no token used to mean "authentication is off, let
+    // everyone in" -- `ServerAuth::Disabled`, which is gone. `run` always
+    // sets one now, so this arm is only reachable from an `AppState` nobody
+    // filled in, and refusing is the safe way to be wrong about that: a bug
+    // in the wiring must not silently open the control API.
     let Some(expected) = state.auth_token.as_deref() else {
-        return next.run(req).await;
+        return unauthorized();
     };
     match bearer_token(&req) {
         Some(presented) if token_matches(expected, presented) => next.run(req).await,
@@ -127,33 +117,11 @@ mod tests {
 
     #[test]
     fn generated_tokens_are_32_random_bytes_as_hex() {
-        let a = ServerAuth::Generated.resolve().unwrap().unwrap();
-        let b = ServerAuth::Generated.resolve().unwrap().unwrap();
+        let a = ServerAuth::Generated.resolve().unwrap();
+        let b = ServerAuth::Generated.resolve().unwrap();
         assert_eq!(a.len(), 64);
         assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b, "two launches must not share a token");
-    }
-
-    #[test]
-    fn explicit_token_is_used_verbatim_and_must_not_be_empty() {
-        assert_eq!(
-            ServerAuth::Token("secret".into()).resolve().unwrap(),
-            Some("secret".to_string())
-        );
-        assert!(ServerAuth::Token(String::new()).resolve().is_err());
-    }
-
-    #[test]
-    fn disabled_resolves_to_no_token() {
-        assert_eq!(ServerAuth::Disabled.resolve().unwrap(), None);
-    }
-
-    #[test]
-    fn debug_output_redacts_the_token() {
-        assert_eq!(
-            format!("{:?}", ServerAuth::Token("secret".into())),
-            "Token(<redacted>)"
-        );
     }
 
     #[test]

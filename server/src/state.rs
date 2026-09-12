@@ -20,7 +20,9 @@ pub struct AppState {
     pub log_dir: PathBuf,
     pub base_url: String,
     pub http_addr: SocketAddr,
-    /// Bearer token the control routes require; `None` leaves them open.
+    /// Bearer token the control routes require. `run` always sets one (see
+    /// `ServerAuth`); `None` is only the value a hand-built state starts
+    /// with, and `auth::require_bearer` refuses rather than opens on it.
     pub auth_token: Option<Arc<str>>,
     /// Archive sessions, swept when idle (see `crate::archives::sessions`);
     /// a swept session's downloaded archive goes with it.

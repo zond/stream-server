@@ -19,7 +19,7 @@ pub use routes::stream::{pretend_available_space, pretend_available_space_readin
 pub use routes::system::{FileNotFound, ServerSettings, resolved_path};
 pub use state::AppState;
 use std::{
-    future::{IntoFuture, pending},
+    future::IntoFuture,
     io::IsTerminal,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
@@ -92,7 +92,6 @@ pub mod stream_numbers;
 pub struct ServerConfig {
     pub http_addr: SocketAddr,
     pub https_addr: Option<SocketAddr>,
-    pub public_base_url: Option<String>,
     /// Settings, logs and certificates. `None`
     /// uses the platform config dir (needs `HOME`/`XDG_*`); embedders must
     /// set it explicitly.
@@ -103,11 +102,15 @@ pub struct ServerConfig {
     /// `config_dir` is given.
     pub cache_dir: Option<PathBuf>,
     pub init_logging: bool,
+    /// Whether this server installs the process-wide crash machinery: the
+    /// panic hook that writes a panic to the log files, and the native
+    /// crash handler that catches a SIGSEGV/SIGABRT the Rust hook never
+    /// sees (`diagnostics::logging`). Off by default, because they are
+    /// *process* globals and the host process may have its own -- but they
+    /// are the only crash-dump machinery in this tree, so an embedder
+    /// whose host installs none should turn this on to get a post-mortem
+    /// out of a torrent or codec crash instead of a silent kill.
     pub manage_process_globals: bool,
-    pub listen_for_ctrl_c: bool,
-    pub print_startup: bool,
-    pub exit_process_on_shutdown_timeout: bool,
-    pub enable_memory_sampler: bool,
     pub enable_ssdp_discovery: bool,
     pub graceful_shutdown_timeout: Duration,
     /// How the control API authenticates (media routes are always open).
@@ -128,10 +131,10 @@ pub struct ServerConfig {
     /// map instead says "the user has pinned nothing", which deletes their
     /// downloads.
     pub pins: Option<enginefs::piece_store::PinSet>,
-    /// The port librqbit's incoming BitTorrent listener binds:
-    /// [`TorrentListenPort::Ephemeral`] for [`Self::embedded`] (any number of
-    /// embedded servers coexist), the fixed `42000..42010` range for
-    /// [`Self::binary_default`].
+    /// The port librqbit's incoming BitTorrent listener binds.
+    /// [`TorrentListenPort::Ephemeral`] by default, so any number of
+    /// embedded servers (and the tests) coexist; an embedder that needs a
+    /// fixed, forwardable port sets [`TorrentListenPort::Fixed`] itself.
     pub torrent_listen_port: TorrentListenPort,
     /// Where the LAN media listener binds when it runs: a second HTTP
     /// listener serving [`lan_media_routes`] and nothing else, so a
@@ -140,8 +143,7 @@ pub struct ServerConfig {
     /// route that creates or fetches anything -- stays on the loopback
     /// listener only (see [`crate::lan_media`]).
     ///
-    /// `None` -- the default for both [`Self::embedded`] and
-    /// [`Self::binary_default`] -- means there is no LAN listener at all and
+    /// `None` -- the default -- means there is no LAN listener at all and
     /// [`ServerHandle::set_lan_media`] has nothing to start. `Some(addr)`
     /// (typically `0.0.0.0:0`, letting the OS pick the port) is where
     /// [`ServerHandle::set_lan_media`] binds it per cast session, subject to
@@ -152,10 +154,9 @@ pub struct ServerConfig {
     /// Whether DHT bootstrap *names* are resolved to address literals before
     /// librqbit sees them (system resolver, then DNS over HTTPS, then a
     /// cache next to the routing table -- see
-    /// `enginefs::backend::dht_bootstrap`). `true` for both
-    /// [`Self::embedded`] and [`Self::binary_default`]: the Android embed is
-    /// exactly the case this exists for, since that is where the system
-    /// resolver was observed returning nothing.
+    /// `enginefs::backend::dht_bootstrap`). `true` by default: the Android
+    /// embed is exactly the case this exists for, since that is where the
+    /// system resolver was observed returning nothing.
     ///
     /// `false` does no DNS and no HTTP at start-up, leaving the names for
     /// librqbit to resolve itself. **Tests set this**, so `cargo test` makes
@@ -163,27 +164,19 @@ pub struct ServerConfig {
     pub resolve_dht_bootstrap_names: bool,
 }
 
+/// The one configuration: a server inside a host process. There used to be a
+/// second, `binary_default()`, for the standalone daemon -- all interfaces,
+/// HTTPS, SSDP, a Ctrl+C handler -- and it went with the daemon.
 impl Default for ServerConfig {
     fn default() -> Self {
-        Self::embedded()
-    }
-}
-
-impl ServerConfig {
-    pub fn embedded() -> Self {
         Self {
             http_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, DEFAULT_HTTP_PORT)),
             pins: None,
             https_addr: None,
-            public_base_url: None,
             config_dir: None,
             cache_dir: None,
             init_logging: false,
             manage_process_globals: false,
-            listen_for_ctrl_c: false,
-            print_startup: false,
-            exit_process_on_shutdown_timeout: false,
-            enable_memory_sampler: false,
             enable_ssdp_discovery: false,
             graceful_shutdown_timeout: Duration::from_secs(3),
             auth: ServerAuth::Generated,
@@ -192,34 +185,10 @@ impl ServerConfig {
             resolve_dht_bootstrap_names: true,
         }
     }
-
-    pub fn binary_default() -> Self {
-        Self {
-            http_addr: SocketAddr::from(([0, 0, 0, 0], DEFAULT_HTTP_PORT)),
-            pins: None,
-            https_addr: Some(SocketAddr::from(([0, 0, 0, 0], DEFAULT_HTTPS_PORT))),
-            public_base_url: Some(format!("http://127.0.0.1:{DEFAULT_HTTP_PORT}")),
-            config_dir: None,
-            cache_dir: None,
-            init_logging: true,
-            manage_process_globals: true,
-            listen_for_ctrl_c: true,
-            print_startup: true,
-            exit_process_on_shutdown_timeout: true,
-            enable_memory_sampler: true,
-            enable_ssdp_discovery: true,
-            graceful_shutdown_timeout: Duration::from_secs(3),
-            auth: ServerAuth::Generated,
-            torrent_listen_port: TorrentListenPort::default(),
-            lan_media_addr: None,
-            resolve_dht_bootstrap_names: true,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShutdownSource {
-    CtrlC,
     External,
 }
 
@@ -929,10 +898,7 @@ pub async fn run(
         .with_context(|| format!("failed to bind HTTP listener on {}", cfg.http_addr))?;
     let bound_http_addr = listener.local_addr()?;
     let public_http_addr = connectable_addr(bound_http_addr);
-    let base_url = cfg
-        .public_base_url
-        .clone()
-        .unwrap_or_else(|| format!("http://{}", public_http_addr));
+    let base_url = format!("http://{}", public_http_addr);
 
     let (config_dir, cache_dir) = resolve_dirs(&cfg)?;
     let log_dir = config_dir.join("logs");
@@ -1129,25 +1095,14 @@ pub async fn run(
     state.settings_file = settings_file;
     state.base_url = base_url.clone();
     state.http_addr = public_http_addr;
-    state.auth_token = cfg.auth.resolve()?.map(Arc::from);
+    state.auth_token = Some(Arc::from(cfg.auth.resolve()?));
     state.lan_media = Arc::new(lan_media::LanMedia::new(cfg.lan_media_addr));
     state.https = Arc::new(https::HttpsListener::new(cfg.https_addr, &config_dir));
-    match state.auth_token.as_deref() {
-        Some(token) => {
-            tracing::info!("control API requires `Authorization: Bearer <token>`");
-            // The token is a secret and must never reach `tracing`: the log
-            // files would keep it, and the kept launches' archives with them.
-            // An embedder reads `ServerHandle::auth_token` instead; the
-            // stdout line is only for a host that asked for one by setting
-            // `print_startup`, and a token the caller supplied itself
-            // (`ServerAuth::Token`) is never printed, since whoever set it
-            // already knows it.
-            if cfg.print_startup && cfg.auth == ServerAuth::Generated {
-                println!("control API token: {token}");
-            }
-        }
-        None => tracing::warn!("control API authentication is disabled; every route is open"),
-    }
+    // The token is a secret and must never reach `tracing`: the log files
+    // would keep it, and the kept launches' archives with them. An embedder
+    // reads `ServerHandle::auth_token` instead. The deleted daemon printed it
+    // to stdout; nothing in a host process reads stdout.
+    tracing::info!("control API requires `Authorization: Bearer <token>`");
 
     let seeding_enabled = settings_arc.read().await.seeding_enabled;
     // The engine's flag starts on and the session opens uploading, so with
@@ -1270,9 +1225,6 @@ pub async fn run(
     // returns, so it exists before the router below can serve a request
     // into the proxy cache rather than a moment after.
     background_tasks.push(cache_budget::start(Arc::new(state.clone())).await);
-    if cfg.enable_memory_sampler {
-        background_tasks.push(diagnostics::start_memory_sampler(state.clone()));
-    }
     if cfg.enable_ssdp_discovery {
         background_tasks.push(diagnostics::logging::spawn_logged(
             "ssdp-discovery",
@@ -1320,10 +1272,6 @@ pub async fn run(
     }
 
     tracing::info!("listening on {}", bound_http_addr);
-    if cfg.print_startup {
-        println!("listening on {}", bound_http_addr);
-        println!("EngineFS server started at {}", base_url);
-    }
     if let Some(ready_tx) = ready_tx {
         let _ = ready_tx.send(Started {
             bound_http_addr,
@@ -1334,20 +1282,10 @@ pub async fn run(
 
     let (shutdown_started_tx, mut shutdown_started_rx) =
         tokio::sync::oneshot::channel::<ShutdownSource>();
-    let listen_for_ctrl_c = cfg.listen_for_ctrl_c;
     let shutdown = async move {
-        let source = tokio::select! {
-            _ = maybe_ctrl_c(listen_for_ctrl_c) => {
-                tracing::info!("Ctrl+C received, shutting down");
-                ShutdownSource::CtrlC
-            }
-            _ = external_shutdown_rx.recv() => {
-                tracing::info!("Shutdown signal received from external controller, shutting down");
-                ShutdownSource::External
-            }
-        };
-
-        let _ = shutdown_started_tx.send(source);
+        external_shutdown_rx.recv().await;
+        tracing::info!("Shutdown signal received from external controller, shutting down");
+        let _ = shutdown_started_tx.send(ShutdownSource::External);
     };
 
     let server = axum::serve(
@@ -1374,15 +1312,11 @@ pub async fn run(
                     result?;
                 }
                 Err(_) => {
-                    if cfg.exit_process_on_shutdown_timeout {
-                        tracing::warn!(
-                            ?source,
-                            timeout_secs = cfg.graceful_shutdown_timeout.as_secs(),
-                            "Shutdown taking too long, forcing process exit"
-                        );
-                        std::process::exit(0);
-                    }
-
+                    // Never `std::process::exit` here. The deleted daemon
+                    // did, and it stayed behind after the daemon went: this
+                    // server is one thread of a host process with its own
+                    // work and its own exit, and a slow shutdown must cost
+                    // that process a dropped future, not its life.
                     tracing::warn!(
                         ?source,
                         timeout_secs = cfg.graceful_shutdown_timeout.as_secs(),
@@ -1450,14 +1384,6 @@ async fn drop_slack_on_switch_and_bell(
             }
             () = bell.rung() => proxied().await,
         }
-    }
-}
-
-async fn maybe_ctrl_c(enabled: bool) {
-    if enabled {
-        let _ = tokio::signal::ctrl_c().await;
-    } else {
-        pending::<()>().await;
     }
 }
 

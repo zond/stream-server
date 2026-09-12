@@ -1,22 +1,21 @@
 // Every test in this file starts a full embedded server. Both of its ports
 // are ephemeral: the HTTP port (`http_addr` port 0) and, through
-// `ServerConfig::embedded`'s `TorrentListenPort::Ephemeral`, librqbit's
+// `ServerConfig`'s default `TorrentListenPort::Ephemeral`, librqbit's
 // BitTorrent listener -- so any number of these servers coexist with each
 // other and with a desktop instance on its fixed 42000..42010 range, and
 // `cargo test`'s parallelism needs no limiting.
 
 use stream_server::{ServerAuth, ServerConfig, ServerHandle, TorrentListenPort};
 
-/// Client builder that sends the server's bearer token (if it has one) on
-/// every request -- every control route requires it.
+/// Client builder that sends the server's bearer token on every request --
+/// every control route requires it, and every server has one.
 fn bearer_client_builder(handle: &ServerHandle) -> reqwest::blocking::ClientBuilder {
     let mut headers = reqwest::header::HeaderMap::new();
-    if let Some(token) = handle.auth_token() {
-        headers.insert(
-            reqwest::header::AUTHORIZATION,
-            format!("Bearer {token}").parse().expect("valid header"),
-        );
-    }
+    let token = handle.auth_token().expect("every launch generates a token");
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        format!("Bearer {token}").parse().expect("valid header"),
+    );
     reqwest::blocking::Client::builder().default_headers(headers)
 }
 
@@ -24,7 +23,7 @@ fn bearer_client(handle: &ServerHandle) -> anyhow::Result<reqwest::blocking::Cli
     Ok(bearer_client_builder(handle).build()?)
 }
 
-/// The base config every test here spreads from: `ServerConfig::embedded()`
+/// The base config every test here spreads from: `ServerConfig::default()`
 /// with DHT bootstrap name resolution turned off, so starting a server makes
 /// no DNS query and no DNS-over-HTTPS request. The stock configs leave it on
 /// (that is asserted below); tests must stay offline, and on a runner with
@@ -44,33 +43,33 @@ fn offline_config() -> ServerConfig {
     }
 }
 
-/// Resolving bootstrap names is on for both shipped configurations -- the
-/// Android embed, which uses `embedded()`, is the case it exists for.
+/// Resolving bootstrap names is on in the stock configuration -- the Android
+/// embed is the case it exists for.
 #[test]
-fn stock_configs_resolve_dht_bootstrap_names() {
-    assert!(ServerConfig::embedded().resolve_dht_bootstrap_names);
-    assert!(ServerConfig::binary_default().resolve_dht_bootstrap_names);
+fn the_stock_config_resolves_dht_bootstrap_names() {
+    assert!(ServerConfig::default().resolve_dht_bootstrap_names);
 }
 
-/// Both stock configurations generate a per-launch token; opening the
-/// control API is an explicit opt-out (`ServerAuth::Disabled`, `--no-auth`).
+/// Every launch generates a per-launch token. There is no way to ask for an
+/// open control API: `ServerAuth::Disabled` was the deleted daemon's
+/// `--no-auth` and went with it, so `Generated` is both the default and the
+/// only value.
 #[test]
-fn stock_configs_default_to_a_generated_token() {
-    assert_eq!(ServerConfig::embedded().auth, ServerAuth::Generated);
-    assert_eq!(ServerConfig::binary_default().auth, ServerAuth::Generated);
+fn the_stock_config_generates_a_token() {
     assert_eq!(ServerConfig::default().auth, ServerAuth::Generated);
 }
 
-/// An embedded server takes an OS-assigned BitTorrent listen port; only the
-/// desktop binary keeps the fixed, forwardable range.
+/// A server takes an OS-assigned BitTorrent listen port, so any number of
+/// them coexist. The fixed, forwardable range is still reachable, but only
+/// for an embedder that names it.
 #[test]
-fn embedded_config_uses_an_ephemeral_torrent_port_the_binary_a_fixed_range() {
+fn the_stock_config_uses_an_ephemeral_torrent_port() {
     assert_eq!(
-        ServerConfig::embedded().torrent_listen_port,
+        ServerConfig::default().torrent_listen_port,
         TorrentListenPort::Ephemeral
     );
     assert_eq!(
-        ServerConfig::binary_default().torrent_listen_port,
+        TorrentListenPort::default(),
         TorrentListenPort::Fixed(42000..42010)
     );
 }
@@ -472,8 +471,6 @@ fn background_traffic_is_dark_on_an_idle_server() -> anyhow::Result<()> {
 /// visibly (non-2xx) instead of the official client silently believing
 /// playback started on the device.
 ///
-/// This server runs with `ServerAuth::Disabled` (the binary's `--no-auth`):
-/// the handle has no token and control routes answer without a header.
 #[test]
 fn casting_player_reports_failure_since_casting_is_not_implemented() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -483,13 +480,10 @@ fn casting_player_reports_failure_since_casting_is_not_implemented() -> anyhow::
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         config_dir: Some(config_dir.path().join("config")),
         cache_dir: Some(cache_dir.path().join("cache")),
-        auth: ServerAuth::Disabled,
         ..offline_config()
     })?;
-    assert_eq!(handle.auth_token(), None);
 
-    // No Authorization header anywhere in this test.
-    let client = reqwest::blocking::Client::new();
+    let client = bearer_client(&handle)?;
     let heartbeat: serde_json::Value = client
         .get(format!("http://{}/heartbeat", handle.http_addr()))
         .send()?
@@ -5266,7 +5260,7 @@ fn get_https_serves_the_certificate_on_the_port_it_answers_with() -> anyhow::Res
         cache_dir: Some(plain_cache_dir.path().join("cache")),
         ..offline_config()
     })?;
-    assert_eq!(ServerConfig::embedded().https_addr, None);
+    assert_eq!(ServerConfig::default().https_addr, None);
     let error = handle
         .install_https_certificate(cert, key)
         .unwrap_err()
@@ -5487,13 +5481,11 @@ fn the_lan_listener_counts_the_requests_that_reach_it() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// With no `lan_media_addr` configured -- the default for both stock
-/// configurations -- there is no LAN listener and nothing to start, whatever
-/// the setting says.
+/// With no `lan_media_addr` configured -- the default -- there is no LAN
+/// listener and nothing to start, whatever the setting says.
 #[test]
 fn without_a_configured_address_there_is_no_lan_media_listener() -> anyhow::Result<()> {
-    assert_eq!(ServerConfig::embedded().lan_media_addr, None);
-    assert_eq!(ServerConfig::binary_default().lan_media_addr, None);
+    assert_eq!(ServerConfig::default().lan_media_addr, None);
 
     let config_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;

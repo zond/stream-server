@@ -1089,7 +1089,7 @@ pub async fn set_settings(
 /// read off the configuration.
 ///
 /// Refused with `501` before any network call when the server has no HTTPS
-/// address configured (`ServerConfig::embedded`, and so the Android embed):
+/// address configured (the default, and so the Android embed):
 /// there is nothing here the certificate could be served on, and writing
 /// its private key to disk anyway -- what this used to do -- left a key
 /// nothing would ever use.

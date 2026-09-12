@@ -1223,22 +1223,22 @@ pub struct BtSettingsReport {
     pub not_honoured: Vec<&'static str>,
 }
 
-/// Ports the standalone binary tries, in order, for librqbit's incoming
-/// BitTorrent listener ([`TorrentListenPort::Fixed`] default). Mirrors the
-/// pre-9.0.1 librqbit `listen_port_range: 42000..42010` fallback.
+/// Ports [`TorrentListenPort::Fixed`] tries, in order, for librqbit's
+/// incoming BitTorrent listener. Mirrors the pre-9.0.1 librqbit
+/// `listen_port_range: 42000..42010` fallback.
 pub const DEFAULT_LISTEN_PORT_RANGE: std::ops::Range<u16> = 42000..42010;
 
 /// Which port librqbit's incoming BitTorrent (TCP) listener binds.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TorrentListenPort {
     /// Try each port of the range in order and keep the first that binds;
-    /// fail if none does. A stable, forwardable port for a long-running
-    /// desktop instance (`ServerConfig::binary_default`).
+    /// fail if none does. A stable, forwardable port, which is what a
+    /// UPnP mapping needs to be worth taking -- an embedder that wants one
+    /// asks for this explicitly.
     Fixed(std::ops::Range<u16>),
     /// Port 0: the OS picks a free port (librqbit reads the bound address
-    /// back and announces that port). For embedded servers and tests, so any
-    /// number of sessions coexist on one machine
-    /// (`ServerConfig::embedded`).
+    /// back and announces that port). The `ServerConfig` default, so any
+    /// number of embedded servers and tests coexist on one machine.
     Ephemeral,
 }
 
@@ -1263,12 +1263,11 @@ impl TorrentListenPort {
     /// Only for [`Self::Fixed`]. A forwarded mapping is a lease on the
     /// router for one external port number, and it is only worth anything if
     /// the same port comes back next launch -- which is precisely what
-    /// `Fixed` means and what the long-running desktop instance
-    /// (`ServerConfig::binary_default`) uses. An [`Self::Ephemeral`] listener
-    /// binds a different port every launch, so each run asks the router for a
-    /// fresh mapping and leaves the previous one to expire on its own; the
-    /// embedders that use it (the Android JNI cdylib, tests) get nothing
-    /// durable out of it. On Android the request cannot succeed at all --
+    /// `Fixed` means, and why only an embedder that asked for a fixed port
+    /// gets a mapping. An [`Self::Ephemeral`] listener -- the `ServerConfig`
+    /// default -- binds a different port every launch, so each run asks the
+    /// router for a fresh mapping and leaves the previous one to expire on
+    /// its own; the embedders that use it get nothing durable out of it. On Android the request cannot succeed at all --
     /// SSDP discovery is multicast the app sandbox is not permitted to send
     /// ("Operation not permitted (os error 1)" in a real device log), and on
     /// a cellular APN there is no gateway to ask -- while librqbit's

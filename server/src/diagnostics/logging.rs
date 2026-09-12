@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     sync::OnceLock,
     sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use chrono::Local;
@@ -487,13 +487,11 @@ unsafe extern "system" fn windows_exception_filter(
     EXCEPTION_EXECUTE_HANDLER
 }
 
-pub const MEMORY_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(60);
-pub const MEMORY_GROWTH_ALERT_BYTES: u64 = 128 * 1024 * 1024;
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     /// Everything a scoped subscriber wrote, so a test can grep the line
     /// exactly as it would land in the log files.
