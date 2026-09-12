@@ -4370,8 +4370,21 @@ mod tests {
         );
     }
 
-    /// The swallowed unpause, against the shipped librqbit: after it, the
-    /// `paused` flag says the torrent is running and the torrent is stopped.
+    /// An unpause that lands while the initial check runs starts the torrent,
+    /// and `run_state` and librqbit's own flag agree about it.
+    ///
+    /// **This used to be a divergence, and the fork fixed it.** `Session::
+    /// unpause` cleared `paused` and then found the check already running, so
+    /// it returned success having started nothing; the check that *was*
+    /// running had captured the add-time `start_paused = true` and parked the
+    /// torrent when it finished. The flag said running, the torrent was
+    /// stopped, and everything here that reads one of the two was reading a
+    /// coin flip. The fork's `f21c3a3e` makes the check land on the pause
+    /// intent as it stands when it finishes, so the unpause is honoured.
+    ///
+    /// Kept, with its assertions turned round, because it is this side's
+    /// guard on that fix: a rebase that lost it would fail here rather than
+    /// in a field log.
     ///
     /// `Session::unpause` writes `g.paused = false` before `_start` has
     /// looked at anything (`torrent_state/mod.rs:649`), then finds the
@@ -4386,7 +4399,7 @@ mod tests {
     /// so a pause that errs is the state machine agreeing with `run_state`
     /// and contradicting the flag.
     #[tokio::test(flavor = "multi_thread")]
-    async fn run_state_sees_the_pause_a_swallowed_unpause_left_behind() {
+    async fn an_unpause_during_the_initial_check_starts_the_torrent() {
         use crate::backend::TorrentHandle;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("dl");
@@ -4453,21 +4466,29 @@ mod tests {
 
         assert_eq!(
             settled,
-            RunState::Paused,
-            "the unpause started nothing; the in-flight check parked the torrent"
+            RunState::Live,
+            "the check landed on the pause intent as it stood, so the unpause started it"
         );
         assert!(
             !handle.handle.is_paused(),
-            "...while the flag it cleared still says the torrent is running"
+            "...and the flag agrees: there is nothing left to diverge"
         );
         assert!(
-            backend.session.pause(&handle.handle).await.is_err(),
-            "librqbit refuses to pause it again, which is it agreeing with run_state"
+            backend.session.pause(&handle.handle).await.is_ok(),
+            "librqbit pauses a running torrent, which is it agreeing with run_state"
         );
     }
 
-    /// The other direction: a pause landing during a *fastresume* check is
-    /// dropped on the floor, and the torrent goes live with the flag set.
+    /// The other direction: a pause landing during a *fastresume* check parks
+    /// the torrent, and the flag agrees.
+    ///
+    /// **Also a divergence the fork fixed.** `validate_fastresume` never read
+    /// `pause_requested`, so the check returned `Ok`, its continuation applied
+    /// the add-time `start_paused` -- `false` for a torrent restored unpaused
+    /// -- and took it `Live` while the flag said paused. That is the shape
+    /// behind the measured 3 MiB -> 12 MiB overshoot: the free-space watch
+    /// stopped the torrent, was told it was paused, and the torrent went on
+    /// writing.
     ///
     /// `TorrentStateInitializing::check` hands `pause_requested` to
     /// `FileOps::initial_check` and to nothing else
@@ -4485,7 +4506,7 @@ mod tests {
     /// one take the fastresume path at all -- and a restart is exactly when
     /// this happens in the field.
     #[tokio::test(flavor = "multi_thread")]
-    async fn run_state_sees_the_torrent_a_swallowed_pause_took_live() {
+    async fn a_pause_during_a_fastresume_check_leaves_the_torrent_parked() {
         use crate::backend::TorrentHandle;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("dl");
@@ -4570,18 +4591,17 @@ mod tests {
 
         assert_eq!(
             settled,
-            RunState::Live,
-            "the fastresume check never read the pause request, so the torrent went live"
+            RunState::Paused,
+            "the fastresume check read the pause request, so the torrent stayed parked"
         );
         assert!(
             handle.handle.is_paused(),
-            "...while the flag still says it is paused"
+            "...and the flag agrees: there is nothing left to diverge"
         );
-        backend
-            .session
-            .pause(&handle.handle)
-            .await
-            .expect("librqbit pauses it, which it would refuse for a paused torrent");
+        assert!(
+            backend.session.pause(&handle.handle).await.is_err(),
+            "librqbit refuses to pause a torrent it already has paused"
+        );
     }
 
     /// Whether the session has written a have-bitfield yet
