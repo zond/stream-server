@@ -71,6 +71,45 @@ unrar-rs = { version = "0.7", default-features = false, features = [
     "crypto-rust",
 ], optional = true }
 lz-str = "0.2.1"
+# The FTP client behind `/ftp`, in place of a spawned `curl`. That was the
+# last external program this server ran, so with it gone the build and the
+# run both need nothing but the crates named here -- which is the whole of
+# what makes this library embeddable in an app store binary. Default
+# features are off: the crate's own default is the blocking client, and the
+# `tokio` feature is the one that fits the runtime everything else here is
+# on. `tokio-rustls-aws-lc-rs` is what `ftps://` needs, on the same rustls
+# and the same aws-lc-rs provider the rest of the workspace already
+# compiles, so it brings no second TLS stack into the graph.
+# `deprecated` is what `connect_secure_implicit` lives behind, and implicit
+# TLS is exactly what `ftps://` means: the scheme opens the control channel
+# inside TLS on 990 rather than negotiating `AUTH TLS` on 21. The crate
+# deprecates it because the RFC prefers explicit FTPS; the URL a caller
+# hands this route does not, and `curl` -- which this replaced -- read
+# `ftps://` the implicit way too. Dropping it would silently turn one
+# scheme into a different protocol.
+suppaftp = { version = "12.0.0", default-features = false, features = [
+    "tokio",
+    "tokio-rustls-aws-lc-rs",
+    "deprecated",
+] }
+# Builds the one `ClientConfig` that FTPS connector is handed
+# (`routes::ftp::tls_config`). Both are already in the graph under reqwest
+# (rustls 0.23) and suppaftp (tokio-rustls 0.26), so naming them here
+# compiles nothing new; a client config cannot be built without saying
+# `rustls`.
+rustls = { version = "0.23", default-features = false, features = [
+    "std",
+    "aws-lc-rs",
+    "tls12",
+] }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "aws-lc-rs",
+    "tls12",
+] }
+# Mozilla's root program, compiled in: the anchors FTPS verifies against.
+# The same crate and the same major version `enginefs::http_client` gives
+# every HTTPS client here, so `/ftp` trusts what `/proxy` trusts.
+webpki-root-certs = "1"
 tempfile = "3.23.0"
 dirs = "6.0"
 dashmap = "6.1.0"

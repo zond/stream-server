@@ -18,7 +18,7 @@
 
 Stream Server is zond's hard fork of [stremio-native/stream-server](https://github.com/stremio-native/stream-server) (formerly `perpetus/stream-server`, itself an open-source alternative to Stremio's closed-source `server.js`), rewritten around a fork of `librqbit`. It has **no ambition to merge back upstream**: the API, the engine and the licensing have all diverged, and it is shaped by one client. That client is [xtremio](https://github.com/zond/xtremio), a Flutter Stremio client that embeds this server in-process as a Rust library (`stream_server::start`, see [Library API](#library-api)). **This crate is a library and nothing else**: there is no standalone daemon any more, so no other Stremio client can run it.
 
-Its goal is narrower than upstream's: a **headless torrent-streaming server with no system-library requirements**. `cargo build` on a machine with a Rust toolchain and a C compiler — no libtorrent, no libclang, no FFmpeg, no GUI toolkits — is enough to compile it, with the default features or with `--no-default-features`. The server itself is Rust; the C compiler is for the C one dependency bundles and builds from source (`aws-lc-sys`, under rustls and librqbit's SHA-1). The one external program the server runs is `curl`, and only for the `/ftp` route (see [Routes](#routes)).
+Its goal is narrower than upstream's: a **headless torrent-streaming server with no system-library requirements**. `cargo build` on a machine with a Rust toolchain and a C compiler — no libtorrent, no libclang, no FFmpeg, no GUI toolkits — is enough to compile it, with the default features or with `--no-default-features`. The server itself is Rust; the C compiler is for the C one dependency bundles and builds from source (`aws-lc-sys`, under rustls and librqbit's SHA-1). **At run time it spawns no external program at all**: `/ftp` was a spawned `curl` and is now the pure-Rust `suppaftp`, so nothing has to be on `PATH` for any route to work. (The one `Command` left in the tree is `build.rs` asking `git` for the commit it is building, which is a build-time convenience and absent from the library.)
 
 To get there, this fork **deliberately drops Stremio server.js API compatibility**: there is no HLS transcoding, no FFmpeg/FFprobe integration, and no video-probing endpoints. Those existed to reformat video for Stremio's web-based player. This server instead sits behind a native client (xtremio: Flutter, with `media_kit`/`libmpv` for playback) that does direct play and handles codecs and subtitles itself — so the server's only job is getting torrent and archive bytes onto an HTTP connection efficiently, not transcoding them.
 
@@ -44,7 +44,7 @@ This is not a drop-in replacement for `server.js` — the API surface it exposes
 ## ✨ Features
 
 ### Core Streaming
-- **🚀 No system libraries, always**: the entire build — every feature combination — needs no system library and no tool but the pinned Rust toolchain and a C compiler, for the C that `aws-lc-sys` bundles. At run time the server runs one external program, and only for `/ftp`: `curl`
+- **🚀 No system libraries, always**: the entire build — every feature combination — needs no system library and no tool but the pinned Rust toolchain and a C compiler, for the C that `aws-lc-sys` bundles. At run time it runs **no external program at all**: the last one was the `curl` behind `/ftp`, replaced by `suppaftp`
 - **🔧 Single backend**: `librqbit` (Rust, via the `zond/rqbit` fork — see [About](#-about)) is the only torrent engine — there is no C++ alternative to opt into
 - **📡 HTTP Range Requests**: torrent pieces are streamed straight to HTTP range requests for instant seeking — direct play, no transcoding step in between
 
@@ -253,7 +253,7 @@ The HTTP surface is deliberately small and split in two by `build_router()` (`se
 | GET, HEAD | `/stream/{infoHash}/{fileIdx}` | OPEN | players (alias of the above) |
 | GET, POST | `/{rar\|zip\|7zip\|tar\|tgz}/create`, `/{…}/create/{key}` | OPEN | players — archive session creation via `?lz=` (stremio-core builds these URLs) |
 | GET | `/{rar\|zip\|7zip\|tar\|tgz}/stream`, `/{…}/stream/{key}`, `/{…}/stream/{key}/{*file}` | OPEN | players — archive member bytes |
-| GET | `/ftp/{filename}?lz=…` | OPEN | players (FTP/FTPS passthrough through a spawned `curl`, which must be on `PATH` — without it the answer is `500`; any other scheme is `400`) |
+| GET | `/ftp/{filename}?lz=…` | OPEN | players (FTP/FTPS passthrough through the pure-Rust `suppaftp` — nothing to install; any other scheme is `400`, and an origin that refuses is `502`) |
 | GET, HEAD, OPTIONS | `/proxy/{*rest}`, `/proxy`, `/proxy/` | OPEN | players — a remote stream fetched on their behalf, with the headers the addon asked for, and cached in whole chunks so a seek back into it is answered from disk. Any other method is `405` with `Allow`. See [Proxied remote streams](#proxied-remote-streams) |
 | GET | `/local-addon/manifest.json` | OPEN | stremio-core default profile — **stub**: a valid manifest (`org.stremio.local`, "Local Files") declaring no types, resources or catalogs |
 | GET | `/local-addon/stream/{type}/{id}`, `/local-addon/stream/{type}/{id}.json` | OPEN | stremio-core default profile — **stub**: always `{"streams": []}` |
@@ -610,8 +610,8 @@ exists as an operator veto that no embedder call can override.
 of a route belonging on the LAN is that it serves bytes the loopback side has
 already arranged and cannot be made to arrange anything. `/proxy` and `/ftp`
 fail it outright: both fetch an arbitrary caller-supplied remote URL rather
-than media bytes from this server — `/proxy` over HTTP(S), `/ftp` through a
-spawned `curl` for FTP/FTPS only — which makes either an open proxy
+than media bytes from this server — `/proxy` over HTTP(S), `/ftp` over
+FTP/FTPS only — which makes either an open proxy
 for whoever can reach it. So do the archive `/create` routes, which
 download an archive from a caller-named URL, and the loopback stream route's first request for
 an info hash, which starts a torrent with the caller's trackers on this

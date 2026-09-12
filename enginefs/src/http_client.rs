@@ -2,8 +2,11 @@
 //!
 //! Every `reqwest` client either crate builds starts at
 //! [`http_client_builder`] -- the tracker-list fetch, the tracker prober, the
-//! BEP-48 scrape, the DoH bootstrap resolver, `/proxy`, `/ftp`, the archive
-//! fetches, and the `/get-https` call to Stremio's certificate API.
+//! BEP-48 scrape, the DoH bootstrap resolver, `/proxy`, the archive fetches,
+//! and the `/get-https` call to Stremio's certificate API. (`/ftp` is the one
+//! fetch that is not reqwest's -- it speaks FTP, through `suppaftp` -- and it
+//! verifies FTPS against the same compiled-in roots; see
+//! `server::routes::ftp::tls_config`.)
 //! It lives in `enginefs` rather than `server` because `server` depends on
 //! `enginefs` and not the reverse; librqbit has its own copy of this policy
 //! (`librqbit::http_client_builder`) for the same reason. The two are no

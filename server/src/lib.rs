@@ -1630,7 +1630,7 @@ fn local_addon_routes() -> Router<AppState> {
 /// `/proxy` and `/ftp` are also here, and are also open for the same
 /// header-less-caller reason -- but neither serves media bytes *from this
 /// server*: both fetch an arbitrary caller-supplied remote URL (`/proxy` over
-/// HTTP(S), `/ftp` via a spawned `curl`, for FTP/FTPS URLs only) and
+/// HTTP(S), `/ftp` over FTP/FTPS and nothing else) and
 /// stream back whatever answers. That makes each an open proxy, which is
 /// fine on the loopback listener -- only this host's own stremio-core can
 /// reach it -- but not on the LAN one. The archive `/create` routes and the
