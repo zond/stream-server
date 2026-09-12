@@ -131,9 +131,12 @@
 //!    away the record that carried it; advertise committed runs, withdraw
 //!    lost runs, no L2 held (all three empty by construction under
 //!    [`Share::Nothing`]); then
-//!    [`Backing::want`], which trims what the backend fetches to the windows
-//!    and what is on the disk, asking the same [`Door`] the reclaim asks
-//!    before it unlinks anything that arrived under the pass.
+//!    [`Backing::want`], which trims what the backend fetches to the
+//!    *want*-windows and what is on the disk, asking the same [`Door`] the
+//!    reclaim asks before it unlinks anything that arrived under the pass.
+//!    Two window lists come out of step 5, not one: every reader is owed a
+//!    window that is not deleted under it, and only a [`Reading::Playback`]
+//!    reader is owed one that is fetched for it.
 //! 7. Test hook.
 //! 8. [`Backing::reclaim`] with a [`Door`] that answers both
 //!    [`Door::window_now`] and [`Door::refuses`] from one reading of L2.
@@ -402,9 +405,14 @@ pub trait Backing: Sized + Send + Sync + 'static {
     /// boundary rule (`this_files_alone`); the proxy's identity.
     fn alone(&self, domain: &Self::Domain, pieces: &[u32])
     -> impl Future<Output = Vec<u32>> + Send;
-    /// Trim what the backend fetches to what the pass decided to keep: want
-    /// every piece of `windows` again, and stop wanting every piece of the
-    /// entity that is in no window and not `held`. The committed set needs
+    /// Trim what the backend fetches to what the pass decided to fetch:
+    /// want every piece of `windows` again, and stop wanting every piece of
+    /// the entity that is in no window and not `held`.
+    ///
+    /// `windows` here is the pass's *want*-windows and not the ones the
+    /// [`Door`] keeps: a [`Reading::Probe`]'s window is kept and never
+    /// ordered, because a probe reads sixteen megabytes and a window round
+    /// it orders a whole forward reach. The committed set needs
     /// no clause of its own: [`RetentionPolicy::advance`] keeps it inside
     /// the held set it was handed, and `held` is that reading.
     ///
@@ -1683,7 +1691,7 @@ impl<B: Backing> Retention<B> {
         // asked for, or the old one that no longer exists. The byte that
         // decided it is owed the pass it could not start: `nothing` with no
         // measurement hands the claim on while something is installed.
-        let (decision, windows, promised, door_policy, at, doomed, asserted) = {
+        let (decision, keep_windows, want_windows, promised, door_policy, at, doomed, asserted) = {
             let mut state = entity.state.lock();
             if !state.still(&begin) {
                 return Self::nothing(&state, claim, about, None);
@@ -1694,15 +1702,17 @@ impl<B: Backing> Retention<B> {
             else {
                 return Self::nothing(&state, claim, about, None);
             };
-            let others: Vec<u32> = state
+            let others: Vec<(u32, Reading)> = state
                 .readers
                 .iter()
                 .filter(|(id, _)| Some(**id) != about)
                 // The read's head, not its playhead: a read parked on its
                 // first piece has delivered nothing and is still the one
                 // the entity is being buffered for.
-                .filter_map(|(_, reader)| reader.head())
-                .filter_map(|position| B::index_of(&state.domain, position))
+                .filter_map(|(_, reader)| Some((reader.head()?, reader.reading)))
+                .filter_map(|(position, reading)| {
+                    Some((B::index_of(&state.domain, position)?, reading))
+                })
                 .collect();
             let promised: Vec<Range<u32>> = state
                 .readers
@@ -1722,11 +1732,31 @@ impl<B: Backing> Retention<B> {
             // entity rather than a reader (the tick, a re-arm from the
             // turn) counts every reader among the others, including the one
             // whose byte was the entity's last.
-            let mut windows = vec![decision.window.clone()];
-            for other in others {
+            //
+            // **Two lists, because keeping and fetching are two different
+            // promises.** A window is a promise not to delete, and every
+            // reader is owed one: a pass may not unlink the bytes a live
+            // read is about to hand out, whatever the read is for. A window
+            // is *also*, through [`Backing::want`], an order to the swarm to
+            // fill it -- and a [`Reading::Probe`] is owed no such thing. A
+            // player's 16 MiB read of the container index at the tail is a
+            // read of sixteen megabytes; ordering the whole forward reach of
+            // a window round it is a hundred and thirty-eight megabytes of
+            // tail the next pass reclaims, which is what a phone paid for
+            // when opening a film fetched 1.6 GB to play a hundred. So the
+            // probe's window is kept and not wanted: its own bytes still
+            // arrive, because a stream's lookahead pulls what it reads
+            // whatever the selection says (see [`Backing::want`]'s note on a
+            // refused reselect), and nothing else is ordered on its behalf.
+            let mut keep = vec![decision.window.clone()];
+            let mut want = vec![decision.window.clone()];
+            for (other, reading) in others {
                 let window = policy.window_at(other);
-                if !windows.contains(&window) {
-                    windows.push(window);
+                if !keep.contains(&window) {
+                    keep.push(window.clone());
+                }
+                if reading == Reading::Playback && !want.contains(&window) {
+                    want.push(window);
                 }
             }
             // What this pass has decided to take is what it will never put
@@ -1737,7 +1767,8 @@ impl<B: Backing> Retention<B> {
             state.doom(&mut claim.guard, runs(&decision.reclaim));
             (
                 decision,
-                windows,
+                keep,
+                want,
                 promised,
                 policy,
                 at,
@@ -1751,7 +1782,7 @@ impl<B: Backing> Retention<B> {
         // set has capacity zero, so both lists are empty and the backing is
         // never asked.
         let mut conclusion = Conclusion {
-            windows: windows.clone(),
+            windows: keep_windows.clone(),
             ..Conclusion::default()
         };
         if B::SHARE == Share::Nothing {
@@ -1834,7 +1865,7 @@ impl<B: Backing> Retention<B> {
             domain: begin.domain.clone(),
             mode: Mode::Live,
             policy: Some(door_policy),
-            windows: windows.clone(),
+            windows: keep_windows,
             promised,
         };
         // And the want-set, trimmed to what this pass keeps: the windows
@@ -1842,7 +1873,7 @@ impl<B: Backing> Retention<B> {
         // not wanted. What is on the disk and outside them is the reclaim's,
         // below.
         self.backing
-            .want(store, &begin.domain, &windows, &held, &door)
+            .want(store, &begin.domain, &want_windows, &held, &door)
             .await;
         // 7. And what playback does while the unlinks run.
         self.run_hook();
@@ -2733,6 +2764,9 @@ mod tests {
         reclaims: parking_lot::Mutex<Vec<Vec<Range<u32>>>>,
         /// The extent of every `want_all` call, in order.
         wanted_all: parking_lot::Mutex<Vec<Range<u32>>>,
+        /// The windows every `want` call was handed, in order: what the
+        /// pass ordered the backend to fetch, as against what it kept.
+        wanted: parking_lot::Mutex<Vec<Vec<Range<u32>>>>,
         /// The runs each `reclaim` call really asked the door about, which
         /// stops at the first `window_now` of `None`.
         asked: parking_lot::Mutex<Vec<Vec<Range<u32>>>>,
@@ -2767,6 +2801,7 @@ mod tests {
                 epoch: AtomicU64::new(1),
                 reclaims: parking_lot::Mutex::new(Vec::new()),
                 wanted_all: parking_lot::Mutex::new(Vec::new()),
+                wanted: parking_lot::Mutex::new(Vec::new()),
                 asked: parking_lot::Mutex::new(Vec::new()),
                 reclaim_panics: AtomicBool::new(false),
                 park_held: parking_lot::Mutex::new(None),
@@ -2928,6 +2963,19 @@ mod tests {
 
         async fn want_all(&self, domain: &FakeDomain) {
             self.wanted_all.lock().push(domain.pieces.clone());
+        }
+
+        /// Only what the pass ordered fetched, which is the half of the
+        /// window list a probe is left out of.
+        async fn want(
+            &self,
+            _store: &(),
+            _domain: &FakeDomain,
+            windows: &[Range<u32>],
+            _held: &BTreeSet<u32>,
+            _door: &Door<Self>,
+        ) {
+            self.wanted.lock().push(windows.to_vec());
         }
 
         /// Both shapes at once: `window_now` gates each run as the torrent
@@ -4974,6 +5022,58 @@ mod tests {
             backing.on_disk(),
             vec![0, 1, 8, 9, 10, 11, 12, 13, 14, 15],
             "the pieces under the player were reclaimed and its stream will fetch them again"
+        );
+    }
+
+    /// **A probe's window is kept and not fetched.**
+    ///
+    /// The other half of the same field bug. A live probe never claimed the
+    /// entity's head, but it did put a window of its own into the list the
+    /// pass hands [`Backing::want`], and that list is an order to the
+    /// swarm: a sixteen-megabyte read of the container index at the tail
+    /// ordered the whole forward reach of a window round it -- a hundred
+    /// and thirty-eight megabytes on the device this was measured on --
+    /// which the next pass reclaimed again. So the two lists are split: the
+    /// probe is in the one that says "do not delete this" and out of the
+    /// one that says "fetch this".
+    #[tokio::test]
+    async fn a_live_probe_keeps_its_window_without_ordering_it_fetched() {
+        let (backing, owner, _budget) = torrent();
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        let playing = owner
+            .reader_on(&0, (0, 0), Reading::Playback)
+            .expect("the entity the install made");
+        assert!(playing.note((0, 0)).is_none());
+        // mpv's read of the Cues, still open while the tick runs.
+        let probe = owner
+            .reader_on(&0, (0, 7 * PIECE), Reading::Probe)
+            .expect("the same entity");
+        assert!(probe.note((0, 7 * PIECE)).is_none());
+
+        let claim = owner.turn(&0).await.expect("the turn");
+        let outcome = owner
+            .pass(&0, &(), claim, Mode::Live)
+            .await
+            .concluded
+            .expect("a pass");
+        assert_eq!(
+            outcome.windows,
+            vec![0..2, 6..8],
+            "both reads are owed a window: the pass may not delete what either is reading"
+        );
+        assert_eq!(
+            *backing.wanted.lock(),
+            vec![vec![0..2]],
+            "only the playing read's window was ordered fetched"
+        );
+        assert!(
+            backing.on_disk().contains(&7),
+            "and the door still refused to unlink the piece the probe is reading"
+        );
+        assert_eq!(
+            backing.on_disk(),
+            vec![0, 1, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            "everything outside both windows went, and nothing inside either did"
         );
     }
 
