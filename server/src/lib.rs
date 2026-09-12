@@ -285,6 +285,34 @@ impl ServerHandle {
         routes::system::dht_status(&self.state)
     }
 
+    /// **Tell the server where the player is**, which is the one fact about
+    /// a viewing it cannot see for itself: `offset` is the player's own
+    /// byte offset into the file and `film` its position in the picture.
+    ///
+    /// Everything the retention window does with a playhead it otherwise
+    /// infers from the byte ranges a player asks for, and those do not
+    /// carry it -- a container index read and a seek into the tail are the
+    /// same request. An embedder that has a real player should call this
+    /// about once a second per open film; see
+    /// [`enginefs::EngineFS::on_playhead`].
+    ///
+    /// Nothing depends on it. Stop calling and the hint goes stale in
+    /// fifteen seconds and the inference answers again, which is what a
+    /// client that never calls gets throughout.
+    pub async fn note_playhead(
+        &self,
+        info_hash: &str,
+        file_idx: usize,
+        offset: u64,
+        film: std::time::Duration,
+        playing: bool,
+    ) {
+        self.state
+            .engine
+            .on_playhead(info_hash, file_idx, offset, film, playing)
+            .await;
+    }
+
     /// Whether this server is using the connection while nothing is playing
     /// -- what a client's "working in the background" indicator shows, in
     /// each direction, exactly what `routes::system::background_traffic`

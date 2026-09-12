@@ -1336,6 +1336,20 @@ impl<H: TorrentHandle> Engine<H> {
         self.retention.note_position(&file_idx, (file_idx, offset));
     }
 
+    /// What the player says about itself; see [`Retention::note_playhead`].
+    /// `offset` is its own byte offset into `file_idx` and `film` its own
+    /// position in the picture.
+    pub fn told_playhead(
+        &self,
+        file_idx: usize,
+        offset: u64,
+        film: std::time::Duration,
+        playing: bool,
+    ) {
+        self.retention
+            .note_playhead(&file_idx, (file_idx, offset), film, playing);
+    }
+
     /// What the retention policy says about `file_idx` right now, or `None`
     /// where there is nothing to say.
     ///

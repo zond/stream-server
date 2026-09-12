@@ -2980,6 +2980,34 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         self.start_stream(info_hash, file_idx, true).await;
     }
 
+    /// **Where the player says it is**, which is the one thing about a
+    /// viewing this process cannot work out for itself.
+    ///
+    /// `offset` is the player's own byte offset into the file -- mpv's
+    /// `stream-pos` -- and `film` its position in the picture; together
+    /// they are the playhead and the film's bitrate without either being
+    /// inferred from the shape of a `Range` header. See
+    /// [`crate::retention::owner::Retention::note_playhead`] for why that
+    /// matters and what it replaces.
+    ///
+    /// Cheap and lock-light on purpose: an embedder calls it about once a
+    /// second per open film, and it takes no turn, installs nothing and
+    /// starts nothing. A torrent this process is not running, or a file
+    /// nothing has installed a policy on, is nothing to remember -- the
+    /// call is a hint, and dropping one costs the freshness of a hint.
+    pub async fn on_playhead(
+        &self,
+        info_hash: &str,
+        file_idx: usize,
+        offset: u64,
+        film: std::time::Duration,
+        playing: bool,
+    ) {
+        if let Some(engine) = self.peek_engine(info_hash).await {
+            engine.told_playhead(file_idx, offset, film, playing);
+        }
+    }
+
     /// [`Self::on_stream_start`] without its `PlaybackStart` reconcile, for
     /// a caller that asks the reconciler itself once its disk gate has run
     /// (`routes::stream`, through [`Self::focus_torrent`]). The gate may
