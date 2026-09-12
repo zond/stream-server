@@ -863,6 +863,18 @@ const STRUCTURAL_PIECES: usize = 8;
 /// on piece 0.
 const STARTUP_RUN: u32 = 16;
 
+/// How near a predicted playhead a read has to be for its own position to
+/// be taken as the exact one, as a fraction of the entity.
+///
+/// It separates two things that are orders apart, so it does not want to
+/// be tight. A prediction drifts from the true offset by however much a
+/// variable-bitrate film has run off its own average -- a few percent of
+/// the file at worst. A read of the container index sits at the very end
+/// of it, most of a file away. Five percent admits every real reader,
+/// including one that has run a long way ahead of the viewer, and admits
+/// nothing at the far end.
+const READ_VICINITY: f64 = 0.05;
+
 /// How long the player's own word stands after it stops arriving.
 ///
 /// The app reports about once a second while a film is open. Going quiet
@@ -2287,6 +2299,13 @@ impl<B: Backing> Retention<B> {
                 key,
                 trace::Pass {
                     playhead: at,
+                    // The stated playhead is converted at the film's average
+                    // rate; a reader's position is the true one. See
+                    // `trace::Pass::drift`.
+                    drift: readers
+                        .iter()
+                        .map(|(head, _)| i64::from(*head) - i64::from(at))
+                        .min_by_key(|drift| drift.abs()),
                     reading,
                     window: decision.window.clone(),
                     reach: reach.end - reach.start,
@@ -2577,10 +2596,46 @@ impl<B: Backing> State<B> {
 
     /// Where the player says it is, while it is still saying it.
     fn told_head(&self) -> Option<B::Position> {
-        self.told
+        let predicted = self
+            .told
             .as_ref()
             .filter(|told| told.when.elapsed() < TOLD_FRESH)
-            .map(|told| told.at)
+            .map(|told| told.at)?;
+        Some(self.read_near(predicted).unwrap_or(predicted))
+    }
+
+    /// A live read sitting near `predicted`, whose position is the exact
+    /// one, or `None` when no read is anywhere near it.
+    ///
+    /// **The prediction says where, a read says exactly where.** Where in
+    /// the picture converts to a byte offset at the film's *average* rate,
+    /// so on a variable-bitrate encode it drifts from the true offset by
+    /// however much the film so far has run above or below its own average
+    /// -- cumulatively, which a wider window does not shrink. A reader's
+    /// own position has no such error.
+    ///
+    /// What a reader's position cannot do on its own is say whether it is
+    /// the viewer: mpv keeps a second reader crawling the container index,
+    /// and taking the newest playing read put the window at the end of the
+    /// film while the viewer was sixteen minutes in. The prediction settles
+    /// that, and it does not have to be accurate to settle it -- an index
+    /// read is most of a file away, where a drift is a few percent of one.
+    ///
+    /// So: the prediction chooses which read to believe, and the read it
+    /// chooses says where. Neither is asked the question it is bad at.
+    fn read_near(&self, predicted: B::Position) -> Option<B::Position> {
+        let extent = B::extent(&self.domain);
+        let pieces = extent.end.saturating_sub(extent.start);
+        let predicted = B::index_of(&self.domain, predicted)?;
+        let tolerance = (f64::from(pieces) * READ_VICINITY) as u32;
+        self.readers
+            .values()
+            .filter(|reader| reader.reading == Reading::Playback)
+            .filter_map(|reader| Some((reader.head()?, ())))
+            .filter_map(|(head, ())| Some((B::index_of(&self.domain, head)?, head)))
+            .filter(|(index, _)| index.abs_diff(predicted) <= tolerance)
+            .min_by_key(|(index, _)| index.abs_diff(predicted))
+            .map(|(_, head)| head)
     }
 
     /// The newest live [`Reading::Playback`] read's head, or `None` when

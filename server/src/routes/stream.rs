@@ -1181,6 +1181,36 @@ async fn stream_video_with(
         is_download,
         is_partial,
     );
+    // **TEMPORARY, with `enginefs::retention::trace`.** What the player
+    // actually asked for, before anything here interprets it.
+    //
+    // `intent` is *our* label -- `playback_intent_for_request` derives it
+    // from the priority header, the download flags and the geometry. A
+    // player says none of that; it sends a byte range. So the range itself
+    // is logged beside the label, because a question about what a player is
+    // doing cannot be answered by reading back our own guess about it.
+    //
+    // What this is here to identify: a reader that spent the whole of the
+    // 2026-09-12 20:49 session reopening once a second at
+    // `file_size - 25,961,713`, taking about 41 kB and advancing some sixty
+    // bytes. That offset is 15.2 MB *before* this file's `moov`, so it is
+    // inside `mdat` -- media data, not the container index this module has
+    // been calling it.
+    tracing::info!(
+        stream_id,
+        info_hash = %info_hash,
+        file_idx = idx,
+        range = range_header.as_deref().unwrap_or("<none>"),
+        start,
+        requested_len = requested_content_length,
+        from_end = size.saturating_sub(start),
+        end,
+        is_partial,
+        priority,
+        intent = ?playback_intent,
+        stage = "stream_request",
+        "a player asked for a range"
+    );
     // The request's own `buffer=` wins; anything else (absent, or a value this
     // build does not know) falls back to the server-wide default.
     let buffer_profile = match query.buffer {
