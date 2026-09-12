@@ -8817,16 +8817,33 @@ mod tests {
         }
         drop(reader);
 
-        // The passes settle round where playback stopped.
-        for _ in 0..10 {
+        // The passes settle round where playback stopped. Settling is
+        // *observed* and not waited out: the playback read above leaves
+        // requests in flight, and a fixed number of ticks is only long
+        // enough for them to drain on a runner as fast as the one the
+        // number was picked on. Where it is not, the bytes still arriving
+        // from that read are counted against the probe below, which is how
+        // this failed on Windows and passed everywhere else.
+        let mut settled = 0;
+        let quiet_at = std::time::Instant::now() + TEST_WAIT_BOUND;
+        loop {
             tokio::time::sleep(Duration::from_millis(50)).await;
             efs.reconcile_tick().await;
+            let fetched = engine
+                .handle
+                .transfer_totals()
+                .expect("a paused film's torrent is still live")
+                .fetched;
+            if fetched == settled {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < quiet_at,
+                "the swarm never stopped delivering after playback stopped: \
+                 {fetched} bytes and still climbing"
+            );
+            settled = fetched;
         }
-        let settled = engine
-            .handle
-            .transfer_totals()
-            .expect("a paused film's torrent is still live")
-            .fetched;
         assert!(
             settled >= RETENTION_BUDGET / 2,
             "only {settled} bytes came off the swarm before the probe, which is less \
