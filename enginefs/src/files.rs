@@ -95,6 +95,30 @@ pub struct FileHandle<H: TorrentHandle> {
     reader: Option<crate::retention::owner::Reader<crate::engine::TorrentBacking<H>>>,
 }
 
+/// What one read of one file is: where in the torrent, where in the file,
+/// what the read is for, and how far ahead the backend granted it.
+///
+/// A struct rather than four more parameters because the last two arrived
+/// together and mean nothing apart: the intent is what the owner is told
+/// the read is *for* ([`PlaybackIntent::reading`]), and the lookahead is
+/// what the backend really granted it, which the owner keeps as the floor
+/// no later budget may size the window under.
+///
+/// [`PlaybackIntent::reading`]: crate::backend::priorities::PlaybackIntent::reading
+#[derive(Debug, Clone, Copy)]
+pub struct Opening {
+    /// Which file of the torrent.
+    pub file_idx: usize,
+    /// The offset in that file the read starts at.
+    pub start_offset: u64,
+    /// What the read is for.
+    pub intent: crate::backend::priorities::PlaybackIntent,
+    /// The stream lookahead the backend granted, in bytes: already the
+    /// smaller of the intent's cap and the window's forward reach. See
+    /// [`crate::piece_store::Buffering`].
+    pub lookahead_bytes: u64,
+}
+
 impl<H: TorrentHandle> FileHandle<H> {
     /// A handle over `stream`, reading `file_idx` from `start_offset`.
     /// Opened after the engine has installed the file's retention policy
@@ -110,6 +134,12 @@ impl<H: TorrentHandle> FileHandle<H> {
     /// the window sliding to the end of the file under a player still at
     /// 0:00.
     ///
+    /// `lookahead_bytes` is what the backend really granted this stream --
+    /// already the smaller of the intent's cap and the window's forward
+    /// reach -- and the owner keeps the largest one open on the file as the
+    /// floor no later budget may size the window under
+    /// ([`crate::piece_store::Buffering`]).
+    ///
     /// And `start_offset` reaches it too, so the read has a head from the
     /// open rather than from its first delivered byte: a reader parked on
     /// the piece it is waiting for is the one the file is being buffered
@@ -121,15 +151,21 @@ impl<H: TorrentHandle> FileHandle<H> {
         name: String,
         stream: Box<dyn FileStreamTrait>,
         engine: Arc<crate::engine::Engine<H>>,
-        file_idx: usize,
-        start_offset: u64,
-        intent: crate::backend::priorities::PlaybackIntent,
+        opening: Opening,
     ) -> Self {
+        let Opening {
+            file_idx,
+            start_offset,
+            intent,
+            lookahead_bytes,
+        } = opening;
         let reader_id = engine.next_reader_id();
-        let reader =
-            engine
-                .retention
-                .reader_on(&file_idx, (file_idx, start_offset), intent.reading());
+        let reader = engine.retention.reader_on(
+            &file_idx,
+            (file_idx, start_offset),
+            intent.reading(),
+            lookahead_bytes,
+        );
         Self {
             size,
             name,

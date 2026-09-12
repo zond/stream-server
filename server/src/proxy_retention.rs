@@ -313,10 +313,21 @@ impl Backing for ProxyBacking {
     /// chunks, so no policy is installed at all: what bounds such an entity
     /// is being slack the moment anything else is played, and the launch
     /// sweep before that.
-    fn policy(domain: &ProxyDomain, budget: u64) -> anyhow::Result<RetentionPolicy> {
+    fn policy(
+        domain: &ProxyDomain,
+        budget: u64,
+        buffering: enginefs::piece_store::Buffering,
+    ) -> anyhow::Result<RetentionPolicy> {
         let chunks = u32::try_from(domain.chunks())
             .context("an entity of more chunks than a retention policy can index")?;
-        RetentionPolicy::new(budget, CHUNK_BYTES, 0..chunks, domain.total, Share::Nothing)
+        RetentionPolicy::new(
+            budget,
+            CHUNK_BYTES,
+            0..chunks,
+            domain.total,
+            Share::Nothing,
+            buffering,
+        )
     }
 
     fn index_of(domain: &ProxyDomain, at: u64) -> Option<u32> {

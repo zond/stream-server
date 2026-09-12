@@ -171,6 +171,56 @@ impl Share {
     }
 }
 
+/// What a reader on this entity has already been promised, and what the
+/// window must therefore be big enough to hold.
+///
+/// **A window smaller than an open stream's lookahead is a disk
+/// permanently over budget.** The lookahead is fixed when the reader opens
+/// (`Engine::try_get_file_with_intent`) and there is no setter for it in
+/// the fork, while the budget is republished every sixty seconds from the
+/// volume's free space and a shrink resizes the policy under readers that
+/// are already open. The stream then fetches past the window forever: the
+/// fork's `drop_pieces` refuses a piece inside `streams.wanted_ranges`, so
+/// the pass does not fetch-and-reclaim in a loop -- it simply never gets
+/// the bytes back, and pays a wasted `drop_pieces` per tick to be refused
+/// again. The window is what yields, because it is the half that can.
+///
+/// The number is what a reader was *granted*, not what its buffer profile
+/// would have liked: the grant is already the smaller of the profile's cap
+/// and the window's forward reach at the open, so this is a no-op at the
+/// moment a reader opens and binds only when the budget moves under it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Buffering {
+    /// The largest lookahead granted to a reader open on this entity, in
+    /// bytes. Zero when none is open, which is every entity nothing has
+    /// read yet.
+    pub lookahead_bytes: u64,
+}
+
+/// The smallest window whose forward reach ([`RetentionPolicy::ahead_of`])
+/// covers `bytes`.
+///
+/// The reach is the window less the tenth of it that sits behind the
+/// playhead, so the floor is stated on the reach and converted here rather
+/// than being applied to the window directly: a floor read as a window
+/// would leave the forward reach a tenth short of the lookahead it exists
+/// to cover, which is the whole of what it is for.
+fn window_for_reach(bytes: u64, piece_length: u64) -> u32 {
+    debug_assert!(piece_length > 0, "a piece length of zero");
+    let pieces = bytes.div_ceil(piece_length.max(1));
+    // `reach(w) = w - w * BEHIND_PERCENT / 100` is monotonic in `w`, and
+    // the closed form is a lower bound that integer division can leave one
+    // piece short, so it is checked rather than trusted.
+    let mut window = pieces
+        .saturating_mul(100)
+        .div_ceil(100 - BEHIND_PERCENT)
+        .min(u64::from(u32::MAX));
+    while window < u64::from(u32::MAX) && window - window * BEHIND_PERCENT / 100 < pieces {
+        window += 1;
+    }
+    window as u32
+}
+
 /// How a budget relates to the file it has to hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shape {
@@ -295,6 +345,7 @@ impl RetentionPolicy {
         pieces: Range<u32>,
         bytes: u64,
         share: Share,
+        buffering: Buffering,
     ) -> anyhow::Result<Self> {
         if piece_length == 0 {
             anyhow::bail!("a piece length of zero");
@@ -316,7 +367,7 @@ impl RetentionPolicy {
         let covered = pieces.start..pieces.start;
         Ok(Self {
             pieces,
-            shape: Self::shape_for(budget_bytes, piece_length, bytes, share),
+            shape: Self::shape_for(budget_bytes, piece_length, bytes, share, buffering),
             committed: BTreeSet::new(),
             covered,
         })
@@ -334,17 +385,29 @@ impl RetentionPolicy {
     /// kind of stream here: a torrent gives half of it to the committed set,
     /// a proxied response gives none, and what is left over is the window in
     /// both cases.
-    fn shape_for(budget_bytes: u64, piece_length: u64, bytes: u64, share: Share) -> Shape {
+    fn shape_for(
+        budget_bytes: u64,
+        piece_length: u64,
+        bytes: u64,
+        share: Share,
+        buffering: Buffering,
+    ) -> Shape {
         if budget_bytes >= bytes {
             return Shape::Whole;
         }
         // `budget_bytes < bytes`, so this cannot exceed the file's own piece
         // count and cannot need more than the u32 piece indices already are.
         let budget = (budget_bytes / piece_length) as u32;
-        let committed = share.committed_of(budget);
+        // The floor, and the committed half is what yields to it -- to
+        // nothing, if that is what it takes. Sharing is generosity; a
+        // window narrower than what an open stream is already fetching is a
+        // disk that can never come back under its budget. See
+        // [`Buffering`].
+        let floor = window_for_reach(buffering.lookahead_bytes, piece_length);
+        let window = (budget - share.committed_of(budget)).max(floor);
         Shape::Split {
-            window: budget - committed,
-            committed,
+            window,
+            committed: budget.saturating_sub(window),
         }
     }
 
@@ -577,6 +640,7 @@ mod tests {
             0..count,
             u64::from(count) * PIECE,
             Share::Half,
+            Buffering::default(),
         )
         .expect("a consistent file")
     }
@@ -589,6 +653,7 @@ mod tests {
             0..count,
             u64::from(count) * PIECE,
             Share::Nothing,
+            Buffering::default(),
         )
         .expect("a consistent file")
     }
@@ -613,6 +678,135 @@ mod tests {
             }
             disk.extend(d.window.clone());
         }
+    }
+
+    /// **The window never reaches less far than a stream already open on
+    /// the file is fetching.**
+    ///
+    /// The grant is cut to the window's forward reach at the open, so the
+    /// floor is a no-op there by construction; what it is for is the
+    /// *next* budget, republished sixty seconds later off a volume that has
+    /// filled. That policy is built without the reader in view and used to
+    /// be free to halve the window under it, leaving the stream fetching
+    /// pieces the pass cannot take back -- the fork refuses to drop a piece
+    /// inside `streams.wanted_ranges` -- so the disk sat over budget for
+    /// the life of the stream and paid a refused `drop_pieces` per tick.
+    #[test]
+    fn the_window_covers_every_profiles_granted_lookahead_at_every_budget() {
+        use crate::backend::priorities::{
+            BufferProfile, PlaybackIntent, librqbit_stream_lookahead_bytes,
+        };
+        const MIB: u64 = 1 << 20;
+        // The field device's piece length, and a file far longer than any
+        // budget here so nothing is clamped against its ends.
+        let piece = 4 * MIB;
+        let pieces = 0..4000;
+        let bytes = 4000 * piece;
+        for profile in BufferProfile::ALL {
+            // The most a playback reader can be granted under this profile.
+            let cap = librqbit_stream_lookahead_bytes(PlaybackIntent::DirectSeek, profile);
+            for budget_pieces in 1..=400u64 {
+                let budget = budget_pieces * piece;
+                let at_open = RetentionPolicy::new(
+                    budget,
+                    piece,
+                    pieces.clone(),
+                    bytes,
+                    Share::Half,
+                    Buffering::default(),
+                )
+                .expect("a consistent file");
+                // What `Engine::try_get_file_with_intent` really hands the
+                // stream: the intent's cap cut to the window's reach.
+                let reach = at_open.ahead_of(2000);
+                let granted = (u64::from(reach.end - reach.start) * piece).min(cap).max(1);
+                // And the policy the next budget publication builds over
+                // it, sixty seconds later on a volume that has filled: a
+                // smaller budget, built without the open reader in view.
+                let later = RetentionPolicy::new(
+                    budget / 2,
+                    piece,
+                    pieces.clone(),
+                    bytes,
+                    Share::Half,
+                    Buffering {
+                        lookahead_bytes: granted,
+                    },
+                )
+                .expect("a consistent file");
+                let reach = later.ahead_of(2000);
+                assert!(
+                    u64::from(reach.end - reach.start) * piece >= granted,
+                    "{profile:?} at {budget_pieces} pieces halved: a reach of {} for a lookahead of {granted}",
+                    u64::from(reach.end - reach.start) * piece
+                );
+            }
+        }
+    }
+
+    /// **The committed half yields to the floor, to nothing if it must.**
+    ///
+    /// Sharing is generosity and playback is the job. A window narrower
+    /// than what an open stream is already fetching cannot come back under
+    /// budget at all, so there is nothing to protect by keeping half the
+    /// budget for a peer.
+    #[test]
+    fn the_committed_half_yields_to_the_windows_floor() {
+        let buffering = Buffering {
+            lookahead_bytes: 9 * PIECE,
+        };
+        let roomy = RetentionPolicy::new(
+            40 * PIECE,
+            PIECE,
+            0..400,
+            400 * PIECE,
+            Share::Half,
+            buffering,
+        )
+        .expect("a consistent file");
+        assert_eq!(
+            roomy.shape(),
+            Shape::Split {
+                window: 20,
+                committed: 20
+            },
+            "a reach of eighteen pieces already covers nine: the floor is a no-op"
+        );
+
+        let mut tight = RetentionPolicy::new(
+            4 * PIECE,
+            PIECE,
+            0..400,
+            400 * PIECE,
+            Share::Half,
+            buffering,
+        )
+        .expect("a consistent file");
+        assert_eq!(
+            tight.shape(),
+            Shape::Split {
+                window: 10,
+                committed: 0
+            },
+            "the window takes the whole budget and then some, and the committed half is nothing"
+        );
+        let reach = tight.ahead_of(100);
+        assert_eq!(
+            u64::from(reach.end - reach.start) * PIECE,
+            9 * PIECE,
+            "and what it reaches is exactly the lookahead the stream was granted"
+        );
+
+        let over = roomy.carry_into(&mut tight);
+        assert!(
+            over.is_empty(),
+            "nothing was committed yet, so nothing is over the new capacity"
+        );
+        let reach = tight.ahead_of(100);
+        assert!(
+            u64::from(reach.end - reach.start) * PIECE >= 9 * PIECE,
+            "and carrying a roomier policy onto it does not shrink the reach"
+        );
     }
 
     #[test]
@@ -702,9 +896,25 @@ mod tests {
     #[test]
     fn the_whole_file_test_is_the_files_own_length_not_a_rounded_one() {
         let bytes = 19 * PIECE + 1;
-        let exact = RetentionPolicy::new(bytes, PIECE, 0..20, bytes, Share::Half).unwrap();
+        let exact = RetentionPolicy::new(
+            bytes,
+            PIECE,
+            0..20,
+            bytes,
+            Share::Half,
+            Buffering::default(),
+        )
+        .unwrap();
         assert_eq!(exact.shape(), Shape::Whole);
-        let short = RetentionPolicy::new(bytes - 1, PIECE, 0..20, bytes, Share::Half).unwrap();
+        let short = RetentionPolicy::new(
+            bytes - 1,
+            PIECE,
+            0..20,
+            bytes,
+            Share::Half,
+            Buffering::default(),
+        )
+        .unwrap();
         assert_ne!(short.shape(), Shape::Whole, "one byte short is not covered");
         // 19 pieces and a byte of budget buys 19 pieces: 10 window, 9 shared.
         assert_eq!(
@@ -746,7 +956,15 @@ mod tests {
 
         // And a budget of less than one whole piece is the same thing: the
         // conversion to pieces floors.
-        let sub = RetentionPolicy::new(PIECE - 1, PIECE, 0..20, 20 * PIECE, Share::Half).unwrap();
+        let sub = RetentionPolicy::new(
+            PIECE - 1,
+            PIECE,
+            0..20,
+            20 * PIECE,
+            Share::Half,
+            Buffering::default(),
+        )
+        .unwrap();
         assert_eq!(
             sub.shape(),
             Shape::Split {
@@ -789,8 +1007,15 @@ mod tests {
 
         // A file that does not start at piece zero is measured in its own
         // pieces.
-        let later = RetentionPolicy::new(2 * PIECE, PIECE, 4..12, 8 * PIECE, Share::Half)
-            .expect("a consistent file");
+        let later = RetentionPolicy::new(
+            2 * PIECE,
+            PIECE,
+            4..12,
+            8 * PIECE,
+            Share::Half,
+            Buffering::default(),
+        )
+        .expect("a consistent file");
         assert_eq!(later.ahead_of(4), 4..5);
         assert_eq!(later.ahead_of(11), 11..12);
         assert_eq!(
@@ -799,8 +1024,15 @@ mod tests {
             "a playhead before the file reads as its first piece"
         );
 
-        let whole = RetentionPolicy::new(20 * PIECE, PIECE, 0..20, 20 * PIECE, Share::Half)
-            .expect("a consistent file");
+        let whole = RetentionPolicy::new(
+            20 * PIECE,
+            PIECE,
+            0..20,
+            20 * PIECE,
+            Share::Half,
+            Buffering::default(),
+        )
+        .expect("a consistent file");
         assert_eq!(whole.shape(), Shape::Whole);
         assert_eq!(whole.ahead_of(5), 5..20);
         assert_eq!(
@@ -868,7 +1100,15 @@ mod tests {
     #[test]
     fn a_file_of_one_piece_is_the_whole_window_and_nothing_else() {
         // Not covered by the budget, so it splits, and the split is degenerate.
-        let mut p = RetentionPolicy::new(PIECE / 2, PIECE, 7..8, PIECE, Share::Half).unwrap();
+        let mut p = RetentionPolicy::new(
+            PIECE / 2,
+            PIECE,
+            7..8,
+            PIECE,
+            Share::Half,
+            Buffering::default(),
+        )
+        .unwrap();
         assert_eq!(
             p.shape(),
             Shape::Split {
@@ -883,7 +1123,9 @@ mod tests {
         assert!(d.reclaim.is_empty() && d.committed.is_empty());
 
         // Covered by it, and the one piece is shared.
-        let mut p = RetentionPolicy::new(PIECE, PIECE, 7..8, PIECE, Share::Half).unwrap();
+        let mut p =
+            RetentionPolicy::new(PIECE, PIECE, 7..8, PIECE, Share::Half, Buffering::default())
+                .unwrap();
         assert_eq!(p.shape(), Shape::Whole);
         let d = p.advance(7, &held([7]));
         assert_eq!(d.committed, vec![7]);
@@ -1197,8 +1439,15 @@ mod tests {
     /// somebody else's decision and must not be reclaimed by this one.
     #[test]
     fn pieces_outside_this_files_range_are_left_alone() {
-        let mut p = RetentionPolicy::new(10 * PIECE, PIECE, 100..200, 100 * PIECE, Share::Half)
-            .expect("consistent");
+        let mut p = RetentionPolicy::new(
+            10 * PIECE,
+            PIECE,
+            100..200,
+            100 * PIECE,
+            Share::Half,
+            Buffering::default(),
+        )
+        .expect("consistent");
         assert_eq!(
             p.shape(),
             Shape::Split {
@@ -1254,19 +1503,28 @@ mod tests {
     #[test]
     fn a_file_whose_numbers_do_not_agree_is_refused() {
         // 20 pieces of 1000 hold between 19001 and 20000 bytes.
-        assert!(RetentionPolicy::new(0, PIECE, 0..20, 20_000, Share::Half).is_ok());
-        assert!(RetentionPolicy::new(0, PIECE, 0..20, 19_001, Share::Half).is_ok());
-        let err = RetentionPolicy::new(0, PIECE, 0..20, 19_000, Share::Half)
+        assert!(
+            RetentionPolicy::new(0, PIECE, 0..20, 20_000, Share::Half, Buffering::default())
+                .is_ok()
+        );
+        assert!(
+            RetentionPolicy::new(0, PIECE, 0..20, 19_001, Share::Half, Buffering::default())
+                .is_ok()
+        );
+        let err = RetentionPolicy::new(0, PIECE, 0..20, 19_000, Share::Half, Buffering::default())
             .unwrap_err()
             .to_string();
         assert!(err.contains("between 19001 and 20000"), "{err}");
-        assert!(RetentionPolicy::new(0, PIECE, 0..20, 20_001, Share::Half).is_err());
         assert!(
-            RetentionPolicy::new(0, 0, 0..20, 20_000, Share::Half).is_err(),
+            RetentionPolicy::new(0, PIECE, 0..20, 20_001, Share::Half, Buffering::default())
+                .is_err()
+        );
+        assert!(
+            RetentionPolicy::new(0, 0, 0..20, 20_000, Share::Half, Buffering::default()).is_err(),
             "zero piece length"
         );
         assert!(
-            RetentionPolicy::new(0, PIECE, 5..5, 0, Share::Half).is_err(),
+            RetentionPolicy::new(0, PIECE, 5..5, 0, Share::Half, Buffering::default()).is_err(),
             "no pieces"
         );
     }
@@ -1279,8 +1537,15 @@ mod tests {
         let count = 64u32;
         let bytes = u64::from(count) * PIECE;
         for budget_bytes in (0..=bytes + 2 * PIECE).step_by(PIECE as usize / 8) {
-            let mut p =
-                RetentionPolicy::new(budget_bytes, PIECE, 0..count, bytes, Share::Half).unwrap();
+            let mut p = RetentionPolicy::new(
+                budget_bytes,
+                PIECE,
+                0..count,
+                bytes,
+                Share::Half,
+                Buffering::default(),
+            )
+            .unwrap();
             match p.shape() {
                 Shape::Whole => assert!(budget_bytes >= bytes),
                 Shape::Split { window, committed } => {

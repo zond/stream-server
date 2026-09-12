@@ -434,13 +434,18 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         domain.span.pieces.clone()
     }
 
-    fn policy(domain: &FileDomain, budget: u64) -> anyhow::Result<RetentionPolicy> {
+    fn policy(
+        domain: &FileDomain,
+        budget: u64,
+        buffering: crate::piece_store::Buffering,
+    ) -> anyhow::Result<RetentionPolicy> {
         RetentionPolicy::new(
             budget,
             domain.piece_length,
             domain.span.pieces.clone(),
             domain.span.bytes,
             Self::SHARE,
+            buffering,
         )
     }
 
@@ -1982,9 +1987,12 @@ impl<H: TorrentHandle> Engine<H> {
             name,
             reader,
             self.clone(),
-            file_idx,
-            start_offset,
-            intent,
+            crate::files::Opening {
+                file_idx,
+                start_offset,
+                intent,
+                lookahead_bytes,
+            },
         ))
     }
 }
