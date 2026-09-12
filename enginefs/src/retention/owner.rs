@@ -573,6 +573,30 @@ struct State<B: Backing> {
     /// asked has ended, and what [`Door::window_now`] draws the window
     /// round.
     last_position: Option<B::Position>,
+    /// What the player said about itself, and when it said it.
+    ///
+    /// Everything else here infers the playhead from the byte ranges the
+    /// player asked for, and a byte range does not say what it is for. Six
+    /// weeks of this module are that inference: whether an open-ended range
+    /// near the end of a file is a seek or a container index, whether a
+    /// reader parked twenty gigabytes away crawling an index is "playing",
+    /// which of two live reads is the viewer. Every one of those is a guess
+    /// at a fact the player holds exactly, and each wrong guess moves the
+    /// window off the film and takes the pieces the viewer is waiting for
+    /// with it.
+    ///
+    /// So the player is asked instead. It is a hint and never a
+    /// requirement: it goes stale ([`TOLD_FRESH`]) if whatever was
+    /// reporting stops, and everything below still answers for a client
+    /// that never reports at all -- another player on the network, the
+    /// proxy, a download.
+    told: Option<Told<B>>,
+    /// The film's bitrate as the player's own numbers give it, smoothed --
+    /// bytes of file over *seconds of film*, which is the definition and
+    /// needs no inference at all. Preferred over [`Self::rate`], which
+    /// measures the same thing through delivery and has to guess at every
+    /// pause, stall and reconnect to do it.
+    told_rate: Option<u64>,
     /// Whether this entity's range is held back from what we announce with
     /// nothing installed to put it back.
     ///
@@ -835,6 +859,65 @@ const RATE_ANCHOR_STALE: std::time::Duration = std::time::Duration::from_secs(8)
 /// probe holding the stream are all refused -- they re-anchor instead, and
 /// the last rate measured stands until playback says otherwise.
 const RATE_SAMPLE_SPAN_MAX: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// Bytes of file per second of film between two reports, or `None` where
+/// the pair says nothing about a bitrate.
+///
+/// Both ends have to have been playing: a report either side of a pause,
+/// a stall or a buffering wait spans wall-clock the film did not. Both the
+/// file offset and the film position have to have moved forwards, and the
+/// film by [`TOLD_SAMPLE_FILM_MIN`], which rejects a seek backwards, a
+/// player sitting still, and the jitter between two reports a few
+/// milliseconds apart. A seek *forwards* needs no rejecting: it moves the
+/// two together and the quotient is the same film's bitrate, measured over
+/// a longer piece of it.
+fn told_bitrate(
+    was: (u64, std::time::Duration, bool),
+    now: (u64, std::time::Duration, bool),
+) -> Option<u64> {
+    let ((was_at, was_film, was_playing), (at, film, playing)) = (was, now);
+    if !was_playing || !playing {
+        return None;
+    }
+    let film = film.checked_sub(was_film)?;
+    if film < TOLD_SAMPLE_FILM_MIN {
+        return None;
+    }
+    let bytes = at.checked_sub(was_at)?;
+    if bytes == 0 {
+        return None;
+    }
+    Some((bytes as f64 / film.as_secs_f64()) as u64)
+}
+
+/// What a player last said about where it is in its own film.
+///
+/// `at` is the position in the *file* -- mpv's `stream-pos`, the demuxer's
+/// byte offset -- so nothing has to convert a time into a byte and be
+/// wrong about it on a variable-bitrate film. `film` is the position in
+/// the *picture* -- `time-pos` -- which is what makes a bitrate out of the
+/// two: bytes of file over seconds of film is what a window measured in
+/// seconds needs, and it is immune to how fast either end delivered.
+#[derive(Debug)]
+struct Told<B: Backing> {
+    at: B::Position,
+    film: std::time::Duration,
+    playing: bool,
+    when: std::time::Instant,
+}
+
+/// How long the player's own word stands after it stops arriving.
+///
+/// The app reports about once a second while a film is open. Going quiet
+/// means it was backgrounded, killed, or handed playback to a receiver, and
+/// after that the last thing it said is a claim about the past. Long enough
+/// to ride out a slow tick or a garbage collection, short enough that a
+/// dead reporter does not pin the window where the viewer used to be.
+const TOLD_FRESH: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The least film a told sample may span. Below this the quotient is
+/// mostly the reporting jitter.
+const TOLD_SAMPLE_FILM_MIN: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl DeliveryRate {
     /// A byte really went out, at `offset`, at `now`, on a read granted
@@ -1111,6 +1194,8 @@ impl<B: Backing> Retention<B> {
                         windows: Vec::new(),
                         readers: HashMap::new(),
                         last_position: None,
+                        told: None,
+                        told_rate: None,
                         // Assumed held back until a clear says otherwise: an
                         // entity that was forgotten took the record with it,
                         // and the backend's mask outlives both the record and
@@ -1216,6 +1301,78 @@ impl<B: Backing> Retention<B> {
         };
         let mut state = entity.state.lock();
         state.last_position = Some(at);
+    }
+
+    /// **The player's own account of where it is**: `at` in the file (its
+    /// demuxer's byte offset), `film` in the picture, and whether it is
+    /// playing rather than paused or stalled.
+    ///
+    /// This is the fact every other path here infers, and infers from byte
+    /// ranges that do not carry it. A player asks for the container index
+    /// with the same kind of request it asks for a seek with, and keeps a
+    /// second reader crawling that index while it plays; nothing in a
+    /// `Range` header separates those from the viewer. Told directly, the
+    /// window goes where the film is being watched and the guessing stops
+    /// mattering -- it stays underneath, for a client that says nothing.
+    ///
+    /// It also gives the time caps their number without measuring it:
+    /// bytes of file over seconds of film is the bitrate by definition, so
+    /// a pause, a stall, a reconnect and a burst are all invisible to it.
+    /// A sample is taken only between two reports that were both playing
+    /// and that moved forwards in both, which is the whole of what makes
+    /// one honest -- a seek moves `film` without playing through it, and
+    /// one end of a pause is not a rate.
+    ///
+    /// L2 only, like [`Self::note_position`]: no turn, no install, and a
+    /// key with no entity is nothing to remember.
+    pub fn note_playhead(
+        &self,
+        key: &B::Key,
+        at: B::Position,
+        film: std::time::Duration,
+        playing: bool,
+    ) {
+        self.note_playhead_at(key, at, film, playing, std::time::Instant::now());
+    }
+
+    /// [`Self::note_playhead`] with the clock handed in, so a test can put
+    /// two reports a measurable distance apart without waiting.
+    pub fn note_playhead_at(
+        &self,
+        key: &B::Key,
+        at: B::Position,
+        film: std::time::Duration,
+        playing: bool,
+        now: std::time::Instant,
+    ) {
+        let Some(entity) = self.lookup(key) else {
+            return;
+        };
+        let mut state = entity.state.lock();
+        if let Some(sample) = state.told.as_ref().and_then(|was| {
+            told_bitrate(
+                (B::offset_of(&state.domain, was.at), was.film, was.playing),
+                (B::offset_of(&state.domain, at), film, playing),
+            )
+        }) {
+            state.told_rate = Some(match state.told_rate {
+                Some(smoothed) => {
+                    smoothed
+                        .saturating_mul(10 - RATE_SMOOTHING_TENTHS)
+                        .saturating_add(sample.saturating_mul(RATE_SMOOTHING_TENTHS))
+                        / 10
+                }
+                None => sample,
+            });
+        }
+        // Playing or not, where it is is where the window belongs: a film
+        // paused at fifty minutes is watched from fifty minutes.
+        state.told = Some(Told {
+            at,
+            film,
+            playing,
+            when: now,
+        });
     }
 
     /// Install (or keep) the policy for `key` about to be streamed, and hold
@@ -2356,7 +2513,7 @@ impl<B: Backing> State<B> {
         // the swarm gives and says nothing about how fast the film is being
         // watched. It is the entity's and not any one reader's, because no
         // reader outlives a reconnect; see [`Self::rate`].
-        asked.bytes_per_second = self.rate.bytes_per_second;
+        asked.bytes_per_second = self.told_rate.or(self.rate.bytes_per_second);
         asked
     }
 
@@ -2400,9 +2557,18 @@ impl<B: Backing> State<B> {
         {
             return Some(head);
         }
-        self.playing_head()
+        self.told_head()
+            .or_else(|| self.playing_head())
             .or(self.last_position)
             .or_else(|| self.live_head())
+    }
+
+    /// Where the player says it is, while it is still saying it.
+    fn told_head(&self) -> Option<B::Position> {
+        self.told
+            .as_ref()
+            .filter(|told| told.when.elapsed() < TOLD_FRESH)
+            .map(|told| told.at)
     }
 
     /// The newest live [`Reading::Playback`] read's head, or `None` when
@@ -6001,6 +6167,208 @@ mod tests {
         assert!(
             backing.on_disk().contains(&5) && backing.on_disk().contains(&6),
             "the bytes the viewer would un-pause into went"
+        );
+    }
+
+    /// **The player's own playhead outranks a read parked at the end of
+    /// the file**, which is the field failure of 2026-09-12 in one test.
+    ///
+    /// mpv keeps a second reader on the container index and reopens it
+    /// about once a second. It arrives as an open-ended range, so the
+    /// server is told nothing that separates it from a viewer seeking into
+    /// the tail, and it is the newest playing read every time it opens. The
+    /// window followed it twenty gigabytes from the film, the pieces the
+    /// viewer was blocked on were dropped and their requests cancelled, and
+    /// single pieces took fifty-one seconds to arrive off a swarm that was
+    /// delivering ten megabytes a second.
+    ///
+    /// No geometry settles that. The player knows.
+    ///
+    /// What the crawler keeps is the point of the split: it is a live read
+    /// and the pieces it is reading out of must not be deleted under it, so
+    /// it gets a window of its own -- two pieces, where it is. What it no
+    /// longer gets is the *film's* window, which is the thing worth
+    /// gigabytes and the thing it was taking.
+    #[tokio::test]
+    async fn the_players_own_playhead_outranks_a_read_parked_at_the_end_of_the_file() {
+        let (_backing, owner, _budget) = torrent();
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        let crawler = owner
+            .reader_on(&0, (0, 7 * PIECE), Reading::Playback, Buffering::default())
+            .expect("the entity the install made");
+        assert!(crawler.note((0, 7 * PIECE)).is_none());
+        owner.note_playhead(
+            &0,
+            (0, 2 * PIECE),
+            std::time::Duration::from_secs(120),
+            true,
+        );
+
+        let claim = owner.turn(&0).await.expect("the turn");
+        let outcome = owner
+            .pass(&0, &(), claim, Mode::Live)
+            .await
+            .concluded
+            .expect("a pass");
+        assert_eq!(
+            outcome.windows,
+            vec![2..4, 6..8],
+            "the film's window is where the player says it is, and the index \
+             read keeps only the pieces it is reading out of"
+        );
+        drop(crawler);
+    }
+
+    /// **A playhead nobody is reporting any more stops being believed.**
+    ///
+    /// The player's word is a hint, not a requirement: the app can be
+    /// backgrounded or killed, playback can be handed to a receiver, and
+    /// the client may be something that never reports at all. What it said
+    /// before any of those is a claim about the past, and the reads --
+    /// which are live by definition -- answer again.
+    #[tokio::test]
+    async fn a_playhead_nobody_is_reporting_any_more_gives_way_to_the_reads() {
+        let (_backing, owner, _budget) = torrent();
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        let reader = owner
+            .reader_on(&0, (0, 5 * PIECE), Reading::Playback, Buffering::default())
+            .expect("the entity the install made");
+        assert!(reader.note((0, 5 * PIECE)).is_none());
+        let long_ago = std::time::Instant::now()
+            .checked_sub(TOLD_FRESH + std::time::Duration::from_secs(1))
+            .expect("a clock with some history");
+        owner.note_playhead_at(
+            &0,
+            (0, 2 * PIECE),
+            std::time::Duration::from_secs(120),
+            true,
+            long_ago,
+        );
+
+        let claim = owner.turn(&0).await.expect("the turn");
+        let outcome = owner
+            .pass(&0, &(), claim, Mode::Live)
+            .await
+            .concluded
+            .expect("a pass");
+        assert_eq!(
+            outcome.windows,
+            vec![5..7],
+            "nothing is reporting, so the read is the only live word on it"
+        );
+        drop(reader);
+    }
+
+    /// **The time caps are sized from the player's numbers, over the
+    /// server's own measurement of the same thing.**
+    ///
+    /// Both answer "how many bytes is a second of this film". The server's
+    /// answer is inferred from what it managed to deliver and when, so it
+    /// reads the socket during a burst and a stall during a wait, and every
+    /// heuristic in [`DeliveryRate`] exists to tell those apart. The
+    /// player's answer is the definition -- its own byte offset over its
+    /// own clock -- so where there is one, it is the one.
+    #[tokio::test]
+    async fn the_time_caps_prefer_the_players_bitrate_to_the_servers_guess() {
+        let (_backing, owner, budget) = torrent();
+        budget.set(Some(6 * PIECE));
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        let asks = Buffering {
+            window_seconds: Some(10),
+            committed_seconds: Some(10),
+            ..Buffering::default()
+        };
+        let reader = owner
+            .reader_on(&0, (0, 0), Reading::Playback, asks)
+            .expect("the entity the install made");
+        let shape = |owner: &Arc<Retention<Torrent>>| {
+            owner
+                .holding(&0)
+                .and_then(|holding| holding.installed)
+                .map(|installed| installed.shape)
+        };
+        // What the server can see: a burst, thirty pieces in three seconds.
+        // Ten seconds of that is more than the whole file, so no cap binds.
+        let start = std::time::Instant::now();
+        reader.note_at((0, 0), start);
+        reader.note_at((0, 30 * PIECE), start + std::time::Duration::from_secs(3));
+        let claim = owner.turn(&0).await.expect("the turn");
+        owner.pass(&0, &(), claim, Mode::Live).await;
+        assert_eq!(
+            shape(&owner),
+            Some(Shape::Split {
+                window: 3,
+                committed: 3
+            }),
+            "the delivery burst caps nothing: half the budget each"
+        );
+
+        // What the player says: ten seconds of film, one piece of file.
+        owner.note_playhead_at(&0, (0, 0), std::time::Duration::ZERO, true, start);
+        owner.note_playhead_at(
+            &0,
+            (0, PIECE),
+            std::time::Duration::from_secs(10),
+            true,
+            start + std::time::Duration::from_secs(10),
+        );
+        let claim = owner.turn(&0).await.expect("the turn");
+        owner.pass(&0, &(), claim, Mode::Live).await;
+        assert_eq!(
+            shape(&owner),
+            Some(Shape::Split {
+                window: 5,
+                committed: 1
+            }),
+            "a hundred bytes of film a second, and ten seconds of it is the cap"
+        );
+        drop(reader);
+    }
+
+    /// **Bytes of file over seconds of film, and what is not that.**
+    #[test]
+    fn a_told_bitrate_is_bytes_of_file_over_seconds_of_film() {
+        let film = std::time::Duration::from_secs;
+        assert_eq!(
+            told_bitrate((0, film(100), true), (34_000_000, film(110), true)),
+            Some(3_400_000),
+            "ten seconds of film, thirty-four megabytes of file"
+        );
+        // A seek forwards moves both and is the same film over more of it.
+        assert_eq!(
+            told_bitrate((0, film(100), true), (1_020_000_000, film(400), true)),
+            Some(3_400_000),
+            "five minutes of film, a gigabyte of file"
+        );
+        // Either end not playing spans wall-clock the film did not.
+        assert_eq!(
+            told_bitrate((0, film(100), false), (34_000_000, film(110), true)),
+            None
+        );
+        assert_eq!(
+            told_bitrate((0, film(100), true), (34_000_000, film(110), false)),
+            None
+        );
+        // A seek back, a player sitting still, and two reports a moment
+        // apart are all of them nothing.
+        assert_eq!(
+            told_bitrate((34_000_000, film(110), true), (0, film(100), true)),
+            None
+        );
+        assert_eq!(
+            told_bitrate((0, film(100), true), (0, film(110), true)),
+            None
+        );
+        assert_eq!(
+            told_bitrate(
+                (0, film(100), true),
+                (
+                    34_000_000,
+                    film(100) + std::time::Duration::from_millis(30),
+                    true
+                )
+            ),
+            None
         );
     }
 
