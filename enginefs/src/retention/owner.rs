@@ -836,6 +836,22 @@ struct Told<B: Backing> {
 /// reads that the window keeps while they are open and no longer.
 const STRUCTURAL_PIECES: usize = 8;
 
+/// How many pieces to want after each one a stream is still waiting for,
+/// before the configured window takes over.
+///
+/// It exists to keep peers busy, and the number it has to beat is one:
+/// a want-set of a single piece is a download from a single peer, because
+/// librqbit reserves a piece to one peer at a time. Sixteen gives a dozen
+/// or more of them something to reserve -- and, as much to the point, a
+/// measured speed, without which the steal that would rescue a slow piece
+/// has nothing to compare.
+///
+/// Sixty-four megabytes at a 4 MiB piece, of which a first frame needs
+/// two or three. That is the price of the swarm being busy, it is paid
+/// once per stream, and it buys back the ninety seconds the field spent
+/// on piece 0.
+const STARTUP_RUN: u32 = 16;
+
 /// How far a reported offset may sit from where the film says it is, as a
 /// fraction of the whole.
 ///
@@ -2070,37 +2086,46 @@ impl<B: Backing> Retention<B> {
                     keep.push(run);
                 }
             }
-            // **What a read is blocked on is wanted too, and never
-            // instead.**
+            // **While the stream is still assembling itself, want a small
+            // window rather than the configured one.**
             //
-            // A piece a parked read is waiting for has to be in the
-            // want-set or nothing orders it, and that is what this is for.
-            // It was briefly the *whole* want-set -- order the piece the
-            // player is stuck on and nothing else -- and that made start-up
-            // five times worse, for a reason worth writing down: librqbit
-            // reserves a piece to exactly one peer (`PieceTracker::inflight`),
-            // and a second peer holding it can only take over by stealing,
-            // which wants a 3x or 10x speed advantage it has no way to
-            // demonstrate while it has nothing else to download. So a
-            // want-set of one piece is a download from one peer: measured in
-            // the field at 117 kB/s against 3.1 MB/s a minute later, with
-            // the same thirty seeders connected.
+            // What a player needs before it can show a frame is a handful
+            // of pieces -- the header, the container's index, the seek
+            // target -- and they have to be *in* the want-set or nothing
+            // orders them. What they must not be is drowned: the configured
+            // window is two hundred pieces at "large", and a swarm spread
+            // over two hundred pieces takes its time over the three.
             //
-            // Ordering is not selection. The piece under a parked read is
-            // already fetched first -- that is what the stream's own
-            // lookahead priority does -- and what the want-set decides is
-            // merely whether the other twenty-nine peers have anything to
-            // do while it happens.
-            let blocked = promised
+            // The answer is not to want only those three, which was tried
+            // and was worse. librqbit reserves a piece to exactly one peer
+            // (`PieceTracker::inflight`), and a second peer holding it can
+            // only take over by stealing, which wants a 3x or 10x speed
+            // advantage it cannot demonstrate with nothing else to
+            // download. A want-set of one piece is therefore a download
+            // from one peer: 117 kB/s in the field, against 3.1 MB/s over
+            // the same swarm a minute later.
+            //
+            // So: everything still missing, each with a short run after it.
+            // Enough pieces that a dozen peers have work and their speeds
+            // are measured, few enough that the swarm's attention stays on
+            // what the first frame needs. The full window returns the
+            // moment nothing is outstanding, which needs no decision about
+            // when start-up ended -- a promise is cleared by the byte that
+            // unparks the read that made it.
+            // Promises and not the structural set: a promise is made by a
+            // *parked* read, so it means "something is waiting for this
+            // now", where a structural piece is only "this stream needed
+            // it once". Wanting the latter pulls a run into a film nobody
+            // is watching, which is what
+            // `a_tail_probe_over_a_paused_film_fetches_nothing_back`
+            // measures and refuses.
+            let outstanding: Vec<Range<u32>> = promised
                 .iter()
-                .filter(|range| (range.start..range.end).any(|piece| !held.contains(&piece)));
-            for range in blocked {
-                if !want
-                    .iter()
-                    .any(|window| window.start <= range.start && window.end >= range.end)
-                {
-                    want.push(range.clone());
-                }
+                .filter(|range| (range.start..range.end).any(|piece| !held.contains(&piece)))
+                .map(|range| range.start..range.end.saturating_add(STARTUP_RUN))
+                .collect();
+            if !outstanding.is_empty() {
+                want = outstanding;
             }
             // What this pass has decided to take is what it will never put
             // back into what we announce; see [`State::doomed`]. Written
@@ -6071,17 +6096,16 @@ mod tests {
         drop(reader);
     }
 
-    /// **A read parked on a piece the disk does not have gets it ordered**
-    /// -- alongside the window, never instead of it.
+    /// **While a read is parked, the want-set is a small window round what
+    /// it is waiting for** -- not the configured one, and not one piece.
     ///
-    /// Both halves matter. Without the piece nothing orders what the player
-    /// is actually stuck on. Without the window there is one piece in the
-    /// want-set, librqbit reserves a piece to exactly one peer, and the
-    /// download runs at that peer's speed while every other seeder idles:
-    /// 117 kB/s in the field where the same swarm gave 3.1 MB/s a minute
-    /// later.
+    /// Not the configured one, because a swarm spread over two hundred
+    /// pieces takes its time over the three a first frame needs. Not one
+    /// piece, because librqbit reserves a piece to exactly one peer, so a
+    /// want-set of one is a download from one: 117 kB/s in the field where
+    /// the same swarm gave 3.1 MB/s a minute later.
     #[tokio::test]
-    async fn a_read_parked_on_a_piece_the_disk_lacks_gets_it_ordered() {
+    async fn a_parked_read_gets_a_small_window_round_what_it_waits_for() {
         let (backing, owner, _budget) = torrent();
         // A disk without piece 6, so the promise below is unmet.
         backing.held.lock().remove(&6);
@@ -6095,14 +6119,15 @@ mod tests {
         owner.pass(&0, &(), claim, Mode::Live).await;
         assert_eq!(
             *backing.wanted.lock(),
-            vec![vec![0..2, 6..7]],
-            "the window the swarm can spread over, and the piece the read is \
-             stuck on, which the stream's own lookahead already fetches first"
+            vec![vec![6..23]],
+            "the piece the read is stuck on and a short run after it -- \
+             enough peers busy to matter, and not the whole configured \
+             window competing with it"
         );
         drop(reader);
     }
 
-    /// **And the windows are wanted again the moment it arrives.**
+    /// **And the configured window is wanted again the moment it arrives.**
     ///
     /// The narrowing ends by itself, which is why it can be as blunt as it
     /// is: a promise is made by a parked read and cleared by the byte that
