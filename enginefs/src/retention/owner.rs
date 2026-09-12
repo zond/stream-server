@@ -5995,6 +5995,61 @@ mod tests {
         drop(crawler);
     }
 
+    /// **The prediction chooses which read to believe; the read says
+    /// where.**
+    ///
+    /// Where in the picture converts to a byte offset at the film's
+    /// *average* rate, so on a variable-bitrate encode the offset drifts
+    /// from the true one by however much the film so far has run above or
+    /// below that average -- cumulatively, which a wider window does not
+    /// shrink. A reader's own position carries no such error, and cannot
+    /// say on its own whether it is the viewer: the read parked at the end
+    /// of the file is a read too.
+    ///
+    /// So each answers the question it is good at. Here the viewer is two
+    /// pieces past where the average rate puts it, inside
+    /// [`READ_VICINITY`], and the window goes where the viewer is rather
+    /// than where the arithmetic guessed -- while the read at the far end,
+    /// fifty-nine pieces out, moves nothing.
+    #[tokio::test]
+    async fn a_read_beside_the_prediction_corrects_it_and_one_at_the_end_does_not() {
+        let backing = Torrent::new([domain(0, 0..80)]);
+        backing.holds(0..80);
+        let budget = Arc::new(RetentionBudget::default());
+        budget.set(Some(4 * PIECE));
+        let owner = Retention::new(backing.clone(), budget.clone());
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        let viewer = owner
+            .reader_on(&0, (0, 22 * PIECE), Reading::Playback, Buffering::default())
+            .expect("the entity the install made");
+        assert!(viewer.note((0, 22 * PIECE)).is_none());
+        let crawler = owner
+            .reader_on(&0, (0, 79 * PIECE), Reading::Playback, Buffering::default())
+            .expect("the entity the install made");
+        assert!(crawler.note((0, 79 * PIECE)).is_none());
+
+        // Eighty pieces of a thousand bytes over eight hundred seconds: a
+        // hundred bytes a second, so two hundred seconds of film is piece
+        // 20, and the viewer is reading piece 22.
+        owner.note_duration(&0, std::time::Duration::from_secs(800));
+        owner.note_playhead(&0, std::time::Duration::from_secs(200), None);
+
+        let claim = owner.turn(&0).await.expect("the turn");
+        let outcome = owner
+            .pass(&0, &(), claim, Mode::Live)
+            .await
+            .concluded
+            .expect("a pass");
+        assert_eq!(
+            outcome.windows,
+            vec![22..24, 78..80],
+            "the window sits on the read beside the prediction, not on the \
+             prediction, and not on the read at the end of the file"
+        );
+        drop(viewer);
+        drop(crawler);
+    }
+
     /// **A film's length is not a playhead and does not go stale with one.**
     ///
     /// It is what a cast can state and nothing else: the receiver does the
