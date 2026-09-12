@@ -54,17 +54,17 @@ jobs:
       # No apt installs here on purpose: the pure-Rust build must succeed
       # on a machine with no libclang, fontconfig/gtk headers, or system libs.
       #
-      # The tree currently carries pre-existing non-correctness clippy
-      # warnings (e.g. collapsible_if in enginefs), so gate hard only on the
-      # correctness and suspicious groups; everything else stays a warning.
+      # No lint flags here on purpose: the policy lives in
+      # `[workspace.lints]` and is inherited by every crate, so a local
+      # `cargo clippy` gates exactly as this does and a new crate cannot opt
+      # out by saying nothing. This used to deny only the correctness and
+      # suspicious groups, which left `unused` as output nobody had to read.
       #
       # The bare invocation lints the workspace default-members, which is
       # exactly the pure-Rust set (identical to `members`). `--all-features`
       # so every optional feature is compiled somewhere.
       - name: Clippy
-        run: >-
-          cargo clippy --all-targets --all-features --
-          -D clippy::correctness -D clippy::suspicious -W clippy::all
+        run: cargo clippy --all-targets --all-features
 
       - name: Test
         run: cargo test

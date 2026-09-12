@@ -19,3 +19,23 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# **Warnings are errors, here and not only in CI.**
+#
+# The tree was clean at `-D warnings` long before this said so, and the gap
+# between that and what CI actually gated on was real: the Clippy step denied
+# only the correctness and suspicious groups, so an unused field or an
+# unreachable branch was a line of output nobody had to read. A dead field is
+# how you find out that a thing you thought was load-bearing is not -- the
+# rate measurement deleted in a5caa82 announced itself exactly that way -- and
+# that signal is worth having at the moment it appears rather than at review.
+#
+# Deliberately at the workspace level and inherited, so a new crate cannot
+# quietly opt out by saying nothing.
+[workspace.lints.rust]
+warnings = "deny"
+
+[workspace.lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+all = { level = "deny", priority = -1 }

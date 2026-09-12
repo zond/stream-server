@@ -85,3 +85,6 @@ tokio = { version = "1.42.0", features = ["test-util"] }
 # directly -- and this crate does not build for it.
 [target.'cfg(not(target_os = "android"))'.dependencies]
 rustls-native-certs = "0.8"
+
+[lints]
+workspace = true
