@@ -7,6 +7,24 @@ pub const MAX_STARTUP_WINDOW_BYTES: u64 = 4 * 1024 * 1024;
 pub const MAX_SEEK_HOT_WINDOW_BYTES: u64 = 128 * 1024 * 1024;
 pub const MAX_WARM_WINDOW_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_CONTAINER_METADATA_WINDOW_BYTES: u64 = 16 * 1024 * 1024;
+
+/// A container's index is a fraction of the container, so the window that
+/// recognises one has to scale with the file rather than sit at a constant.
+///
+/// The field film of 2026-09-12 is 23 GB with a 10.7 MB `moov`, and mpv
+/// does not read that once and stop: it keeps a second reader crawling the
+/// region for as long as the film is open, reopening about once a second.
+/// In that log the crawler sat 25.96 MB from the end -- past the 16 MiB
+/// constant, so it arrived as `DirectSeek`, became the newest playing read
+/// every time it reopened, and took the retention window 4,700 pieces away
+/// from the viewer: `playhead=5559` with the reader at piece 806.
+///
+/// A five-hundred-and-twelfth is 45 MB of that film, and leaves the
+/// constant in charge of anything under 8 GB. What it costs is a viewer
+/// seeking to within thirteen seconds of the end of a 23 GB film being read
+/// as an index fetch -- which costs them the retention window over the
+/// seconds they have left, and nothing else.
+const CONTAINER_METADATA_FRACTION: u64 = 512;
 pub const MAX_DOWNLOAD_RANGE_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
 pub const SMALL_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -24,6 +42,12 @@ pub const COMMITTED_SECONDS: u64 = 90;
 
 /// Start treating reads as "container metadata" when they fall in the last 10MB
 /// or the last 5% of the file, whichever starts earlier.
+/// How much of the end of a file an index read may cover; see
+/// [`CONTAINER_METADATA_FRACTION`].
+pub fn container_metadata_window(file_size: u64) -> u64 {
+    MAX_CONTAINER_METADATA_WINDOW_BYTES.max(file_size / CONTAINER_METADATA_FRACTION)
+}
+
 pub fn container_metadata_start(file_size: u64) -> u64 {
     if file_size == 0 {
         0
@@ -69,7 +93,7 @@ pub fn is_container_metadata_request(start: u64, requested_len: u64, file_size: 
     start > 0
         && file_size > 0
         && requested_len > 0
-        && requested_len <= MAX_CONTAINER_METADATA_WINDOW_BYTES
+        && requested_len <= container_metadata_window(file_size)
         && start >= container_metadata_start(file_size)
 }
 
@@ -387,9 +411,39 @@ mod tests {
         assert!(!open_ended(container_metadata_start(file_size)));
         // libmpv reading the container index, which is the shape the field
         // log caught being called a seek.
-        assert!(open_ended(file_size - MAX_CONTAINER_METADATA_WINDOW_BYTES));
-        assert!(!open_ended(
-            file_size - MAX_CONTAINER_METADATA_WINDOW_BYTES - 1
+        // The window scales with the file: twenty mebibytes of a 10 GiB
+        // one, not the sixteen the constant alone would allow -- an index
+        // is a fraction of its container, and mpv's crawler on the field's
+        // 23 GB film sat 25.96 MB out, past any constant.
+        let window = container_metadata_window(file_size);
+        assert_eq!(window, file_size / 512);
+        assert!(open_ended(file_size - window));
+        assert!(!open_ended(file_size - window - 1));
+    }
+
+    /// **mpv's index crawler, at the size it really was.**
+    ///
+    /// The field film of 2026-09-12: 23,346,250,742 bytes, and a second
+    /// reader parked 25,962,800 from the end, reopening about once a second
+    /// for the whole viewing. Under the 16 MiB constant that read arrived as
+    /// `DirectSeek`, so it was the newest *playing* read every time it
+    /// opened and the retention window followed it to the end of the film --
+    /// `playhead=5559` with the viewer's own reader at piece 806.
+    #[test]
+    fn the_field_crawler_is_an_index_read_and_not_a_seek() {
+        let file_size = 23_346_250_742;
+        let crawler = 25_962_800;
+        assert!(
+            is_container_metadata_request(file_size - crawler, crawler, file_size),
+            "the crawler is the container's index, not somebody watching from there"
+        );
+        // And a viewer who really is near the end still is: a minute of a
+        // 23 Mbps film is far more than the window.
+        let minute = 3_400_000 * 60;
+        assert!(!is_container_metadata_request(
+            file_size - minute,
+            minute,
+            file_size
         ));
     }
 
@@ -398,16 +452,9 @@ mod tests {
         let file_size = 10 * 1024 * 1024 * 1024;
         let start = container_metadata_start(file_size);
 
-        assert!(is_container_metadata_request(
-            start,
-            MAX_CONTAINER_METADATA_WINDOW_BYTES,
-            file_size
-        ));
-        assert!(!is_container_metadata_request(
-            start,
-            MAX_CONTAINER_METADATA_WINDOW_BYTES + 1,
-            file_size
-        ));
+        let window = container_metadata_window(file_size);
+        assert!(is_container_metadata_request(start, window, file_size));
+        assert!(!is_container_metadata_request(start, window + 1, file_size));
     }
 
     #[test]
