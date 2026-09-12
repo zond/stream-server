@@ -618,8 +618,8 @@ mod tests {
     #[test]
     fn the_token_is_redacted_in_both_spellings_and_nothing_else_is_touched() {
         assert_eq!(
-            redacted_args(strings(&["server", "--token", "hunter2", "--tui"])),
-            strings(&["server", "--token", REDACTED, "--tui"])
+            redacted_args(strings(&["server", "--token", "hunter2", "--verbose"])),
+            strings(&["server", "--token", REDACTED, "--verbose"])
         );
         assert_eq!(
             redacted_args(strings(&["--token=hunter2", "--no-auth"])),

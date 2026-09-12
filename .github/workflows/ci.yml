@@ -60,7 +60,7 @@ jobs:
       #
       # The bare invocation lints the workspace default-members, which is
       # exactly the pure-Rust set (identical to `members`). `--all-features`
-      # so the off-by-default `tui` feature is compiled somewhere.
+      # so every optional feature is compiled somewhere.
       - name: Clippy
         run: >-
           cargo clippy --all-targets --all-features --
@@ -148,12 +148,12 @@ jobs:
         with:
           cache-on-failure: true
 
-      # Pure Rust: no ffmpeg, no libclang, no system libraries. A cheap
-      # cross-platform guard for the release build, which stays in
-      # release.yml; built with the `tui` feature as that build is, since
-      # crossterm has a Windows path of its own.
+      # Pure Rust: no ffmpeg, no libclang, no system libraries. The only job
+      # that compiles the `cfg(windows)` half of `diagnostics` -- the
+      # `windows` crate's process and memory queries -- so it is the guard
+      # for those, and the one place the tests run on Windows.
       - name: Build
-        run: cargo build --features server/tui
+        run: cargo build
 
       - name: Test
         run: cargo test

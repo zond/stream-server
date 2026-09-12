@@ -89,8 +89,6 @@ mod routes;
 mod ssdp;
 mod state;
 pub mod stream_numbers;
-#[cfg(feature = "tui")]
-mod tui;
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -106,9 +104,6 @@ pub struct ServerConfig {
     /// platform cache dir. No environment variable is consulted once
     /// `config_dir` is given.
     pub cache_dir: Option<PathBuf>,
-    /// The terminal UI on stdout. Only a build with the `tui` feature has
-    /// one; without it, `run` refuses a config that asks for it.
-    pub use_tui: bool,
     pub init_logging: bool,
     pub manage_process_globals: bool,
     pub listen_for_ctrl_c: bool,
@@ -185,7 +180,6 @@ impl ServerConfig {
             public_base_url: None,
             config_dir: None,
             cache_dir: None,
-            use_tui: false,
             init_logging: false,
             manage_process_globals: false,
             listen_for_ctrl_c: false,
@@ -209,7 +203,6 @@ impl ServerConfig {
             public_base_url: Some(format!("http://127.0.0.1:{DEFAULT_HTTP_PORT}")),
             config_dir: None,
             cache_dir: None,
-            use_tui: false,
             init_logging: true,
             manage_process_globals: true,
             listen_for_ctrl_c: true,
@@ -229,7 +222,6 @@ impl ServerConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShutdownSource {
     CtrlC,
-    Tui,
     External,
 }
 
@@ -934,13 +926,6 @@ pub async fn run(
     mut external_shutdown_rx: tokio::sync::mpsc::Receiver<()>,
     ready_tx: Option<tokio::sync::oneshot::Sender<Started>>,
 ) -> anyhow::Result<Option<ShutdownSource>> {
-    // Refused rather than ignored: the operator asked for a screen and would
-    // get a server logging to stdout instead.
-    #[cfg(not(feature = "tui"))]
-    anyhow::ensure!(
-        !cfg.use_tui,
-        "use_tui asks for the terminal UI, which this build left out (feature `tui`)"
-    );
     let listener = tokio::net::TcpListener::bind(cfg.http_addr)
         .await
         .with_context(|| format!("failed to bind HTTP listener on {}", cfg.http_addr))?;
@@ -950,16 +935,6 @@ pub async fn run(
         .public_base_url
         .clone()
         .unwrap_or_else(|| format!("http://{}", public_http_addr));
-
-    #[cfg(feature = "tui")]
-    let (tui_log_layer, tui_rx) = if cfg.use_tui {
-        let (tx, rx) = crossbeam_channel::bounded(1000);
-        (Some(tui::log_layer::TuiLogLayer::new(tx)), Some(rx))
-    } else {
-        (None, None)
-    };
-    #[cfg(not(feature = "tui"))]
-    let tui_log_layer: Option<tracing_subscriber::layer::Identity> = None;
 
     let (config_dir, cache_dir) = resolve_dirs(&cfg)?;
     let log_dir = config_dir.join("logs");
@@ -996,13 +971,12 @@ pub async fn run(
             .with_writer(json_writer)
             .with_ansi(false);
 
-        // The TUI owns the terminal, so stdout gets log lines only without it.
-        let stdout_layer = (tui_log_layer.is_none() && std::io::stdout().is_terminal())
+        let stdout_layer = std::io::stdout()
+            .is_terminal()
             .then(tracing_subscriber::fmt::layer);
         let init_result = registry
             .with(human_file_layer)
             .with(json_file_layer)
-            .with(tui_log_layer)
             .with(stdout_layer)
             .try_init();
 
@@ -1311,20 +1285,6 @@ pub async fn run(
     // See `diagnostics::dht_health`.
     background_tasks.push(diagnostics::dht_health::start(state.engine.clone()));
 
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
-    #[cfg(feature = "tui")]
-    if cfg.use_tui
-        && let Some(rx) = tui_rx
-    {
-        tui::start_tui(Arc::new(state.clone()), rx, shutdown_tx);
-    }
-    // Nothing sends on it without the TUI, but it must live to the end of
-    // `run`: a `drop(shutdown_tx)` would close the channel, which the
-    // select below reads as the TUI's quit, and shut the server down at
-    // once. The binding only names it for the unused-variable lint.
-    #[cfg(not(feature = "tui"))]
-    let _no_tui_quits = shutdown_tx;
-
     let app = build_router(state.clone());
 
     // The LAN media listener is deliberately not started here. It exists for
@@ -1381,10 +1341,6 @@ pub async fn run(
             _ = maybe_ctrl_c(listen_for_ctrl_c) => {
                 tracing::info!("Ctrl+C received, shutting down");
                 ShutdownSource::CtrlC
-            }
-            _ = shutdown_rx.recv() => {
-                tracing::info!("Shutdown signal received from TUI, shutting down");
-                ShutdownSource::Tui
             }
             _ = external_shutdown_rx.recv() => {
                 tracing::info!("Shutdown signal received from external controller, shutting down");

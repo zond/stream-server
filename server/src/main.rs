@@ -12,12 +12,10 @@ mod app {
 
     #[derive(Debug, PartialEq, Eq)]
     pub(super) struct CliOptions {
-        pub use_tui: bool,
         pub auth: ServerAuth,
     }
 
-    /// Parse the daemon's command line. `--tui` selects the ratatui mode,
-    /// and is refused by a build without the `tui` feature.
+    /// Parse the daemon's command line.
     /// The control API token comes from, in order of precedence: `--no-auth`
     /// (every route open), `--token <t>` / `--token=<t>`, the
     /// `STREAM_SERVER_TOKEN` environment variable (`env_token`; blank counts
@@ -29,16 +27,11 @@ mod app {
         args: impl IntoIterator<Item = String>,
         env_token: Option<String>,
     ) -> anyhow::Result<CliOptions> {
-        let mut use_tui = false;
         let mut no_auth = false;
         let mut token: Option<String> = None;
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
-                "--tui" if cfg!(feature = "tui") => use_tui = true,
-                "--tui" => anyhow::bail!(
-                    "--tui: this build has no terminal UI; build it with `--features tui`"
-                ),
                 "--no-auth" => no_auth = true,
                 "--token" => {
                     let value = args
@@ -65,7 +58,7 @@ mod app {
         } else {
             ServerAuth::Generated
         };
-        Ok(CliOptions { use_tui, auth })
+        Ok(CliOptions { auth })
     }
 
     pub fn main() -> anyhow::Result<()> {
@@ -87,7 +80,6 @@ mod app {
         let rt = tokio::runtime::Runtime::new()?;
         let (_tx, rx) = tokio::sync::mpsc::channel::<()>(1);
         let mut cfg = stream_server::ServerConfig::binary_default();
-        cfg.use_tui = options.use_tui;
         cfg.auth = options.auth;
         let _ = rt.block_on(stream_server::run(cfg, rx, None))?;
         Ok(())
@@ -105,33 +97,16 @@ mod app {
         }
 
         #[test]
-        fn defaults_to_a_generated_token_without_tui() {
+        fn defaults_to_a_generated_token() {
             let options = parse(&[], None).unwrap();
             assert_eq!(
                 options,
                 CliOptions {
-                    use_tui: false,
                     auth: ServerAuth::Generated,
                 }
             );
             // Unknown arguments are ignored, as before.
             assert_eq!(parse(&["--verbose"], None).unwrap(), options);
-        }
-
-        #[cfg(feature = "tui")]
-        #[test]
-        fn tui_and_no_auth_flags() {
-            let options = parse(&["--tui", "--no-auth"], None).unwrap();
-            assert!(options.use_tui);
-            assert_eq!(options.auth, ServerAuth::Disabled);
-        }
-
-        /// Rather than start a server whose operator asked for a screen and
-        /// gets a log on stdout.
-        #[cfg(not(feature = "tui"))]
-        #[test]
-        fn a_build_without_the_tui_refuses_the_flag() {
-            assert!(parse(&["--tui"], None).is_err());
         }
 
         #[test]

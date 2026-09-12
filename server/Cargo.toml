@@ -75,10 +75,6 @@ unrar-rs = { version = "0.7", default-features = false, features = [
 lz-str = "0.2.1"
 tempfile = "3.23.0"
 mimalloc = { version = "0.1.48", default-features = false }
-# The `--tui` screen, behind the `tui` feature (see [features]).
-ratatui = { version = "0.30.0", optional = true }
-crossterm = { version = "0.29.0", optional = true }
-crossbeam-channel = { version = "0.5.13", optional = true }
 dirs = "6.0"
 dashmap = "6.1.0"
 tar = "0.4.44"
@@ -153,13 +149,6 @@ windows = { version = "0.62.2", features = [
 # compiled and is not a feature.
 default = ["rar"]
 rar = ["dep:unrar-rs"]
-# The desktop binary's `--tui` terminal UI. OFF by default: a feature is the
-# package's, not a target's, so a default-on `tui` would link a terminal UI
-# stack into the cdylib and into every embedder's library (xtremio's Android
-# build among them), none of which has a terminal. The release workflow
-# builds the desktop binaries with `--features server/tui`; a binary built
-# without it refuses `--tui`.
-tui = ["dep:ratatui", "dep:crossterm", "dep:crossbeam-channel"]
 
 [package.metadata.deb]
 maintainer = "stream-server maintainers"
