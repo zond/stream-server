@@ -226,14 +226,19 @@ impl ServerHandle {
     }
 
     /// The bearer token the control routes require this launch
-    /// (`Authorization: Bearer <token>`), or `None` when
-    /// [`ServerAuth::Disabled`] left them open.
+    /// (`Authorization: Bearer <token>`). A started server always has one:
+    /// the `Option` is only what an `AppState` no `run` filled in carries,
+    /// and `ServerAuth::Disabled` -- which used to make it `None` and leave
+    /// the control routes open -- is gone.
     pub fn auth_token(&self) -> Option<&str> {
         self.state.auth_token.as_deref()
     }
 
-    /// The URL the server advertises (`settings.baseUrl`): `public_base_url`
-    /// if configured, else `http://<connectable bound address>`.
+    /// The URL the server advertises (`settings.baseUrl`):
+    /// `http://<connectable bound address>`. There used to be a
+    /// `public_base_url` override for the daemon, which set it to the
+    /// address it was binding anyway; without it this cannot disagree with
+    /// the listener.
     pub fn base_url(&self) -> &str {
         &self.state.base_url
     }
