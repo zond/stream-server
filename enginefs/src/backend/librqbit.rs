@@ -8369,11 +8369,26 @@ mod tests {
         );
     }
 
-    /// **The bound under a lookahead wider than the window.** The same
-    /// stream, opened with the intent every request after the first carries
+    /// **The bound under a lookahead wider than the window, and with the
+    /// player's read of the container index beside it.** The same stream,
+    /// opened with the intent every request after the first carries
     /// (`DirectSeek`, a 128 MiB cap: four times this file), never has more
-    /// on disk than the budget, and no pass is refused a piece it set out to
-    /// reclaim.
+    /// on disk than the budget, never has more off the swarm than the
+    /// budget and what it has delivered can account for, and no pass is
+    /// refused a piece it set out to reclaim.
+    ///
+    /// **The tail read is the third of those.** Part-way through the pause
+    /// mpv reads the end of the file for the Cues
+    /// ([`BoundWatch::probe_the_tail`]) and closes that response, exactly as
+    /// it does before the first frame of every MKV. That read used to leave
+    /// the *file's* head at the end of the file behind it, so every pass
+    /// after it measured from there; what that costs is bytes off the
+    /// swarm, and the occupancy -- one window, wherever it is -- says
+    /// nothing about it at all. Reverting the head's owner today fails this
+    /// test on the disk bound first, because the probe's window and the
+    /// player's are then two windows over a budget of one; the network
+    /// bound is what stays true when the churn is inside the budget, which
+    /// is where it was on the television.
     ///
     /// Before the reader's lookahead was cut to the window's reach this held
     /// only for the 4 MiB startup intent, and by luck of the constants: the
@@ -8438,7 +8453,9 @@ mod tests {
             engine: &engine,
             hash: &hash,
             budget_pieces: (RETENTION_BUDGET / RETENTION_PIECE) as usize,
+            fetched_at_start: engine.handle.transfer_totals().unwrap_or_default().fetched,
             worst: 0,
+            fetched_peak: 0,
             deadline: std::time::Instant::now() + TEST_WAIT_BOUND,
         };
         let mut read = Vec::with_capacity(original.len());
@@ -8454,8 +8471,14 @@ mod tests {
         bound
             .read_until(&mut reader, &mut read, 4 * 1024 * 1024 + 64 * 1024)
             .await;
-        for _ in 0..30 {
+        for pass in 0..30 {
             tokio::time::sleep(Duration::from_millis(50)).await;
+            // And a third of the way through the pause, the player reads
+            // the container index at the end of the file. See
+            // [`BoundWatch::probe_the_tail`].
+            if pass == 10 {
+                bound.probe_the_tail().await;
+            }
             bound.tick(read.len()).await;
         }
         // Then plays the rest through.
@@ -8474,19 +8497,42 @@ mod tests {
             "the cache really filled ({} pieces at most), or the bound proves nothing",
             bound.worst
         );
+        assert!(
+            bound.fetched_peak >= RETENTION_BUDGET,
+            "only {} bytes were ever seen coming off the swarm, so the network bound \
+             was never measured against anything",
+            bound.fetched_peak
+        );
     }
 
-    /// One retention pass at a time over a streaming engine, and the two
-    /// things every pass has to leave true: the disk under the budget, and
-    /// no piece the pass set out to reclaim refused. For
-    /// `a_stream_wider_than_its_window_is_fetched_inside_it`.
+    /// One retention pass at a time over a streaming engine, and the three
+    /// things every pass has to leave true: the disk under the budget, no
+    /// piece the pass set out to reclaim refused, and the *network* bounded
+    /// too. For `a_stream_wider_than_its_window_is_fetched_inside_it`.
+    ///
+    /// **The network is the bound the disk cannot show.** A pass that
+    /// reclaims a piece the reader is still about to want leaves the
+    /// occupancy exactly where the budget says it should be and has the
+    /// swarm send the same bytes again, every tick, for as long as the
+    /// stream is open: on a television, 64% of everything fetched in the
+    /// first eighteen seconds of a film thrown away with the player still
+    /// at 0:00. So what came off the peers is measured as well, and what it
+    /// may be is what the reader has been given plus what the policy is
+    /// allowed to be holding for it -- one budget, and a piece for the one
+    /// the reader is part-way through.
     struct BoundWatch<'a> {
         efs: &'a crate::BackendEngineFS<LibrqbitBackend>,
-        engine: &'a crate::engine::Engine<LibrqbitHandle>,
+        engine: &'a Arc<crate::engine::Engine<LibrqbitHandle>>,
         hash: &'a str,
         budget_pieces: usize,
+        /// What the torrent had fetched when the watch began, so the bound
+        /// below is about this stream and not about the pieces the add
+        /// pulled before it.
+        fetched_at_start: u64,
         /// The most pieces any pass found on the disk.
         worst: usize,
+        /// The most any pass saw come off the swarm since the watch began.
+        fetched_peak: u64,
         deadline: std::time::Instant,
     }
 
@@ -8511,6 +8557,63 @@ mod tests {
                 "a pass was refused a piece it set out to reclaim after {read_so_far} bytes: \
                  the stream's lookahead reached past the window"
             );
+            // A torrent that is not live has no counter to read
+            // (`transfer_totals` is `None` off `Live`), and `0` is not what
+            // that means: read as a total it would make every pass after
+            // the reconciler pauses a finished torrent pass for free. So a
+            // pass with no reading asserts nothing, and `fetched_peak`
+            // below is what says the readings there were meant something.
+            if let Some(totals) = self.engine.handle.transfer_totals() {
+                let fetched = totals.fetched.saturating_sub(self.fetched_at_start);
+                self.fetched_peak = self.fetched_peak.max(fetched);
+                let bound = RETENTION_BUDGET + read_so_far as u64 + RETENTION_PIECE;
+                assert!(
+                    fetched <= bound,
+                    "{fetched} bytes came off the swarm for {read_so_far} bytes delivered, \
+                     which is more than the {bound} a budget of {RETENTION_BUDGET} and a \
+                     part-read piece can account for: something is being fetched and \
+                     thrown away"
+                );
+            }
+        }
+
+        /// **mpv's read of the container index at the tail**, which is what
+        /// made the field measurement above what it was: a second reader on
+        /// the same file, opened near its end with the intent that names it
+        /// (`ContainerMetadata`), which delivers a few bytes and closes
+        /// before the next pass runs.
+        ///
+        /// That read used to claim the file's head, and a head is not given
+        /// back when a read ends -- a paused film keeps its window. So
+        /// every pass after it drew the window round the end of the file,
+        /// stopped wanting the head the player was parked on and unlinked
+        /// it, and the playing stream's priority path fetched it back
+        /// again, once per tick. Nothing about the disk shows that: the
+        /// occupancy is one window either way. The fetched count is the
+        /// only place it appears.
+        async fn probe_the_tail(&mut self) {
+            use tokio::io::AsyncReadExt;
+            let mut probe = self
+                .engine
+                .try_get_file_with_intent(
+                    0,
+                    RETENTION_FILE_BYTES as u64 - RETENTION_PIECE,
+                    255,
+                    crate::backend::priorities::PlaybackIntent::ContainerMetadata,
+                    crate::backend::priorities::BufferProfile::Normal,
+                )
+                .await
+                .expect("a reader on the tail");
+            let mut buf = vec![0u8; 64 * 1024];
+            let delivered = tokio::time::timeout(TEST_WAIT_BOUND, probe.read(&mut buf))
+                .await
+                .expect("the probe's read returned")
+                .expect("read");
+            assert_ne!(
+                delivered, 0,
+                "the probe delivered nothing, so it never had a byte to claim a head with"
+            );
+            drop(probe);
         }
 
         /// Read `reader` into `read` until it holds `until` bytes, with a
