@@ -148,10 +148,22 @@ pub fn pass<K: Debug>(key: &K, sample: Pass<'_>) {
     );
 }
 
-/// The one event that should never happen: a pass taking a piece an open
-/// stream is still reading ahead over. Not rate-limited, because one of
-/// these is worth more than a hundred of the lines above.
-pub fn reclaimed_inside_a_lookahead<K: Debug>(
+/// A pass that has *decided* to reclaim a piece an open stream is reading
+/// ahead over.
+///
+/// **This is the plan and not the outcome**, and the difference has cost
+/// two wrong diagnoses. The decision is taken against the entity's own
+/// window; the door is asked again at every unlink, against every live
+/// reader's *current* window ([`Door::windows_now`]), and cuts these pieces
+/// out of the runs there. So a line here is a piece the pass would have
+/// taken had nothing been reading it, which is the ordinary case, and may
+/// well have deleted nothing.
+///
+/// What says whether anything went is `unlinked` on the pass line that
+/// follows. Read the two together or not at all.
+///
+/// [`Door::windows_now`]: super::owner::Door::windows_now
+pub fn planned_to_reclaim_inside_a_lookahead<K: Debug>(
     key: &K,
     pieces: &[u32],
     reader: Range<u32>,
@@ -164,7 +176,8 @@ pub fn reclaimed_inside_a_lookahead<K: Debug>(
         reader_start = reader.start,
         reader_end = reader.end,
         lookahead_bytes,
-        "a retention pass reclaimed inside an open stream's lookahead"
+        "a retention pass planned to reclaim inside an open stream's lookahead; \
+         `unlinked` on the next pass line says whether any of it went"
     );
 }
 

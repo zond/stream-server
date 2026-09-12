@@ -2186,7 +2186,12 @@ impl<B: Backing> Retention<B> {
                         .filter(|piece| (*head..ahead).contains(piece))
                         .collect();
                     if !inside.is_empty() {
-                        trace::reclaimed_inside_a_lookahead(key, &inside, *head..ahead, *lookahead);
+                        trace::planned_to_reclaim_inside_a_lookahead(
+                            key,
+                            &inside,
+                            *head..ahead,
+                            *lookahead,
+                        );
                     }
                 }
             }
