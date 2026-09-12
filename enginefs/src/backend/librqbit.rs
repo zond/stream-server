@@ -4386,13 +4386,13 @@ mod tests {
     /// guard on that fix: a rebase that lost it would fail here rather than
     /// in a field log.
     ///
-    /// `Session::unpause` writes `g.paused = false` before `_start` has
-    /// looked at anything (`torrent_state/mod.rs:649`), then finds the
-    /// initial check already running and returns success having started
-    /// nothing (`:548-551`). The check that *is* running was spawned by the
-    /// add, with `start_paused = true` captured, so when it finishes its own
-    /// continuation parks the torrent in `Paused` (`:587`, returning at
-    /// `:607`).
+    /// At the pinned rev the shape is: `Session::unpause`
+    /// (`session.rs:1692`) reaches `start`, which writes the intent
+    /// (`torrent_state/mod.rs:867`) and then finds the initial check already
+    /// running and returns success having started nothing (`:763`). What
+    /// changed is the continuation: it now reads the intent off the guard
+    /// (`mod.rs:825`) rather than the `start_paused` captured a check ago,
+    /// so the unpause is honoured and this test asserts that it is.
     ///
     /// The last assertion is librqbit's own opinion rather than either of
     /// the two readings: it refuses to pause a torrent it considers paused,
@@ -4490,16 +4490,14 @@ mod tests {
     /// stopped the torrent, was told it was paused, and the torrent went on
     /// writing.
     ///
-    /// `TorrentStateInitializing::check` hands `pause_requested` to
+    /// `TorrentStateInitializing::check` still hands `pause_requested` to
     /// `FileOps::initial_check` and to nothing else
-    /// (`torrent_state/initializing.rs:279`); `validate_fastresume` never
-    /// reads it. So the check returns `Ok`, its continuation applies the
-    /// add-time `start_paused` -- `false`, this torrent having been restored
-    /// unpaused -- and takes it `Live` (`torrent_state/mod.rs:606-620`).
-    ///
-    /// This is the shape behind the measured 3 MiB -> 12 MiB overshoot: the
-    /// free-space watch stopped the torrent, was told it was paused, and the
-    /// torrent went on writing to the full volume.
+    /// (`torrent_state/initializing.rs:283`, read at `file_ops.rs:113`), and
+    /// `validate_fastresume` still never reads it -- so the check returns
+    /// `Ok` with the pause unseen. What the fix changed is what happens
+    /// next: the continuation applies the intent as it stands
+    /// (`torrent_state/mod.rs:825`) instead of the add-time `start_paused`,
+    /// and the torrent parks. Line refs are at the rev `Cargo.toml` pins.
     ///
     /// A restart is not decoration here. Fastresume needs a have-bitfield
     /// from a previous run, so the first session is what makes the second
