@@ -113,9 +113,10 @@ jobs:
 
       # The app ships to 32-bit ARM (a Chromecast is armeabi-v7a), where
       # usize is 32 bits and off_t can be, and nothing else here builds for
-      # it; the jni exports and every other cfg(target_os = "android") path
-      # are only compiled here. A check, not a build: nothing links, and no
-      # test runs, so a 32-bit arithmetic bug that compiles still gets past.
+      # it; every cfg(target_os = "android") path -- the Android arm of
+      # `enginefs::http_client` among them -- is only compiled here. A check,
+      # not a build: nothing links, and no test runs, so a 32-bit arithmetic
+      # bug that compiles still gets past.
       #
       # It needs the NDK even so. Build scripts compile C for the target
       # (aws-lc-sys under rustls and librqbit's sha1, libmimalloc-sys), so

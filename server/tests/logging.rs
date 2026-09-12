@@ -2,7 +2,7 @@
 
 use stream_server::ServerConfig;
 
-/// A second start in one process -- the JNI surface's stop, then start --
+/// A second start in one process -- an embedder's stop, then start --
 /// leaves the first start's log files alone. The first start's subscriber
 /// is the process's for good and goes on writing `server_current.log`;
 /// when the second start rotated that file, its lines went on into the

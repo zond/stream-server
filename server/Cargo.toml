@@ -15,7 +15,6 @@ authors = ["Perpetus <perpetus@example.com>"]
 [lib]
 name = "stream_server"
 path = "src/lib.rs"
-crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "server"
@@ -117,16 +116,6 @@ librqbit = { git = "https://github.com/zond/rqbit", rev = "92343f5ad4c1203f1bc32
     "rust-tls",
     "http-api-client",
 ] }
-
-[target.'cfg(target_os = "android")'.dependencies]
-# The JNI surface stremio-android loads the cdylib through (`src/jni.rs`),
-# which no other platform has.
-jni = "0.22.4"
-# Only to *arm* the Java verifier from `jni::init_android_tls_verifier`, as a
-# fallback for a client built without `enginefs::http_client_builder`. No
-# client this workspace or librqbit builds constructs it any more; see that
-# function's doc comment.
-rustls-platform-verifier = "0.7.0"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [
