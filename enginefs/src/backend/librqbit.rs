@@ -8720,6 +8720,149 @@ mod tests {
         }
     }
 
+    /// **The film paused with its response closed, and the tail read that
+    /// used to move the window off it.**
+    ///
+    /// `a_stream_wider_than_its_window_is_fetched_inside_it` probes the
+    /// tail with the player's body still open, and that shape cannot show
+    /// this: a live playing read is the first thing `State::head` asks
+    /// about, so the gate on `last_position` and the head's tiers each
+    /// hold the window on the player without the other. Reverting either
+    /// alone leaves that test green.
+    ///
+    /// The field shape is the one where they come apart. A viewer pauses
+    /// and the client closes the response -- there is no live read at all,
+    /// and where playback got to is the only thing left that says where
+    /// the film is -- and then the player reads the container index at the
+    /// end of the file, as mpv does before every frame it decodes after a
+    /// seek. That read delivers bytes like any other, it used to write
+    /// `last_position`, and `Reader::drop` deliberately leaves that value
+    /// behind, so the window relocated to the end of the file and stayed
+    /// there with nobody watching it. What that costs is bytes off the
+    /// peers: the disk holds one window either way.
+    ///
+    /// So: what comes off the swarm after the probe has closed, against
+    /// what had come off it before the probe opened, with two pieces of
+    /// slack for the probe's own read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tail_probe_over_a_paused_film_fetches_nothing_back() {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let content = tmp.path().join("content");
+        tokio::fs::create_dir_all(&content).await.unwrap();
+        let payload = content.join("movie.bin");
+        write_payload(&payload, RETENTION_FILE_BYTES).await;
+        let (torrent_bytes, _) =
+            make_torrent_with_piece_length(&payload, RETENTION_PIECE as u32).await;
+
+        let client_dir = tmp.path().join("client");
+        let (efs, client_addr) = streaming_engine_fs(&client_dir).await;
+        efs.set_cache_budget(Some(RETENTION_BUDGET));
+        let engine = efs
+            .add_torrent(TorrentSource::Bytes(torrent_bytes.clone()), None)
+            .await
+            .expect("add");
+        let hash = engine.info_hash.clone();
+        engine.handle.handle.wait_until_initialized().await.unwrap();
+        let _seeder = seeder_dialling(&content, &torrent_bytes, client_addr).await;
+        // The viewer is on this file, which is what keeps the entity a
+        // `Mode::Live` one once its last read has ended: a paused film is
+        // not a file nobody is watching.
+        efs.on_stream_start(&hash, 0).await;
+
+        // Four megabytes of the film, and then the body ends.
+        let mut reader = engine
+            .try_get_file_with_intent(
+                0,
+                0,
+                255,
+                crate::backend::priorities::PlaybackIntent::DirectInitial,
+                crate::backend::priorities::BufferProfile::Normal,
+            )
+            .await
+            .expect("reader");
+        let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut played = 0usize;
+        while played < 4 * 1024 * 1024 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stream stalled at {played} bytes"
+            );
+            let n = reader.read(&mut buf).await.expect("read");
+            assert_ne!(n, 0, "the stream ended early at {played}");
+            played += n;
+        }
+        drop(reader);
+
+        // The passes settle round where playback stopped.
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            efs.reconcile_tick().await;
+        }
+        let settled = engine
+            .handle
+            .transfer_totals()
+            .expect("a paused film's torrent is still live")
+            .fetched;
+        assert!(
+            settled >= RETENTION_BUDGET / 2,
+            "only {settled} bytes came off the swarm before the probe, which is less \
+             than the window a moved one would have re-fetched: there is nothing here \
+             for this to measure"
+        );
+
+        // And mpv reads the Cues at the end of the file, and closes.
+        let tail = RETENTION_FILE_BYTES as u64 - RETENTION_PIECE;
+        let mut probe = engine
+            .try_get_file_with_intent(
+                0,
+                tail,
+                255,
+                crate::backend::priorities::PlaybackIntent::ContainerMetadata,
+                crate::backend::priorities::BufferProfile::Normal,
+            )
+            .await
+            .expect("a reader on the tail");
+        probe
+            .seek(std::io::SeekFrom::Start(tail))
+            .await
+            .expect("the probe seeks to the tail, as the route does");
+        let delivered = tokio::time::timeout(TEST_WAIT_BOUND, probe.read(&mut buf))
+            .await
+            .expect("the probe's read returned")
+            .expect("read");
+        let want: Vec<u8> = (tail as usize..tail as usize + delivered)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        assert_eq!(
+            buf[..delivered],
+            want[..],
+            "the probe read {delivered} bytes that are not the file's tail"
+        );
+        drop(probe);
+
+        // Nothing of the film comes back.
+        let bound = settled + 2 * RETENTION_PIECE;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            efs.reconcile_tick().await;
+            let fetched = engine
+                .handle
+                .transfer_totals()
+                .expect("the torrent is still live")
+                .fetched;
+            assert!(
+                fetched <= bound,
+                "{} bytes came off the swarm after a probe of the tail closed over a \
+                 paused film: the window followed the probe and the pieces it left \
+                 are being fetched again",
+                fetched - settled
+            );
+        }
+    }
+
     /// **The freshness half of the budget.** Before any cache pass has run,
     /// this process has not been told a budget -- and "not told" is not
     /// "nothing". Nothing is held back, nothing is reclaimed, and the
