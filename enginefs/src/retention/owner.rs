@@ -630,6 +630,21 @@ struct State<B: Backing> {
     /// It lives exactly as long as the policy that made it: written at the
     /// pass's decision, cleared when a policy is installed or forgotten.
     doomed: Vec<Range<u32>>,
+    /// The last delivery rate measured on this entity by a read that was
+    /// playing it, and `None` until one has been.
+    ///
+    /// **The bitrate is the film's and the reader is not.** The rate lives
+    /// on a [`ReaderState`] because that is where it is measured, and it
+    /// dies with the reader -- so the moment a seek replaces one reader with
+    /// another, or a viewer pauses and the client closes the body, the
+    /// entity has no rate and both time caps stop applying. The window then
+    /// goes back to its share of the budget until two seconds of the new
+    /// read have gone out: on a ten-gigabyte cache that is a jump from
+    /// three hundred megabytes to five gigabytes, ordered from the swarm by
+    /// the pass that measured it and given back by the pass after. The film
+    /// did not change bitrate because a reader was replaced, so the entity
+    /// keeps the number and a live read's own measurement wins over it.
+    rate: Option<u64>,
     /// The draw that decides which of this entity's pieces this process
     /// offers to the swarm ([`Buffering::seed`]).
     ///
@@ -1046,6 +1061,7 @@ impl<B: Backing> Retention<B> {
                         // the pieces. See [`State::held_back`].
                         held_back: B::SHARE == Share::Half,
                         doomed: Vec::new(),
+                        rate: None,
                         opens: 0,
                         seed: share_seed(),
                     })),
@@ -2288,7 +2304,10 @@ impl<B: Backing> State<B> {
             .values()
             .filter(|reader| reader.reading == Reading::Playback)
             .filter_map(|reader| reader.rate.bytes_per_second)
-            .max();
+            .max()
+            // And the entity's own last reading where no live read has one
+            // yet, which is every seek and every resume: see [`Self::rate`].
+            .or(self.rate);
         asked
     }
 
@@ -2782,6 +2801,7 @@ impl<B: Backing> Reader<B> {
             // The byte really went out, so this is a delivery and not a
             // request: the only reading the window's time cap is sized from.
             reader.rate.note(offset, now);
+            let measured = reader.rate.bytes_per_second;
             let due = match index {
                 Some(index) => {
                     // Delivered is no longer promised: the piece went out
@@ -2799,6 +2819,13 @@ impl<B: Backing> Reader<B> {
                 }
                 None => false,
             };
+            // The entity keeps what a playing read measured, so the time
+            // caps survive the read that measured them; see [`State::rate`].
+            if self.reading == Reading::Playback
+                && let Some(rate) = measured
+            {
+                state.rate = Some(rate);
+            }
             let claim = due
                 .then(|| self.entity.turn.clone().try_lock_owned().ok())
                 .flatten()
@@ -5416,6 +5443,69 @@ mod tests {
             }),
             "ten seconds of a hundred bytes a second is a kilobyte, floored at the smallest \
              cap -- so the committed set takes one piece and the window takes the rest"
+        );
+    }
+
+    /// **A seek does not un-cap the window while the new read finds its
+    /// feet.**
+    ///
+    /// The rate is measured per read and dies with it, and a seek is a new
+    /// response: for the two seconds it takes the new one to make a sample,
+    /// the entity has no rate, neither time cap applies, and the window goes
+    /// back to its share of the budget -- on a ten-gigabyte cache a jump
+    /// from three hundred megabytes to five gigabytes, ordered from the
+    /// swarm by the pass that saw it and given back by the pass after. A
+    /// pause with the body closed is the same thing for as long as the
+    /// viewer is away. The film's bitrate did not change, so the entity
+    /// keeps the number.
+    #[tokio::test]
+    async fn a_seek_that_replaces_the_read_keeps_the_rate_the_film_was_measured_at() {
+        let (_backing, owner, budget) = torrent();
+        budget.set(Some(6 * PIECE));
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        let asks = Buffering {
+            window_seconds: Some(10),
+            committed_seconds: Some(10),
+            ..Buffering::default()
+        };
+        let shape = |owner: &Arc<Retention<Torrent>>| {
+            owner
+                .holding(&0)
+                .and_then(|holding| holding.installed)
+                .map(|installed| installed.shape)
+        };
+        let start = std::time::Instant::now();
+        {
+            let playing = owner
+                .reader_on(&0, (0, 0), Reading::Playback, asks)
+                .expect("the entity the install made");
+            playing.note_at((0, 0), start);
+            playing.note_at((0, 300), start + std::time::Duration::from_secs(3));
+            let claim = owner.turn(&0).await.expect("the turn");
+            owner.pass(&0, &(), claim, Mode::Live).await;
+            assert_eq!(
+                shape(&owner),
+                Some(Shape::Split {
+                    window: 5,
+                    committed: 1
+                }),
+                "a hundred bytes a second, capped at ten seconds of it"
+            );
+        }
+        // The viewer seeks: that response ends and another opens, with
+        // nothing measured on it yet.
+        let _seeking = owner
+            .reader_on(&0, (0, 2 * PIECE), Reading::Playback, asks)
+            .expect("the same entity");
+        let claim = owner.turn(&0).await.expect("the turn");
+        owner.pass(&0, &(), claim, Mode::Live).await;
+        assert_eq!(
+            shape(&owner),
+            Some(Shape::Split {
+                window: 5,
+                committed: 1
+            }),
+            "the film is the same film, so the caps still apply"
         );
     }
 
