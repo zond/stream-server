@@ -14,16 +14,26 @@ response also carries a `btSettings` report of what your specific update did
 -- `appliedLive`, `pendingRestart`, `notHonoured` -- so a client never has to
 guess whether a setting took effect.
 
+`/settings` is a **control route**, so every request below needs the
+per-launch bearer token or it answers `401` and changes nothing. The token is
+generated at start-up and written down nowhere: the embedder reads it from
+`ServerHandle::auth_token` (there is no binary, and nothing prints it), so the
+examples assume it is in `$TOKEN`. The port is the embedder's too --
+`ServerConfig::http_addr` defaults to `127.0.0.1:11470`, and an embedder that
+asks for port 0, as xtremio does, gets whatever the OS gave it
+(`ServerHandle::base_url`).
+
 The setting names mirror the JSON keys returned by:
 
 ```bash
-curl http://127.0.0.1:11470/settings
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:11470/settings
 ```
 
 Update only the keys you want to change:
 
 ```bash
 curl -X POST http://127.0.0.1:11470/settings \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"btEnableDht":false,"btEncryptionMode":"require"}'
 ```
@@ -83,6 +93,7 @@ Privacy-focused example:
 
 ```bash
 curl -X POST http://127.0.0.1:11470/settings \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "btEnableDht": false,
@@ -96,47 +107,37 @@ curl -X POST http://127.0.0.1:11470/settings \
   }'
 ```
 
-## Interface And Port Binding
+## Speed And Connections
 
 | Setting | Type | Default | Description |
 | --- | --- | --- | --- |
-| `btListenInterfaces` | string | `"0.0.0.0:42000-42010,[::]:42000-42010"` | Incoming BitTorrent listen interfaces and ports, as `host:start-end` pairs. |
-| `btOutgoingInterfaces` | string | `""` | Network interface names or IPs used for outgoing BitTorrent traffic. Empty means system default routing. |
-| `btOutgoingPort` | number | `0` | First local outgoing TCP port. `0` lets the OS choose. |
-| `btNumOutgoingPorts` | number | `0` | Number of outgoing ports starting at `btOutgoingPort`. `0` means no fixed outgoing range. |
+| `btDownloadSpeedHardLimit` | number | `0` | Session-wide download limit in bytes per second; `0` is unlimited. The one setting that applies to the **running** session. |
+| `btMaxConnections` | number | `160` | Peer budget. librqbit takes a *per-torrent* live cap from it (`/4`, clamped to 40-200), so the default lands on 40 peers per torrent -- the figure a 2 GB television wants, a peer costing about 75 KiB. Applied to every torrent at once, live; while the embedding app is in the background the lean cap stands instead, and this is what a return to the foreground restores. |
+| `btOutgoingInterfaces` | string | `""` | One interface **name** for outgoing traffic, bound with `SO_BINDTODEVICE`. An address, or a list, is not applied (a warning says so), and a name the OS rejects starts the session unbound. Read when the session opens, so it takes effect on the **next server start**. |
+| `btDownloadSpeedSoftLimit` | number | `0` | Accepted and persisted, never applied: librqbit has one download limit, not a soft and a hard one. |
+| `btHandshakeTimeout` | number | `20000` | Accepted and persisted, never applied: librqbit has a connect timeout (10 s) and a read/write timeout (30 s), and neither is a handshake timeout. |
+| `btRequestTimeout` | number | `10000` | Accepted and persisted, never applied: librqbit's request timing is its own. |
+| `btMinPeersForStable` | number | `5` | Accepted and persisted, never applied: nothing reads it, and the stats echo librqbit's own peer-search figures. |
 
-Bind incoming traffic to a specific IP and port range:
-
-```bash
-curl -X POST http://127.0.0.1:11470/settings \
-  -H "Content-Type: application/json" \
-  -d '{
-    "btListenInterfaces": "192.168.1.25:42000-42010",
-    "btOutgoingInterfaces": "192.168.1.25"
-  }'
-```
-
-Bind to a VPN interface by name:
+Cap the download rate and widen the peer budget, both without a restart:
 
 ```bash
 curl -X POST http://127.0.0.1:11470/settings \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "btListenInterfaces": "tun0:42000-42010",
-    "btOutgoingInterfaces": "tun0"
+    "btDownloadSpeedHardLimit": 5000000,
+    "btMaxConnections": 400
   }'
 ```
 
-Use fixed outgoing ports:
-
-```bash
-curl -X POST http://127.0.0.1:11470/settings \
-  -H "Content-Type: application/json" \
-  -d '{
-    "btOutgoingPort": 42100,
-    "btNumOutgoingPorts": 20
-  }'
-```
+**There is no listen-port setting.** `btListenInterfaces`, `btOutgoingPort`
+and `btNumOutgoingPorts` are accepted, echoed back and persisted like every
+other key, and none of them reaches librqbit: the incoming listener is the
+launch configuration's `TorrentListenPort`, which is `Ephemeral` for an
+embedded server -- the only way this library runs -- so the OS picks the port
+and nothing needs forwarding or a firewall rule. Outgoing ports are the OS's
+to pick; librqbit has no knob for a fixed range.
 
 ## Tracker And Peer Proxy
 
@@ -156,6 +157,7 @@ Proxy only tracker traffic:
 
 ```bash
 curl -X POST http://127.0.0.1:11470/settings \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "btProxyType": "socks5",
@@ -171,6 +173,7 @@ Proxy tracker and peer traffic through an authenticated SOCKS5 proxy:
 
 ```bash
 curl -X POST http://127.0.0.1:11470/settings \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "btProxyType": "socks5Password",
@@ -188,6 +191,7 @@ Disable the proxy:
 
 ```bash
 curl -X POST http://127.0.0.1:11470/settings \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "btProxyType": "none",
@@ -205,12 +209,13 @@ curl -X POST http://127.0.0.1:11470/settings \
 - What each `bt*` setting actually does against `librqbit` is fixed per setting,
   not best-effort. The authority is the `enginefs::backend::bt_settings_support()`
   truth table, one row per setting: `Live` (applied to the running session now --
-  only `btDownloadSpeedHardLimit`), `NextStart` (read once when the session opens,
+  `btDownloadSpeedHardLimit` and `btMaxConnections`), `NextStart` (read once when the session opens,
   so a change takes effect on the next server start -- `btEnableDht`, `btEnableLsd`,
   `btOutgoingInterfaces`, and the SOCKS5 proxy settings), or `NotHonoured` (no
   librqbit knob at all, with the reason in the row -- `btEnablePex`,
   `btEncryptionMode`, `btAnonymousMode`, `btValidateHttpsTrackers`,
-  `btSsrfMitigation`, the outgoing-port settings, and the rest). A `POST /settings`
+  `btSsrfMitigation`, `btListenInterfaces`, the outgoing-port settings, and the
+  rest). A `POST /settings`
   response reports which of these buckets each setting you sent fell into, as
   `btSettings.appliedLive` / `pendingRestart` / `notHonoured`.
 - `btEnablePex` is `NotHonoured`: librqbit has no PeX switch (`ut_pex` is always on
