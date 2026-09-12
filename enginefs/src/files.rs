@@ -117,6 +117,12 @@ pub struct Opening {
     /// smaller of the intent's cap and the window's forward reach. See
     /// [`crate::piece_store::Buffering`].
     pub lookahead_bytes: u64,
+    /// The viewer's read-ahead choice, which is also how many seconds of
+    /// the stream the retention window may buy
+    /// ([`BufferProfile::window_seconds`]).
+    ///
+    /// [`BufferProfile::window_seconds`]: crate::backend::priorities::BufferProfile::window_seconds
+    pub buffer: crate::backend::priorities::BufferProfile,
 }
 
 impl<H: TorrentHandle> FileHandle<H> {
@@ -158,13 +164,20 @@ impl<H: TorrentHandle> FileHandle<H> {
             start_offset,
             intent,
             lookahead_bytes,
+            buffer,
         } = opening;
         let reader_id = engine.next_reader_id();
         let reader = engine.retention.reader_on(
             &file_idx,
             (file_idx, start_offset),
             intent.reading(),
-            lookahead_bytes,
+            crate::piece_store::Buffering {
+                lookahead_bytes,
+                window_seconds: buffer.window_seconds(),
+                committed_seconds: Some(crate::backend::priorities::COMMITTED_SECONDS),
+                // Measured, not asked for: see `Buffering::bytes_per_second`.
+                bytes_per_second: None,
+            },
         );
         Self {
             size,

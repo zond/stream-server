@@ -8093,6 +8093,7 @@ mod tests {
                 start_offset: 0,
                 intent: crate::backend::priorities::PlaybackIntent::DirectInitial,
                 lookahead_bytes: 0,
+                buffer: crate::backend::priorities::BufferProfile::Normal,
             },
         );
         engine.active_streams.fetch_add(1, Ordering::SeqCst);
@@ -8247,6 +8248,7 @@ mod tests {
                 start_offset: 0,
                 intent: crate::backend::priorities::PlaybackIntent::DirectInitial,
                 lookahead_bytes: 0,
+                buffer: crate::backend::priorities::BufferProfile::Normal,
             },
         );
         // Balanced by `FileHandle::drop`, which subtracts one.
@@ -10743,13 +10745,23 @@ mod tests {
         // question, because that is when it is showing a spinner.
         let playing = engine
             .retention
-            .reader_on(&0, (0, 0), crate::retention::owner::Reading::Playback, 0)
+            .reader_on(
+                &0,
+                (0, 0),
+                crate::retention::owner::Reading::Playback,
+                crate::piece_store::Buffering::default(),
+            )
             .expect("file 0 has an entity");
         // And mpv's read of the tail for the Cues, which delivers and ends.
         {
             let probe = engine
                 .retention
-                .reader_on(&0, (0, 99), crate::retention::owner::Reading::Probe, 0)
+                .reader_on(
+                    &0,
+                    (0, 99),
+                    crate::retention::owner::Reading::Probe,
+                    crate::piece_store::Buffering::default(),
+                )
                 .expect("file 0 has an entity");
             assert!(probe.note((0, 99)).is_none());
         }
@@ -11396,8 +11408,9 @@ mod tests {
             .expect("a reader");
         assert_eq!(
             counters.lookaheads.lock().unwrap().last(),
-            Some(&40),
-            "a two-piece budget, and the window still reaches what the open streams are fetching"
+            Some(&35),
+            "a two-piece budget, and the window still covers the eight pieces the open \
+             streams are fetching -- 35 bytes being the reach to the start of the last of them"
         );
 
         // A window of one piece reaches no further than the piece under the
@@ -11755,13 +11768,23 @@ mod tests {
         let first = Arc::new(
             engine
                 .retention
-                .reader_on(&0, (0, 0), crate::retention::owner::Reading::Playback, 0)
+                .reader_on(
+                    &0,
+                    (0, 0),
+                    crate::retention::owner::Reading::Playback,
+                    crate::piece_store::Buffering::default(),
+                )
                 .expect("the entity"),
         );
         let second = Arc::new(
             engine
                 .retention
-                .reader_on(&0, (0, 0), crate::retention::owner::Reading::Playback, 0)
+                .reader_on(
+                    &0,
+                    (0, 0),
+                    crate::retention::owner::Reading::Playback,
+                    crate::piece_store::Buffering::default(),
+                )
                 .expect("the entity"),
         );
         assert!(first.note((0, 0)).is_none());
@@ -13881,7 +13904,12 @@ mod tests {
         // A response is still delivering file 0.
         let reader = engine
             .retention
-            .reader_on(&0, (0, 0), crate::retention::owner::Reading::Playback, 0)
+            .reader_on(
+                &0,
+                (0, 0),
+                crate::retention::owner::Reading::Playback,
+                crate::piece_store::Buffering::default(),
+            )
             .expect("file 0 has an entity");
         reader.promises(0..1);
 
@@ -13919,7 +13947,12 @@ mod tests {
         engine.begin_retention(0).await;
         let reader = engine
             .retention
-            .reader_on(&0, (0, 0), crate::retention::owner::Reading::Playback, 0)
+            .reader_on(
+                &0,
+                (0, 0),
+                crate::retention::owner::Reading::Playback,
+                crate::piece_store::Buffering::default(),
+            )
             .expect("file 0 has an entity");
         reader.promises(0..1);
 
@@ -13997,12 +14030,22 @@ mod tests {
         engine.begin_retention(0).await;
         let first = engine
             .retention
-            .reader_on(&0, (0, 0), crate::retention::owner::Reading::Playback, 0)
+            .reader_on(
+                &0,
+                (0, 0),
+                crate::retention::owner::Reading::Playback,
+                crate::piece_store::Buffering::default(),
+            )
             .expect("an entity");
         first.promises(0..1);
         let second = engine
             .retention
-            .reader_on(&0, (0, 0), crate::retention::owner::Reading::Playback, 0)
+            .reader_on(
+                &0,
+                (0, 0),
+                crate::retention::owner::Reading::Playback,
+                crate::piece_store::Buffering::default(),
+            )
             .expect("an entity");
         second.promises(0..1);
 
@@ -14010,7 +14053,12 @@ mod tests {
         engine.begin_retention(1).await;
         let next = engine
             .retention
-            .reader_on(&1, (1, 0), crate::retention::owner::Reading::Playback, 0)
+            .reader_on(
+                &1,
+                (1, 0),
+                crate::retention::owner::Reading::Playback,
+                crate::piece_store::Buffering::default(),
+            )
             .expect("an entity");
         next.promises(0..1);
         assert_eq!(enginefs.live().reading().file_of(TEST_HASH), Some(0));
@@ -14062,7 +14110,12 @@ mod tests {
         engine.begin_retention(0).await;
         let first = engine
             .retention
-            .reader_on(&0, (0, 0), crate::retention::owner::Reading::Playback, 0)
+            .reader_on(
+                &0,
+                (0, 0),
+                crate::retention::owner::Reading::Playback,
+                crate::piece_store::Buffering::default(),
+            )
             .expect("an entity");
         first.promises(0..1);
 
@@ -14106,7 +14159,12 @@ mod tests {
         engine.begin_retention(0).await;
         let first = engine
             .retention
-            .reader_on(&0, (0, 0), crate::retention::owner::Reading::Playback, 0)
+            .reader_on(
+                &0,
+                (0, 0),
+                crate::retention::owner::Reading::Playback,
+                crate::piece_store::Buffering::default(),
+            )
             .expect("an entity");
         first.promises(0..1);
         let enginefs = Arc::new(enginefs);
@@ -14161,7 +14219,12 @@ mod tests {
         engine.begin_retention(0).await;
         let before = engine
             .retention
-            .reader_on(&0, (0, 0), crate::retention::owner::Reading::Playback, 0)
+            .reader_on(
+                &0,
+                (0, 0),
+                crate::retention::owner::Reading::Playback,
+                crate::piece_store::Buffering::default(),
+            )
             .expect("an entity");
         before.promises(0..1);
         // A subtitle opened beside the film.
@@ -14217,7 +14280,12 @@ mod tests {
         enginefs.live().open(torrent(1), false);
         let reader = engine
             .retention
-            .reader_on(&1, (1, 0), crate::retention::owner::Reading::Playback, 0)
+            .reader_on(
+                &1,
+                (1, 0),
+                crate::retention::owner::Reading::Playback,
+                crate::piece_store::Buffering::default(),
+            )
             .expect("file 1 has an entity");
         reader.promises(0..1);
         drop(registry);
@@ -14260,7 +14328,12 @@ mod tests {
         // delivering this file.
         let reader = engine
             .retention
-            .reader_on(&0, (0, 0), crate::retention::owner::Reading::Playback, 0)
+            .reader_on(
+                &0,
+                (0, 0),
+                crate::retention::owner::Reading::Playback,
+                crate::piece_store::Buffering::default(),
+            )
             .expect("file 0 has an entity");
         reader.promises(0..1);
         nothing_torrent_is_playing(&enginefs);

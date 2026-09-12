@@ -195,7 +195,52 @@ pub struct Buffering {
     /// bytes. Zero when none is open, which is every entity nothing has
     /// read yet.
     pub lookahead_bytes: u64,
+    /// How many seconds of this stream the window's forward reach may buy,
+    /// or `None` for no time cap at all -- the `Maximum` buffer profile,
+    /// which asks for the whole file.
+    ///
+    /// **This is the user's decision and the disk is only the ceiling.**
+    /// Sized from the budget alone, the forward reach is a fixed fraction
+    /// of `cacheSize`, so a viewer who gave the app a bigger cache bought a
+    /// bigger mobile-data bill without being asked. It binds only once
+    /// [`Self::bytes_per_second`] is known.
+    pub window_seconds: Option<u64>,
+    /// How many seconds of watched video the committed set may hold, or
+    /// `None` for no cap.
+    ///
+    /// The committed set is what a peer may be offered and what a scan back
+    /// is served from; both want the recent past, not half the volume. Half
+    /// the budget is what it used to be, which on a small cache is the half
+    /// the forward buffer needed.
+    pub committed_seconds: Option<u64>,
+    /// The rate bytes are really leaving the server at for this entity,
+    /// smoothed, or `None` before anything has been measured.
+    ///
+    /// **An observation and not a bitrate.** It is what the reader is being
+    /// handed per second, which starts at whatever the swarm can give while
+    /// the player fills its own cache and settles on the real bitrate once
+    /// that cache is full. Until there is one, the two time caps do not
+    /// apply at all and the byte arithmetic below stands on its own.
+    pub bytes_per_second: Option<u64>,
 }
+
+impl Buffering {
+    /// Bytes `seconds` of this stream comes to, or `None` with no measured
+    /// rate to convert it at.
+    fn over(&self, seconds: u64) -> Option<u64> {
+        self.bytes_per_second
+            .map(|rate| rate.saturating_mul(seconds))
+    }
+}
+
+/// The smallest a time cap may come to, whatever the measured rate says.
+///
+/// A cap is a promise about playback, and ninety seconds of a 2 Mbps
+/// talking-heads documentary is twenty-two megabytes -- enough buffer for a
+/// good connection and nothing at all for a bad one, where the cost of
+/// having fetched more is only disk we had anyway. So the cap never falls
+/// below this, and the budget is still what bounds it from above.
+const SMALLEST_TIME_CAP_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The smallest window whose forward reach ([`RetentionPolicy::ahead_of`])
 /// covers `bytes`.
@@ -207,16 +252,19 @@ pub struct Buffering {
 /// to cover, which is the whole of what it is for.
 fn window_for_reach(bytes: u64, piece_length: u64) -> u32 {
     debug_assert!(piece_length > 0, "a piece length of zero");
-    let pieces = bytes.div_ceil(piece_length.max(1));
-    // `reach(w) = w - w * BEHIND_PERCENT / 100` is monotonic in `w`, and
-    // the closed form is a lower bound that integer division can leave one
-    // piece short, so it is checked rather than trusted.
-    let mut window = pieces
-        .saturating_mul(100)
-        .div_ceil(100 - BEHIND_PERCENT)
-        .min(u64::from(u32::MAX));
-    while window < u64::from(u32::MAX) && window - window * BEHIND_PERCENT / 100 < pieces {
-        window += 1;
+    let pieces = bytes.div_ceil(piece_length.max(1)).min(u64::from(u32::MAX));
+    // `reach(w) = w - w * BEHIND_PERCENT / 100` is non-decreasing in `w`,
+    // so this is a search and not a formula: a closed form has to round,
+    // and rounding the wrong way costs a whole piece of window at every
+    // budget. Climb by the deficit, which converges in a few steps, then
+    // walk back to the least window that still covers it.
+    let reach = |window: u64| window - window * BEHIND_PERCENT / 100;
+    let mut window = pieces;
+    while window < u64::from(u32::MAX) && reach(window) < pieces {
+        window = (window + (pieces - reach(window))).min(u64::from(u32::MAX));
+    }
+    while window > pieces && reach(window - 1) >= pieces {
+        window -= 1;
     }
     window as u32
 }
@@ -292,6 +340,15 @@ pub struct Decision {
 #[derive(Debug, Clone)]
 pub struct RetentionPolicy {
     pieces: Range<u32>,
+    /// What this policy was built from, so [`Self::observe`] can re-shape
+    /// it under a rate that was not known when it was built. None of them
+    /// is ever re-read from the world: a second reading of the budget that
+    /// disagreed with the published one would size the two halves of the
+    /// cache against different numbers.
+    budget_bytes: u64,
+    piece_length: u64,
+    bytes: u64,
+    share: Share,
     shape: Shape,
     committed: BTreeSet<u32>,
     /// The window the previous [`Self::advance`] chose, and the whole of what
@@ -367,6 +424,10 @@ impl RetentionPolicy {
         let covered = pieces.start..pieces.start;
         Ok(Self {
             pieces,
+            budget_bytes,
+            piece_length,
+            bytes,
+            share,
             shape: Self::shape_for(budget_bytes, piece_length, bytes, share, buffering),
             committed: BTreeSet::new(),
             covered,
@@ -404,11 +465,80 @@ impl RetentionPolicy {
         // disk that can never come back under its budget. See
         // [`Buffering`].
         let floor = window_for_reach(buffering.lookahead_bytes, piece_length);
-        let window = (budget - share.committed_of(budget)).max(floor);
+        // Three numbers, composed in one order: what the disk can hold,
+        // what the viewer asked for in time, and what an open stream is
+        // already fetching.
+        // What the committed set could want, capped by time before the
+        // window is sized: the rest of the budget is the window's, so a
+        // profile with no time cap of its own (`Maximum`) takes everything
+        // sharing does not need rather than stopping at half.
+        let committed_cap = buffering
+            .committed_seconds
+            .and_then(|seconds| buffering.over(seconds))
+            .map(|bytes| (bytes / piece_length) as u32);
+        let wants_committed = share.committed_of(budget);
+        let mut window = budget - wants_committed.min(committed_cap.unwrap_or(wants_committed));
+        if let Some(cap) = buffering
+            .window_seconds
+            .and_then(|seconds| buffering.over(seconds))
+            .map(|bytes| window_for_reach(bytes.max(SMALLEST_TIME_CAP_BYTES), piece_length))
+        {
+            if cap < floor {
+                // The floor is bigger than the time the design wants to
+                // buffer, which means MAX_SEEK_HOT_WINDOW_BYTES is. The
+                // alternative to letting the floor win is a stream fetching
+                // exactly what the pass then deletes, so it wins -- and the
+                // fact is said out loud, because it is a statement about
+                // the constants and not about this file.
+                tracing::info!(
+                    floor_pieces = floor,
+                    cap_pieces = cap,
+                    seconds = buffering.window_seconds,
+                    bytes_per_second = buffering.bytes_per_second,
+                    "a stream's lookahead is wider than the time cap the buffer profile asks for; the lookahead wins"
+                );
+            }
+            window = window.min(cap);
+        }
+        let window = window.max(floor);
+        // And what is left of the budget may be shared, for as much of it
+        // as time allows. The rest is simply not used: an unfilled cache
+        // costs nothing, and a starved forward buffer costs a stall.
+        let mut committed = budget.saturating_sub(window).min(wants_committed);
+        if let Some(cap) = committed_cap {
+            committed = committed.min(cap);
+        }
         Shape::Split {
             window,
-            committed: budget.saturating_sub(window),
+            committed: if share == Share::Nothing {
+                0
+            } else {
+                committed
+            },
         }
+    }
+
+    /// Re-shape under what the entity's readers are doing now -- a rate
+    /// that has been measured since this policy was built, a reader that
+    /// has opened or ended -- and say whether anything moved.
+    ///
+    /// The budget, the file and the share are this policy's own and are not
+    /// re-read: a budget that moves builds a new policy through
+    /// [`Self::carry_into`], which is where a committed set over the new
+    /// capacity is dealt with. Nothing here takes a committed piece away
+    /// (see [`Decision::committed`]); a capacity that shrinks under one
+    /// only stops the set growing.
+    pub fn observe(&mut self, buffering: Buffering) -> bool {
+        let shape = Self::shape_for(
+            self.budget_bytes,
+            self.piece_length,
+            self.bytes,
+            self.share,
+            buffering,
+        );
+        let moved = shape != self.shape;
+        self.shape = shape;
+        moved
     }
 
     /// The pieces of the file this policy governs.
@@ -680,6 +810,188 @@ mod tests {
         }
     }
 
+    /// A ten-gigabyte cache, a 16 GiB film, and a stream delivering three
+    /// mebibytes a second: the shape the three bounds compose to.
+    fn timed(buffering: Buffering) -> Shape {
+        const MIB: u64 = 1 << 20;
+        let piece = 4 * MIB;
+        RetentionPolicy::new(
+            10 * 1024 * MIB,
+            piece,
+            0..4000,
+            4000 * piece,
+            Share::Half,
+            buffering,
+        )
+        .expect("a consistent file")
+        .shape()
+    }
+
+    fn watching(rate_mib: u64, seconds: Option<u64>) -> Buffering {
+        const MIB: u64 = 1 << 20;
+        Buffering {
+            lookahead_bytes: 0,
+            window_seconds: seconds,
+            committed_seconds: Some(90),
+            bytes_per_second: Some(rate_mib * MIB),
+        }
+    }
+
+    /// **A bigger disk cache must not silently buy a bigger data bill.**
+    ///
+    /// Sized from the budget alone, the forward reach is 45% of
+    /// `cacheSize`: a viewer who gave the app ten gigabytes got a
+    /// five-gigabyte window and fetched it over whatever connection they
+    /// were on. What a buffer is *for* is measured in seconds of the film,
+    /// so that is the unit the cap is stated in, converted at the rate
+    /// bytes are really going out.
+    #[test]
+    fn the_window_is_bounded_by_the_seconds_of_stream_it_buys() {
+        assert_eq!(
+            timed(watching(3, Some(90))),
+            Shape::Split {
+                window: 75,
+                committed: 67
+            },
+            "ninety seconds of forward reach and ninety of sharing: 568 MiB of a 10 GiB cache, \
+             and the rest simply not used"
+        );
+        assert_eq!(
+            timed(watching(3, Some(4 * 60))),
+            Shape::Split {
+                window: 199,
+                committed: 67
+            },
+            "the Large profile buys four minutes of the same stream"
+        );
+    }
+
+    /// **`Maximum` has no time cap: it is the whole file while you are
+    /// watching it.**
+    ///
+    /// Where the budget covers the film that is [`Shape::Whole`] and
+    /// nothing is bounded at all. Where it does not, it is the widest
+    /// window the budget allows -- everything sharing does not need, rather
+    /// than the half a budget-sized split would leave.
+    #[test]
+    fn the_maximum_profile_asks_for_the_file_and_not_for_a_number_of_seconds() {
+        assert_eq!(
+            timed(watching(3, None)),
+            Shape::Split {
+                window: 2493,
+                committed: 67
+            },
+            "no cap on the window, and it takes everything the committed set does not"
+        );
+        const MIB: u64 = 1 << 20;
+        let piece = 4 * MIB;
+        let whole = RetentionPolicy::new(
+            10 * 1024 * MIB,
+            piece,
+            0..2000,
+            2000 * piece,
+            Share::Half,
+            watching(3, None),
+        )
+        .expect("a consistent file");
+        assert_eq!(
+            whole.shape(),
+            Shape::Whole,
+            "and a film the budget covers is kept and shared whole, as it always was"
+        );
+    }
+
+    /// **Where the floor and the cap disagree, the floor wins.**
+    ///
+    /// The alternative is a stream fetching exactly what the pass then
+    /// deletes. It says something true when it happens -- that
+    /// `MAX_SEEK_HOT_WINDOW_BYTES` is wider than the time the profile wants
+    /// to buffer -- which is why the policy says it out loud.
+    #[test]
+    fn a_lookahead_wider_than_the_time_cap_wins_over_it() {
+        const MIB: u64 = 1 << 20;
+        assert_eq!(
+            timed(Buffering {
+                lookahead_bytes: 600 * MIB,
+                ..watching(3, Some(90))
+            }),
+            Shape::Split {
+                window: 166,
+                committed: 67
+            },
+            "the window holds the 600 MiB an open stream is fetching, not the 90 seconds asked for"
+        );
+    }
+
+    /// **With no rate measured, the byte arithmetic stands on its own.**
+    ///
+    /// A cap in seconds needs a rate to be a number of bytes, and there is
+    /// none until a stream has delivered for a few seconds. Until then the
+    /// shape is exactly what it was before any of this: half the budget to
+    /// the window, half to sharing.
+    #[test]
+    fn a_stream_with_no_measured_rate_falls_back_to_the_budget() {
+        assert_eq!(
+            timed(Buffering {
+                window_seconds: Some(90),
+                committed_seconds: Some(90),
+                ..Buffering::default()
+            }),
+            Shape::Split {
+                window: 1280,
+                committed: 1280
+            },
+            "no rate, no time cap: the budget halved, as before"
+        );
+    }
+
+    /// **A rate measured after the policy was built re-shapes it in
+    /// place.**
+    ///
+    /// The rate is not knowable at the open -- nothing has been delivered
+    /// yet -- so the shape the first passes run under is the fallback one,
+    /// and the pass is what folds the measurement in
+    /// (`State::advance`). Nothing else about the policy is re-read: the
+    /// budget is the publisher's, and a budget that moves builds a new
+    /// policy.
+    #[test]
+    fn a_policy_re_shapes_when_a_rate_is_measured_under_it() {
+        const MIB: u64 = 1 << 20;
+        let piece = 4 * MIB;
+        let mut p = RetentionPolicy::new(
+            10 * 1024 * MIB,
+            piece,
+            0..4000,
+            4000 * piece,
+            Share::Half,
+            Buffering {
+                window_seconds: Some(90),
+                committed_seconds: Some(90),
+                ..Buffering::default()
+            },
+        )
+        .expect("a consistent file");
+        assert_eq!(
+            p.shape(),
+            Shape::Split {
+                window: 1280,
+                committed: 1280
+            }
+        );
+        assert!(p.observe(watching(3, Some(90))), "the shape moved");
+        assert_eq!(
+            p.shape(),
+            Shape::Split {
+                window: 75,
+                committed: 67
+            }
+        );
+        assert!(
+            !p.observe(watching(3, Some(90))),
+            "and the same reading again moves nothing"
+        );
+    }
+
     /// **The window never reaches less far than a stream already open on
     /// the file is fetching.**
     ///
@@ -731,6 +1043,7 @@ mod tests {
                     Share::Half,
                     Buffering {
                         lookahead_bytes: granted,
+                        ..Buffering::default()
                     },
                 )
                 .expect("a consistent file");
@@ -754,6 +1067,7 @@ mod tests {
     fn the_committed_half_yields_to_the_windows_floor() {
         let buffering = Buffering {
             lookahead_bytes: 9 * PIECE,
+            ..Buffering::default()
         };
         let roomy = RetentionPolicy::new(
             40 * PIECE,
@@ -785,7 +1099,7 @@ mod tests {
         assert_eq!(
             tight.shape(),
             Shape::Split {
-                window: 10,
+                window: 9,
                 committed: 0
             },
             "the window takes the whole budget and then some, and the committed half is nothing"

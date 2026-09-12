@@ -449,6 +449,12 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         )
     }
 
+    /// How far into the file the reader is. The entity is the file, so
+    /// this is the file's own offset and not the torrent's.
+    fn offset_of(_domain: &FileDomain, (_file, offset): (usize, u64)) -> u64 {
+        offset
+    }
+
     /// The torrent piece a reader at `offset` of `file` is sitting on.
     /// Always `Some`: a file's entity hears only its own bytes -- the
     /// [`FileHandle`]'s reader is on the file it reads, and the tests'
@@ -1992,6 +1998,7 @@ impl<H: TorrentHandle> Engine<H> {
                 start_offset,
                 intent,
                 lookahead_bytes,
+                buffer,
             },
         ))
     }

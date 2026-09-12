@@ -10,6 +10,17 @@ pub const MAX_CONTAINER_METADATA_WINDOW_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_DOWNLOAD_RANGE_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
 pub const SMALL_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
+/// How many seconds of watched video the committed set may hold, whatever
+/// the buffer profile.
+///
+/// The committed set is what we offer a peer, and what a peer or a scan
+/// back really wants is the recent past, not half the disk. Sized from the
+/// budget alone it was `cacheSize / 2` -- 151 MB on the field device, about
+/// fifty-one seconds of a 23 Mbps film, so it was most of the way full
+/// inside half a minute and the forward buffer had the other half of the
+/// disk and no more. Time is the unit that says what it is for.
+pub const COMMITTED_SECONDS: u64 = 90;
+
 /// Start treating reads as "container metadata" when they fall in the last 10MB
 /// or the last 5% of the file, whichever starts earlier.
 pub fn container_metadata_start(file_size: u64) -> u64 {
@@ -45,15 +56,38 @@ pub fn is_container_metadata_request(start: u64, requested_len: u64, file_size: 
 /// makes playback start quickly, and widening it would spend that latency to
 /// buy read-ahead the very next request already provides. Every profile
 /// starts a stream the same way and differs only once bytes are flowing.
+///
+/// **It is also how long the retention window may be, in time**
+/// ([`Self::window_seconds`]). Sized from the disk alone, the forward reach
+/// is a fraction of `cacheSize`, so a viewer who gave the app a bigger cache
+/// silently bought a bigger mobile-data bill: the window fetched what the
+/// disk could hold rather than what the playback needed. The profile says
+/// how many seconds of *this stream* the buffer is worth, measured from the
+/// rate bytes really leave the server at, and the disk is only the ceiling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum BufferProfile {
-    /// Today's behaviour, and the default.
+    /// About a minute and a half of the stream buffered ahead, and today's
+    /// read-ahead cap. The default.
     #[default]
     Normal,
-    /// Twice the playback read-ahead.
+    /// About four minutes ahead, and twice the playback read-ahead.
     Large,
-    /// Four times the playback read-ahead.
+    /// **The whole file, while you are watching it**, where the cache
+    /// budget covers it -- there is no time cap at all -- and the widest
+    /// window the budget allows where it does not. Four times the playback
+    /// read-ahead.
+    ///
+    /// **Maximum is for this viewing; a pin is for later.** The retention
+    /// owner takes these bytes back as soon as the stream is not the live
+    /// one, or the volume needs the room; a pin survives a restart and the
+    /// launch sweep spares it. That is the whole difference, and it is the
+    /// reason this profile is worth having rather than being a bigger
+    /// number.
+    ///
+    /// On a metered connection it means the whole film over mobile data,
+    /// and downloading is not what the sharing switch governs. Whoever
+    /// picks it is choosing that, so the setting has to say so.
     Maximum,
 }
 
@@ -92,6 +126,23 @@ impl BufferProfile {
 
     /// Scale a playback read-ahead window in bytes. Saturating, so no profile
     /// can wrap a large window round to a small one.
+    /// How many seconds of the stream the retention window's forward reach
+    /// may buy, or `None` for [`Self::Maximum`], which asks for the file.
+    ///
+    /// The unit is the one the viewer chose in: "how much of this film do I
+    /// want in hand", not "what fraction of my disk". The bytes it comes to
+    /// are the measured delivery rate times this, floored at
+    /// `SMALLEST_TIME_CAP_BYTES` so a low-bitrate stream still gets a
+    /// sensible buffer, and it is only ever a *cap* -- the budget and the
+    /// lookahead floor still bound it from the other side.
+    pub const fn window_seconds(self) -> Option<u64> {
+        match self {
+            Self::Normal => Some(90),
+            Self::Large => Some(4 * 60),
+            Self::Maximum => None,
+        }
+    }
+
     pub const fn scale_playback_window(self, bytes: u64) -> u64 {
         bytes.saturating_mul(self.window_scale())
     }

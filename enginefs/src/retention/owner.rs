@@ -339,6 +339,11 @@ pub trait Backing: Sized + Send + Sync + 'static {
         budget: u64,
         buffering: Buffering,
     ) -> anyhow::Result<RetentionPolicy>;
+    /// How many bytes into the entity `at` is. Pure, and monotonic with
+    /// the position: it is differenced against the last one to measure how
+    /// fast bytes are really going out ([`DeliveryRate`]), so it has to be
+    /// the offset in the thing being read and not an index into it.
+    fn offset_of(domain: &Self::Domain, at: Self::Position) -> u64;
     /// The index `at` lands on under `domain`, clamped to the last, or
     /// `None` when the position names nothing in this domain's index space.
     /// An entity only ever hears its own bytes -- a [`Reader`] is opened on
@@ -713,28 +718,94 @@ struct ReaderState<B: Backing> {
     /// The piece this reader's last pass ran at, so one reader playing on
     /// does not spend another's throttle.
     passed_at: Option<u32>,
-    /// The stream lookahead this read was granted when it opened, in
-    /// bytes, and zero for a backing that grants none (the proxy: a
-    /// proxied body is fetched by its own response and reads nothing
-    /// ahead).
+    /// What this read asks of the cache: the stream lookahead it was
+    /// granted when it opened, and the seconds its buffer profile wants
+    /// held. Zero and `None` for a backing that grants neither (the proxy:
+    /// a proxied body is fetched by its own response and reads nothing
+    /// ahead, and its viewer chooses no profile).
     ///
-    /// The window may never be sized under the largest of these; see
+    /// The window may never be sized under the largest lookahead here; see
     /// [`Buffering`]. It is what the reader was *granted*, which is already
     /// cut to the window's forward reach at the open, so it binds only when
     /// the budget moves under a reader that is already open.
-    lookahead_bytes: u64,
+    /// [`Buffering::bytes_per_second`] is not this read's to state and is
+    /// always `None` in it; it is measured, below.
+    buffering: Buffering,
+    /// How fast bytes are really going out of this read.
+    rate: DeliveryRate,
+}
+
+/// The rate one read is delivering at, smoothed.
+///
+/// **What the server can see, which is not the media's bitrate.** It is
+/// what a player is being handed per second: whatever the swarm can give
+/// while the player fills its own cache, settling on the real bitrate once
+/// that cache is full and the player is reading only as fast as it plays.
+/// That settled value is the one the time caps want, and the transient
+/// above it errs towards a bigger buffer, which is the safe direction.
+///
+/// Measured from delivered bytes and nothing else: a `Range` header is a
+/// request, not a delivery. A read that goes backwards starts the
+/// measurement again rather than reporting a negative second -- a seek is
+/// not a rate.
+#[derive(Debug, Clone, Copy, Default)]
+struct DeliveryRate {
+    /// Where and when the last sample was taken.
+    since: Option<(u64, std::time::Instant)>,
+    /// The smoothed rate, once two samples far enough apart exist.
+    bytes_per_second: Option<u64>,
+}
+
+/// How far apart two readings have to be to be a sample. Short enough to
+/// settle within a few seconds of a stream starting, long enough that one
+/// burst of a slow player's reads is not read as the rate.
+const RATE_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The weight a fresh sample carries, in tenths.
+const RATE_SMOOTHING_TENTHS: u64 = 3;
+
+impl DeliveryRate {
+    /// A byte really went out, at `offset`, at `now`.
+    fn note(&mut self, offset: u64, now: std::time::Instant) {
+        let Some((was, at)) = self.since else {
+            self.since = Some((offset, now));
+            return;
+        };
+        if offset < was {
+            // A seek back. The bytes in between were not delivered now and
+            // the elapsed time is not this read's.
+            self.since = Some((offset, now));
+            return;
+        }
+        let elapsed = now.saturating_duration_since(at);
+        if elapsed < RATE_SAMPLE_INTERVAL {
+            return;
+        }
+        let sample = ((offset - was) as f64 / elapsed.as_secs_f64()) as u64;
+        self.bytes_per_second = Some(match self.bytes_per_second {
+            Some(smoothed) => {
+                smoothed
+                    .saturating_mul(10 - RATE_SMOOTHING_TENTHS)
+                    .saturating_add(sample.saturating_mul(RATE_SMOOTHING_TENTHS))
+                    / 10
+            }
+            None => sample,
+        });
+        self.since = Some((offset, now));
+    }
 }
 
 impl<B: Backing> ReaderState<B> {
     /// A read just opened: nothing delivered, nothing promised.
-    fn opened(reading: Reading, opened_at: Option<B::Position>, lookahead_bytes: u64) -> Self {
+    fn opened(reading: Reading, opened_at: Option<B::Position>, buffering: Buffering) -> Self {
         Self {
             playhead: None,
             opened_at,
             reading,
             promised: 0..0,
             passed_at: None,
-            lookahead_bytes,
+            buffering,
+            rate: DeliveryRate::default(),
         }
     }
 
@@ -997,8 +1068,9 @@ impl<B: Backing> Retention<B> {
             opened_at: None,
             // A proxied body is fetched by its own response and reads
             // nothing ahead of the bytes it is relaying, so there is no
-            // lookahead the window has to hold.
-            lookahead_bytes: 0,
+            // lookahead the window has to hold, and its viewer chooses no
+            // buffer profile.
+            buffering: Buffering::default(),
         }
     }
 
@@ -1010,10 +1082,10 @@ impl<B: Backing> Retention<B> {
     /// only, no I/O.
     ///
     /// `at` is where the read was opened, `reading` what it is for and
-    /// `lookahead_bytes` the stream lookahead it was granted -- the window
-    /// may never be sized under that ([`Buffering`]). The first two are
-    /// recorded here, at the open, rather than waiting for a delivered
-    /// byte: the policy is installed before this is called, so the very
+    /// `buffering` what it asks of the cache -- the lookahead it was
+    /// granted and the seconds its buffer profile wants held
+    /// ([`Buffering`]). The first two are recorded here, at the open,
+    /// rather than waiting for a delivered byte: the policy is installed before this is called, so the very
     /// first pass over the entity can draw its window round a read that is
     /// still parked on its first piece, and a probe never gets to claim the
     /// entity's head at all.
@@ -1022,7 +1094,7 @@ impl<B: Backing> Retention<B> {
         key: &B::Key,
         at: B::Position,
         reading: Reading,
-        lookahead_bytes: u64,
+        buffering: Buffering,
     ) -> Option<Reader<B>> {
         let entity = self.lookup(key)?;
         let id = ReaderId(self.next_reader.fetch_add(1, Ordering::Relaxed));
@@ -1030,14 +1102,14 @@ impl<B: Backing> Retention<B> {
             .state
             .lock()
             .readers
-            .insert(id, ReaderState::opened(reading, Some(at), lookahead_bytes));
+            .insert(id, ReaderState::opened(reading, Some(at), buffering));
         Some(Reader {
             owner: self.clone(),
             entity,
             id,
             reading,
             opened_at: Some(at),
-            lookahead_bytes,
+            buffering,
         })
     }
 
@@ -2091,14 +2163,39 @@ impl<B: Backing> State<B> {
     /// them. A reader that has ended is out of the map and out of this: its
     /// stream is not fetching anything.
     fn buffering(&self) -> Buffering {
-        Buffering {
-            lookahead_bytes: self
-                .readers
-                .values()
-                .map(|reader| reader.lookahead_bytes)
-                .max()
-                .unwrap_or(0),
+        let mut asked = Buffering::default();
+        // No reader at all asks for no time cap, which is the shape that
+        // leaves the byte arithmetic alone: an entity nothing is reading is
+        // not one to start capping in seconds.
+        let mut any = false;
+        for reader in self.readers.values() {
+            asked.lookahead_bytes = asked.lookahead_bytes.max(reader.buffering.lookahead_bytes);
+            // The most generous profile in force wins, and `None` -- the
+            // whole file -- beats every number: a second reader asking for
+            // less must not shrink the window under the one already open.
+            asked.window_seconds =
+                match (any, asked.window_seconds, reader.buffering.window_seconds) {
+                    (false, _, seconds) => seconds,
+                    (true, Some(a), Some(b)) => Some(a.max(b)),
+                    _ => None,
+                };
+            asked.committed_seconds =
+                match (asked.committed_seconds, reader.buffering.committed_seconds) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (a, b) => a.or(b),
+                };
+            any = true;
         }
+        // The rate is the playing reads': a probe walks the file at
+        // whatever the swarm gives and says nothing about how fast the film
+        // is being watched.
+        asked.bytes_per_second = self
+            .readers
+            .values()
+            .filter(|reader| reader.reading == Reading::Playback)
+            .filter_map(|reader| reader.rate.bytes_per_second)
+            .max();
+        asked
     }
 
     /// The head a pass for `about` is about: that reader's own head while
@@ -2334,6 +2431,18 @@ impl<B: Backing> State<B> {
         at: u32,
         held: &BTreeSet<u32>,
     ) -> Option<(Decision, RetentionPolicy)> {
+        // Under what the readers are doing *now*, before the decision: the
+        // delivery rate the time caps are sized from is not known when the
+        // policy is built, and a reader that opened or ended since changes
+        // what the window has to hold. The budget is not re-read -- a
+        // budget that moves builds a new policy under the turn.
+        let buffering = self.buffering();
+        let installed = self.installed.as_mut()?;
+        if installed.policy.observe(buffering)
+            && let Shape::Split { window, .. } = installed.policy.shape()
+        {
+            self.stride = stride_for::<B>(window);
+        }
         let installed = self.installed.as_mut()?;
         let decision = installed.policy.advance(at, held);
         Some((decision, installed.policy.clone()))
@@ -2482,9 +2591,8 @@ pub struct Reader<B: Backing> {
     reading: Reading,
     /// Where this read was opened; see [`ReaderState::opened_at`].
     opened_at: Option<B::Position>,
-    /// The stream lookahead this read was granted; see
-    /// [`ReaderState::lookahead_bytes`].
-    lookahead_bytes: u64,
+    /// What this read asks of the cache; see [`ReaderState::buffering`].
+    buffering: Buffering,
 }
 
 impl<B: Backing> Reader<B> {
@@ -2500,9 +2608,7 @@ impl<B: Backing> Reader<B> {
         state
             .readers
             .entry(self.id)
-            .or_insert_with(|| {
-                ReaderState::opened(self.reading, self.opened_at, self.lookahead_bytes)
-            })
+            .or_insert_with(|| ReaderState::opened(self.reading, self.opened_at, self.buffering))
             .promised = pieces;
     }
 
@@ -2530,6 +2636,12 @@ impl<B: Backing> Reader<B> {
     /// `None` is a pass in flight, and the pass's conclusion asks the same
     /// head again.
     pub fn note(&self, at: B::Position) -> Option<Claim> {
+        self.note_at(at, std::time::Instant::now())
+    }
+
+    /// [`Self::note`] with the clock handed in, so a test can put two
+    /// deliveries a measurable distance apart without waiting.
+    fn note_at(&self, at: B::Position, now: std::time::Instant) -> Option<Claim> {
         let budget = self.owner.budget.get();
         let (claim, refused) = {
             let mut state = self.entity.state.lock();
@@ -2543,11 +2655,15 @@ impl<B: Backing> Reader<B> {
                 None
             };
             let index = B::index_of(&state.domain, at);
+            let offset = B::offset_of(&state.domain, at);
             let (bounded, stride) = (state.installed.is_some(), state.stride);
             let reader = state.readers.entry(self.id).or_insert_with(|| {
-                ReaderState::opened(self.reading, self.opened_at, self.lookahead_bytes)
+                ReaderState::opened(self.reading, self.opened_at, self.buffering)
             });
             reader.playhead = Some(at);
+            // The byte really went out, so this is a delivery and not a
+            // request: the only reading the window's time cap is sized from.
+            reader.rate.note(offset, now);
             let due = match index {
                 Some(index) => {
                     // Delivered is no longer promised: the piece went out
@@ -2973,6 +3089,10 @@ mod tests {
                 S::SHARE,
                 buffering,
             )
+        }
+
+        fn offset_of(_domain: &FakeDomain, (_file, offset): At) -> u64 {
+            offset
         }
 
         fn index_of(domain: &FakeDomain, (file, offset): At) -> Option<u32> {
@@ -3688,7 +3808,7 @@ mod tests {
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         let opens = owner.opens_of(&0);
         let reader = owner
-            .reader_on(&0, (0, 0), Reading::Playback, 0)
+            .reader_on(&0, (0, 0), Reading::Playback, Buffering::default())
             .expect("the entity the install made");
         assert!(
             reader.note((0, 0)).is_none(),
@@ -4066,7 +4186,7 @@ mod tests {
             "opened, nothing read"
         );
         let reader = owner
-            .reader_on(&0, (0, 0), Reading::Playback, 0)
+            .reader_on(&0, (0, 0), Reading::Playback, Buffering::default())
             .expect("the entity");
         assert!(reader.note((0, 0)).is_none());
         assert_eq!(owner.readers_and_opens_of(&0), (1, 1), "a read delivering");
@@ -4101,7 +4221,7 @@ mod tests {
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         let opens = owner.opens_of(&0);
         let reader = owner
-            .reader_on(&0, (0, 0), Reading::Playback, 0)
+            .reader_on(&0, (0, 0), Reading::Playback, Buffering::default())
             .expect("the entity the install made");
         assert_eq!(owner.readers_of(&0), 0, "it has delivered nothing");
 
@@ -4961,13 +5081,15 @@ mod tests {
         let (backing, owner, _budget) = torrent();
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         let first = owner
-            .reader_on(&0, (0, 0), Reading::Playback, 0)
+            .reader_on(&0, (0, 0), Reading::Playback, Buffering::default())
             .expect("the entity install made");
         let second = owner
-            .reader_on(&0, (0, 6 * PIECE), Reading::Playback, 0)
+            .reader_on(&0, (0, 6 * PIECE), Reading::Playback, Buffering::default())
             .expect("the same entity");
         assert!(
-            owner.reader_on(&9, (9, 0), Reading::Playback, 0).is_none(),
+            owner
+                .reader_on(&9, (9, 0), Reading::Playback, Buffering::default())
+                .is_none(),
             "a reader was opened on a key with no entity"
         );
         assert_eq!(
@@ -5039,7 +5161,7 @@ mod tests {
         let (backing, owner, _budget) = torrent();
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         let playing = owner
-            .reader_on(&0, (0, 0), Reading::Playback, 0)
+            .reader_on(&0, (0, 0), Reading::Playback, Buffering::default())
             .expect("the entity the install made");
         assert!(
             playing.note((0, 0)).is_none(),
@@ -5048,7 +5170,7 @@ mod tests {
         {
             // mpv's read of the Cues at the tail: it delivers, and it ends.
             let probe = owner
-                .reader_on(&0, (0, 7 * PIECE), Reading::Probe, 0)
+                .reader_on(&0, (0, 7 * PIECE), Reading::Probe, Buffering::default())
                 .expect("the same entity");
             assert!(probe.note((0, 7 * PIECE)).is_none());
             assert_eq!(
@@ -5084,6 +5206,70 @@ mod tests {
         );
     }
 
+    /// **The delivery rate a read is really getting reaches the policy, and
+    /// the pass is what folds it in.**
+    ///
+    /// Nothing knows the rate when the policy is built -- no byte has gone
+    /// out -- so the first passes run on the byte arithmetic and the shape
+    /// changes under the measurement. Two deliveries far enough apart are
+    /// one sample; `note_at` is what lets a test put them there without
+    /// waiting three seconds.
+    #[tokio::test]
+    async fn a_measured_delivery_rate_re_shapes_the_policy_at_the_next_pass() {
+        let (_backing, owner, budget) = torrent();
+        // A roomy budget over a small file, so the time cap is the only
+        // thing that can bind: eight pieces of a thousand bytes, six of
+        // which the budget covers.
+        budget.set(Some(6 * PIECE));
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        let reader = owner
+            .reader_on(
+                &0,
+                (0, 0),
+                Reading::Playback,
+                Buffering {
+                    // Ten seconds of a stream at the rate noted below is
+                    // one piece, and the smallest cap floors that at 64
+                    // MiB -- which is the whole file here, so the cap does
+                    // not bind and the shape is the budget's.
+                    window_seconds: Some(10),
+                    committed_seconds: Some(10),
+                    ..Buffering::default()
+                },
+            )
+            .expect("the entity the install made");
+        let shape = |owner: &Arc<Retention<Torrent>>| {
+            owner
+                .holding(&0)
+                .and_then(|holding| holding.installed)
+                .map(|installed| installed.shape)
+        };
+        assert_eq!(
+            shape(&owner),
+            Some(Shape::Split {
+                window: 3,
+                committed: 3
+            }),
+            "no rate yet: half the budget each"
+        );
+
+        // Two deliveries three seconds apart: 100 bytes a second.
+        let start = std::time::Instant::now();
+        reader.note_at((0, 0), start);
+        reader.note_at((0, 300), start + std::time::Duration::from_secs(3));
+        let claim = owner.turn(&0).await.expect("the turn");
+        owner.pass(&0, &(), claim, Mode::Live).await;
+        assert_eq!(
+            shape(&owner),
+            Some(Shape::Split {
+                window: 5,
+                committed: 1
+            }),
+            "ten seconds of a hundred bytes a second is a kilobyte, floored at the smallest \
+             cap -- so the committed set takes one piece and the window takes the rest"
+        );
+    }
+
     /// **A budget that shrinks under an open reader does not shrink the
     /// window under that reader's lookahead.**
     ///
@@ -5097,7 +5283,15 @@ mod tests {
         let (_backing, owner, budget) = torrent();
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         let _reader = owner
-            .reader_on(&0, (0, 0), Reading::Playback, 5 * PIECE)
+            .reader_on(
+                &0,
+                (0, 0),
+                Reading::Playback,
+                Buffering {
+                    lookahead_bytes: 5 * PIECE,
+                    ..Buffering::default()
+                },
+            )
             .expect("the entity the install made");
         // The volume filled: half the budget, published under the reader.
         budget.set(Some(2 * PIECE));
@@ -5127,12 +5321,12 @@ mod tests {
         let (backing, owner, _budget) = torrent();
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         let playing = owner
-            .reader_on(&0, (0, 0), Reading::Playback, 0)
+            .reader_on(&0, (0, 0), Reading::Playback, Buffering::default())
             .expect("the entity the install made");
         assert!(playing.note((0, 0)).is_none());
         // mpv's read of the Cues, still open while the tick runs.
         let probe = owner
-            .reader_on(&0, (0, 7 * PIECE), Reading::Probe, 0)
+            .reader_on(&0, (0, 7 * PIECE), Reading::Probe, Buffering::default())
             .expect("the same entity");
         assert!(probe.note((0, 7 * PIECE)).is_none());
 
@@ -5183,7 +5377,7 @@ mod tests {
         let (backing, owner, _budget) = torrent();
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         let reader = owner
-            .reader_on(&0, (0, 4 * PIECE), Reading::Playback, 0)
+            .reader_on(&0, (0, 4 * PIECE), Reading::Playback, Buffering::default())
             .expect("the entity the install made");
         assert_eq!(
             owner.readers_of(&0),
@@ -5225,10 +5419,10 @@ mod tests {
         let (backing, owner, _budget) = torrent();
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         let seeking = owner
-            .reader_on(&0, (0, 6 * PIECE), Reading::Playback, 0)
+            .reader_on(&0, (0, 6 * PIECE), Reading::Playback, Buffering::default())
             .expect("the entity the install made");
         let playing = owner
-            .reader_on(&0, (0, 0), Reading::Playback, 0)
+            .reader_on(&0, (0, 0), Reading::Playback, Buffering::default())
             .expect("the same entity");
         assert!(playing.note((0, 0)).is_none());
 
@@ -5262,7 +5456,7 @@ mod tests {
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         {
             let playing = owner
-                .reader_on(&0, (0, 0), Reading::Playback, 0)
+                .reader_on(&0, (0, 0), Reading::Playback, Buffering::default())
                 .expect("the entity the install made");
             assert!(playing.note((0, 5 * PIECE)).is_none());
         }
@@ -5271,7 +5465,7 @@ mod tests {
         // container read does. It does not take the window off it.
         {
             let probe = owner
-                .reader_on(&0, (0, 0), Reading::Probe, 0)
+                .reader_on(&0, (0, 0), Reading::Probe, Buffering::default())
                 .expect("the same entity");
             assert!(probe.note((0, 0)).is_none());
         }
@@ -5304,7 +5498,7 @@ mod tests {
         let (backing, owner, _budget) = torrent();
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         let probe = owner
-            .reader_on(&0, (0, 3 * PIECE), Reading::Probe, 0)
+            .reader_on(&0, (0, 3 * PIECE), Reading::Probe, Buffering::default())
             .expect("the entity the install made");
         assert!(probe.note((0, 3 * PIECE)).is_none());
         assert_eq!(
@@ -5349,7 +5543,7 @@ mod tests {
         let (backing, owner, _budget) = torrent();
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         let playing = owner
-            .reader_on(&0, (0, 0), Reading::Playback, 0)
+            .reader_on(&0, (0, 0), Reading::Playback, Buffering::default())
             .expect("the entity the install made");
         assert!(
             playing.note((0, 0)).is_none(),
@@ -5366,7 +5560,7 @@ mod tests {
             move |door: &Door<Torrent>| {
                 *held_open.lock() = Some(
                     owner
-                        .reader_on(&0, (0, 6 * PIECE), Reading::Probe, 0)
+                        .reader_on(&0, (0, 6 * PIECE), Reading::Probe, Buffering::default())
                         .expect("the same entity"),
                 );
                 seen.lock().push(door.windows_now());
