@@ -1798,6 +1798,95 @@ mod tests {
         );
     }
 
+    /// **A capacity that shrinks under the set does not drop what it
+    /// announced out of the draw.**
+    ///
+    /// [`RetentionPolicy::observe`] runs at the top of every pass and
+    /// re-draws whenever the capacity moves, which under a measured rate is
+    /// most passes. Lowest-rank-`count` is nested, so a shrink drops the
+    /// unchosen tail of the draw -- and a piece we have already announced is
+    /// in that tail as easily as any other. `advance` would not reclaim it,
+    /// because it tests the committed set first, but the moment the disk
+    /// loses the piece behind our back it leaves the committed set and the
+    /// draw no longer says to put it back: we withdraw a piece we announced
+    /// and then refuse to announce it again with the bytes in hand. So the
+    /// re-draw adopts whatever is committed, whatever the capacity says.
+    #[test]
+    fn a_capacity_that_shrinks_under_the_set_keeps_what_it_announced_in_the_draw() {
+        let mut p = policy(30, 500);
+        let mut disk: BTreeSet<u32> = BTreeSet::new();
+        play(&mut p, &mut disk, (0..300).step_by(3));
+        let announced = p.advertised().clone();
+        assert!(
+            announced.len() > 1,
+            "the walk has to announce more than the shrunk capacity: {announced:?}"
+        );
+
+        // A rate is measured, and ten seconds of it is one piece: the
+        // committed capacity falls to one, under a set of several.
+        p.observe(Buffering {
+            committed_seconds: Some(10),
+            bytes_per_second: Some(PIECE / 10),
+            ..Buffering::default()
+        });
+        assert_eq!(
+            *p.advertised(),
+            announced,
+            "a capacity that shrank took a piece back"
+        );
+
+        // The disk loses one of them behind our back and gets it back.
+        let lost = *announced.iter().next_back().expect("something announced");
+        disk.remove(&lost);
+        let d = p.advance(0, &disk);
+        assert_eq!(d.withdrawn, vec![lost], "the lost piece is withdrawn");
+        disk.insert(lost);
+        let d = p.advance(0, &disk);
+        assert!(
+            !d.reclaim.contains(&lost),
+            "a piece we announced was reclaimed once the capacity had shrunk under it"
+        );
+        assert!(
+            p.advertised().contains(&lost),
+            "a piece we announced is not announced again with its bytes back"
+        );
+    }
+
+    /// **And so does the carry onto a smaller budget.**
+    ///
+    /// [`RetentionPolicy::carry_into`] adopts the whole committed set, over
+    /// the new capacity and all, because there is no un-have. The draw the
+    /// new policy was built with knows nothing about it -- it is a fresh
+    /// `choose` at the smaller capacity -- so it adopts it too, for the same
+    /// reason [`RetentionPolicy::observe`] does.
+    #[test]
+    fn a_budget_that_shrinks_carries_what_was_announced_into_the_new_draw() {
+        let mut p = policy(30, 500);
+        let mut disk: BTreeSet<u32> = BTreeSet::new();
+        play(&mut p, &mut disk, (0..300).step_by(3));
+        let announced = p.advertised().clone();
+        assert!(announced.len() > 1, "nothing was announced to carry");
+
+        // The volume filled: a tenth of the budget, under the same file.
+        let mut next = policy(3, 500);
+        p.carry_into(&mut next);
+        assert_eq!(*next.advertised(), announced, "the carry lost a piece");
+
+        let lost = *announced.iter().next_back().expect("something announced");
+        disk.remove(&lost);
+        assert_eq!(next.advance(0, &disk).withdrawn, vec![lost]);
+        disk.insert(lost);
+        let d = next.advance(0, &disk);
+        assert!(
+            !d.reclaim.contains(&lost),
+            "the carried policy reclaimed a piece the old one had announced"
+        );
+        assert!(
+            next.advertised().contains(&lost),
+            "the carried policy will not announce again what it carried"
+        );
+    }
+
     /// **Two clients over one file keep different pieces.**
     ///
     /// That is the whole reason the draw is random rather than a rule. A

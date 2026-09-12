@@ -5419,6 +5419,83 @@ mod tests {
         );
     }
 
+    /// **A probe's delivery rate is not the film's.**
+    ///
+    /// The time caps ask how many bytes a second of this film comes to, and
+    /// only a read that is playing it can answer. A probe walks a region at
+    /// whatever the swarm gives -- mpv's read of the container index arrives
+    /// as fast as the peers can send it -- and taking the largest rate over
+    /// every open read would size the window off that burst, which is the
+    /// disk-shaped answer the time caps exist to replace.
+    #[tokio::test]
+    async fn the_time_caps_are_sized_from_a_playing_reads_rate_and_not_a_probes() {
+        let (_backing, owner, budget) = torrent();
+        budget.set(Some(6 * PIECE));
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        let asks = Buffering {
+            window_seconds: Some(10),
+            committed_seconds: Some(10),
+            ..Buffering::default()
+        };
+        let playing = owner
+            .reader_on(&0, (0, 0), Reading::Playback, asks)
+            .expect("the entity the install made");
+        let probe = owner
+            .reader_on(&0, (0, 0), Reading::Probe, asks)
+            .expect("the same entity");
+        let start = std::time::Instant::now();
+        let after = |seconds| start + std::time::Duration::from_secs(seconds);
+        // A hundred bytes a second of film, beside a probe pulling ten times
+        // that off the swarm.
+        playing.note_at((0, 0), start);
+        playing.note_at((0, 300), after(3));
+        probe.note_at((0, 0), start);
+        probe.note_at((0, 3000), after(3));
+
+        let claim = owner.turn(&0).await.expect("the turn");
+        owner.pass(&0, &(), claim, Mode::Live).await;
+        assert_eq!(
+            owner
+                .holding(&0)
+                .and_then(|holding| holding.installed)
+                .map(|installed| installed.shape),
+            Some(Shape::Split {
+                window: 5,
+                committed: 1
+            }),
+            "ten seconds of the film is one piece, whatever the probe is being handed"
+        );
+    }
+
+    /// **A read that goes backwards starts the measurement again.**
+    ///
+    /// A seek is not a rate. The offset is the only thing the measurement
+    /// has, so a playhead that moves back would otherwise be a negative
+    /// number of bytes over a real second -- which in a debug build is not a
+    /// wrong rate but a panic, and in a release build is a rate of about
+    /// eighteen exabytes a second and a window the size of the disk.
+    #[test]
+    fn a_read_that_goes_backwards_starts_the_delivery_rate_again() {
+        let mut rate = DeliveryRate::default();
+        let start = std::time::Instant::now();
+        let after = |seconds| start + std::time::Duration::from_secs(seconds);
+        rate.note(0, start);
+        rate.note(3000, after(3));
+        assert_eq!(rate.bytes_per_second, Some(1000), "a kilobyte a second");
+        rate.note(0, after(6));
+        assert_eq!(
+            rate.bytes_per_second,
+            Some(1000),
+            "the seek back is not a sample"
+        );
+        rate.note(3000, after(9));
+        assert_eq!(
+            rate.bytes_per_second,
+            Some(1000),
+            "and the next sample is measured from the seek, not across it"
+        );
+    }
+
     /// **A budget that shrinks under an open reader does not shrink the
     /// window under that reader's lookahead.**
     ///
