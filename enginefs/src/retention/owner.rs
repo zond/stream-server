@@ -2039,34 +2039,37 @@ impl<B: Backing> Retention<B> {
                     keep.push(run);
                 }
             }
-            // **What a read is actually blocked on comes first, alone.**
+            // **What a read is blocked on is wanted too, and never
+            // instead.**
             //
-            // A want-set is an order to the swarm, and an order for a
-            // thousand pieces is not an order at all: seventeen seeders
-            // delivering twelve megabytes a second took eighteen seconds to
-            // produce the one piece a player was parked on, because the
-            // other 1279 were equally wanted. Playing from an offset makes
-            // it three such waits in series -- the header, the container
-            // index at the far end, then the seek target -- which is the
-            // whole of a slow start.
+            // A piece a parked read is waiting for has to be in the
+            // want-set or nothing orders it, and that is what this is for.
+            // It was briefly the *whole* want-set -- order the piece the
+            // player is stuck on and nothing else -- and that made start-up
+            // five times worse, for a reason worth writing down: librqbit
+            // reserves a piece to exactly one peer (`PieceTracker::inflight`),
+            // and a second peer holding it can only take over by stealing,
+            // which wants a 3x or 10x speed advantage it has no way to
+            // demonstrate while it has nothing else to download. So a
+            // want-set of one piece is a download from one peer: measured in
+            // the field at 117 kB/s against 3.1 MB/s a minute later, with
+            // the same thirty seeders connected.
             //
-            // So while any read is parked on a piece the disk does not
-            // have, that piece and its fellows are the want-set, and the
-            // windows are not in it. Nothing competes with the bytes that
-            // are the difference between a picture and a spinner.
-            //
-            // It ends by itself, which is why it can be this blunt: a
-            // promise is made by a *parked* read and cleared by the byte
-            // that unparks it, so the moment the swarm delivers, the
-            // windows are wanted again. Nothing has to decide when
-            // start-up is over.
-            let blocked: Vec<Range<u32>> = promised
+            // Ordering is not selection. The piece under a parked read is
+            // already fetched first -- that is what the stream's own
+            // lookahead priority does -- and what the want-set decides is
+            // merely whether the other twenty-nine peers have anything to
+            // do while it happens.
+            let blocked = promised
                 .iter()
-                .filter(|range| (range.start..range.end).any(|piece| !held.contains(&piece)))
-                .cloned()
-                .collect();
-            if !blocked.is_empty() {
-                want = blocked;
+                .filter(|range| (range.start..range.end).any(|piece| !held.contains(&piece)));
+            for range in blocked {
+                if !want
+                    .iter()
+                    .any(|window| window.start <= range.start && window.end >= range.end)
+                {
+                    want.push(range.clone());
+                }
             }
             // What this pass has decided to take is what it will never put
             // back into what we announce; see [`State::doomed`]. Written
@@ -5959,17 +5962,17 @@ mod tests {
         drop(reader);
     }
 
-    /// **A read parked on a piece the disk does not have is the whole
-    /// want-set**, and nothing else is ordered while it waits.
+    /// **A read parked on a piece the disk does not have gets it ordered**
+    /// -- alongside the window, never instead of it.
     ///
-    /// A want-set is an order to the swarm, and an order for a thousand
-    /// pieces is not one. In the field, seventeen seeders delivering twelve
-    /// megabytes a second took eighteen seconds to produce the single piece
-    /// a player was parked on, because the rest of the window was wanted
-    /// just as much. Playing from an offset makes that three waits in
-    /// series -- header, container index, seek target.
+    /// Both halves matter. Without the piece nothing orders what the player
+    /// is actually stuck on. Without the window there is one piece in the
+    /// want-set, librqbit reserves a piece to exactly one peer, and the
+    /// download runs at that peer's speed while every other seeder idles:
+    /// 117 kB/s in the field where the same swarm gave 3.1 MB/s a minute
+    /// later.
     #[tokio::test]
-    async fn a_read_parked_on_a_piece_the_disk_lacks_is_the_whole_want_set() {
+    async fn a_read_parked_on_a_piece_the_disk_lacks_gets_it_ordered() {
         let (backing, owner, _budget) = torrent();
         // A disk without piece 6, so the promise below is unmet.
         backing.held.lock().remove(&6);
@@ -5983,8 +5986,9 @@ mod tests {
         owner.pass(&0, &(), claim, Mode::Live).await;
         assert_eq!(
             *backing.wanted.lock(),
-            vec![vec![6..7]],
-            "the piece the read is stuck on, and nothing to compete with it"
+            vec![vec![0..2, 6..7]],
+            "the window the swarm can spread over, and the piece the read is \
+             stuck on, which the stream's own lookahead already fetches first"
         );
         drop(reader);
     }
