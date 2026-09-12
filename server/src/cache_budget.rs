@@ -313,6 +313,18 @@ where
     let _turn = turn.lock().await;
     let (configured, available, occupied) = read().await;
     let cap = cap_to_publish(configured, available, occupied);
+    // TEMPORARY: see `enginefs::retention::trace`, and delete this line with
+    // that module. The pass reports the budget in force; this is the only
+    // place that knows which of the two numbers it came from.
+    enginefs::retention::trace::budget_published(
+        cap,
+        (configured != 0).then_some(configured),
+        available.map(|available| {
+            occupied
+                .saturating_add(available)
+                .saturating_sub(CACHE_FREE_SPACE_FLOOR)
+        }),
+    );
     publish(budget, cap);
     cap
 }

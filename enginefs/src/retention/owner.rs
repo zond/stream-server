@@ -209,7 +209,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::piece_store::{Buffering, Decision, RetentionPolicy, Shape, Share};
-use crate::retention::{CacheBudget, RetentionBudget, runs};
+use crate::retention::{CacheBudget, RetentionBudget, runs, trace};
 
 /// What starts a pass over an entity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -463,6 +463,11 @@ pub trait Backing: Sized + Send + Sync + 'static {
     /// with the turn held and no owner lock.
     fn want_all(&self, _domain: &Self::Domain) -> impl Future<Output = ()> + Send {
         async {}
+    }
+    /// **TEMPORARY**, with [`crate::retention::trace`] and deleted with it:
+    /// what the backing can say about the entity that the owner cannot.
+    fn trace(&self, _domain: &Self::Domain) -> Option<crate::retention::trace::Backing> {
+        None
     }
     /// Take `runs` off the disk, asking `door` at the backing's own
     /// granularity **at the instant of each unlink**, and say how many
@@ -1791,7 +1796,17 @@ impl<B: Backing> Retention<B> {
         // asked for, or the old one that no longer exists. The byte that
         // decided it is owed the pass it could not start: `nothing` with no
         // measurement hands the claim on while something is installed.
-        let (decision, keep_windows, want_windows, promised, door_policy, at, doomed, asserted) = {
+        let (
+            decision,
+            keep_windows,
+            want_windows,
+            promised,
+            door_policy,
+            at,
+            doomed,
+            asserted,
+            traced,
+        ) = {
             let mut state = entity.state.lock();
             if !state.still(&begin) {
                 return Self::nothing(&state, claim, about, None);
@@ -1820,6 +1835,32 @@ impl<B: Backing> Retention<B> {
                 .map(|reader| reader.promised.clone())
                 .filter(|range| !range.is_empty())
                 .collect();
+            // TEMPORARY: see [`crate::retention::trace`]. The heads and the
+            // lookaheads of the reads that are open, and what the read that
+            // owns the head this pass measures from is for.
+            let traced_readers: Vec<(u32, u64)> = state
+                .readers
+                .values()
+                .filter_map(|reader| {
+                    Some((
+                        B::index_of(&state.domain, reader.head()?)?,
+                        reader.buffering.lookahead_bytes,
+                    ))
+                })
+                .collect();
+            let traced_reading = about
+                .and_then(|about| state.readers.get(&about))
+                .or_else(|| {
+                    state
+                        .readers
+                        .values()
+                        .find(|reader| reader.reading == Reading::Playback)
+                })
+                .map(|reader| match reader.reading {
+                    Reading::Playback => "playback",
+                    Reading::Probe => "probe",
+                });
+            let traced_buffering = state.buffering();
             let Some((decision, policy)) = state.advance(&mut claim.guard, at, &held) else {
                 return Self::nothing(&state, claim, about, None);
             };
@@ -1874,6 +1915,7 @@ impl<B: Backing> Retention<B> {
                 at,
                 state.doomed.clone(),
                 state.asserted_epoch(),
+                (traced_readers, traced_reading, traced_buffering),
             )
         };
         // 6. Advertise what is committed before reclaiming: the two sets are
@@ -1964,7 +2006,9 @@ impl<B: Backing> Retention<B> {
             key: key.clone(),
             domain: begin.domain.clone(),
             mode: Mode::Live,
-            policy: Some(door_policy),
+            // TEMPORARY: cloned rather than moved only so the trace below
+            // can read the same policy. Move it again with that block.
+            policy: Some(door_policy.clone()),
             windows: keep_windows,
             promised,
         };
@@ -1983,6 +2027,56 @@ impl<B: Backing> Retention<B> {
             .backing
             .reclaim(store, &begin.domain, runs(&alone), door)
             .await;
+        // TEMPORARY: see [`crate::retention::trace`], and delete this block
+        // with that module.
+        {
+            let (readers, reading, buffering) = traced;
+            let backing = self.backing.trace(&begin.domain);
+            if let Some(piece_length) = backing.map(|backing| backing.piece_length) {
+                for (head, lookahead) in &readers {
+                    let ahead = head.saturating_add(
+                        u32::try_from(lookahead.div_ceil(piece_length.max(1))).unwrap_or(u32::MAX),
+                    );
+                    let inside: Vec<u32> = decision
+                        .reclaim
+                        .iter()
+                        .copied()
+                        .filter(|piece| (*head..ahead).contains(piece))
+                        .collect();
+                    if !inside.is_empty() {
+                        trace::reclaimed_inside_a_lookahead(key, &inside, *head..ahead, *lookahead);
+                    }
+                }
+            }
+            let (behind, ahead) = held
+                .iter()
+                .filter(|piece| B::extent(&begin.domain).contains(piece))
+                .partition::<Vec<u32>, _>(|piece| **piece < at);
+            let reach = door_policy.ahead_of(at);
+            trace::pass(
+                key,
+                trace::Pass {
+                    playhead: at,
+                    reading,
+                    window: decision.window.clone(),
+                    reach: reach.end - reach.start,
+                    held_behind: behind.len(),
+                    held_ahead: ahead.len(),
+                    committed: door_policy.advertised().len(),
+                    budget: begin.budget,
+                    lookahead_bytes: buffering.lookahead_bytes,
+                    bytes_per_second: buffering.bytes_per_second,
+                    dropped: B::extent(&begin.domain)
+                        .filter(|piece| {
+                            !want_windows.iter().any(|window| window.contains(piece))
+                                && !held.contains(piece)
+                        })
+                        .count(),
+                    unlinked: conclusion.reclaimed,
+                    backing: backing.as_ref(),
+                },
+            );
+        }
         // 9. Conclude, under L2, with the claim released or handed on inside
         // the same block (rule 3).
         let mut state = entity.state.lock();

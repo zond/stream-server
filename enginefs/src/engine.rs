@@ -474,6 +474,18 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         ))
     }
 
+    /// **TEMPORARY**, with [`crate::retention::trace`]: the counters the
+    /// owner cannot read, and the piece length a lookahead is measured in.
+    fn trace(&self, domain: &FileDomain) -> Option<crate::retention::trace::Backing> {
+        let transfer = self.handle.transfer_totals()?;
+        Some(crate::retention::trace::Backing {
+            fetched: transfer.fetched,
+            verified: transfer.verified,
+            refused: self.refused.load(Ordering::Relaxed),
+            piece_length: domain.piece_length,
+        })
+    }
+
     /// A pin on this file: a pin is a retention property, the user asked
     /// for those bytes, and they are shared like any other bytes we keep.
     ///
