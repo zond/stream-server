@@ -630,21 +630,27 @@ struct State<B: Backing> {
     /// It lives exactly as long as the policy that made it: written at the
     /// pass's decision, cleared when a policy is installed or forgotten.
     doomed: Vec<Range<u32>>,
-    /// The last delivery rate measured on this entity by a read that was
-    /// playing it, and `None` until one has been.
+    /// How fast this entity's film is being watched, measured across every
+    /// read that has played it.
     ///
-    /// **The bitrate is the film's and the reader is not.** The rate lives
-    /// on a [`ReaderState`] because that is where it is measured, and it
-    /// dies with the reader -- so the moment a seek replaces one reader with
-    /// another, or a viewer pauses and the client closes the body, the
-    /// entity has no rate and both time caps stop applying. The window then
-    /// goes back to its share of the budget until two seconds of the new
-    /// read have gone out: on a ten-gigabyte cache that is a jump from
-    /// three hundred megabytes to five gigabytes, ordered from the swarm by
-    /// the pass that measured it and given back by the pass after. The film
-    /// did not change bitrate because a reader was replaced, so the entity
-    /// keeps the number and a live read's own measurement wins over it.
-    rate: Option<u64>,
+    /// **The bitrate is the film's and the reader is not**, so neither is
+    /// the measurement. Held per read it dies with the read, and the field
+    /// log this was written from says what that costs: libmpv takes about
+    /// twenty megabytes, closes the response and reopens five megabytes
+    /// further on, so no read there lived longer than about 1.2 seconds and
+    /// not one of them ever reached [`RATE_SAMPLE_INTERVAL`]. No sample was
+    /// ever taken, `bytes_per_second` stayed `None` for the whole viewing,
+    /// neither time cap ever applied, and the window sat at its share of the
+    /// budget: 1280 pieces, 5.4 GB, on a film being watched at 3.4 MB/s.
+    ///
+    /// Anchored here it spans the reconnect instead of restarting at it,
+    /// which also makes it the *right* number rather than merely an
+    /// available one. Inside one response the server hands over bytes as
+    /// fast as the swarm and the socket allow -- 15 MB/s in that log, four
+    /// and a half times the film's rate, most of it discarded unread when
+    /// the client drops the connection. Across the reconnects, offset over
+    /// wall-clock is what the viewer is actually consuming.
+    rate: DeliveryRate,
     /// The draw that decides which of this entity's pieces this process
     /// offers to the swarm ([`Buffering::seed`]).
     ///
@@ -761,8 +767,6 @@ struct ReaderState<B: Backing> {
     /// [`Buffering::bytes_per_second`] is not this read's to state and is
     /// always `None` in it; it is measured, below.
     buffering: Buffering,
-    /// How fast bytes are really going out of this read.
-    rate: DeliveryRate,
 }
 
 /// The rate one read is delivering at, smoothed.
@@ -794,9 +798,27 @@ const RATE_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs
 /// The weight a fresh sample carries, in tenths.
 const RATE_SMOOTHING_TENTHS: u64 = 3;
 
+/// How far ahead of the last delivery a new one may be and still be the
+/// same walk through the film.
+///
+/// A player that reconnects resumes within its own read-ahead, so the gap
+/// between the byte one response stopped at and the byte the next starts
+/// from is a few megabytes. Anything further is a different read -- a
+/// forward seek, or a second reader on the same file, which is what an
+/// index crawler parked at the end of the container is. Neither is a rate,
+/// so neither is allowed to move the anchor while a walk is in progress.
+/// The floor is for a backing that grants no lookahead at all.
+const RATE_CONTINUATION_FLOOR: u64 = 64 * 1024 * 1024;
+
+/// How long an anchor may sit unadvanced before any delivery may take it
+/// over. Without this a forward seek would strand the anchor behind the
+/// only reader there is, and no sample could ever form again.
+const RATE_ANCHOR_STALE: std::time::Duration = std::time::Duration::from_secs(8);
+
 impl DeliveryRate {
-    /// A byte really went out, at `offset`, at `now`.
-    fn note(&mut self, offset: u64, now: std::time::Instant) {
+    /// A byte really went out, at `offset`, at `now`, on a read granted
+    /// `lookahead` bytes of read-ahead.
+    fn note(&mut self, offset: u64, lookahead: u64, now: std::time::Instant) {
         let Some((was, at)) = self.since else {
             self.since = Some((offset, now));
             return;
@@ -808,6 +830,14 @@ impl DeliveryRate {
             return;
         }
         let elapsed = now.saturating_duration_since(at);
+        if offset - was > lookahead.max(RATE_CONTINUATION_FLOOR) {
+            // Too far ahead to be the same walk. Let it take the anchor
+            // only once the walk it would interrupt has stopped happening.
+            if elapsed >= RATE_ANCHOR_STALE {
+                self.since = Some((offset, now));
+            }
+            return;
+        }
         if elapsed < RATE_SAMPLE_INTERVAL {
             return;
         }
@@ -835,7 +865,6 @@ impl<B: Backing> ReaderState<B> {
             promised: 0..0,
             passed_at: None,
             buffering,
-            rate: DeliveryRate::default(),
         }
     }
 
@@ -1061,7 +1090,7 @@ impl<B: Backing> Retention<B> {
                         // the pieces. See [`State::held_back`].
                         held_back: B::SHARE == Share::Half,
                         doomed: Vec::new(),
-                        rate: None,
+                        rate: DeliveryRate::default(),
                         opens: 0,
                         seed: share_seed(),
                     })),
@@ -2296,18 +2325,11 @@ impl<B: Backing> State<B> {
                 };
             any = true;
         }
-        // The rate is the playing reads': a probe walks the file at
-        // whatever the swarm gives and says nothing about how fast the film
-        // is being watched.
-        asked.bytes_per_second = self
-            .readers
-            .values()
-            .filter(|reader| reader.reading == Reading::Playback)
-            .filter_map(|reader| reader.rate.bytes_per_second)
-            .max()
-            // And the entity's own last reading where no live read has one
-            // yet, which is every seek and every resume: see [`Self::rate`].
-            .or(self.rate);
+        // Only playing reads feed it: a probe walks the file at whatever
+        // the swarm gives and says nothing about how fast the film is being
+        // watched. It is the entity's and not any one reader's, because no
+        // reader outlives a reconnect; see [`Self::rate`].
+        asked.bytes_per_second = self.rate.bytes_per_second;
         asked
     }
 
@@ -2798,10 +2820,7 @@ impl<B: Backing> Reader<B> {
                 ReaderState::opened(self.reading, self.opened_at, self.buffering)
             });
             reader.playhead = Some(at);
-            // The byte really went out, so this is a delivery and not a
-            // request: the only reading the window's time cap is sized from.
-            reader.rate.note(offset, now);
-            let measured = reader.rate.bytes_per_second;
+            let lookahead = reader.buffering.lookahead_bytes;
             let due = match index {
                 Some(index) => {
                     // Delivered is no longer promised: the piece went out
@@ -2821,10 +2840,10 @@ impl<B: Backing> Reader<B> {
             };
             // The entity keeps what a playing read measured, so the time
             // caps survive the read that measured them; see [`State::rate`].
-            if self.reading == Reading::Playback
-                && let Some(rate) = measured
-            {
-                state.rate = Some(rate);
+            if self.reading == Reading::Playback {
+                // The byte really went out, so this is a delivery and not a
+                // request: the only reading the time caps are sized from.
+                state.rate.note(offset, lookahead, now);
             }
             let claim = due
                 .then(|| self.entity.turn.clone().try_lock_owned().ok())
@@ -5509,6 +5528,124 @@ mod tests {
         );
     }
 
+    /// **A film watched through reads too short to sample is still
+    /// measured.**
+    ///
+    /// This is the field failure the entity-level measurement was written
+    /// for, and the one a per-read measurement cannot survive. libmpv takes
+    /// about twenty megabytes, closes the response and reopens a few
+    /// megabytes further on, so no read lives as long as
+    /// [`RATE_SAMPLE_INTERVAL`]. Measured per read, not one of them ever
+    /// takes a sample, `bytes_per_second` stays `None` for the whole
+    /// viewing, neither time cap ever applies, and the window falls back to
+    /// its share of the budget -- which in the log this was written from was
+    /// 1280 pieces, 5.4 GB, for a film being watched at 3.4 MB/s.
+    ///
+    /// Anchored on the entity the reconnect is not an event at all: the
+    /// offsets keep walking forwards and the sample lands on the first
+    /// delivery two seconds after the first one, whichever read happens to
+    /// be open by then.
+    #[tokio::test]
+    async fn a_film_watched_through_reads_too_short_to_sample_is_still_measured() {
+        let (_backing, owner, budget) = torrent();
+        budget.set(Some(6 * PIECE));
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        let asks = Buffering {
+            window_seconds: Some(10),
+            committed_seconds: Some(10),
+            ..Buffering::default()
+        };
+        let start = std::time::Instant::now();
+        // Six responses, none of them alive for two seconds, each resuming
+        // a hundred bytes on from where the one before it stopped. The last
+        // is still open at the pass, as a player's always is -- an entity
+        // nobody is reading asks for no time cap at all.
+        let mut reading = None;
+        for step in 0..6u64 {
+            let opened = start + std::time::Duration::from_secs(step);
+            let response = owner
+                .reader_on(&0, (0, step * 100), Reading::Playback, asks)
+                .expect("the entity the install made");
+            response.note_at((0, step * 100), opened);
+            response.note_at(
+                (0, step * 100 + 50),
+                opened + std::time::Duration::from_millis(900),
+            );
+            reading = Some(response);
+        }
+        let claim = owner.turn(&0).await.expect("the turn");
+        owner.pass(&0, &(), claim, Mode::Live).await;
+        assert_eq!(
+            owner
+                .holding(&0)
+                .and_then(|holding| holding.installed)
+                .map(|installed| installed.shape),
+            Some(Shape::Split {
+                window: 5,
+                committed: 1
+            }),
+            "the reconnects are not seeks: a hundred bytes a second, capped \
+             at ten seconds of it"
+        );
+        drop(reading);
+    }
+
+    /// **A second read far down the file is not the walk being measured.**
+    ///
+    /// mpv keeps a reader parked on the container index at the end of the
+    /// file and reopens it about once a second -- forty-three kilobytes at
+    /// a time, twenty gigabytes away from the playhead. It is a
+    /// [`Reading::Playback`] read like any other, because an open-ended
+    /// range is all the server is told. Fed into one anchor beside the
+    /// playhead's own deliveries it would make every other note a jump
+    /// forwards and the one after it a seek back, and no sample could ever
+    /// form.
+    #[test]
+    fn a_delivery_far_beyond_the_walk_does_not_move_the_anchor() {
+        let mut rate = DeliveryRate::default();
+        let start = std::time::Instant::now();
+        let after = |millis| start + std::time::Duration::from_millis(millis);
+        let lookahead = 4096;
+        rate.note(0, lookahead, start);
+        // The crawler, a long way past anything the walk has a lookahead
+        // over, and far enough into the interval that it would otherwise be
+        // a sample in its own right. Then the walk's own next delivery.
+        rate.note(1_000_000_000, lookahead, after(2_500));
+        rate.note(3000, lookahead, after(3_000));
+        assert_eq!(
+            rate.bytes_per_second,
+            Some(1000),
+            "measured from the walk, across the read that was not part of it"
+        );
+    }
+
+    /// **An anchor a forward seek left behind is taken over once it stops
+    /// being a walk.**
+    ///
+    /// The rule above refuses a delivery too far ahead to be the same walk.
+    /// A forward seek is exactly that, and it does not come back -- so
+    /// without this the anchor would sit where the viewer used to be and no
+    /// sample would ever form again.
+    #[test]
+    fn an_anchor_a_forward_seek_left_behind_is_taken_over_when_it_goes_stale() {
+        let mut rate = DeliveryRate::default();
+        let start = std::time::Instant::now();
+        let after = |seconds| start + std::time::Duration::from_secs(seconds);
+        let lookahead = 4096;
+        rate.note(0, lookahead, start);
+        rate.note(1_000_000_000, lookahead, after(1));
+        assert_eq!(rate.bytes_per_second, None, "too far ahead to be a sample");
+        // Nothing has advanced the old anchor since, so the seek's own
+        // walk takes it.
+        rate.note(1_000_001_000, lookahead, after(9));
+        rate.note(1_000_003_000, lookahead, after(11));
+        assert_eq!(
+            rate.bytes_per_second,
+            Some(1000),
+            "and the measurement starts again where the viewer now is"
+        );
+    }
+
     /// **A probe's delivery rate is not the film's.**
     ///
     /// The time caps ask how many bytes a second of this film comes to, and
@@ -5569,16 +5706,16 @@ mod tests {
         let mut rate = DeliveryRate::default();
         let start = std::time::Instant::now();
         let after = |seconds| start + std::time::Duration::from_secs(seconds);
-        rate.note(0, start);
-        rate.note(3000, after(3));
+        rate.note(0, 0, start);
+        rate.note(3000, 0, after(3));
         assert_eq!(rate.bytes_per_second, Some(1000), "a kilobyte a second");
-        rate.note(0, after(6));
+        rate.note(0, 0, after(6));
         assert_eq!(
             rate.bytes_per_second,
             Some(1000),
             "the seek back is not a sample"
         );
-        rate.note(3000, after(9));
+        rate.note(3000, 0, after(9));
         assert_eq!(
             rate.bytes_per_second,
             Some(1000),
