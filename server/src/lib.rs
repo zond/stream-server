@@ -305,11 +305,12 @@ impl ServerHandle {
         file_idx: usize,
         offset: u64,
         film: std::time::Duration,
+        duration: Option<std::time::Duration>,
         playing: bool,
     ) {
         self.state
             .engine
-            .on_playhead(info_hash, file_idx, offset, film, playing)
+            .on_playhead(info_hash, file_idx, offset, film, duration, playing)
             .await;
     }
 

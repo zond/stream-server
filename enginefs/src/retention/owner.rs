@@ -325,6 +325,18 @@ pub trait Backing: Sized + Send + Sync + 'static {
     fn governs(domain: &Self::Domain, want: Self::Want) -> bool;
     /// The piece index space of the entity. Pure.
     fn extent(domain: &Self::Domain) -> Range<u32>;
+    /// How many bytes the entity is, or `None` where the backing cannot say.
+    ///
+    /// Only [`State::buffering`] asks, and only to turn a player's stated
+    /// duration into the film's bitrate -- which is what a window measured
+    /// in seconds needs, and what this module spent three field rounds
+    /// failing to *measure*. Size over duration is that number exactly, at
+    /// the first report, with nothing to converge and no read pattern to be
+    /// fooled by.
+    fn bytes(domain: &Self::Domain) -> Option<u64> {
+        let _ = domain;
+        None
+    }
     /// The policy for `domain` under `budget` bytes, or why there is none.
     /// Pure, and it returns its error rather than logging it: it is called
     /// under L2 from [`Reader::note`], and the owner logs after unlock. The
@@ -926,6 +938,9 @@ fn told_bitrate(
 struct Told<B: Backing> {
     at: B::Position,
     film: std::time::Duration,
+    /// How long the film is, where the player knows. With the entity's own
+    /// size ([`Backing::bytes`]) this is the bitrate outright.
+    duration: Option<std::time::Duration>,
     playing: bool,
     when: std::time::Instant,
 }
@@ -1379,9 +1394,10 @@ impl<B: Backing> Retention<B> {
         key: &B::Key,
         at: B::Position,
         film: std::time::Duration,
+        duration: Option<std::time::Duration>,
         playing: bool,
     ) {
-        self.note_playhead_at(key, at, film, playing, std::time::Instant::now());
+        self.note_playhead_at(key, at, film, duration, playing, std::time::Instant::now());
     }
 
     /// [`Self::note_playhead`] with the clock handed in, so a test can put
@@ -1391,6 +1407,7 @@ impl<B: Backing> Retention<B> {
         key: &B::Key,
         at: B::Position,
         film: std::time::Duration,
+        duration: Option<std::time::Duration>,
         playing: bool,
         now: std::time::Instant,
     ) {
@@ -1419,6 +1436,7 @@ impl<B: Backing> Retention<B> {
         state.told = Some(Told {
             at,
             film,
+            duration,
             playing,
             when: now,
         });
@@ -2623,7 +2641,22 @@ impl<B: Backing> State<B> {
         // the swarm gives and says nothing about how fast the film is being
         // watched. It is the entity's and not any one reader's, because no
         // reader outlives a reconnect; see [`Self::rate`].
-        asked.bytes_per_second = self.told_rate.or(self.rate.bytes_per_second);
+        // **Computed where it can be, measured only where it cannot.** Size
+        // over duration is the film's bitrate by arithmetic: exact at the
+        // first report, nothing to converge, and nothing a player's read
+        // pattern can distort. The measured paths below answer only for a
+        // stream whose length nobody has stated.
+        asked.bytes_per_second = self
+            .told
+            .as_ref()
+            .filter(|told| told.when.elapsed() < TOLD_FRESH)
+            .and_then(|told| told.duration)
+            .filter(|duration| !duration.is_zero())
+            .and_then(|duration| {
+                Some((B::bytes(&self.domain)? as f64 / duration.as_secs_f64()) as u64)
+            })
+            .or(self.told_rate)
+            .or(self.rate.bytes_per_second);
         asked
     }
 
@@ -3564,6 +3597,10 @@ mod tests {
 
         fn governs(domain: &FakeDomain, want: usize) -> bool {
             domain.file == want
+        }
+
+        fn bytes(domain: &FakeDomain) -> Option<u64> {
+            Some(u64::from(domain.pieces.end - domain.pieces.start) * PIECE)
         }
 
         fn extent(domain: &FakeDomain) -> Range<u32> {
@@ -6021,6 +6058,51 @@ mod tests {
         );
     }
 
+    /// **The film's length is the bitrate, and nothing has to measure it.**
+    ///
+    /// Size over duration is arithmetic: exact at the first report, with
+    /// nothing to converge and no read pattern to distort it. Three field
+    /// rounds went into measuring the same number and produced three bytes
+    /// a second and then seventeen.
+    #[tokio::test]
+    async fn a_stated_duration_is_the_bitrate_without_measuring_anything() {
+        let (_backing, owner, budget) = torrent();
+        budget.set(Some(6 * PIECE));
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        let asks = Buffering {
+            window_seconds: Some(10),
+            committed_seconds: Some(10),
+            ..Buffering::default()
+        };
+        let reader = owner
+            .reader_on(&0, (0, 0), Reading::Playback, asks)
+            .expect("the entity the install made");
+
+        // File 0 is eight pieces of a thousand bytes. Eighty seconds of film
+        // is a hundred bytes a second, and ten seconds of that is one piece.
+        owner.note_playhead(
+            &0,
+            (0, 0),
+            std::time::Duration::ZERO,
+            Some(std::time::Duration::from_secs(80)),
+            true,
+        );
+        let claim = owner.turn(&0).await.expect("the turn");
+        owner.pass(&0, &(), claim, Mode::Live).await;
+        assert_eq!(
+            owner
+                .holding(&0)
+                .and_then(|holding| holding.installed)
+                .map(|installed| installed.shape),
+            Some(Shape::Split {
+                window: 5,
+                committed: 1
+            }),
+            "one report, nothing to measure it against, and the cap binds"
+        );
+        drop(reader);
+    }
+
     /// **A probe's delivery rate is not the film's.**
     ///
     /// The time caps ask how many bytes a second of this film comes to, and
@@ -6347,6 +6429,7 @@ mod tests {
             &0,
             (0, 2 * PIECE),
             std::time::Duration::from_secs(120),
+            None,
             true,
         );
 
@@ -6387,6 +6470,7 @@ mod tests {
             &0,
             (0, 2 * PIECE),
             std::time::Duration::from_secs(120),
+            None,
             true,
             long_ago,
         );
@@ -6450,11 +6534,12 @@ mod tests {
         );
 
         // What the player says: ten seconds of film, one piece of file.
-        owner.note_playhead_at(&0, (0, 0), std::time::Duration::ZERO, true, start);
+        owner.note_playhead_at(&0, (0, 0), std::time::Duration::ZERO, None, true, start);
         owner.note_playhead_at(
             &0,
             (0, 10 * PIECE),
             std::time::Duration::from_secs(100),
+            None,
             true,
             start + std::time::Duration::from_secs(100),
         );

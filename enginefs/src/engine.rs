@@ -454,6 +454,14 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         offset
     }
 
+    /// What the file's pieces hold, which is the file to within the part of
+    /// its first and last pieces a neighbour owns -- eight mebibytes of a
+    /// twenty-three gigabyte film, and the bitrate this divides into is not
+    /// asked to three figures.
+    fn bytes(domain: &FileDomain) -> Option<u64> {
+        Some(domain.span.bytes).filter(|bytes| *bytes > 0)
+    }
+
     /// The torrent piece a reader at `offset` of `file` is sitting on.
     /// Always `Some`: a file's entity hears only its own bytes -- the
     /// [`FileHandle`]'s reader is on the file it reads, and the tests'
@@ -1344,10 +1352,11 @@ impl<H: TorrentHandle> Engine<H> {
         file_idx: usize,
         offset: u64,
         film: std::time::Duration,
+        duration: Option<std::time::Duration>,
         playing: bool,
     ) {
         self.retention
-            .note_playhead(&file_idx, (file_idx, offset), film, playing);
+            .note_playhead(&file_idx, (file_idx, offset), film, duration, playing);
     }
 
     /// What the retention policy says about `file_idx` right now, or `None`

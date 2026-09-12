@@ -3001,10 +3001,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         file_idx: usize,
         offset: u64,
         film: std::time::Duration,
+        duration: Option<std::time::Duration>,
         playing: bool,
     ) {
         if let Some(engine) = self.peek_engine(info_hash).await {
-            engine.told_playhead(file_idx, offset, film, playing);
+            engine.told_playhead(file_idx, offset, film, duration, playing);
         }
     }
 
