@@ -8456,6 +8456,8 @@ mod tests {
             fetched_at_start: engine.handle.transfer_totals().unwrap_or_default().fetched,
             worst: 0,
             fetched_peak: 0,
+            last: None,
+            at_rest: 0,
             deadline: std::time::Instant::now() + TEST_WAIT_BOUND,
         };
         let mut read = Vec::with_capacity(original.len());
@@ -8503,6 +8505,12 @@ mod tests {
              was never measured against anything",
             bound.fetched_peak
         );
+        assert!(
+            bound.at_rest >= 10,
+            "only {} passes found the stream at rest, so the tight half of the network \
+             bound was hardly asked: the pause has to outlast the window filling",
+            bound.at_rest
+        );
     }
 
     /// One retention pass at a time over a streaming engine, and the three
@@ -8533,6 +8541,12 @@ mod tests {
         worst: usize,
         /// The most any pass saw come off the swarm since the watch began.
         fetched_peak: u64,
+        /// What the last pass read: bytes delivered, pieces on the disk,
+        /// bytes off the swarm. For [`Self::at_rest`].
+        last: Option<(usize, usize, u64)>,
+        /// How many passes were measured at rest, so a run in which the
+        /// stream never settled cannot pass for nothing.
+        at_rest: usize,
         deadline: std::time::Instant,
     }
 
@@ -8574,6 +8588,43 @@ mod tests {
                      part-read piece can account for: something is being fetched and \
                      thrown away"
                 );
+                // **And the bound at rest, which is the tight one.** The
+                // one above is slack by a whole budget: it is a bound on
+                // the total, and a total that may grow by 16 MiB says
+                // nothing about a pass that threw a megabyte away. This
+                // says what the plateau says. A pass that handed the
+                // reader nothing since the pass before it, and left the
+                // disk holding the same number of pieces, has a stream
+                // that is not asking for anything and a policy that is
+                // keeping what it kept -- so nothing may have come off the
+                // peers. That is the churn's own signature: the occupancy
+                // is one window wherever the window is, and the fetched
+                // count is the only place a window that moves under a
+                // parked player shows up at all.
+                //
+                // A piece of slack, for the one a pass was part-way
+                // through when the reader stopped, and for the read opened
+                // beside the player ([`Self::probe_the_tail`]), which
+                // fetches the piece it is parked on: measured at exactly
+                // `RETENTION_PIECE`. A pass where either reading *did*
+                // move asserts nothing rather than guessing what the move
+                // was worth, so a disk that wobbles by a piece makes this
+                // measure less, never fail.
+                if let Some((was_read, was_held, was_fetched)) = self.last
+                    && read_so_far == was_read
+                    && held == was_held
+                {
+                    self.at_rest += 1;
+                    assert!(
+                        fetched <= was_fetched + RETENTION_PIECE,
+                        "{} bytes came off the swarm across a pass that delivered nothing \
+                         to the reader and left the same {held} pieces on the disk: the \
+                         window moved off the reader and something is being fetched and \
+                         thrown away",
+                        fetched - was_fetched
+                    );
+                }
+                self.last = Some((read_so_far, held, fetched));
             }
         }
 
