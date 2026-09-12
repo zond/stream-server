@@ -21,14 +21,22 @@
 //! all of it. No split and no window. This is the phone with 379 GB free and
 //! it is every desktop.
 //!
-//! **If it does not, the budget is halved:**
+//! **If it does not, it is split:**
 //!
-//! * Half is a rolling window around the playhead, roughly 90% ahead and 10%
-//!   behind, so a short scan back is served from disk instead of from the
+//! * One part is a rolling window around the playhead, roughly 90% ahead and
+//!   10% behind, so a short scan back is served from disk instead of from the
 //!   swarm.
-//! * Half is committed for sharing. It is filled *opportunistically*, from
-//!   pieces we already hold -- nothing here ever asks for a byte outside the
-//!   playhead -- and once a piece is in it, it stays.
+//! * The other is committed for sharing. It is filled *opportunistically*,
+//!   from pieces we already hold -- nothing here ever asks for a byte outside
+//!   the playhead -- and once a piece is in it, it stays.
+//!
+//! Where the split falls is not a half any more. Both parts are bounded in
+//! *time* first ([`Buffering`]) -- so many seconds of this stream at the rate
+//! bytes are really leaving the server at -- and the budget is only the
+//! ceiling. The committed part yields first and the window yields last: it
+//! also has a floor, the lookahead an open stream was already granted, which
+//! beats every cap here because the alternative is a stream fetching exactly
+//! what the next pass deletes.
 //!
 //! **Only what is committed is advertised** -- once an engine can be told
 //! that. That is the whole of being a good citizen here: a piece we might
@@ -53,69 +61,59 @@
 //!
 //! # Two choices worth stating, because they look arbitrary
 //!
-//! **A piece is committed at the moment it leaves the window**, not while it
-//! is still inside one, and not merely by being outside the one the window is
-//! in now. That is the only moment where committing is provably free: the
-//! piece is already on disk, and the alternative for it is deletion.
-//! Committing a window piece early would be free too, but it would fill the
-//! shared half with the read-ahead of the first minute of the file and settle
-//! the whole session's sharing before playback had passed anything. So would
-//! committing a piece *ahead* of the window -- read-ahead the playhead has not
-//! reached, or a leftover cache from a previous session -- which is the same
-//! mistake wearing the opposite sign: on the first pass of a stream that
-//! resumes onto a warm cache it settles the permanent, never-reclaimed,
-//! always-advertised set out of pieces playback has passed over none of.
+//! **Which pieces we share is drawn before playback starts, not learned from
+//! it.** The committed set is a uniformly random subset of the file's pieces,
+//! of the size the committed capacity allows, taken from a seed held per
+//! entity for that entity's life (see [`choose`]). Random and not a stride,
+//! because a stride is a lattice -- two clients with the same k differ only by
+//! phase and can still overlap almost completely -- and independent draws
+//! overlap only by chance, which is the property that makes peers who cannot
+//! see each other sum to even coverage of a torrent. Even and not biased late,
+//! because a shared late bias only moves the hole: if every client kept the
+//! tail, the tail becomes the over-replicated part and the head goes scarce.
 //!
-//! "Leaves the window" is therefore a transition and not a position, and
-//! deciding it needs one pass of memory: the window the previous
-//! [`RetentionPolicy::advance`] chose. But "that window covered it and this
-//! one does not" is *not* the transition -- it is only the window stopping
-//! covering the piece, which is a thing seeks do wholesale and in both
-//! directions. **A release is a piece the playhead has moved past**, which is
-//! three conditions and not one: the previous window covered it, it is behind
-//! the playhead now, and the playhead got where it is by walking rather than
-//! jumping -- every piece between where it was and where it is now was covered
-//! by that window. The window is the whole of what we fetch, so a playhead
-//! beyond the last piece it covered crossed pieces we never held and cannot
-//! have played them. A held piece the window has never covered is a reclaim
-//! candidate and nothing else, whichever side of the playhead it is on.
-//! Waiting until the window releases a piece is also what makes "a piece we
-//! might reclaim is never announced" decidable in one place: the decision to
-//! advertise and the decision never to reclaim are the same decision, taken
-//! once.
+//! It is the opposite of the rule that used to be here, which committed a
+//! piece when the window *released* it -- the playhead having walked past it
+//! -- and so settled the shared set out of the first minutes of the film. In a
+//! swarm of streaming clients everyone watches from the start, so the head is
+//! the most replicated part of a torrent and the tail is the scarce part: that
+//! rule kept exactly the pieces nobody needs. Measured on the field device --
+//! a cap of thirty-six pieces, about fifty seconds of a 23 Mbps film -- it
+//! shared the first fifty seconds of a 109-minute feature and nothing else for
+//! the rest of the process.
 //!
-//! **A large forward seek therefore commits nothing, exactly like a backward
-//! one.** The pieces it jumps over were covered and are behind the playhead
-//! now, and calling them released is the tempting reading -- but playback
-//! never reached them either. They are the read-ahead of a position the player
-//! walked away from, and settling the permanent, never-reclaimed,
-//! always-advertised set out of them is the thing this section rules out, in
-//! whichever direction it is done. So they are reclaimed like any other cache
-//! the playhead has not reached. That is the rule the owner set -- we keep
-//! pieces we have *seen*, and we never settle the shared set from read-ahead
-//! -- rather than the shorter predicate: the cost of it is that a seeky
-//! session shares less, on a volume too small to share much anyway, and the
-//! cost of the other choice is that the rule stops being true. Being about
-//! walking rather than about the sign of the movement is also why both seeks
-//! land in the same place, and why neither needs a case of its own.
+//! **A drawn piece is committed and announced the moment we hold it**, verified
+//! on the disk, rather than when something lets go of it. The old rule had to
+//! wait: with membership decided by playback there was always a piece we might
+//! still reclaim, and announcing one of those is the advertise-then-refuse this
+//! module exists to prevent. With the set fixed up front there is nothing to
+//! take back, so a piece can go out the moment it verifies -- which is what any
+//! BitTorrent client does with every piece it completes, and it means peers
+//! learn we have those bytes *while* the viewer is watching, which is when the
+//! upload switch lets us serve them.
 //!
-//! One ambiguity is left, and it is bounded rather than hidden: inside the
-//! reach of the previous window a seek and playing on are the same
-//! observation -- a playhead that has moved forward over pieces we held -- so
-//! a seek shorter than a window commits what it skipped. Those are pieces we
-//! had already fetched for imminent playback, within a window of where the
-//! playhead really was, and there are at most a window's worth of them; that
-//! is a different thing from a warm cache or a jumped-over region, both of
-//! which are unbounded and neither of which is next to the playhead at all.
+//! **Nothing once committed is ever un-announced or reclaimed**, and that is
+//! now a property of the design rather than a consequence of a capacity never
+//! being reached. There is no un-have in BitTorrent: hiding a piece changes
+//! only the bitfield a *new* peer is handed at its handshake, while a peer that
+//! already holds our Have can still ask for it and, the bytes being gone, be
+//! hung up on. So a capacity that shrinks under the set only stops it growing
+//! ([`RetentionPolicy::observe`]), and a smaller budget adopts the whole of
+//! what the bigger one announced, over its capacity and all
+//! ([`RetentionPolicy::carry_into`]).
 //!
-//! **The first pieces offered win, and the set then never changes.** The
-//! design says to choose by whatever is cheapest and explicitly not by rarity:
-//! measured across four live swarms, rarity-based retention beat random by
-//! ≤0.15%, and by 0.00% on three of them, because seeder fractions of 94-100%
-//! cap the whole effect. So there is no availability map here and nothing to
-//! rank -- the cheapest possible rule is "no comparison at all", and it has the
-//! property the design asks for by construction: once the committed half is
-//! full it does not churn, whatever the playhead does afterwards.
+//! **The set under-fills, and that is correct.** It is never fetched for: we
+//! commit what we hold, and we hold what the viewer's window fetched, so a
+//! viewer who stops halfway fills about half the draw and the rest of it stays
+//! empty. Filling it would mean fetching bytes for the swarm rather than for
+//! the viewer, which on a metered phone is a trade nobody agreed to, and an
+//! unfilled cache costs nothing.
+//!
+//! **And the draw is uniform rather than ranked.** The design says to choose by
+//! whatever is cheapest and explicitly not by rarity: measured across four live
+//! swarms, rarity-based retention beat random by <=0.15%, and by 0.00% on three
+//! of them, because seeder fractions of 94-100% cap the whole effect. So there
+//! is no availability map here and nothing to rank.
 //!
 //! # What this does not decide
 //!
@@ -752,22 +750,19 @@ impl RetentionPolicy {
     /// committed piece back (see [`Decision::committed`]); a caller that reads
     /// this as two outcomes and reclaims whatever is outside the window
     /// deletes the pieces it is advertising, which is the advertise-then-
-    /// refuse the whole policy exists to avoid. Any *other* held piece outside
-    /// the window is **committed** if the window *released* it -- the previous
-    /// pass covered it, it is behind `playhead` now, and `playhead` is no
-    /// further on than the last piece that window covered, so playback walked
-    /// past this piece rather than jumping over it (see `Self::covered`) --
-    /// and **reclaimed** if not. So the first pass of a stream commits
-    /// nothing, no window having covered anything yet, and so does either
-    /// direction of a seek: what a seek leaves behind is read-ahead it never
-    /// reached.
+    /// refuse the whole policy exists to avoid. Any *other* held piece is
+    /// **committed** if the draw chose it ([`Self::chosen`]) and **reclaimed**
+    /// if it is outside the window and the draw did not. The playhead decides
+    /// neither: membership was settled when the policy was built, so a piece is
+    /// committed the moment we hold it, whether the window is still over it or
+    /// has never been, and a seek in either direction commits exactly the
+    /// pieces it happens to have brought in.
     ///
     /// Idempotent for a fixed playhead and a fixed `held`: the second call
-    /// commits nothing new and reclaims the same pieces, because a reclaim is
-    /// a request rather than a record. The caller is what makes it true, by
-    /// deleting them and no longer holding them. The second call has a second
-    /// reason to commit nothing new -- the window it is compared against is
-    /// the one it is.
+    /// commits nothing new -- the pieces it would commit are committed -- and
+    /// reclaims the same pieces, because a reclaim is a request rather than a
+    /// record. The caller is what makes that true, by deleting them and no
+    /// longer holding them.
     pub fn advance(&mut self, playhead: u32, held: &BTreeSet<u32>) -> Decision {
         let window = self.window_at(playhead);
         let mut decision = Decision {
@@ -847,9 +842,8 @@ mod tests {
     /// piece is what fetches it.
     ///
     /// Stepping matters, and several tests below need it rather than a single
-    /// leap: a playhead that arrives beyond the last piece the previous window
-    /// covered has jumped over pieces we never held, and this policy commits
-    /// nothing for a jump.
+    /// leap: what a policy commits is what it has held, and it holds what the
+    /// windows it was walked through covered.
     fn play(
         p: &mut RetentionPolicy,
         disk: &mut BTreeSet<u32>,

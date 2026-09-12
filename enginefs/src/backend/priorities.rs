@@ -10,15 +10,16 @@ pub const MAX_CONTAINER_METADATA_WINDOW_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_DOWNLOAD_RANGE_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
 pub const SMALL_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
-/// How many seconds of watched video the committed set may hold, whatever
-/// the buffer profile.
+/// How much of the film the committed set may come to, stated as seconds of
+/// it, whatever the buffer profile.
 ///
-/// The committed set is what we offer a peer, and what a peer or a scan
-/// back really wants is the recent past, not half the disk. Sized from the
-/// budget alone it was `cacheSize / 2` -- 151 MB on the field device, about
-/// fifty-one seconds of a 23 Mbps film, so it was most of the way full
-/// inside half a minute and the forward buffer had the other half of the
-/// disk and no more. Time is the unit that says what it is for.
+/// The committed set is what we offer a peer, drawn at random across the
+/// whole file, so this is a size and not a region of the film. Sized from
+/// the budget alone it was `cacheSize / 2` -- 151 MB on the field device,
+/// about fifty-one seconds of a 23 Mbps film -- so the forward buffer had
+/// the other half of a disk far too small to give half of away. Time is the
+/// unit that says what it is for: what we offer is stated against the film,
+/// as the buffer is.
 pub const COMMITTED_SECONDS: u64 = 90;
 
 /// Start treating reads as "container metadata" when they fall in the last 10MB
