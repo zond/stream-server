@@ -2,12 +2,12 @@
 name = "server"
 version = "0.1.8"
 edition = "2024"
-# What the default build distributes: this package's source is MIT (the
-# repository's LICENSE), and the `rar` feature links unrar-rs, which is
-# GPL-3.0-or-later, so the binary built from it is under the GPL
-# (LICENSE-GPL-3.0). cargo-deb writes this field into the package's
-# copyright file. A `--no-default-features` build links no GPL code and is
-# MIT alone; the field cannot say so per feature.
+# This package's source is MIT (the repository's LICENSE), and the `rar`
+# feature links unrar-rs, which is GPL-3.0-or-later. This crate builds no
+# binary of its own, so the obligation travels to whoever links it and
+# distributes the result -- see the `unrar-rs` dependency comment below.
+# A `--no-default-features` build links no GPL code and is MIT alone; the
+# field cannot say so per feature.
 license = "MIT AND GPL-3.0-or-later"
 description = "Headless torrent and archive streaming server for Stremio clients"
 authors = ["Perpetus <perpetus@example.com>"]
@@ -54,10 +54,13 @@ mime_guess = "2.0.5"
 # RAR archive streaming via the pure-Rust `unrar-rs` crate. LICENSING: this
 # crate is GPL-3.0-or-later. The repo SOURCE stays MIT (the LICENSE file is
 # unchanged and contains no unrar-rs code — the crate is only fetched at build
-# time), but because the DEFAULT build links unrar-rs, compiled/distributed
-# DEFAULT binaries of stream-server are covered by GPL-3.0-or-later. Build with
-# `--no-default-features` to produce an MIT-licensed binary with no RAR support
-# (the librqbit backend is always compiled and is not a feature).
+# time). This repository distributes no binary at all, so the GPL obligation
+# is the EMBEDDER's: any program that links this library with `rar` on and is
+# then distributed is distributed under GPL-3.0-or-later, and must ship the
+# GPL text (LICENSE-GPL-3.0 here) and unrar-rs's own notice. xtremio does
+# both, inside the app. Build with `--no-default-features` to link no GPL
+# code and have no RAR support (the librqbit backend is always compiled and
+# is not a feature).
 #
 # default-features=false + crypto-rust keeps RAR's decryption in Rust. It no
 # longer keeps a C toolchain out of the build: aws-lc-sys is compiled anyway,
@@ -126,34 +129,10 @@ windows = { version = "0.62.2", features = [
 [features]
 # RAR is DEFAULT-ON. The pure-Rust `unrar-rs` backend needs no libclang/C++
 # toolchain, so it can ship in the default build. LICENSING: unrar-rs is
-# GPL-3.0-or-later, so the default binary is GPL-3.0-or-later (see the dep
-# comment above). Build `--no-default-features` for an MIT binary with no RAR
-# (RAR requests then return a 501 JSON error); the librqbit backend is always
-# compiled and is not a feature.
+# GPL-3.0-or-later, so a program that links this library with `rar` on is
+# distributed under the GPL (see the dep comment above). Build
+# `--no-default-features` for an MIT-only build with no RAR (RAR requests
+# then return a 501 JSON error); the librqbit backend is always compiled and
+# is not a feature.
 default = ["rar"]
 rar = ["dep:unrar-rs"]
-
-[package.metadata.deb]
-maintainer = "stream-server maintainers"
-copyright = "2025"
-# The copyright file carries the GPL, which is what the packaged (default,
-# RAR-enabled) binary is distributed under; the MIT notice the source's
-# code needs goes beside it.
-license-file = ["../LICENSE-GPL-3.0", "0"]
-extended-description = "Headless torrent and archive streaming server for Stremio clients: streams torrents, ZIP/7Z/TAR/RAR members and cached HTTP sources over a local HTTP API."
-section = "net"
-priority = "optional"
-assets = [
-    ["target/release/server", "usr/bin/stream-server", "755"],
-    ["../LICENSE", "usr/share/doc/server/LICENSE-MIT", "644"],
-]
-
-[package.metadata.wix]
-upgrade-guid = "A1B2C3D4-E5F6-7890-ABCD-EF1234567890"
-path-guid = "B2C3D4E5-F678-90AB-CDEF-123456789012"
-license = false
-eula = false
-
-[build-dependencies]
-winres = "0.1"
-chrono = "0.4.42"

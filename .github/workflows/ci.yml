@@ -119,7 +119,7 @@ jobs:
       # bug that compiles still gets past.
       #
       # It needs the NDK even so. Build scripts compile C for the target
-      # (aws-lc-sys under rustls and librqbit's sha1, libmimalloc-sys), so
+      # (aws-lc-sys, under rustls and librqbit's sha1), so
       # cargo-ndk points cc at the NDK's clang; the runner image carries an
       # NDK at $ANDROID_NDK_LATEST_HOME.
       - name: Install cargo-ndk

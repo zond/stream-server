@@ -6,7 +6,7 @@
 
 *A headless, zero-system-dependency streaming backend, forked from Stremio's `server.js` replacement*
 
-[![Release Build](https://github.com/zond/stream-server/actions/workflows/release.yml/badge.svg)](https://github.com/zond/stream-server/actions/workflows/release.yml)
+[![CI](https://github.com/zond/stream-server/actions/workflows/ci.yml/badge.svg)](https://github.com/zond/stream-server/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT%20src%20%2F%20GPL--3.0%20binary-blue?style=flat-square)](#-license)
 [![Open Source](https://img.shields.io/badge/Open%20Source-✓-brightgreen?style=flat-square)](https://github.com/zond/stream-server)
 
@@ -49,7 +49,7 @@ This is not a drop-in replacement for `server.js` — the API surface it exposes
 - **📡 HTTP Range Requests**: torrent pieces are streamed straight to HTTP range requests for instant seeking — direct play, no transcoding step in between
 
 ### Media & Archives
-- **📦 Archive Streaming**: direct playback from ZIP, 7Z, TAR, tgz (`.tar.gz`) and RAR archives out of the box (all pure Rust). RAR is **on by default** via `unrar-rs`, which is GPL-3.0-or-later, so the default binary is GPL-3.0-or-later — see [License](#-license); build `--no-default-features` for an MIT binary without RAR
+- **📦 Archive Streaming**: direct playback from ZIP, 7Z, TAR, tgz (`.tar.gz`) and RAR archives out of the box (all pure Rust). RAR is **on by default** via `unrar-rs`, which is GPL-3.0-or-later, so a program that links this library with RAR on is GPL-3.0-or-later — see [License](#-license); build `--no-default-features` to link no GPL code and have no RAR
 - Subtitles are the client's job: there is no subtitle conversion, track discovery or OpenSubtitles hashing in the server (see [Removed routes](#removed-routes))
 
 ### Control API
@@ -736,7 +736,7 @@ cargo build --release
 | Android check | `cargo ndk -t armeabi-v7a -t arm64-v8a check -p server --all-targets --locked`, with the runner's NDK: a check, not a build — nothing links and no test runs |
 | Windows Build and Test | `cargo build` and `cargo test` — the only job that compiles the `cfg(windows)` half of `diagnostics` |
 
-Nothing builds or tests macOS. [`release.yml`](.github/workflows/release.yml) is separate: on a `v*` tag (or by hand) it builds the Windows, Linux and Arch artifacts.
+Nothing builds or tests macOS, and `ci.yml` is the only workflow there is: this crate publishes nothing, so there is no release build, no packaging and no tag matrix.
 
 ---
 
@@ -771,19 +771,19 @@ There is no `bindings/` directory and no vcpkg apparatus: the optional C++ `libt
 
 ## 📄 License
 
-**The source in this repository is MIT** — see [LICENSE](LICENSE). It contains no GPL code; `LICENSE-GPL-3.0` is only the licence text the binaries ship with.
+**The source in this repository is MIT** — see [LICENSE](LICENSE). It contains no GPL code.
 
-**The stream-server binaries this project distributes are under the GNU GPL, version 3 or later** — see [LICENSE-GPL-3.0](LICENSE-GPL-3.0). RAR streaming is on by default and is powered by the [`unrar-rs`](https://crates.io/crates/unrar-rs) crate, which is licensed **GPL-3.0-or-later**. That crate is fetched and linked only at build time, but linking it means a **default-built binary of stream-server, with RAR support, is distributed under GPL-3.0-or-later** — every server binary the release workflow publishes, the portable executables, the `.deb`, the `.msi`, the AppImage and the Arch package included. This is a deliberate choice: RAR support is wanted on by default, and the project is released openly.
+**This repository distributes nothing.** It builds no binary and publishes no packages, so there is no download here that anyone receives under any licence. What it publishes is source, and that source is MIT.
 
-Each package carries both texts: the GPL, which the binary is distributed under, and the MIT notice, which the source it is built from carries (`/usr/share/doc/server/` in the `.deb`, `/usr/share/licenses/stream-server/` in the Arch package, `/usr/share/doc/stream-server/` in the AppImage, the install folder for the `.msi`). The release page lists both as `LICENSE-GPL-3.0.txt` and `LICENSE-MIT.txt`, for the portable binaries. The `stremio-runtime` stub links no GPL code and is MIT.
+**The GPL obligation passes to whoever links this library and distributes a program.** RAR streaming is on by default and is powered by the [`unrar-rs`](https://crates.io/crates/unrar-rs) crate, which is licensed **GPL-3.0-or-later**. The crate is fetched and linked only at build time, but linking it means the **program built from it** is distributed under GPL-3.0-or-later. Today that program is [xtremio](https://github.com/zond/xtremio), which links this library with `rar` on and ships [LICENSE-GPL-3.0](LICENSE-GPL-3.0) and `unrar-rs`'s own licence file inside the app. `LICENSE-GPL-3.0` is kept here (verbatim from gnu.org) so an embedder has the text to ship; it says nothing about this repository's own source. Any other embedder inherits the same duty. This is a deliberate choice: RAR support is wanted on by default, and the project is released openly.
 
-To produce an **MIT-licensed binary with no GPL code**, build without the `rar` feature (RAR requests then return a 501 JSON error):
+To link **no GPL code at all**, build without the `rar` feature (RAR requests then return a 501 JSON error):
 
 ```bash
 cargo build --release --no-default-features
 ```
 
-MIT is GPL-compatible, so shipping the MIT source alongside GPL default binaries is fine; the GPL obligation attaches to the compiled/distributed default binary, not to this repository's source.
+MIT is GPL-compatible, so MIT source under a GPL program is fine; the obligation attaches to the distributed program, not to this repository's source.
 
 ---
 

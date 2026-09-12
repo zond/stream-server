@@ -12,7 +12,9 @@ This fork has deliberately dropped Stremio server.js API compatibility for trans
 
 ## Licensing
 
-The repo **source** is MIT (the `LICENSE` file is unchanged and must **stay MIT** — it contains no GPL code). But RAR support is **on by default** and uses the `unrar-rs` crate, which is **GPL-3.0-or-later**. That crate is only fetched at build time, yet linking it means a **default-built, distributed binary is GPL-3.0-or-later**. This is intentional: the owner wants RAR on by default and is releasing openly (iOS App Store is not a concern). MIT is GPL-compatible, so the MIT source shipping alongside GPL default binaries is fine. To build an **MIT binary without RAR**, use `--no-default-features` (RAR requests then return 501; the librqbit backend is not a feature, so it's not named here). Do **not** change the `LICENSE` file to GPL; document the situation instead. The GPL's own text is `LICENSE-GPL-3.0` (verbatim from gnu.org), and every package of the default binary carries it beside the MIT notice: `server/Cargo.toml`'s `license` is `MIT AND GPL-3.0-or-later` and its `[package.metadata.deb]` `license-file` is the GPL (the MIT text goes in as `usr/share/doc/server/LICENSE-MIT`), `server/wix/main.wxs` installs both as `LICENSE-GPL-3.0.txt`/`LICENSE-MIT.txt` next to `bin`, and `release.yml` puts both in the AppImage (`usr/share/doc/stream-server/`), the Arch package (`usr/share/licenses/stream-server/`, `license=('MIT AND GPL-3.0-or-later')`) and the release's assets, for the portable binaries. A new package or asset of the binary needs the same.
+The repo **source** is MIT (the `LICENSE` file is unchanged and must **stay MIT** — it contains no GPL code). But RAR support is **on by default** and uses the `unrar-rs` crate, which is **GPL-3.0-or-later**. That crate is only fetched at build time, yet linking it puts the linked program under **GPL-3.0-or-later**. This is intentional: the owner wants RAR on by default and is releasing openly (iOS App Store is not a concern). MIT is GPL-compatible, so MIT source under a GPL binary is fine.
+
+**This repository distributes no binary, so the obligation is the embedder's, not this repo's.** It builds no program and publishes no packages; the GPL travels with whoever links this library and ships the result. Today that is xtremio, which links it with `rar` on and ships `LICENSE-GPL-3.0` and `unrar-rs`'s own licence file inside the app. Anyone else who links it inherits the same duty, and this repo's job is to keep the fact visible rather than to satisfy it: `server/Cargo.toml`'s `license` is `MIT AND GPL-3.0-or-later`, the `unrar-rs` dependency and the `rar` feature both carry the explanation, and the GPL's own text is kept here as `LICENSE-GPL-3.0` (verbatim from gnu.org) so an embedder has the file to ship. Keep all of those in step. To link **no GPL code at all**, build `--no-default-features` (RAR requests then return 501; the librqbit backend is not a feature, so it's not named here). Do **not** change the `LICENSE` file to GPL; document the situation instead.
 
 ## Workspace map
 
@@ -27,7 +29,7 @@ There is no `bindings/` directory of any kind: the vendored 7-Zip and UnRAR C++ 
 
 ## Toolchain
 
-`rust-toolchain.toml` pins **1.98.0** (needed for the committed `Cargo.lock` and edition 2024); rustup resolves it automatically. CI installs the same version explicitly (`dtolnay/rust-toolchain@1.98.0`) in every job of `ci.yml`, the Windows and Android ones included — if you ever bump the pin, bump those `Setup Rust` steps too. `release.yml` asks for `@stable`, and rustup then runs whatever `rust-toolchain.toml` names in the checkout; its Arch job builds with Arch's own `rust` package, which has no rustup and ignores the pin.
+`rust-toolchain.toml` pins **1.98.0** (needed for the committed `Cargo.lock` and edition 2024); rustup resolves it automatically. CI installs the same version explicitly (`dtolnay/rust-toolchain@1.98.0`) in every job of `ci.yml`, the Windows and Android ones included — if you ever bump the pin, bump those `Setup Rust` steps too.
 
 ## Build, test, lint
 
@@ -49,7 +51,7 @@ None. There is no runtime external-binary dependency at all.
 ## CI
 
 - `.github/workflows/ci.yml` (PR checks): `fmt` (cargo fmt --all --check), `test` (clippy with `--all-features`, gated on correctness+suspicious, then `cargo test`, deliberately **no apt installs** — it proves the zero-system-library default build, which includes pure-Rust RAR), `mit-build` (runs `cargo test -p server --no-default-features`, the MIT escape hatch without `unrar-rs`, whose 501 path is compiled nowhere else), `android` (`cargo ndk ... check --all-targets` for armv7-linux-androideabi and aarch64-linux-android: the cfg(target_os = "android") code and a 32-bit `usize`/`off_t` are compiled nowhere else; a check, so nothing links and no test runs there), plus a Windows build and test (the only job that compiles the `cfg(windows)` half of `diagnostics`). There is no libtorrent job anywhere — the backend no longer exists.
-- `.github/workflows/release.yml` (release matrix, gated on `v*` tags or manual dispatch): builds the default features (`cargo build --release`, RAR on, librqbit the only backend) per platform — Windows (+ MSI via cargo-wix), Linux (+ .deb via cargo-deb, + AppImage), and an Arch package. No release has been tagged from this fork yet, so no binaries have actually been published.
+There is no release workflow. `ci.yml` is the only workflow in the repo: this crate publishes nothing, so there is no matrix, no packaging and no tag build. Whoever links the library ships it (today, xtremio, from its own repo).
 
 ## Conventions
 
@@ -80,7 +82,6 @@ Use the cheapest model adequate for the task at hand. Small/fast models are fine
 
 ## Gotchas & do-not-touch
 
-- **Do not casually edit**: the `.github/workflows/release.yml` build matrix and artifact/asset names (`scripts/generate_release_notes.py` and the release-notes step depend on the `release/*` filenames it produces); `server/Cargo.toml`'s `[package.metadata.deb]` and `[package.metadata.wix]` blocks (release-critical, and the WiX GUIDs must never be regenerated).
 - **Contract strings**: nothing parses this server's stdout any more. The `EngineFS server started at <base url>` line existed for `stremio-runtime-stub`, which waited for it before telling a legacy client the server was up; both the stub and the binary that printed it are gone, and an embedder learns the address from `ServerHandle::bound_http_addr()` instead. Port 11470 is still the default `embedded()` binds and the port stremio-core's URLs are built around, so it is a contract with the *client*, not with a launcher.
 - **Release profile** (`panic = "abort"`, lto, opt-level=z, in the root `Cargo.toml`) means no unwinding in release — don't rely on `catch_unwind`.
 - **Single instance is the embedder's problem, not this crate's.** The `stream-server.lock` file in the temp dir went with the binary that took it; a library cannot decide that a host may only run one of itself. Several servers in one process is a supported case -- it is what the test suite does -- as long as each gets its own `config_dir`/`cache_dir` and an ephemeral port.
