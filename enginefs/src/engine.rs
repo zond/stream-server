@@ -448,12 +448,6 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         )
     }
 
-    /// How far into the file the reader is. The entity is the file, so
-    /// this is the file's own offset and not the torrent's.
-    fn offset_of(_domain: &FileDomain, (_file, offset): (usize, u64)) -> u64 {
-        offset
-    }
-
     /// What the file's pieces hold, which is the file to within the part of
     /// its first and last pieces a neighbour owns -- eight mebibytes of a
     /// twenty-three gigabyte film, and the bitrate this divides into is not

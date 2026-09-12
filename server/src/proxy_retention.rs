@@ -330,11 +330,6 @@ impl Backing for ProxyBacking {
         )
     }
 
-    /// A proxied position is already a byte count into the entity.
-    fn offset_of(_domain: &ProxyDomain, at: u64) -> u64 {
-        at
-    }
-
     fn index_of(domain: &ProxyDomain, at: u64) -> Option<u32> {
         Some(domain.chunk(at))
     }

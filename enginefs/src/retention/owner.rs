@@ -351,13 +351,6 @@ pub trait Backing: Sized + Send + Sync + 'static {
         budget: u64,
         buffering: Buffering,
     ) -> anyhow::Result<RetentionPolicy>;
-    /// How many bytes into the entity `at` is. Pure, and monotonic with
-    /// the position, so it is an offset in the thing being read and not an
-    /// index into it. It was differenced against the last one to measure a
-    /// delivery rate; the rate is size over duration now, and nothing in
-    /// this crate calls this -- it is kept as the offset half of a
-    /// backing's position, which a backing outside it may still need.
-    fn offset_of(domain: &Self::Domain, at: Self::Position) -> u64;
     /// The index `at` lands on under `domain`, clamped to the last, or
     /// `None` when the position names nothing in this domain's index space.
     /// An entity only ever hears its own bytes -- a [`Reader`] is opened on
@@ -3436,10 +3429,6 @@ mod tests {
                 S::SHARE,
                 buffering,
             )
-        }
-
-        fn offset_of(_domain: &FakeDomain, (_file, offset): At) -> u64 {
-            offset
         }
 
         fn index_of(domain: &FakeDomain, (file, offset): At) -> Option<u32> {
