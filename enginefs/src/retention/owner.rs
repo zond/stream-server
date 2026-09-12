@@ -836,6 +836,16 @@ struct Told<B: Backing> {
 /// reads that the window keeps while they are open and no longer.
 const STRUCTURAL_PIECES: usize = 8;
 
+/// How far a reported offset may sit from where the film says it is, as a
+/// fraction of the whole.
+///
+/// A quarter of the file is far more than variable bitrate can drift --
+/// it is a quarter of a two-hour film -- and far less than an index read
+/// misses by, which is most of the file. Wide on purpose: refusing a real
+/// playhead costs the window its place, and there is nothing to gain by
+/// being strict about a number that is right.
+const PLAYHEAD_TOLERANCE: f64 = 0.25;
+
 /// How long the player's own word stands after it stops arriving.
 ///
 /// The app reports about once a second while a film is open. Going quiet
@@ -1209,9 +1219,10 @@ impl<B: Backing> Retention<B> {
         &self,
         key: &B::Key,
         at: B::Position,
+        film: Option<std::time::Duration>,
         duration: Option<std::time::Duration>,
     ) {
-        self.note_playhead_at(key, at, duration, std::time::Instant::now());
+        self.note_playhead_at(key, at, film, duration, std::time::Instant::now());
     }
 
     /// **How long the entity's film is**, without saying where anything is
@@ -1238,6 +1249,7 @@ impl<B: Backing> Retention<B> {
         &self,
         key: &B::Key,
         at: B::Position,
+        film: Option<std::time::Duration>,
         duration: Option<std::time::Duration>,
         now: std::time::Instant,
     ) {
@@ -1249,6 +1261,25 @@ impl<B: Backing> Retention<B> {
         // paused at fifty minutes is watched from fifty minutes.
         if duration.is_some() {
             state.duration = duration;
+        }
+        // **A read offset is not always a playhead**, and the player's own
+        // clock is what tells them apart.
+        //
+        // What a player reports is where its demuxer has *read* to, and it
+        // reads the container's index as readily as the film: mpv keeps a
+        // second reader crawling that index and its `stream-pos` follows,
+        // so a faithful report puts the playhead at the end of the file
+        // while the viewer is sixteen minutes in. The field log of
+        // 2026-09-12 20:49 is that, `playhead=5559` against a reader at 816.
+        //
+        // Where in the picture it is settles it: a position and a length
+        // give a fraction of the film, the entity's extent gives a fraction
+        // of the file, and playback keeps those roughly together however
+        // variable the bitrate. An index read does not -- it is off by most
+        // of the file, not by a few percent -- so the tolerance can be wide
+        // enough that no real playback is ever refused.
+        if !state.plausible_playhead(at, film) {
+            return;
         }
         state.told = Some(Told { at, when: now });
     }
@@ -2519,6 +2550,29 @@ impl<B: Backing> State<B> {
             .or_else(|| self.playing_head())
             .or(self.last_position)
             .or_else(|| self.live_head())
+    }
+
+    /// Whether `at` is where the film is being watched, rather than where
+    /// the player happens to be reading; see [`Self::told`].
+    ///
+    /// True whenever there is nothing to check it against -- no stated
+    /// film position, no duration, no size, no extent. A hint is not
+    /// refused for want of evidence against it.
+    fn plausible_playhead(&self, at: B::Position, film: Option<std::time::Duration>) -> bool {
+        let (Some(film), Some(duration)) = (film, self.duration) else {
+            return true;
+        };
+        if duration.is_zero() {
+            return true;
+        }
+        let extent = B::extent(&self.domain);
+        let pieces = extent.end.saturating_sub(extent.start);
+        let (Some(index), true) = (B::index_of(&self.domain, at), pieces > 0) else {
+            return true;
+        };
+        let of_the_file = f64::from(index.saturating_sub(extent.start)) / f64::from(pieces);
+        let of_the_film = film.as_secs_f64() / duration.as_secs_f64();
+        (of_the_file - of_the_film).abs() <= PLAYHEAD_TOLERANCE
     }
 
     /// Where the player says it is, while it is still saying it.
@@ -5602,7 +5656,7 @@ mod tests {
 
         // File 0 is eight pieces of a thousand bytes. Eighty seconds of film
         // is a hundred bytes a second, and ten seconds of that is one piece.
-        owner.note_playhead(&0, (0, 0), Some(std::time::Duration::from_secs(80)));
+        owner.note_playhead(&0, (0, 0), None, Some(std::time::Duration::from_secs(80)));
         let claim = owner.turn(&0).await.expect("the turn");
         owner.pass(&0, &(), claim, Mode::Live).await;
         assert_eq!(
@@ -5864,7 +5918,7 @@ mod tests {
             .reader_on(&0, (0, 7 * PIECE), Reading::Playback, Buffering::default())
             .expect("the entity the install made");
         assert!(crawler.note((0, 7 * PIECE)).is_none());
-        owner.note_playhead(&0, (0, 2 * PIECE), None);
+        owner.note_playhead(&0, (0, 2 * PIECE), None, None);
 
         let claim = owner.turn(&0).await.expect("the turn");
         let outcome = owner
@@ -5928,6 +5982,61 @@ mod tests {
         drop(reader);
     }
 
+    /// **A read offset that is not where the film is, is not a playhead.**
+    ///
+    /// What a player reports is where its demuxer has read to, and it reads
+    /// the container's index as readily as the film -- mpv keeps a second
+    /// reader crawling the index and `stream-pos` follows it. Reported
+    /// faithfully, that puts the playhead at the end of the file while the
+    /// viewer is sixteen minutes in, which is the field log of 2026-09-12
+    /// 20:49: `playhead=5559` with the viewer's reader at piece 816.
+    ///
+    /// The player's own clock settles it, and it is the same number the
+    /// progress bar draws.
+    #[tokio::test]
+    async fn an_offset_the_film_position_contradicts_is_not_believed() {
+        let (_backing, owner, _budget) = torrent();
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        let reader = owner
+            .reader_on(&0, (0, 0), Reading::Playback, Buffering::default())
+            .expect("the entity the install made");
+        assert!(reader.note((0, 0)).is_none());
+
+        // File 0 is eight pieces over eighty seconds. Twenty seconds in is
+        // a quarter of the film, so a report from the last piece is the
+        // index being read and not the viewer.
+        let film = std::time::Duration::from_secs(20);
+        let whole = Some(std::time::Duration::from_secs(80));
+        owner.note_playhead(&0, (0, 7 * PIECE), Some(film), whole);
+        let claim = owner.turn(&0).await.expect("the turn");
+        let outcome = owner
+            .pass(&0, &(), claim, Mode::Live)
+            .await
+            .concluded
+            .expect("a pass");
+        assert_eq!(
+            outcome.windows,
+            vec![0..2],
+            "the window stays where the reads are, not where the index is"
+        );
+
+        // And a report that agrees with the clock is the playhead, however
+        // far from any read it is.
+        owner.note_playhead(&0, (0, 2 * PIECE), Some(film), whole);
+        let claim = owner.turn(&0).await.expect("the turn");
+        let outcome = owner
+            .pass(&0, &(), claim, Mode::Live)
+            .await
+            .concluded
+            .expect("a pass");
+        assert_eq!(
+            outcome.windows,
+            vec![2..4, 0..2],
+            "a quarter of the file at a quarter of the film is the viewer"
+        );
+        drop(reader);
+    }
+
     /// **A playhead nobody is reporting any more stops being believed.**
     ///
     /// The player's word is a hint, not a requirement: the app can be
@@ -5946,7 +6055,7 @@ mod tests {
         let long_ago = std::time::Instant::now()
             .checked_sub(TOLD_FRESH + std::time::Duration::from_secs(1))
             .expect("a clock with some history");
-        owner.note_playhead_at(&0, (0, 2 * PIECE), None, long_ago);
+        owner.note_playhead_at(&0, (0, 2 * PIECE), None, None, long_ago);
 
         let claim = owner.turn(&0).await.expect("the turn");
         let outcome = owner
