@@ -2823,11 +2823,13 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     ) -> Option<crate::retention::TorrentStreamNumbers> {
         let engine = self.peek_engine(info_hash).await?;
         let transfer = engine.handle.transfer_totals();
+        let refused_reclaims = engine.refused_reclaims();
         let Some(reading) = engine.policy_reading(file_idx) else {
             return Some(crate::retention::TorrentStreamNumbers {
                 window: None,
                 committed_bytes: None,
                 transfer,
+                refused_reclaims,
             });
         };
         // A torrent with no registered store -- one in Error, or one whose
@@ -2838,6 +2840,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             window: Some(reading.window(&held)),
             committed_bytes: Some(reading.committed_bytes()),
             transfer,
+            refused_reclaims,
         })
     }
 
@@ -4868,6 +4871,7 @@ mod tests {
         /// through `transfer_totals()`; a test adds to these where peers
         /// would.
         fetched: AtomicU64,
+        verified: AtomicU64,
         uploaded: AtomicU64,
         /// Test knob: how many pieces each file of the fake torrent spans.
         /// Zero -- the default -- is one piece per file, which is the
@@ -5171,6 +5175,7 @@ mod tests {
             (self.run_state() == crate::backend::RunState::Live).then(|| {
                 crate::backend::TransferTotals {
                     fetched: self.counters.fetched.load(Ordering::SeqCst),
+                    verified: self.counters.verified.load(Ordering::SeqCst),
                     uploaded: self.counters.uploaded.load(Ordering::SeqCst),
                 }
             })
@@ -6508,11 +6513,13 @@ mod tests {
         assert_eq!(totals[TEST_HASH], TransferTotals::default());
 
         counters.fetched.store(4_096, Ordering::SeqCst);
+        counters.verified.store(4_000, Ordering::SeqCst);
         counters.uploaded.store(512, Ordering::SeqCst);
         assert_eq!(
             enginefs.transfer_totals().await[TEST_HASH],
             TransferTotals {
                 fetched: 4_096,
+                verified: 4_000,
                 uploaded: 512,
             }
         );
@@ -11947,6 +11954,51 @@ mod tests {
         );
         assert!((2..4).all(|piece| !bucket.join(piece.to_string()).exists()));
         assert!(bucket.join("0").is_file() && bucket.join("1").is_file());
+    }
+
+    /// **A reclaim the backend refuses is counted, and the count is
+    /// reported.**
+    ///
+    /// A refusal is librqbit keeping a piece an open stream's lookahead
+    /// still covers and this policy's window no longer does. It is not a
+    /// fetch-and-reclaim loop -- the fork's `drop_pieces` skips
+    /// `streams.wanted_ranges` -- it is a disk that cannot come back under
+    /// its budget while the stream lives, plus a wasted `drop_pieces` on
+    /// every tick. The counter was `#[cfg(test)]`, so there was no way to
+    /// see it happening on a device; it is in the numbers the app polls
+    /// now, and zero is the only healthy value.
+    #[tokio::test]
+    async fn refused_reclaims_are_counted_and_reported_in_the_stream_numbers() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        // `drops_what_it_is_asked` stays clear: the backend keeps what it
+        // is asked to forget.
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in [0u32, 1, 2, 3] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let _store = seeded_store(&enginefs, &engine);
+        engine.begin_retention(0).await;
+        engine.note_playhead(0, 0);
+        let pass = engine
+            .retain(enginefs.store_registry(), &playing(0))
+            .await
+            .expect("a pass");
+        assert_eq!(pass.reclaimed, 0, "the backend gave nothing back: {pass:?}");
+
+        let numbers = enginefs
+            .torrent_stream_numbers(TEST_HASH, 0)
+            .await
+            .expect("the engine exists");
+        assert_eq!(
+            numbers.refused_reclaims, 2,
+            "the two pieces outside the window and outside the draw were asked \
+             for and refused"
+        );
     }
 
     /// **The held set the pass is handed is this file's, not the torrent's.**

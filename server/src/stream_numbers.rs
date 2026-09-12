@@ -98,6 +98,20 @@ pub struct Sharing {
     /// What the torrent has moved this session, or `None` where the backend
     /// has no counters to read: see [`Transfer`].
     pub transfer: Option<Transfer>,
+    /// How many pieces this engine's retention passes asked the backend to
+    /// forget and were refused, over the life of the engine.
+    ///
+    /// **Zero is the only healthy value, and it is here because it was
+    /// invisible.** A refusal is librqbit keeping a piece an open stream's
+    /// lookahead still covers and this policy's window no longer does: the
+    /// disk cannot come back under budget while that stream lives, and
+    /// every tick spends a `drop_pieces` to be refused again. It and
+    /// [`Transfer::wasted_bytes`] are the two numbers that made a phone
+    /// fetching 1.6 GB to play a hundred megabytes legible, and they stay
+    /// for that reason.
+    ///
+    /// `None` for a proxied response, which has no engine and no passes.
+    pub refused_reclaims: Option<usize>,
 }
 
 /// What a torrent has moved over the connection **in this session**, and
@@ -115,6 +129,14 @@ pub struct Sharing {
 pub struct Transfer {
     /// Bytes this torrent has fetched from peers **in this session**.
     pub downloaded_bytes: u64,
+    /// Bytes fetched that never became a piece we kept: `fetched` less
+    /// librqbit's `downloaded_and_checked_bytes`.
+    ///
+    /// A few per cent is the endgame duplicating the last pieces of a
+    /// download and is normal. A multiple of what was played is a stream
+    /// fetching what its own retention pass is deleting, which is the bug
+    /// this figure exists to show.
+    pub wasted_bytes: u64,
     /// Bytes this torrent has sent to peers **in this session**.
     pub uploaded_bytes: u64,
     /// Uploaded over downloaded, the form every BitTorrent client shows.
@@ -136,17 +158,22 @@ impl Sharing {
     fn of(
         committed_bytes: Option<u64>,
         transfer: Option<enginefs::backend::TransferTotals>,
+        refused_reclaims: Option<usize>,
     ) -> Option<Self> {
         let transfer = transfer.map(|transfer| Transfer {
             downloaded_bytes: transfer.fetched,
+            wasted_bytes: transfer.wasted(),
             uploaded_bytes: transfer.uploaded,
             ratio: (transfer.fetched > 0)
                 .then(|| transfer.uploaded as f64 / transfer.fetched as f64),
         });
-        (committed_bytes.is_some() || transfer.is_some()).then_some(Self {
-            committed_bytes,
-            transfer,
-        })
+        (committed_bytes.is_some() || transfer.is_some() || refused_reclaims.is_some()).then_some(
+            Self {
+                committed_bytes,
+                transfer,
+                refused_reclaims,
+            },
+        )
     }
 }
 
@@ -211,7 +238,11 @@ impl StreamStore for EngineFS {
         let numbers = self.torrent_stream_numbers(&info_hash, file_idx).await?;
         Some(StreamNumbers {
             window: numbers.window,
-            sharing: Sharing::of(numbers.committed_bytes, numbers.transfer),
+            sharing: Sharing::of(
+                numbers.committed_bytes,
+                numbers.transfer,
+                Some(numbers.refused_reclaims),
+            ),
         })
     }
 }
@@ -485,8 +516,10 @@ mod tests {
                 Some(859_832_320),
                 Some(enginefs::backend::TransferTotals {
                     fetched: 4_800,
+                    verified: 4_400,
                     uploaded: 2_100,
                 }),
+                Some(3),
             ),
         };
         assert_eq!(
@@ -497,9 +530,11 @@ mod tests {
                     "committedBytes": 859_832_320u64,
                     "transfer": {
                         "downloadedBytes": 4_800,
+                        "wastedBytes": 400,
                         "uploadedBytes": 2_100,
                         "ratio": 2_100.0 / 4_800.0,
                     },
+                    "refusedReclaims": 3,
                 },
             })
         );
@@ -528,8 +563,10 @@ mod tests {
             None,
             Some(TransferTotals {
                 fetched: 0,
+                verified: 0,
                 uploaded: 2_100,
             }),
+            Some(0),
         )
         .expect("a torrent that has moved bytes has a sharing row");
         let seeding = seeding.transfer.expect("its counters were readable");
@@ -540,8 +577,10 @@ mod tests {
             Some(820),
             Some(TransferTotals {
                 fetched: 4_800,
+                verified: 4_400,
                 uploaded: 2_100,
             }),
+            Some(0),
         )
         .expect("a sharing row");
         assert_eq!(both.committed_bytes, Some(820));
@@ -562,7 +601,7 @@ mod tests {
     /// would tell a viewer their session has shared nothing.
     #[test]
     fn a_torrent_whose_counters_cannot_be_read_reports_no_transfer_at_all() {
-        let paused = Sharing::of(Some(820), None).expect("its policy still committed bytes");
+        let paused = Sharing::of(Some(820), None, None).expect("its policy still committed bytes");
         assert_eq!(paused.committed_bytes, Some(820));
         assert_eq!(
             paused.transfer, None,
@@ -571,11 +610,15 @@ mod tests {
 
         assert_eq!(
             serde_json::to_value(paused).expect("it serializes"),
-            serde_json::json!({ "committedBytes": 820, "transfer": null })
+            serde_json::json!({
+                "committedBytes": 820,
+                "transfer": null,
+                "refusedReclaims": null
+            })
         );
 
         assert_eq!(
-            Sharing::of(None, None),
+            Sharing::of(None, None, None),
             None,
             "and with no committed set either there is no sharing row to draw"
         );

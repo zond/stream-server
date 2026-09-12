@@ -278,6 +278,17 @@ pub struct TorrentStreamNumbers {
     /// from a zero says it has. See
     /// [`crate::backend::TorrentHandle::transfer_totals`].
     pub transfer: Option<crate::backend::TransferTotals>,
+    /// How many pieces this engine's retention passes have asked the
+    /// backend to forget and been refused, summed over the engine's life.
+    ///
+    /// **Zero is the only healthy value.** A refusal is librqbit keeping a
+    /// piece inside an open stream's lookahead that this policy's window no
+    /// longer covers: the disk cannot come back under budget while that
+    /// stream lives, and every tick spends a `drop_pieces` to be refused
+    /// again. It is not `Option`, because "no refusals" and "nothing to
+    /// read" are the same fact here -- the counter is the engine's own and
+    /// exists from its construction.
+    pub refused_reclaims: usize,
 }
 
 /// What one retention pass did, for the log and for the tests.

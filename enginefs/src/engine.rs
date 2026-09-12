@@ -367,8 +367,7 @@ pub(crate) struct TorrentBacking<H: TorrentHandle> {
     pins_unknown: Arc<crate::piece_store::PinsUnknown>,
     /// Pieces a reclaim asked the backend to forget and did not get back --
     /// a peer mid-flight on them, or a stream's lookahead over them. Shared
-    /// with [`Engine::refused_reclaims`], where a test reads it.
-    #[cfg(test)]
+    /// with [`Engine::refused_reclaims`], which reports it.
     refused: Arc<AtomicUsize>,
 }
 
@@ -819,11 +818,9 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
                     .collect();
             }
             if parts.len() == 1 && parts[0] == run {
-                #[cfg(test)]
                 let asked = (run.end - run.start) as usize;
                 let freed =
                     crate::retention::release(&self.handle, store, &self.info_hash, run).await;
-                #[cfg(test)]
                 self.refused
                     .fetch_add(asked.saturating_sub(freed), Ordering::Relaxed);
                 reclaimed += freed;
@@ -1030,8 +1027,15 @@ pub struct Engine<H: TorrentHandle> {
     pub(crate) interleave: Interleave,
     /// How many pieces the passes asked the backend to forget and were
     /// refused, summed over the engine's life: the count the fetch-ahead
-    /// bound exists to keep at zero, read by the test that pins it.
-    #[cfg(test)]
+    /// bound exists to keep at zero.
+    ///
+    /// **It is reported, not only tested.** A refusal is a piece inside an
+    /// open stream's lookahead and outside the window that would keep it --
+    /// the disk permanently over budget, plus a wasted `drop_pieces` per
+    /// tick for as long as the stream lives -- and while this was
+    /// `#[cfg(test)]` there was no way to see it happening on a device. It
+    /// and the waste figure beside it are what made the 1.6 GB open
+    /// visible, so they stay.
     pub(crate) refused_reclaims: Arc<AtomicUsize>,
 }
 
@@ -1073,7 +1077,6 @@ impl<H: TorrentHandle> Engine<H> {
         pins_unknown: Arc<crate::piece_store::PinsUnknown>,
     ) -> Self {
         let pinned_files = Arc::new(parking_lot::RwLock::new(BTreeSet::new()));
-        #[cfg(test)]
         let refused_reclaims = Arc::new(AtomicUsize::new(0));
         let retention = Retention::new(
             Arc::new(TorrentBacking {
@@ -1082,7 +1085,6 @@ impl<H: TorrentHandle> Engine<H> {
                 live: live.clone(),
                 pinned: pinned_files.clone(),
                 pins_unknown: pins_unknown.clone(),
-                #[cfg(test)]
                 refused: refused_reclaims.clone(),
             }),
             budget,
@@ -1121,9 +1123,14 @@ impl<H: TorrentHandle> Engine<H> {
             rest: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             interleave,
-            #[cfg(test)]
             refused_reclaims,
         }
+    }
+
+    /// How many pieces this engine's passes have been refused; see the
+    /// field. Reported in the stream numbers a client polls.
+    pub(crate) fn refused_reclaims(&self) -> usize {
+        self.refused_reclaims.load(Ordering::Relaxed)
     }
 
     /// Whether this process has re-applied its want-set to this torrent

@@ -2225,6 +2225,7 @@ impl TorrentHandle for LibrqbitHandle {
                 let snapshot = live.stats_snapshot();
                 Some(TransferTotals {
                     fetched: snapshot.fetched_bytes,
+                    verified: snapshot.downloaded_and_checked_bytes,
                     uploaded: snapshot.uploaded_bytes,
                 })
             }

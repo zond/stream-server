@@ -148,6 +148,17 @@ pub trait TorrentBackend: Send + Sync {
 pub struct TransferTotals {
     /// Bytes received from peers.
     pub fetched: u64,
+    /// Bytes received from peers that went on to verify and be kept --
+    /// librqbit's `downloaded_and_checked_bytes`.
+    ///
+    /// **The difference from [`Self::fetched`] is waste**, and it is the
+    /// number that made the retention bug visible: a phone that fetched
+    /// 1.6 GB to play a hundred megabytes had fetched pieces the next
+    /// retention pass deleted, or pieces a peer beat us to, and nothing
+    /// downstream could see either. A healthy session's waste is a few
+    /// per cent of endgame duplication; a session whose window is
+    /// fighting its own fetches is a multiple.
+    pub verified: u64,
     /// Bytes sent to peers.
     pub uploaded: u64,
 }
@@ -157,8 +168,17 @@ impl TransferTotals {
     pub fn plus(self, other: TransferTotals) -> TransferTotals {
         TransferTotals {
             fetched: self.fetched.saturating_add(other.fetched),
+            verified: self.verified.saturating_add(other.verified),
             uploaded: self.uploaded.saturating_add(other.uploaded),
         }
+    }
+
+    /// Bytes fetched that never became a piece we kept; see
+    /// [`Self::verified`]. Saturating, because the two counters are read
+    /// from one snapshot but a torrent restored from disk starts with
+    /// verified bytes it never fetched.
+    pub fn wasted(self) -> u64 {
+        self.fetched.saturating_sub(self.verified)
     }
 }
 
