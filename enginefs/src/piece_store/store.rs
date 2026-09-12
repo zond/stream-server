@@ -842,6 +842,57 @@ impl Inner {
         self.handles.forget(u64::from(piece));
     }
 
+    /// Do `io` on `piece`'s file, and if the handle turns out to be stale,
+    /// throw it away, open the piece again and do it once more.
+    ///
+    /// **An open descriptor does not always survive its file.** POSIX says
+    /// it does -- unlink leaves a reader reading, which is what the handle
+    /// cache is written against -- but Android's FUSE-mediated
+    /// `/storage/emulated` does not honour that, and a descriptor whose file
+    /// has been deleted fails with `EBADF` rather than reading on. A
+    /// retention reclaim deleting a piece while anything holds a handle to
+    /// it is therefore a hard error on the device and impossible to
+    /// reproduce on any CI runner.
+    ///
+    /// The 2026-09-12 field log is what that costs: one `EBADF` writing to
+    /// piece 5565 put the torrent into `torrent_error_state`, every later
+    /// request answered 502, and the session was over. A piece that goes
+    /// away is an ordinary thing here -- the reclaim's whole job -- and it
+    /// must cost the read or write that raced it, and nothing else.
+    ///
+    /// Only the stale case retries: a real I/O error is returned at once,
+    /// because reopening a failing disk twice tells nobody anything.
+    fn retrying_a_stale_handle(
+        &self,
+        piece: u32,
+        io: impl FnMut(&File) -> io::Result<()>,
+    ) -> anyhow::Result<()> {
+        // Opened again on the retry, which is where a piece that really has
+        // gone becomes `MissingPiece` rather than an I/O failure -- the
+        // distinction the layer above draws.
+        retrying_a_stale_handle(
+            || self.open_for_read(piece),
+            io,
+            || self.forget_handles(piece),
+        )
+    }
+
+    /// [`Self::retrying_a_stale_handle`] for the writing side, which opens
+    /// the piece differently and, on the retry, creates it again: the file
+    /// the first handle named is gone, and the bytes still have to land
+    /// somewhere for the piece to complete.
+    fn retrying_a_stale_handle_for_write(
+        &self,
+        piece: u32,
+        io: impl FnMut(&File) -> io::Result<()>,
+    ) -> anyhow::Result<()> {
+        retrying_a_stale_handle(
+            || self.open_for_write(piece),
+            io,
+            || self.forget_handles(piece),
+        )
+    }
+
     #[cfg(test)]
     fn count_open(&self) {
         self.opens.fetch_add(1, Ordering::Relaxed);
@@ -1258,18 +1309,17 @@ impl TorrentStorage for PieceStore {
             .segments(file_id, offset, buf.len() as u64)?
         {
             let len = segment.len as usize;
-            let file = self.inner.open_for_read(segment.piece)?;
-            pread_exact_at(
-                &file,
-                segment.offset_in_piece,
-                &mut buf[filled..filled + len],
-            )
-            .map_err(|e| {
-                anyhow::Error::new(e).context(format!(
-                    "reading {len} bytes at {} of piece {}",
-                    segment.offset_in_piece, segment.piece
-                ))
-            })?;
+            let target = &mut buf[filled..filled + len];
+            self.inner
+                .retrying_a_stale_handle(segment.piece, |file| {
+                    pread_exact_at(file, segment.offset_in_piece, target)
+                })
+                .with_context(|| {
+                    format!(
+                        "reading {len} bytes at {} of piece {}",
+                        segment.offset_in_piece, segment.piece
+                    )
+                })?;
             filled += len;
         }
         Ok(())
@@ -1284,15 +1334,17 @@ impl TorrentStorage for PieceStore {
             .segments(file_id, offset, buf.len() as u64)?
         {
             let len = segment.len as usize;
-            let file = self.inner.open_for_write(segment.piece)?;
-            pwrite_all_at(&file, segment.offset_in_piece, &buf[written..written + len]).map_err(
-                |e| {
-                    anyhow::Error::new(e).context(format!(
+            let source = &buf[written..written + len];
+            self.inner
+                .retrying_a_stale_handle_for_write(segment.piece, |file| {
+                    pwrite_all_at(file, segment.offset_in_piece, source)
+                })
+                .with_context(|| {
+                    format!(
                         "writing {len} bytes at {} of piece {}",
                         segment.offset_in_piece, segment.piece
-                    ))
-                },
-            )?;
+                    )
+                })?;
             written += len;
         }
         Ok(())
@@ -1542,6 +1594,42 @@ impl StorageFactory for PieceStoreFactory {
 }
 
 #[cfg(unix)]
+/// Do `io` on what `open` gives, and if the handle turns out to be stale,
+/// `forget` it, open again and do it once more.
+///
+/// Free of the store so the retry itself can be tested: no filesystem
+/// reachable from a test can produce the failure this exists for.
+fn retrying_a_stale_handle<T, H: std::ops::Deref<Target = T>>(
+    open: impl Fn() -> anyhow::Result<H>,
+    mut io: impl FnMut(&T) -> io::Result<()>,
+    forget: impl FnOnce(),
+) -> anyhow::Result<()> {
+    let handle = open()?;
+    match io(&handle) {
+        Err(error) if is_stale_handle(&error) => {
+            drop(handle);
+            forget();
+            let fresh = open()?;
+            io(&fresh).map_err(anyhow::Error::new)
+        }
+        other => other.map_err(anyhow::Error::new),
+    }
+}
+
+/// Whether this is a descriptor that no longer names its file, rather than
+/// a disk saying no.
+///
+/// `EBADF` is the one Android's FUSE storage answers with once the file
+/// behind an open handle has been unlinked. `ENOENT` is here for the same
+/// reason at one remove: some of those layers answer it for a handle rather
+/// than for a path.
+fn is_stale_handle(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc_ebadf) if libc_ebadf == 9
+    ) || error.kind() == io::ErrorKind::NotFound
+}
+
 fn pread_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
     use std::os::unix::fs::FileExt;
     file.read_exact_at(buf, offset)
@@ -2450,6 +2538,61 @@ mod tests {
         // Nothing staged any more: the idempotent completion is still one.
         store.complete_piece(0).unwrap();
         assert!(store.has_piece(0));
+    }
+
+    /// **A handle that no longer names its file costs the read, and the
+    /// read is done again.**
+    ///
+    /// This cannot be provoked through the filesystem from a test: on every
+    /// CI runner an unlinked file stays readable through an open descriptor,
+    /// which is exactly why the failure reached a phone and not a build.
+    /// Android's FUSE-mediated `/storage/emulated` answers `EBADF` instead,
+    /// and on 2026-09-12 one of those -- writing to piece 5565, which a
+    /// retention pass had taken -- put the torrent into `torrent_error_state`
+    /// and ended the session. So the retry is driven here directly.
+    #[test]
+    fn a_stale_handle_is_thrown_away_and_the_io_done_again() {
+        let opens = std::cell::Cell::new(0);
+        let forgotten = std::cell::Cell::new(0);
+        let attempts = std::cell::Cell::new(0);
+        let outcome = retrying_a_stale_handle(
+            || {
+                opens.set(opens.get() + 1);
+                Ok(Box::new(()))
+            },
+            |()| {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    Err(io::Error::from_raw_os_error(9))
+                } else {
+                    Ok(())
+                }
+            },
+            || forgotten.set(forgotten.get() + 1),
+        );
+        assert!(outcome.is_ok(), "{:#}", outcome.unwrap_err());
+        assert_eq!(opens.get(), 2, "the stale handle was opened again");
+        assert_eq!(forgotten.get(), 1, "and dropped from the cache first");
+        assert_eq!(attempts.get(), 2);
+    }
+
+    /// **A disk that is failing is not a stale handle**, and reopening it
+    /// twice tells nobody anything.
+    #[test]
+    fn an_ordinary_io_failure_is_not_retried() {
+        let opens = std::cell::Cell::new(0);
+        let forgotten = std::cell::Cell::new(0);
+        let outcome = retrying_a_stale_handle(
+            || {
+                opens.set(opens.get() + 1);
+                Ok(Box::new(()))
+            },
+            |()| Err(io::Error::from_raw_os_error(5)),
+            || forgotten.set(forgotten.get() + 1),
+        );
+        assert!(outcome.is_err());
+        assert_eq!(opens.get(), 1);
+        assert_eq!(forgotten.get(), 0);
     }
 
     /// A cached handle keeps a deleted file's bytes readable for as long as
