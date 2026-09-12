@@ -8592,18 +8592,33 @@ mod tests {
         /// occupancy is one window either way. The fetched count is the
         /// only place it appears.
         async fn probe_the_tail(&mut self) {
-            use tokio::io::AsyncReadExt;
+            use tokio::io::{AsyncReadExt, AsyncSeekExt};
+            let tail = RETENTION_FILE_BYTES as u64 - RETENTION_PIECE;
             let mut probe = self
                 .engine
                 .try_get_file_with_intent(
                     0,
-                    RETENTION_FILE_BYTES as u64 - RETENTION_PIECE,
+                    tail,
                     255,
                     crate::backend::priorities::PlaybackIntent::ContainerMetadata,
                     crate::backend::priorities::BufferProfile::Normal,
                 )
                 .await
                 .expect("a reader on the tail");
+            // **And the seek, which is not a formality.** The offset handed
+            // to `try_get_file_with_intent` reaches the backend as the
+            // stream's priority window and as the reader's opened-at, and
+            // nowhere else: `LibrqbitBackend::get_file_reader` opens
+            // librqbit's `FileStream` at zero whatever it is handed, and
+            // `stream_video` seeks the handle before it serves a byte.
+            // Without the same seek here the probe delivered the *head* of
+            // the file -- already on the disk, off no peer, its playhead
+            // recorded at a tail it had never reached -- and the read this
+            // fixture exists to reproduce never happened.
+            probe
+                .seek(std::io::SeekFrom::Start(tail))
+                .await
+                .expect("the probe seeks to the tail, as the route does");
             let mut buf = vec![0u8; 64 * 1024];
             let delivered = tokio::time::timeout(TEST_WAIT_BOUND, probe.read(&mut buf))
                 .await
@@ -8612,6 +8627,17 @@ mod tests {
             assert_ne!(
                 delivered, 0,
                 "the probe delivered nothing, so it never had a byte to claim a head with"
+            );
+            // The payload is `i % 251`, so the bytes say which offset they
+            // came from: a probe silently reading the head again is what
+            // this catches.
+            let want: Vec<u8> = (tail as usize..tail as usize + delivered)
+                .map(|i| (i % 251) as u8)
+                .collect();
+            assert_eq!(
+                buf[..delivered],
+                want[..],
+                "the probe read {delivered} bytes that are not the file's tail"
             );
             drop(probe);
         }
