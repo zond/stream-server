@@ -815,6 +815,27 @@ const RATE_CONTINUATION_FLOOR: u64 = 64 * 1024 * 1024;
 /// only reader there is, and no sample could ever form again.
 const RATE_ANCHOR_STALE: std::time::Duration = std::time::Duration::from_secs(8);
 
+/// The longest a single sample may span.
+///
+/// The anchor deliberately survives the gap between one response and the
+/// next, because that gap is part of how fast the film is being watched
+/// and measuring only inside a burst reads the socket instead. A gap in
+/// which *nothing was played* is not that. The field log of 2026-09-12
+/// has the difference: the first read delivered four megabytes from the
+/// head of the file and stopped, the player spent the next twelve seconds
+/// on the container index -- a probe, which rightly feeds nothing here --
+/// and the next playing delivery arrived 48 bytes further on. Forty-eight
+/// bytes over 12.85 seconds is three bytes a second, which is what the
+/// window was then sized from: sixteen pieces, a floor, and a playback
+/// that never started.
+///
+/// So a sample is a measurement of playback or it is not taken. Long
+/// enough to cover a player that closes its response and reopens a second
+/// later, short enough that a stall, a pause with the body open, or a
+/// probe holding the stream are all refused -- they re-anchor instead, and
+/// the last rate measured stands until playback says otherwise.
+const RATE_SAMPLE_SPAN_MAX: std::time::Duration = std::time::Duration::from_secs(6);
+
 impl DeliveryRate {
     /// A byte really went out, at `offset`, at `now`, on a read granted
     /// `lookahead` bytes of read-ahead.
@@ -839,6 +860,12 @@ impl DeliveryRate {
             return;
         }
         if elapsed < RATE_SAMPLE_INTERVAL {
+            return;
+        }
+        if elapsed > RATE_SAMPLE_SPAN_MAX {
+            // Whatever happened over that long, it was not this film being
+            // played at a rate. Start again from here.
+            self.since = Some((offset, now));
             return;
         }
         let sample = ((offset - was) as f64 / elapsed.as_secs_f64()) as u64;
@@ -5588,6 +5615,43 @@ mod tests {
              at ten seconds of it"
         );
         drop(reading);
+    }
+
+    /// **A gap in which nothing was played is not a rate**, which is the
+    /// failure the field log of 2026-09-12 caught in the shipped build.
+    ///
+    /// The anchor survives the gap between one response and the next on
+    /// purpose. What it must not survive is a gap that was not playback:
+    /// there the divisor is real seconds and the dividend is whatever the
+    /// next read happened to open at, and the quotient is not a bitrate.
+    #[test]
+    fn a_gap_in_which_nothing_was_played_is_not_a_sample() {
+        let mut rate = DeliveryRate::default();
+        let start = std::time::Instant::now();
+        let after = |millis| start + std::time::Duration::from_millis(millis);
+        let lookahead = 128 * 1024 * 1024;
+        // The head of the film, delivered in one burst far too short to
+        // sample, so the anchor stays where it started.
+        rate.note(0, lookahead, start);
+        rate.note(4 * 1024 * 1024, lookahead, after(50));
+        // Then twelve seconds in which the player read the container index
+        // -- a probe, which feeds nothing here -- and the next playing byte
+        // arrives 48 further on than the anchor. In the field this was the
+        // whole measurement: 48 bytes over 12.85 seconds, three bytes a
+        // second, a sixteen-piece window and a playback that never started.
+        rate.note(48, lookahead, after(12_850));
+        assert_eq!(
+            rate.bytes_per_second, None,
+            "the twelve seconds were not this film being played"
+        );
+        // And the walk that follows measures normally, from where the
+        // refusal re-anchored.
+        rate.note(48 + 7_000_000, lookahead, after(14_850));
+        assert_eq!(
+            rate.bytes_per_second,
+            Some(3_500_000),
+            "the next two seconds are playback, and they are the rate"
+        );
     }
 
     /// **A second read far down the file is not the walk being measured.**
