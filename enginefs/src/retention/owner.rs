@@ -585,6 +585,22 @@ struct State<B: Backing> {
     /// asked has ended, and what [`Door::window_now`] draws the window
     /// round.
     last_position: Option<B::Position>,
+    /// How long this entity's film is, where a player has said.
+    ///
+    /// **A property of the film and not of a report**, which is why it sits
+    /// here rather than on [`Told`] and never goes stale: with the entity's
+    /// own size ([`Backing::bytes`]) it is the bitrate, a film does not
+    /// change length, and a viewer who hands playback to a receiver stops
+    /// reporting a position without the film becoming any shorter.
+    ///
+    /// It is also the only thing a cast can state. The receiver does the
+    /// reading and reports where it is in *seconds*; converting that to a
+    /// byte offset needs a constant bitrate, and on the field's 23 GB film
+    /// a two-percent error is 460 MB -- wider than the whole window, so the
+    /// window would land off the film. So a cast says how long the film is,
+    /// which sizes the window exactly, and leaves where it is to the reads,
+    /// which for a receiver are plainly sequential.
+    duration: Option<std::time::Duration>,
     /// **The pieces a container cannot be played without**, whatever the
     /// playhead is over.
     ///
@@ -812,10 +828,6 @@ struct ReaderState<B: Backing> {
 #[derive(Debug)]
 struct Told<B: Backing> {
     at: B::Position,
-    /// How long the film is, where the player knows. With the entity's own
-    /// size ([`Backing::bytes`]) this is the bitrate outright, and it is
-    /// the only reason a duration is carried at all.
-    duration: Option<std::time::Duration>,
     when: std::time::Instant,
 }
 
@@ -1066,6 +1078,7 @@ impl<B: Backing> Retention<B> {
                         windows: Vec::new(),
                         readers: HashMap::new(),
                         last_position: None,
+                        duration: None,
                         structural: std::collections::BTreeSet::new(),
                         told: None,
                         // Assumed held back until a clear says otherwise: an
@@ -1205,6 +1218,24 @@ impl<B: Backing> Retention<B> {
         self.note_playhead_at(key, at, duration, std::time::Instant::now());
     }
 
+    /// **How long the entity's film is**, without saying where anything is
+    /// in it; see [`State::duration`].
+    ///
+    /// What a cast can state and nothing else can. The receiver does the
+    /// reading and reports its position in seconds, which is not convertible
+    /// to a byte offset without a constant bitrate -- but the length is the
+    /// bitrate, so the window is sized exactly and only its placement is
+    /// left to the reads.
+    pub fn note_duration(&self, key: &B::Key, duration: std::time::Duration) {
+        if duration.is_zero() {
+            return;
+        }
+        let Some(entity) = self.lookup(key) else {
+            return;
+        };
+        entity.state.lock().duration = Some(duration);
+    }
+
     /// [`Self::note_playhead`] with the clock handed in, so a test can put
     /// two reports a measurable distance apart without waiting.
     pub fn note_playhead_at(
@@ -1220,11 +1251,10 @@ impl<B: Backing> Retention<B> {
         let mut state = entity.state.lock();
         // Playing or not, where it is is where the window belongs: a film
         // paused at fifty minutes is watched from fifty minutes.
-        state.told = Some(Told {
-            at,
-            duration,
-            when: now,
-        });
+        if duration.is_some() {
+            state.duration = duration;
+        }
+        state.told = Some(Told { at, when: now });
     }
 
     /// Install (or keep) the policy for `key` about to be streamed, and hold
@@ -2437,10 +2467,7 @@ impl<B: Backing> State<B> {
         // pattern can distort. The measured paths below answer only for a
         // stream whose length nobody has stated.
         asked.bytes_per_second = self
-            .told
-            .as_ref()
-            .filter(|told| told.when.elapsed() < TOLD_FRESH)
-            .and_then(|told| told.duration)
+            .duration
             .filter(|duration| !duration.is_zero())
             .and_then(|duration| {
                 Some((B::bytes(&self.domain)? as f64 / duration.as_secs_f64()) as u64)
@@ -5856,6 +5883,53 @@ mod tests {
              read keeps only the pieces it is reading out of"
         );
         drop(crawler);
+    }
+
+    /// **A film's length is not a playhead and does not go stale with one.**
+    ///
+    /// It is what a cast can state and nothing else: the receiver does the
+    /// reading and reports seconds, which do not convert to a byte offset
+    /// without a constant bitrate. The length *is* the bitrate, so the
+    /// window is sized exactly even though where it sits is left to the
+    /// reads -- and it keeps sizing it when the viewer stops reporting a
+    /// position, because a film does not get shorter while nobody is
+    /// looking.
+    #[tokio::test]
+    async fn a_films_length_sizes_the_window_with_no_playhead_at_all() {
+        let (_backing, owner, budget) = torrent();
+        budget.set(Some(6 * PIECE));
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        let reader = owner
+            .reader_on(
+                &0,
+                (0, 0),
+                Reading::Playback,
+                Buffering {
+                    window_seconds: Some(10),
+                    committed_seconds: Some(10),
+                    ..Buffering::default()
+                },
+            )
+            .expect("the entity the install made");
+
+        // Eight pieces of a thousand bytes over eighty seconds: a hundred
+        // bytes a second, and ten seconds of it is one piece. No position
+        // was ever reported.
+        owner.note_duration(&0, std::time::Duration::from_secs(80));
+        let claim = owner.turn(&0).await.expect("the turn");
+        owner.pass(&0, &(), claim, Mode::Live).await;
+        assert_eq!(
+            owner
+                .holding(&0)
+                .and_then(|holding| holding.installed)
+                .map(|installed| installed.shape),
+            Some(Shape::Split {
+                window: 5,
+                committed: 1
+            }),
+            "the cap binds on a length alone"
+        );
+        drop(reader);
     }
 
     /// **A playhead nobody is reporting any more stops being believed.**

@@ -1347,6 +1347,12 @@ impl<H: TorrentHandle> Engine<H> {
     /// What the player says about itself; see [`Retention::note_playhead`].
     /// `offset` is its own byte offset into `file_idx` and `film` its own
     /// position in the picture.
+    /// How long the film is, with no position; see
+    /// [`Retention::note_duration`]. What a cast can state.
+    pub fn told_duration(&self, file_idx: usize, duration: std::time::Duration) {
+        self.retention.note_duration(&file_idx, duration);
+    }
+
     pub fn told_playhead(
         &self,
         file_idx: usize,

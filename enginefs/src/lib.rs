@@ -2995,6 +2995,22 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// starts nothing. A torrent this process is not running, or a file
     /// nothing has installed a policy on, is nothing to remember -- the
     /// call is a hint, and dropping one costs the freshness of a hint.
+    /// **How long the film is**, with no position: what a cast can say and
+    /// nothing else, since a receiver reports seconds and those do not
+    /// convert to a byte offset without a constant bitrate. The length is
+    /// what sizes the window; see
+    /// [`crate::retention::owner::Retention::note_duration`].
+    pub async fn on_duration(
+        &self,
+        info_hash: &str,
+        file_idx: usize,
+        duration: std::time::Duration,
+    ) {
+        if let Some(engine) = self.peek_engine(info_hash).await {
+            engine.told_duration(file_idx, duration);
+        }
+    }
+
     pub async fn on_playhead(
         &self,
         info_hash: &str,

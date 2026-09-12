@@ -299,6 +299,22 @@ impl ServerHandle {
     /// Nothing depends on it. Stop calling and the hint goes stale in
     /// fifteen seconds and the inference answers again, which is what a
     /// client that never calls gets throughout.
+    /// **Tell the server how long the film is**, without saying where the
+    /// player is in it -- which is all a cast can say, the receiver doing
+    /// the reading and reporting only seconds. The length is what sizes the
+    /// retention window; see [`enginefs::EngineFS::on_duration`].
+    pub async fn note_duration(
+        &self,
+        info_hash: &str,
+        file_idx: usize,
+        duration: std::time::Duration,
+    ) {
+        self.state
+            .engine
+            .on_duration(info_hash, file_idx, duration)
+            .await;
+    }
+
     pub async fn note_playhead(
         &self,
         info_hash: &str,
