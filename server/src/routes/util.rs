@@ -1,18 +1,5 @@
 //! Small helpers shared across `server/src/routes/*` modules.
 
-/// Parse an HTTP `Range` header of the form `bytes=<start>-<end>` (with
-/// either side optional, i.e. suffix ranges `bytes=-N` and open-ended
-/// ranges `bytes=N-`) against a resource of `size` bytes.
-///
-/// Returns `Some((start, end))` (inclusive, `end` clamped to `size - 1`)
-/// when the header describes a satisfiable byte range, `None` otherwise
-/// (including malformed headers, non-`bytes` units, and any range that
-/// cannot be satisfied — callers should fall back to a full-body 200 or
-/// respond 416 as appropriate).
-///
-/// `size == 0` always yields `None`: there is no valid inclusive byte
-/// range on an empty resource, and computing `size - 1` for a suffix or
-/// open range would otherwise underflow `u64`.
 /// Whether a `Range` header names an end, as against asking for the rest of
 /// the resource.
 ///
@@ -30,6 +17,19 @@ pub(crate) fn range_is_bounded(header: &str) -> bool {
         .is_some_and(|(_, end)| !end.is_empty())
 }
 
+/// Parse an HTTP `Range` header of the form `bytes=<start>-<end>` (with
+/// either side optional, i.e. suffix ranges `bytes=-N` and open-ended
+/// ranges `bytes=N-`) against a resource of `size` bytes.
+///
+/// Returns `Some((start, end))` (inclusive, `end` clamped to `size - 1`)
+/// when the header describes a satisfiable byte range, `None` otherwise
+/// (including malformed headers, non-`bytes` units, and any range that
+/// cannot be satisfied — callers should fall back to a full-body 200 or
+/// respond 416 as appropriate).
+///
+/// `size == 0` always yields `None`: there is no valid inclusive byte
+/// range on an empty resource, and computing `size - 1` for a suffix or
+/// open range would otherwise underflow `u64`.
 pub(crate) fn parse_range(header: &str, size: u64) -> Option<(u64, u64)> {
     let prefix = "bytes=";
     if !header.starts_with(prefix) || size == 0 {
