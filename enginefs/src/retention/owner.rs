@@ -5141,6 +5141,77 @@ mod tests {
         drop(probe);
     }
 
+    /// **A read that opens while the reclaim is running is a window at the
+    /// door, from its open and not from its first byte.**
+    ///
+    /// The door is asked at every unlink because a read can open between
+    /// the decision and the unlink -- a pass over a 4 MiB piece on a slow
+    /// disk is not instant, and mpv opens its read of the container index
+    /// while the film is already streaming. That read has delivered
+    /// nothing, so a door that asks for a *playhead* does not see it at
+    /// all, cuts no run round it, refuses no index of it, and unlinks the
+    /// piece it is parked on waiting for. Asking for its head instead is
+    /// the whole of the difference, and it is the reason both readings in
+    /// [`Door`] say `head()`.
+    ///
+    /// A probe deliberately, and not a second player: a parked *playback*
+    /// read is the entity's head as well ([`State::playing_head`]), so the
+    /// door's first window would cover it however the readers were asked
+    /// about. Nothing but the per-reader reading protects a parked probe.
+    #[tokio::test]
+    async fn a_read_that_opens_under_the_reclaim_is_a_window_at_the_door() {
+        let (backing, owner, _budget) = torrent();
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        let playing = owner
+            .reader_on(&0, (0, 0), Reading::Playback)
+            .expect("the entity the install made");
+        assert!(
+            playing.note((0, 0)).is_none(),
+            "the tick is the torrent's trigger"
+        );
+
+        // mpv's read of the Cues, opened after the pass had decided what to
+        // take and while it is taking it. It is parked on the last piece of
+        // the file: it has promised nothing and delivered nothing.
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let held_open = Arc::new(parking_lot::Mutex::new(None));
+        let hook: Hook<TorrentSide> = Box::new({
+            let (owner, seen, held_open) = (owner.clone(), seen.clone(), held_open.clone());
+            move |door: &Door<Torrent>| {
+                *held_open.lock() = Some(
+                    owner
+                        .reader_on(&0, (0, 6 * PIECE), Reading::Probe)
+                        .expect("the same entity"),
+                );
+                seen.lock().push(door.windows_now());
+            }
+        });
+        *backing.on_reclaim.lock() = Some(hook);
+
+        let claim = owner.turn(&0).await.expect("the turn");
+        let outcome = owner
+            .pass(&0, &(), claim, Mode::Live)
+            .await
+            .concluded
+            .expect("a pass");
+        assert_eq!(
+            outcome.windows,
+            vec![0..2],
+            "the probe did not exist when the pass decided, so it is not in what it planned"
+        );
+        assert_eq!(
+            *seen.lock(),
+            vec![Some(vec![0..2, 6..8])],
+            "the player's window at the door, and the parked probe's beside it"
+        );
+        assert_eq!(
+            backing.on_disk(),
+            vec![0, 1, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            "the piece the probe is parked on was not unlinked under it"
+        );
+        drop(held_open.lock().take());
+    }
+
     /// **The test hook runs twice per pass, with the turn held and no owner
     /// lock**: a note inside it finds the pass running, and a holding can
     /// be read.
