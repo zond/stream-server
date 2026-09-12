@@ -626,12 +626,6 @@ struct State<B: Backing> {
     /// that never reports at all -- another player on the network, the
     /// proxy, a download.
     told: Option<Told<B>>,
-    /// The film's bitrate as the player's own numbers give it, smoothed --
-    /// bytes of file over *seconds of film*, which is the definition and
-    /// needs no inference at all. Preferred over [`Self::rate`], which
-    /// measures the same thing through delivery and has to guess at every
-    /// pause, stall and reconnect to do it.
-    told_rate: Option<u64>,
     /// Whether this entity's range is held back from what we announce with
     /// nothing installed to put it back.
     ///
@@ -689,27 +683,6 @@ struct State<B: Backing> {
     /// It lives exactly as long as the policy that made it: written at the
     /// pass's decision, cleared when a policy is installed or forgotten.
     doomed: Vec<Range<u32>>,
-    /// How fast this entity's film is being watched, measured across every
-    /// read that has played it.
-    ///
-    /// **The bitrate is the film's and the reader is not**, so neither is
-    /// the measurement. Held per read it dies with the read, and the field
-    /// log this was written from says what that costs: libmpv takes about
-    /// twenty megabytes, closes the response and reopens five megabytes
-    /// further on, so no read there lived longer than about 1.2 seconds and
-    /// not one of them ever reached [`RATE_SAMPLE_INTERVAL`]. No sample was
-    /// ever taken, `bytes_per_second` stayed `None` for the whole viewing,
-    /// neither time cap ever applied, and the window sat at its share of the
-    /// budget: 1280 pieces, 5.4 GB, on a film being watched at 3.4 MB/s.
-    ///
-    /// Anchored here it spans the reconnect instead of restarting at it,
-    /// which also makes it the *right* number rather than merely an
-    /// available one. Inside one response the server hands over bytes as
-    /// fast as the swarm and the socket allow -- 15 MB/s in that log, four
-    /// and a half times the film's rate, most of it discarded unread when
-    /// the client drops the connection. Across the reconnects, offset over
-    /// wall-clock is what the viewer is actually consuming.
-    rate: DeliveryRate,
     /// The draw that decides which of this entity's pieces this process
     /// offers to the swarm ([`Buffering::seed`]).
     ///
@@ -824,106 +797,8 @@ struct ReaderState<B: Backing> {
     /// cut to the window's forward reach at the open, so it binds only when
     /// the budget moves under a reader that is already open.
     /// [`Buffering::bytes_per_second`] is not this read's to state and is
-    /// always `None` in it; it is measured, below.
+    /// always `None` in it; the entity states it.
     buffering: Buffering,
-}
-
-/// The rate one read is delivering at, smoothed.
-///
-/// **What the server can see, which is not the media's bitrate.** It is
-/// what a player is being handed per second: whatever the swarm can give
-/// while the player fills its own cache, settling on the real bitrate once
-/// that cache is full and the player is reading only as fast as it plays.
-/// That settled value is the one the time caps want, and the transient
-/// above it errs towards a bigger buffer, which is the safe direction.
-///
-/// Measured from delivered bytes and nothing else: a `Range` header is a
-/// request, not a delivery. A read that goes backwards starts the
-/// measurement again rather than reporting a negative second -- a seek is
-/// not a rate.
-#[derive(Debug, Clone, Copy, Default)]
-struct DeliveryRate {
-    /// Where and when the last sample was taken.
-    since: Option<(u64, std::time::Instant)>,
-    /// The smoothed rate, once two samples far enough apart exist.
-    bytes_per_second: Option<u64>,
-}
-
-/// How far apart two readings have to be to be a sample. Short enough to
-/// settle within a few seconds of a stream starting, long enough that one
-/// burst of a slow player's reads is not read as the rate.
-const RATE_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// The weight a fresh sample carries, in tenths.
-const RATE_SMOOTHING_TENTHS: u64 = 3;
-
-/// How far ahead of the last delivery a new one may be and still be the
-/// same walk through the film.
-///
-/// A player that reconnects resumes within its own read-ahead, so the gap
-/// between the byte one response stopped at and the byte the next starts
-/// from is a few megabytes. Anything further is a different read -- a
-/// forward seek, or a second reader on the same file, which is what an
-/// index crawler parked at the end of the container is. Neither is a rate,
-/// so neither is allowed to move the anchor while a walk is in progress.
-/// The floor is for a backing that grants no lookahead at all.
-const RATE_CONTINUATION_FLOOR: u64 = 64 * 1024 * 1024;
-
-/// How long an anchor may sit unadvanced before any delivery may take it
-/// over. Without this a forward seek would strand the anchor behind the
-/// only reader there is, and no sample could ever form again.
-const RATE_ANCHOR_STALE: std::time::Duration = std::time::Duration::from_secs(8);
-
-/// The longest a single sample may span.
-///
-/// The anchor deliberately survives the gap between one response and the
-/// next, because that gap is part of how fast the film is being watched
-/// and measuring only inside a burst reads the socket instead. A gap in
-/// which *nothing was played* is not that. The field log of 2026-09-12
-/// has the difference: the first read delivered four megabytes from the
-/// head of the file and stopped, the player spent the next twelve seconds
-/// on the container index -- a probe, which rightly feeds nothing here --
-/// and the next playing delivery arrived 48 bytes further on. Forty-eight
-/// bytes over 12.85 seconds is three bytes a second, which is what the
-/// window was then sized from: sixteen pieces, a floor, and a playback
-/// that never started.
-///
-/// So a sample is a measurement of playback or it is not taken. Long
-/// enough to cover a player that closes its response and reopens a second
-/// later, short enough that a stall, a pause with the body open, or a
-/// probe holding the stream are all refused -- they re-anchor instead, and
-/// the last rate measured stands until playback says otherwise.
-const RATE_SAMPLE_SPAN_MAX: std::time::Duration = std::time::Duration::from_secs(6);
-
-/// Bytes of file per second of film between two reports, or `None` where
-/// the pair says nothing about a bitrate.
-///
-/// Both ends have to have been playing: a report either side of a pause,
-/// a stall or a buffering wait spans wall-clock the film did not. Both the
-/// file offset and the film position have to have moved forwards, and the
-/// film by [`TOLD_SAMPLE_FILM_MIN`], which rejects a seek backwards, a
-/// player sitting still, and -- the reason that bound is as large as it is
-/// -- a player reading in bursts and playing out of its own buffer between
-/// them. A seek *forwards* needs no rejecting: it moves the
-/// two together and the quotient is the same film's bitrate, measured over
-/// a longer piece of it.
-fn told_bitrate(
-    was: (u64, std::time::Duration, bool),
-    now: (u64, std::time::Duration, bool),
-) -> Option<u64> {
-    let ((was_at, was_film, was_playing), (at, film, playing)) = (was, now);
-    if !was_playing || !playing {
-        return None;
-    }
-    let film = film.checked_sub(was_film)?;
-    if film < TOLD_SAMPLE_FILM_MIN {
-        return None;
-    }
-    let bytes = at.checked_sub(was_at)?;
-    if bytes == 0 {
-        return None;
-    }
-    Some((bytes as f64 / film.as_secs_f64()) as u64)
 }
 
 /// What a player last said about where it is in its own film.
@@ -937,11 +812,10 @@ fn told_bitrate(
 #[derive(Debug)]
 struct Told<B: Backing> {
     at: B::Position,
-    film: std::time::Duration,
     /// How long the film is, where the player knows. With the entity's own
-    /// size ([`Backing::bytes`]) this is the bitrate outright.
+    /// size ([`Backing::bytes`]) this is the bitrate outright, and it is
+    /// the only reason a duration is carried at all.
     duration: Option<std::time::Duration>,
-    playing: bool,
     when: std::time::Instant,
 }
 
@@ -962,71 +836,6 @@ const STRUCTURAL_PIECES: usize = 8;
 /// to ride out a slow tick or a garbage collection, short enough that a
 /// dead reporter does not pin the window where the viewer used to be.
 const TOLD_FRESH: std::time::Duration = std::time::Duration::from_secs(15);
-
-/// The least film a told sample may span.
-///
-/// **Bytes over seconds-of-film is the bitrate in the limit, not over two
-/// seconds of it.** `stream-pos` is where a demuxer has *read* to, and a
-/// player reads in jumps: it pulls twenty megabytes, then plays out of its
-/// own buffer for several seconds without touching the stream at all. Over
-/// a short interval the quotient is therefore whatever the read pattern
-/// happened to do, and the field log of 2026-09-12 14:35 has both ends of
-/// that -- `bytes_per_second=17`, from a couple of dozen bytes across two
-/// seconds the player spent in its buffer, and 7,898,227 a minute later,
-/// which is 2.3x the film's real rate.
-///
-/// Half a minute is long enough that a player's read pattern averages out
-/// and short enough to settle well inside a viewing. Nothing is lost by
-/// waiting for it: with no rate at all the byte arithmetic stands, which is
-/// wasteful and stable, where a rate that is eighty times low collapses the
-/// window onto its floor and stops playback outright.
-const TOLD_SAMPLE_FILM_MIN: std::time::Duration = std::time::Duration::from_secs(30);
-
-impl DeliveryRate {
-    /// A byte really went out, at `offset`, at `now`, on a read granted
-    /// `lookahead` bytes of read-ahead.
-    fn note(&mut self, offset: u64, lookahead: u64, now: std::time::Instant) {
-        let Some((was, at)) = self.since else {
-            self.since = Some((offset, now));
-            return;
-        };
-        if offset < was {
-            // A seek back. The bytes in between were not delivered now and
-            // the elapsed time is not this read's.
-            self.since = Some((offset, now));
-            return;
-        }
-        let elapsed = now.saturating_duration_since(at);
-        if offset - was > lookahead.max(RATE_CONTINUATION_FLOOR) {
-            // Too far ahead to be the same walk. Let it take the anchor
-            // only once the walk it would interrupt has stopped happening.
-            if elapsed >= RATE_ANCHOR_STALE {
-                self.since = Some((offset, now));
-            }
-            return;
-        }
-        if elapsed < RATE_SAMPLE_INTERVAL {
-            return;
-        }
-        if elapsed > RATE_SAMPLE_SPAN_MAX {
-            // Whatever happened over that long, it was not this film being
-            // played at a rate. Start again from here.
-            self.since = Some((offset, now));
-            return;
-        }
-        let sample = ((offset - was) as f64 / elapsed.as_secs_f64()) as u64;
-        self.bytes_per_second = Some(match self.bytes_per_second {
-            Some(smoothed) => {
-                smoothed
-                    .saturating_mul(10 - RATE_SMOOTHING_TENTHS)
-                    .saturating_add(sample.saturating_mul(RATE_SMOOTHING_TENTHS))
-                    / 10
-            }
-            None => sample,
-        });
-        self.since = Some((offset, now));
-    }
-}
 
 impl<B: Backing> ReaderState<B> {
     /// A read just opened: nothing delivered, nothing promised.
@@ -1259,14 +1068,12 @@ impl<B: Backing> Retention<B> {
                         last_position: None,
                         structural: std::collections::BTreeSet::new(),
                         told: None,
-                        told_rate: None,
                         // Assumed held back until a clear says otherwise: an
                         // entity that was forgotten took the record with it,
                         // and the backend's mask outlives both the record and
                         // the pieces. See [`State::held_back`].
                         held_back: B::SHARE == Share::Half,
                         doomed: Vec::new(),
-                        rate: DeliveryRate::default(),
                         opens: 0,
                         seed: share_seed(),
                     })),
@@ -1393,11 +1200,9 @@ impl<B: Backing> Retention<B> {
         &self,
         key: &B::Key,
         at: B::Position,
-        film: std::time::Duration,
         duration: Option<std::time::Duration>,
-        playing: bool,
     ) {
-        self.note_playhead_at(key, at, film, duration, playing, std::time::Instant::now());
+        self.note_playhead_at(key, at, duration, std::time::Instant::now());
     }
 
     /// [`Self::note_playhead`] with the clock handed in, so a test can put
@@ -1406,38 +1211,18 @@ impl<B: Backing> Retention<B> {
         &self,
         key: &B::Key,
         at: B::Position,
-        film: std::time::Duration,
         duration: Option<std::time::Duration>,
-        playing: bool,
         now: std::time::Instant,
     ) {
         let Some(entity) = self.lookup(key) else {
             return;
         };
         let mut state = entity.state.lock();
-        if let Some(sample) = state.told.as_ref().and_then(|was| {
-            told_bitrate(
-                (B::offset_of(&state.domain, was.at), was.film, was.playing),
-                (B::offset_of(&state.domain, at), film, playing),
-            )
-        }) {
-            state.told_rate = Some(match state.told_rate {
-                Some(smoothed) => {
-                    smoothed
-                        .saturating_mul(10 - RATE_SMOOTHING_TENTHS)
-                        .saturating_add(sample.saturating_mul(RATE_SMOOTHING_TENTHS))
-                        / 10
-                }
-                None => sample,
-            });
-        }
         // Playing or not, where it is is where the window belongs: a film
         // paused at fifty minutes is watched from fifty minutes.
         state.told = Some(Told {
             at,
-            film,
             duration,
-            playing,
             when: now,
         });
     }
@@ -2654,9 +2439,7 @@ impl<B: Backing> State<B> {
             .filter(|duration| !duration.is_zero())
             .and_then(|duration| {
                 Some((B::bytes(&self.domain)? as f64 / duration.as_secs_f64()) as u64)
-            })
-            .or(self.told_rate)
-            .or(self.rate.bytes_per_second);
+            });
         asked
     }
 
@@ -3153,7 +2936,7 @@ impl<B: Backing> Reader<B> {
 
     /// [`Self::note`] with the clock handed in, so a test can put two
     /// deliveries a measurable distance apart without waiting.
-    fn note_at(&self, at: B::Position, now: std::time::Instant) -> Option<Claim> {
+    fn note_at(&self, at: B::Position, _now: std::time::Instant) -> Option<Claim> {
         let budget = self.owner.budget.get();
         let (claim, refused) = {
             let mut state = self.entity.state.lock();
@@ -3181,13 +2964,11 @@ impl<B: Backing> Reader<B> {
             {
                 state.structural.insert(index);
             }
-            let offset = B::offset_of(&state.domain, at);
             let (bounded, stride) = (state.installed.is_some(), state.stride);
             let reader = state.readers.entry(self.id).or_insert_with(|| {
                 ReaderState::opened(self.reading, self.opened_at, self.buffering)
             });
             reader.playhead = Some(at);
-            let lookahead = reader.buffering.lookahead_bytes;
             let due = match index {
                 Some(index) => {
                     // Delivered is no longer promised: the piece went out
@@ -3207,11 +2988,6 @@ impl<B: Backing> Reader<B> {
             };
             // The entity keeps what a playing read measured, so the time
             // caps survive the read that measured them; see [`State::rate`].
-            if self.reading == Reading::Playback {
-                // The byte really went out, so this is a delivery and not a
-                // request: the only reading the time caps are sized from.
-                state.rate.note(offset, lookahead, now);
-            }
             let claim = due
                 .then(|| self.entity.turn.clone().try_lock_owned().ok())
                 .flatten()
@@ -5776,288 +5552,6 @@ mod tests {
         );
     }
 
-    /// **The delivery rate a read is really getting reaches the policy, and
-    /// the pass is what folds it in.**
-    ///
-    /// Nothing knows the rate when the policy is built -- no byte has gone
-    /// out -- so the first passes run on the byte arithmetic and the shape
-    /// changes under the measurement. Two deliveries far enough apart are
-    /// one sample; `note_at` is what lets a test put them there without
-    /// waiting three seconds.
-    #[tokio::test]
-    async fn a_measured_delivery_rate_re_shapes_the_policy_at_the_next_pass() {
-        let (_backing, owner, budget) = torrent();
-        // A roomy budget over a small file, so the time cap is the only
-        // thing that can bind: eight pieces of a thousand bytes, six of
-        // which the budget covers.
-        budget.set(Some(6 * PIECE));
-        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
-        let reader = owner
-            .reader_on(
-                &0,
-                (0, 0),
-                Reading::Playback,
-                Buffering {
-                    // Ten seconds of a stream at the rate noted below is
-                    // one piece, and the smallest cap floors that at 64
-                    // MiB -- which is the whole file here, so the cap does
-                    // not bind and the shape is the budget's.
-                    window_seconds: Some(10),
-                    committed_seconds: Some(10),
-                    ..Buffering::default()
-                },
-            )
-            .expect("the entity the install made");
-        let shape = |owner: &Arc<Retention<Torrent>>| {
-            owner
-                .holding(&0)
-                .and_then(|holding| holding.installed)
-                .map(|installed| installed.shape)
-        };
-        assert_eq!(
-            shape(&owner),
-            Some(Shape::Split {
-                window: 3,
-                committed: 3
-            }),
-            "no rate yet: half the budget each"
-        );
-
-        // Two deliveries three seconds apart: 100 bytes a second.
-        let start = std::time::Instant::now();
-        reader.note_at((0, 0), start);
-        reader.note_at((0, 300), start + std::time::Duration::from_secs(3));
-        let claim = owner.turn(&0).await.expect("the turn");
-        owner.pass(&0, &(), claim, Mode::Live).await;
-        assert_eq!(
-            shape(&owner),
-            Some(Shape::Split {
-                window: 5,
-                committed: 1
-            }),
-            "ten seconds of a hundred bytes a second is a kilobyte, floored at the smallest \
-             cap -- so the committed set takes one piece and the window takes the rest"
-        );
-    }
-
-    /// **A seek does not un-cap the window while the new read finds its
-    /// feet.**
-    ///
-    /// The rate is measured per read and dies with it, and a seek is a new
-    /// response: for the two seconds it takes the new one to make a sample,
-    /// the entity has no rate, neither time cap applies, and the window goes
-    /// back to its share of the budget -- on a ten-gigabyte cache a jump
-    /// from three hundred megabytes to five gigabytes, ordered from the
-    /// swarm by the pass that saw it and given back by the pass after. A
-    /// pause with the body closed is the same thing for as long as the
-    /// viewer is away. The film's bitrate did not change, so the entity
-    /// keeps the number.
-    #[tokio::test]
-    async fn a_seek_that_replaces_the_read_keeps_the_rate_the_film_was_measured_at() {
-        let (_backing, owner, budget) = torrent();
-        budget.set(Some(6 * PIECE));
-        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
-        let asks = Buffering {
-            window_seconds: Some(10),
-            committed_seconds: Some(10),
-            ..Buffering::default()
-        };
-        let shape = |owner: &Arc<Retention<Torrent>>| {
-            owner
-                .holding(&0)
-                .and_then(|holding| holding.installed)
-                .map(|installed| installed.shape)
-        };
-        let start = std::time::Instant::now();
-        {
-            let playing = owner
-                .reader_on(&0, (0, 0), Reading::Playback, asks)
-                .expect("the entity the install made");
-            playing.note_at((0, 0), start);
-            playing.note_at((0, 300), start + std::time::Duration::from_secs(3));
-            let claim = owner.turn(&0).await.expect("the turn");
-            owner.pass(&0, &(), claim, Mode::Live).await;
-            assert_eq!(
-                shape(&owner),
-                Some(Shape::Split {
-                    window: 5,
-                    committed: 1
-                }),
-                "a hundred bytes a second, capped at ten seconds of it"
-            );
-        }
-        // The viewer seeks: that response ends and another opens, with
-        // nothing measured on it yet.
-        let _seeking = owner
-            .reader_on(&0, (0, 2 * PIECE), Reading::Playback, asks)
-            .expect("the same entity");
-        let claim = owner.turn(&0).await.expect("the turn");
-        owner.pass(&0, &(), claim, Mode::Live).await;
-        assert_eq!(
-            shape(&owner),
-            Some(Shape::Split {
-                window: 5,
-                committed: 1
-            }),
-            "the film is the same film, so the caps still apply"
-        );
-    }
-
-    /// **A film watched through reads too short to sample is still
-    /// measured.**
-    ///
-    /// This is the field failure the entity-level measurement was written
-    /// for, and the one a per-read measurement cannot survive. libmpv takes
-    /// about twenty megabytes, closes the response and reopens a few
-    /// megabytes further on, so no read lives as long as
-    /// [`RATE_SAMPLE_INTERVAL`]. Measured per read, not one of them ever
-    /// takes a sample, `bytes_per_second` stays `None` for the whole
-    /// viewing, neither time cap ever applies, and the window falls back to
-    /// its share of the budget -- which in the log this was written from was
-    /// 1280 pieces, 5.4 GB, for a film being watched at 3.4 MB/s.
-    ///
-    /// Anchored on the entity the reconnect is not an event at all: the
-    /// offsets keep walking forwards and the sample lands on the first
-    /// delivery two seconds after the first one, whichever read happens to
-    /// be open by then.
-    #[tokio::test]
-    async fn a_film_watched_through_reads_too_short_to_sample_is_still_measured() {
-        let (_backing, owner, budget) = torrent();
-        budget.set(Some(6 * PIECE));
-        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
-        let asks = Buffering {
-            window_seconds: Some(10),
-            committed_seconds: Some(10),
-            ..Buffering::default()
-        };
-        let start = std::time::Instant::now();
-        // Six responses, none of them alive for two seconds, each resuming
-        // a hundred bytes on from where the one before it stopped. The last
-        // is still open at the pass, as a player's always is -- an entity
-        // nobody is reading asks for no time cap at all.
-        let mut reading = None;
-        for step in 0..6u64 {
-            let opened = start + std::time::Duration::from_secs(step);
-            let response = owner
-                .reader_on(&0, (0, step * 100), Reading::Playback, asks)
-                .expect("the entity the install made");
-            response.note_at((0, step * 100), opened);
-            response.note_at(
-                (0, step * 100 + 50),
-                opened + std::time::Duration::from_millis(900),
-            );
-            reading = Some(response);
-        }
-        let claim = owner.turn(&0).await.expect("the turn");
-        owner.pass(&0, &(), claim, Mode::Live).await;
-        assert_eq!(
-            owner
-                .holding(&0)
-                .and_then(|holding| holding.installed)
-                .map(|installed| installed.shape),
-            Some(Shape::Split {
-                window: 5,
-                committed: 1
-            }),
-            "the reconnects are not seeks: a hundred bytes a second, capped \
-             at ten seconds of it"
-        );
-        drop(reading);
-    }
-
-    /// **A gap in which nothing was played is not a rate**, which is the
-    /// failure the field log of 2026-09-12 caught in the shipped build.
-    ///
-    /// The anchor survives the gap between one response and the next on
-    /// purpose. What it must not survive is a gap that was not playback:
-    /// there the divisor is real seconds and the dividend is whatever the
-    /// next read happened to open at, and the quotient is not a bitrate.
-    #[test]
-    fn a_gap_in_which_nothing_was_played_is_not_a_sample() {
-        let mut rate = DeliveryRate::default();
-        let start = std::time::Instant::now();
-        let after = |millis| start + std::time::Duration::from_millis(millis);
-        let lookahead = 128 * 1024 * 1024;
-        // The head of the film, delivered in one burst far too short to
-        // sample, so the anchor stays where it started.
-        rate.note(0, lookahead, start);
-        rate.note(4 * 1024 * 1024, lookahead, after(50));
-        // Then twelve seconds in which the player read the container index
-        // -- a probe, which feeds nothing here -- and the next playing byte
-        // arrives 48 further on than the anchor. In the field this was the
-        // whole measurement: 48 bytes over 12.85 seconds, three bytes a
-        // second, a sixteen-piece window and a playback that never started.
-        rate.note(48, lookahead, after(12_850));
-        assert_eq!(
-            rate.bytes_per_second, None,
-            "the twelve seconds were not this film being played"
-        );
-        // And the walk that follows measures normally, from where the
-        // refusal re-anchored.
-        rate.note(48 + 7_000_000, lookahead, after(14_850));
-        assert_eq!(
-            rate.bytes_per_second,
-            Some(3_500_000),
-            "the next two seconds are playback, and they are the rate"
-        );
-    }
-
-    /// **A second read far down the file is not the walk being measured.**
-    ///
-    /// mpv keeps a reader parked on the container index at the end of the
-    /// file and reopens it about once a second -- forty-three kilobytes at
-    /// a time, twenty gigabytes away from the playhead. It is a
-    /// [`Reading::Playback`] read like any other, because an open-ended
-    /// range is all the server is told. Fed into one anchor beside the
-    /// playhead's own deliveries it would make every other note a jump
-    /// forwards and the one after it a seek back, and no sample could ever
-    /// form.
-    #[test]
-    fn a_delivery_far_beyond_the_walk_does_not_move_the_anchor() {
-        let mut rate = DeliveryRate::default();
-        let start = std::time::Instant::now();
-        let after = |millis| start + std::time::Duration::from_millis(millis);
-        let lookahead = 4096;
-        rate.note(0, lookahead, start);
-        // The crawler, a long way past anything the walk has a lookahead
-        // over, and far enough into the interval that it would otherwise be
-        // a sample in its own right. Then the walk's own next delivery.
-        rate.note(1_000_000_000, lookahead, after(2_500));
-        rate.note(3000, lookahead, after(3_000));
-        assert_eq!(
-            rate.bytes_per_second,
-            Some(1000),
-            "measured from the walk, across the read that was not part of it"
-        );
-    }
-
-    /// **An anchor a forward seek left behind is taken over once it stops
-    /// being a walk.**
-    ///
-    /// The rule above refuses a delivery too far ahead to be the same walk.
-    /// A forward seek is exactly that, and it does not come back -- so
-    /// without this the anchor would sit where the viewer used to be and no
-    /// sample would ever form again.
-    #[test]
-    fn an_anchor_a_forward_seek_left_behind_is_taken_over_when_it_goes_stale() {
-        let mut rate = DeliveryRate::default();
-        let start = std::time::Instant::now();
-        let after = |seconds| start + std::time::Duration::from_secs(seconds);
-        let lookahead = 4096;
-        rate.note(0, lookahead, start);
-        rate.note(1_000_000_000, lookahead, after(1));
-        assert_eq!(rate.bytes_per_second, None, "too far ahead to be a sample");
-        // Nothing has advanced the old anchor since, so the seek's own
-        // walk takes it.
-        rate.note(1_000_001_000, lookahead, after(9));
-        rate.note(1_000_003_000, lookahead, after(11));
-        assert_eq!(
-            rate.bytes_per_second,
-            Some(1000),
-            "and the measurement starts again where the viewer now is"
-        );
-    }
-
     /// **The film's length is the bitrate, and nothing has to measure it.**
     ///
     /// Size over duration is arithmetic: exact at the first report, with
@@ -6080,13 +5574,7 @@ mod tests {
 
         // File 0 is eight pieces of a thousand bytes. Eighty seconds of film
         // is a hundred bytes a second, and ten seconds of that is one piece.
-        owner.note_playhead(
-            &0,
-            (0, 0),
-            std::time::Duration::ZERO,
-            Some(std::time::Duration::from_secs(80)),
-            true,
-        );
+        owner.note_playhead(&0, (0, 0), Some(std::time::Duration::from_secs(80)));
         let claim = owner.turn(&0).await.expect("the turn");
         owner.pass(&0, &(), claim, Mode::Live).await;
         assert_eq!(
@@ -6101,83 +5589,6 @@ mod tests {
             "one report, nothing to measure it against, and the cap binds"
         );
         drop(reader);
-    }
-
-    /// **A probe's delivery rate is not the film's.**
-    ///
-    /// The time caps ask how many bytes a second of this film comes to, and
-    /// only a read that is playing it can answer. A probe walks a region at
-    /// whatever the swarm gives -- mpv's read of the container index arrives
-    /// as fast as the peers can send it -- and taking the largest rate over
-    /// every open read would size the window off that burst, which is the
-    /// disk-shaped answer the time caps exist to replace.
-    #[tokio::test]
-    async fn the_time_caps_are_sized_from_a_playing_reads_rate_and_not_a_probes() {
-        let (_backing, owner, budget) = torrent();
-        budget.set(Some(6 * PIECE));
-        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
-        let asks = Buffering {
-            window_seconds: Some(10),
-            committed_seconds: Some(10),
-            ..Buffering::default()
-        };
-        let playing = owner
-            .reader_on(&0, (0, 0), Reading::Playback, asks)
-            .expect("the entity the install made");
-        let probe = owner
-            .reader_on(&0, (0, 0), Reading::Probe, asks)
-            .expect("the same entity");
-        let start = std::time::Instant::now();
-        let after = |seconds| start + std::time::Duration::from_secs(seconds);
-        // A hundred bytes a second of film, beside a probe pulling ten times
-        // that off the swarm.
-        playing.note_at((0, 0), start);
-        playing.note_at((0, 300), after(3));
-        probe.note_at((0, 0), start);
-        probe.note_at((0, 3000), after(3));
-
-        let claim = owner.turn(&0).await.expect("the turn");
-        owner.pass(&0, &(), claim, Mode::Live).await;
-        assert_eq!(
-            owner
-                .holding(&0)
-                .and_then(|holding| holding.installed)
-                .map(|installed| installed.shape),
-            Some(Shape::Split {
-                window: 5,
-                committed: 1
-            }),
-            "ten seconds of the film is one piece, whatever the probe is being handed"
-        );
-    }
-
-    /// **A read that goes backwards starts the measurement again.**
-    ///
-    /// A seek is not a rate. The offset is the only thing the measurement
-    /// has, so a playhead that moves back would otherwise be a negative
-    /// number of bytes over a real second -- which in a debug build is not a
-    /// wrong rate but a panic, and in a release build is a rate of about
-    /// eighteen exabytes a second and a window the size of the disk.
-    #[test]
-    fn a_read_that_goes_backwards_starts_the_delivery_rate_again() {
-        let mut rate = DeliveryRate::default();
-        let start = std::time::Instant::now();
-        let after = |seconds| start + std::time::Duration::from_secs(seconds);
-        rate.note(0, 0, start);
-        rate.note(3000, 0, after(3));
-        assert_eq!(rate.bytes_per_second, Some(1000), "a kilobyte a second");
-        rate.note(0, 0, after(6));
-        assert_eq!(
-            rate.bytes_per_second,
-            Some(1000),
-            "the seek back is not a sample"
-        );
-        rate.note(3000, 0, after(9));
-        assert_eq!(
-            rate.bytes_per_second,
-            Some(1000),
-            "and the next sample is measured from the seek, not across it"
-        );
     }
 
     /// **A budget that shrinks under an open reader does not shrink the
@@ -6425,13 +5836,7 @@ mod tests {
             .reader_on(&0, (0, 7 * PIECE), Reading::Playback, Buffering::default())
             .expect("the entity the install made");
         assert!(crawler.note((0, 7 * PIECE)).is_none());
-        owner.note_playhead(
-            &0,
-            (0, 2 * PIECE),
-            std::time::Duration::from_secs(120),
-            None,
-            true,
-        );
+        owner.note_playhead(&0, (0, 2 * PIECE), None);
 
         let claim = owner.turn(&0).await.expect("the turn");
         let outcome = owner
@@ -6466,14 +5871,7 @@ mod tests {
         let long_ago = std::time::Instant::now()
             .checked_sub(TOLD_FRESH + std::time::Duration::from_secs(1))
             .expect("a clock with some history");
-        owner.note_playhead_at(
-            &0,
-            (0, 2 * PIECE),
-            std::time::Duration::from_secs(120),
-            None,
-            true,
-            long_ago,
-        );
+        owner.note_playhead_at(&0, (0, 2 * PIECE), None, long_ago);
 
         let claim = owner.turn(&0).await.expect("the turn");
         let outcome = owner
@@ -6487,127 +5885,6 @@ mod tests {
             "nothing is reporting, so the read is the only live word on it"
         );
         drop(reader);
-    }
-
-    /// **The time caps are sized from the player's numbers, over the
-    /// server's own measurement of the same thing.**
-    ///
-    /// Both answer "how many bytes is a second of this film". The server's
-    /// answer is inferred from what it managed to deliver and when, so it
-    /// reads the socket during a burst and a stall during a wait, and every
-    /// heuristic in [`DeliveryRate`] exists to tell those apart. The
-    /// player's answer is the definition -- its own byte offset over its
-    /// own clock -- so where there is one, it is the one.
-    #[tokio::test]
-    async fn the_time_caps_prefer_the_players_bitrate_to_the_servers_guess() {
-        let (_backing, owner, budget) = torrent();
-        budget.set(Some(6 * PIECE));
-        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
-        let asks = Buffering {
-            window_seconds: Some(10),
-            committed_seconds: Some(10),
-            ..Buffering::default()
-        };
-        let reader = owner
-            .reader_on(&0, (0, 0), Reading::Playback, asks)
-            .expect("the entity the install made");
-        let shape = |owner: &Arc<Retention<Torrent>>| {
-            owner
-                .holding(&0)
-                .and_then(|holding| holding.installed)
-                .map(|installed| installed.shape)
-        };
-        // What the server can see: a burst, thirty pieces in three seconds.
-        // Ten seconds of that is more than the whole file, so no cap binds.
-        let start = std::time::Instant::now();
-        reader.note_at((0, 0), start);
-        reader.note_at((0, 30 * PIECE), start + std::time::Duration::from_secs(3));
-        let claim = owner.turn(&0).await.expect("the turn");
-        owner.pass(&0, &(), claim, Mode::Live).await;
-        assert_eq!(
-            shape(&owner),
-            Some(Shape::Split {
-                window: 3,
-                committed: 3
-            }),
-            "the delivery burst caps nothing: half the budget each"
-        );
-
-        // What the player says: ten seconds of film, one piece of file.
-        owner.note_playhead_at(&0, (0, 0), std::time::Duration::ZERO, None, true, start);
-        owner.note_playhead_at(
-            &0,
-            (0, 10 * PIECE),
-            std::time::Duration::from_secs(100),
-            None,
-            true,
-            start + std::time::Duration::from_secs(100),
-        );
-        let claim = owner.turn(&0).await.expect("the turn");
-        owner.pass(&0, &(), claim, Mode::Live).await;
-        assert_eq!(
-            shape(&owner),
-            Some(Shape::Split {
-                window: 5,
-                committed: 1
-            }),
-            "a hundred bytes of film a second, and ten seconds of it is the cap"
-        );
-        drop(reader);
-    }
-
-    /// **Bytes of file over seconds of film, and what is not that.**
-    #[test]
-    fn a_told_bitrate_is_bytes_of_file_over_seconds_of_film() {
-        let film = std::time::Duration::from_secs;
-        assert_eq!(
-            told_bitrate((0, film(100), true), (34_000_000, film(140), true)),
-            Some(850_000),
-            "forty seconds of film, thirty-four megabytes of file"
-        );
-        // Ten seconds is not enough of it: a player that read nothing for
-        // most of them would report its buffer, not the film.
-        assert_eq!(
-            told_bitrate((0, film(100), true), (34_000_000, film(110), true)),
-            None,
-            "too little film to divide by"
-        );
-        // A seek forwards moves both and is the same film over more of it.
-        assert_eq!(
-            told_bitrate((0, film(100), true), (1_020_000_000, film(400), true)),
-            Some(3_400_000),
-            "five minutes of film, a gigabyte of file"
-        );
-        // Either end not playing spans wall-clock the film did not.
-        assert_eq!(
-            told_bitrate((0, film(100), false), (34_000_000, film(140), true)),
-            None
-        );
-        assert_eq!(
-            told_bitrate((0, film(100), true), (34_000_000, film(140), false)),
-            None
-        );
-        // A seek back, a player sitting still, and two reports a moment
-        // apart are all of them nothing.
-        assert_eq!(
-            told_bitrate((34_000_000, film(140), true), (0, film(100), true)),
-            None
-        );
-        assert_eq!(
-            told_bitrate((0, film(100), true), (0, film(140), true)),
-            None
-        );
-        assert_eq!(
-            told_bitrate(
-                (0, film(100), true),
-                (
-                    34_000_000,
-                    film(100) + std::time::Duration::from_millis(30),
-                    true
-                )
-            ),
-            None
-        );
     }
 
     /// **A read parked on a piece the disk does not have is the whole

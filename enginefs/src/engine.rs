@@ -1351,12 +1351,10 @@ impl<H: TorrentHandle> Engine<H> {
         &self,
         file_idx: usize,
         offset: u64,
-        film: std::time::Duration,
         duration: Option<std::time::Duration>,
-        playing: bool,
     ) {
         self.retention
-            .note_playhead(&file_idx, (file_idx, offset), film, duration, playing);
+            .note_playhead(&file_idx, (file_idx, offset), duration);
     }
 
     /// What the retention policy says about `file_idx` right now, or `None`
