@@ -13,6 +13,23 @@
 /// `size == 0` always yields `None`: there is no valid inclusive byte
 /// range on an empty resource, and computing `size - 1` for a suffix or
 /// open range would otherwise underflow `u64`.
+/// Whether a `Range` header names an end, as against asking for the rest of
+/// the resource.
+///
+/// `bytes=X-Y` and the suffix form `bytes=-N` both say how many bytes are
+/// wanted; `bytes=X-` does not. [`parse_range`] resolves the open form
+/// against the size and cannot be asked afterwards which it was, and the
+/// difference decides whether a read near the end of a film is a player
+/// fetching the container index or a viewer watching from there
+/// (`priorities::is_container_metadata_request`). Malformed headers answer
+/// `false`; `parse_range` rejects them separately.
+pub(crate) fn range_is_bounded(header: &str) -> bool {
+    header
+        .strip_prefix("bytes=")
+        .and_then(|range| range.split_once('-'))
+        .is_some_and(|(_, end)| !end.is_empty())
+}
+
 pub(crate) fn parse_range(header: &str, size: u64) -> Option<(u64, u64)> {
     let prefix = "bytes=";
     if !header.starts_with(prefix) || size == 0 {
@@ -112,5 +129,20 @@ mod tests {
         assert_eq!(parse_range("bytes=0-1-2", 10), None);
         assert_eq!(parse_range("bytes=0", 10), None);
         assert_eq!(parse_range("", 10), None);
+    }
+
+    /// Which `Range` headers say how many bytes they want. The open form
+    /// does not, and that is what tells a container-index read from a
+    /// viewer seeking into the tail of a film.
+    #[test]
+    fn only_a_range_that_names_an_end_is_bounded() {
+        assert!(range_is_bounded("bytes=0-99"));
+        assert!(
+            range_is_bounded("bytes=-500"),
+            "a suffix range says a length"
+        );
+        assert!(!range_is_bounded("bytes=500-"));
+        assert!(!range_is_bounded("bytes=0"));
+        assert!(!range_is_bounded("items=0-9"));
     }
 }

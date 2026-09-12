@@ -35,8 +35,33 @@ pub fn container_metadata_start(file_size: u64) -> u64 {
     }
 }
 
-pub fn is_container_metadata_request(start: u64, requested_len: u64, file_size: u64) -> bool {
-    start > 0
+/// Whether a read of `requested_len` bytes from `start` of a file of
+/// `file_size` is a player fetching the container's index rather than
+/// somebody watching from there.
+///
+/// **A probe is a BOUNDED range.** The geometry alone -- near the end,
+/// short enough -- cannot tell a Cues read from a viewer who dragged the
+/// scrubber into the last ten minutes, because an open-ended
+/// `Range: bytes=X-` arrives here with `requested_len` already resolved to
+/// `file_size - start` and is therefore "short" on any file whose last 10
+/// MiB is 10 MiB. It matters: a probe is [`crate::retention::owner::Reading::Probe`],
+/// which since the playhead fix means the retention window stays where
+/// playback was -- so a viewer who seeks into the tail of a film gets no
+/// window at all round where they are watching, and every pass reclaims
+/// what their stream has just fetched.
+///
+/// A player reading an index asks for the bytes of that index and says how
+/// many; a player playing asks for the rest of the file. So `bounded` is
+/// the first question, and the geometry only narrows it: a bounded read is
+/// a probe only if it is also near the end and short.
+pub fn is_container_metadata_request(
+    start: u64,
+    requested_len: u64,
+    file_size: u64,
+    bounded: bool,
+) -> bool {
+    bounded
+        && start > 0
         && file_size > 0
         && requested_len > 0
         && requested_len <= MAX_CONTAINER_METADATA_WINDOW_BYTES
@@ -331,11 +356,47 @@ mod tests {
     fn small_file_metadata_starts_at_final_five_percent() {
         let file_size = 8 * 1024 * 1024;
         assert_eq!(container_metadata_start(file_size), file_size * 95 / 100);
-        assert!(!is_container_metadata_request(1024 * 1024, 1024, file_size));
+        assert!(!is_container_metadata_request(
+            1024 * 1024,
+            1024,
+            file_size,
+            true
+        ));
         assert!(is_container_metadata_request(
             container_metadata_start(file_size),
             1024,
-            file_size
+            file_size,
+            true
+        ));
+    }
+
+    /// **An open-ended range is never a probe, wherever it starts.**
+    ///
+    /// `Range: bytes=X-` reaches the geometry with its length already
+    /// resolved to `file_size - start`, so a viewer who dragged the
+    /// scrubber into the last ten minutes of a film asked for "the rest of
+    /// it" and was read as a sixteen-megabyte index fetch. Since the
+    /// playhead fix that no longer moves the window to the tail -- it does
+    /// something quieter and worse: the window stays where playback *was*,
+    /// so the reader gets no window at all round what it is playing and
+    /// every pass reclaims what its stream has just fetched.
+    #[test]
+    fn an_open_ended_range_near_the_end_is_playback_and_not_metadata() {
+        let file_size = 10 * 1024 * 1024 * 1024;
+        let start = container_metadata_start(file_size);
+        // The same geometry, twice: the only difference is whether the
+        // player said how many bytes it wanted.
+        assert!(is_container_metadata_request(start, 1024, file_size, true));
+        assert!(!is_container_metadata_request(
+            start, 1024, file_size, false
+        ));
+        // And the shape a seek into the tail really arrives in: open-ended,
+        // so its length is everything that is left.
+        assert!(!is_container_metadata_request(
+            start,
+            file_size - start,
+            file_size,
+            false
         ));
     }
 
@@ -347,12 +408,14 @@ mod tests {
         assert!(is_container_metadata_request(
             start,
             MAX_CONTAINER_METADATA_WINDOW_BYTES,
-            file_size
+            file_size,
+            true
         ));
         assert!(!is_container_metadata_request(
             start,
             MAX_CONTAINER_METADATA_WINDOW_BYTES + 1,
-            file_size
+            file_size,
+            true
         ));
     }
 

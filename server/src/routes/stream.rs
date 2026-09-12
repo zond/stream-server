@@ -416,6 +416,10 @@ fn playback_intent_for_request(
     file_size: u64,
     is_download: bool,
     is_partial: bool,
+    // Whether the `Range` header named an end. An open-ended one is a
+    // player asking for the rest of the file, which is playback wherever it
+    // starts; see `priorities::is_container_metadata_request`.
+    is_bounded: bool,
 ) -> PlaybackIntent {
     if priority == 255 {
         return PlaybackIntent::InternalProbe;
@@ -429,8 +433,12 @@ fn playback_intent_for_request(
     if is_download && is_partial {
         return PlaybackIntent::DownloadRange;
     }
-    if enginefs::backend::priorities::is_container_metadata_request(start, requested_len, file_size)
-    {
+    if enginefs::backend::priorities::is_container_metadata_request(
+        start,
+        requested_len,
+        file_size,
+        is_bounded,
+    ) {
         return PlaybackIntent::ContainerMetadata;
     }
 
@@ -1180,6 +1188,9 @@ async fn stream_video_with(
         size,
         is_download,
         is_partial,
+        range_header
+            .as_deref()
+            .is_some_and(crate::routes::util::range_is_bounded),
     );
     // The request's own `buffer=` wins; anything else (absent, or a value this
     // build does not know) falls back to the server-wide default.
@@ -1623,7 +1634,7 @@ mod tests {
     #[test]
     fn full_download_uses_download_full_intent() {
         assert_eq!(
-            playback_intent_for_request(1, 0, 10_000, 10_000, true, false),
+            playback_intent_for_request(1, 0, 10_000, 10_000, true, false, true),
             PlaybackIntent::DownloadFull
         );
     }
@@ -1631,7 +1642,7 @@ mod tests {
     #[test]
     fn ranged_download_uses_download_range_intent() {
         assert_eq!(
-            playback_intent_for_request(1, 500, 1, 10_000, true, true),
+            playback_intent_for_request(1, 500, 1, 10_000, true, true, true),
             PlaybackIntent::DownloadRange
         );
     }
@@ -1639,7 +1650,7 @@ mod tests {
     #[test]
     fn full_file_range_download_uses_download_full_intent() {
         assert_eq!(
-            playback_intent_for_request(1, 0, 10_000, 10_000, true, true),
+            playback_intent_for_request(1, 0, 10_000, 10_000, true, true, true),
             PlaybackIntent::DownloadFull
         );
     }
@@ -1647,7 +1658,7 @@ mod tests {
     #[test]
     fn resumed_full_remaining_download_uses_download_full_intent() {
         assert_eq!(
-            playback_intent_for_request(1, 5_000, 5_000, 10_000, true, true),
+            playback_intent_for_request(1, 5_000, 5_000, 10_000, true, true, true),
             PlaybackIntent::DownloadFull
         );
     }
@@ -1655,7 +1666,7 @@ mod tests {
     #[test]
     fn playback_without_range_is_direct_initial_not_download() {
         assert_eq!(
-            playback_intent_for_request(1, 0, 10_000, 10_000, false, false),
+            playback_intent_for_request(1, 0, 10_000, 10_000, false, false, true),
             PlaybackIntent::DirectInitial
         );
     }
@@ -1665,7 +1676,24 @@ mod tests {
         let file_size = 100 * 1024 * 1024;
         let tail = enginefs::backend::priorities::container_metadata_start(file_size);
         assert_eq!(
-            playback_intent_for_request(1, tail, 1024, file_size, false, true),
+            playback_intent_for_request(1, tail, 1024, file_size, false, true, true),
+            PlaybackIntent::ContainerMetadata
+        );
+    }
+
+    /// A seek into the tail arrives as `Range: bytes=X-`, and that is
+    /// playback: see `priorities::is_container_metadata_request`.
+    #[test]
+    fn an_open_ended_tail_range_is_a_seek_and_not_container_metadata() {
+        let file_size = 100 * 1024 * 1024;
+        let tail = enginefs::backend::priorities::container_metadata_start(file_size);
+        assert_eq!(
+            playback_intent_for_request(1, tail, file_size - tail, file_size, false, true, false),
+            PlaybackIntent::DirectSeek
+        );
+        // And the bounded read of the same region still is one.
+        assert_eq!(
+            playback_intent_for_request(1, tail, 1024, file_size, false, true, true),
             PlaybackIntent::ContainerMetadata
         );
     }
@@ -1681,6 +1709,7 @@ mod tests {
                 enginefs::backend::priorities::MAX_CONTAINER_METADATA_WINDOW_BYTES + 1,
                 file_size,
                 false,
+                true,
                 true
             ),
             PlaybackIntent::DirectSeek
@@ -1691,7 +1720,7 @@ mod tests {
     fn small_file_non_tail_range_stays_direct_seek() {
         let file_size = 8 * 1024 * 1024;
         assert_eq!(
-            playback_intent_for_request(1, 1024 * 1024, 1024, file_size, false, true),
+            playback_intent_for_request(1, 1024 * 1024, 1024, file_size, false, true, true),
             PlaybackIntent::DirectSeek
         );
     }
