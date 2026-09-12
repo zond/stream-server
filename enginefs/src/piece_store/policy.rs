@@ -211,14 +211,18 @@ pub struct Buffering {
     /// the budget is what it used to be, which on a small cache is the half
     /// the forward buffer needed.
     pub committed_seconds: Option<u64>,
-    /// The rate bytes are really leaving the server at for this entity,
-    /// smoothed, or `None` before anything has been measured.
+    /// The film's average bitrate for this entity, or `None` until its
+    /// length has been stated.
     ///
-    /// **An observation and not a bitrate.** It is what the reader is being
-    /// handed per second, which starts at whatever the swarm can give while
-    /// the player fills its own cache and settles on the real bitrate once
-    /// that cache is full. Until there is one, the two time caps do not
-    /// apply at all and the byte arithmetic below stands on its own.
+    /// **A bitrate and not an observation.** It is the entity's size over
+    /// the duration the player reported (`Retention::note_duration`), which
+    /// is exact at the first report and cannot be distorted by a read
+    /// pattern. It was an EWMA over delivered bytes, and that measured a
+    /// swarm and a player's own cache rather than a film: three bytes a
+    /// second across a gap in which nothing played, seventeen across two
+    /// seconds a player spent inside its buffer, each collapsing the window
+    /// onto its floor. Until there is a rate the two time caps do not apply
+    /// at all and the byte arithmetic below stands on its own.
     pub bytes_per_second: Option<u64>,
     /// The draw that decides which pieces of this entity this process
     /// offers to the swarm; see [`choose`].
@@ -232,15 +236,15 @@ pub struct Buffering {
 }
 
 impl Buffering {
-    /// Bytes `seconds` of this stream comes to, or `None` with no measured
-    /// rate to convert it at.
+    /// Bytes `seconds` of this stream comes to, or `None` with no bitrate
+    /// to convert it at.
     fn over(&self, seconds: u64) -> Option<u64> {
         self.bytes_per_second
             .map(|rate| rate.saturating_mul(seconds))
     }
 }
 
-/// The smallest a time cap may come to, whatever the measured rate says.
+/// The smallest a time cap may come to, whatever the bitrate says.
 ///
 /// A cap is a promise about playback, and ninety seconds of a 2 Mbps
 /// talking-heads documentary is twenty-two megabytes -- enough buffer for a
@@ -1802,8 +1806,8 @@ mod tests {
     /// announced out of the draw.**
     ///
     /// [`RetentionPolicy::observe`] runs at the top of every pass and
-    /// re-draws whenever the capacity moves, which under a measured rate is
-    /// most passes. Lowest-rank-`count` is nested, so a shrink drops the
+    /// re-draws whenever the capacity moves, which a stated bitrate and a
+    /// moving budget between them make often enough to matter. Lowest-rank-`count` is nested, so a shrink drops the
     /// unchosen tail of the draw -- and a piece we have already announced is
     /// in that tail as easily as any other. `advance` would not reclaim it,
     /// because it tests the committed set first, but the moment the disk
@@ -1822,7 +1826,7 @@ mod tests {
             "the walk has to announce more than the shrunk capacity: {announced:?}"
         );
 
-        // A rate is measured, and ten seconds of it is one piece: the
+        // A bitrate is stated, and ten seconds of it is one piece: the
         // committed capacity falls to one, under a set of several.
         p.observe(Buffering {
             committed_seconds: Some(10),

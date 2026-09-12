@@ -352,9 +352,11 @@ pub trait Backing: Sized + Send + Sync + 'static {
         buffering: Buffering,
     ) -> anyhow::Result<RetentionPolicy>;
     /// How many bytes into the entity `at` is. Pure, and monotonic with
-    /// the position: it is differenced against the last one to measure how
-    /// fast bytes are really going out ([`DeliveryRate`]), so it has to be
-    /// the offset in the thing being read and not an index into it.
+    /// the position, so it is an offset in the thing being read and not an
+    /// index into it. It was differenced against the last one to measure a
+    /// delivery rate; the rate is size over duration now, and nothing in
+    /// this crate calls this -- it is kept as the offset half of a
+    /// backing's position, which a backing outside it may still need.
     fn offset_of(domain: &Self::Domain, at: Self::Position) -> u64;
     /// The index `at` lands on under `domain`, clamped to the last, or
     /// `None` when the position names nothing in this domain's index space.
@@ -821,10 +823,11 @@ struct ReaderState<B: Backing> {
 ///
 /// `at` is the position in the *file* -- mpv's `stream-pos`, the demuxer's
 /// byte offset -- so nothing has to convert a time into a byte and be
-/// wrong about it on a variable-bitrate film. `film` is the position in
-/// the *picture* -- `time-pos` -- which is what makes a bitrate out of the
-/// two: bytes of file over seconds of film is what a window measured in
-/// seconds needs, and it is immune to how fast either end delivered.
+/// wrong about it on a variable-bitrate film. It places the window and
+/// nothing else: the position in the *picture* was kept here too while a
+/// bitrate was made by dividing one by the other, and with the film's
+/// length stated ([`Retention::note_duration`]) the length sizes the
+/// window and the playhead places it, neither needing the other.
 #[derive(Debug)]
 struct Told<B: Backing> {
     at: B::Position,
@@ -2457,15 +2460,16 @@ impl<B: Backing> State<B> {
                 };
             any = true;
         }
-        // Only playing reads feed it: a probe walks the file at whatever
-        // the swarm gives and says nothing about how fast the film is being
-        // watched. It is the entity's and not any one reader's, because no
-        // reader outlives a reconnect; see [`Self::rate`].
-        // **Computed where it can be, measured only where it cannot.** Size
-        // over duration is the film's bitrate by arithmetic: exact at the
-        // first report, nothing to converge, and nothing a player's read
-        // pattern can distort. The measured paths below answer only for a
-        // stream whose length nobody has stated.
+        // **Computed, never measured.** Size over duration is the film's
+        // bitrate by arithmetic: exact at the first report, nothing to
+        // converge, and nothing a player's read pattern can distort. It is
+        // the entity's and not any one reader's, because no reader outlives
+        // a reconnect. There is no fallback: a stream whose length nobody
+        // has stated has no rate here, the two time caps do not apply, and
+        // the byte arithmetic stands on its own -- which is better than the
+        // measurement this replaced, whose three bytes a second and
+        // seventeen bytes a second both collapsed a window onto its floor
+        // and stopped playback.
         asked.bytes_per_second = self
             .duration
             .filter(|duration| !duration.is_zero())
@@ -2718,9 +2722,9 @@ impl<B: Backing> State<B> {
         held: &BTreeSet<u32>,
     ) -> Option<(Decision, RetentionPolicy)> {
         // Under what the readers are doing *now*, before the decision: the
-        // delivery rate the time caps are sized from is not known when the
-        // policy is built, and a reader that opened or ended since changes
-        // what the window has to hold. The budget is not re-read -- a
+        // bitrate the time caps are sized from needs a duration the player
+        // states after the policy is built, and a reader that opened or
+        // ended since changes what the window has to hold. The budget is not re-read -- a
         // budget that moves builds a new policy under the turn.
         let buffering = self.buffering();
         let installed = self.installed.as_mut()?;

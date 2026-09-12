@@ -175,7 +175,8 @@ impl<H: TorrentHandle> FileHandle<H> {
                 lookahead_bytes,
                 window_seconds: buffer.window_seconds(),
                 committed_seconds: Some(crate::backend::priorities::COMMITTED_SECONDS),
-                // Measured, not asked for: see `Buffering::bytes_per_second`.
+                // The entity's, from its size and the film's length, not
+                // this read's to ask for: see `Buffering::bytes_per_second`.
                 bytes_per_second: None,
                 // The entity's, not this read's: every read of one file
                 // shares the same pieces. See `Retention::reader_on`.

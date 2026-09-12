@@ -185,7 +185,7 @@ impl BufferProfile {
     ///
     /// The unit is the one the viewer chose in: "how much of this film do I
     /// want in hand", not "what fraction of my disk". The bytes it comes to
-    /// are the measured delivery rate times this, floored at
+    /// are the film's own bitrate times this, floored at
     /// `SMALLEST_TIME_CAP_BYTES` so a low-bitrate stream still gets a
     /// sensible buffer, and it is only ever a *cap* -- the budget and the
     /// lookahead floor still bound it from the other side.

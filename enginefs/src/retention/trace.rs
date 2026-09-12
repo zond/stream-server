@@ -66,7 +66,8 @@ pub struct Pass<'a> {
     pub budget: CacheBudget,
     /// The largest stream lookahead granted to a reader still open.
     pub lookahead_bytes: u64,
-    /// The delivery rate the time caps are sized from, once measured.
+    /// The bitrate the time caps are sized from -- the entity's size over
+    /// the duration a player stated -- or `None` until one is stated.
     pub bytes_per_second: Option<u64>,
     /// Pieces of the entity this pass stopped wanting.
     pub dropped: usize,
