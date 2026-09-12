@@ -78,7 +78,6 @@ tar = "0.4.44"
 flate2 = "1.1.5"
 uuid = "1.19.0"
 bytes = "1.11.0"
-ssdp-client = "2.1.0"
 # Pure-Rust 7z decompression (also used by tests to write fixtures via the
 # default "compress" feature); no C++ toolchain or libclang required.
 sevenz-rust2 = "0.22.2"

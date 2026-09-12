@@ -465,14 +465,20 @@ fn background_traffic_is_dark_on_an_idle_server() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The two casting calls stremio-core makes on every boot.
+///
+/// `GET /casting` answers an empty list. The SSDP discovery loop that filled
+/// it ran only in the deleted daemon and is gone, so empty is now the only
+/// answer -- and the honest one, since nothing could be cast to a discovered
+/// device anyway, which is the other half of this test.
+///
 /// stremio-core's play_on_device (models/streaming_server.rs:716-744) POSTs
 /// to `casting/{device}/player` and treats any 2xx response as
 /// `PlayingOnDevice`. Casting isn't implemented, so the endpoint must fail
 /// visibly (non-2xx) instead of the official client silently believing
 /// playback started on the device.
-///
 #[test]
-fn casting_player_reports_failure_since_casting_is_not_implemented() -> anyhow::Result<()> {
+fn casting_lists_no_devices_and_refuses_to_play_on_one() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
 
@@ -490,6 +496,17 @@ fn casting_player_reports_failure_since_casting_is_not_implemented() -> anyhow::
         .error_for_status()?
         .json()?;
     assert_eq!(heartbeat["success"], true);
+
+    let devices: serde_json::Value = client
+        .get(format!("http://{}/casting", handle.http_addr()))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    assert_eq!(
+        devices,
+        serde_json::json!([]),
+        "nothing fills the device list any more"
+    );
 
     let response = client
         .post(format!(

@@ -76,13 +76,13 @@ mod archives;
 mod auth;
 mod cache_budget;
 mod cache_cleaner;
+mod devices;
 mod diagnostics;
 mod lan_media;
 mod proxy_cache;
 mod proxy_retention;
 mod proxy_streams;
 mod routes;
-mod ssdp;
 mod state;
 pub mod stream_numbers;
 
@@ -108,7 +108,6 @@ pub struct ServerConfig {
     /// whose host installs none should turn this on to get a post-mortem
     /// out of a torrent or codec crash instead of a silent kill.
     pub manage_process_globals: bool,
-    pub enable_ssdp_discovery: bool,
     pub graceful_shutdown_timeout: Duration,
     /// How the control API authenticates (media routes are always open).
     /// Defaults to a per-launch generated token; see [`ServerAuth`].
@@ -173,7 +172,6 @@ impl Default for ServerConfig {
             cache_dir: None,
             init_logging: false,
             manage_process_globals: false,
-            enable_ssdp_discovery: false,
             graceful_shutdown_timeout: Duration::from_secs(3),
             auth: ServerAuth::Generated,
             torrent_listen_port: TorrentListenPort::Ephemeral,
@@ -1182,12 +1180,6 @@ pub async fn run(
     // returns, so it exists before the router below can serve a request
     // into the proxy cache rather than a moment after.
     background_tasks.push(cache_budget::start(Arc::new(state.clone())).await);
-    if cfg.enable_ssdp_discovery {
-        background_tasks.push(diagnostics::logging::spawn_logged(
-            "ssdp-discovery",
-            crate::ssdp::start_discovery(state.devices.clone()),
-        ));
-    }
     // Unconditional and unconfigurable: two routing-table length reads on a
     // timer, and the only thing that ever states whether the DHT works here.
     // See `diagnostics::dht_health`.

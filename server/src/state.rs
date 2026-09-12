@@ -27,7 +27,10 @@ pub struct AppState {
     /// Archive sessions, swept when idle (see `crate::archives::sessions`);
     /// a swept session's downloaded archive goes with it.
     pub archive_cache: crate::archives::sessions::Sessions<crate::archives::ArchiveSession>,
-    pub devices: Arc<RwLock<Vec<crate::ssdp::Device>>>,
+    /// What `GET /casting` answers with. Always empty: the SSDP discovery
+    /// loop that filled it went with the daemon, and nothing could be cast
+    /// to an entry anyway (see `crate::devices`).
+    pub devices: Arc<RwLock<Vec<crate::devices::Device>>>,
     /// The proxied streams players are reading right now, so a client can
     /// end its own player's (see `crate::proxy_streams`).
     pub proxy_streams: Arc<crate::proxy_streams::ProxyStreams>,

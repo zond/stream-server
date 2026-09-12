@@ -119,9 +119,9 @@ let base_url = handle.base_url().to_string();   // http://127.0.0.1:<port>
 let token = handle.auth_token().map(str::to_string); // control-route bearer
 ```
 
-`ServerConfig::default()` is the only configuration: **loopback only** — `127.0.0.1:11470`, no logging, no SSDP discovery, a freshly generated per-launch bearer token the embedder reads off the handle, and an ephemeral BitTorrent listen port so several servers (and the tests) coexist. Set `http_addr`'s port to `0` to let the OS pick the HTTP port too, and read the one it picked from `ServerHandle::bound_http_addr()`.
+`ServerConfig::default()` is the only configuration: **loopback only** — `127.0.0.1:11470`, no logging, a freshly generated per-launch bearer token the embedder reads off the handle, and an ephemeral BitTorrent listen port so several servers (and the tests) coexist. Set `http_addr`'s port to `0` to let the OS pick the HTTP port too, and read the one it picked from `ServerHandle::bound_http_addr()`.
 
-There used to be a second, `binary_default()` — all interfaces, HTTPS on 12470, SSDP, a Ctrl+C handler, a startup banner on stdout, a memory sampler, and a `std::process::exit` if shutdown ran long. It existed for the deleted daemon and nothing here ever ran it; every field that only it set is gone with it. An embedder that wants the open media routes (`/proxy` and `/ftp` among them, which fetch whatever URL they are handed) reachable from the local network now has to say so field by field, which is the point.
+There used to be a second, `binary_default()` — all interfaces, HTTPS on 12470, SSDP discovery, a Ctrl+C handler, a startup banner on stdout, a memory sampler, and a `std::process::exit` if shutdown ran long. It existed for the deleted daemon and nothing here ever ran it; every field that only it set is gone with it. An embedder that wants the open media routes (`/proxy` and `/ftp` among them, which fetch whatever URL they are handed) reachable from the local network now has to say so field by field, which is the point.
 
 **There is no HTTPS listener.** `ServerConfig::https_addr`, `server/src/https.rs` and the certificate machinery went with the daemon: a server embedded in a host process binds loopback, and the remote address a certificate would be for belongs to the host, not to this library. `/get-https` stays as a `501` — see the route table.
 
@@ -265,7 +265,7 @@ The HTTP surface is deliberately small and split in two by `build_router()` (`se
 | POST | `/{infoHash}/create` | TOKEN | stremio-core `CreateTorrent` (magnet) |
 | GET, POST | `/settings` | TOKEN | stremio-core `StreamingServer` (`{ baseUrl, options, values }` / `{ success }`) |
 | GET | `/network-info`, `/device-info` | TOKEN | stremio-core `StreamingServer` |
-| GET | `/casting` | TOKEN | stremio-core playback devices: what SSDP discovery has found. Discovery runs only where `ServerConfig::enable_ssdp_discovery` is set, which the default does not, so the server an embedder starts answers `[]`; nothing can be cast to a listed device either (next row). No trailing slash: `/casting/` is an unknown path (`404`) |
+| GET | `/casting` | TOKEN | stremio-core playback devices: **`[]`, always.** The SSDP discovery loop that filled the list ran only in the deleted daemon and is gone with the `ssdp-client` dependency; nothing could be cast to an entry it found in any case (next row), and on Android M-SEARCH is multicast the app sandbox cannot send. An embedder that casts discovers receivers itself and feeds them from the [LAN media listener](#lan-media-listener). No trailing slash: `/casting/` is an unknown path (`404`) |
 | POST | `/casting/{devID}/player` | TOKEN | stremio-core `play_on_device`; answers `501` because casting is not implemented |
 | GET | `/get-https?authKey=…&ipAddress=…` | TOKEN | **`501`, always.** stremio-core has `GetHTTPSEndpoint` in its `StreamingServer` vocabulary and dispatches it for "access from other devices", so the path must exist — a `404` would make this a server core does not recognise, and keeping the route is also what keeps our fork of core from needing a patch. There is nothing behind it: an embedded server has no HTTPS endpoint to name. The parameters are not read, no network call is made, and nothing is written |
 | POST | `/{infoHash}/{fileIdx}/download` | TOKEN | offline downloads — pin the file; optional body `{"trackers":[…]}` (`sources`/`announce` accepted too), answer is a `DownloadInfo`. See [Offline downloads](#offline-downloads) |
@@ -413,7 +413,7 @@ The cache bounds itself (see *What bounds the cache* above); these two calls let
 
 Both share their functions with `ServerHandle::{cache_usage, clean_cache_now}` (`routes::cache`), token-protected control routes, absent from the LAN media listener like every other control route.
 
-`ServerConfig::default()` is tuned for a host process: loopback HTTP on 11470, no logging and no SSDP, a generated token, and `torrent_listen_port: TorrentListenPort::Ephemeral` — librqbit's incoming BitTorrent listener takes an OS-assigned port, so any number of embedded servers (and the tests) coexist with a desktop instance. `TorrentListenPort::Fixed(42000..42010)` — the first free port of the range, stable and forwardable, and the only shape a UPnP mapping is worth taking for — is still there; set the field explicitly if an embedder needs it.
+`ServerConfig::default()` is tuned for a host process: loopback HTTP on 11470, no logging, a generated token, and `torrent_listen_port: TorrentListenPort::Ephemeral` — librqbit's incoming BitTorrent listener takes an OS-assigned port, so any number of embedded servers (and the tests) coexist with a desktop instance. `TorrentListenPort::Fixed(42000..42010)` — the first free port of the range, stable and forwardable, and the only shape a UPnP mapping is worth taking for — is still there; set the field explicitly if an embedder needs it.
 
 ### Proxied remote streams
 
