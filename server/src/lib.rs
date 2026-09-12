@@ -70,6 +70,18 @@ pub use url::Url;
 pub(crate) const DEFAULT_LOG_FILTER: &str = "stream_server=info,tower_http=info,\
      enginefs=info,librqbit=warn,librqbit_dht::dht=error,librqbit_upnp=error";
 
+/// The port stremio-core's default profile builds `streaming_server_url`
+/// from (`http://127.0.0.1:11470/`), which is why it is what
+/// [`ServerConfig::default`] binds: a client that has never been told
+/// otherwise looks here.
+///
+/// **An embedder that reads the bound address back should ask for `0`
+/// instead**, and xtremio does. Core's URL is retargeted at whatever this
+/// server actually bound the moment it is known, so the number buys nothing
+/// downstream -- while binding it can lose to a desktop Stremio, to a second
+/// instance of the same app, or to whatever else holds 11470. The constant
+/// stays because it is the client-facing contract, not because anything
+/// here needs a fixed port.
 pub const DEFAULT_HTTP_PORT: u16 = 11470;
 
 mod archives;

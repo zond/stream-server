@@ -119,7 +119,9 @@ let base_url = handle.base_url().to_string();   // http://127.0.0.1:<port>
 let token = handle.auth_token().map(str::to_string); // control-route bearer
 ```
 
-`ServerConfig::default()` is the only configuration: **loopback only** — `127.0.0.1:11470`, no logging, a freshly generated per-launch bearer token the embedder reads off the handle, and an ephemeral BitTorrent listen port so several servers (and the tests) coexist. Set `http_addr`'s port to `0` to let the OS pick the HTTP port too, and read the one it picked from `ServerHandle::bound_http_addr()`.
+`ServerConfig::default()` is the only configuration: **loopback only** — `127.0.0.1:11470`, no logging, a freshly generated per-launch bearer token the embedder reads off the handle, and an ephemeral BitTorrent listen port so several servers (and the tests) coexist.
+
+**Prefer `http_addr`'s port `0`** and read the one the OS picked from `ServerHandle::bound_http_addr()`. 11470 is the default because it is what stremio-core's default profile points `streaming_server_url` at, so a client that has never been told otherwise looks there — but an embedder that retargets core at the address it read back (xtremio does, and so does this repository's own example and every test) gains nothing from the number and can only lose the bind to a desktop Stremio, to a second instance of itself, or to whatever else holds the port. `DEFAULT_HTTP_PORT` is a contract with the *client*, not a port anything here needs.
 
 There used to be a second, `binary_default()` — all interfaces, HTTPS on 12470, SSDP discovery, a Ctrl+C handler, a startup banner on stdout, a memory sampler, and a `std::process::exit` if shutdown ran long. It existed for the deleted daemon and nothing here ever ran it; every field that only it set is gone with it. An embedder that wants the open media routes (`/proxy` and `/ftp` among them, which fetch whatever URL they are handed) reachable from the local network now has to say so field by field, which is the point.
 
