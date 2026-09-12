@@ -4722,8 +4722,8 @@ fn lan_media_listener_serves_media_but_no_control_route() -> anyhow::Result<()> 
         }
         // The same path on the loopback listener is a control route that
         // exists: it answers the request rather than the 404 fallback.
-        // (`/get-https` is a 400 without its `authKey`; what matters is that
-        // it is not a 404.)
+        // (`/get-https` answers `501`; what matters is that it is not a
+        // 404.)
         let response = with_token.get(format!("{base}{path}")).send()?;
         assert_ne!(response.status(), reqwest::StatusCode::NOT_FOUND, "{path}");
         assert_ne!(
@@ -5128,159 +5128,59 @@ fn set_lan_media_toggles_the_listener_and_the_setting_can_forbid_it() -> anyhow:
     Ok(())
 }
 
-/// A certificate on disk that will not load costs the HTTPS listener and
-/// nothing else: the server starts and serves plain HTTP. It used to refuse
-/// to start at all, at every launch, over the remote-access feature.
+/// `/get-https` is a `501`, unconditionally, and is still a route.
+///
+/// stremio-core has `GetHTTPSEndpoint` in its `StreamingServer` vocabulary
+/// and dispatches it for "access from other devices", so the path has to
+/// exist: a `404` would make this a server core does not recognise, and
+/// leaving the route in is also what keeps our fork of core from needing a
+/// patch. There is nothing behind it -- an embedded server binds loopback
+/// inside a host process and has no HTTPS endpoint to name -- so the answer
+/// is the refusal, whatever the query says and whether or not it carries
+/// the parameters the old certificate fetch read.
+///
+/// No network call and nothing written: a `501` that took a round trip to
+/// Stremio's API, or left a private key in the config dir, would be a
+/// different thing wearing the same status code.
 #[test]
-fn a_certificate_that_will_not_load_leaves_the_plain_server_up() -> anyhow::Result<()> {
+fn get_https_is_a_501_and_writes_nothing() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
     let config_path = config_dir.path().join("config");
-    std::fs::create_dir_all(&config_path)?;
-    std::fs::write(config_path.join("https-cert.pem"), "not a certificate")?;
-    std::fs::write(config_path.join("https-key.pem"), "not a key")?;
-
-    let handle = stream_server::start(ServerConfig {
+    let handle = stream_server::start(stream_server::ServerConfig {
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
-        https_addr: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
-        config_dir: Some(config_path),
+        config_dir: Some(config_path.clone()),
         cache_dir: Some(cache_dir.path().join("cache")),
         ..offline_config()
     })?;
-    assert_eq!(handle.https_addr(), None);
-    let heartbeat: serde_json::Value = bearer_client(&handle)?
-        .get(format!("http://{}/heartbeat", handle.http_addr()))
-        .send()?
-        .error_for_status()?
-        .json()?;
-    assert_eq!(heartbeat["success"], true);
 
-    handle.shutdown()?;
-    handle.join()?;
-    Ok(())
-}
-
-/// `/get-https` answers with a port a TLS handshake succeeds on, because the
-/// listener behind the answer is started by the same call that writes the
-/// certificate -- not the plain-HTTP port, and not a port that only exists
-/// after a restart.
-///
-/// The fetch from Stremio's API cannot run here, so the test drives the
-/// serving half through the library method that shares it,
-/// `install_https_certificate`, with the throwaway self-signed PEMs beside
-/// this file: nothing is bound before a certificate exists; installing one
-/// binds the configured address and a TLS client reaches the control API
-/// there with the bearer token; a restart on the same config dir finds the
-/// certificate and comes back up on its own; and a server with no HTTPS
-/// address configured refuses -- the route with `501` before any network
-/// call, the method with an error -- rather than writing a key nothing
-/// would serve.
-#[test]
-fn get_https_serves_the_certificate_on_the_port_it_answers_with() -> anyhow::Result<()> {
-    let config_dir = tempfile::tempdir()?;
-    let cache_dir = tempfile::tempdir()?;
-    let config = || ServerConfig {
-        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
-        https_addr: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
-        config_dir: Some(config_dir.path().join("config")),
-        cache_dir: Some(cache_dir.path().join("cache")),
-        ..offline_config()
-    };
-    let cert = include_str!("selfsigned-cert.pem");
-    let key = include_str!("selfsigned-key.pem");
-    // The fixture is self-signed, so the client has to be told to accept
-    // it; what the handshake proves is that *this* certificate is served.
-    let tls_client = |handle: &ServerHandle| -> anyhow::Result<reqwest::blocking::Client> {
-        Ok(bearer_client_builder(handle)
-            .danger_accept_invalid_certs(true)
-            .build()?)
-    };
-
-    let handle = stream_server::start(config())?;
+    let client = bearer_client(&handle)?;
+    let base = format!("http://{}", handle.http_addr());
+    for query in [
+        "",
+        "?ipAddress=127.0.0.1",
+        "?authKey=not-a-real-key&ipAddress=127.0.0.1",
+    ] {
+        let response = client.get(format!("{base}/get-https{query}")).send()?;
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::NOT_IMPLEMENTED,
+            "/get-https{query}"
+        );
+    }
+    // And it is a control route, not an open one.
     assert_eq!(
-        handle.https_addr(),
-        None,
-        "no certificate yet, so nothing to serve it on"
-    );
-
-    let bound = handle.install_https_certificate(cert, key)?;
-    assert_eq!(handle.https_addr(), Some(bound));
-    assert_ne!(
-        bound,
-        handle.http_addr(),
-        "the HTTPS listener is its own socket, not the plain one renamed"
-    );
-    let heartbeat: serde_json::Value = tls_client(&handle)?
-        .get(format!("https://{bound}/heartbeat"))
-        .send()?
-        .error_for_status()?
-        .json()?;
-    assert_eq!(heartbeat["success"], true);
-    // And it is the control API, behind the same token.
-    assert_eq!(
-        reqwest::blocking::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .build()?
-            .get(format!("https://{bound}/heartbeat"))
+        reqwest::blocking::Client::new()
+            .get(format!("{base}/get-https"))
             .send()?
             .status(),
         reqwest::StatusCode::UNAUTHORIZED
     );
-    // Installing again -- a renewed certificate -- restarts the listener
-    // and still answers with a port that serves.
-    let renewed = handle.install_https_certificate(cert, key)?;
-    assert_eq!(handle.https_addr(), Some(renewed));
-    tls_client(&handle)?
-        .get(format!("https://{renewed}/heartbeat"))
-        .send()?
-        .error_for_status()?;
-    handle.shutdown()?;
-    handle.join()?;
-
-    // A restart on the same config dir finds the certificate on disk and
-    // serves it from the start.
-    let handle = stream_server::start(config())?;
-    let restarted = handle
-        .https_addr()
-        .expect("the certificate is on disk, so the listener is up at boot");
-    tls_client(&handle)?
-        .get(format!("https://{restarted}/heartbeat"))
-        .send()?
-        .error_for_status()?;
-    handle.shutdown()?;
-    handle.join()?;
-
-    // No HTTPS address configured -- the embedded default -- is a refusal,
-    // before any certificate is written and before any network call.
-    let plain_config_dir = tempfile::tempdir()?;
-    let plain_cache_dir = tempfile::tempdir()?;
-    let handle = stream_server::start(ServerConfig {
-        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
-        config_dir: Some(plain_config_dir.path().join("config")),
-        cache_dir: Some(plain_cache_dir.path().join("cache")),
-        ..offline_config()
-    })?;
-    assert_eq!(ServerConfig::default().https_addr, None);
-    let error = handle
-        .install_https_certificate(cert, key)
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("https_addr"), "{error}");
     assert!(
-        !plain_config_dir
-            .path()
-            .join("config")
-            .join("https-key.pem")
-            .exists(),
-        "no key is written for a listener that can never run"
+        !config_path.join("https-key.pem").exists(),
+        "no key is written for a listener that does not exist"
     );
-    let response = bearer_client(&handle)?
-        .get(format!(
-            "http://{}/get-https?authKey=not-a-real-key&ipAddress=127.0.0.1",
-            handle.http_addr()
-        ))
-        .send()?;
-    assert_eq!(response.status(), reqwest::StatusCode::NOT_IMPLEMENTED);
+
     handle.shutdown()?;
     handle.join()?;
     Ok(())

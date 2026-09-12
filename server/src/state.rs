@@ -44,10 +44,6 @@ pub struct AppState {
     /// (see `crate::lan_media`). Constructed disabled; `run` replaces it with
     /// one carrying `ServerConfig::lan_media_addr`.
     pub lan_media: Arc<crate::lan_media::LanMedia>,
-    /// The HTTPS listener `/get-https` starts and answers for (see
-    /// `crate::https`). Constructed with no address; `run` replaces it with
-    /// one carrying `ServerConfig::https_addr`.
-    pub https: Arc<crate::https::HttpsListener>,
     /// The standing reading behind `ServerHandle::background_traffic` (see
     /// `routes::system::background_traffic`). One per server, not per
     /// caller: the verdict is a comparison against the last reading, and
@@ -98,8 +94,6 @@ impl AppState {
             engine.cache_budget(),
             engine.live().clone(),
         ));
-        let https = Arc::new(crate::https::HttpsListener::new(None, &config_dir));
-
         Self {
             engine,
             settings,
@@ -116,7 +110,6 @@ impl AppState {
             proxy_streams: Arc::new(crate::proxy_streams::ProxyStreams::new()),
             proxy_cache,
             lan_media: Arc::new(crate::lan_media::LanMedia::new(None)),
-            https,
             traffic_window: Arc::new(enginefs::traffic::TrafficWindow::new()),
             budget_publication: Arc::default(),
         }

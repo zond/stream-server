@@ -78,7 +78,6 @@ tar = "0.4.44"
 flate2 = "1.1.5"
 uuid = "1.19.0"
 bytes = "1.11.0"
-axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 ssdp-client = "2.1.0"
 # Pure-Rust 7z decompression (also used by tests to write fixtures via the
 # default "compress" feature); no C++ toolchain or libclang required.
@@ -87,6 +86,11 @@ chrono = "0.4.42"
 sysinfo = "0.39.5"
 
 [dev-dependencies]
+# The TLS origin `server/tests/proxy.rs` stands up to test what `/proxy` does
+# with an HTTPS upstream. The crate used to be a real dependency: it served
+# the deleted HTTPS listener, and nothing in the library speaks TLS server-side
+# any more.
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 # Turns on the test-root registry in the same enginefs the tests link, so the
 # proxy's TLS fixture can present a chain that verifies, and the retention
 # owner's test hook, which is how a proxy test stands inside a pass. Feature

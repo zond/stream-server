@@ -1078,142 +1078,31 @@ pub async fn set_settings(
     }
 }
 
-/// stremio-core's remote-HTTPS certificate fetch: get a certificate for
-/// `ipAddress` from Stremio's API with the user's `authKey`, serve it, and
-/// answer with the domain the certificate is for and **the port a TLS
-/// handshake will succeed on** -- the client builds
-/// `https://<domain>:<port>` from nothing else. The serving half is
-/// `crate::https::HttpsListener::install_certificate`, shared with
-/// `ServerHandle::install_https_certificate`; the port in the answer is the
-/// address that call bound, never the plain-HTTP port and never a number
-/// read off the configuration.
+/// stremio-core's "access from other devices": `501 Not Implemented`, always.
 ///
-/// Refused with `501` before any network call when the server has no HTTPS
-/// address configured (the default, and so the Android embed):
-/// there is nothing here the certificate could be served on, and writing
-/// its private key to disk anyway -- what this used to do -- left a key
-/// nothing would ever use.
-pub async fn get_https(
-    State(state): State<AppState>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> impl IntoResponse {
-    let ip_address = match params.get("ipAddress") {
-        Some(ip) => ip,
-        None => return (StatusCode::BAD_REQUEST, "Missing ipAddress").into_response(),
-    };
-    let auth_key = match params.get("authKey") {
-        Some(key) => key,
-        None => return (StatusCode::BAD_REQUEST, "Missing authKey").into_response(),
-    };
-    if state.https.configured_addr().is_none() {
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            "This server has no HTTPS listener configured, so remote HTTPS is not available",
-        )
-            .into_response();
-    }
-
-    let client = match enginefs::http_client_builder().build() {
-        Ok(client) => client,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to build HTTP client: {}", e),
-            )
-                .into_response();
-        }
-    };
-    let api_url = "https://api.strem.io/api/certificateGet";
-
-    let payload = json!({
-        "authKey": auth_key,
-        "ipAddress": ip_address
-    });
-
-    let resp = match client.post(api_url).json(&payload).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("API error: {}", e),
-            )
-                .into_response();
-        }
-    };
-
-    let json: serde_json::Value = match resp.json().await {
-        Ok(j) => j,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("JSON error: {}", e),
-            )
-                .into_response();
-        }
-    };
-
-    // Parity with http_client_804.js: parse certificate response
-    let result = &json["result"];
-    if result.is_null() {
-        return (StatusCode::NOT_FOUND, "No certificate found in response").into_response();
-    }
-
-    let cert_data_str = match result["certificate"].as_str() {
-        Some(s) => s,
-        None => return (StatusCode::NOT_FOUND, "Certificate field missing").into_response(),
-    };
-
-    let cert_data: serde_json::Value = match serde_json::from_str(cert_data_str) {
-        Ok(v) => v,
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to parse inner certificate JSON",
-            )
-                .into_response();
-        }
-    };
-
-    let (Some(cert), Some(key)) = (
-        cert_data["certificate"].as_str(),
-        cert_data["privateKey"].as_str(),
-    ) else {
-        return (
-            StatusCode::NOT_FOUND,
-            "Certificate response carries no certificate and key",
-        )
-            .into_response();
-    };
-    // The answer is only as good as the listener behind it, so a certificate
-    // that will not load or a port that will not bind is this request's
-    // failure, not a line in the log and a port that speaks HTTP.
-    let bound = match state.https.install_certificate(&state, cert, key).await {
-        Ok(bound) => bound,
-        Err(error) => {
-            tracing::error!(error = %format!("{error:#}"), "get_https: could not serve the certificate");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "The certificate was fetched but the HTTPS listener could not be started",
-            )
-                .into_response();
-        }
-    };
-
-    let domain = format!(
-        "{}-{}",
-        ip_address.replace(".", "-"),
-        cert_data["commonName"]
-            .as_str()
-            .unwrap_or("")
-            .replace("*", "")
-    );
-
-    Json(json!({
-        "ipAddress": ip_address,
-        "domain": domain,
-        "port": bound.port()
-    }))
-    .into_response()
+/// The route survives because stremio-core dispatches it. `GetHTTPSEndpoint`
+/// is in its `StreamingServer` vocabulary and a client can ask for it at any
+/// time, so a server that answered `404` would be a server core does not
+/// recognise; `501` is the honest "this server, no". Keeping it also keeps
+/// our fork of core rebasable -- nothing there has to be patched out.
+///
+/// What it used to do was fetch a certificate for the caller's `ipAddress`
+/// from Stremio's API with their `authKey`, write it to the config dir, and
+/// start an HTTPS listener to serve it on. An *embedded* server has no HTTPS
+/// endpoint to give: it binds loopback inside a host process, the remote
+/// address a certificate would be for belongs to the host, and the listener
+/// that served one is gone (`ServerConfig::https_addr` with it). This was
+/// already the only answer xtremio ever saw, since it configured no HTTPS
+/// address; now it is the only answer there is.
+///
+/// No parameters are read, so nothing is validated and no network call is
+/// made -- and no private key is written for a listener that can never run,
+/// which is what an earlier version of this route did.
+pub async fn get_https() -> impl IntoResponse {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "This server has no HTTPS endpoint: it is embedded in a host process and serves loopback HTTP only",
+    )
 }
 
 /// What a `stats.json` route reports on: the engine for the hash if there

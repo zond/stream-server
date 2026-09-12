@@ -71,14 +71,12 @@ pub(crate) const DEFAULT_LOG_FILTER: &str = "stream_server=info,tower_http=info,
      enginefs=info,librqbit=warn,librqbit_dht::dht=error,librqbit_upnp=error";
 
 pub const DEFAULT_HTTP_PORT: u16 = 11470;
-pub const DEFAULT_HTTPS_PORT: u16 = 12470;
 
 mod archives;
 mod auth;
 mod cache_budget;
 mod cache_cleaner;
 mod diagnostics;
-mod https;
 mod lan_media;
 mod proxy_cache;
 mod proxy_retention;
@@ -91,7 +89,6 @@ pub mod stream_numbers;
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub http_addr: SocketAddr,
-    pub https_addr: Option<SocketAddr>,
     /// Settings, logs and certificates. `None`
     /// uses the platform config dir (needs `HOME`/`XDG_*`); embedders must
     /// set it explicitly.
@@ -172,7 +169,6 @@ impl Default for ServerConfig {
         Self {
             http_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, DEFAULT_HTTP_PORT)),
             pins: None,
-            https_addr: None,
             config_dir: None,
             cache_dir: None,
             init_logging: false,
@@ -236,44 +232,6 @@ impl ServerHandle {
     pub fn settings(&self) -> anyhow::Result<ServerSettings> {
         let state = self.state.clone();
         self.block_on_server(async move { state.settings.read().await.clone() })
-    }
-
-    /// Where the HTTPS listener is bound, or `None` while it is not running
-    /// -- which is the case until `/get-https` (or
-    /// [`Self::install_https_certificate`]) has put a certificate on disk;
-    /// again until the next one when the certificate on disk at boot would
-    /// not load or its port would not bind (the server serves plain HTTP
-    /// alone meanwhile); and always when [`ServerConfig::https_addr`] is
-    /// unset. With a configured port of `0` this is the port the OS
-    /// assigned.
-    pub fn https_addr(&self) -> Option<SocketAddr> {
-        let state = self.state.clone();
-        self.block_on_server(async move { state.https.bound_addr().await })
-            .ok()
-            .flatten()
-    }
-
-    /// Serve `cert_pem`/`key_pem` over HTTPS: written to the config dir and
-    /// the HTTPS listener started -- or restarted, so the new certificate is
-    /// the one presented -- on [`ServerConfig::https_addr`]. Returns the
-    /// bound address. This is the second half of `GET /get-https`, which
-    /// fetches the certificate from Stremio's API first; an embedder that
-    /// obtains a certificate some other way installs it here. Refused when
-    /// no HTTPS address is configured.
-    pub fn install_https_certificate(
-        &self,
-        cert_pem: &str,
-        key_pem: &str,
-    ) -> anyhow::Result<SocketAddr> {
-        let state = self.state.clone();
-        let cert_pem = cert_pem.to_string();
-        let key_pem = key_pem.to_string();
-        self.block_on_server(async move {
-            state
-                .https
-                .install_certificate(&state, &cert_pem, &key_pem)
-                .await
-        })?
     }
 
     /// Apply `patch` exactly as `POST /settings` would (same keys, same
@@ -1097,7 +1055,6 @@ pub async fn run(
     state.http_addr = public_http_addr;
     state.auth_token = Some(Arc::from(cfg.auth.resolve()?));
     state.lan_media = Arc::new(lan_media::LanMedia::new(cfg.lan_media_addr));
-    state.https = Arc::new(https::HttpsListener::new(cfg.https_addr, &config_dir));
     // The token is a secret and must never reach `tracing`: the log files
     // would keep it, and the kept launches' archives with them. An embedder
     // reads `ServerHandle::auth_token` instead. The deleted daemon printed it
@@ -1249,28 +1206,6 @@ pub async fn run(
     // error and nobody else's; the handle below is for the stop at shutdown.
     let lan_media = state.lan_media.clone();
 
-    // The HTTPS listener comes up at boot only when an earlier `/get-https`
-    // left its certificate on disk; otherwise that route starts it when it
-    // fetches one (see `https`). The same control block serves both, so the
-    // route answers with the port that is actually bound. Before the ready
-    // signal, like the plain listener: by the time `start` hands back a
-    // handle, a configured address with a certificate is either serving or
-    // has been logged as not starting -- never still on its way up.
-    let https_listener = state.https.clone();
-    // A failure here is the HTTPS listener's and nobody else's. It used to
-    // be the whole server's: a certificate that would not load -- a key
-    // and a certificate from two different `/get-https` answers, a file
-    // cut short -- or a port something else held refused the loopback
-    // server every client needs, over a remote-access feature, at every
-    // start until someone found the file. `/get-https` starts the listener
-    // again when it fetches a certificate.
-    if let Err(error) = https_listener.start_if_certificate_present(&state).await {
-        tracing::warn!(
-            error = format!("{error:#}"),
-            "the HTTPS listener did not start; serving plain HTTP only"
-        );
-    }
-
     tracing::info!("listening on {}", bound_http_addr);
     if let Some(ready_tx) = ready_tx {
         let _ = ready_tx.send(Started {
@@ -1332,7 +1267,6 @@ pub async fn run(
         task.abort();
     }
     lan_media.stop().await;
-    https_listener.stop().await;
 
     Ok(shutdown_source)
 }

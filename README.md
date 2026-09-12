@@ -106,9 +106,9 @@ stream_server = { package = "server", path = "../stream-server/server" }
 
 ```rust
 let handle = stream_server::start(stream_server::ServerConfig {
-    // Where settings.json, logs/ and any HTTPS certificate go. An embedder
-    // must set this: the default reads the platform config dir, which needs
-    // HOME/XDG_* to be set.
+    // Where settings.json and logs/ go. An embedder must set this: the
+    // default reads the platform config dir, which needs HOME/XDG_* to be
+    // set.
     config_dir: Some(config_dir),
     // Torrent data, the proxy cache and the archive scratch. Defaults to
     // `config_dir/cache`.
@@ -119,9 +119,11 @@ let base_url = handle.base_url().to_string();   // http://127.0.0.1:<port>
 let token = handle.auth_token().map(str::to_string); // control-route bearer
 ```
 
-`ServerConfig::default()` is the only configuration: **loopback only** — `127.0.0.1:11470`, no HTTPS listener, no logging, no SSDP discovery, a freshly generated per-launch bearer token the embedder reads off the handle, and an ephemeral BitTorrent listen port so several servers (and the tests) coexist. Set `http_addr`'s port to `0` to let the OS pick the HTTP port too, and read the one it picked from `ServerHandle::bound_http_addr()`.
+`ServerConfig::default()` is the only configuration: **loopback only** — `127.0.0.1:11470`, no logging, no SSDP discovery, a freshly generated per-launch bearer token the embedder reads off the handle, and an ephemeral BitTorrent listen port so several servers (and the tests) coexist. Set `http_addr`'s port to `0` to let the OS pick the HTTP port too, and read the one it picked from `ServerHandle::bound_http_addr()`.
 
-There used to be a second, `binary_default()` — all interfaces, HTTPS, SSDP, a Ctrl+C handler, a startup banner on stdout, a memory sampler, and a `std::process::exit` if shutdown ran long. It existed for the deleted daemon and nothing here ever ran it; every field that only it set is gone with it. An embedder that wants the open media routes (`/proxy` and `/ftp` among them, which fetch whatever URL they are handed) reachable from the local network now has to say so field by field, which is the point.
+There used to be a second, `binary_default()` — all interfaces, HTTPS on 12470, SSDP, a Ctrl+C handler, a startup banner on stdout, a memory sampler, and a `std::process::exit` if shutdown ran long. It existed for the deleted daemon and nothing here ever ran it; every field that only it set is gone with it. An embedder that wants the open media routes (`/proxy` and `/ftp` among them, which fetch whatever URL they are handed) reachable from the local network now has to say so field by field, which is the point.
+
+**There is no HTTPS listener.** `ServerConfig::https_addr`, `server/src/https.rs` and the certificate machinery went with the daemon: a server embedded in a host process binds loopback, and the remote address a certificate would be for belongs to the host, not to this library. `/get-https` stays as a `501` — see the route table.
 
 Control routes require that token on every request (`Authorization: Bearer <token>`); media routes are open so a player can fetch bytes without one. `ServerHandle` calls the same functions the routes do, so an embedder needs no HTTP client for control at all — see [Library API](#library-api) and [Authentication](#authentication).
 
@@ -265,7 +267,7 @@ The HTTP surface is deliberately small and split in two by `build_router()` (`se
 | GET | `/network-info`, `/device-info` | TOKEN | stremio-core `StreamingServer` |
 | GET | `/casting` | TOKEN | stremio-core playback devices: what SSDP discovery has found. Discovery runs only where `ServerConfig::enable_ssdp_discovery` is set, which the default does not, so the server an embedder starts answers `[]`; nothing can be cast to a listed device either (next row). No trailing slash: `/casting/` is an unknown path (`404`) |
 | POST | `/casting/{devID}/player` | TOKEN | stremio-core `play_on_device`; answers `501` because casting is not implemented |
-| GET | `/get-https?authKey=…&ipAddress=…` | TOKEN | stremio-core remote-HTTPS certificate fetch: fetches the certificate, writes it to the config dir, starts (or restarts) the HTTPS listener on `ServerConfig::https_addr` with it, and answers with **that listener's** port. `501` when no HTTPS address is configured (the default, and so the Android embed) — nothing is written and no network call is made |
+| GET | `/get-https?authKey=…&ipAddress=…` | TOKEN | **`501`, always.** stremio-core has `GetHTTPSEndpoint` in its `StreamingServer` vocabulary and dispatches it for "access from other devices", so the path must exist — a `404` would make this a server core does not recognise, and keeping the route is also what keeps our fork of core from needing a patch. There is nothing behind it: an embedded server has no HTTPS endpoint to name. The parameters are not read, no network call is made, and nothing is written |
 | POST | `/{infoHash}/{fileIdx}/download` | TOKEN | offline downloads — pin the file; optional body `{"trackers":[…]}` (`sources`/`announce` accepted too), answer is a `DownloadInfo`. See [Offline downloads](#offline-downloads) |
 | DELETE | `/{infoHash}/{fileIdx}/download?deleteFiles=1` | TOKEN | offline downloads — drop the pin, and with `deleteFiles` the data too |
 | GET | `/downloads.json` | TOKEN | offline downloads — every pinned file |
@@ -331,8 +333,6 @@ An embedder holds a `ServerHandle` (from `stream_server::start`) and never needs
 | `settings() -> Result<ServerSettings>` | `GET /settings` → `values` |
 | `update_settings(patch: serde_json::Value) -> Result<ServerSettings>` | `POST /settings` (same keys, validation, engine update and persistence); returns the settings afterwards |
 | `update_settings_with_report(patch) -> Result<(ServerSettings, BtSettingsReport)>` | the same, plus the `btSettings` report the HTTP response carries |
-| `install_https_certificate(cert_pem: &str, key_pem: &str) -> Result<SocketAddr>` | the serving half of `GET /get-https`: write the PEMs to the config dir and start — or restart, so the new certificate is the one presented — the HTTPS listener on `ServerConfig::https_addr`; returns its bound address. Refused when no HTTPS address is configured |
-| `https_addr() -> Option<SocketAddr>` | where the HTTPS listener is bound; `None` until a certificate has been installed (or found on disk at startup), after a boot whose HTTPS start failed (a certificate that will not load, a busy port: logged, and the server serves plain HTTP until the next `/get-https`), and always when `https_addr` is unset |
 | `engine_stats(info_hash, trackers: &[String]) -> Result<EngineStats>` | `GET /{infoHash}/stats.json?tr=…` — including creating the engine with `trackers` when it is the first request for the hash and answering `resolvingMetadata` at once. `trackers` are normalised inside the shared function exactly like `tr=` (`tracker:` prefix stripped, `dht:` dropped, trimmed), so a stream's `sources` array can be passed as is |
 | `file_stats(info_hash, file_idx: usize, trackers) -> Result<EngineStats>` | `GET /{infoHash}/{fileIdx}/stats.json?tr=…`; the route's `404` is a `FileNotFound` error |
 | `pin_download(info_hash, file_idx: usize, trackers) -> Result<DownloadInfo>` | `POST /{infoHash}/{fileIdx}/download` — pin the file as an offline download (see [Offline downloads](#offline-downloads)); `trackers` are normalised as for `engine_stats` |
