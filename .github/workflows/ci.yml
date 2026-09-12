@@ -79,10 +79,10 @@ jobs:
       # test job above already builds and tests it — no libclang, no separate
       # rar job. What still needs its own guard is the MIT escape hatch:
       # `--no-default-features` must keep building WITHOUT unrar-rs
-      # (GPL-3.0-or-later), so a distributor can produce an MIT-licensed binary,
-      # and that binary must work: the cfg(not(feature = "rar")) paths (RAR
-      # answered 501) are only compiled here, so only here can a test reach
-      # them. The librqbit backend is always compiled (it is no longer a
+      # (GPL-3.0-or-later), so an embedder can link an MIT-licensed library --
+      # this repo builds no binary at all -- and that build must work: the
+      # cfg(not(feature = "rar")) paths (RAR answered 501) are only compiled
+      # here, so only here can a test reach them. The librqbit backend is always compiled (it is no longer a
       # feature), so no backend feature needs to be named. No apt installs.
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@1.98.0
