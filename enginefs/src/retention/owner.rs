@@ -890,8 +890,9 @@ const RATE_SAMPLE_SPAN_MAX: std::time::Duration = std::time::Duration::from_secs
 /// a stall or a buffering wait spans wall-clock the film did not. Both the
 /// file offset and the film position have to have moved forwards, and the
 /// film by [`TOLD_SAMPLE_FILM_MIN`], which rejects a seek backwards, a
-/// player sitting still, and the jitter between two reports a few
-/// milliseconds apart. A seek *forwards* needs no rejecting: it moves the
+/// player sitting still, and -- the reason that bound is as large as it is
+/// -- a player reading in bursts and playing out of its own buffer between
+/// them. A seek *forwards* needs no rejecting: it moves the
 /// two together and the quotient is the same film's bitrate, measured over
 /// a longer piece of it.
 fn told_bitrate(
@@ -947,9 +948,24 @@ const STRUCTURAL_PIECES: usize = 8;
 /// dead reporter does not pin the window where the viewer used to be.
 const TOLD_FRESH: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// The least film a told sample may span. Below this the quotient is
-/// mostly the reporting jitter.
-const TOLD_SAMPLE_FILM_MIN: std::time::Duration = std::time::Duration::from_secs(2);
+/// The least film a told sample may span.
+///
+/// **Bytes over seconds-of-film is the bitrate in the limit, not over two
+/// seconds of it.** `stream-pos` is where a demuxer has *read* to, and a
+/// player reads in jumps: it pulls twenty megabytes, then plays out of its
+/// own buffer for several seconds without touching the stream at all. Over
+/// a short interval the quotient is therefore whatever the read pattern
+/// happened to do, and the field log of 2026-09-12 14:35 has both ends of
+/// that -- `bytes_per_second=17`, from a couple of dozen bytes across two
+/// seconds the player spent in its buffer, and 7,898,227 a minute later,
+/// which is 2.3x the film's real rate.
+///
+/// Half a minute is long enough that a player's read pattern averages out
+/// and short enough to settle well inside a viewing. Nothing is lost by
+/// waiting for it: with no rate at all the byte arithmetic stands, which is
+/// wasteful and stable, where a rate that is eighty times low collapses the
+/// window onto its floor and stops playback outright.
+const TOLD_SAMPLE_FILM_MIN: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl DeliveryRate {
     /// A byte really went out, at `offset`, at `now`, on a read granted
@@ -6437,10 +6453,10 @@ mod tests {
         owner.note_playhead_at(&0, (0, 0), std::time::Duration::ZERO, true, start);
         owner.note_playhead_at(
             &0,
-            (0, PIECE),
-            std::time::Duration::from_secs(10),
+            (0, 10 * PIECE),
+            std::time::Duration::from_secs(100),
             true,
-            start + std::time::Duration::from_secs(10),
+            start + std::time::Duration::from_secs(100),
         );
         let claim = owner.turn(&0).await.expect("the turn");
         owner.pass(&0, &(), claim, Mode::Live).await;
@@ -6460,9 +6476,16 @@ mod tests {
     fn a_told_bitrate_is_bytes_of_file_over_seconds_of_film() {
         let film = std::time::Duration::from_secs;
         assert_eq!(
+            told_bitrate((0, film(100), true), (34_000_000, film(140), true)),
+            Some(850_000),
+            "forty seconds of film, thirty-four megabytes of file"
+        );
+        // Ten seconds is not enough of it: a player that read nothing for
+        // most of them would report its buffer, not the film.
+        assert_eq!(
             told_bitrate((0, film(100), true), (34_000_000, film(110), true)),
-            Some(3_400_000),
-            "ten seconds of film, thirty-four megabytes of file"
+            None,
+            "too little film to divide by"
         );
         // A seek forwards moves both and is the same film over more of it.
         assert_eq!(
@@ -6472,21 +6495,21 @@ mod tests {
         );
         // Either end not playing spans wall-clock the film did not.
         assert_eq!(
-            told_bitrate((0, film(100), false), (34_000_000, film(110), true)),
+            told_bitrate((0, film(100), false), (34_000_000, film(140), true)),
             None
         );
         assert_eq!(
-            told_bitrate((0, film(100), true), (34_000_000, film(110), false)),
+            told_bitrate((0, film(100), true), (34_000_000, film(140), false)),
             None
         );
         // A seek back, a player sitting still, and two reports a moment
         // apart are all of them nothing.
         assert_eq!(
-            told_bitrate((34_000_000, film(110), true), (0, film(100), true)),
+            told_bitrate((34_000_000, film(140), true), (0, film(100), true)),
             None
         );
         assert_eq!(
-            told_bitrate((0, film(100), true), (0, film(110), true)),
+            told_bitrate((0, film(100), true), (0, film(140), true)),
             None
         );
         assert_eq!(
