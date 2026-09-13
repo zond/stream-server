@@ -2708,8 +2708,8 @@ fn a_panels_numbers_are_about_the_file_the_url_resolved_to() -> anyhow::Result<(
     let filtered_idx = file_index(&stats, "Show.S01E02.mkv");
     let picked_pieces = file_pieces(&stats, picked_idx, PIECE);
     let filtered_pieces = file_pieces(&stats, filtered_idx, PIECE);
-    complete_file_stats(&client, &base, &info_hash, picked_idx)?;
-    complete_file_stats(&client, &base, &info_hash, filtered_idx)?;
+    complete_file_stats(&client, &base, &info_hash, picked_idx, &cache_root)?;
+    complete_file_stats(&client, &base, &info_hash, filtered_idx, &cache_root)?;
 
     let anonymous = reqwest::blocking::Client::new();
     let auto_url = format!("{base}/{info_hash}/-1");
@@ -2912,7 +2912,7 @@ fn a_panel_asking_about_a_torrent_stream_is_told_what_is_on_the_disk() -> anyhow
         .error_for_status()?;
     let stats = stats_after_check(&client, &base, &info_hash)?;
     let idx = file_index(&stats, "film.bin");
-    complete_file_stats(&client, &base, &info_hash, idx)?;
+    complete_file_stats(&client, &base, &info_hash, idx, &cache_root)?;
 
     let anonymous = reqwest::blocking::Client::new();
     let player_url = format!("{base}/{info_hash}/{idx}");
@@ -3446,7 +3446,7 @@ fn lan_media_server(
         .error_for_status()?;
     let stats = stats_after_check(&client, &base, &info_hash)?;
     let idx = file_index(&stats, "movie.bin");
-    complete_file_stats(&client, &base, &info_hash, idx)?;
+    complete_file_stats(&client, &base, &info_hash, idx, &cache_root)?;
 
     Ok((handle, base, info_hash, idx, payload))
 }
@@ -3457,11 +3457,33 @@ fn lan_media_server(
 /// and `phase` can already read `buffering` while that check is still queued
 /// -- so this waits on the observable state a media request needs (bounded,
 /// not a timing assertion), never on a sleep of its own choosing.
+///
+/// `cache_root` is the one the fixture seeded through, and it is here for the
+/// failure message alone. This wait expired once on the Windows runner
+/// (2026-09-13, run 34727326274) with the whole file unclaimed -- `downloaded`
+/// zero, every piece of a one-file torrent missing -- and the stats alone
+/// cannot say which of the two things happened, because a torrent reports the
+/// same numbers either way:
+///
+/// * the piece files were **not on the disk** when the check ran, so
+///   `PieceStore::has_piece` said no to every piece and the check read
+///   nothing; or
+/// * they **were** on the disk and the check would not claim them. One read
+///   error is enough for that: `FileOps::initial_check` marks the whole
+///   *file* broken on the first failed read and skips every later piece of
+///   it without reading, so a single transient failure on piece 0 of a
+///   one-file torrent writes off all hundred -- and nothing re-checks a
+///   torrent afterwards, which is why the wait then has nothing to wait for.
+///
+/// So the count off the disk goes in the message. It is read *after* the
+/// bound has expired, against a torrent that is no longer downloading
+/// anything, so it is the same disk the check saw.
 fn complete_file_stats(
     client: &reqwest::blocking::Client,
     base: &str,
     info_hash: &str,
     idx: usize,
+    cache_root: &std::path::Path,
 ) -> anyhow::Result<serde_json::Value> {
     let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
     loop {
@@ -3469,10 +3491,17 @@ fn complete_file_stats(
         if stats["files"][idx]["complete"] == true {
             return Ok(stats);
         }
-        anyhow::ensure!(
-            std::time::Instant::now() < deadline,
-            "the pre-seeded file was still incomplete after {CHECK_WAIT_BOUND:?}: {stats}"
-        );
+        if std::time::Instant::now() >= deadline {
+            let held = held_piece_indices(cache_root, info_hash);
+            anyhow::bail!(
+                "the pre-seeded file was still incomplete after {CHECK_WAIT_BOUND:?}; \
+                 the store holds {} piece files ({} of them complete: {:?}) under {}: {stats}",
+                pieces_held(cache_root, info_hash),
+                held.len(),
+                held.iter().take(8).collect::<Vec<_>>(),
+                piece_store(cache_root).torrent_dir(info_hash).display(),
+            );
+        }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
