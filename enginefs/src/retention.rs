@@ -98,23 +98,48 @@ pub enum CacheBudget {
 /// "unknown" has to survive being read: an atomic would need a sentinel,
 /// and a sentinel is how a value a process invents at startup gets read
 /// back as an observation.
+///
+/// **Two numbers, one publication.** The cap is what the whole cache may
+/// occupy; the headroom is what the volume will still give before the
+/// margin -- the `free_disk - margin` of `docs/read-pattern-retention.md`
+/// section 4. They are written together, under this lock, by the one
+/// publisher, because they are two readings of one `statvfs` and a pass
+/// that mixed a fresh cap with a stale headroom would be sizing a lookahead
+/// against a disk that never existed.
 #[derive(Debug, Default)]
-pub struct RetentionBudget(parking_lot::RwLock<CacheBudget>);
+pub struct RetentionBudget(parking_lot::RwLock<(CacheBudget, Option<u64>)>);
 
 impl RetentionBudget {
     pub fn get(&self) -> CacheBudget {
-        *self.0.read()
+        self.0.read().0
+    }
+
+    /// What the volume will still give before the margin, or `None` for a
+    /// volume nothing has read.
+    ///
+    /// **What an entity may grow into, rather than what the cache may
+    /// hold.** An entity's own allowance is this plus what it already
+    /// holds: computed from the free space alone it would shrink as the
+    /// cache filled and never converge, stopping well short of the disk
+    /// with nothing to explain why.
+    pub fn headroom(&self) -> Option<u64> {
+        self.0.read().1
     }
 
     /// The publisher's reading. `None` is [`CacheBudget::Unbounded`] --
     /// the shape `CacheLimit::effective` answers in -- and never
     /// [`CacheBudget::Unknown`], which only the absence of a publication
-    /// can mean.
-    pub fn set(&self, limit: Option<u64>) {
-        *self.0.write() = match limit {
-            Some(bytes) => CacheBudget::Bytes(bytes),
-            None => CacheBudget::Unbounded,
-        };
+    /// can mean. `headroom` is `None` for a volume that could not be read,
+    /// which is not "no room": the cap then stands alone, as it did before
+    /// any of this existed.
+    pub fn set(&self, limit: Option<u64>, headroom: Option<u64>) {
+        *self.0.write() = (
+            match limit {
+                Some(bytes) => CacheBudget::Bytes(bytes),
+                None => CacheBudget::Unbounded,
+            },
+            headroom,
+        );
     }
 }
 

@@ -496,7 +496,14 @@ pub trait Backing: Sized + Send + Sync + 'static {
     ///
     /// Defaulted to nothing: the proxy has the same shape and is not wired
     /// to it yet. Goes out with `crate::retention::trace`.
-    fn observe_reads(&self, _domain: &Self::Domain, _held: &BTreeSet<u32>, _budget: u64) {}
+    fn observe_reads(
+        &self,
+        _domain: &Self::Domain,
+        _held: &BTreeSet<u32>,
+        _budget: CacheBudget,
+        _headroom: Option<u64>,
+    ) {
+    }
 
     fn trace(
         &self,
@@ -1966,19 +1973,13 @@ impl<B: Backing> Retention<B> {
         // against the listing above. Here because membership is a question
         // about the disk and this is the first place in the pass that knows
         // what is on it. Observed and obeyed by nothing.
-        self.backing.observe_reads(
-            &begin.domain,
-            &held,
-            match begin.budget {
-                CacheBudget::Bytes(bytes) => bytes,
-                // Unknown is a budget nobody has stated yet, and it is
-                // not a licence to want everything: reported as nothing,
-                // every stream falls to its floor, which is what a
-                // stream with no measurement gets anyway.
-                CacheBudget::Unknown => 0,
-                CacheBudget::Unbounded => u64::MAX,
-            },
-        );
+        // Both published numbers, and the backing decides what its own
+        // entity may take from them: the cap is over the whole cache, the
+        // headroom is what the volume will still give, and what turns those
+        // into one entity's allowance is what that entity holds -- which is
+        // the listing above, and is the backing's to price.
+        self.backing
+            .observe_reads(&begin.domain, &held, begin.budget, self.budget.headroom());
         // 5. **The deciding reading, taken after the listing.** Read before
         // the walk the head is the older half of the pair: the window is
         // drawn round where playback *was*, everything the fill wrote ahead
@@ -3671,7 +3672,7 @@ mod tests {
         let (backing, owner, budget) = proxy();
         // A two-piece window, so a second head in the back half of the file
         // does not cover the whole reclaim.
-        budget.set(Some(2 * PIECE));
+        budget.set(Some(2 * PIECE), None);
         let reader = owner.reader(0, domain(0, 0..8));
         // A second player at piece 7 whose body ends while the unlinks run:
         // its window is in the pass's own windows and nowhere else by then.
@@ -4145,7 +4146,7 @@ mod tests {
         // The rewatch, under a budget that covers the file: nothing to
         // install, and the range the forgotten entity left held back goes
         // back into what we announce.
-        budget.set(Some(8 * PIECE));
+        budget.set(Some(8 * PIECE), None);
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Unbounded);
         assert_eq!(
             *backing.advertised.lock(),
@@ -4161,7 +4162,7 @@ mod tests {
 
         // A fresh entity that goes straight to a policy is not given back
         // first: the hold-back it is about to get covers the same range.
-        budget.set(Some(4 * PIECE));
+        budget.set(Some(4 * PIECE), None);
         backing.advertised.lock().clear();
         assert_eq!(owner.install(1, 1).await, InstallOutcome::Installed);
         assert_eq!(*backing.advertised.lock(), vec![(8..16, false)]);
@@ -4449,7 +4450,7 @@ mod tests {
         let (entered, release) = backing.park_held();
         let pass = spawn_pass(&owner, 0, claim);
         entered.await.expect("parked at the listing");
-        budget.set(Some(2 * PIECE));
+        budget.set(Some(2 * PIECE), None);
         // The byte that observes the new budget decides under it, under L2
         // alone, while the pass holds the turn.
         assert!(reader.note((0, 2 * PIECE)).is_none());
@@ -4495,7 +4496,7 @@ mod tests {
         // The same publish landing during the unlinks rather than the
         // listing: the re-read has passed, the unlinks stand as refetch cost
         // (as today's do), and the conclusion is still not written.
-        budget.set(Some(4 * PIECE));
+        budget.set(Some(4 * PIECE), None);
         // A publish makes every reader due again, whatever the stride: the
         // old `passed_at` described a shape that no longer exists.
         let claim = reader
@@ -4512,7 +4513,7 @@ mod tests {
         let (entered, release) = backing.park_reclaim();
         let pass = spawn_pass(&owner, 0, claim);
         entered.await.expect("parked at the reclaim");
-        budget.set(Some(2 * PIECE));
+        budget.set(Some(2 * PIECE), None);
         assert!(reader.note((0, 5 * PIECE)).is_none());
         release.send(()).expect("the parked pass");
         let outcome = pass.await.expect("joined");
@@ -4548,7 +4549,7 @@ mod tests {
         // OnOpen: the note carries the byte and nothing else.
         let (_backing, owner, budget) = torrent();
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
-        budget.set(Some(2 * PIECE));
+        budget.set(Some(2 * PIECE), None);
         let reader = owner.reader(0, domain(0, 0..8));
         assert!(
             reader.note((0, PIECE)).is_none(),
@@ -4595,7 +4596,7 @@ mod tests {
         entered.await.expect("parked at the listing");
         // The fill writes ahead while the pass waits on the disk.
         backing.holds(4..8);
-        budget.set(Some(2 * PIECE));
+        budget.set(Some(2 * PIECE), None);
         assert!(
             reader.note((0, 6 * PIECE)).is_none(),
             "a note during a pass took the turn"
@@ -4678,7 +4679,7 @@ mod tests {
     #[tokio::test]
     async fn an_unbounded_entity_is_never_due_and_a_pass_over_it_lists_nothing() {
         let (backing, owner, budget) = proxy();
-        budget.set(None);
+        budget.set(None, None);
         let reader = owner.reader(0, domain(0, 0..8));
         assert!(
             reader.note((0, 0)).is_none(),
@@ -4716,7 +4717,7 @@ mod tests {
         owner.entity(0, domain(0, 0..4));
         assert_eq!(owner.holding(&0).unwrap().domain, domain(0, 0..8));
         // The budget covers the file: decided, and nothing installed.
-        budget.set(Some(8 * PIECE));
+        budget.set(Some(8 * PIECE), None);
         assert!(reader.note((0, PIECE)).is_none());
         let holding = owner.holding(&0).unwrap();
         assert_eq!(holding.decided, Some(CacheBudget::Bytes(8 * PIECE)));
@@ -4724,7 +4725,7 @@ mod tests {
         // A domain no policy can be sized for: decided, nothing installed,
         // and the error carried out from under the lock.
         let owner = Retention::new(Proxy::new([broken(0, 0..8)]), budget.clone());
-        budget.set(Some(4 * PIECE));
+        budget.set(Some(4 * PIECE), None);
         let reader = owner.reader(0, broken(0, 0..8));
         assert!(reader.note((0, 0)).is_none());
         let holding = owner.holding(&0).unwrap();
@@ -4741,16 +4742,16 @@ mod tests {
     #[tokio::test]
     async fn an_install_that_bounds_nothing_says_so_and_a_policy_that_will_not_go_stands() {
         let (backing, owner, budget) = torrent();
-        budget.set(None);
+        budget.set(None, None);
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Unbounded);
-        budget.set(Some(8 * PIECE));
+        budget.set(Some(8 * PIECE), None);
         assert_eq!(
             owner.install(0, 0).await,
             InstallOutcome::Unbounded,
             "a budget that covers the file installed a policy"
         );
         assert!(owner.holding(&0).unwrap().installed.is_none());
-        budget.set(Some(4 * PIECE));
+        budget.set(Some(4 * PIECE), None);
         assert_eq!(
             owner.install(2, 2).await,
             InstallOutcome::Unbounded,
@@ -4776,7 +4777,7 @@ mod tests {
         // The same key under a new budget is resized in place: nothing
         // given back, nothing held back afresh.
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
-        budget.set(Some(6 * PIECE));
+        budget.set(Some(6 * PIECE), None);
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Resized);
         assert_eq!(
             owner.holding(&0).unwrap().installed.map(|i| i.budget),
@@ -4789,7 +4790,7 @@ mod tests {
         // The domain is what the backend says the file is now, and a
         // policy over another domain is given back and held back afresh.
         backing.domains.lock().insert(0, domain(0, 0..6));
-        budget.set(Some(4 * PIECE));
+        budget.set(Some(4 * PIECE), None);
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         assert_eq!(owner.holding(&0).unwrap().domain, domain(0, 0..6));
         assert_eq!(
@@ -4800,7 +4801,7 @@ mod tests {
         // one stands, under a new budget and under a pin alike.
         backing.fail_advertise.store(true, Ordering::SeqCst);
         backing.domains.lock().insert(0, domain(0, 0..7));
-        budget.set(Some(2 * PIECE));
+        budget.set(Some(2 * PIECE), None);
         assert_eq!(owner.install(0, 0).await, InstallOutcome::OldStands);
         assert_eq!(
             owner.holding(&0).unwrap().installed.map(|i| i.budget),
@@ -4946,7 +4947,7 @@ mod tests {
         // A restart out of an error threw the hold-back away, and the
         // resize is no new hold-back: the pass after it still owes one.
         backing.epoch.fetch_add(1, Ordering::SeqCst);
-        budget.set(Some(6 * PIECE));
+        budget.set(Some(6 * PIECE), None);
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Resized);
         assert_eq!(
             backing.advertised.lock().len(),
@@ -4973,7 +4974,7 @@ mod tests {
         // Two pieces: a window of one and a committed capacity of one. The
         // three pieces already announced are over that and stay announced
         // and on the disk, because nothing here can un-say a Have.
-        budget.set(Some(2 * PIECE));
+        budget.set(Some(2 * PIECE), None);
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Resized);
         assert_eq!(
             backing.advertised.lock().len(),
@@ -5356,7 +5357,7 @@ mod tests {
     #[tokio::test]
     async fn a_stated_duration_is_the_bitrate_without_measuring_anything() {
         let (_backing, owner, budget) = torrent();
-        budget.set(Some(6 * PIECE));
+        budget.set(Some(6 * PIECE), None);
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         let asks = Buffering {
             window_seconds: Some(10),
@@ -5410,7 +5411,7 @@ mod tests {
             )
             .expect("the entity the install made");
         // The volume filled: half the budget, published under the reader.
-        budget.set(Some(2 * PIECE));
+        budget.set(Some(2 * PIECE), None);
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Resized);
         let (_domain, ahead) = owner.reach(&0, (0, 0)).expect("a bounded entity");
         assert!(
@@ -5670,7 +5671,7 @@ mod tests {
         let backing = Torrent::new([domain(0, 0..80)]);
         backing.holds(0..80);
         let budget = Arc::new(RetentionBudget::default());
-        budget.set(Some(4 * PIECE));
+        budget.set(Some(4 * PIECE), None);
         let owner = Retention::new(backing.clone(), budget.clone());
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         let viewer = owner
@@ -5716,7 +5717,7 @@ mod tests {
     #[tokio::test]
     async fn a_films_length_sizes_the_window_with_no_playhead_at_all() {
         let (_backing, owner, budget) = torrent();
-        budget.set(Some(6 * PIECE));
+        budget.set(Some(6 * PIECE), None);
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         let reader = owner
             .reader_on(
@@ -6055,7 +6056,7 @@ mod tests {
         let (entered, release) = backing.park_reclaim();
         let pass = spawn_pass(&owner, 0, claim);
         entered.await.expect("parked at the reclaim");
-        budget.set(Some(2 * PIECE));
+        budget.set(Some(2 * PIECE), None);
         assert!(reader.note((0, 5 * PIECE)).is_none());
         release.send(()).expect("the parked pass");
         let outcome = pass.await.expect("joined");

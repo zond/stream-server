@@ -564,7 +564,7 @@ pub(crate) fn proxy() -> (Arc<Proxy>, Arc<Retention<Proxy>>, Arc<RetentionBudget
     let backing = Proxy::new([domain(0, 0..8)]);
     backing.holds(0..8);
     let budget = Arc::new(RetentionBudget::default());
-    budget.set(Some(4 * PIECE));
+    budget.set(Some(4 * PIECE), None);
     let owner = Retention::new(backing.clone(), budget.clone());
     (backing, owner, budget)
 }
@@ -575,7 +575,7 @@ pub(crate) fn torrent() -> (Arc<Torrent>, Arc<Retention<Torrent>>, Arc<Retention
     let backing = Torrent::new([domain(0, 0..8), domain(1, 8..16)]);
     backing.holds(0..16);
     let budget = Arc::new(RetentionBudget::default());
-    budget.set(Some(4 * PIECE));
+    budget.set(Some(4 * PIECE), None);
     let owner = Retention::new(backing.clone(), budget.clone());
     (backing, owner, budget)
 }
@@ -860,7 +860,7 @@ impl Scenario {
         let domain = film_domain(FILE, film.piece, film.bytes);
         let backing = Torrent::new([domain]);
         let cap = Arc::new(RetentionBudget::default());
-        cap.set(Some(budget));
+        cap.set(Some(budget), None);
         let owner = Retention::new(backing.clone(), cap);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()

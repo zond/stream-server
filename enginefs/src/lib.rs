@@ -2558,7 +2558,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// ([`crate::retention::CacheBudget::Unknown`], which is what this
     /// starts as).
     pub fn set_cache_budget(&self, limit: Option<u64>) {
-        self.budget.set(limit);
+        self.budget.set(limit, None);
     }
 
     /// The budget itself, for the *other* adapter over the chunk store.

@@ -242,8 +242,12 @@ fn cap_to_publish(configured: u64, available: Option<u64>, occupied: u64) -> Opt
 ///
 /// It is handed the shared cell (`EngineFS::cache_budget`) rather than an
 /// engine to tell, because the cell is the dependency.
-pub(crate) fn publish(budget: &enginefs::retention::RetentionBudget, limit: Option<u64>) {
-    budget.set(limit);
+pub(crate) fn publish(
+    budget: &enginefs::retention::RetentionBudget,
+    limit: Option<u64>,
+    headroom: Option<u64>,
+) {
+    budget.set(limit, headroom);
 }
 
 /// Read the volume and publish what it allows, now, without walking
@@ -313,6 +317,13 @@ where
     let _turn = turn.lock().await;
     let (configured, available, occupied) = read().await;
     let cap = cap_to_publish(configured, available, occupied);
+    // What the volume will still give before the margin, published beside
+    // the cap because it is the other half of the same `statvfs` and the
+    // two must not be read from different moments: an entity's own
+    // allowance is this plus what it already holds
+    // (`docs/read-pattern-retention.md` section 4), so a fresh cap over a
+    // stale headroom sizes a lookahead against a disk that never existed.
+    let headroom = available.map(|available| available.saturating_sub(CACHE_FREE_SPACE_FLOOR));
     // TEMPORARY: see `enginefs::retention::trace`, and delete this line with
     // that module. The pass reports the budget in force; this is the only
     // place that knows which of the two numbers it came from.
@@ -325,7 +336,7 @@ where
                 .saturating_sub(CACHE_FREE_SPACE_FLOOR)
         }),
     );
-    publish(budget, cap);
+    publish(budget, cap, headroom);
     cap
 }
 
@@ -498,6 +509,47 @@ mod tests {
         );
     }
 
+    /// **The headroom is published with the cap, from the same reading.**
+    ///
+    /// It is the other half of one `statvfs` -- what the volume will still
+    /// give before the margin -- and what an entity is allowed is that plus
+    /// what it already holds (`docs/read-pattern-retention.md` section 4).
+    /// A publication that stated one and not the other would leave a pass
+    /// sizing a lookahead against a disk that never existed.
+    #[tokio::test]
+    async fn a_publication_states_the_volumes_headroom_beside_the_cap() {
+        let turn = tokio::sync::Mutex::new(());
+        let budget = RetentionBudget::default();
+
+        let free = CACHE_FREE_SPACE_FLOOR + 8 * MIB;
+        publish_in_turn(&turn, &budget, || async move { (u64::MAX, Some(free), 4 * MIB) }).await;
+
+        assert_eq!(
+            budget.get(),
+            CacheBudget::Bytes(12 * MIB),
+            "the cap is what the cache holds plus what the volume will give"
+        );
+        assert_eq!(
+            budget.headroom(),
+            Some(8 * MIB),
+            "and the headroom is the volume's half of it, without ours"
+        );
+    }
+
+    /// An unreadable volume publishes no headroom, which is not a headroom
+    /// of nothing: an entity then falls back to the cap, exactly as it did
+    /// before any of this existed.
+    #[tokio::test]
+    async fn an_unreadable_volume_publishes_no_headroom_rather_than_none_of_it() {
+        let turn = tokio::sync::Mutex::new(());
+        let budget = RetentionBudget::default();
+
+        publish_in_turn(&turn, &budget, || async move { (100 * MIB, None, 0) }).await;
+
+        assert_eq!(budget.get(), CacheBudget::Bytes(100 * MIB));
+        assert_eq!(budget.headroom(), None);
+    }
+
     /// **A publication that had to wait reads its inputs after the wait.**
     /// One publication is in its turn; a second one starts, and while it
     /// waits the `cacheSize` behind it changes. What it states is the new
@@ -542,11 +594,16 @@ mod tests {
         );
 
         let cap = cap_to_publish(u64::MAX, Some(CACHE_FREE_SPACE_FLOOR + 8 * MIB), 0);
-        publish(&budget, cap);
+        publish(&budget, cap, Some(8 * MIB));
         assert_eq!(
             budget.get(),
             CacheBudget::Bytes(8 * MIB),
             "a reading of the volume is a cap whether or not a walk produced it"
+        );
+        assert_eq!(
+            budget.headroom(),
+            Some(8 * MIB),
+            "and what the volume will still give comes with it"
         );
     }
 

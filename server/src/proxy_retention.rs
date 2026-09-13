@@ -1890,7 +1890,7 @@ mod tests {
     fn retention(limit: Option<u64>) -> Arc<ProxyRetention> {
         let budget = Arc::new(RetentionBudget::default());
         if let Some(limit) = limit {
-            budget.set(Some(limit));
+            budget.set(Some(limit), None);
         }
         Arc::new(ProxyRetention::new(budget, Arc::default(), Arc::default()))
     }
@@ -2527,7 +2527,7 @@ mod tests {
         write_chunks(&dir, 0..16);
 
         let budget = Arc::new(RetentionBudget::default());
-        budget.set(Some(12 * CHUNK_BYTES));
+        budget.set(Some(12 * CHUNK_BYTES), None);
         let retention = Arc::new(ProxyRetention::new(
             budget.clone(),
             Arc::default(),
@@ -2548,7 +2548,7 @@ mod tests {
         let into_hook = reader.clone();
         let published = budget.clone();
         *retention.interleave.lock().unwrap() = Some(Arc::new(move || {
-            published.set(None);
+            published.set(None, None);
             into_hook.note(0);
         }));
         // Playing on a chunk is what starts the pass over the old cap.

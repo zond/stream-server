@@ -1701,7 +1701,7 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("a scratch root");
         let budget = Arc::new(enginefs::retention::RetentionBudget::default());
-        budget.set(Some(4 * CHUNK_BYTES));
+        budget.set(Some(4 * CHUNK_BYTES), None);
         let cache = ProxyCache::new(dir.path(), budget, Arc::default());
         let entry = entry_of(&cache, "https://host/film.mkv");
 
@@ -1772,7 +1772,7 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("a scratch root");
         let budget = Arc::new(enginefs::retention::RetentionBudget::default());
-        budget.set(Some(4 * CHUNK_BYTES));
+        budget.set(Some(4 * CHUNK_BYTES), None);
         let cache = ProxyCache::new(dir.path(), budget, Arc::default());
         let entry = entry_of(&cache, "https://host/film.mkv");
 

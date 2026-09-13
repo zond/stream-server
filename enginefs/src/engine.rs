@@ -495,9 +495,35 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
     /// about the disk -- a consumer is the unbroken run of bytes it caused
     /// -- and `poll_read` cannot reach a listing cheaply. A read carries
     /// its own timestamps, so answering late costs the answer nothing.
-    fn observe_reads(&self, domain: &FileDomain, held: &BTreeSet<u32>, budget: u64) {
+    fn observe_reads(
+        &self,
+        domain: &FileDomain,
+        held: &BTreeSet<u32>,
+        budget: crate::retention::CacheBudget,
+        headroom: Option<u64>,
+    ) {
         let extent = Self::extent(domain);
         let now = std::time::Instant::now();
+        // **What this entity may hold: what it holds now, plus what the
+        // volume will still give before the margin.**
+        // `docs/read-pattern-retention.md` section 4. Its own usage has to
+        // be in there or the allowance shrinks as the cache fills and never
+        // converges -- a stream would stop well short of the disk with
+        // nothing to explain why. The cap is over the whole cache and is
+        // what an entity is bounded by when there is no reading of the
+        // volume at all.
+        let available = match (budget, headroom) {
+            (crate::retention::CacheBudget::Unbounded, _) => u64::MAX,
+            (_, Some(headroom)) => (held.len() as u64)
+                .saturating_mul(domain.piece_length)
+                .saturating_add(headroom),
+            (crate::retention::CacheBudget::Bytes(cap), None) => cap,
+            // A budget nobody has stated yet, over a volume nothing has
+            // read: not a licence to want everything. Every stream falls to
+            // its floor, which is what a stream with no measurement gets
+            // anyway.
+            (crate::retention::CacheBudget::Unknown, None) => 0,
+        };
         let mut streams = self.streams.lock();
         // Where this file lies, first: a read carries an offset inside its
         // own file, and every question the detector answers is about
@@ -515,7 +541,7 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         // talks about it.
         let want = streams.want(
             crate::retention::streams::REPORTED_SECONDS,
-            budget,
+            available,
             domain.piece_length,
         );
         if !streams.report_due(now) {
@@ -2288,7 +2314,7 @@ mod pin_tests {
                 returned: t0,
             },
         );
-        backing.observe_reads(&domain, &held, u64::MAX);
+        backing.observe_reads(&domain, &held, crate::retention::CacheBudget::Unbounded, None);
         let first = streams.lock().held_by_streams(0);
 
         // One second later, a piece further on: a measured rate, and a pass
@@ -2303,12 +2329,80 @@ mod pin_tests {
                 returned: t0 + std::time::Duration::from_secs(1),
             },
         );
-        backing.observe_reads(&domain, &held, u64::MAX);
+        backing.observe_reads(&domain, &held, crate::retention::CacheBudget::Unbounded, None);
         let second = streams.lock().held_by_streams(0);
 
         assert!(
             second > first,
             "the pass that said nothing still grew the window: {first} then {second}"
+        );
+    }
+
+    /// **What an entity may hold is what it holds now plus what the volume
+    /// will still give**, and its own usage has to be in there.
+    ///
+    /// Sized from the free space alone, an allowance shrinks as the cache
+    /// fills and never converges: a stream would stop well short of the
+    /// disk with nothing to explain why. The two entities here hold
+    /// different amounts of the same volume, and the one already holding
+    /// more is allowed more, not less.
+    #[test]
+    fn an_entitys_allowance_counts_what_it_already_holds() {
+        use crate::retention::streams::Read;
+
+        let want_of = |pieces: Range<u32>| {
+            let streams: Arc<parking_lot::Mutex<crate::retention::streams::Streams>> =
+                Arc::default();
+            let backing = TorrentBacking {
+                handle: PinnedHandle {
+                    reselected: Arc::default(),
+                },
+                info_hash: "pinned".to_string(),
+                live: Arc::new(Live::new()),
+                pinned: Arc::default(),
+                pins_unknown: Arc::default(),
+                refused: Arc::new(AtomicUsize::new(0)),
+                streams: streams.clone(),
+            };
+            let domain = FileDomain {
+                file_idx: 0,
+                span: FilePieceSpan {
+                    pieces: 0..64,
+                    offset: 0,
+                    bytes: 64 * PIECE,
+                },
+                piece_length: PIECE,
+            };
+            let held: BTreeSet<u32> = pieces.collect();
+            let t0 = std::time::Instant::now();
+            // Two reads a second apart: a measured rate, so the share is
+            // what decides the window rather than the floor.
+            for (step, at) in [(0u64, t0), (1, t0 + std::time::Duration::from_secs(1))] {
+                streams.lock().record(
+                    0,
+                    1,
+                    Read {
+                        begin: step * PIECE,
+                        end: (step + 1) * PIECE,
+                        arrived: at,
+                        returned: at,
+                    },
+                );
+                backing.observe_reads(
+                    &domain,
+                    &held,
+                    crate::retention::CacheBudget::Bytes(64 * PIECE),
+                    // A volume with room for one more piece and no more.
+                    Some(PIECE),
+                );
+            }
+            streams.lock().held_by_streams(0)
+        };
+
+        assert!(
+            want_of(0..32) > want_of(0..2),
+            "the entity already holding half the file is allowed more than the one holding two \
+             pieces of it, out of the same headroom"
         );
     }
 
