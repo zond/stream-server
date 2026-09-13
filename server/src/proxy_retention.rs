@@ -406,6 +406,7 @@ impl Backing for ProxyBacking {
         streams.domain(0, 0, extent);
         let rejected = streams.observe(held, CHUNK_BYTES, now);
         let want = streams.want(
+            0,
             enginefs::retention::streams::REPORTED_SECONDS,
             available,
             CHUNK_BYTES,

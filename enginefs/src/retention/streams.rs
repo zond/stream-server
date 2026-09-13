@@ -409,39 +409,62 @@ impl FileStreams {
     /// streams is sixteen megabytes, and a device with less free space than
     /// that is not playing video, so it is not a case the allocation has to
     /// be shaped around.
-    fn want(&mut self, seconds: u64, budget: u64, piece: u64) -> Vec<Range<u32>> {
-        let floor = FLOOR_PIECES.saturating_mul(piece);
-        let asked: u64 = self
-            .streams
+    /// What these streams would ask for over `seconds`, before anything is
+    /// shared out -- the demand this file puts on the entity's allowance.
+    fn asked(&self, seconds: u64) -> u64 {
+        self.streams
             .iter()
             .map(|stream| stream.rate.unwrap_or(0).saturating_mul(seconds))
-            .sum();
-        // One factor for every stream, which is what makes the shares equal
-        // in seconds. Nothing to scale when it all fits.
-        let share = |want: u64| {
-            if asked <= budget || asked == 0 {
-                want
-            } else {
-                ((want as u128 * budget as u128) / asked as u128) as u64
-            }
-        };
-        let mut windows = Vec::new();
+            .sum()
+    }
+
+    /// Grow every stream towards its share of the allowance and answer
+    /// where the windows now reach.
+    ///
+    /// `share` is the entity's, not this file's: it is one factor over
+    /// every stream of every file, which is what makes the shares equal in
+    /// seconds across the whole of what is being read. A file that scaled
+    /// its own demand against the whole allowance would be promised it
+    /// alone, and two files being read would together promise twice the
+    /// disk there is.
+    fn grant(
+        &mut self,
+        seconds: u64,
+        piece: u64,
+        share: impl Fn(u64) -> u64,
+    ) -> Vec<Range<u32>> {
+        let floor = FLOOR_PIECES.saturating_mul(piece);
         for stream in &mut self.streams {
             let target = share(stream.rate.unwrap_or(0).saturating_mul(seconds));
-            let bytes = stream.grant(target, floor);
-            let from = self.geometry.at(piece, stream.end);
-            let to = self
-                .geometry
-                .at(piece, stream.end.saturating_add(bytes))
-                .saturating_add(1);
-            let window = from.max(self.geometry.bound.start)..to.min(self.geometry.bound.end);
-            if !window.is_empty() {
-                windows.push(window);
-            }
+            stream.grant(target, floor);
         }
+        self.windows(piece)
+    }
+
+    /// Where the windows already granted reach, granting nothing.
+    ///
+    /// What a pass of *another* file reports for this one. The grant is a
+    /// doubling, one step per pass ([`Stream::grant`]), and a file whose
+    /// window doubled on every pass of every other file would reach a full
+    /// lookahead at a rate set by how many files are being read rather than
+    /// by its own.
+    fn windows(&self, piece: u64) -> Vec<Range<u32>> {
+        let windows: Vec<Range<u32>> = self
+            .streams
+            .iter()
+            .filter_map(|stream| {
+                let from = self.geometry.at(piece, stream.end);
+                let to = self
+                    .geometry
+                    .at(piece, stream.end.saturating_add(stream.window))
+                    .saturating_add(1);
+                let window = from.max(self.geometry.bound.start)..to.min(self.geometry.bound.end);
+                (!window.is_empty()).then_some(window)
+            })
+            .collect();
         // What a window covers is what may not be unlinked, so the answer
-        // is published here, where it is decided, rather than recomputed at
-        // a door that would have to take this lock to do it.
+        // is published here, where it is known, rather than recomputed at a
+        // door that would have to take this lock to do it.
         self.exempt.publish(&windows);
         windows
     }
@@ -608,11 +631,32 @@ impl Streams {
 
     /// What every stream on every file of this entity wants fetched ahead
     /// of it. See [`FileStreams::want`].
-    pub fn want(&mut self, seconds: u64, budget: u64, piece: u64) -> Vec<Range<u32>> {
-        self.by_file
-            .values_mut()
-            .flat_map(|streams| streams.want(seconds, budget, piece))
-            .collect()
+    pub fn want(&mut self, file: usize, seconds: u64, budget: u64, piece: u64) -> Vec<Range<u32>> {
+        // The demand of everything being read, so the sharing is over the
+        // entity and not over one file of it.
+        let asked: u64 = self.by_file.values().map(|streams| streams.asked(seconds)).sum();
+        // One factor for every stream of every file, which is what makes
+        // the shares equal in seconds. Nothing to scale when it all fits.
+        let share = |want: u64| {
+            if asked <= budget || asked == 0 {
+                want
+            } else {
+                ((want as u128 * budget as u128) / asked as u128) as u64
+            }
+        };
+        let mut windows = Vec::new();
+        for (idx, streams) in self.by_file.iter_mut() {
+            // Granted for the file whose pass this is, and only reported
+            // for the others: a grant is a doubling, one step per pass, and
+            // a window that doubled on every pass of every file would grow
+            // at a rate set by how many files are being read.
+            windows.extend(if *idx == file {
+                streams.grant(seconds, piece, share)
+            } else {
+                streams.windows(piece)
+            });
+        }
+        windows
     }
 
     /// What each stream on `file` has measured its consumer to be eating,
@@ -963,6 +1007,25 @@ mod tests {
         );
     }
 
+    /// One file's share of its own demand: what [`Streams::want`] does when
+    /// the entity is one file, which is every test below that builds a
+    /// [`FileStreams`] directly.
+    fn want(
+        streams: &mut FileStreams,
+        seconds: u64,
+        budget: u64,
+        piece: u64,
+    ) -> Vec<Range<u32>> {
+        let asked = streams.asked(seconds);
+        streams.grant(seconds, piece, |want| {
+            if asked <= budget || asked == 0 {
+                want
+            } else {
+                ((want as u128 * budget as u128) / asked as u128) as u64
+            }
+        })
+    }
+
     /// Put a stream on `streams` at `piece` with a measured rate, without
     /// driving reads through it -- the want set is being tested here, not
     /// the detector.
@@ -993,7 +1056,7 @@ mod tests {
         let mut streams = file_at(start * PIECE);
         stream_at(&mut streams, 100, 3_500_000, t0);
 
-        let windows = streams.want(90, u64::MAX, PIECE);
+        let windows = want(&mut streams, 90, u64::MAX, PIECE);
         assert_eq!(
             windows[0].start,
             u32::try_from(start).unwrap() + 100,
@@ -1019,7 +1082,7 @@ mod tests {
         // Sixty seconds asked for, and half of that on the disk. Rates far
         // enough above the floor that the share is what decides, not it.
         let asked = (3_500_000 + 1_000_000) * 60;
-        let windows = streams.want(60, asked / 2, PIECE);
+        let windows = want(&mut streams, 60, asked / 2, PIECE);
 
         let film = u64::from(windows[0].end - windows[0].start);
         let track = u64::from(windows[1].end - windows[1].start);
@@ -1030,6 +1093,85 @@ mod tests {
         assert!(
             film > track * 3 && film < track * 4,
             "the windows are not in the ratio of the rates: {film} against {track}"
+        );
+    }
+
+    /// Put a stream on one file of `streams`, with a measured rate and a
+    /// window already at its ceiling, so what a grant answers is the share
+    /// and not the doubling.
+    fn stream_on(
+        streams: &mut Streams,
+        file: usize,
+        start: u32,
+        at: u32,
+        rate: u64,
+        t0: Instant,
+    ) {
+        streams.domain(file, u64::from(start) * PIECE, start..PIECES);
+        let file = streams.by_file.get_mut(&file).expect("the file was just described");
+        stream_at(file, at, rate, t0);
+    }
+
+    /// **The allowance is shared across everything being read, not within
+    /// each file.**
+    ///
+    /// A season pack plays one episode while a second track of it is read
+    /// from another file; a film plays while its subtitles are fetched from
+    /// a sibling. If each file scaled its own demand against the whole
+    /// allowance, two files being read would together be promised twice the
+    /// disk there is -- and the shares would not be equal seconds either,
+    /// which is the one thing the sharing exists to be.
+    #[test]
+    fn the_allowance_is_shared_across_the_files_being_read() {
+        let t0 = Instant::now();
+        let mut streams = Streams::default();
+        // The film in the first half of the torrent, a second track in the
+        // second, at a fraction of its rate.
+        stream_on(&mut streams, 0, 0, 100, 3_500_000, t0);
+        stream_on(&mut streams, 1, 2_783, 100, 1_000_000, t0);
+
+        // Sixty seconds asked for between them, and half of it on the disk.
+        let asked = (3_500_000 + 1_000_000) * 60;
+        streams.want(0, 60, asked / 2, PIECE);
+        let windows = streams.want(1, 60, asked / 2, PIECE);
+
+        let width = |of: &Range<u32>| u64::from(of.end - of.start);
+        let film: u64 = windows.iter().filter(|w| w.start < 2_783).map(width).sum();
+        let track: u64 = windows.iter().filter(|w| w.start >= 2_783).map(width).sum();
+        assert!(
+            film > track * 3 && film < track * 4,
+            "the windows are not in the ratio of the rates: {film} against {track}"
+        );
+    }
+
+    /// **A window doubles on its own file's pass, and on nobody else's.**
+    ///
+    /// The grant is one doubling per pass, and the passes of one entity are
+    /// per file: a window that grew on every pass of every file would reach
+    /// its full lookahead at a rate set by how many files are being read
+    /// rather than by how fast its own consumer is going.
+    #[test]
+    fn a_pass_of_one_file_does_not_grow_another_files_window() {
+        let t0 = Instant::now();
+        let mut streams = Streams::default();
+        stream_on(&mut streams, 0, 0, 100, 3_500_000, t0);
+        stream_on(&mut streams, 1, 2_783, 100, 3_500_000, t0);
+        // Both at the floor, where a doubling is visible.
+        for file in [0, 1] {
+            streams.by_file.get_mut(&file).unwrap().streams[0].window = 0;
+        }
+
+        for _ in 0..4 {
+            streams.want(0, 90, u64::MAX, PIECE);
+        }
+        assert_eq!(
+            streams.by_file[&1].streams[0].window, 0,
+            "four passes of the other file granted this one nothing"
+        );
+        streams.want(1, 90, u64::MAX, PIECE);
+        assert!(
+            streams.by_file[&1].streams[0].window > 0,
+            "and its own pass is what grants it"
         );
     }
 
@@ -1050,7 +1192,7 @@ mod tests {
         streams.streams[0].window = 0;
 
         let floor = FLOOR_PIECES * PIECE;
-        let first = streams.want(90, u64::MAX, PIECE);
+        let first = want(&mut streams, 90, u64::MAX, PIECE);
         assert_eq!(
             u64::from(first[0].end - first[0].start) * PIECE,
             floor + PIECE,
@@ -1059,7 +1201,7 @@ mod tests {
 
         let mut granted = streams.streams[0].window;
         for _ in 0..4 {
-            streams.want(90, u64::MAX, PIECE);
+            want(&mut streams, 90, u64::MAX, PIECE);
             let now = streams.streams[0].window;
             assert!(
                 now <= granted * 2,
@@ -1224,7 +1366,7 @@ mod tests {
         let held = run(1_800..1_860);
         streams.record(0, 1, read(1_850 * PIECE, 1_850 * PIECE + 262_144, t0, 0));
         streams.observe(&held, PIECE, t0);
-        let windows = streams.want(90, u64::MAX, PIECE);
+        let windows = streams.want(0, 90, u64::MAX, PIECE);
 
         let exempt = streams.exempt(0);
         let window = windows[0].clone();

@@ -540,6 +540,7 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         // how fast a consumer is fetched for to how often this server
         // talks about it.
         let want = streams.want(
+            domain.file_idx,
             crate::retention::streams::REPORTED_SECONDS,
             available,
             domain.piece_length,
