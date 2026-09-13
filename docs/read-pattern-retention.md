@@ -298,7 +298,56 @@ guess about byte geometry:
   than a guess, and still wrong: a long-lived connection widens the span
   until a second track twenty gigabytes away falls inside it.
 
-## 8. Staging
+## 8. What a pass must get right
+
+Three invariants, each found by reproducing the field session rather than by
+reasoning about it (`enginefs/src/retention/scenarios.rs`).
+
+**Selection must describe the disk the pass leaves behind.** Today a pass
+computes what to keep wanting and what to delete from one listing taken
+before the reclaim, so it tells the backend to keep wanting a piece and then
+unlinks it. The stream's own read pulls it back, the next pass deletes it
+again, and round it goes -- fifteen passes out of fifteen in the scenario,
+every one of them taking the second track's pieces off the disk. On a swarm
+that keeps up this costs only bandwidth, continuously; on the field's
+(`peers=2`, `download_speed=193592`) a 4 MiB piece takes 21.7 seconds to
+come back, which is the 20,013 ms the player waited. A perfect want set and
+a perfect LRU still loop if the pass says them in the wrong order.
+
+**A stream is live, not a response.** A stream outlives the response feeding
+it -- that is the whole reason a reopen joins one -- so what is protected
+from eviction must key on the stream, never on whether a response happens to
+be open. A player that reopens 46 times in 70 seconds spends most of its
+time between responses.
+
+**Membership and the want set have different inputs.** Membership answers
+*which stream is this read part of*, from what is on disk. The want set
+answers *what should we fetch*, and is forward-looking by construction -- a
+lookahead names pieces that are precisely not held yet. Deriving the second
+from the first would leave nothing ever asking for anything.
+
+## 9. When a pass runs
+
+On events, never on a timer:
+
+- **a read**, once the stream has consumed a fraction of its own lookahead.
+  The gate needs no constant -- it scales with the lookahead, which scales
+  with measured speed.
+- **a close**, which makes that stream's bytes reclaimable.
+- **a switch**, which takes the previous film's.
+
+This replaces two mechanisms with one. The torrent runs a pass on the
+reconciler's tick today, which fires when nothing has happened and waits
+when much has; the proxy has no tick at all, so it triggers on delivered
+bytes and needs `stride`, `owes_a_pass` and the again-chain to stop that
+being every byte. All of it goes, along with the `Trigger` distinction
+between the two backings.
+
+Deliberately no idle sweep. A paused viewer is idle and their bytes are
+exactly what should be kept; cleaning because nothing is being read would
+take the one thing they are about to want.
+
+## 10. Staging
 
 The old policy cannot be left running alongside the new one -- it would have
 to be the one deciding, which is the thing being replaced -- and is useless
