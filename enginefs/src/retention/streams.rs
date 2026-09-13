@@ -75,6 +75,53 @@ struct Stream {
     reads: u32,
     /// When the last one did.
     seen: Instant,
+    /// How fast this consumer is eating the file, in bytes a second, or
+    /// `None` until two reads have been served far enough apart to say.
+    rate: Option<u64>,
+}
+
+impl Stream {
+    /// Fold what this consumer ate since the last read into its rate.
+    ///
+    /// **What it ate, not what we sent.** A player resumes where it stopped
+    /// consuming, which is behind where we stopped sending by whatever sat
+    /// unread in the socket -- 1.15 MB to 9.0 MB over the measured session.
+    /// Crediting the whole of the last read overstates the rate by that
+    /// much: on one real reopen, 21,757,952 bytes served against
+    /// 18,374,055 actually eaten, an 18% error.
+    ///
+    /// **And the gap runs from our return to its next arrival.** Any other
+    /// pairing puts our own fetch latency inside it, so a consumer blocked
+    /// on a missing piece measures as slow, is given a smaller window, and
+    /// stays blocked. This pairing cannot: our stall happens after the read
+    /// has arrived.
+    ///
+    /// Two samples are refused rather than folded. A gap of zero divides by
+    /// nothing -- `consumed as f64 / 0.0` is `inf`, and `inf as u64`
+    /// saturates to `u64::MAX`, which would read as a real measurement of
+    /// an impossibly fast consumer. And a read that consumed nothing is a
+    /// reopen landing behind, or a re-read of ground already served; it
+    /// says where the consumer is, not how fast it is going, and folded in
+    /// as a zero it would drag the rate to the floor on every seek.
+    fn sample(&mut self, read: &Read) {
+        let overlap = self
+            .last
+            .end
+            .saturating_sub(read.begin)
+            .min(self.last.size());
+        let consumed = self.last.size().saturating_sub(overlap);
+        let gap = read.arrived.saturating_duration_since(self.last.returned);
+        if consumed == 0 || gap.is_zero() {
+            return;
+        }
+        let sample = (consumed as f64 / gap.as_secs_f64()) as u64;
+        self.rate = Some(match self.rate {
+            None => sample,
+            Some(rate) => {
+                (rate * (8 - RATE_SMOOTHING_EIGHTHS) + sample * RATE_SMOOTHING_EIGHTHS) / 8
+            }
+        });
+    }
 }
 
 /// Why a read had to start a stream of its own.
@@ -85,9 +132,20 @@ struct Stream {
 /// readings are told apart by how often this appears.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Rejected {
-    /// Every stream's last read ended further than [`SAME_CONSUMER`] away.
+    /// The read began in no run this file's streams are in -- a different
+    /// stretch of disk, or a piece the disk does not hold at all.
     Outside,
 }
+
+/// How much of a new sample the rate takes, in eighths.
+///
+/// A player's reads are bursty -- it drains as fast as the socket allows
+/// until its own buffer is full, then asks only as often as it plays -- so
+/// a rate that followed each sample would swing between the link's speed
+/// and the film's. Seven eighths of the old number and one of the new
+/// settles over roughly a dozen reads, which at fourteen reads a second is
+/// under a second of film.
+const RATE_SMOOTHING_EIGHTHS: u64 = 1;
 
 /// The maximal unbroken stretch of `held` containing `piece`, inside
 /// `bound`, or `None` for a piece the disk does not have.
@@ -170,6 +228,7 @@ impl FileStreams {
 
         if let Some(index) = nearest {
             let stream = &mut self.streams[index];
+            stream.sample(&read);
             if stream.reader != reader {
                 stream.reader = reader;
             }
@@ -194,6 +253,7 @@ impl FileStreams {
             last: read,
             reads: 1,
             seen: read.returned,
+            rate: None,
         });
         Some(Rejected::Outside)
     }
@@ -299,6 +359,22 @@ impl Streams {
                     .map(|stream| (stream.end, stream.reads))
                     .collect()
             })
+            .unwrap_or_default()
+    }
+
+    /// What each stream on `file` has measured its consumer to be eating,
+    /// in bytes a second, or `None` for one that has not had two reads far
+    /// enough apart to say.
+    ///
+    /// Reported beside the raw `consumed`/`gap_ms` of the last sample, not
+    /// instead of them: at this seam a read is at most the 256 KiB the
+    /// response asks for, so a rate could be measuring the socket draining
+    /// while a player fills its buffer rather than the player consuming.
+    /// Nothing is sized from this until a field log says which it is.
+    pub(crate) fn rates(&self, file: usize) -> Vec<Option<u64>> {
+        self.by_file
+            .get(&file)
+            .map(|streams| streams.streams.iter().map(|stream| stream.rate).collect())
             .unwrap_or_default()
     }
 
@@ -560,6 +636,81 @@ mod tests {
         }
         assert_eq!(streams.streams.len(), 1);
         assert_eq!(streams.streams[0].reads, 4);
+    }
+
+    /// **The rate is what the consumer ate, over the time it took to come
+    /// back for more.**
+    ///
+    /// The numbers are a real reopen from the field: 21,757,952 bytes
+    /// served, a resume 3,383,897 behind our send position, so 18,374,055
+    /// actually eaten. Crediting the whole read would overstate it by 18%.
+    #[test]
+    fn the_rate_credits_what_was_eaten_and_not_what_was_sent() {
+        let t0 = Instant::now();
+        // Both reads and the stream's own end are inside one run.
+        let held = run(1_460..1_475);
+        let mut streams = FileStreams::default();
+
+        // One read of 21,757,952 bytes, returned at t0.
+        streams.observe(
+            1,
+            Read {
+                begin: 6_144_401_926,
+                end: 6_166_159_878,
+                arrived: t0,
+                returned: t0,
+            },
+            &held,
+            &whole(),
+            PIECE,
+        );
+        // The consumer comes back one second later, 3,383,897 behind.
+        streams.observe(
+            1,
+            Read {
+                begin: 6_162_775_981,
+                end: 6_163_038_125,
+                arrived: at(t0, 1),
+                returned: at(t0, 1),
+            },
+            &held,
+            &whole(),
+            PIECE,
+        );
+
+        assert_eq!(
+            streams.streams[0].rate,
+            Some(18_374_055),
+            "what it ate in the second it took to ask again"
+        );
+    }
+
+    /// A sample that measures nothing is refused rather than folded in.
+    ///
+    /// Two shapes of nothing. A gap of zero divides by it -- and `inf as
+    /// u64` saturates to `u64::MAX` in Rust, which would read as a real
+    /// measurement rather than an error. And a read that consumed nothing
+    /// is a reopen landing behind or a re-read of ground already served: it
+    /// says where the consumer is, not how fast it is going, and folded in
+    /// as a zero it would drag the rate to the floor on every seek.
+    #[test]
+    fn a_sample_that_measures_nothing_is_refused() {
+        let t0 = Instant::now();
+        let held = run(0..8);
+        let mut streams = FileStreams::default();
+
+        streams.observe(1, read(0, 262_144, t0, 0), &held, &whole(), PIECE);
+        // Same instant: no time passed.
+        streams.observe(1, read(262_144, 524_288, t0, 0), &held, &whole(), PIECE);
+        assert_eq!(streams.streams[0].rate, None, "a gap of zero says nothing");
+
+        // A second later, but landing entirely behind what the last read
+        // served: nothing was consumed.
+        streams.observe(1, read(0, 262_144, t0, 1), &held, &whole(), PIECE);
+        assert_eq!(
+            streams.streams[0].rate, None,
+            "and a read that ate nothing says nothing either"
+        );
     }
 
     /// **A stream nothing has read from stops being one.**

@@ -507,6 +507,7 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
             &streams.counts(),
             &streams.heads(domain.file_idx),
             streams.last_sample(domain.file_idx),
+            &streams.rates(domain.file_idx),
             rejected,
         );
     }

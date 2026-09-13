@@ -250,6 +250,7 @@ pub(crate) fn streams_seen(
     counts: &[(usize, usize)],
     heads: &[(u64, u32)],
     sample: Option<(u64, Duration)>,
+    rates: &[Option<u64>],
     why: Option<super::streams::Rejected>,
 ) {
     tracing::info!(
@@ -258,6 +259,7 @@ pub(crate) fn streams_seen(
         file_idx,
         streams = ?counts,
         heads = ?heads,
+        rates = ?rates,
         consumed = sample.map(|(bytes, _)| bytes),
         gap_ms = sample.map(|(_, gap)| gap.as_millis() as u64),
         why = ?why,
