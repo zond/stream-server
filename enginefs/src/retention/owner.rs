@@ -502,6 +502,7 @@ pub trait Backing: Sized + Send + Sync + 'static {
         _held: &BTreeSet<u32>,
         _budget: CacheBudget,
         _headroom: Option<u64>,
+        _ceiling: Option<u64>,
     ) {
     }
 
@@ -1978,8 +1979,19 @@ impl<B: Backing> Retention<B> {
         // headroom is what the volume will still give, and what turns those
         // into one entity's allowance is what that entity holds -- which is
         // the listing above, and is the backing's to price.
-        self.backing
-            .observe_reads(&begin.domain, &held, begin.budget, self.budget.headroom());
+        // And the file's own arithmetic -- its size over its duration --
+        // which is the ceiling every stream on it is fetched at and the
+        // only honest absolute number there is: a starving player's reads
+        // measure our delivery and not its consumption. See
+        // `retention::streams::Stream::sample`.
+        let ceiling = entity.state.lock().buffering().bytes_per_second;
+        self.backing.observe_reads(
+            &begin.domain,
+            &held,
+            begin.budget,
+            self.budget.headroom(),
+            ceiling,
+        );
         // 5. **The deciding reading, taken after the listing.** Read before
         // the walk the head is the older half of the pair: the window is
         // drawn round where playback *was*, everything the fill wrote ahead

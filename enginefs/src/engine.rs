@@ -501,6 +501,7 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         held: &BTreeSet<u32>,
         budget: crate::retention::CacheBudget,
         headroom: Option<u64>,
+        ceiling: Option<u64>,
     ) {
         let extent = Self::extent(domain);
         let now = std::time::Instant::now();
@@ -514,7 +515,16 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         // volume at all.
         let available = match (budget, headroom) {
             (crate::retention::CacheBudget::Unbounded, _) => u64::MAX,
-            (_, Some(headroom)) => (held.len() as u64)
+            // **The smaller of the two, like every other reading of this.**
+            // The volume said 381 GB free on the field's phone against a
+            // configured 10.7 GB, and an allowance that took the disk's
+            // word alone let one entity's want set grow to the whole film.
+            (crate::retention::CacheBudget::Bytes(cap), Some(headroom)) => cap.min(
+                (held.len() as u64)
+                    .saturating_mul(domain.piece_length)
+                    .saturating_add(headroom),
+            ),
+            (crate::retention::CacheBudget::Unknown, Some(headroom)) => (held.len() as u64)
                 .saturating_mul(domain.piece_length)
                 .saturating_add(headroom),
             (crate::retention::CacheBudget::Bytes(cap), None) => cap,
@@ -528,7 +538,7 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         // Where this file lies, first: a read carries an offset inside its
         // own file, and every question the detector answers is about
         // torrent pieces.
-        streams.domain(domain.file_idx, domain.span.offset, extent.clone());
+        streams.domain(domain.file_idx, domain.span.offset, extent.clone(), ceiling);
         let rejected = streams.observe(domain.file_idx, held, domain.piece_length, now);
         // What the replacement would order, beside what this pass did.
         // Obeyed by nothing: the point of carrying it is that a field log
@@ -2325,6 +2335,9 @@ mod pin_tests {
             &held,
             crate::retention::CacheBudget::Unbounded,
             None,
+            // A film of one piece a second, so a read of a whole piece
+            // carries a second of picture.
+            Some(PIECE),
         );
         let first = streams.lock().held_by_streams(0);
 
@@ -2345,6 +2358,9 @@ mod pin_tests {
             &held,
             crate::retention::CacheBudget::Unbounded,
             None,
+            // A film of one piece a second, so a read of a whole piece
+            // carries a second of picture.
+            Some(PIECE),
         );
         let second = streams.lock().held_by_streams(0);
 
@@ -2410,6 +2426,7 @@ mod pin_tests {
                     crate::retention::CacheBudget::Bytes(64 * PIECE),
                     // A volume with room for one more piece and no more.
                     Some(PIECE),
+                    Some(PIECE),
                 );
             }
             streams.lock().held_by_streams(0)
@@ -2419,6 +2436,75 @@ mod pin_tests {
             want_of(0..32) > want_of(0..2),
             "the entity already holding half the file is allowed more than the one holding two \
              pieces of it, out of the same headroom"
+        );
+    }
+
+    /// **What the operator configured caps the allowance, whatever the
+    /// volume has left.**
+    ///
+    /// The field's phone had 382 GB free against a configured 10.7 GB, and
+    /// an allowance that took the disk's word alone reported
+    /// `allowed=381570437120` -- so nothing bounded the want set at all and
+    /// it grew to the whole film.
+    #[test]
+    fn the_allowance_is_bounded_by_the_configured_cap() {
+        use crate::retention::streams::Read;
+
+        let streams: Arc<parking_lot::Mutex<crate::retention::streams::Streams>> = Arc::default();
+        let backing = TorrentBacking {
+            handle: PinnedHandle {
+                reselected: Arc::default(),
+            },
+            info_hash: "pinned".to_string(),
+            live: Arc::new(Live::new()),
+            pinned: Arc::default(),
+            pins_unknown: Arc::default(),
+            refused: Arc::new(AtomicUsize::new(0)),
+            streams: streams.clone(),
+        };
+        let domain = FileDomain {
+            file_idx: 0,
+            span: FilePieceSpan {
+                pieces: 0..64,
+                offset: 0,
+                bytes: 64 * PIECE,
+            },
+            piece_length: PIECE,
+        };
+        let held: BTreeSet<u32> = (0..8).collect();
+        let t0 = std::time::Instant::now();
+        streams.lock().record(
+            0,
+            1,
+            Read {
+                begin: 0,
+                end: PIECE,
+                arrived: t0,
+                returned: t0,
+            },
+        );
+
+        // Eight passes, which is doublings enough to reach ninety seconds
+        // of this film if nothing stops it.
+        for _ in 0..8 {
+            backing.observe_reads(
+                &domain,
+                &held,
+                // Two pieces of cache allowed, over a volume with room for
+                // a thousand.
+                crate::retention::CacheBudget::Bytes(2 * PIECE),
+                Some(1_000 * PIECE),
+                // A film of a piece a second: ninety seconds of it is
+                // ninety pieces, which is most of this file.
+                Some(PIECE),
+            );
+        }
+
+        let held_by_streams = streams.lock().held_by_streams(0);
+        assert!(
+            held_by_streams <= 3,
+            "the want set is bounded by what the operator configured, not by what the \
+             volume has left: {held_by_streams} pieces"
         );
     }
 

@@ -380,6 +380,7 @@ impl Backing for ProxyBacking {
         held: &BTreeSet<u32>,
         budget: enginefs::retention::CacheBudget,
         headroom: Option<u64>,
+        ceiling: Option<u64>,
     ) {
         let extent = Self::extent(domain);
         let now = std::time::Instant::now();
@@ -389,7 +390,14 @@ impl Backing for ProxyBacking {
         // half of this, which reads the same.
         let available = match (budget, headroom) {
             (enginefs::retention::CacheBudget::Unbounded, _) => u64::MAX,
-            (_, Some(headroom)) => (held.len() as u64)
+            // The smaller of the two: what the operator configured is a
+            // cap on this cache whatever the volume has left.
+            (enginefs::retention::CacheBudget::Bytes(cap), Some(headroom)) => cap.min(
+                (held.len() as u64)
+                    .saturating_mul(CHUNK_BYTES)
+                    .saturating_add(headroom),
+            ),
+            (enginefs::retention::CacheBudget::Unknown, Some(headroom)) => (held.len() as u64)
                 .saturating_mul(CHUNK_BYTES)
                 .saturating_add(headroom),
             (enginefs::retention::CacheBudget::Bytes(cap), None) => cap,
@@ -404,7 +412,12 @@ impl Backing for ProxyBacking {
         // The proxy's entity is one file starting at its own beginning, so
         // its geometry is the trivial one -- and it is still stated, because
         // the detector converts every offset through it.
-        streams.domain(0, 0, extent);
+        // A proxied URL states no duration, so there is usually no
+        // ceiling here and the delivery rate is all there is -- the same
+        // choice the policy this replaces makes when nothing has stated a
+        // length. Passed through rather than dropped, because an entity
+        // whose duration the app *has* stated is the same arithmetic.
+        streams.domain(0, 0, extent, ceiling);
         let rejected = streams.observe(0, held, CHUNK_BYTES, now);
         let want = streams.want(
             0,

@@ -76,7 +76,9 @@ struct Stream {
     /// When the last one did.
     seen: Instant,
     /// How fast this consumer is eating the file, in bytes a second, or
-    /// `None` until two reads have been served far enough apart to say.
+    /// `None` until a read has come back late enough to say anything. See
+    /// [`Stream::sample`]: this is a *correction* to the file's own
+    /// arithmetic and never the whole of the answer.
     rate: Option<u64>,
     /// How much is currently fetched ahead of it, in bytes. Grows towards
     /// what the rate asks for rather than jumping to it -- see
@@ -85,29 +87,54 @@ struct Stream {
 }
 
 impl Stream {
-    /// Fold what this consumer ate since the last read into its rate.
+    /// Fold what this consumer ate since the last read into its rate, if
+    /// what it did says anything at all.
+    ///
+    /// **A starving player asks again the instant we answer**, because the
+    /// socket has room and it has nothing to play. So the gap between our
+    /// return and its next request measures *us* and not it: the field
+    /// measured 262,144 bytes across a gap of under a millisecond, over and
+    /// over, which read as five to eighteen gigabytes a second and asked
+    /// for the whole film as a window. Consumption is only observable once
+    /// we are already keeping up, which is exactly when we least need to
+    /// discover it.
+    ///
+    /// So a sample counts only when the player came back *later than the
+    /// picture it was carrying*. A read of `consumed` bytes is
+    /// `consumed / ceiling` seconds of film; a player that returns sooner
+    /// than that cannot have played what it was just given, so it is
+    /// catching up, and the read measures our delivery. One that returns
+    /// later has played it and waited, and that gap is the consumer's own.
+    ///
+    /// **There is no tolerance in that and no constant.** The comparison is
+    /// against the film's own arithmetic, so it scales with the film: a
+    /// dense film gives a read more seconds of picture, a sparse one fewer.
+    ///
+    /// It biases the measurement, and the bias is the useful direction. A
+    /// sample saying "faster than the film's average" is exactly the one
+    /// that cannot be told from starving, so it is discarded; what survives
+    /// says "slower", which is what a subtitle track at twenty kilobytes a
+    /// second is, and telling those apart is the whole of what the disk
+    /// allocation needs. By construction nothing here can exceed `ceiling`:
+    /// the gap that admits a sample is the gap that bounds it.
+    ///
+    /// Without a ceiling -- an entity whose length nobody has stated, which
+    /// is a proxied URL -- there is no picture to compare against and the
+    /// delivery rate is all there is. That is the same choice the policy
+    /// this replaces makes: no duration, no time caps, byte arithmetic
+    /// alone.
     ///
     /// **What it ate, not what we sent.** A player resumes where it stopped
     /// consuming, which is behind where we stopped sending by whatever sat
     /// unread in the socket -- 1.15 MB to 9.0 MB over the measured session.
-    /// Crediting the whole of the last read overstates the rate by that
-    /// much: on one real reopen, 21,757,952 bytes served against
-    /// 18,374,055 actually eaten, an 18% error.
+    /// Crediting the whole of the last read overstates it: on one real
+    /// reopen, 21,757,952 bytes served against 18,374,055 actually eaten.
     ///
-    /// **And the gap runs from our return to its next arrival.** Any other
-    /// pairing puts our own fetch latency inside it, so a consumer blocked
-    /// on a missing piece measures as slow, is given a smaller window, and
-    /// stays blocked. This pairing cannot: our stall happens after the read
-    /// has arrived.
-    ///
-    /// Two samples are refused rather than folded. A gap of zero divides by
-    /// nothing -- `consumed as f64 / 0.0` is `inf`, and `inf as u64`
-    /// saturates to `u64::MAX`, which would read as a real measurement of
-    /// an impossibly fast consumer. And a read that consumed nothing is a
-    /// reopen landing behind, or a re-read of ground already served; it
-    /// says where the consumer is, not how fast it is going, and folded in
-    /// as a zero it would drag the rate to the floor on every seek.
-    fn sample(&mut self, read: &Read) {
+    /// A read that consumed nothing is refused as well. It is a reopen
+    /// landing behind, or a re-read of ground already served; it says where
+    /// the consumer is, not how fast it is going, and folded in as a zero
+    /// it would drag the rate to the floor on every seek.
+    fn sample(&mut self, read: &Read, ceiling: Option<u64>) {
         let overlap = self
             .last
             .end
@@ -118,6 +145,13 @@ impl Stream {
         if consumed == 0 || gap.is_zero() {
             return;
         }
+        // The picture that read was carrying, which is the least the player
+        // could have spent on it.
+        if let Some(ceiling) = ceiling.filter(|ceiling| *ceiling > 0)
+            && gap.as_secs_f64() < consumed as f64 / ceiling as f64
+        {
+            return;
+        }
         let sample = (consumed as f64 / gap.as_secs_f64()) as u64;
         self.rate = Some(match self.rate {
             None => sample,
@@ -125,6 +159,30 @@ impl Stream {
                 (rate * (8 - RATE_SMOOTHING_EIGHTHS) + sample * RATE_SMOOTHING_EIGHTHS) / 8
             }
         });
+    }
+
+    /// What this stream should be fetched at, in bytes a second.
+    ///
+    /// **Arithmetic first, measurement as a correction.** `ceiling` is the
+    /// file's own size over its duration: exact at the first report,
+    /// nothing to converge, and no read pattern can distort it. A stream
+    /// nothing has measured is fetched at it from the start, which is what
+    /// a playhead that has never once been kept up with needs -- and costs
+    /// nothing, because the window still grows a doubling at a time
+    /// ([`Stream::grant`]), so a consumer that turns out to be a one-shot
+    /// probe has had the floor and stopped.
+    ///
+    /// A measurement can only lower it. See [`Stream::sample`] for why that
+    /// is the only thing a measurement can honestly say.
+    fn demand(&self, ceiling: Option<u64>) -> u64 {
+        match (self.rate, ceiling) {
+            (Some(rate), Some(ceiling)) => rate.min(ceiling),
+            (Some(rate), None) => rate,
+            (None, Some(ceiling)) => ceiling,
+            // Neither arithmetic nor measurement: nothing is claimed, and
+            // the demand floor is what the stream gets.
+            (None, None) => 0,
+        }
     }
 }
 
@@ -256,6 +314,11 @@ pub struct FileStreams {
     /// Where the file is, learned from the pass: the read path has a file
     /// offset and nothing else.
     geometry: Geometry,
+    /// The file's own bitrate -- its size over its duration -- or `None`
+    /// for a file whose length nobody has stated. The ceiling every stream
+    /// on it is fetched at, and the measure of what a read's gap has to
+    /// beat to say anything. See [`Stream::sample`].
+    ceiling: Option<u64>,
     streams: Vec<Stream>,
     /// When each piece of this file was last any use. Kept because
     /// `Backing::held` answers a set with no times on it; see
@@ -278,6 +341,7 @@ impl FileStreams {
         let exempt = std::sync::Arc::new(super::exempt::Exempt::for_pieces(geometry.bound.end));
         Self {
             geometry,
+            ceiling: None,
             streams: Vec::new(),
             ledger: super::ledger::Ledger::default(),
             exempt,
@@ -337,7 +401,7 @@ impl FileStreams {
 
         if let Some(index) = nearest {
             let stream = &mut self.streams[index];
-            stream.sample(&read);
+            stream.sample(&read, self.ceiling);
             if stream.reader != reader {
                 stream.reader = reader;
             }
@@ -426,7 +490,7 @@ impl FileStreams {
     fn asked(&self, seconds: u64) -> u64 {
         self.streams
             .iter()
-            .map(|stream| stream.rate.unwrap_or(0).saturating_mul(seconds))
+            .map(|stream| stream.demand(self.ceiling).saturating_mul(seconds))
             .sum()
     }
 
@@ -441,8 +505,9 @@ impl FileStreams {
     /// disk there is.
     fn grant(&mut self, seconds: u64, piece: u64, share: impl Fn(u64) -> u64) -> Vec<Range<u32>> {
         let floor = FLOOR_PIECES.saturating_mul(piece);
+        let ceiling = self.ceiling;
         for stream in &mut self.streams {
-            let target = share(stream.rate.unwrap_or(0).saturating_mul(seconds));
+            let target = share(stream.demand(ceiling).saturating_mul(seconds));
             stream.grant(target, floor);
         }
         self.windows(piece)
@@ -523,14 +588,17 @@ impl Streams {
     /// whole entry: the exempt set is a handle a door may already be
     /// holding, and replacing it would leave that door reading a set
     /// nothing publishes into.
-    pub fn domain(&mut self, file: usize, offset: u64, bound: Range<u32>) {
+    pub fn domain(&mut self, file: usize, offset: u64, bound: Range<u32>, ceiling: Option<u64>) {
         let geometry = Geometry { offset, bound };
         match self.by_file.entry(file) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 entry.get_mut().geometry = geometry;
+                entry.get_mut().ceiling = ceiling;
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(FileStreams::on(geometry));
+                let mut streams = FileStreams::on(geometry);
+                streams.ceiling = ceiling;
+                entry.insert(streams);
             }
         }
     }
@@ -750,6 +818,14 @@ mod tests {
 
     fn whole() -> Range<u32> {
         0..PIECES
+    }
+
+    /// The detector for a film whose size over its duration is `ceiling`
+    /// bytes a second, at the start of the torrent.
+    fn film_at(ceiling: u64) -> FileStreams {
+        let mut streams = file_at(0);
+        streams.ceiling = Some(ceiling);
+        streams
     }
 
     /// The detector for a file that starts at torrent offset `offset` and
@@ -977,6 +1053,170 @@ mod tests {
         );
     }
 
+    /// **A player that comes back sooner than the picture it was given is
+    /// catching up, and says nothing about how fast it plays.**
+    ///
+    /// The numbers are the field's: 262,144 bytes -- one read -- of a film
+    /// at 3,568,061 bytes a second, which is 73 milliseconds of picture,
+    /// returned after a gap the log printed as `gap_ms=0`. Taken as a
+    /// measurement that is 5.5 gigabytes a second, and the want set it
+    /// produced was the whole film: `want=[0..5567] exempt=5567`. A starving
+    /// player asks again the instant we answer, so the gap measures our
+    /// delivery; consumption is only observable once we are keeping up.
+    #[test]
+    fn a_read_returned_sooner_than_its_own_picture_is_not_a_measurement() {
+        let t0 = Instant::now();
+        let held = run(0..8);
+        let mut streams = film_at(3_568_061);
+
+        streams.observe(1, read(0, 262_144, t0, 0), &held, PIECE);
+        // Four hundred microseconds later, which is what the socket
+        // draining looks like.
+        streams.observe(
+            1,
+            Read {
+                begin: 262_144,
+                end: 524_288,
+                arrived: t0 + Duration::from_micros(400),
+                returned: t0 + Duration::from_micros(400),
+            },
+            &held,
+            PIECE,
+        );
+
+        assert_eq!(
+            streams.streams[0].rate, None,
+            "it cannot have played 73 ms of film in 400 us, so it was catching up"
+        );
+    }
+
+    /// And one that comes back later than its own picture has played it and
+    /// waited, so the gap is the consumer's own.
+    ///
+    /// **Which is the only thing a measurement can honestly say: slower.**
+    /// By construction it cannot say faster -- the gap that admits a sample
+    /// is the gap that bounds it -- and that is the useful direction: a
+    /// subtitle track at twenty kilobytes a second is what the disk
+    /// allocation has to tell apart from the film.
+    #[test]
+    fn a_read_returned_later_than_its_picture_measures_the_consumer() {
+        let t0 = Instant::now();
+        let held = run(0..8);
+        let ceiling = 3_568_061;
+        let mut streams = film_at(ceiling);
+
+        streams.observe(1, read(0, 262_144, t0, 0), &held, PIECE);
+        // A second later: this consumer ate 262,144 bytes in that second,
+        // which is a fourteenth of the film's rate.
+        streams.observe(
+            1,
+            Read {
+                begin: 262_144,
+                end: 524_288,
+                arrived: t0 + Duration::from_secs(1),
+                returned: t0 + Duration::from_secs(1),
+            },
+            &held,
+            PIECE,
+        );
+
+        let rate = streams.streams[0]
+            .rate
+            .expect("a real gap is a measurement");
+        assert_eq!(rate, 262_144);
+        assert!(rate < ceiling, "and a measurement can only say slower");
+    }
+
+    /// **A stream nothing has measured is fetched at the film's own
+    /// bitrate**, which is arithmetic and not a guess: size over duration
+    /// is exact at the first report and no read pattern can distort it.
+    ///
+    /// A playhead that has never once been kept up with is exactly the
+    /// stream no measurement can describe, and it is the one that most
+    /// needs fetching for. It costs nothing to start it there, because the
+    /// window still grows a doubling at a time.
+    #[test]
+    fn a_stream_nothing_has_measured_is_fetched_at_the_films_own_rate() {
+        let t0 = Instant::now();
+        let mut streams = film_at(3_568_061);
+        stream_at(&mut streams, 100, 0, t0);
+        streams.streams[0].rate = None;
+        streams.streams[0].window = 0;
+
+        // Five passes of doubling from the floor.
+        for _ in 0..5 {
+            want(&mut streams, 90, u64::MAX, PIECE);
+        }
+        assert!(
+            streams.streams[0].window > FLOOR_PIECES * PIECE,
+            "an unmeasured stream grew past the floor: {}",
+            streams.streams[0].window
+        );
+    }
+
+    /// And a measurement only ever lowers it. A second track measured at a
+    /// fraction of the film's rate is fetched at the fraction, which is
+    /// what leaves the film the disk.
+    #[test]
+    fn a_measured_stream_is_fetched_at_what_it_measured() {
+        let t0 = Instant::now();
+        let ceiling = 3_568_061;
+        let mut streams = film_at(ceiling);
+        // A track at a fifth of a megabyte a second: above the demand
+        // floor, so what it is granted is its own rate and not the floor.
+        stream_at(&mut streams, 100, 200_000, t0);
+
+        want(&mut streams, 90, u64::MAX, PIECE);
+        let window = streams.streams[0].window;
+        assert_eq!(window, 200_000 * 90, "ninety seconds of what it measured");
+        assert!(
+            window < ceiling * 90,
+            "and not ninety seconds of the film, which is what leaves the film the disk"
+        );
+    }
+
+    /// **A rate measured before the film stated its length is still bound
+    /// by it once it does.**
+    ///
+    /// Not hypothetical: the duration arrives from the app after playback
+    /// starts, so the first reads of every session are measured with no
+    /// ceiling to refuse them -- and those are exactly the reads of a
+    /// player that has nothing buffered. The field measured 5.5 gigabytes a
+    /// second that way.
+    #[test]
+    fn a_rate_measured_before_the_ceiling_was_known_is_still_bound_by_it() {
+        let t0 = Instant::now();
+        let held = run(0..8);
+        let mut streams = file_at(0);
+
+        streams.observe(1, read(0, 262_144, t0, 0), &held, PIECE);
+        streams.observe(
+            1,
+            Read {
+                begin: 262_144,
+                end: 524_288,
+                arrived: t0 + Duration::from_micros(400),
+                returned: t0 + Duration::from_micros(400),
+            },
+            &held,
+            PIECE,
+        );
+        let measured = streams.streams[0].rate.expect("no ceiling refused nothing");
+        assert!(measured > 100_000_000, "the socket, measured: {measured}");
+
+        // And then the duration arrives.
+        let ceiling = 3_568_061;
+        streams.ceiling = Some(ceiling);
+        streams.streams[0].window = u64::MAX;
+
+        want(&mut streams, 90, u64::MAX, PIECE);
+        assert_eq!(
+            streams.streams[0].window,
+            ceiling * 90,
+            "ninety seconds of film, not ninety seconds of the socket"
+        );
+    }
+
     /// A sample that measures nothing is refused rather than folded in.
     ///
     /// Two shapes of nothing. A gap of zero divides by it -- and `inf as
@@ -1093,7 +1333,7 @@ mod tests {
     /// window already at its ceiling, so what a grant answers is the share
     /// and not the doubling.
     fn stream_on(streams: &mut Streams, file: usize, start: u32, at: u32, rate: u64, t0: Instant) {
-        streams.domain(file, u64::from(start) * PIECE, start..PIECES);
+        streams.domain(file, u64::from(start) * PIECE, start..PIECES, None);
         let file = streams
             .by_file
             .get_mut(&file)
@@ -1305,7 +1545,7 @@ mod tests {
             "nothing was attributed to a file nothing has described"
         );
 
-        streams.domain(1, u64::from(start) * PIECE, start..PIECES);
+        streams.domain(1, u64::from(start) * PIECE, start..PIECES, None);
         streams.observe(1, &held, PIECE, at(t0, 1));
         assert_eq!(
             streams.counts(),
@@ -1331,7 +1571,7 @@ mod tests {
         }
         streams.observe(3, &run(0..PIECES), PIECE, t0);
 
-        streams.domain(3, 0, whole());
+        streams.domain(3, 0, whole(), None);
         streams.observe(3, &run(0..PIECES), PIECE, at(t0, 1));
         assert_eq!(
             streams.heads(3),
@@ -1349,7 +1589,7 @@ mod tests {
     fn the_door_reads_the_window_the_pass_granted() {
         let t0 = Instant::now();
         let mut streams = Streams::default();
-        streams.domain(0, 0, whole());
+        streams.domain(0, 0, whole(), None);
         // A stream a third of the way in, moving at the film's rate.
         let held = run(1_800..1_860);
         streams.record(0, 1, read(1_850 * PIECE, 1_850 * PIECE + 262_144, t0, 0));
@@ -1386,7 +1626,7 @@ mod tests {
         assert_eq!(exempt.count(), 0);
 
         // The file's first pass, on the handle already handed out.
-        streams.domain(7, 0, whole());
+        streams.domain(7, 0, whole(), None);
         let held = run(1_800..1_860);
         streams.record(7, 1, read(1_850 * PIECE, 1_850 * PIECE + 262_144, t0, 0));
         streams.observe(7, &held, PIECE, t0);
@@ -1411,8 +1651,8 @@ mod tests {
     fn a_pass_of_one_file_does_not_forget_another_files_pieces() {
         let t0 = Instant::now();
         let mut streams = Streams::default();
-        streams.domain(0, 0, 0..2_783);
-        streams.domain(1, 2_783 * PIECE, 2_783..PIECES);
+        streams.domain(0, 0, 0..2_783, None);
+        streams.domain(1, 2_783 * PIECE, 2_783..PIECES, None);
 
         // The first file's pass, which is what puts its pieces in a ledger.
         streams.observe(0, &run(0..8), PIECE, t0);
@@ -1438,8 +1678,8 @@ mod tests {
         let t0 = Instant::now();
         let held = run(0..4);
         let mut streams = Streams::default();
-        streams.domain(0, 0, whole());
-        streams.domain(1, 0, whole());
+        streams.domain(0, 0, whole(), None);
+        streams.domain(1, 0, whole(), None);
         streams.record(0, 1, read(0, 262_144, t0, 0));
         streams.record(1, 2, read(0, 262_144, t0, 1));
         streams.observe(0, &held, PIECE, t0);
