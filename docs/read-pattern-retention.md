@@ -270,16 +270,75 @@ deletion against xtremio's pin, and whether the lookahead cap wants to apply
 to the sum of the streams rather than to each of them, which the Phase A
 trace will say more about than an argument will.
 
-## 7. Staging
+## 7. What a stream is
 
-**A. The detector, running alongside, trace only.** One field session says
-whether it reports exactly two streams on that film, with sensible rates, and
-nothing else. Everything downstream is wrong if this is wrong, and it is one
-APK away from being known.
+**A stream is a contiguous run of bytes on disk.** A fetch outside what we
+hold starts a new one.
 
-**B. The want set from streams.** Should fix the 5560 starvation on its own,
-and is worth having whatever happens to the rest.
+Not "what a stream asked for", which is easier to answer and was proposed
+and rejected. The reason is not purity. Membership from disk makes the
+back-scrub tolerance scale with the disk by itself: a large disk keeps more
+history, so a scrub back lands inside a run and joins; a small one keeps
+less, so the same scrub lands outside and is a new stream. It both allows
+and limits back-scrub membership, and it is why none of the rules below
+needs a tuned distance.
 
-**C. The LRU replaces keep-windows.** The larger and riskier half.
+Three rules were tried against the field before this one, and each was a
+guess about byte geometry:
 
-**D. Delete the classification code.**
+- *Inside the stream's whole span, and extending past it.* Right at the
+  granularity the design was drawn at, a whole HTTP response; wrong at the
+  granularity reads arrive. One read is at most 256 KiB and a reopen resumes
+  1.15-9.0 MB behind, so the first dozen reads of a resumed connection reach
+  past nothing. 43 streams on a film with two tracks.
+- *Within 16 MB of the last read.* Removed the span's failure and brought a
+  constant that is in bytes while the thing it separates is in time: 4.5
+  seconds on this film, 32 on a low-bitrate one, under a second on a high one.
+- *Inside what this connection has served.* Bounded by a measurement rather
+  than a guess, and still wrong: a long-lived connection widens the span
+  until a second track twenty gigabytes away falls inside it.
+
+## 8. Staging
+
+The old policy cannot be left running alongside the new one -- it would have
+to be the one deciding, which is the thing being replaced -- and is useless
+if it is not. So: build the new one standalone, prove it against scaffolded
+scenarios, and swap it in as one commit.
+
+The harness comes first and proves itself before the policy exists, by
+reproducing the field failure against the *old* policy:
+`planned to reclaim inside an open stream's lookahead pieces=[5560,5561,5562]
+reader_start=5559`. A harness that cannot reproduce the bug cannot prove the
+fix. It also settles something two surveys disagreed about -- whether that
+starvation was the keep set or the want set -- before anything is written.
+
+Order:
+
+0. **An in-memory held set for the proxy, maintained by the owner.** The
+   torrent already has one (`StoreRegistry` -> `HeldBits`, and
+   `Engine::held` never touches the filesystem); the proxy never got one and
+   `read_dir`s its buckets on every pass. Membership from disk has to be
+   answerable on the read path, where a listing is out of the question. This
+   is also the invariant the common owner was built for -- it owns every
+   filesystem mutation, so the mirror is derivable and authoritative, and
+   the one honest `read_dir` left is the one that seeds it at startup.
+   Chunk_store.rs:510 records what the listing costs when it lies: a
+   transient directory error read as "empty" withdrew every committed piece
+   of a file from what we announce, after peers had been told, and there is
+   no un-Have.
+1. The scenario harness, proved against the old policy.
+2. Membership from disk: runs, births, and the one-past-the-edge clause.
+3. Rate from the consumer, with **slow start** -- seeded at zero, not at the
+   film bitrate. Seeded at the bitrate a new stream is handed 315 MB on a
+   90 s profile; one-shot that is ~12 MB actually fetched, which does not
+   re-buy the 1.6 GB probe regression, but 46 reopens in 70 seconds that
+   miss is 0.5-4.6 GB, which does. Slow start makes a spurious stream cost
+   8 MiB, and the film reaches its full window in under a second.
+4. The want set: equal seconds, the demand floor, the next piece.
+5. The LRU, the per-piece ledger, and the tiers.
+6. The exempt bitmap: one `Arc<[AtomicU64]>` bit per piece, written only by
+   the owner under L2, so the Door does one load and a bit test and takes no
+   lock at all. The Door must never become a writer.
+7. The disk budget of section 4.
+8. The swap, as one commit -- which also deletes the told playhead, and so
+   lands with xtremio.
