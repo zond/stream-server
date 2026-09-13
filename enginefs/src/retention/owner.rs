@@ -2397,9 +2397,60 @@ impl<B: Backing> Retention<B> {
     pub fn reach(&self, key: &B::Key, at: B::Position) -> Option<(B::Domain, Range<u32>)> {
         let entity = self.lookup(key)?;
         let state = entity.state.lock();
-        let installed = state.installed.as_ref()?;
+        state.installed.as_ref()?;
         let index = B::index_of(&state.domain, at)?;
-        Some((state.domain.clone(), installed.policy.ahead_of(index)))
+        // **What the last pass said this entity is asking for**, at the
+        // window this position is in. Not a window drawn round the position
+        // from a budget: what is being fetched for is what the consumers
+        // are being fetched for, and a stream that read past it would have
+        // the next pass refuse to keep what it just pulled.
+        //
+        // The window *in front of* this position, which is where a consumer
+        // here is being fetched to: a want set is drawn from where a
+        // consumer has got to and reaches forward, so a reader is normally
+        // just behind the window rather than inside it.
+        let reach = state
+            .windows
+            .iter()
+            .filter(|window| window.end > index)
+            .min_by_key(|window| window.start)
+            .cloned()?;
+        Some((state.domain.clone(), reach))
+    }
+
+    /// **The entity's own bitrate**: its size over the duration a player
+    /// stated, or `None` where nobody has stated one.
+    ///
+    /// It is what a second of this film costs, and it is the only absolute
+    /// number about playback that arithmetic can give -- exact at the first
+    /// report, nothing to converge, and no read pattern can distort it. A
+    /// stream's lookahead is this times the seconds the viewer asked to
+    /// have buffered, which makes what the swarm is asked for and what the
+    /// disk is kept for one answer with one source
+    /// ([`crate::retention::streams`] sizes the want set from the same
+    /// number).
+    ///
+    /// Asked of the entity rather than of a reader, because a reader
+    /// opening is the first thing that asks and it is not in the map yet.
+    pub fn bitrate(&self, key: &B::Key) -> Option<u64> {
+        let entity = self.lookup(key)?;
+        let buffering = entity.state.lock().buffering();
+        buffering.bytes_per_second
+    }
+
+    /// **The most a stream may read ahead whatever anything else says**:
+    /// what the whole cache may hold.
+    ///
+    /// Reading further than the cache can keep is the one thing a lookahead
+    /// may not do. The pass cannot keep what is past the cap, the backend
+    /// refuses to forget a piece a live stream is reading ahead over, and
+    /// the two together leave the disk over its budget for the life of the
+    /// stream. `None` is a cache nothing bounds.
+    pub fn cap(&self) -> Option<u64> {
+        match self.budget.get() {
+            CacheBudget::Bytes(bytes) => Some(bytes),
+            CacheBudget::Unbounded | CacheBudget::Unknown => None,
+        }
     }
 
     /// How many open reads have promised pieces or delivered a byte and have
@@ -5300,14 +5351,16 @@ mod tests {
     /// **A budget that shrinks under an open reader does not shrink the
     /// window under that reader's lookahead.**
     ///
-    /// The floor's only job, and the only place the owner can do it: the
-    /// stream's lookahead is fixed when the reader opens and the fork has
-    /// no setter for it, while the budget is republished every sixty
-    /// seconds from the volume's free space. The reader reports what it was
-    /// granted at its open and the resize holds it.
+    /// The stream's lookahead is fixed when the reader opens and the fork
+    /// has no setter for it, while the budget is republished every sixty
+    /// seconds from the volume's free space. So what a pass asks for and
+    /// what it refuses to unlink both have to cover what an open reader was
+    /// granted -- the backend will not forget a piece inside a live stream's
+    /// lookahead anyway, so a pass that asked would be refused and the disk
+    /// would grow by exactly that much, for the life of the stream.
     #[tokio::test]
     async fn a_budget_that_shrinks_under_a_reader_keeps_its_lookahead_inside_the_window() {
-        let (_backing, owner, budget) = torrent();
+        let (backing, owner, budget) = torrent();
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         let _reader = owner
             .reader_on(
@@ -5323,12 +5376,24 @@ mod tests {
         // The volume filled: half the budget, published under the reader.
         budget.set(Some(2 * PIECE), None);
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Resized);
-        let (_domain, ahead) = owner.reach(&0, (0, 0)).expect("a bounded entity");
+
+        let claim = owner.turn(&0).await.expect("the turn");
+        owner
+            .pass(&0, &(), claim, Mode::Live)
+            .await
+            .concluded
+            .expect("a pass");
+        let left = backing.on_disk();
+        for piece in 0..5 {
+            assert!(
+                left.contains(&piece),
+                "piece {piece} is inside the lookahead this reader was granted \
+                 and the pass took it anyway: {left:?}"
+            );
+        }
         assert!(
-            u64::from(ahead.end - ahead.start) * PIECE >= 5 * PIECE,
-            "the window reaches {} bytes for a stream fetching {}",
-            u64::from(ahead.end - ahead.start) * PIECE,
-            5 * PIECE
+            !left.contains(&6) && !left.contains(&7),
+            "and what is outside it still went: {left:?}"
         );
     }
 

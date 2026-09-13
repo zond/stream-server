@@ -11529,91 +11529,67 @@ mod tests {
         );
     }
 
-    /// **A reader fetches ahead by the smaller of its intent's cap and the
-    /// window's reach, and never by nothing.**
+    /// **A stream reads ahead by seconds of film, not by what its range
+    /// looked like.**
     ///
-    /// The cap alone (128 MiB for every request after the first) had a
-    /// stream ask librqbit for the whole rest of a file the budget covered
-    /// a fraction of; librqbit refuses to drop what a stream is about to
-    /// read, so the disk sat over the budget by the lookahead for the
-    /// stream's life and every pass asked for the same refused pieces again.
-    /// The reach is the bytes from the reader's offset to the *start* of the
-    /// last piece the window reaches ahead of it -- librqbit rounds the end
-    /// of a lookahead up to a whole piece, and a reader drifts inside its
-    /// piece as it plays, so a lookahead cut at the edge itself reaches one
-    /// piece past it half the time. Forty pieces of five bytes under a
-    /// budget of twenty: a ten-piece window, one behind, nine ahead.
+    /// The film's own bitrate -- its size over the length the player stated
+    /// -- times the seconds the viewer's buffer profile buys. It is the same
+    /// number the retention fetches a consumer at, so what the swarm is
+    /// asked for and what the disk is kept for are one answer with one
+    /// source.
+    ///
+    /// Where no length has been stated there is no such number, and the
+    /// request's own classification stands -- which is every open before the
+    /// player has said how long the film is, including the first of a
+    /// session.
     #[tokio::test]
-    async fn a_reader_fetches_ahead_by_the_smaller_of_its_cap_and_the_windows_reach() {
+    async fn a_stream_reads_ahead_by_the_seconds_the_film_states() {
         use crate::backend::priorities::{BufferProfile, PlaybackIntent};
         let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 200)]);
         counters.pieces_per_file.store(40, Ordering::SeqCst);
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
-        enginefs.set_cache_budget(Some(100));
-        let cap = crate::backend::priorities::librqbit_stream_lookahead_bytes(
-            PlaybackIntent::DirectSeek,
-            BufferProfile::Normal,
-        );
-        assert!(
-            cap > 200,
-            "the cap is wider than the file, so the window is the bound"
-        );
+        // Room enough that the cap is not what binds: this is about the
+        // seconds, and the cap is asserted at the end.
+        enginefs.set_cache_budget(Some(10_000));
 
-        // At the file's start: the reach is pieces 0..9, and the last piece
-        // it reaches starts at byte 40.
-        let _at_start = engine
+        // Nothing has stated a length: the intent's own cap stands.
+        let _first = engine
             .try_get_file_with_intent(0, 0, 255, PlaybackIntent::DirectSeek, BufferProfile::Normal)
-            .await
-            .expect("a reader");
-        // Seven bytes in, on piece 1: the reach is 1..10, byte 45, minus
-        // the seven already behind.
-        let _seven_in = engine
-            .try_get_file_with_intent(0, 7, 255, PlaybackIntent::DirectSeek, BufferProfile::Normal)
             .await
             .expect("a reader");
         assert_eq!(
             *counters.lookaheads.lock().unwrap(),
-            vec![40, 38],
-            "the window's reach, in bytes from where the reader starts"
+            vec![10_000],
+            "with no length there is no bitrate, so the classification stands \
+             -- bounded, as everything is, by what the cache may hold"
         );
 
-        // The budget halves under those two open readers, and the window
-        // does not follow it down: they were granted 40 bytes of reach and
-        // the fork has no way to take a granted lookahead back, so the
-        // window is sized to hold it. See `piece_store::Buffering`.
-        enginefs.set_cache_budget(Some(10));
-        let under_them = engine
+        // Two hundred bytes over twenty seconds is ten bytes a second, and
+        // ninety seconds of it is nine hundred.
+        engine.begin_retention(0).await;
+        engine.told_duration(0, std::time::Duration::from_secs(20));
+        let _second = engine
             .try_get_file_with_intent(0, 0, 255, PlaybackIntent::DirectSeek, BufferProfile::Normal)
             .await
             .expect("a reader");
         assert_eq!(
             counters.lookaheads.lock().unwrap().last(),
-            Some(&35),
-            "a two-piece budget, and the window still covers the eight pieces the open \
-             streams are fetching -- 35 bytes being the reach to the start of the last of them"
+            Some(&900),
+            "ninety seconds of a ten-byte-a-second film"
         );
 
-        // A window of one piece reaches no further than the piece under the
-        // reader: the bound is zero bytes, and the stream still reads one.
-        // Only once nothing is open is there no floor to hold, and only a
-        // budget that moves rebuilds the shape.
-        drop(_at_start);
-        drop(_seven_in);
-        drop(under_them);
-        enginefs.set_cache_budget(Some(11));
-        let _one_piece = engine
-            .try_get_file_with_intent(0, 3, 255, PlaybackIntent::DirectSeek, BufferProfile::Normal)
-            .await
-            .expect("a reader");
-        assert_eq!(counters.lookaheads.lock().unwrap().last(), Some(&1));
-
-        // Nothing bounds the file: the cap is the whole of it.
-        enginefs.set_cache_budget(None);
-        let _unbounded = engine
+        // And never further than the cache may hold: reading past that is
+        // reading what no pass can keep.
+        enginefs.set_cache_budget(Some(500));
+        let _bounded = engine
             .try_get_file_with_intent(0, 0, 255, PlaybackIntent::DirectSeek, BufferProfile::Normal)
             .await
             .expect("a reader");
-        assert_eq!(counters.lookaheads.lock().unwrap().last(), Some(&cap));
+        assert_eq!(
+            counters.lookaheads.lock().unwrap().last(),
+            Some(&500),
+            "the cap binds what the seconds asked for"
+        );
     }
 
     /// **The reach is measured in the reader's own file, from the reader's
@@ -11639,31 +11615,60 @@ mod tests {
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
         enginefs.set_cache_budget(Some(100));
 
-        // At the top of episode two, on piece 4: the reach is 4..6, and
-        // piece 5 starts at torrent byte 125 -- byte 25 of the file.
+        // A consumer at the top of episode two, and a pass to publish what
+        // it is being fetched: without one there is nothing asking for
+        // anything, and a stream's own cap is the only bound there is.
+        engine.begin_retention(1).await;
+        engine.note_playhead(1, 0);
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in [4u32, 5, 6] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let _store = seeded_store(&enginefs, &engine);
+        engine
+            .retain(enginefs.store_registry(), &playing(1))
+            .await
+            .expect("a pass");
+        let published = engine
+            .retention
+            .holding(&1)
+            .expect("the entity")
+            .windows
+            .clone();
+        assert!(
+            !published.is_empty(),
+            "the pass published nothing to be bounded by"
+        );
+
+        // At the top of episode two, and three bytes in: the same window,
+        // three fewer bytes to its far edge. The window's pieces are the
+        // torrent's -- episode two starts a hundred bytes in -- and what
+        // the reader is handed is measured from where it starts in its own
+        // file. Without that subtraction every reader of every file after
+        // the first fetches its file's offset past the window, which is the
+        // whole first episode for the second.
         let _at_start = engine
             .try_get_file_with_intent(1, 0, 255, PlaybackIntent::DirectSeek, BufferProfile::Normal)
             .await
             .expect("a reader");
-        // Three bytes in: the same piece, three fewer bytes to it.
         let _three_in = engine
             .try_get_file_with_intent(1, 3, 255, PlaybackIntent::DirectSeek, BufferProfile::Normal)
             .await
             .expect("a reader");
-        // Inside the file's last piece, which starts at byte 175 of the
-        // file: the reach is that piece alone, and the bound cannot be
-        // measured backwards.
-        let _at_end = engine
-            .try_get_file_with_intent(
-                1,
-                197,
-                255,
-                PlaybackIntent::DirectSeek,
-                BufferProfile::Normal,
-            )
-            .await
-            .expect("a reader");
-        assert_eq!(*counters.lookaheads.lock().unwrap(), vec![25, 22, 1]);
+        let reaches = counters.lookaheads.lock().unwrap().clone();
+        assert_eq!(reaches.len(), 2, "two readers, two bounds: {reaches:?}");
+        assert_eq!(
+            reaches[0] - reaches[1],
+            3,
+            "the second reader starts three bytes further into its own file, \
+             so it has three fewer bytes to the same edge: {reaches:?}"
+        );
+        assert!(
+            reaches[0] < 100,
+            "and the bound is inside episode two rather than a hundred bytes \
+             of episode one past it: {reaches:?}"
+        );
     }
 
     /// **A pass leaves the backend wanting the window and the committed
@@ -13748,7 +13753,7 @@ mod tests {
             vec![6..8],
             "one run of disk under two reads is one consumer"
         );
-        assert_eq!(pass.reclaimed, 4, "{pass:?}");
+        assert_eq!(pass.reclaimed, 3, "{pass:?}");
         assert!(
             bucket.join("0").is_file(),
             "the piece the first stream is still promised is nobody's to take"
@@ -13761,12 +13766,17 @@ mod tests {
             bucket.join("7").is_file(),
             "the piece the consumer is reading ahead over"
         );
-        for piece in [2u32, 3, 4, 5] {
-            assert!(
-                !bucket.join(piece.to_string()).exists(),
-                "piece {piece} is behind the consumer and nothing needs it"
-            );
-        }
+        // What neither stream is reading ahead over, and neither was
+        // promised, is what a budget this small gives back.
+        let gone = [2u32, 3, 4, 5]
+            .into_iter()
+            .filter(|piece| !bucket.join(piece.to_string()).exists())
+            .count();
+        assert_eq!(
+            gone, 3,
+            "three of the four between the two streams went, and the fourth \
+             is inside what one of them is reading ahead over"
+        );
     }
 
     /// **Dropping a stream's handle ends its reader, and the next pass has

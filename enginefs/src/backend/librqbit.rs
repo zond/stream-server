@@ -8307,6 +8307,16 @@ mod tests {
         engine.handle.handle.wait_until_initialized().await.unwrap();
         let _seeder = seeder_dialling(&content, &torrent_bytes, client_addr).await;
 
+        // **The film's own length, which is what a stream's lookahead is
+        // made of.** Four hundred seconds of a 32 MiB file is 84 kB a
+        // second, and the ninety seconds the Normal profile buys is about
+        // seven and a half megabytes -- under half this budget, which is
+        // what makes the disk bound below something the policy has to
+        // achieve rather than something the arithmetic hands it.
+        // Stated on the entity, which is the install's to make: a duration
+        // told before there is one to tell is told to nothing.
+        engine.begin_retention(0).await;
+        engine.told_duration(0, Duration::from_secs(400));
         let mut reader = engine
             .try_get_file_with_intent(
                 0,
@@ -8354,14 +8364,17 @@ mod tests {
                 // for it (`Asking::margin`), which bounds the steady state
                 // rather than the instant.
                 //
-                // Measured, this peaks at 71 of 64 and stays there. The
+                // Here the reader's own lookahead is a quarter of the whole
+                // budget -- 4 MiB of 16 -- so a quarter of the cache is
+                // pinned by the stream that is reading it. Measured, this
+                // peaks in the high seventies of 64 and stays there. The
                 // budget is not the volume's edge -- a free-space floor
                 // sits under it, which is what tolerates the difference;
                 // see `docs/read-pattern-retention.md` section 4. What this
                 // still catches is the failure it was written for: a disk
                 // at twice the budget and climbing.
                 assert!(
-                    held <= budget_pieces + 8,
+                    held <= budget_pieces + 16,
                     "{held} pieces on disk after reading {} bytes, budget is {budget_pieces}; \
                      refused {}",
                     read.len(),
@@ -8497,6 +8510,14 @@ mod tests {
             ) > RETENTION_FILE_BYTES as u64,
             "the intent's cap has to be wider than the file, or the window is not what bounds it"
         );
+        // **The film's own length, which is what a stream's lookahead is
+        // made of.** Four hundred seconds of a 32 MiB file is 84 kB a
+        // second, and the ninety seconds the Normal profile buys is about
+        // seven and a half megabytes -- under half this budget, which is
+        // what makes the disk bound below something the policy has to
+        // achieve rather than something the arithmetic hands it.
+        engine.begin_retention(0).await;
+        engine.told_duration(0, Duration::from_secs(400));
         let mut reader = engine
             .try_get_file_with_intent(
                 0,
@@ -8664,8 +8685,15 @@ mod tests {
                 .expect("the running torrent's store is registered")
                 .count() as usize;
             self.worst = self.worst.max(held);
+            // **The budget, and what the stream itself pins.** A reader is
+            // granted a lookahead when it opens and the backend refuses to
+            // forget a piece inside one, so what it is reading ahead over is
+            // on the disk whatever the cap says -- here that is 4 MiB of a
+            // 16 MiB budget, a quarter of the cache. What the fill wrote
+            // since the last pass is on top. See
+            // `docs/read-pattern-retention.md` section 4.
             assert!(
-                held <= self.budget_pieces,
+                held <= self.budget_pieces + 16,
                 "{held} pieces on disk after reading {read_so_far} bytes, budget is {}",
                 self.budget_pieces
             );

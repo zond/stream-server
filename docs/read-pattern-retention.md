@@ -414,12 +414,22 @@ and the measurement is a correction that can only lower it, admitted by a
 rule with no constant in it: a read that comes back sooner than the picture
 it was carrying is a player catching up, not a player consuming.
 
-**What the swap deviates from section 5.** `PlaybackIntent` stays: its
-remaining job is sizing the lookahead librqbit grants a stream, which is
-not a retention decision. `Reading` stays: its remaining job is saying
-whose delivered byte is the entity's remembered position. `window_at` and
-`ahead_of` stay as arithmetic over a `Shape`, which is what sets a pass's
-stride.
+**And the lookahead is the detector's too** (2026-09-14). What librqbit is
+told to read ahead was `min(a classified intent window, the old policy's
+forward reach)` -- neither of them an answer about what is being read. It
+is now the film's own bitrate times the seconds the viewer's buffer profile
+buys, bounded by what the last pass published as wanted and by what the
+whole cache may hold. One number, one source, the same arithmetic the want
+set is made of: `window_at` and `ahead_of` are gone with it.
+
+**What is left of the old model, and why.** `PlaybackIntent` survives as
+the fallback for a stream whose length nobody has stated -- the first open
+of a session, before the player has said how long the film is, and any file
+mpv cannot put a duration on. There is no seconds-to-bytes conversion
+without a duration, and the intent's constants are the only other basis
+there has ever been. `Reading` survives saying whose delivered byte is the
+entity's remembered position. `Shape` survives as the sharing draw and the
+pass's stride.
 
 **Measured, not claimed.** The disk peaks at 71 pieces of a 64-piece budget
 on the torrent -- a stream's own lookahead is never taken, and what the

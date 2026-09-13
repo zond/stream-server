@@ -683,60 +683,6 @@ impl RetentionPolicy {
         next.chosen.extend(next.committed.iter().copied());
     }
 
-    /// Where the rolling window sits for a playhead on `piece`.
-    ///
-    /// The window keeps its size and slides to stay inside the file, so a
-    /// playhead at the start gets all of it ahead and one at the end gets all
-    /// of it behind. Shrinking it at the ends instead would give the last
-    /// minutes of a film a fraction of the read-ahead the middle got, for no
-    /// reason -- the budget is the same there.
-    ///
-    /// It is never empty, even under a budget of nothing: the piece being read
-    /// is not optional, and a policy that asked for the bytes under the
-    /// player's head to be deleted would be asking for a stall. So a zero
-    /// budget holds one piece, which is the one place this can exceed what it
-    /// was given, and it is a piece rather than a stall.
-    pub fn window_at(&self, playhead: u32) -> Range<u32> {
-        let total = self.pieces.end - self.pieces.start;
-        let want = match self.shape {
-            Shape::Whole => total,
-            Shape::Split { window, .. } => window.clamp(1, total),
-        };
-        let playhead = playhead.clamp(self.pieces.start, self.pieces.end - 1);
-        let behind = (u64::from(want) * BEHIND_PERCENT / 100) as u32;
-        let mut start = playhead.saturating_sub(behind).max(self.pieces.start);
-        if start.saturating_add(want) > self.pieces.end {
-            // `want <= total`, so sliding back to fit cannot cross the start.
-            start = self.pieces.end - want;
-        }
-        start..start + want
-    }
-
-    /// The pieces from `playhead` to the window's forward edge, as that edge
-    /// stands once nothing clamps the window against the file's start:
-    /// `playhead` and the nine tenths ahead of it, cut at the last piece.
-    ///
-    /// This is what a stream opened at `playhead` may fetch ahead of itself.
-    /// Not [`Self::window_at`]`.end`: at the start of a file the window is
-    /// clamped against piece zero, so its end is the whole window ahead of
-    /// the playhead rather than nine tenths of it, and a lookahead sized from
-    /// that end outruns the window for the first tenth of it as the playhead
-    /// moves on -- the window's end stands still while the lookahead's
-    /// advances -- fetching pieces the next pass reclaims. The reach is at
-    /// most the window's end wherever the playhead is, and it moves with the
-    /// playhead exactly as the unclamped window does.
-    pub fn ahead_of(&self, playhead: u32) -> Range<u32> {
-        let total = self.pieces.end - self.pieces.start;
-        let want = match self.shape {
-            Shape::Whole => total,
-            Shape::Split { window, .. } => window.clamp(1, total),
-        };
-        let playhead = playhead.clamp(self.pieces.start, self.pieces.end - 1);
-        let behind = (u64::from(want) * BEHIND_PERCENT / 100) as u32;
-        let end = playhead.saturating_add(want - behind).min(self.pieces.end);
-        playhead..end
-    }
-
     /// Decide, for a playhead on `playhead` over the pieces we currently
     /// `held`, what the window covers, what joins the committed set, and what
     /// to give back.
@@ -1107,8 +1053,8 @@ mod tests {
                 .expect("a consistent file");
                 // What `Engine::try_get_file_with_intent` really hands the
                 // stream: the intent's cap cut to the window's reach.
-                let reach = at_open.ahead_of(2000);
-                let granted = (u64::from(reach.end - reach.start) * piece).min(cap).max(1);
+                let reach = at_open.shape().piece_budget().unwrap_or(0);
+                let granted = (u64::from(reach) * piece).min(cap).max(1);
                 // And the policy the next budget publication builds over
                 // it, sixty seconds later on a volume that has filled: a
                 // smaller budget, built without the open reader in view.
@@ -1124,11 +1070,11 @@ mod tests {
                     },
                 )
                 .expect("a consistent file");
-                let reach = later.ahead_of(2000);
+                let reach = later.shape().piece_budget().unwrap_or(0);
                 assert!(
-                    u64::from(reach.end - reach.start) * piece >= granted,
+                    u64::from(reach) * piece >= granted,
                     "{profile:?} at {budget_pieces} pieces halved: a reach of {} for a lookahead of {granted}",
-                    u64::from(reach.end - reach.start) * piece
+                    u64::from(reach) * piece
                 );
             }
         }
@@ -1181,18 +1127,16 @@ mod tests {
             },
             "the window takes the whole budget and then some, and the committed half is nothing"
         );
-        let reach = tight.ahead_of(100);
         assert_eq!(
-            u64::from(reach.end - reach.start) * PIECE,
+            u64::from(tight.shape().piece_budget().unwrap_or(0)) * PIECE,
             9 * PIECE,
-            "and what it reaches is exactly the lookahead the stream was granted"
+            "and what it covers is exactly the lookahead the stream was granted"
         );
 
         roomy.carry_into(&mut tight);
-        let reach = tight.ahead_of(100);
         assert!(
-            u64::from(reach.end - reach.start) * PIECE >= 9 * PIECE,
-            "and carrying a roomier policy onto it does not shrink the reach"
+            u64::from(tight.shape().piece_budget().unwrap_or(0)) * PIECE >= 9 * PIECE,
+            "and carrying a roomier policy onto it does not shrink it"
         );
     }
 
@@ -1202,7 +1146,6 @@ mod tests {
         let mut p = policy(100, 20);
         assert_eq!(p.shape(), Shape::Whole);
         assert_eq!(p.shape().piece_budget(), None);
-        assert_eq!(p.window_at(7), 0..20, "no split means no window either");
 
         let d = p.advance(&[], &held(0..12));
         assert!(d.reclaim.is_empty(), "nothing is dropped when it all fits");
@@ -1311,163 +1254,6 @@ mod tests {
                 committed: 9
             }
         );
-    }
-
-    /// The reach a stream is sized by is never empty and never past the
-    /// file: a budget of nothing reaches the piece under the playhead
-    /// (`Engine::fetch_bound` takes `end - 1`, and an empty reach would put
-    /// that a piece behind the reader, or underflow at piece zero); at the
-    /// file's tail it is cut at the last piece; a playhead the file does not
-    /// contain is read as its last piece, as `window_at` reads it; and a
-    /// policy shaped `Whole` reaches the whole rest of the file, so that a
-    /// bound computed from it bounds nothing the file has.
-    #[test]
-    fn the_reach_is_never_empty_and_never_past_the_file() {
-        let nothing = policy(0, 20);
-        assert_eq!(nothing.window_at(7), 7..8);
-        assert_eq!(
-            nothing.ahead_of(7),
-            7..8,
-            "the piece being read is reached, however small the budget"
-        );
-
-        // Ten ahead of the playhead, one behind: the reach is the nine ahead
-        // and the playhead's own, cut where the file ends.
-        let split = policy(20, 200);
-        assert_eq!(split.ahead_of(100), 100..109);
-        assert_eq!(split.ahead_of(195), 195..200, "cut at the last piece");
-        assert_eq!(split.ahead_of(199), 199..200);
-        assert_eq!(
-            split.ahead_of(250),
-            199..200,
-            "a playhead past the file reads as its last piece"
-        );
-
-        // A file that does not start at piece zero is measured in its own
-        // pieces.
-        let later = RetentionPolicy::new(
-            2 * PIECE,
-            PIECE,
-            4..12,
-            8 * PIECE,
-            Share::Half,
-            Buffering::default(),
-        )
-        .expect("a consistent file");
-        assert_eq!(later.ahead_of(4), 4..5);
-        assert_eq!(later.ahead_of(11), 11..12);
-        assert_eq!(
-            later.ahead_of(0),
-            4..5,
-            "a playhead before the file reads as its first piece"
-        );
-
-        let whole = RetentionPolicy::new(
-            20 * PIECE,
-            PIECE,
-            0..20,
-            20 * PIECE,
-            Share::Half,
-            Buffering::default(),
-        )
-        .expect("a consistent file");
-        assert_eq!(whole.shape(), Shape::Whole);
-        assert_eq!(whole.ahead_of(5), 5..20);
-        assert_eq!(
-            whole.ahead_of(0),
-            0..18,
-            "nine tenths of the whole file ahead of its start"
-        );
-    }
-
-    #[test]
-    fn the_window_is_ninety_percent_ahead_and_ten_behind() {
-        let p = policy(20, 200);
-        assert_eq!(
-            p.shape(),
-            Shape::Split {
-                window: 10,
-                committed: 10
-            },
-            "the budget is halved, and the odd piece would go to the window"
-        );
-        assert_eq!(p.window_at(100), 99..109, "one behind, nine ahead");
-
-        // A hundred pieces of window: ten behind, ninety ahead.
-        let p = policy(200, 2000);
-        assert_eq!(
-            p.shape(),
-            Shape::Split {
-                window: 100,
-                committed: 100
-            }
-        );
-        assert_eq!(p.window_at(1000), 990..1090);
-    }
-
-    /// At either end the window keeps its size and slides, rather than being
-    /// cut in half by the edge of the file.
-    #[test]
-    fn a_playhead_at_either_end_gets_a_whole_window_anyway() {
-        let p = policy(20, 200);
-        let want = 10;
-
-        assert_eq!(p.window_at(0), 0..10, "all of it ahead");
-        assert_eq!(p.window_at(1), 0..10, "still pinned to the start");
-        assert_eq!(p.window_at(2), 1..11, "and then it moves");
-
-        assert_eq!(p.window_at(199), 190..200, "all of it behind");
-        assert_eq!(p.window_at(198), 190..200);
-        assert_eq!(p.window_at(197), 190..200, "197 - 1 behind = 196, slid up");
-
-        for playhead in 0..200 {
-            let w = p.window_at(playhead);
-            assert_eq!(w.end - w.start, want, "the window never shrinks");
-            assert!(w.contains(&playhead), "and always holds the playhead");
-            assert!(w.end <= 200, "and stays inside the file");
-        }
-
-        // A playhead outside the file is clamped rather than refused: a stream
-        // that has run off the end of its file is a bookkeeping mistake
-        // upstairs, not a reason to stop deciding what to keep.
-        assert_eq!(p.window_at(u32::MAX), p.window_at(199));
-    }
-
-    /// The window can be told to cover more pieces than the file has -- a file
-    /// of one piece is the extreme -- and it is the file that wins.
-    #[test]
-    fn a_file_of_one_piece_is_the_whole_window_and_nothing_else() {
-        // Not covered by the budget, so it splits, and the split is degenerate.
-        let mut p = RetentionPolicy::new(
-            PIECE / 2,
-            PIECE,
-            7..8,
-            PIECE,
-            Share::Half,
-            Buffering::default(),
-        )
-        .unwrap();
-        assert_eq!(
-            p.shape(),
-            Shape::Split {
-                window: 0,
-                committed: 0
-            }
-        );
-        assert_eq!(p.window_at(7), 7..8);
-        assert_eq!(p.window_at(0), 7..8, "clamped from below");
-        assert_eq!(p.window_at(9), 7..8, "and from above");
-        let d = p.advance(&[], &held([7]));
-        assert!(d.reclaim.is_empty() && d.committed.is_empty());
-
-        // Covered by it, and the one piece is shared.
-        let mut p =
-            RetentionPolicy::new(PIECE, PIECE, 7..8, PIECE, Share::Half, Buffering::default())
-                .unwrap();
-        assert_eq!(p.shape(), Shape::Whole);
-        let d = p.advance(&[], &held([7]));
-        assert_eq!(d.committed, vec![7]);
-        assert!(d.reclaim.is_empty());
     }
 
     /// A committed piece is never reclaimed, and a reclaimed piece is never

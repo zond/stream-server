@@ -2183,16 +2183,37 @@ impl<H: TorrentHandle> Engine<H> {
         // [`Self::begin_retention`].
         self.begin_retention(file_idx).await;
         let bound = self.fetch_bound(file_idx, start_offset);
-        // The smaller of what the intent would read ahead and what the
-        // window will keep: a stream that fetched past the window would have
-        // every pass reclaim what it just fetched, and librqbit refuses to
-        // drop a piece a stream is about to read, so the disk would sit over
-        // budget by the lookahead for the stream's life. At least one byte:
-        // librqbit refuses a stream that reads nothing ahead.
+        // **How many seconds of film, not how a range looked.**
+        //
+        // What a stream reads ahead is the film's own bitrate times the
+        // seconds the viewer asked to have buffered -- the same number the
+        // retention fetches a consumer at, so what the swarm is asked for
+        // and what the disk is kept for stop being two answers with two
+        // sources. Where there is no duration to divide by there is no such
+        // number, and the intent's own constants stand, as they did for all
+        // of this before: that is the first open of a session, before the
+        // player has said how long the film is.
+        //
+        // Bounded by what the last pass said this entity is asking for. A
+        // stream that fetched past that would have every pass refuse to
+        // keep what it just pulled, and librqbit will not drop a piece a
+        // stream is about to read -- so the disk would sit over budget by
+        // the lookahead for the stream's life. At least one byte: librqbit
+        // refuses a stream that reads nothing ahead.
         let lookahead_bytes = bound
             .forward_bytes
             .unwrap_or(u64::MAX)
-            .min(priorities::librqbit_stream_lookahead_bytes(intent, buffer))
+            .min(
+                self.retention
+                    .bitrate(&file_idx)
+                    .zip(buffer.window_seconds())
+                    .map(|(rate, seconds)| rate.saturating_mul(seconds))
+                    .unwrap_or_else(|| priorities::librqbit_stream_lookahead_bytes(intent, buffer)),
+            )
+            // And never further than the whole cache may hold: past that
+            // the pass cannot keep what the stream pulls, and the backend
+            // will not forget a piece a live stream is reading ahead over.
+            .min(self.retention.cap().unwrap_or(u64::MAX))
             .max(1);
 
         let reader_start = Instant::now();
