@@ -8362,6 +8362,29 @@ mod tests {
         // long as the torrent is up. So the second reading is the one the
         // occupancy cannot show -- what the peers sent us while nothing was
         // being read at all.
+        // The playback read above leaves requests in flight, and bytes
+        // still arriving from it are not bytes the policy asked for again.
+        // So the measurement starts where the swarm goes quiet rather than
+        // where the reader stopped -- on a runner slower than this one
+        // those two are a long way apart, and the difference is booked
+        // against the policy. A swarm that never goes quiet is the very bug
+        // this guards, and says so.
+        let mut settled = 0;
+        let quiet_at = std::time::Instant::now() + TEST_WAIT_BOUND;
+        loop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            efs.reconcile_tick().await;
+            let fetched = engine.handle.transfer_totals().unwrap_or_default().fetched;
+            if fetched == settled {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < quiet_at,
+                "the swarm never stopped delivering after playback ended: {fetched} bytes \
+                 and still climbing, so what the policy released is being wanted again"
+            );
+            settled = fetched;
+        }
         let fetched_before = engine.handle.transfer_totals().unwrap_or_default().fetched;
         for _ in 0..20 {
             tokio::time::sleep(Duration::from_millis(50)).await;
