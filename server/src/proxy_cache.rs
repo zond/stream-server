@@ -136,7 +136,7 @@
 //!   boundary are dropped rather than provoking a wider fetch than the player
 //!   asked for. Every whole chunk after that boundary is written as usual.
 
-use crate::proxy_retention::ProxyRetention;
+use crate::proxy_retention::{OnDisk, ProxyRetention};
 use bytes::Bytes;
 use enginefs::chunk_store::ChunkDir;
 use futures_util::Stream;
@@ -700,8 +700,12 @@ impl Entry {
         let retention = self.retention.clone();
         tokio::task::spawn_blocking(move || {
             let _ticket = ticket;
-            let (freed, left) =
-                remove_other_entities(&stale, &fresh, |entity| retention.readers_of(entity) > 0);
+            let (freed, left) = remove_other_entities(
+                &stale,
+                &fresh,
+                |entity| retention.readers_of(entity) > 0,
+                |entity| retention.forget(entity),
+            );
             retention.uncounted(freed);
             if left > 0 {
                 if let Err(error) = std::fs::create_dir_all(&fresh) {
@@ -821,11 +825,23 @@ pub fn can_be_filed(total: u64, content_type: &str, validator: &str) -> bool {
 /// [`Entry::sole_entity`] sends every request to the origin, which is what
 /// two entities have always meant.
 ///
-/// Answers what the removal freed and how many entities it left standing.
+/// Answers what the removal freed and how many entities it left standing,
+/// and calls `removed` with each entity directory that really went.
+///
+/// **`removed` is how the held set hears about this.** It is the one
+/// deletion of proxy chunks that does not go chunk by chunk through the
+/// retention owner, so it is the one place the owner's mirror could be left
+/// naming a directory's worth of chunks that are not there -- the direction
+/// that breaks reads (`proxy_retention::Held`). It is called for every
+/// entity this *attempted* to remove, whether or not the removal succeeded,
+/// because `remove_dir_all` walks and a failure partway through leaves some
+/// of the chunks gone; never for an entity left standing for a body that is
+/// reading it, which is untouched.
 fn remove_other_entities(
     key_dir: &Path,
     keep: &Path,
     is_read: impl Fn(&Path) -> bool,
+    removed: impl Fn(&Path),
 ) -> (u64, usize) {
     let Ok(entries) = std::fs::read_dir(key_dir) else {
         return (0, 0);
@@ -858,7 +874,16 @@ fn remove_other_entities(
             .filter_map(|entry| entry.metadata().ok())
             .map(|metadata| enginefs::chunk_store::occupied_bytes(&metadata))
             .sum();
-        match std::fs::remove_dir_all(&path) {
+        let dropped = std::fs::remove_dir_all(&path);
+        // Told whether it worked or not, and that is the point of putting
+        // it here rather than in the `Ok` arm: `remove_dir_all` walks, so a
+        // failure partway through is a directory some of whose chunks have
+        // gone -- which is exactly the state a held set must not be left
+        // believing it holds. What it is told is "forget this entity", so
+        // the worst a failure costs is the one listing that seeds it again
+        // from whatever really survived.
+        removed(&path);
+        match dropped {
             Ok(()) => {
                 freed += held;
                 tracing::debug!(
@@ -1001,17 +1026,23 @@ impl Cached {
                 let bytes = match tokio::fs::read(&path).await {
                     Ok(bytes) if bytes.len() as u64 == want => bytes,
                     Ok(_) => {
-                        // Off the count as well as off the disk, like every
-                        // other deletion of a chunk: bytes the count still
-                        // held would read as a larger cap for the life of
-                        // the process (`ProxyRetention::occupancy`).
-                        let occupied = tokio::fs::metadata(&path)
-                            .await
-                            .map(|metadata| enginefs::chunk_store::occupied_bytes(&metadata))
-                            .unwrap_or(0);
-                        if tokio::fs::remove_file(&path).await.is_ok() {
-                            reader.retention().uncounted(occupied);
-                        }
+                        // Off the count *and* out of the held set as well
+                        // as off the disk, like every other deletion of a
+                        // chunk, and all three under one booking
+                        // (`ProxyRetention::discarded`): bytes the count
+                        // still held would read as a larger cap for the
+                        // life of the process, and a chunk the held set
+                        // still named would have the next lookup frame a
+                        // body round bytes this has just unlinked. On the
+                        // blocking pool because the booking takes a
+                        // `std::sync::Mutex` and does a `stat` and an
+                        // `unlink` under it.
+                        let retention = reader.retention();
+                        let entity = dir.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            retention.discarded(&entity, index)
+                        })
+                        .await;
                         return Some((
                             Err(io::Error::other("a cached chunk is not the length it was")),
                             last + 1,
@@ -1119,7 +1150,7 @@ impl Filler {
                             );
                             return;
                         }
-                        retention.counted(|| write_chunk(&dir, index, &chunk, want));
+                        retention.counted(&dir, index, || write_chunk(&dir, index, &chunk, want));
                     });
                 }
             }
@@ -1162,7 +1193,15 @@ impl Filler {
 /// through `ProxyRetention::counted` and not around it -- the two racing
 /// writers would otherwise both read "no file" first and both book the
 /// whole chunk.
-fn write_chunk(dir: &ChunkDir, index: u64, chunk: &[u8], want: u64) -> u64 {
+///
+/// It answers what stands at the chunk's name as well, because the held set
+/// is booked from the same closure and a difference of bytes cannot say
+/// that: a second writer of a chunk already there gains nothing and the
+/// chunk is very much held, while a write the filesystem refused gains
+/// nothing and leaves whatever was there before -- which may be a complete
+/// chunk somebody else wrote, so it is [`OnDisk::Unmoved`] and not
+/// `OnDisk::Gone`.
+fn write_chunk(dir: &ChunkDir, index: u64, chunk: &[u8], want: u64) -> (u64, OnDisk) {
     let occupancy = |path: &Path| {
         std::fs::metadata(path)
             .map(|metadata| enginefs::chunk_store::occupied_bytes(&metadata))
@@ -1172,9 +1211,9 @@ fn write_chunk(dir: &ChunkDir, index: u64, chunk: &[u8], want: u64) -> u64 {
     let before = occupancy(&path);
     if let Err(error) = dir.write_whole(index, chunk, Some(want)) {
         tracing::debug!(path = %path.display(), %error, "could not write a proxy cache chunk");
-        return 0;
+        return (0, OnDisk::Unmoved);
     }
-    occupancy(&path).saturating_sub(before)
+    (occupancy(&path).saturating_sub(before), OnDisk::Held)
 }
 
 /// The origin's body, with every whole chunk of it written to the cache on
@@ -1315,7 +1354,7 @@ mod tests {
     use super::*;
     use axum::http::HeaderMap;
     use enginefs::chunk_store::CHUNKS_PER_DIRECTORY;
-    use std::collections::HashSet;
+    use std::collections::{BTreeSet, HashSet};
 
     /// The entity directory as the store sees it.
     fn chunks(dir: &Path) -> ChunkDir {
@@ -2092,6 +2131,101 @@ mod tests {
         );
     }
 
+    /// **What a fill writes, the owner knows it holds -- without anything
+    /// having listed the directory.**
+    ///
+    /// The fill is the proxy's one writer of a chunk, so it is the whole of
+    /// what the held set has to hear on the way in
+    /// (`proxy_retention::Held`). Shown by listing the entity exactly once,
+    /// before it exists: the one seed this entity will ever get finds an
+    /// empty directory, so every chunk the set names afterwards is one the
+    /// fill booked as it renamed the file into place.
+    ///
+    /// A writer the set did not hear is the survivable direction -- nobody
+    /// reads a chunk we have forgotten, they re-fetch it -- but it is also
+    /// a leak: no pass would ever be asked to reclaim those bytes, because
+    /// no pass would know they were there.
+    #[tokio::test]
+    async fn what_a_fill_writes_goes_into_the_held_set_without_a_listing() {
+        let (_root, cache) = cache();
+        let entry = entry_of(&cache, "https://host/film.mkv");
+        let total = 2 * CHUNK_BYTES;
+        let dir = entry
+            .dir
+            .join(entity_dir_name(total, "video/mp4", VALIDATOR));
+        let listed = ChunkDir::new(dir.clone());
+        assert!(
+            cache
+                .retention()
+                .held(&listed)
+                .expect("an entity with no directory holds nothing")
+                .is_empty(),
+            "the seed is taken here, before the entity exists"
+        );
+
+        let mut filler = entry.fill(total, "video/mp4", VALIDATOR, 0);
+        filler.take(&vec![7u8; total as usize]);
+        cache.settled().await;
+        drop(filler);
+
+        assert_eq!(
+            cache.retention().held(&listed).expect("the held set"),
+            BTreeSet::from([0, 1]),
+            "both chunks of the body went onto the disk and into the set \
+             under one booking each"
+        );
+    }
+
+    /// **And out of the owner's held set, which is the half that a player
+    /// would have felt.**
+    ///
+    /// The count being wrong costs a cap that is a little the wrong size.
+    /// The held set being wrong the other way costs a read: this deleter
+    /// runs from inside a body, and a set that went on naming the chunk it
+    /// unlinked would have the next lookup follow the run through it and
+    /// frame a `Content-Length` round bytes that are not on the disk. So
+    /// the `stat`, the `unlink`, the count and the set are one booking
+    /// (`ProxyRetention::discarded`).
+    #[tokio::test]
+    async fn a_chunk_refused_for_its_length_comes_out_of_the_held_set() {
+        use futures_util::StreamExt as _;
+
+        let (_root, cache) = cache();
+        let entry = entry_of(&cache, "https://host/film.mkv");
+        let total = 2 * CHUNK_BYTES;
+        let dir = entry
+            .dir
+            .join(entity_dir_name(total, "video/mp4", VALIDATOR));
+        let mut filler = entry.fill(total, "video/mp4", VALIDATOR, 0);
+        filler.take(&vec![7u8; total as usize]);
+        cache.settled().await;
+        drop(filler);
+
+        // Chunk 1 is not the length it was written at any more. A listing
+        // reads names and not lengths, so the seed below holds both chunks
+        // -- as it should: the file is there, and it is the *read* that
+        // finds out it is not a chunk.
+        std::fs::write(chunk_path(&dir, 1), vec![7u8; CHUNK_BYTES as usize / 2]).unwrap();
+        let listed = ChunkDir::new(dir.clone());
+        assert_eq!(
+            cache.retention().held(&listed).expect("the seed"),
+            BTreeSet::from([0, 1]),
+            "both names are in the directory"
+        );
+
+        let cached = entry
+            .look_up(Some("bytes=0-"))
+            .expect("both chunks are named");
+        let served: Vec<Result<Bytes, io::Error>> = cached.body().collect().await;
+        assert!(served[1].is_err(), "the impostor is refused");
+        assert_eq!(
+            cache.retention().held(&listed).expect("the held set"),
+            BTreeSet::from([0]),
+            "and the chunk the body unlinked is one the owner no longer \
+             says we hold"
+        );
+    }
+
     /// **A chunk written where one already is gains the cache nothing.**
     ///
     /// Two bodies of one entity can race past [`Filler::take`]'s check on
@@ -2105,14 +2239,54 @@ mod tests {
         let dir = tempfile::tempdir().expect("a scratch root");
         let entity = chunks(dir.path());
         let bytes = vec![1u8; CHUNK_BYTES as usize];
+        let (gained, on_disk) = super::write_chunk(&entity, 0, &bytes, CHUNK_BYTES);
         assert!(
-            super::write_chunk(&entity, 0, &bytes, CHUNK_BYTES) >= CHUNK_BYTES,
+            gained >= CHUNK_BYTES,
             "the first write is what the chunk occupies"
         );
+        assert_eq!(on_disk, OnDisk::Held, "and the chunk is there");
         assert_eq!(
             super::write_chunk(&entity, 0, &bytes, CHUNK_BYTES),
-            0,
-            "and the second is what it gained, which is nothing"
+            (0, OnDisk::Held),
+            "and the second gained nothing -- while the chunk is no less \
+             held for it, which is why the two answers are separate"
+        );
+    }
+
+    /// **And a write the store refused leaves whatever was at that name.**
+    ///
+    /// The answer that goes into the held set has to distinguish "the write
+    /// did not happen" from "there is nothing there", because the fill only
+    /// skips a chunk it saw at the moment it looked and a second body of
+    /// the same entity can put one under it after that. A failed write
+    /// reported as `Gone` would withdraw a complete chunk that is on the
+    /// disk and staying there.
+    ///
+    /// The refusal here is the store's own commit criterion -- a buffer
+    /// that is not the length the entity says the chunk is -- which fails
+    /// before anything is written, which is exactly the case being
+    /// described.
+    #[test]
+    fn a_write_the_store_refused_leaves_the_chunk_that_was_there() {
+        let dir = tempfile::tempdir().expect("a scratch root");
+        let entity = chunks(dir.path());
+        let bytes = vec![1u8; CHUNK_BYTES as usize];
+        assert_eq!(
+            super::write_chunk(&entity, 0, &bytes, CHUNK_BYTES).1,
+            OnDisk::Held,
+            "the chunk is written"
+        );
+
+        assert_eq!(
+            super::write_chunk(&entity, 0, &bytes[..10], CHUNK_BYTES),
+            (0, OnDisk::Unmoved),
+            "and a write the store would not commit gained nothing and \
+             moved nothing"
+        );
+        assert!(
+            entity.chunk_path(0).is_file(),
+            "the chunk it could not replace is still on the disk, which is \
+             why the owner must not be told it has gone"
         );
     }
 
@@ -2144,7 +2318,9 @@ mod tests {
             for _ in 0..2 {
                 scope.spawn(|| {
                     both.wait();
-                    retention.counted(|| super::write_chunk(&entity, 0, &bytes, CHUNK_BYTES));
+                    retention.counted(&entity, 0, || {
+                        super::write_chunk(&entity, 0, &bytes, CHUNK_BYTES)
+                    });
                 });
             }
         });
@@ -2243,6 +2419,57 @@ mod tests {
             !old.exists(),
             "and the fill after the read has ended takes it"
         );
+    }
+
+    /// **And the owner is told, so its held set does not go on naming the
+    /// chunks that went with it.**
+    ///
+    /// The sibling removal is the one deletion of proxy chunks that does
+    /// not go through the retention owner chunk by chunk: one
+    /// `remove_dir_all` takes a whole entity. The owner keeps an in-memory
+    /// set of what each entity holds (`proxy_retention::Held`) and it may be
+    /// short but may never be long -- a chunk it names that is not there is
+    /// a lookup framing a body round bytes the disk does not hold. So this
+    /// removal has to be heard, and what it says is "forget this entity",
+    /// after which the next ask seeds from what is really at that path.
+    #[tokio::test]
+    async fn a_replaced_entity_is_forgotten_by_the_owners_held_set() {
+        let (_root, cache) = cache();
+        let entry = entry_of(&cache, "https://host/film.mkv");
+        let old = entry
+            .dir
+            .join(entity_dir_name(CHUNK_BYTES * 2, "video/mp4", VALIDATOR));
+        write_chunk(&old, 0, &vec![1u8; CHUNK_BYTES as usize]);
+        write_chunk(&old, 1, &vec![1u8; CHUNK_BYTES as usize]);
+
+        // Listed once, which is what puts the old entity in the set at all.
+        let listed = ChunkDir::new(old.clone());
+        assert_eq!(
+            cache.retention().held(&listed).expect("the seed").len(),
+            2,
+            "both chunks of the entity the origin is about to disown"
+        );
+
+        let filler = entry.fill(CHUNK_BYTES * 3, "video/mp4", VALIDATOR, 0);
+        for _ in 0..200 {
+            if !old.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        cache.settled().await;
+        assert!(!old.exists(), "the old entity is off the disk");
+        assert!(
+            cache
+                .retention()
+                .held(&listed)
+                .expect("a directory that is not there lists empty")
+                .is_empty(),
+            "and out of the owner's book with it: a set still naming those \
+             two chunks would have the next lookup promise a player bytes \
+             this fill has just unlinked"
+        );
+        drop(filler);
     }
 
     /// A fill that completes no chunk leaves no directory behind.

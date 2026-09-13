@@ -480,7 +480,12 @@ mod tests {
             Arc::default(),
             Arc::default(),
         );
-        proxy.counted(|| 2 * MIB);
+        // A chunk of the proxy's, booked the way a fill books one: what it
+        // gained, and that the chunk is on the disk.
+        let entity = enginefs::chunk_store::ChunkDir::new(tmp.path().join("proxy-entity"));
+        proxy.counted(&entity, 0, || {
+            (2 * MIB, crate::proxy_retention::OnDisk::Held)
+        });
 
         assert_eq!(
             cap_to_publish(

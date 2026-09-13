@@ -88,8 +88,9 @@
 //!   file may only be unlinked after librqbit has forgotten the piece, under
 //!   the claim `enginefs::retention::take_claimed` holds, or the torrent
 //!   advertises bytes it no longer has. Nothing believes anything about a
-//!   proxy chunk except the directory listing itself -- and the promises
-//!   above, which is why they are here.
+//!   proxy chunk except the owner's own held set ([`Held`]), which the
+//!   reclaim books into as it unlinks -- and the promises above, which is
+//!   why they are here.
 //!
 //! # When a pass runs
 //!
@@ -100,7 +101,10 @@
 //! moves the window is the same byte that grew the cache, and the pass
 //! belongs there. It is throttled to [`PASSES_PER_WINDOW`] passes per
 //! window of playback, which bounds the overshoot to a twentieth of the
-//! budget and keeps the directory listing off the hot path. The owner does
+//! budget and the unlinking to twenty walks per window. What a pass asks
+//! about the disk it asks of the owner's own held set ([`Held`]) and not of
+//! the filesystem: the listing that used to be the expensive half of a pass
+//! now happens once per entity, to seed that set. The owner does
 //! the throttling ([`Trigger::OnMove`]); what a delivered byte hands this
 //! module is a [`Claim`] on the entity's turn, and [`ProxyRetention::spawn_pass`]
 //! is the task that runs the pass under it, and every pass the first one
@@ -144,9 +148,9 @@
 //! is *not* kept in either case is a stream nobody is reading, which is the
 //! first thing that should go.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -169,8 +173,12 @@ use crate::proxy_cache::CHUNK_BYTES;
 ///
 /// Tying the throttle to the window rather than to a fixed number of chunks
 /// makes the overshoot a fraction of the budget instead of a constant, and
-/// makes the listing rarer exactly when it is dearer -- a big window is many
-/// bucket directories.
+/// makes the pass rarer exactly where a pass is dearer -- a big window is
+/// many chunks to walk and, when it moves, many to unlink. It used to buy
+/// one more thing, and does not any more: a pass was a `read_dir` per bucket
+/// of the entity, so the throttle was also what kept the listing off the hot
+/// path. The owner's held set ([`Held`]) is what keeps it off now, and there
+/// is one listing per entity rather than one per pass.
 ///
 /// The number itself is the overshoot the bound tolerates, and nothing
 /// subtler than that: what is on the disk when a pass measures it is the
@@ -351,33 +359,42 @@ impl Backing for ProxyBacking {
         self.live.is_proxy(key)
     }
 
-    /// The listing, on the blocking pool: one `read_dir` of the entity's
-    /// directory and one more per thousand chunks, which on the flash of a
-    /// television is whatever the device says it is. The same listing goes
-    /// there from [`ProxyRetention::window`] when a panel asks what a stream
-    /// holds; this is the other caller of it.
+    /// **The held set, out of memory** ([`Held`]), and a `read_dir` only on
+    /// the pass that first asks about an entity.
+    ///
+    /// This used to be a real listing of the entity's directory -- one
+    /// `read_dir` of it and one more per thousand chunks, on the flash of a
+    /// television -- on *every* pass, and the torrent side had already
+    /// measured what that costs and stopped doing it (`Engine::held`, an
+    /// in-memory `HeldBits`, against some 6,750 `statx` calls a pass on a
+    /// 27 GB torrent). Now the owner keeps the mirror as it writes and
+    /// unlinks, and the only listing left is the one that seeds it.
+    ///
+    /// Still on the blocking pool, and not as ceremony: whether this ask is
+    /// the seed is precisely what the caller cannot know, and the seed is a
+    /// `read_dir` per bucket. The reads after it are a mutex and a clone.
     ///
     /// A chunk index too big for the policy's index space is one the policy
     /// was never built over -- see [`Self::policy`], which refuses to build
     /// one at all in that case -- so the filter cannot narrow a window that
-    /// exists. A directory that would not list is a listing we do not have,
-    /// and the pass concludes nothing rather than advance over an empty
-    /// reading of a directory that is not empty -- which is what a listing
-    /// error used to arrive as, and what had the policy withdraw every
-    /// committed chunk on one tick and reclaim them on the next (see
+    /// exists. A seed that would not list is an answer we do not have, and
+    /// the pass concludes nothing rather than advance over an empty reading
+    /// of a directory that is not empty -- which is what a listing error
+    /// used to arrive as, and what had the policy withdraw every committed
+    /// chunk on one tick and reclaim them on the next (see
     /// `ChunkDir::held_in_bucket`).
     async fn held(&self, _store: &(), domain: &ProxyDomain) -> Option<BTreeSet<u32>> {
         let dir = domain.dir.clone();
         let backing = self.probe();
-        let listing = tokio::task::spawn_blocking(move || {
+        let mirror = tokio::task::spawn_blocking(move || {
             backing.note_disk_thread();
-            dir.held().map(|held| {
+            backing.occupancy.chunks(&dir).map(|held| {
                 held.into_iter()
                     .filter_map(|index| u32::try_from(index).ok())
                     .collect::<BTreeSet<u32>>()
             })
         });
-        match listing.await {
+        match mirror.await {
             Ok(Ok(held)) => Some(held),
             Ok(Err(error)) => {
                 tracing::warn!(
@@ -432,12 +449,14 @@ impl Backing for ProxyBacking {
         let backing = self.probe();
         tokio::task::spawn_blocking(move || {
             backing.note_disk_thread();
+            let entity = dir.path().to_path_buf();
             let mut freed = 0usize;
             for index in runs.into_iter().flatten() {
                 if door.refuses(index) {
                     continue;
                 }
-                let path = dir.chunk_path(u64::from(index));
+                let chunk = u64::from(index);
+                let path = dir.chunk_path(chunk);
                 // Measured before the unlink, because after it there is
                 // nothing to measure: the count this comes off is the one
                 // the fill added when the chunk landed, and a chunk that
@@ -445,20 +464,42 @@ impl Backing for ProxyBacking {
                 // rather than as freeing a guess.
                 // Priced and taken under one booking, so the stat cannot
                 // read a chunk a fill is replacing at that moment and book
-                // the unlink of a file that is still there.
-                freed += backing.occupancy.lost(|| {
+                // the unlink of a file that is still there -- and the held
+                // set comes off inside the same booking, which is what
+                // stops a pass concluding over a set that says we hold a
+                // chunk this loop unlinked a moment ago.
+                //
+                // A file that was not there is `Gone` and frees nothing:
+                // the unlink failed, so it is not a reclaim and `freed`
+                // must not count it, but the name is empty and the held set
+                // has no business naming it. Any other error leaves the
+                // chunk where it was ([`OnDisk::Unmoved`]).
+                freed += backing.occupancy.lost(&entity, chunk, || {
                     let bytes = std::fs::metadata(&path)
                         .map(|metadata| enginefs::chunk_store::occupied_bytes(&metadata))
                         .unwrap_or(0);
                     match std::fs::remove_file(&path) {
-                        Ok(()) => (bytes, 1),
-                        Err(_) => (0, 0),
+                        Ok(()) => (bytes, OnDisk::Gone, 1),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            (0, OnDisk::Gone, 0)
+                        }
+                        Err(_) => (0, OnDisk::Unmoved, 0),
                     }
                 });
             }
             // What the unlinks emptied goes too -- the bucket, the entity,
             // the key -- or every stream a slack pass took would leave its
             // directories behind. A chunk that stayed keeps them all.
+            //
+            // The held set is *not* forgotten with them, and does not need
+            // to be: `rmdir` is what decided the entity was empty, and the
+            // only way the loop above can have emptied it is by booking
+            // every one of those chunks out, so the entry this leaves
+            // behind says the entity holds nothing -- which is the truth,
+            // and stays the truth if a fill makes the directory again and
+            // books its chunks in. `Occupancy::forget` is for the other
+            // case, where a directory goes without its chunks having been
+            // unlinked one by one.
             if freed > 0 {
                 crate::proxy_cache::prune(&dir);
             }
@@ -502,32 +543,212 @@ impl ProxyBacking {
 /// volume, and the disk was already the thing they queued on.
 #[derive(Debug, Default)]
 pub(crate) struct Occupancy {
-    held: AtomicU64,
-    booking: Mutex<()>,
+    occupied: AtomicU64,
+    /// The booking lock, and **under it the held set the bookings
+    /// maintain** ([`Held`]). One lock and not two, because the two books
+    /// are readings of the same instant: a booking that took the byte count
+    /// under one lock and the membership under another would leave a window
+    /// in which a chunk is in the count and not in the set, and the seed --
+    /// the one listing left -- would have to be atomic against both at once
+    /// to mean anything.
+    booking: Mutex<Held>,
+}
+
+/// What a booking found at a chunk's name when it was done with it: the
+/// half of its answer that goes into the held set, beside the bytes that go
+/// into the count.
+///
+/// Stated by the closure rather than inferred from the byte figure, because
+/// the byte figure cannot carry it. A fill answers a *difference* -- what
+/// the cache gained -- and a chunk rewritten at the same length gains
+/// nothing while very much being on the disk; an unlink of a file that was
+/// already gone frees nothing while leaving the name empty. Zero bytes is
+/// therefore not "nothing happened", and reading it as one would be wrong
+/// in whichever direction the disk happened to differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OnDisk {
+    /// A complete chunk stands at that name.
+    Held,
+    /// Nothing does.
+    Gone,
+    /// The change did not happen -- a write the filesystem refused, an
+    /// unlink that failed for anything but the file not being there -- so
+    /// whatever was at that name before is still there, and the set already
+    /// says which it was. Deliberately not [`OnDisk::Gone`]: a write that
+    /// failed over an older complete copy would otherwise withdraw a chunk
+    /// that is on the disk and staying there.
+    Unmoved,
+}
+
+/// Which chunks of which entity are on the disk, as the owner has watched
+/// them arrive and go.
+///
+/// **The proxy's answer to `enginefs::engine::Engine::held`.** The torrent
+/// side answers "do we hold this" out of the store's `HeldBits` -- atomic
+/// words in memory, no syscall -- and its doc says why it must stay that
+/// way: the listing it replaced cost some 6,750 `statx` calls per retention
+/// pass on a 27 GB torrent. The proxy never got one, so
+/// [`ProxyBacking::held`] ran a real `read_dir` of every bucket directory
+/// of the entity on *every* pass, and the design that follows this one
+/// (`docs/read-pattern-retention.md`, section 8, step 0) needs the same
+/// question answered on the **read** path, where a directory listing is not
+/// available at any price.
+///
+/// # It may be short. It may never be long.
+///
+/// [`Occupancy`]'s byte count can afford to be approximate -- it saturates
+/// at nothing and its doc says why -- because what it feeds is a published
+/// cap, and a cap that is a little wrong is a cache that is a little the
+/// wrong size. A held set cannot take that shortcut, and the two directions
+/// are not each other's mirror:
+///
+/// * A chunk on the disk this does **not** name costs a re-fetch of bytes
+///   we already had, and leaves those bytes standing until the entity is
+///   dropped whole. Money and disk, and nothing a player can see.
+/// * A chunk this names that is **not** on the disk is a read that fails. A
+///   lookup frames a `Content-Length` round the run it was told we hold and
+///   the body then finds a hole in it, which is a truncated response to a
+///   range the player was promised -- and once membership drives the want
+///   set, a run the policy believes is cached and therefore never fetches.
+///
+/// So the shape is chosen so only the survivable direction is reachable:
+/// every mutation is booked *into* this inside the same critical section
+/// that prices it, and an entity nobody has listed is **absent** rather
+/// than empty.
+///
+/// # An entity nothing has listed is absent, not empty
+///
+/// An entry means "this was listed, and every change to it since was booked
+/// here". No entry means nothing has listed it, and a booking for an entity
+/// with no entry is dropped rather than allowed to start one: an entry
+/// begun from the first chunk a fill happened to write would be silent
+/// about everything already in that directory -- the short direction, but
+/// silently and for the entity's whole life rather than until the next
+/// listing.
+///
+/// The seed is taken with the booking lock **held across the `read_dir`**.
+/// That is what makes the listing an instant rather than a smear: a fill
+/// that lands during the walk is either in the listing or queued behind it,
+/// and an unlink during the walk cannot leave a name the walk has already
+/// passed standing in the set. It costs that entity's chunk writes the
+/// length of one listing, once, and the listing is a short one -- the
+/// launch sweep empties this cache before the router serves
+/// (`proxy_cache::sweep`), so what a seed walks is what this process has
+/// written since playback started, and the first pass comes one stride into
+/// the film.
+///
+/// A seed that **fails** installs nothing. A listing the filesystem refused
+/// -- `EMFILE` on a television out of descriptors, a permission lost under
+/// us, and no longer "this volume is broken", which `routes::system`'s
+/// startup check has already refused a cache root for -- is not an empty
+/// directory, and an entry installed empty from one would be wrong about
+/// that entity for the rest of the process, which is the direction that
+/// breaks reads. `chunk_store.rs`'s `held_in_bucket` records what the same
+/// mistake cost the torrent side: one transient directory error read as
+/// "empty" withdrew every committed piece of a file from what we announce,
+/// after peers had been told, and there is no un-Have. So the error is the
+/// whole answer, the pass concludes nothing that tick exactly as it did
+/// when every pass listed, and the next one seeds again.
+///
+/// # What it costs to keep
+///
+/// One entry per entity this process has listed, and nothing forgets them
+/// but [`Occupancy::forget`], which the one place that removes an entity
+/// directory behind the owner's back calls. That is not the growth worth
+/// worrying about: the owner's own holdings map keeps a `Holding` per
+/// entity -- the domain, the target URL, the windows, the promises -- for
+/// the same lifetime, and it is several times the size of a path and a set
+/// of `u64`s.
+#[derive(Debug, Default)]
+struct Held {
+    entities: HashMap<PathBuf, BTreeSet<u64>>,
+}
+
+impl Held {
+    /// Book what a change did to chunk `index` of `entity`, if anything has
+    /// listed that entity. See the type's doc for why an entity with no
+    /// entry is left without one rather than started from here.
+    fn note(&mut self, entity: &Path, index: u64, on_disk: OnDisk) {
+        let Some(chunks) = self.entities.get_mut(entity) else {
+            return;
+        };
+        match on_disk {
+            OnDisk::Held => {
+                chunks.insert(index);
+            }
+            OnDisk::Gone => {
+                chunks.remove(&index);
+            }
+            OnDisk::Unmoved => {}
+        }
+    }
 }
 
 impl Occupancy {
     /// What the cache holds right now.
     fn bytes(&self) -> u64 {
-        self.held.load(Ordering::Relaxed)
+        self.occupied.load(Ordering::Relaxed)
     }
 
-    /// Do `change` -- something that writes or unlinks a chunk and answers
-    /// what the cache gained by it -- and book that, with no other booking
+    /// Do `change` -- something that writes chunk `index` of `entity`,
+    /// answering what the cache gained by it and what stands at that name
+    /// afterwards -- and book both, with no other booking and no seed
     /// inside the readings it took.
-    fn gained<T>(&self, change: impl FnOnce() -> (u64, T)) -> T {
-        let _booking = self.booking.lock().unwrap_or_else(|held| held.into_inner());
-        let (bytes, answer) = change();
-        self.held.fetch_add(bytes, Ordering::Relaxed);
+    fn gained<T>(&self, entity: &Path, index: u64, change: impl FnOnce() -> (u64, OnDisk, T)) -> T {
+        let mut booking = self.booking.lock().unwrap_or_else(|held| held.into_inner());
+        let (bytes, on_disk, answer) = change();
+        self.occupied.fetch_add(bytes, Ordering::Relaxed);
+        booking.note(entity, index, on_disk);
         answer
     }
 
-    /// Do `change` and take what it says left the disk off the count.
-    fn lost<T>(&self, change: impl FnOnce() -> (u64, T)) -> T {
-        let _booking = self.booking.lock().unwrap_or_else(|held| held.into_inner());
-        let (bytes, answer) = change();
+    /// Do `change` -- an unlink of chunk `index` of `entity`, answering what
+    /// left the disk and what stands at that name afterwards -- and take the
+    /// one off the count and the other out of the held set, together.
+    fn lost<T>(&self, entity: &Path, index: u64, change: impl FnOnce() -> (u64, OnDisk, T)) -> T {
+        let mut booking = self.booking.lock().unwrap_or_else(|held| held.into_inner());
+        let (bytes, on_disk, answer) = change();
         self.take(bytes);
+        booking.note(entity, index, on_disk);
         answer
+    }
+
+    /// Which chunks of `dir` are on the disk, out of the held set -- seeding
+    /// it from one listing if nothing has listed this entity yet.
+    ///
+    /// **Blocking on the seed and on nothing else.** The first ask of an
+    /// entity is a `read_dir` per bucket, taken under the booking lock;
+    /// every ask after it is a lock and a clone of a `BTreeSet`. Call it off
+    /// the reactor all the same -- which ask is the first one is not
+    /// something a caller can know.
+    ///
+    /// `Err` is a listing that failed, and it is the whole answer: nothing
+    /// is installed, and the caller concludes nothing rather than read a
+    /// refusal as an empty directory. See [`Held`].
+    fn chunks(&self, dir: &ChunkDir) -> std::io::Result<BTreeSet<u64>> {
+        let mut booking = self.booking.lock().unwrap_or_else(|held| held.into_inner());
+        if let Some(chunks) = booking.entities.get(dir.path()) {
+            return Ok(chunks.clone());
+        }
+        let seed = dir.held()?;
+        booking
+            .entities
+            .insert(dir.path().to_path_buf(), seed.clone());
+        Ok(seed)
+    }
+
+    /// Forget everything known about an entity whose directory has just been
+    /// removed whole.
+    ///
+    /// The held set's dangerous direction is naming a chunk that is not
+    /// there, and a `remove_dir_all` of an entity is a hundred of those at
+    /// once. Taken under the booking lock and **after** the removal, so a
+    /// write that slipped in beside it is forgotten too and the entity is
+    /// simply unlisted again: the next ask seeds it from whatever is really
+    /// at that path, which is nothing.
+    fn forget(&self, entity: &Path) {
+        let mut booking = self.booking.lock().unwrap_or_else(|held| held.into_inner());
+        booking.entities.remove(entity);
     }
 
     /// Take `bytes` off the count, saturating at nothing.
@@ -542,7 +763,7 @@ impl Occupancy {
     /// wrap to the whole of a `u64` and state a cap of everything.
     fn take(&self, bytes: u64) {
         let _ = self
-            .held
+            .occupied
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
                 Some(held.saturating_sub(bytes))
             });
@@ -810,9 +1031,10 @@ impl ProxyRetention {
     /// names is the one that answers: that is the one a player is inside,
     /// and the other is slack with its chunks on their way off the disk.
     ///
-    /// Blocking: it lists the entity's bucket directories, one `getdents`
-    /// per thousand chunks. Call it off the reactor. No lock is held across
-    /// the listing.
+    /// Blocking, and only if this is the first thing to ask about the
+    /// entity: the answer is [`Self::held`], which is the owner's held set
+    /// and lists the entity's bucket directories only to seed it. Call it
+    /// off the reactor -- a panel cannot know whether it is the first.
     pub fn window(&self, target: &str) -> Option<enginefs::retention::CacheWindow> {
         let live = self.live.reading();
         let (_, holding) = self.owner.holdings().into_iter().find(|(key, holding)| {
@@ -821,9 +1043,10 @@ impl ProxyRetention {
         let at = holding.last_position? / CHUNK_BYTES;
         let dir = holding.domain.dir;
         let mut window = enginefs::retention::CacheWindow::default();
-        // No listing, no window: a panel shown an empty window would be
-        // shown a measurement nobody made.
-        for index in dir.held().ok()? {
+        // No held set, no window: a panel shown an empty window would be
+        // shown a measurement nobody made. Only the seed can fail, and a
+        // seed that failed installed nothing, so the next panel asks again.
+        for index in self.held(&dir).ok()? {
             // The chunk the playhead is in counts as ahead: it is the one a
             // player is reading out of, not one it has passed.
             let half = if index < at {
@@ -885,11 +1108,70 @@ impl ProxyRetention {
         self.occupancy.bytes()
     }
 
-    /// Do `write` -- a chunk on its way to the disk, answering what the
-    /// cache gained by it -- and book that: see [`Occupancy`] for why the
-    /// two are one operation.
-    pub(crate) fn counted(&self, write: impl FnOnce() -> u64) {
-        self.occupancy.gained(|| (write(), ()));
+    /// Do `write` -- chunk `index` of `dir` on its way to the disk,
+    /// answering what the cache gained by it and what stands at its name
+    /// afterwards -- and book both: see [`Occupancy`] for why the readings
+    /// and the change are one operation, and [`Held`] for why the fill is
+    /// where the held set hears about a chunk arriving.
+    ///
+    /// **This is the proxy's one writer of a chunk**, so it is the whole of
+    /// what the held set has to hear on the way in. Anything that wrote a
+    /// chunk around it would be a chunk the mirror is short of -- the
+    /// survivable direction, but a leak: nothing would ever reclaim it,
+    /// because nothing would know it was there.
+    pub(crate) fn counted(
+        &self,
+        dir: &ChunkDir,
+        index: u64,
+        write: impl FnOnce() -> (u64, OnDisk),
+    ) {
+        self.occupancy.gained(dir.path(), index, || {
+            let (bytes, on_disk) = write();
+            (bytes, on_disk, ())
+        });
+    }
+
+    /// Which chunks of `dir` this cache holds, out of the owner's held set.
+    ///
+    /// The proxy's `Engine::held`. Blocking only on the first ask of an
+    /// entity, which seeds the set from one listing; see [`Held`].
+    pub(crate) fn held(&self, dir: &ChunkDir) -> std::io::Result<BTreeSet<u64>> {
+        self.occupancy.chunks(dir)
+    }
+
+    /// Chunk `index` of `dir` is not what this cache said it was: take it
+    /// off the disk, off the count and out of the held set, under one
+    /// booking.
+    ///
+    /// The deleter that is neither a pass nor a fill. `proxy_cache::Cached`
+    /// discards a chunk whose file is not the length the entity says it is
+    /// -- a truncated leftover the lookup skipped and the fill refused to
+    /// overwrite, so the origin was asked for those bytes at every play --
+    /// and it has to be booked here rather than through the count alone,
+    /// because a chunk the held set still named after the unlink is the
+    /// dangerous direction: the next lookup would frame a body round bytes
+    /// that are not there.
+    ///
+    /// A file that has already gone is [`OnDisk::Gone`] and frees nothing.
+    /// Blocking; call it off the reactor.
+    pub(crate) fn discarded(&self, dir: &ChunkDir, index: u64) {
+        let path = dir.chunk_path(index);
+        self.occupancy.lost(dir.path(), index, || {
+            let bytes = std::fs::metadata(&path)
+                .map(|metadata| enginefs::chunk_store::occupied_bytes(&metadata))
+                .unwrap_or(0);
+            match std::fs::remove_file(&path) {
+                Ok(()) => (bytes, OnDisk::Gone, ()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (0, OnDisk::Gone, ()),
+                Err(_) => (0, OnDisk::Unmoved, ()),
+            }
+        });
+    }
+
+    /// An entity directory has been removed whole: forget what the held set
+    /// said about it. See [`Occupancy::forget`].
+    pub(crate) fn forget(&self, entity: &std::path::Path) {
+        self.occupancy.forget(entity);
     }
 
     /// Take `bytes` this cache no longer holds off the count.
@@ -907,10 +1189,12 @@ impl ProxyRetention {
     /// entity nothing bounds or nothing has measured yet, the whole of
     /// it.
     ///
-    /// It lists the entity's directory, so what it reports is the window's
-    /// chunks that are really on the disk and not the window's own size. On
-    /// the blocking pool, one listing per live entity, and only from
-    /// `GET /cache.json`.
+    /// It intersects the window with the owner's held set, so what it
+    /// reports is the window's chunks that are really on the disk and not
+    /// the window's own size. On the blocking pool, because an entity
+    /// nothing has listed yet is seeded there; every live entity has been
+    /// through a pass by the time a panel asks, so in practice this is a
+    /// lock per entity and no syscall at all.
     pub async fn protected(&self) -> ProxyProtection {
         let live = self.live.reading();
         let mut protection = ProxyProtection::default();
@@ -934,10 +1218,12 @@ impl ProxyRetention {
             }
             let dir = holding.domain.dir.clone();
             let total = holding.domain.total;
-            // No listing, no answer for this entity: a protection figure
+            // No held set, no answer for this entity: a protection figure
             // built over a directory nobody could read would report the
             // window's size where the disk holds part of it.
-            let Ok(Some(held)) = tokio::task::spawn_blocking(move || dir.held().ok()).await else {
+            let occupancy = self.occupancy.clone();
+            let Ok(Ok(held)) = tokio::task::spawn_blocking(move || occupancy.chunks(&dir)).await
+            else {
                 continue;
             };
             for chunk in held {
@@ -1188,8 +1474,11 @@ mod tests {
         );
 
         // What a fill wrote since that pass: on the disk, outside the
-        // window, and the next pass's to take.
-        write_chunks(&dir, 14..16);
+        // window, and the next pass's to take. Booked as a fill books it,
+        // because by now the pass has seeded the held set and a chunk
+        // written round the booking would be one the owner never hears
+        // about -- which is a different test from this one.
+        fill_chunks(&retention, &dir, 14..16);
         let since = retention.protected().await;
         assert_eq!(
             (since.bytes, since.entities),
@@ -1215,6 +1504,381 @@ mod tests {
         drop(reader);
     }
 
+    /// **The first pass lists the entity. No pass after it does.**
+    ///
+    /// This is what the held set is for, and the only honest way to show a
+    /// listing did not happen is to make the disk and the set disagree and
+    /// see which one the pass believed. So: let the first pass seed itself
+    /// from a full directory and reclaim the far end of the film, then put
+    /// a chunk back at that name *behind every booking* -- which nothing in
+    /// the shipped build does, and a `read_dir` would find at once -- and
+    /// run another pass. What the pass does not know about, it does not
+    /// take.
+    ///
+    /// The chunk left standing is the price of the short direction, stated:
+    /// a few bytes nothing reclaims until the entity is dropped whole. It
+    /// buys the ask being a mutex instead of one `read_dir` per bucket per
+    /// pass, on the flash of a television, for the life of a stream -- and
+    /// it buys the same ask being answerable on the read path, where a
+    /// listing is not available at any price.
+    #[tokio::test]
+    async fn a_pass_after_the_first_asks_the_held_set_and_not_the_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = ChunkDir::new(tmp.path().join("entity"));
+        write_chunks(&dir, 0..16);
+
+        // Eight chunks of budget over sixteen: the window is real and the
+        // far end of the film is outside it.
+        let retention = retention(Some(8 * CHUNK_BYTES));
+        let reader = retention.reader(&dir, TOTAL, TARGET.into());
+        reader.note(0);
+        settled(&retention, "the first pass seeded and reclaimed", || {
+            !dir.chunk_path(15).exists()
+        })
+        .await;
+
+        write_chunks(&dir, 15..16);
+        let before = retention.passes.load(Ordering::Relaxed);
+        reader.note(2 * CHUNK_BYTES);
+        settled(&retention, "another pass ran", || {
+            retention.passes.load(Ordering::Relaxed) > before
+        })
+        .await;
+
+        assert!(
+            dir.chunk_path(15).exists(),
+            "the pass reclaimed a chunk the owner never heard land, which \
+             it can only have found by listing the directory"
+        );
+        drop(reader);
+    }
+
+    /// **And what the fill books is what the pass then sees.**
+    ///
+    /// The other half of the same claim, from the other side: seed the set
+    /// while the directory is empty -- so the one listing there is finds
+    /// nothing -- and then write every chunk the way `proxy_cache::Filler`
+    /// writes one, through [`ProxyRetention::counted`]. A pass that can
+    /// reclaim the far end of that film reclaimed it out of the owner's own
+    /// book, because no listing of this entity ever saw a chunk in it.
+    #[tokio::test]
+    async fn a_chunk_a_fill_books_is_one_the_next_pass_can_take() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = ChunkDir::new(tmp.path().join("entity"));
+
+        let retention = retention(Some(8 * CHUNK_BYTES));
+        assert!(
+            retention
+                .held(&dir)
+                .expect("an entity with no directory holds nothing")
+                .is_empty(),
+            "the seed is taken here, against an empty directory"
+        );
+
+        fill_chunks(&retention, &dir, 0..16);
+        let reader = retention.reader(&dir, TOTAL, TARGET.into());
+        reader.note(0);
+        settled(&retention, "the pass took the far end of the film", || {
+            !dir.chunk_path(15).exists()
+        })
+        .await;
+        drop(reader);
+    }
+
+    /// **A reclaimed chunk leaves the held set with the disk, in the same
+    /// booking.**
+    ///
+    /// The dangerous direction, ruled out where it would arise: the pass is
+    /// the proxy's biggest deleter of chunks, and a set that still named
+    /// what it unlinked would have the next lookup frame a `Content-Length`
+    /// round bytes that are not there. The unlink and the withdrawal are
+    /// one critical section, so there is no instant between them for a
+    /// lookup to read.
+    #[tokio::test]
+    async fn what_a_pass_unlinks_comes_out_of_the_held_set_with_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = ChunkDir::new(tmp.path().join("entity"));
+        write_chunks(&dir, 0..16);
+
+        let retention = retention(Some(8 * CHUNK_BYTES));
+        let reader = retention.reader(&dir, TOTAL, TARGET.into());
+        reader.note(0);
+        settled(&retention, "the pass reclaimed the far end", || {
+            !dir.chunk_path(15).exists()
+        })
+        .await;
+
+        let on_disk = dir.held().expect("the entity's chunks");
+        assert!(
+            on_disk.len() < 16,
+            "the pass took what its window did not cover: {} left",
+            on_disk.len()
+        );
+        assert_eq!(
+            retention.held(&dir).expect("the held set"),
+            on_disk,
+            "the set the owner keeps and the directory it keeps it of"
+        );
+        drop(reader);
+    }
+
+    /// **And the two readings a client sees come off the same set.**
+    ///
+    /// `GET /cache.json`'s protection figure and the panel's window were
+    /// the other two callers of the listing, and they are the reason
+    /// `ChunkDir::held` was on a hot path three times over rather than
+    /// once. They read the owner's set now, which is not merely cheaper: a
+    /// panel and a pass that answered from two different readings of the
+    /// disk would disagree about the same stream at the same instant, and
+    /// the number a client is shown would be the one nothing acts on.
+    ///
+    /// Shown the way the claim can be checked: chunks put on the disk
+    /// behind every booking, which no path in the shipped build does and a
+    /// `read_dir` would find at once -- one of them promised by an open
+    /// body, so a protection figure built from a listing would count it.
+    #[tokio::test]
+    async fn a_panel_and_a_protection_figure_read_the_held_set_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = ChunkDir::new(tmp.path().join("entity"));
+        write_chunks(&dir, 0..16);
+
+        let retention = retention(Some(8 * CHUNK_BYTES));
+        let reader = retention.reader(&dir, TOTAL, TARGET.into());
+        reader.note(0);
+        settled(&retention, "the pass seeded and reclaimed", || {
+            !dir.chunk_path(15).exists()
+        })
+        .await;
+
+        let shown = retention
+            .window(TARGET)
+            .expect("a bounded stream a player is inside");
+        let protected = retention.protected().await;
+
+        write_chunks(&dir, 14..16);
+        let seeking = retention.reader(&dir, TOTAL, TARGET.into());
+        seeking.promises(14..16);
+
+        assert_eq!(
+            retention.window(TARGET),
+            Some(shown),
+            "the panel shows what the owner has watched arrive, and two \
+             chunks it never heard about are not that"
+        );
+        assert_eq!(
+            retention.protected().await,
+            protected,
+            "and the protection figure prices the promise against the same \
+             set: bytes nothing booked are bytes no pass will be asked to \
+             spare"
+        );
+        drop(seeking);
+        drop(reader);
+    }
+
+    /// **A chunk the pass found already gone comes out of the set with the
+    /// ones it took.**
+    ///
+    /// The unlink that freed nothing. It is not a reclaim -- nothing left
+    /// the disk, so the pass must not count it as having given bytes back
+    /// -- but the name is empty, and the held set has no business naming
+    /// it: that is the long direction, and the long direction is a read
+    /// that fails. So the two answers part company here, and the withdrawal
+    /// happens whatever the count does.
+    ///
+    /// The file is taken between the decision and the unlinks, from inside
+    /// the pass, which is the only place it can be taken from and still be
+    /// the case under test -- taken earlier and the seed never names it,
+    /// taken later and the unlink beat it.
+    #[tokio::test]
+    async fn a_chunk_a_pass_found_already_gone_comes_out_of_the_held_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = ChunkDir::new(tmp.path().join("entity"));
+        write_chunks(&dir, 0..16);
+
+        let retention = retention(Some(8 * CHUNK_BYTES));
+        // The owner calls this twice a pass: after the snapshot and before
+        // the held set is read, then after the decision and before the
+        // unlinks. The second call of the first pass is the moment.
+        let calls = Arc::new(AtomicU64::new(0));
+        let vanishing = dir.chunk_path(15);
+        *retention.interleave.lock().expect("the interleave slot") = Some(Arc::new(move || {
+            if calls.fetch_add(1, Ordering::Relaxed) == 1 {
+                std::fs::remove_file(&vanishing).expect("the chunk to take");
+            }
+        }));
+
+        let reader = retention.reader(&dir, TOTAL, TARGET.into());
+        reader.note(0);
+        settled(&retention, "the pass reclaimed the far end", || {
+            !dir.chunk_path(14).exists()
+        })
+        .await;
+
+        assert!(
+            !retention.held(&dir).expect("the held set").contains(&15),
+            "the pass's unlink of chunk 15 answered NotFound and freed \
+             nothing, and the set says so anyway"
+        );
+        drop(reader);
+    }
+
+    /// **A seed that could not list installs nothing, and the next ask
+    /// seeds again.**
+    ///
+    /// The failure is no longer "this volume is broken" -- `routes::system`
+    /// refuses a cache root that will not list, at startup, before anything
+    /// gets here -- so a listing that fails now is transient: `EMFILE` on a
+    /// television that has run out of descriptors, a permission lost under
+    /// us. Read as "the directory is empty" it would not cost a tick, it
+    /// would cost the entity: the set is installed once and believed for
+    /// the life of the process, so an empty one seeded from a refusal says
+    /// we hold nothing of a stream we hold all of, for ever.
+    ///
+    /// `chunk_store.rs`'s `held_in_bucket` is where the same mistake was
+    /// made and what it cost: one transient directory error withdrew every
+    /// committed piece of a file from what we announce, after peers had
+    /// been told, and there is no un-Have.
+    ///
+    /// A file where the entity's directory belongs is the portable stand-in
+    /// for a listing that fails -- `ENOTDIR` rather than `EMFILE`, and the
+    /// same `Err` either way. It is not `NotFound`, which is a directory
+    /// nothing has been written to and really is empty.
+    #[test]
+    fn a_seed_that_could_not_list_is_not_an_empty_entity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("entity");
+        std::fs::write(&path, b"not a directory").unwrap();
+        let dir = ChunkDir::new(path.clone());
+
+        let retention = retention(None);
+        assert!(
+            retention.held(&dir).is_err(),
+            "the listing failed, and that is the whole answer"
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        write_chunks(&dir, 0..4);
+        assert_eq!(
+            retention.held(&dir).expect("the seed, second time").len(),
+            4,
+            "nothing was installed from the refusal, so the next ask is \
+             still the seed and finds the entity that was there all along"
+        );
+    }
+
+    /// **A booking does not start an entity the seed has not listed.**
+    ///
+    /// The rule that makes the absence of an entry mean "nothing has listed
+    /// this" rather than "this holds nothing". A booking allowed to start
+    /// its own entry would answer the entity's every later ask out of a set
+    /// that began at the first chunk somebody happened to write, and there
+    /// would never be a seed to correct it -- the short direction, but for
+    /// the entity's whole life rather than until the next listing.
+    ///
+    /// So: chunks on the disk that nobody booked, then one written through
+    /// the fill's own path, and the first ask is still the seed.
+    #[test]
+    fn a_booking_does_not_start_an_entity_nothing_has_listed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = ChunkDir::new(tmp.path().join("entity"));
+        write_chunks(&dir, 0..4);
+
+        let retention = retention(None);
+        fill_chunks(&retention, &dir, 4..5);
+        assert_eq!(
+            retention.held(&dir).expect("the seed").len(),
+            5,
+            "the booking started nothing, so this ask is the seed and finds \
+             the four chunks that were there as well as the one it booked"
+        );
+    }
+
+    /// **A write the filesystem refused withdraws nothing, and an unlink
+    /// that found nothing withdraws all the same.**
+    ///
+    /// The two bookings that are neither "it is there now" nor "it is not".
+    /// A write that failed may have failed over a complete chunk somebody
+    /// else wrote -- the fill only skips a chunk it saw at the moment it
+    /// looked -- so calling that `Gone` would take a chunk out of the set
+    /// that is on the disk and staying there, which is the short direction
+    /// for no reason at all. An unlink that answered `NotFound` did not
+    /// free anything and is not a reclaim, but the name is empty, and a set
+    /// that went on holding it would be long: that is the direction that
+    /// breaks a read, so the withdrawal happens whatever the count does.
+    #[test]
+    fn a_refused_write_holds_and_an_unlink_that_found_nothing_withdraws() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = ChunkDir::new(tmp.path().join("entity"));
+        write_chunks(&dir, 0..1);
+
+        let retention = retention(None);
+        assert_eq!(
+            retention.held(&dir).expect("the seed"),
+            BTreeSet::from([0]),
+            "listed once, with the chunk in it"
+        );
+
+        retention.counted(&dir, 0, || (0, OnDisk::Unmoved));
+        assert_eq!(
+            retention.held(&dir).expect("the held set"),
+            BTreeSet::from([0]),
+            "a write that gained nothing and moved nothing leaves the chunk \
+             it could not replace exactly where the set already had it"
+        );
+
+        // Somebody took the file behind the owner's back -- which nothing
+        // in the shipped build does, and is the state the withdrawal has to
+        // be able to repair.
+        std::fs::remove_file(dir.chunk_path(0)).unwrap();
+        retention.discarded(&dir, 0);
+        assert!(
+            retention.held(&dir).expect("the held set").is_empty(),
+            "the unlink freed nothing and the set says so anyway"
+        );
+    }
+
+    /// **An entity whose directory went whole is unlisted again, not
+    /// remembered.**
+    ///
+    /// Every other deleter of a proxy chunk goes through the owner one
+    /// chunk at a time and is booked as it goes. `proxy_cache`'s sibling
+    /// removal does not: a fill that finds the origin serving a different
+    /// resource takes the old entity off the disk with one `remove_dir_all`,
+    /// and a set that still named that directory's chunks would be the
+    /// dangerous direction a hundred chunks at a time. So the removal says
+    /// so, and what it says is "forget this", not "it holds nothing": an
+    /// unlisted entity is seeded from whatever is really at that path if
+    /// anything asks again.
+    #[test]
+    fn an_entity_removed_whole_is_forgotten_rather_than_emptied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = ChunkDir::new(tmp.path().join("entity"));
+        write_chunks(&dir, 0..4);
+
+        let retention = retention(None);
+        assert_eq!(retention.held(&dir).expect("the seed").len(), 4);
+
+        // The set does not watch the disk, which is the whole point of it
+        // and also the whole risk: what goes behind its back stays in it.
+        std::fs::remove_dir_all(dir.path()).unwrap();
+        assert_eq!(
+            retention.held(&dir).expect("the held set").len(),
+            4,
+            "a removal nothing told the owner about is a set that lies"
+        );
+
+        retention.forget(dir.path());
+        assert!(
+            retention
+                .held(&dir)
+                .expect("a directory that is not there lists empty")
+                .is_empty(),
+            "told about it, the owner unlists the entity and the next ask \
+             seeds it from the disk"
+        );
+    }
+
     /// A 4 MiB entity: sixteen chunks.
     const TOTAL: u64 = 16 * CHUNK_BYTES;
 
@@ -1231,11 +1895,40 @@ mod tests {
         Arc::new(ProxyRetention::new(budget, Arc::default(), Arc::default()))
     }
 
+    /// Chunks on the disk and in nobody's book: what a *previous* process
+    /// left, or what this one wrote before anything listed the entity.
+    ///
+    /// The held set has no opinion about these until it is seeded, which is
+    /// the point -- most of the tests here start from a directory that is
+    /// already full and let the first pass's seed discover it.
     fn write_chunks(dir: &ChunkDir, indices: impl IntoIterator<Item = u64>) {
         let bytes = vec![0u8; CHUNK_BYTES as usize];
         for index in indices {
             dir.write_whole(index, &bytes, Some(CHUNK_BYTES))
                 .expect("a chunk");
+        }
+    }
+
+    /// Chunks written the way `proxy_cache::Filler` writes them: through
+    /// [`ProxyRetention::counted`], so the count and the held set both hear
+    /// about them.
+    ///
+    /// The difference from [`write_chunks`] only shows once the entity has
+    /// been seeded, and then it is the whole difference: a chunk booked
+    /// here is one a pass can see and reclaim, and a chunk written round the
+    /// booking is one the owner does not know is there.
+    fn fill_chunks(
+        retention: &Arc<ProxyRetention>,
+        dir: &ChunkDir,
+        indices: impl IntoIterator<Item = u64>,
+    ) {
+        let bytes = vec![0u8; CHUNK_BYTES as usize];
+        for index in indices {
+            retention.counted(dir, index, || {
+                dir.write_whole(index, &bytes, Some(CHUNK_BYTES))
+                    .expect("a chunk");
+                (CHUNK_BYTES, OnDisk::Held)
+            });
         }
     }
 
