@@ -391,3 +391,42 @@ Order:
 7. The disk budget of section 4.
 8. The swap, as one commit -- which also deletes the told playhead, and so
    lands with xtremio.
+
+### Where this stands
+
+0-7 are built. Every one of them is Phase A: written, traced, obeyed by
+nothing, on both backings -- the torrent's reads come from `poll_read`'s
+delivered path, the proxy's from the cached body and from the fill, and both
+are answered at the pass, where the disk can be asked about.
+
+Three things came out of building it that the design above did not say.
+
+**A read's offset is inside its file, and the disk is listed by torrent
+piece.** The detector divided the offset by the piece length, which is the
+same number only for a file starting at torrent offset zero. On the second
+file of a pack it asked about a run tens of thousands of pieces from the
+read, found nothing held, and would have reported a stream per read for the
+whole session. A file's geometry is now kept beside its streams, stated by
+the pass, and every conversion goes through it.
+
+**The want set is computed on every pass, not only on the ones that report.**
+The grant is where the doubling happens, so computing it inside the
+ten-second trace throttle tied how fast a consumer is fetched for to how
+often the server writes a log line about it.
+
+**An entity's allowance is its own usage plus the volume's headroom**, and
+the headroom is published beside the cap by the one publisher, out of the
+same `statvfs`. Sizing a want set against the process-wide cap let one
+entity ask for the whole cache; sizing it against free space alone would
+never converge, which is the point section 4 makes and the reason our usage
+is in the formula.
+
+The configured `cacheSize` still binds above all of it. Removing it -- which
+section 4 argues for -- would let the policy that is still deciding grow the
+cache to the disk, so it goes with the swap, where the cache is bounded by
+the session instead.
+
+What step 8 needs before it is written is a field log: the whole of Phase A
+exists to say whether the detector sees two streams on a film with two
+tracks, what the measured rates actually are at that seam, and how much of
+an entity the exempt set would be holding. None of those has been read yet.
