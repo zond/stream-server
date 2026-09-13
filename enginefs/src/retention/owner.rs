@@ -484,6 +484,20 @@ pub trait Backing: Sized + Send + Sync + 'static {
     }
     /// **TEMPORARY**, with [`crate::retention::trace`] and deleted with it:
     /// what the backing can say about the entity that the owner cannot.
+    /// **Phase A only**: hand the backing the reads served since the last
+    /// pass, together with what the listing just found on the disk.
+    ///
+    /// Membership is a question about the disk -- a consumer is the
+    /// unbroken run of bytes it caused -- so it is answered here, where the
+    /// listing is, and not on the read path, which cannot reach one
+    /// cheaply. A read carries its own timestamps, so nothing is lost by
+    /// answering late; the pass is the first moment the question *can* be
+    /// answered.
+    ///
+    /// Defaulted to nothing: the proxy has the same shape and is not wired
+    /// to it yet. Goes out with `crate::retention::trace`.
+    fn observe_reads(&self, _domain: &Self::Domain, _held: &BTreeSet<u32>) {}
+
     fn trace(
         &self,
         _store: &Self::Store,
@@ -1948,6 +1962,11 @@ impl<B: Backing> Retention<B> {
             let state = entity.state.lock();
             return Self::nothing(&state, claim, about, Some(begin.at));
         };
+        // **Phase A**: the reads served since the last pass, answered
+        // against the listing above. Here because membership is a question
+        // about the disk and this is the first place in the pass that knows
+        // what is on it. Observed and obeyed by nothing.
+        self.backing.observe_reads(&begin.domain, &held);
         // 5. **The deciding reading, taken after the listing.** Read before
         // the walk the head is the older half of the pair: the window is
         // drawn round where playback *was*, everything the fill wrote ahead

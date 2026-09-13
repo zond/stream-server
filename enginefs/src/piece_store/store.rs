@@ -3363,7 +3363,9 @@ mod tests {
         let store = open_store(tmp.path(), PIECE_LENGTH, &SPECS);
         let global = global_bytes(store.layout().total_length());
         fill(&store, &global, 8);
-        store.init_for_tests().expect("seed the held set from the disk");
+        store
+            .init_for_tests()
+            .expect("seed the held set from the disk");
         let pieces = store.layout().piece_count();
         let whole = 0..pieces;
         let held = store.held().expect("a seeded store");

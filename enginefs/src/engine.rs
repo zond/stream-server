@@ -360,6 +360,11 @@ pub(crate) struct TorrentBacking<H: TorrentHandle> {
     /// property, and the owner asks about it before every pass and at every
     /// door.
     pinned: Arc<parking_lot::RwLock<BTreeSet<usize>>>,
+    /// **Phase A only**: the engine's read-pattern detector, shared the way
+    /// `live` and `pinned` are. The pass hands it the listing because
+    /// membership is a question about the disk; see
+    /// [`crate::retention::streams`].
+    streams: Arc<parking_lot::Mutex<crate::retention::streams::Streams>>,
     /// Whether the embedder named a pin set at boot, shared with the whole
     /// process ([`crate::piece_store::PinsUnknown`]). While it holds, the
     /// pin set is not "empty", it is *unknown*, and an owner that reclaimed
@@ -483,6 +488,29 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
 
     /// **TEMPORARY**, with [`crate::retention::trace`]: the counters the
     /// owner cannot read, and the piece length a lookahead is measured in.
+    /// **Phase A only.** Answer the reads kept since the last pass against
+    /// what the listing found, and say what the detector makes of them.
+    ///
+    /// Here rather than on the read path because membership is a question
+    /// about the disk -- a consumer is the unbroken run of bytes it caused
+    /// -- and `poll_read` cannot reach a listing cheaply. A read carries
+    /// its own timestamps, so answering late costs the answer nothing.
+    fn observe_reads(&self, domain: &FileDomain, held: &BTreeSet<u32>) {
+        let mut streams = self.streams.lock();
+        let rejected = streams.observe(held, &Self::extent(domain), domain.piece_length);
+        if !streams.report_due(std::time::Instant::now()) {
+            return;
+        }
+        crate::retention::trace::streams_seen(
+            &self.info_hash,
+            domain.file_idx,
+            &streams.counts(),
+            &streams.heads(domain.file_idx),
+            streams.last_sample(domain.file_idx),
+            rejected,
+        );
+    }
+
     fn trace(
         &self,
         store: &Arc<StoreRegistry>,
@@ -1023,7 +1051,7 @@ pub struct Engine<H: TorrentHandle> {
     /// those die with the HTTP response, and the thing being detected
     /// survives a reopen -- one that did not would report a new stream per
     /// reopen, manufacturing the very symptom this is measuring.
-    streams: parking_lot::Mutex<crate::retention::streams::Streams>,
+    streams: Arc<parking_lot::Mutex<crate::retention::streams::Streams>>,
     /// The retention owner for this torrent's files, keyed by file index:
     /// one policy per file, resident, with its turn beside it. What
     /// `announce`, the policy slot, its mirror and the playhead used to be
@@ -1094,6 +1122,7 @@ impl<H: TorrentHandle> Engine<H> {
             pinned: self.pinned_files.clone(),
             pins_unknown: self.pins_unknown.clone(),
             refused: self.refused_reclaims.clone(),
+            streams: self.streams.clone(),
         };
         let domain = backing.resolve(file_idx).await?;
         backing.held(store, &domain).await
@@ -1110,6 +1139,8 @@ impl<H: TorrentHandle> Engine<H> {
     ) -> Self {
         let pinned_files = Arc::new(parking_lot::RwLock::new(BTreeSet::new()));
         let refused_reclaims = Arc::new(AtomicUsize::new(0));
+        let streams: Arc<parking_lot::Mutex<crate::retention::streams::Streams>> =
+            Arc::new(parking_lot::Mutex::new(Default::default()));
         let retention = Retention::new(
             Arc::new(TorrentBacking {
                 handle: handle.clone(),
@@ -1118,6 +1149,7 @@ impl<H: TorrentHandle> Engine<H> {
                 pinned: pinned_files.clone(),
                 pins_unknown: pins_unknown.clone(),
                 refused: refused_reclaims.clone(),
+                streams: streams.clone(),
             }),
             budget,
         );
@@ -1150,7 +1182,7 @@ impl<H: TorrentHandle> Engine<H> {
             reads_refused: AtomicBool::new(false),
             read_wakers: parking_lot::Mutex::new(HashMap::new()),
             next_reader_id: AtomicU64::new(1),
-            streams: parking_lot::Mutex::new(Default::default()),
+            streams,
             retention,
             live,
             rest: tokio::sync::Mutex::new(()),
@@ -1311,19 +1343,7 @@ impl<H: TorrentHandle> Engine<H> {
         reader_id: u64,
         read: crate::retention::streams::Read,
     ) {
-        let mut streams = self.streams.lock();
-        let rejected = streams.observe(file_idx, reader_id, read);
-        if !streams.report_due(read.returned) {
-            return;
-        }
-        crate::retention::trace::streams_seen(
-            &self.info_hash,
-            file_idx,
-            &streams.counts(),
-            &streams.heads(file_idx),
-            streams.last_sample(file_idx),
-            rejected,
-        );
+        self.streams.lock().record(file_idx, reader_id, read);
     }
 
     pub fn reads_refused(&self) -> bool {
@@ -2184,6 +2204,7 @@ mod pin_tests {
                 pinned,
                 pins_unknown: Arc::default(),
                 refused: Arc::new(AtomicUsize::new(0)),
+                streams: Arc::default(),
             }),
             Arc::new(RetentionBudget::default()),
         )

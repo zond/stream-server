@@ -23,7 +23,8 @@
 //! [`Reading`]: super::owner::Reading
 //! [`PlaybackIntent`]: crate::backend::priorities::PlaybackIntent
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::ops::Range;
 use std::time::Instant;
 
 /// One read that was served, as the detector sees it.
@@ -88,6 +89,28 @@ pub(crate) enum Rejected {
     Outside,
 }
 
+/// The maximal unbroken stretch of `held` containing `piece`, inside
+/// `bound`, or `None` for a piece the disk does not have.
+///
+/// A plain set rather than the piece store's own bitfield, because the
+/// proxy's held set is a set of chunk indices and the rule is the same for
+/// both: what a consumer may reach back to is however much of the disk was
+/// kept behind it.
+fn run_containing(held: &BTreeSet<u32>, piece: u32, bound: &Range<u32>) -> Option<Range<u32>> {
+    if !bound.contains(&piece) || !held.contains(&piece) {
+        return None;
+    }
+    let mut start = piece;
+    while start > bound.start && held.contains(&(start - 1)) {
+        start -= 1;
+    }
+    let mut end = piece.saturating_add(1);
+    while end < bound.end && held.contains(&end) {
+        end = end.saturating_add(1);
+    }
+    Some(start..end)
+}
+
 /// Every stream detected on one file.
 #[derive(Debug, Default)]
 pub(crate) struct FileStreams {
@@ -98,48 +121,52 @@ impl FileStreams {
     /// Take account of one served read, and say why it had to start a new
     /// stream when it did.
     ///
-    /// **A read joins the stream whose last read ended nearest it, within
-    /// [`SAME_CONSUMER`].** The question being asked is not whether this
-    /// read continues the stream -- it is whether it is the same consumer,
-    /// and a consumer that re-reads, retries or scrubs back two seconds is
-    /// still one playhead.
+    /// **A read joins the stream that is in the same unbroken stretch of
+    /// disk it is.** A consumer *is* the run of bytes it caused to be
+    /// there, so two reads belong to one consumer exactly when the disk
+    /// between them is whole, and a hole an eviction left is what ends one.
     ///
-    /// An earlier rule asked instead whether the read began inside
-    /// everything the stream had served and reached past all of it. That is
-    /// right at the granularity the design was drawn at, a whole HTTP
-    /// response, and wrong at the granularity reads actually arrive: one
-    /// read is at most the 256 KiB the response asks for, and a reopened
-    /// connection resumes 1.15 MB to 9.0 MB behind where we stopped
-    /// sending, so its first dozen reads are entirely inside what the old
-    /// one served and none of them reaches past it. The field said so
-    /// plainly -- a stream served to 6,149,382,662, a reopen at
-    /// 6,146,281,365 whose first read ended at 6,146,543,509, and 43
-    /// streams reported on a film with two tracks.
+    /// Which makes the tolerance a measurement rather than a choice, and
+    /// scales it the right way: a cache with room holds a long run, so a
+    /// scrub back lands inside it and is the same viewer; a cache under
+    /// pressure holds a short one, so the same scrub lands outside and is a
+    /// new consumer that has to be fetched for. Bigger disks behave better,
+    /// with no number anywhere.
     ///
-    /// The same rule caught the other half of that log: a consumer blocked
-    /// on a missing piece retries from a few bytes further back and every
-    /// read ends at the same byte, so each is a strict subset of the last
-    /// and each opened a stream of its own. Twenty of them, all at
-    /// 23,320,330,240.
+    /// Three rules preceded it, each guessing that distance in bytes, each
+    /// wrong in a way the last one could not have predicted. The span of
+    /// everything a stream had served merged two tracks as soon as one
+    /// connection ran long enough to span them. Sixteen megabytes from the
+    /// last read is four and a half seconds of one film and thirty-two of
+    /// another. What a single connection had served grows without bound on
+    /// a connection nobody closes. See `docs/read-pattern-retention.md`.
     ///
-    /// Two tracks stay apart without the extends-past clause, because they
-    /// are twenty gigabytes apart and [`SAME_CONSUMER`] is sixteen
-    /// megabytes.
-    fn observe(&mut self, reader: u64, read: Read) -> Option<Rejected> {
+    /// The read's **begin** is what is looked up, not its end. A consumer
+    /// blocked on a missing piece serves up to the hole and stops, so its
+    /// end is the first byte it does *not* have -- in no run by definition,
+    /// and the reason the field showed twenty separate streams all ending
+    /// at 23,320,330,240. Where it started is where it was.
+    fn observe(
+        &mut self,
+        reader: u64,
+        read: Read,
+        held: &BTreeSet<u32>,
+        bound: &Range<u32>,
+        piece: u64,
+    ) -> Option<Rejected> {
         // Before the join, so an expired stream cannot be resumed and a new
         // one starting where it left off is reported honestly as new.
         let now = read.returned;
         self.streams
             .retain(|stream| now.saturating_duration_since(stream.seen) < STREAM_IDLE);
 
-        let nearest = self
-            .streams
-            .iter()
-            .enumerate()
-            .map(|(index, stream)| (index, stream.last.end.abs_diff(read.begin)))
-            .filter(|(_, apart)| *apart <= SAME_CONSUMER)
-            .min_by_key(|(_, apart)| *apart)
-            .map(|(index, _)| index);
+        let at = |offset: u64| u32::try_from(offset / piece.max(1)).unwrap_or(u32::MAX);
+        let run = run_containing(held, at(read.begin), bound);
+        let nearest = run.and_then(|run| {
+            self.streams
+                .iter()
+                .position(|stream| run.contains(&at(stream.end.saturating_sub(1))))
+        });
 
         if let Some(index) = nearest {
             let stream = &mut self.streams[index];
@@ -193,27 +220,14 @@ const REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 /// than a viewer's pause.
 const STREAM_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// How near a stream's last read another has to land to be the same
-/// consumer.
-///
-/// Wider than the socket overhang and far narrower than a seek, which is
-/// the whole of it. A reopened connection resumes where the *player*
-/// stopped consuming rather than where we stopped sending, and the gap is
-/// whatever we had written into the socket that it never read: 1.15 MB to
-/// 9.0 MB over the session this was measured on, never once ahead. A real
-/// seek is gigabytes. Sixteen megabytes sits between them with room either
-/// side, and is about four seconds of this film.
-///
-/// It admits a scrub back of a second or two, which joins rather than
-/// starting a stream. That is the right answer: the same viewer at
-/// essentially the same place is one playhead, and the window should stay
-/// where it is.
-const SAME_CONSUMER: u64 = 16 * 1024 * 1024;
-
 /// The detected streams of one entity, by file index.
 #[derive(Debug, Default)]
 pub(crate) struct Streams {
     by_file: HashMap<usize, FileStreams>,
+    /// Reads served since the last pass, awaiting a listing to be answered
+    /// against. A read carries its own timestamps, so waiting costs the
+    /// answer nothing.
+    pending: Vec<(usize, u64, Read)>,
     /// When the last report went out, or `None` having said nothing yet.
     reported: Option<Instant>,
 }
@@ -235,8 +249,30 @@ impl Streams {
         }
         due
     }
-    pub(crate) fn observe(&mut self, file: usize, reader: u64, read: Read) -> Option<Rejected> {
-        self.by_file.entry(file).or_default().observe(reader, read)
+    /// Keep a served read until a pass can say which consumer it belonged
+    /// to. The read path cannot answer that: membership is a question about
+    /// the disk, and the disk's answer is a listing away.
+    pub(crate) fn record(&mut self, file: usize, reader: u64, read: Read) {
+        self.pending.push((file, reader, read));
+    }
+
+    /// Answer every read kept since the last pass against `held`, and say
+    /// what the most recent one had to do.
+    pub(crate) fn observe(
+        &mut self,
+        held: &BTreeSet<u32>,
+        bound: &Range<u32>,
+        piece: u64,
+    ) -> Option<Rejected> {
+        let mut last = None;
+        for (file, reader, read) in std::mem::take(&mut self.pending) {
+            last = self
+                .by_file
+                .entry(file)
+                .or_default()
+                .observe(reader, read, held, bound, piece);
+        }
+        last
     }
 
     /// How many streams are open on each file, for the trace line.
@@ -293,6 +329,19 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    /// The field film's geometry: 4 MiB pieces over 23,346,250,742 bytes.
+    const PIECE: u64 = 4 * 1024 * 1024;
+    const PIECES: u32 = 5_566;
+
+    fn whole() -> Range<u32> {
+        0..PIECES
+    }
+
+    /// A disk holding every piece of `runs` and nothing else.
+    fn disk(runs: &[Range<u32>]) -> BTreeSet<u32> {
+        runs.iter().flat_map(|run| run.clone()).collect()
+    }
+
     fn at(t0: Instant, secs: u64) -> Instant {
         t0 + Duration::from_secs(secs)
     }
@@ -306,181 +355,249 @@ mod tests {
         }
     }
 
-    /// **A reopened connection continues the stream it resumed, from its
-    /// very first read.**
+    /// **A reopened connection continues the stream it resumed**, however
+    /// far behind it lands, so long as the disk between is whole.
     ///
-    /// The case the field disproved the old rule on. A player does not
-    /// resume where we stopped sending; it resumes where it stopped
-    /// consuming, and the gap is what we had written into the socket that
-    /// it never read -- 1.15 MB to 9.0 MB over the measured session. But a
-    /// single read is at most 256 KiB, so the resuming connection's first
-    /// reads are all *behind* where the old one got to, and a rule asking
-    /// "does this reach past what we served?" rejects every one of them.
-    /// The numbers here are a real reopen from that log, where it opened a
-    /// second stream and then eleven more.
+    /// The numbers are a real reopen from the field: a stream served to
+    /// 6,149,382,662 and a connection resuming 3.1 MB behind it, whose
+    /// first read ends well short of where the old one got to. Three
+    /// earlier rules each judged that distance and each was wrong about it;
+    /// this one does not judge it at all, it asks whether the bytes in
+    /// between are there.
     #[test]
-    fn a_reopen_behind_our_send_position_continues_the_stream_at_once() {
+    fn a_reopen_behind_our_send_position_continues_the_stream() {
         let t0 = Instant::now();
+        let held = disk(&[1_460..1_470]);
         let mut streams = FileStreams::default();
 
-        // Served to 6,149,382,662 on one connection, 256 KiB at a time.
         assert_eq!(
-            streams.observe(1, read(6_149_120_518, 6_149_382_662, t0, 0)),
-            Some(Rejected::Outside)
+            streams.observe(
+                1,
+                read(6_149_120_518, 6_149_382_662, t0, 0),
+                &held,
+                &whole(),
+                PIECE
+            ),
+            Some(Rejected::Outside),
+            "the first read of a session joins nothing"
         );
-        // The player reopens 3.1 MB behind that. Its first read ends well
-        // short of where we had got to.
         assert_eq!(
-            streams.observe(2, read(6_146_281_365, 6_146_543_509, t0, 1)),
+            streams.observe(
+                2,
+                read(6_146_281_365, 6_146_543_509, t0, 1),
+                &held,
+                &whole(),
+                PIECE
+            ),
             None,
-            "the same consumer, three megabytes back, on its first read"
+            "and the reopen behind it is the same consumer: the disk is whole between them"
         );
-
         assert_eq!(streams.streams.len(), 1);
-        assert_eq!(
-            streams.streams[0].end, 6_146_543_509,
-            "and the stream is where the consumer is, not where it had got to"
+    }
+
+    /// **A hole in the disk is what ends a stream**, and it is the only
+    /// thing that does.
+    ///
+    /// The same two reads, on a disk an eviction has broken between them.
+    /// Nothing about the consumer changed; what changed is what was kept,
+    /// and that is the whole of the rule. It is also why a big cache
+    /// behaves better than a small one with no number anywhere: more room
+    /// means longer runs means a scrub back is still the same viewer.
+    #[test]
+    fn a_hole_between_two_reads_makes_them_two_consumers() {
+        let t0 = Instant::now();
+        // The reads are in pieces 1466 and 1465; the eviction took 1465
+        // itself, which is both the hole and where the reopen lands.
+        let held = disk(&[1_460..1_465, 1_466..1_470]);
+        let mut streams = FileStreams::default();
+
+        streams.observe(
+            1,
+            read(6_149_120_518, 6_149_382_662, t0, 0),
+            &held,
+            &whole(),
+            PIECE,
         );
+        assert_eq!(
+            streams.observe(
+                2,
+                read(6_146_281_365, 6_146_543_509, t0, 1),
+                &held,
+                &whole(),
+                PIECE
+            ),
+            Some(Rejected::Outside),
+            "the run the reopen landed in is not the run the stream is in"
+        );
+        assert_eq!(streams.streams.len(), 2);
     }
 
     /// **A consumer stuck on a missing piece is one stream, not one per
     /// retry.**
     ///
     /// Every read ends at the same byte -- the boundary of the piece it is
-    /// blocked on -- while its start creeps forward a few dozen bytes per
-    /// attempt, so each read is a strict subset of the one before. Asking
-    /// whether a read reaches past what the stream served makes every
-    /// attempt a new stream: the field log has twenty of them, all ending
-    /// at 23,320,330,240.
+    /// blocked on -- while its start creeps forward a few dozen bytes an
+    /// attempt. The field showed twenty streams there, all ending at
+    /// 23,320,330,240. What the rule looks up is where a read *began*,
+    /// which is in the run; where it ended is the first byte it does not
+    /// have, which is in no run by definition.
     #[test]
     fn a_consumer_retrying_a_blocked_piece_stays_one_stream() {
         let t0 = Instant::now();
-        let mut streams = FileStreams::default();
+        // Held up to the boundary of piece 5560, and not beyond.
+        let held = disk(&[5_556..5_560]);
         let boundary = 23_320_330_240;
+        let mut streams = FileStreams::default();
 
         for (attempt, begin) in [
             23_320_306_052u64,
             23_320_306_078,
             23_320_306_166,
             23_320_306_260,
-            23_320_306_321,
         ]
         .into_iter()
         .enumerate()
         {
-            let outcome = streams.observe(2, read(begin, boundary, t0, attempt as u64));
+            let outcome = streams.observe(
+                2,
+                read(begin, boundary, t0, attempt as u64),
+                &held,
+                &whole(),
+                PIECE,
+            );
             if attempt == 0 {
                 assert_eq!(outcome, Some(Rejected::Outside), "the first one is new");
             } else {
                 assert_eq!(outcome, None, "every retry after it is the same consumer");
             }
         }
-
         assert_eq!(streams.streams.len(), 1);
-        assert_eq!(streams.streams[0].reads, 5);
+        assert_eq!(streams.streams[0].reads, 4);
     }
 
-    /// **Two tracks twenty gigabytes apart are two streams.**
-    ///
-    /// What the whole design is for, and it needs no clause of its own:
-    /// they are further apart than any consumer can be from itself.
+    /// **Two tracks are two streams**, and need no clause of their own: the
+    /// film's run and the second track's are different runs.
     #[test]
-    fn a_second_track_far_from_the_film_is_its_own_stream() {
+    fn a_second_track_in_another_run_is_its_own_stream() {
         let t0 = Instant::now();
+        let held = disk(&[1_460..1_470, 5_556..5_560]);
         let mut streams = FileStreams::default();
 
-        streams.observe(1, read(6_149_120_518, 6_149_382_662, t0, 0));
-        assert_eq!(
-            streams.observe(2, read(23_320_289_113, 23_320_330_240, t0, 1)),
-            Some(Rejected::Outside),
-            "twenty gigabytes is not the same playhead"
+        streams.observe(
+            1,
+            read(6_149_120_518, 6_149_382_662, t0, 0),
+            &held,
+            &whole(),
+            PIECE,
         );
-
+        assert_eq!(
+            streams.observe(
+                2,
+                read(23_320_289_113, 23_320_330_240, t0, 1),
+                &held,
+                &whole(),
+                PIECE
+            ),
+            Some(Rejected::Outside),
+            "twenty gigabytes away, and a different stretch of disk"
+        );
         assert_eq!(streams.streams.len(), 2, "two tracks, two streams");
     }
 
-    /// A real seek is a new stream; a scrub of a second or two is not.
-    ///
-    /// The tolerance has one job, to sit between the socket overhang and a
-    /// seek. Four seconds of this film is inside it and deliberately so --
-    /// the same viewer at essentially the same place is one playhead, and
-    /// the window should stay where it is.
+    /// A read into territory the disk does not hold is a new consumer: it
+    /// is in no run, so it is in no stream, and something has to fetch for
+    /// it.
     #[test]
-    fn a_seek_starts_a_stream_and_a_scrub_does_not() {
+    fn a_read_of_what_we_do_not_hold_is_a_new_consumer() {
         let t0 = Instant::now();
+        let held = disk(&[1_460..1_470]);
         let mut streams = FileStreams::default();
-        streams.observe(1, read(6_000_000_000, 6_000_262_144, t0, 0));
+        streams.observe(
+            1,
+            read(6_149_120_518, 6_149_382_662, t0, 0),
+            &held,
+            &whole(),
+            PIECE,
+        );
 
         assert_eq!(
-            streams.observe(1, read(5_998_000_000, 5_998_262_144, t0, 1)),
-            None,
-            "two megabytes back is the same viewer"
-        );
-        assert_eq!(
-            streams.observe(2, read(1_000_000_000, 1_000_262_144, t0, 2)),
-            Some(Rejected::Outside),
-            "five gigabytes back is a seek"
+            streams.observe(
+                1,
+                read(1_000_000_000, 1_000_262_144, t0, 1),
+                &held,
+                &whole(),
+                PIECE
+            ),
+            Some(Rejected::Outside)
         );
         assert_eq!(streams.streams.len(), 2);
     }
 
-    /// **Nearness is to the stream's last read, not to how far it ever
-    /// got.**
-    ///
-    /// The two are the same until a consumer works behind its own reach,
-    /// which is what a reopen and a scrub both do. A viewer scrubbing back
-    /// twice over is one viewer: measured from the last read each step is
-    /// small, measured from the high-water mark they accumulate, and the
-    /// second step lands outside a tolerance the first was well inside.
-    #[test]
-    fn nearness_is_to_the_last_read_and_not_to_the_high_water_mark() {
-        let t0 = Instant::now();
-        let mut streams = FileStreams::default();
-        streams.observe(1, read(6_200_000_000, 6_200_262_144, t0, 0));
-
-        // Back fifteen megabytes: inside the tolerance either way.
-        assert_eq!(
-            streams.observe(1, read(6_185_000_000, 6_185_262_144, t0, 1)),
-            None
-        );
-        // And fifteen more. Thirty from where the stream reached, fifteen
-        // from where it actually is.
-        assert_eq!(
-            streams.observe(1, read(6_170_000_000, 6_170_262_144, t0, 2)),
-            None,
-            "still the same viewer, however far the stream once got"
-        );
-
-        assert_eq!(streams.streams.len(), 1);
-        assert_eq!(
-            streams.streams[0].end, 6_170_262_144,
-            "and it is where the viewer scrubbed to"
-        );
-    }
-
     /// Reads within one connection are exactly contiguous -- `ReadCursor`
-    /// advances by what each delivered -- so the ordinary case joins with
-    /// nothing between them at all.
+    /// advances by what each delivered -- and all inside one run.
     #[test]
     fn consecutive_reads_of_one_connection_are_one_stream() {
         let t0 = Instant::now();
+        let held = disk(&[0..4]);
         let mut streams = FileStreams::default();
-        streams.observe(7, read(0, 262_144, t0, 0));
+        streams.observe(7, read(0, 262_144, t0, 0), &held, &whole(), PIECE);
         for chunk in 1..4u64 {
             assert_eq!(
-                streams.observe(7, read(chunk * 262_144, (chunk + 1) * 262_144, t0, chunk)),
+                streams.observe(
+                    7,
+                    read(chunk * 262_144, (chunk + 1) * 262_144, t0, chunk),
+                    &held,
+                    &whole(),
+                    PIECE
+                ),
                 None
             );
         }
-
         assert_eq!(streams.streams.len(), 1);
         assert_eq!(streams.streams[0].reads, 4);
-        assert_eq!(streams.streams[0].end, 4 * 262_144);
     }
 
-    /// The report is throttled on the detector's own clock, not on a global
-    /// one: a test must be able to drive it without sleeping, and two
-    /// entities reporting must not silence each other.
+    /// **A stream nothing has read from stops being one.**
+    ///
+    /// Without it a two-hour film accumulates a stream per seek for the
+    /// whole session, and the count the field log is read for stops meaning
+    /// anything. Pruned before the join, so an expired stream cannot be
+    /// resumed by a read that happens to land in its old run.
+    #[test]
+    fn a_stream_nothing_has_read_from_stops_being_one() {
+        let t0 = Instant::now();
+        let held = disk(&[0..4, 2_000..2_004]);
+        let mut streams = FileStreams::default();
+        streams.observe(1, read(0, 262_144, t0, 0), &held, &whole(), PIECE);
+        streams.observe(
+            2,
+            read(8_388_608_000, 8_388_870_144, t0, 1),
+            &held,
+            &whole(),
+            PIECE,
+        );
+        assert_eq!(streams.streams.len(), 2);
+
+        assert_eq!(
+            streams.observe(1, read(262_144, 524_288, t0, 20), &held, &whole(), PIECE),
+            None
+        );
+        assert_eq!(streams.streams.len(), 2, "twenty seconds is not idle yet");
+
+        assert_eq!(
+            streams.observe(1, read(524_288, 786_432, t0, 40), &held, &whole(), PIECE),
+            None
+        );
+        assert_eq!(
+            streams.streams.len(),
+            1,
+            "the one that stopped reading is gone; the one that did not is not"
+        );
+    }
+
+    /// The report is throttled on the detector's own clock, not a global
+    /// one: a test must drive it without sleeping, and two entities
+    /// reporting must not silence each other.
     #[test]
     fn a_report_waits_for_its_interval() {
         let t0 = Instant::now();
@@ -500,9 +617,11 @@ mod tests {
     #[test]
     fn two_files_do_not_share_a_stream() {
         let t0 = Instant::now();
+        let held = disk(&[0..4]);
         let mut streams = Streams::default();
-        streams.observe(0, 1, read(0, 262_144, t0, 0));
-        streams.observe(1, 2, read(0, 262_144, t0, 1));
+        streams.record(0, 1, read(0, 262_144, t0, 0));
+        streams.record(1, 2, read(0, 262_144, t0, 1));
+        streams.observe(&held, &whole(), PIECE);
 
         assert_eq!(streams.counts(), vec![(0, 1), (1, 1)]);
     }
