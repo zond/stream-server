@@ -54,6 +54,20 @@ use crate::piece_store::{DeleteOutcome, HeldSnapshot, StoreRegistry};
 
 pub mod live;
 pub mod owner;
+/// The scenario harness and the fake backing every retention test is built
+/// over. **Test-only**, and a sibling of [`owner`] rather than a part of it
+/// on purpose: the policy in `owner` is being replaced whole
+/// (`docs/read-pattern-retention.md`), the replacement has to be proved
+/// against the same scenarios, and a fixture that lived inside the module
+/// being replaced would have to move -- taking its scenarios with it -- at
+/// the moment the comparison matters most.
+#[cfg(test)]
+pub(crate) mod scenario;
+/// What is asked of the harness: scenarios that are statements about a
+/// cache rather than about an implementation, so the same file measures the
+/// policy that replaces this one.
+#[cfg(test)]
+mod scenarios;
 pub(crate) mod streams;
 pub mod trace;
 
