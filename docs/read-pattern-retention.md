@@ -394,39 +394,39 @@ Order:
 
 ### Where this stands
 
-0-7 are built. Every one of them is Phase A: written, traced, obeyed by
-nothing, on both backings -- the torrent's reads come from `poll_read`'s
-delivered path, the proxy's from the cached body and from the fill, and both
-are answered at the pass, where the disk can be asked about.
+**Landed.** 0-8: the detector, the ledger, the exempt bitmap, the disk
+budget, and the swap. What a pass keeps, fetches and gives back is now an
+answer about what an entity's consumers are doing, on both backings, and
+the told playhead is gone from both repos.
 
-Three things came out of building it that the design above did not say.
+The five scenarios that reproduced the field failure are inverted: no pass
+plans inside an open stream's lookahead, the second track's pieces stay
+once it has read them, nothing is taken and paid for again, its pieces are
+ordered while it is reading, and it does not block on a piece a pass took.
 
-**A read's offset is inside its file, and the disk is listed by torrent
-piece.** The detector divided the offset by the piece length, which is the
-same number only for a file starting at torrent offset zero. On the second
-file of a pack it asked about a run tens of thousands of pieces from the
-read, found nothing held, and would have reported a stream per read for the
-whole session. A file's geometry is now kept beside its streams, stated by
-the pass, and every conversion goes through it.
+**What the field log changed.** Section 1 said the rate was measured from
+what a consumer ate over the gap between reads. It is not measurable that
+way: a starving player asks again the instant it is answered, so the gap
+measures our delivery -- 262,144 bytes across a gap the log printed as
+`gap_ms=0`, which read as five to eighteen gigabytes a second and asked for
+the whole film. The absolute number is now arithmetic (size over duration)
+and the measurement is a correction that can only lower it, admitted by a
+rule with no constant in it: a read that comes back sooner than the picture
+it was carrying is a player catching up, not a player consuming.
 
-**The want set is computed on every pass, not only on the ones that report.**
-The grant is where the doubling happens, so computing it inside the
-ten-second trace throttle tied how fast a consumer is fetched for to how
-often the server writes a log line about it.
+**What the swap deviates from section 5.** `PlaybackIntent` stays: its
+remaining job is sizing the lookahead librqbit grants a stream, which is
+not a retention decision. `Reading` stays: its remaining job is saying
+whose delivered byte is the entity's remembered position. `window_at` and
+`ahead_of` stay as arithmetic over a `Shape`, which is what sets a pass's
+stride.
 
-**An entity's allowance is its own usage plus the volume's headroom**, and
-the headroom is published beside the cap by the one publisher, out of the
-same `statvfs`. Sizing a want set against the process-wide cap let one
-entity ask for the whole cache; sizing it against free space alone would
-never converge, which is the point section 4 makes and the reason our usage
-is in the formula.
+**Measured, not claimed.** The disk peaks at 71 pieces of a 64-piece budget
+on the torrent -- a stream's own lookahead is never taken, and what the
+fill wrote since the last pass is on the disk when a reading is taken. On
+the proxy it sits at about twice the cap while a body is open: an open body
+has been promised every chunk its `Content-Length` covers, and those are
+bytes a player has already been told it is being sent. Framing shorter
+responses is the only thing that would bring it down, and that is not a
+retention change.
 
-The configured `cacheSize` still binds above all of it. Removing it -- which
-section 4 argues for -- would let the policy that is still deciding grow the
-cache to the disk, so it goes with the swap, where the cache is bounded by
-the session instead.
-
-What step 8 needs before it is written is a field log: the whole of Phase A
-exists to say whether the detector sees two streams on a film with two
-tracks, what the measured rates actually are at that seam, and how much of
-an entity the exempt set would be holding. None of those has been read yet.
