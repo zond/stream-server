@@ -342,6 +342,11 @@ mod tests {
         runs.iter().flat_map(|run| run.clone()).collect()
     }
 
+    /// A disk holding one unbroken run.
+    fn run(pieces: Range<u32>) -> BTreeSet<u32> {
+        pieces.collect()
+    }
+
     fn at(t0: Instant, secs: u64) -> Instant {
         t0 + Duration::from_secs(secs)
     }
@@ -367,7 +372,7 @@ mod tests {
     #[test]
     fn a_reopen_behind_our_send_position_continues_the_stream() {
         let t0 = Instant::now();
-        let held = disk(&[1_460..1_470]);
+        let held = run(1_460..1_470);
         let mut streams = FileStreams::default();
 
         assert_eq!(
@@ -445,7 +450,7 @@ mod tests {
     fn a_consumer_retrying_a_blocked_piece_stays_one_stream() {
         let t0 = Instant::now();
         // Held up to the boundary of piece 5560, and not beyond.
-        let held = disk(&[5_556..5_560]);
+        let held = run(5_556..5_560);
         let boundary = 23_320_330_240;
         let mut streams = FileStreams::default();
 
@@ -510,7 +515,7 @@ mod tests {
     #[test]
     fn a_read_of_what_we_do_not_hold_is_a_new_consumer() {
         let t0 = Instant::now();
-        let held = disk(&[1_460..1_470]);
+        let held = run(1_460..1_470);
         let mut streams = FileStreams::default();
         streams.observe(
             1,
@@ -538,7 +543,7 @@ mod tests {
     #[test]
     fn consecutive_reads_of_one_connection_are_one_stream() {
         let t0 = Instant::now();
-        let held = disk(&[0..4]);
+        let held = run(0..4);
         let mut streams = FileStreams::default();
         streams.observe(7, read(0, 262_144, t0, 0), &held, &whole(), PIECE);
         for chunk in 1..4u64 {
@@ -617,7 +622,7 @@ mod tests {
     #[test]
     fn two_files_do_not_share_a_stream() {
         let t0 = Instant::now();
-        let held = disk(&[0..4]);
+        let held = run(0..4);
         let mut streams = Streams::default();
         streams.record(0, 1, read(0, 262_144, t0, 0));
         streams.record(1, 2, read(0, 262_144, t0, 1));
