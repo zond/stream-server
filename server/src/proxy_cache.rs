@@ -1182,7 +1182,8 @@ impl Filler {
         // growing and the window is what bounds that growth.
         if self.offset > 0 {
             self.reader.note(self.offset - 1);
-            self.reader.note_read(from, self.offset, at, std::time::Instant::now());
+            self.reader
+                .note_read(from, self.offset, at, std::time::Instant::now());
         }
     }
 }

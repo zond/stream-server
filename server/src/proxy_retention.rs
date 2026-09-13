@@ -217,7 +217,6 @@ type Detectors = Arc<Mutex<HashMap<PathBuf, enginefs::retention::streams::Stream
 /// start there are no entities, so there is no URL to read back -- which is
 /// true, this process has relayed nothing yet.
 
-
 #[derive(Clone, PartialEq)]
 struct ProxyDomain {
     dir: ChunkDir,
@@ -399,7 +398,9 @@ impl Backing for ProxyBacking {
         let Ok(mut detectors) = self.detectors.lock() else {
             return;
         };
-        let streams = detectors.entry(domain.dir.path().to_path_buf()).or_default();
+        let streams = detectors
+            .entry(domain.dir.path().to_path_buf())
+            .or_default();
         // The proxy's entity is one file starting at its own beginning, so
         // its geometry is the trivial one -- and it is still stated, because
         // the detector converts every offset through it.
@@ -414,11 +415,8 @@ impl Backing for ProxyBacking {
         if !streams.report_due(now) {
             return;
         }
-        let (tracked, coldest) = streams.coldest(
-            now,
-            &want,
-            enginefs::retention::streams::COLDEST_REPORTED,
-        );
+        let (tracked, coldest) =
+            streams.coldest(now, &want, enginefs::retention::streams::COLDEST_REPORTED);
         enginefs::retention::trace::streams_seen(enginefs::retention::trace::StreamsSeen {
             // The entity's directory, which is what the proxy is keyed by
             // and the only name it has: there is no info hash here.
@@ -1476,7 +1474,13 @@ impl Reader {
     /// consumer runs from one read's return to the next one's arrival: any
     /// pairing that spans our own fetch books an origin's latency as the
     /// player thinking.
-    pub(crate) fn note_read(&self, begin: u64, end: u64, arrived: std::time::Instant, returned: std::time::Instant) {
+    pub(crate) fn note_read(
+        &self,
+        begin: u64,
+        end: u64,
+        arrived: std::time::Instant,
+        returned: std::time::Instant,
+    ) {
         if self.total == 0 || end <= begin {
             return;
         }

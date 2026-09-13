@@ -2315,7 +2315,12 @@ mod pin_tests {
                 returned: t0,
             },
         );
-        backing.observe_reads(&domain, &held, crate::retention::CacheBudget::Unbounded, None);
+        backing.observe_reads(
+            &domain,
+            &held,
+            crate::retention::CacheBudget::Unbounded,
+            None,
+        );
         let first = streams.lock().held_by_streams(0);
 
         // One second later, a piece further on: a measured rate, and a pass
@@ -2330,7 +2335,12 @@ mod pin_tests {
                 returned: t0 + std::time::Duration::from_secs(1),
             },
         );
-        backing.observe_reads(&domain, &held, crate::retention::CacheBudget::Unbounded, None);
+        backing.observe_reads(
+            &domain,
+            &held,
+            crate::retention::CacheBudget::Unbounded,
+            None,
+        );
         let second = streams.lock().held_by_streams(0);
 
         assert!(

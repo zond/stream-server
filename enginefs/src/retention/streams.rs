@@ -427,12 +427,7 @@ impl FileStreams {
     /// its own demand against the whole allowance would be promised it
     /// alone, and two files being read would together promise twice the
     /// disk there is.
-    fn grant(
-        &mut self,
-        seconds: u64,
-        piece: u64,
-        share: impl Fn(u64) -> u64,
-    ) -> Vec<Range<u32>> {
+    fn grant(&mut self, seconds: u64, piece: u64, share: impl Fn(u64) -> u64) -> Vec<Range<u32>> {
         let floor = FLOOR_PIECES.saturating_mul(piece);
         for stream in &mut self.streams {
             let target = share(stream.rate.unwrap_or(0).saturating_mul(seconds));
@@ -530,12 +525,7 @@ impl Streams {
 
     /// Answer every read kept since the last pass against `held`, and say
     /// what the most recent one had to do.
-    pub fn observe(
-        &mut self,
-        held: &BTreeSet<u32>,
-        piece: u64,
-        now: Instant,
-    ) -> Option<Rejected> {
+    pub fn observe(&mut self, held: &BTreeSet<u32>, piece: u64, now: Instant) -> Option<Rejected> {
         // The listing first, so a read of a piece that arrived this pass
         // finds it in the ledger to stamp.
         self.ledger.settle(held, now);
@@ -567,12 +557,7 @@ impl Streams {
     /// What the LRU would give up first, and how many pieces it is watching
     /// -- exempting everything inside a window the streams want, which is
     /// the tier above it.
-    pub fn coldest(
-        &self,
-        now: Instant,
-        want: &[Range<u32>],
-        how_many: usize,
-    ) -> (usize, Vec<u32>) {
+    pub fn coldest(&self, now: Instant, want: &[Range<u32>], how_many: usize) -> (usize, Vec<u32>) {
         let exempt = |piece: u32| want.iter().any(|window| window.contains(&piece));
         (
             self.ledger.len(),
@@ -634,7 +619,11 @@ impl Streams {
     pub fn want(&mut self, file: usize, seconds: u64, budget: u64, piece: u64) -> Vec<Range<u32>> {
         // The demand of everything being read, so the sharing is over the
         // entity and not over one file of it.
-        let asked: u64 = self.by_file.values().map(|streams| streams.asked(seconds)).sum();
+        let asked: u64 = self
+            .by_file
+            .values()
+            .map(|streams| streams.asked(seconds))
+            .sum();
         // One factor for every stream of every file, which is what makes
         // the shares equal in seconds. Nothing to scale when it all fits.
         let share = |want: u64| {
@@ -758,22 +747,12 @@ mod tests {
         let mut streams = file_at(0);
 
         assert_eq!(
-            streams.observe(
-                1,
-                read(6_149_120_518, 6_149_382_662, t0, 0),
-                &held,
-                PIECE
-            ),
+            streams.observe(1, read(6_149_120_518, 6_149_382_662, t0, 0), &held, PIECE),
             Some(Rejected::Outside),
             "the first read of a session joins nothing"
         );
         assert_eq!(
-            streams.observe(
-                2,
-                read(6_146_281_365, 6_146_543_509, t0, 1),
-                &held,
-                PIECE
-            ),
+            streams.observe(2, read(6_146_281_365, 6_146_543_509, t0, 1), &held, PIECE),
             None,
             "and the reopen behind it is the same consumer: the disk is whole between them"
         );
@@ -796,19 +775,9 @@ mod tests {
         let held = disk(&[1_460..1_465, 1_466..1_470]);
         let mut streams = file_at(0);
 
-        streams.observe(
-            1,
-            read(6_149_120_518, 6_149_382_662, t0, 0),
-            &held,
-            PIECE,
-        );
+        streams.observe(1, read(6_149_120_518, 6_149_382_662, t0, 0), &held, PIECE);
         assert_eq!(
-            streams.observe(
-                2,
-                read(6_146_281_365, 6_146_543_509, t0, 1),
-                &held,
-                PIECE
-            ),
+            streams.observe(2, read(6_146_281_365, 6_146_543_509, t0, 1), &held, PIECE),
             Some(Rejected::Outside),
             "the run the reopen landed in is not the run the stream is in"
         );
@@ -841,12 +810,8 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let outcome = streams.observe(
-                2,
-                read(begin, boundary, t0, attempt as u64),
-                &held,
-                PIECE,
-            );
+            let outcome =
+                streams.observe(2, read(begin, boundary, t0, attempt as u64), &held, PIECE);
             if attempt == 0 {
                 assert_eq!(outcome, Some(Rejected::Outside), "the first one is new");
             } else {
@@ -865,19 +830,9 @@ mod tests {
         let held = disk(&[1_460..1_470, 5_556..5_560]);
         let mut streams = file_at(0);
 
-        streams.observe(
-            1,
-            read(6_149_120_518, 6_149_382_662, t0, 0),
-            &held,
-            PIECE,
-        );
+        streams.observe(1, read(6_149_120_518, 6_149_382_662, t0, 0), &held, PIECE);
         assert_eq!(
-            streams.observe(
-                2,
-                read(23_320_289_113, 23_320_330_240, t0, 1),
-                &held,
-                PIECE
-            ),
+            streams.observe(2, read(23_320_289_113, 23_320_330_240, t0, 1), &held, PIECE),
             Some(Rejected::Outside),
             "twenty gigabytes away, and a different stretch of disk"
         );
@@ -892,20 +847,10 @@ mod tests {
         let t0 = Instant::now();
         let held = run(1_460..1_470);
         let mut streams = file_at(0);
-        streams.observe(
-            1,
-            read(6_149_120_518, 6_149_382_662, t0, 0),
-            &held,
-            PIECE,
-        );
+        streams.observe(1, read(6_149_120_518, 6_149_382_662, t0, 0), &held, PIECE);
 
         assert_eq!(
-            streams.observe(
-                1,
-                read(1_000_000_000, 1_000_262_144, t0, 1),
-                &held,
-                PIECE
-            ),
+            streams.observe(1, read(1_000_000_000, 1_000_262_144, t0, 1), &held, PIECE),
             Some(Rejected::Outside)
         );
         assert_eq!(streams.streams.len(), 2);
@@ -1010,12 +955,7 @@ mod tests {
     /// One file's share of its own demand: what [`Streams::want`] does when
     /// the entity is one file, which is every test below that builds a
     /// [`FileStreams`] directly.
-    fn want(
-        streams: &mut FileStreams,
-        seconds: u64,
-        budget: u64,
-        piece: u64,
-    ) -> Vec<Range<u32>> {
+    fn want(streams: &mut FileStreams, seconds: u64, budget: u64, piece: u64) -> Vec<Range<u32>> {
         let asked = streams.asked(seconds);
         streams.grant(seconds, piece, |want| {
             if asked <= budget || asked == 0 {
@@ -1099,16 +1039,12 @@ mod tests {
     /// Put a stream on one file of `streams`, with a measured rate and a
     /// window already at its ceiling, so what a grant answers is the share
     /// and not the doubling.
-    fn stream_on(
-        streams: &mut Streams,
-        file: usize,
-        start: u32,
-        at: u32,
-        rate: u64,
-        t0: Instant,
-    ) {
+    fn stream_on(streams: &mut Streams, file: usize, start: u32, at: u32, rate: u64, t0: Instant) {
         streams.domain(file, u64::from(start) * PIECE, start..PIECES);
-        let file = streams.by_file.get_mut(&file).expect("the file was just described");
+        let file = streams
+            .by_file
+            .get_mut(&file)
+            .expect("the file was just described");
         stream_at(file, at, rate, t0);
     }
 
@@ -1227,12 +1163,7 @@ mod tests {
         let held = disk(&[0..4, 2_000..2_004]);
         let mut streams = file_at(0);
         streams.observe(1, read(0, 262_144, t0, 0), &held, PIECE);
-        streams.observe(
-            2,
-            read(8_388_608_000, 8_388_870_144, t0, 1),
-            &held,
-            PIECE,
-        );
+        streams.observe(2, read(8_388_608_000, 8_388_870_144, t0, 1), &held, PIECE);
         assert_eq!(streams.streams.len(), 2);
 
         assert_eq!(
@@ -1339,7 +1270,11 @@ mod tests {
         let mut streams = Streams::default();
         let reads = WAITING_READS + 64;
         for chunk in 0..reads as u64 {
-            streams.record(3, 7, read(chunk * 262_144, (chunk + 1) * 262_144, t0, chunk));
+            streams.record(
+                3,
+                7,
+                read(chunk * 262_144, (chunk + 1) * 262_144, t0, chunk),
+            );
         }
         streams.observe(&run(0..PIECES), PIECE, t0);
 

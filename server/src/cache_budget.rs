@@ -522,7 +522,12 @@ mod tests {
         let budget = RetentionBudget::default();
 
         let free = CACHE_FREE_SPACE_FLOOR + 8 * MIB;
-        publish_in_turn(&turn, &budget, || async move { (u64::MAX, Some(free), 4 * MIB) }).await;
+        publish_in_turn(
+            &turn,
+            &budget,
+            || async move { (u64::MAX, Some(free), 4 * MIB) },
+        )
+        .await;
 
         assert_eq!(
             budget.get(),
