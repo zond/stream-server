@@ -495,21 +495,32 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
     /// about the disk -- a consumer is the unbroken run of bytes it caused
     /// -- and `poll_read` cannot reach a listing cheaply. A read carries
     /// its own timestamps, so answering late costs the answer nothing.
-    fn observe_reads(&self, domain: &FileDomain, held: &BTreeSet<u32>) {
+    fn observe_reads(&self, domain: &FileDomain, held: &BTreeSet<u32>, budget: u64) {
+        let extent = Self::extent(domain);
         let mut streams = self.streams.lock();
-        let rejected = streams.observe(held, &Self::extent(domain), domain.piece_length);
+        let rejected = streams.observe(held, &extent, domain.piece_length);
         if !streams.report_due(std::time::Instant::now()) {
             return;
         }
-        crate::retention::trace::streams_seen(
-            &self.info_hash,
-            domain.file_idx,
-            &streams.counts(),
-            &streams.heads(domain.file_idx),
-            streams.last_sample(domain.file_idx),
-            &streams.rates(domain.file_idx),
-            rejected,
+        // What the replacement would order, beside what this pass did.
+        // Obeyed by nothing: the point of carrying it is that a field log
+        // shows the two answers to the same disk, on the same line.
+        let want = streams.want(
+            crate::retention::streams::REPORTED_SECONDS,
+            budget,
+            domain.piece_length,
+            &extent,
         );
+        crate::retention::trace::streams_seen(crate::retention::trace::StreamsSeen {
+            info_hash: &self.info_hash,
+            file_idx: domain.file_idx,
+            counts: &streams.counts(),
+            heads: &streams.heads(domain.file_idx),
+            sample: streams.last_sample(domain.file_idx),
+            rates: &streams.rates(domain.file_idx),
+            want: &want,
+            why: rejected,
+        });
     }
 
     fn trace(

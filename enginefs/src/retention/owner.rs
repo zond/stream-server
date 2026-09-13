@@ -496,7 +496,7 @@ pub trait Backing: Sized + Send + Sync + 'static {
     ///
     /// Defaulted to nothing: the proxy has the same shape and is not wired
     /// to it yet. Goes out with `crate::retention::trace`.
-    fn observe_reads(&self, _domain: &Self::Domain, _held: &BTreeSet<u32>) {}
+    fn observe_reads(&self, _domain: &Self::Domain, _held: &BTreeSet<u32>, _budget: u64) {}
 
     fn trace(
         &self,
@@ -1966,7 +1966,19 @@ impl<B: Backing> Retention<B> {
         // against the listing above. Here because membership is a question
         // about the disk and this is the first place in the pass that knows
         // what is on it. Observed and obeyed by nothing.
-        self.backing.observe_reads(&begin.domain, &held);
+        self.backing.observe_reads(
+            &begin.domain,
+            &held,
+            match begin.budget {
+                CacheBudget::Bytes(bytes) => bytes,
+                // Unknown is a budget nobody has stated yet, and it is
+                // not a licence to want everything: reported as nothing,
+                // every stream falls to its floor, which is what a
+                // stream with no measurement gets anyway.
+                CacheBudget::Unknown => 0,
+                CacheBudget::Unbounded => u64::MAX,
+            },
+        );
         // 5. **The deciding reading, taken after the listing.** Read before
         // the walk the head is the older half of the pair: the window is
         // drawn round where playback *was*, everything the fill wrote ahead

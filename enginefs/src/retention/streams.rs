@@ -78,6 +78,10 @@ struct Stream {
     /// How fast this consumer is eating the file, in bytes a second, or
     /// `None` until two reads have been served far enough apart to say.
     rate: Option<u64>,
+    /// How much is currently fetched ahead of it, in bytes. Grows towards
+    /// what the rate asks for rather than jumping to it -- see
+    /// [`Stream::grant`].
+    window: u64,
 }
 
 impl Stream {
@@ -124,6 +128,33 @@ impl Stream {
     }
 }
 
+impl Stream {
+    /// Grow this stream's window towards `target`, and answer what it is
+    /// now.
+    ///
+    /// **At most twice what it was.** A window that jumped straight to what
+    /// one measurement asked for would hand a consumer that read once -- a
+    /// container index, a probe, anything that opens and closes -- a whole
+    /// film's worth of lookahead off a single sample. That is not
+    /// hypothetical: it is the build that fetched 1.6 GB to play 100 MB,
+    /// and the reason the policy this replaces keeps a probe's window and
+    /// never wants it.
+    ///
+    /// Doubling costs the real consumer nothing. At the field's fourteen
+    /// reads a second, a film reaches a 315 MB window from the floor in
+    /// about five doublings -- under a second -- while a stream that turns
+    /// out to be a one-shot probe has cost eight megabytes and stopped.
+    fn grant(&mut self, target: u64, floor: u64) -> u64 {
+        let ceiling = if self.window == 0 {
+            floor
+        } else {
+            self.window.saturating_mul(2)
+        };
+        self.window = target.min(ceiling).max(floor);
+        self.window
+    }
+}
+
 /// Why a read had to start a stream of its own.
 ///
 /// One variant, and it stays an enum because the field log needs to say
@@ -146,6 +177,24 @@ pub(crate) enum Rejected {
 /// settles over roughly a dozen reads, which at fourteen reads a second is
 /// under a second of film.
 const RATE_SMOOTHING_EIGHTHS: u64 = 1;
+
+/// The smallest window a stream is ever granted, in pieces.
+///
+/// Not a tunable: it is what a sequential reader needs to not block on the
+/// very next piece it asks for. A consumer given only the piece it is
+/// sitting in reads to the boundary and stops -- which is the field's
+/// second track exactly, forty kilobytes at a time, every read ending at
+/// 23,320,330,240. One piece past where it is, is the least that can be
+/// called a lookahead.
+const FLOOR_PIECES: u64 = 2;
+
+/// The lookahead the trace reports a want set for, while nothing obeys it.
+///
+/// A stand-in for the buffer profile, which the owner knows and this side
+/// does not, chosen to match the profile a film plays under so a field log
+/// can be read against the policy that is still deciding. It goes when the
+/// want set is wired to the policy that has the real number.
+pub(crate) const REPORTED_SECONDS: u64 = 90;
 
 /// The maximal unbroken stretch of `held` containing `piece`, inside
 /// `bound`, or `None` for a piece the disk does not have.
@@ -254,6 +303,7 @@ impl FileStreams {
             reads: 1,
             seen: read.returned,
             rate: None,
+            window: 0,
         });
         Some(Rejected::Outside)
     }
@@ -279,6 +329,67 @@ const REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 /// read. Thirty seconds is longer than any gap that track left and shorter
 /// than a viewer's pause.
 const STREAM_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl FileStreams {
+    /// The pieces these streams want fetched ahead of them.
+    ///
+    /// **Shared as equal seconds, never as equal bytes.** Playback is gated
+    /// by the worst track: ninety seconds of subtitles buys nothing while
+    /// video has two, so the allocation that makes sense is the one that
+    /// maximises the minimum. Equal shares of the *bytes* does the opposite
+    /// -- ten megabytes split between a 3.5 MB/s film and a 20 kB/s second
+    /// track gives the film 1.4 seconds and the track four minutes.
+    ///
+    /// So a single `t` is solved for, such that every stream's rate times
+    /// `t` fits the budget, and each is granted `t` seconds. Scaling every
+    /// stream's byte target by one factor is the same arithmetic, since
+    /// bytes are rate times time; what must not happen is dividing the
+    /// budget into equal parts.
+    ///
+    /// Then each is floored at [`FLOOR_PIECES`] and grown towards its share
+    /// rather than jumped to it ([`Stream::grant`]). The floor is applied
+    /// after the share and not subtracted before it: two pieces on two
+    /// streams is sixteen megabytes, and a device with less free space than
+    /// that is not playing video, so it is not a case the allocation has to
+    /// be shaped around.
+    fn want(
+        &mut self,
+        seconds: u64,
+        budget: u64,
+        piece: u64,
+        bound: &Range<u32>,
+    ) -> Vec<Range<u32>> {
+        let floor = FLOOR_PIECES.saturating_mul(piece);
+        let asked: u64 = self
+            .streams
+            .iter()
+            .map(|stream| stream.rate.unwrap_or(0).saturating_mul(seconds))
+            .sum();
+        // One factor for every stream, which is what makes the shares equal
+        // in seconds. Nothing to scale when it all fits.
+        let share = |want: u64| {
+            if asked <= budget || asked == 0 {
+                want
+            } else {
+                ((want as u128 * budget as u128) / asked as u128) as u64
+            }
+        };
+        let mut windows = Vec::new();
+        for stream in &mut self.streams {
+            let target = share(stream.rate.unwrap_or(0).saturating_mul(seconds));
+            let bytes = stream.grant(target, floor);
+            let from = u32::try_from(stream.end / piece.max(1)).unwrap_or(u32::MAX);
+            let to = u32::try_from((stream.end.saturating_add(bytes)) / piece.max(1))
+                .unwrap_or(u32::MAX)
+                .saturating_add(1);
+            let window = from.max(bound.start)..to.min(bound.end);
+            if !window.is_empty() {
+                windows.push(window);
+            }
+        }
+        windows
+    }
+}
 
 /// The detected streams of one entity, by file index.
 #[derive(Debug, Default)]
@@ -360,6 +471,21 @@ impl Streams {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// What every stream on every file of this entity wants fetched ahead
+    /// of it. See [`FileStreams::want`].
+    pub(crate) fn want(
+        &mut self,
+        seconds: u64,
+        budget: u64,
+        piece: u64,
+        bound: &Range<u32>,
+    ) -> Vec<Range<u32>> {
+        self.by_file
+            .values_mut()
+            .flat_map(|streams| streams.want(seconds, budget, piece, bound))
+            .collect()
     }
 
     /// What each stream on `file` has measured its consumer to be eating,
@@ -710,6 +836,93 @@ mod tests {
         assert_eq!(
             streams.streams[0].rate, None,
             "and a read that ate nothing says nothing either"
+        );
+    }
+
+    /// Put a stream on `streams` at `piece` with a measured rate, without
+    /// driving reads through it -- the want set is being tested here, not
+    /// the detector.
+    fn stream_at(streams: &mut FileStreams, piece: u32, rate: u64, t0: Instant) {
+        streams.streams.push(Stream {
+            reader: 1,
+            end: u64::from(piece) * PIECE,
+            last: read(0, 0, t0, 0),
+            reads: 1,
+            seen: t0,
+            rate: Some(rate),
+            window: u64::MAX,
+        });
+    }
+
+    /// **A disk too small for every stream is shared as equal seconds, not
+    /// equal bytes.**
+    ///
+    /// Playback is gated by the worst track, so the allocation that makes
+    /// sense maximises the minimum. Equal shares of the bytes does the
+    /// opposite: the film and a second track at a hundred and seventy-five
+    /// times its rate, given half the disk each, leaves the film with a
+    /// fraction of a second and the track with minutes it will never use.
+    #[test]
+    fn a_short_disk_is_shared_as_seconds_and_not_as_bytes() {
+        let t0 = Instant::now();
+        let mut streams = FileStreams::default();
+        stream_at(&mut streams, 100, 3_500_000, t0);
+        stream_at(&mut streams, 5_000, 1_000_000, t0);
+
+        // Sixty seconds asked for, and half of that on the disk. Rates far
+        // enough above the floor that the share is what decides, not it.
+        let asked = (3_500_000 + 1_000_000) * 60;
+        let windows = streams.want(60, asked / 2, PIECE, &whole());
+
+        let film = u64::from(windows[0].end - windows[0].start);
+        let track = u64::from(windows[1].end - windows[1].start);
+        // Equal seconds means the windows are in the ratio of the rates,
+        // 3.5 to 1. Equal bytes would have made them the same size, which
+        // is 1 to 1 -- the shape that gives a film a second and a half of
+        // lookahead while a subtitle track sits on four minutes of it.
+        assert!(
+            film > track * 3 && film < track * 4,
+            "the windows are not in the ratio of the rates: {film} against {track}"
+        );
+    }
+
+    /// **A window grows towards what the rate asks for; it never jumps to
+    /// it.**
+    ///
+    /// A consumer that reads once and stops -- a container index, a probe,
+    /// anything that opens and closes -- would otherwise be handed a film's
+    /// worth of lookahead off a single sample. That is the build that
+    /// fetched 1.6 GB to play 100 MB. Doubling costs a real consumer
+    /// nothing: at the field's fourteen reads a second it reaches a full
+    /// window in about five doublings.
+    #[test]
+    fn a_window_doubles_towards_its_target_rather_than_jumping_to_it() {
+        let t0 = Instant::now();
+        let mut streams = FileStreams::default();
+        stream_at(&mut streams, 100, 3_500_000, t0);
+        streams.streams[0].window = 0;
+
+        let floor = FLOOR_PIECES * PIECE;
+        let first = streams.want(90, u64::MAX, PIECE, &whole());
+        assert_eq!(
+            u64::from(first[0].end - first[0].start) * PIECE,
+            floor + PIECE,
+            "the first grant is the floor, whatever the rate asks for"
+        );
+
+        let mut granted = streams.streams[0].window;
+        for _ in 0..4 {
+            streams.want(90, u64::MAX, PIECE, &whole());
+            let now = streams.streams[0].window;
+            assert!(
+                now <= granted * 2,
+                "a window grew more than double in one pass: {granted} to {now}"
+            );
+            granted = now;
+        }
+        assert!(
+            granted < 3_500_000 * 90,
+            "five doublings from eight megabytes is not yet a full window"
         );
     }
 

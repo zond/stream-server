@@ -225,44 +225,37 @@ pub fn budget_published(bytes: Option<u64>, configured: Option<u64>, from_disk: 
     );
 }
 
-/// **What the read-pattern detector has found**, said every
-/// `streams::REPORT_EVERY` while a file is being read.
-///
-/// Phase A's one deliverable. Nothing obeys the detector yet; this line is
-/// how a field log answers whether its join rule works, and the answer is
-/// not a single number. `streams` too high means the rule is too tight and
-/// every HTTP reopen opened its own; too low means it is too loose and two
-/// tracks merged; two with heads twenty gigabytes apart is the shape being
-/// hoped for. `why` says which clause rejected the nearest candidate when a
-/// read had to start a stream, which is what tells those apart.
-///
-/// `consumed`/`gap_ms` are the two halves of a rate sample, raw. They are
-/// reported rather than a rate because at this seam one read is at most the
-/// 256 KiB the response asks for, so the sample may be measuring the socket
-/// draining rather than the player consuming -- which is the delivery rate
-/// a previous attempt was deleted for. Nothing should be sized from this
-/// until a log says which it is.
-///
-/// Goes out with the rest of this module.
-pub(crate) fn streams_seen(
-    info_hash: &str,
-    file_idx: usize,
-    counts: &[(usize, usize)],
-    heads: &[(u64, u32)],
-    sample: Option<(u64, Duration)>,
-    rates: &[Option<u64>],
-    why: Option<super::streams::Rejected>,
-) {
+/// What the read-pattern detector has found on one file.
+pub(crate) struct StreamsSeen<'a> {
+    pub info_hash: &'a str,
+    pub file_idx: usize,
+    /// How many streams on each file of the entity.
+    pub counts: &'a [(usize, usize)],
+    /// Where each stream on `file_idx` has reached, and how many reads took
+    /// it there.
+    pub heads: &'a [(u64, u32)],
+    /// The two halves of the last rate sample, raw.
+    pub sample: Option<(u64, Duration)>,
+    /// What each stream has measured its consumer to be eating.
+    pub rates: &'a [Option<u64>],
+    /// What the replacement policy would order, which nothing obeys.
+    pub want: &'a [std::ops::Range<u32>],
+    /// Why the most recent read had to start a stream, if it did.
+    pub why: Option<super::streams::Rejected>,
+}
+
+pub(crate) fn streams_seen(seen: StreamsSeen<'_>) {
     tracing::info!(
         target: "enginefs::retention::trace",
-        info_hash = %info_hash,
-        file_idx,
-        streams = ?counts,
-        heads = ?heads,
-        rates = ?rates,
-        consumed = sample.map(|(bytes, _)| bytes),
-        gap_ms = sample.map(|(_, gap)| gap.as_millis() as u64),
-        why = ?why,
+        info_hash = %seen.info_hash,
+        file_idx = seen.file_idx,
+        streams = ?seen.counts,
+        heads = ?seen.heads,
+        rates = ?seen.rates,
+        want = ?seen.want,
+        consumed = seen.sample.map(|(bytes, _)| bytes),
+        gap_ms = seen.sample.map(|(_, gap)| gap.as_millis() as u64),
+        why = ?seen.why,
         stage = "streams_seen",
         "what the reads of this file look like"
     );
