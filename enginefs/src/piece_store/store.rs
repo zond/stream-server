@@ -340,6 +340,36 @@ impl HeldSnapshot {
         self.bits.get(word).is_some_and(|w| w & bit != 0)
     }
 
+    /// The **maximal contiguous run of held pieces containing `piece`**, or
+    /// `None` for a piece this snapshot does not hold.
+    ///
+    /// What a stream is. A consumer's identity is the unbroken stretch of
+    /// bytes it has caused to be on the disk, so two reads belong to one
+    /// consumer exactly when the disk between them is whole -- which makes
+    /// the tolerance a measurement of what was kept rather than a distance
+    /// somebody chose. A big cache keeps more history, so a scrub back
+    /// lands inside the run and joins; a small one keeps less, so the same
+    /// scrub lands outside it and is a new consumer. Three earlier rules
+    /// each guessed that distance in bytes and each was wrong in the field
+    /// -- see `docs/read-pattern-retention.md`.
+    ///
+    /// `bound` is the entity's extent: a run never runs off the end of the
+    /// file it belongs to.
+    pub fn run_containing(&self, piece: u32, bound: Range<u32>) -> Option<Range<u32>> {
+        if !bound.contains(&piece) || !self.contains(piece) {
+            return None;
+        }
+        let mut start = piece;
+        while start > bound.start && self.contains(start - 1) {
+            start -= 1;
+        }
+        let mut end = piece.saturating_add(1);
+        while end < bound.end && self.contains(end) {
+            end = end.saturating_add(1);
+        }
+        Some(start..end)
+    }
+
     /// The held pieces inside `range`, ascending -- the shape the retention
     /// policy advances over.
     pub fn in_range(&self, range: Range<u32>) -> BTreeSet<u32> {
@@ -3314,6 +3344,60 @@ mod tests {
         store
             .remove_directory_if_empty(Path::new(""))
             .expect("and again on a directory that is already gone");
+    }
+
+    /// **A stream is the unbroken stretch of disk it caused**, and the hole
+    /// an eviction leaves is what ends one.
+    ///
+    /// The property the whole read-pattern design rests on: how far back a
+    /// consumer may reach and still be the same consumer is not a number
+    /// anybody picks, it is however much of the disk was kept. A cache with
+    /// room holds a long run, so a scrub back lands inside it; a cache
+    /// under pressure holds a short one, so the same scrub lands outside
+    /// and is a new consumer that has to be fetched for. Self-scaling in
+    /// the direction that makes bigger disks behave better, which none of
+    /// the byte-distance rules that preceded it did.
+    #[test]
+    fn a_run_is_bounded_by_the_holes_around_it_and_by_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path(), PIECE_LENGTH, &SPECS);
+        let global = global_bytes(store.layout().total_length());
+        fill(&store, &global, 8);
+        store.init_for_tests().expect("seed the held set from the disk");
+        let pieces = store.layout().piece_count();
+        let whole = 0..pieces;
+        let held = store.held().expect("a seeded store");
+
+        assert_eq!(
+            held.run_containing(1, whole.clone()),
+            Some(whole.clone()),
+            "nothing is missing, so every piece is in one run"
+        );
+
+        // Take a piece out, as a reclaim would.
+        store.delete_piece(2).expect("delete");
+        let held = store.held().expect("a seeded store");
+        assert_eq!(
+            held.run_containing(1, whole.clone()),
+            Some(0..2),
+            "the hole ends the run before it"
+        );
+        assert_eq!(
+            held.run_containing(3, whole.clone()),
+            Some(3..pieces),
+            "and starts the one after it"
+        );
+        assert_eq!(
+            held.run_containing(2, whole.clone()),
+            None,
+            "a piece that is not held is in no run at all"
+        );
+        assert_eq!(
+            held.run_containing(1, 1..2),
+            Some(1..2),
+            "and a run is never larger than the file it belongs to, however \
+             much of the disk around it is whole"
+        );
     }
 
     /// **A write into a piece this store holds is counted, and it is the
