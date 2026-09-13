@@ -8518,6 +8518,7 @@ mod tests {
             fetched_peak: 0,
             last: None,
             at_rest: 0,
+            at_rest_bytes: 0,
             deadline: std::time::Instant::now() + TEST_WAIT_BOUND,
         };
         let mut read = Vec::with_capacity(original.len());
@@ -8583,6 +8584,14 @@ mod tests {
             bound.fetched_peak
         );
         assert!(
+            bound.at_rest_bytes <= 8 * RETENTION_PIECE,
+            "{} bytes came off the swarm across {} passes that delivered nothing and \
+             left the disk where it was: that is a window moving off its reader, not \
+             a fill landing after the reading stopped",
+            bound.at_rest_bytes,
+            bound.at_rest
+        );
+        assert!(
             bound.at_rest >= AT_REST_PASSES,
             "only {} passes found the stream at rest, so the tight half of the network \
              bound was hardly asked: the pause has to outlast the window filling",
@@ -8633,6 +8642,14 @@ mod tests {
         /// How many passes were measured at rest, so a run in which the
         /// stream never settled cannot pass for nothing.
         at_rest: usize,
+        /// What came off the swarm across all of them together.
+        ///
+        /// **The per-pass bound tolerates a landing, this one refuses a
+        /// habit.** Bytes in flight when the reading stopped arrive after
+        /// it, and on a loaded machine several passes later; what that
+        /// cannot look like is a pass fetching something every time, which
+        /// is the churn a window that moves off its reader produces.
+        at_rest_bytes: u64,
         deadline: std::time::Instant,
     }
 
@@ -8688,11 +8705,11 @@ mod tests {
                 // count is the only place a window that moves under a
                 // parked player shows up at all.
                 //
-                // A piece of slack, for the one a pass was part-way
-                // through when the reader stopped, and for the read opened
-                // beside the player ([`Self::probe_the_tail`]), which
-                // fetches the piece it is parked on: measured at exactly
-                // `RETENTION_PIECE`. A pass where either reading *did*
+                // Slack for whatever was in flight when the reading
+                // stopped: a piece per consumer that could have had a fill
+                // running -- the player, and the read opened beside it
+                // ([`Self::probe_the_tail`]). A pass where either reading
+                // *did*
                 // move asserts nothing rather than guessing what the move
                 // was worth, so a disk that wobbles by a piece makes this
                 // measure less, never fail.
@@ -8701,8 +8718,9 @@ mod tests {
                     && held == was_held
                 {
                     self.at_rest += 1;
+                    self.at_rest_bytes += fetched - was_fetched;
                     assert!(
-                        fetched <= was_fetched + RETENTION_PIECE,
+                        fetched <= was_fetched + 4 * RETENTION_PIECE,
                         "{} bytes came off the swarm across a pass that delivered nothing \
                          to the reader and left the same {held} pieces on the disk: the \
                          window moved off the reader and something is being fetched and \

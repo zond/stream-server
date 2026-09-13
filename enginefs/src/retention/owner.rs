@@ -903,7 +903,6 @@ struct ReaderState<B: Backing> {
     buffering: Buffering,
 }
 
-
 /// How many pieces to want after each one a stream is still waiting for,
 /// before the configured window takes over.
 ///
