@@ -434,6 +434,10 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         domain.file_idx == file_idx
     }
 
+    fn piece_length(domain: &FileDomain) -> Option<u64> {
+        Some(domain.piece_length)
+    }
+
     fn extent(domain: &FileDomain) -> Range<u32> {
         domain.span.pieces.clone()
     }
@@ -486,23 +490,21 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         ))
     }
 
-    /// **TEMPORARY**, with [`crate::retention::trace`]: the counters the
-    /// owner cannot read, and the piece length a lookahead is measured in.
-    /// **Phase A only.** Answer the reads kept since the last pass against
-    /// what the listing found, and say what the detector makes of them.
+    /// Answer the reads served since the last pass against what the
+    /// listing found, and say what this entity's consumers are asking of
+    /// the disk.
     ///
     /// Here rather than on the read path because membership is a question
     /// about the disk -- a consumer is the unbroken run of bytes it caused
     /// -- and `poll_read` cannot reach a listing cheaply. A read carries
     /// its own timestamps, so answering late costs the answer nothing.
-    fn observe_reads(
+    fn reading(
         &self,
         domain: &FileDomain,
         held: &BTreeSet<u32>,
-        budget: crate::retention::CacheBudget,
-        headroom: Option<u64>,
-        ceiling: Option<u64>,
-    ) {
+        asking: crate::retention::owner::Asking,
+    ) -> crate::retention::owner::Consumers {
+        let (budget, headroom, ceiling) = (asking.budget, asking.headroom, asking.ceiling);
         let extent = Self::extent(domain);
         let now = std::time::Instant::now();
         // **What this entity may hold: what it holds now, plus what the
@@ -534,6 +536,10 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
             // anyway.
             (crate::retention::CacheBudget::Unknown, None) => 0,
         };
+        // And the room the fill needs between two passes: an allowance that
+        // spent the whole budget would sit a stride over it for as long as
+        // anything is downloading.
+        let available = available.saturating_sub(asking.margin);
         let mut streams = self.streams.lock();
         // Where this file lies, first: a read carries an offset inside its
         // own file, and every question the detector answers is about
@@ -549,25 +555,52 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         // so grants that happened only when a log line was due would tie
         // how fast a consumer is fetched for to how often this server
         // talks about it.
+        //
+        // Every pass, and not only the ones that report: a window grows
+        // towards what its rate asks for by doubling, one step per grant,
+        // so grants that happened only when a log line was due would tie
+        // how fast a consumer is fetched for to how often this server talks
+        // about it.
         let want = streams.want(
             domain.file_idx,
-            crate::retention::streams::REPORTED_SECONDS,
+            // No time cap is the `Maximum` buffer profile, which asks for
+            // the whole file; the allowance is then the only bound, which
+            // is what that profile means.
+            asking.seconds.unwrap_or(u64::MAX),
             available,
             domain.piece_length,
         );
+        let exempt = streams.exempt(domain.file_idx, extent.end);
+        // **What may not be unlinked is published here**, where the want
+        // set is decided: the pass's own holdings -- every promise and
+        // every open stream's lookahead -- with what the consumers are
+        // asking for. The same set is what the coldest are chosen against,
+        // because a reclaim chosen against a smaller one frees nothing: the
+        // door refuses what this publishes.
+        let mut kept = want.clone();
+        kept.extend(asking.holding.iter().cloned());
+        exempt.publish(&kept);
+        // **What must go, and no more.** The disk that nothing else needs
+        // is scrub-back: giving it up before something asks for the room
+        // buys nothing and costs a re-fetch. So the reclaim is the overhang
+        // over the allowance and nothing else, taken coldest first.
+        let over = (held.len() as u64)
+            .saturating_mul(domain.piece_length)
+            .saturating_sub(available);
+        let how_many = usize::try_from(over.div_ceil(domain.piece_length.max(1))).unwrap_or(0);
+        let (tracked, reclaim) = streams.coldest_of(domain.file_idx, now, &kept, how_many);
         if !streams.report_due(now) {
-            return;
+            return crate::retention::owner::Consumers {
+                want,
+                exempt,
+                reclaim,
+            };
         }
-        let (tracked, coldest);
-        // And what the LRU beneath the windows would give up first. Traced
-        // rather than taken: this pass's own reclaim is still the old
-        // policy's.
-        (tracked, coldest) = streams.coldest(
-            domain.file_idx,
-            now,
-            &want,
-            crate::retention::streams::COLDEST_REPORTED,
-        );
+        let coldest: Vec<u32> = reclaim
+            .iter()
+            .copied()
+            .take(crate::retention::streams::COLDEST_REPORTED)
+            .collect();
         crate::retention::trace::streams_seen(crate::retention::trace::StreamsSeen {
             info_hash: &self.info_hash,
             file_idx: domain.file_idx,
@@ -582,6 +615,11 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
             coldest: &coldest,
             why: rejected,
         });
+        crate::retention::owner::Consumers {
+            want,
+            exempt,
+            reclaim,
+        }
     }
 
     fn trace(
@@ -791,9 +829,8 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
                     // with this file, as it does at the reclaim's door.
                     let pinned =
                         pinned_spans(&self.handle, &self.pinned, Some(domain.file_idx)).await;
-                    let arrived: Vec<u32> = match (store.held(&self.info_hash), door.windows_now())
-                    {
-                        (Some(now), Some(windows)) => {
+                    let arrived: Vec<u32> = match (store.held(&self.info_hash), !door.shut()) {
+                        (Some(now), true) => {
                             let now = now.in_range(run.clone());
                             claim
                                 .pieces()
@@ -801,10 +838,8 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
                                 .copied()
                                 .filter(|piece| {
                                     now.contains(piece)
-                                        && !windows
-                                            .iter()
-                                            .chain(&pinned)
-                                            .any(|window| window.contains(piece))
+                                        && !door.refuses(*piece)
+                                        && !pinned.iter().any(|span| span.contains(piece))
                                 })
                                 .collect()
                         }
@@ -920,9 +955,9 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
             // carried in from the plan: the door answers for this file's own
             // pin only, and the pinned file wants its boundary piece whole.
             let pinned = pinned_spans(&self.handle, &self.pinned, Some(domain.file_idx)).await;
-            let Some(windows) = door.windows_now() else {
+            if door.shut() {
                 break;
-            };
+            }
             let run_state = self.handle.run_state();
             if !matches!(
                 run_state,
@@ -935,12 +970,20 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
                 );
                 break;
             }
-            let mut parts = vec![run.clone()];
-            for window in windows.iter().chain(&pinned) {
-                parts = parts
-                    .into_iter()
-                    .flat_map(|part| crate::retention::outside(part, window))
-                    .collect();
+            // **Asked piece by piece at the door**, which is a load and a
+            // bit test rather than a lock: what may not go is published as
+            // one bit per piece (`crate::retention::exempt`). A pinned
+            // neighbour's span is the other half, and it is a listing away
+            // rather than a bit, so it stays a range check.
+            let mut parts: Vec<Range<u32>> = Vec::new();
+            for piece in run.clone() {
+                if door.refuses(piece) || pinned.iter().any(|span| span.contains(&piece)) {
+                    continue;
+                }
+                match parts.last_mut() {
+                    Some(part) if part.end == piece => part.end = piece + 1,
+                    _ => parts.push(piece..piece + 1),
+                }
             }
             if parts.len() == 1 && parts[0] == run {
                 let asked = (run.end - run.start) as usize;
@@ -1476,24 +1519,27 @@ impl<H: TorrentHandle> Engine<H> {
     #[cfg(test)]
     pub(crate) fn note_playhead(&self, file_idx: usize, offset: u64) {
         self.retention.note_position(&file_idx, (file_idx, offset));
+        // And the read that put a consumer there, which is what the
+        // detector answers everything from: a position says where
+        // something got to, a read says somebody is moving through the
+        // file. `poll_read` reports both on the real path.
+        let now = std::time::Instant::now();
+        self.note_read(
+            file_idx,
+            1,
+            crate::retention::streams::Read {
+                begin: offset,
+                end: offset.saturating_add(1),
+                arrived: now,
+                returned: now,
+            },
+        );
     }
 
-    /// What the player says about itself; see [`Retention::note_playhead`].
-    /// `offset` is its own byte offset into `file_idx` and `film` its own
-    /// position in the picture.
     /// How long the film is, with no position; see
     /// [`Retention::note_duration`]. What a cast can state.
     pub fn told_duration(&self, file_idx: usize, duration: std::time::Duration) {
         self.retention.note_duration(&file_idx, duration);
-    }
-
-    pub fn told_playhead(
-        &self,
-        file_idx: usize,
-        film: std::time::Duration,
-        duration: Option<std::time::Duration>,
-    ) {
-        self.retention.note_playhead(&file_idx, film, duration);
     }
 
     /// What the retention policy says about `file_idx` right now, or `None`
@@ -2330,14 +2376,19 @@ mod pin_tests {
                 returned: t0,
             },
         );
-        backing.observe_reads(
+        backing.reading(
             &domain,
             &held,
-            crate::retention::CacheBudget::Unbounded,
-            None,
-            // A film of one piece a second, so a read of a whole piece
-            // carries a second of picture.
-            Some(PIECE),
+            crate::retention::owner::Asking {
+                budget: crate::retention::CacheBudget::Unbounded,
+                headroom: None,
+                // A film of one piece a second, so a read of a whole piece
+                // carries a second of picture.
+                ceiling: Some(PIECE),
+                seconds: Some(90),
+                holding: Vec::new(),
+                margin: 0,
+            },
         );
         let first = streams.lock().held_by_streams(0);
 
@@ -2353,14 +2404,19 @@ mod pin_tests {
                 returned: t0 + std::time::Duration::from_secs(1),
             },
         );
-        backing.observe_reads(
+        backing.reading(
             &domain,
             &held,
-            crate::retention::CacheBudget::Unbounded,
-            None,
-            // A film of one piece a second, so a read of a whole piece
-            // carries a second of picture.
-            Some(PIECE),
+            crate::retention::owner::Asking {
+                budget: crate::retention::CacheBudget::Unbounded,
+                headroom: None,
+                // A film of one piece a second, so a read of a whole piece
+                // carries a second of picture.
+                ceiling: Some(PIECE),
+                seconds: Some(90),
+                holding: Vec::new(),
+                margin: 0,
+            },
         );
         let second = streams.lock().held_by_streams(0);
 
@@ -2420,13 +2476,18 @@ mod pin_tests {
                         returned: at,
                     },
                 );
-                backing.observe_reads(
+                backing.reading(
                     &domain,
                     &held,
-                    crate::retention::CacheBudget::Bytes(64 * PIECE),
-                    // A volume with room for one more piece and no more.
-                    Some(PIECE),
-                    Some(PIECE),
+                    crate::retention::owner::Asking {
+                        budget: crate::retention::CacheBudget::Bytes(64 * PIECE),
+                        // A volume with room for one more piece and no more.
+                        headroom: Some(PIECE),
+                        ceiling: Some(PIECE),
+                        seconds: Some(90),
+                        holding: Vec::new(),
+                        margin: 0,
+                    },
                 );
             }
             streams.lock().held_by_streams(0)
@@ -2487,16 +2548,21 @@ mod pin_tests {
         // Eight passes, which is doublings enough to reach ninety seconds
         // of this film if nothing stops it.
         for _ in 0..8 {
-            backing.observe_reads(
+            backing.reading(
                 &domain,
                 &held,
-                // Two pieces of cache allowed, over a volume with room for
-                // a thousand.
-                crate::retention::CacheBudget::Bytes(2 * PIECE),
-                Some(1_000 * PIECE),
-                // A film of a piece a second: ninety seconds of it is
-                // ninety pieces, which is most of this file.
-                Some(PIECE),
+                crate::retention::owner::Asking {
+                    // Two pieces of cache allowed, over a volume with room
+                    // for a thousand.
+                    budget: crate::retention::CacheBudget::Bytes(2 * PIECE),
+                    headroom: Some(1_000 * PIECE),
+                    // A film of a piece a second: ninety seconds of it is
+                    // ninety pieces, which is most of this file.
+                    ceiling: Some(PIECE),
+                    seconds: Some(90),
+                    holding: Vec::new(),
+                    margin: 0,
+                },
             );
         }
 

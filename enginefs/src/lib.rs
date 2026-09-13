@@ -3034,18 +3034,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
     }
 
-    pub async fn on_playhead(
-        &self,
-        info_hash: &str,
-        file_idx: usize,
-        film: std::time::Duration,
-        duration: Option<std::time::Duration>,
-    ) {
-        if let Some(engine) = self.peek_engine(info_hash).await {
-            engine.told_playhead(file_idx, film, duration);
-        }
-    }
-
     /// [`Self::on_stream_start`] without its `PlaybackStart` reconcile, for
     /// a caller that asks the reconciler itself once its disk gate has run
     /// (`routes::stream`, through [`Self::focus_torrent`]). The gate may
@@ -11714,10 +11702,10 @@ mod tests {
             .expect("a pass");
         assert_eq!(
             selected(),
-            std::collections::BTreeSet::from([0, 1]),
-            "the window round piece 0; the six pieces beyond it are not wanted"
+            std::collections::BTreeSet::from([0, 1, 2]),
+            "what the one consumer is being fetched; the five pieces beyond it are not wanted"
         );
-        assert_eq!(*counters.reselected.lock().unwrap(), vec![0..2]);
+        assert_eq!(*counters.reselected.lock().unwrap(), vec![0..3]);
 
         // Playback walks on to piece 2 with pieces 1 and 2 arrived: 0 and 1
         // commit, the window is 2..4.
@@ -11736,13 +11724,13 @@ mod tests {
         );
         assert_eq!(
             selected(),
-            std::collections::BTreeSet::from([0, 1, 2, 3]),
+            std::collections::BTreeSet::from([0, 1, 2, 3, 4, 5]),
             "the window, the committed set and what is on the disk"
         );
         assert_eq!(
             counters.reselected.lock().unwrap().last(),
-            Some(&(2..4)),
-            "the pieces the window moved onto are wanted again"
+            Some(&(2..6)),
+            "the pieces the consumer moved onto are wanted again"
         );
     }
 
@@ -11792,8 +11780,9 @@ mod tests {
             "nothing was held outside the window when the pass decided: {pass:?}"
         );
         assert!(
-            !bucket.join("2").exists(),
-            "the piece the backend forgot is not left on the disk"
+            bucket.join("2").is_file(),
+            "nothing needed the room, so the piece the backend forgot is \
+             scrub-back like anything else it holds"
         );
         assert_eq!(
             enginefs
@@ -11801,12 +11790,12 @@ mod tests {
                 .held(TEST_HASH)
                 .expect("registered")
                 .in_range(0..4),
-            std::collections::BTreeSet::from([0]),
+            std::collections::BTreeSet::from([0, 2]),
             "and the set says so"
         );
         assert_eq!(
             *counters.dropped_ranges.lock().unwrap(),
-            vec![(1..4, crate::backend::AfterRelease::LeaveDropped)],
+            vec![(3..4, crate::backend::AfterRelease::LeaveDropped)],
             "one ask, the want-set's"
         );
     }
@@ -11858,7 +11847,7 @@ mod tests {
         assert_eq!(pass.reclaimed, 0, "{pass:?}");
         assert_eq!(
             *counters.dropped_ranges.lock().unwrap(),
-            vec![(1..4, crate::backend::AfterRelease::LeaveDropped)],
+            vec![(3..4, crate::backend::AfterRelease::LeaveDropped)],
             "the want-set's one ask, and nothing after the pin"
         );
         assert!(
@@ -12004,8 +11993,10 @@ mod tests {
             .await
             .expect("a pass");
         assert!(
-            bucket.join("2").is_file(),
-            "the piece under the second player was taken from under it"
+            !bucket.join("2").exists(),
+            "a piece that arrived under the pass is not one any consumer has \
+             read or is reading ahead over: it is the newest thing on a disk \
+             with no room, and nothing published a promise over it"
         );
         assert_eq!(
             enginefs
@@ -12013,7 +12004,7 @@ mod tests {
                 .held(TEST_HASH)
                 .expect("registered")
                 .in_range(0..4),
-            std::collections::BTreeSet::from([0, 2])
+            std::collections::BTreeSet::from([0])
         );
         assert_eq!(
             engine.retention.holding(&0).unwrap().last_position,
@@ -12056,7 +12047,7 @@ mod tests {
             .await
             .expect("a pass ran");
         assert_eq!(
-            pass.reclaimed, 2,
+            pass.reclaimed, 1,
             "the two outside the window and outside the draw: {pass:?}"
         );
         assert_eq!(
@@ -12065,8 +12056,8 @@ mod tests {
                 .held(TEST_HASH)
                 .expect("registered")
                 .in_range(0..4),
-            std::collections::BTreeSet::from([0, 1]),
-            "the set is the disk: the reclaimed pieces left it with their files"
+            std::collections::BTreeSet::from([0, 1, 2]),
+            "the set is the disk: the reclaimed piece left it with its file"
         );
         assert!(bucket.join("0").is_file() && bucket.join("1").is_file());
         assert_eq!(
@@ -12087,8 +12078,8 @@ mod tests {
         assert_eq!(
             *counters.dropped_ranges.lock().unwrap(),
             vec![
-                (2..4, crate::backend::AfterRelease::LeaveDropped),
-                (2..4, crate::backend::AfterRelease::LeaveDropped),
+                (3..4, crate::backend::AfterRelease::LeaveDropped),
+                (3..4, crate::backend::AfterRelease::LeaveDropped),
             ],
             "so it asked the backend to forget nothing more: the second ask is \
              the want-set's, for the two pieces it gave back and does not \
@@ -12128,12 +12119,16 @@ mod tests {
             .await
             .expect("a pass");
         assert_eq!(
-            pass.reclaimed, 2,
+            pass.reclaimed, 1,
             "the two outside the window and outside the draw go from a paused \
              torrent: {pass:?}"
         );
-        assert!((2..4).all(|piece| !bucket.join(piece.to_string()).exists()));
-        assert!(bucket.join("0").is_file() && bucket.join("1").is_file());
+        // Piece 2 is inside what the one consumer is being fetched; piece
+        // 3 is past it and is the only thing there is to give back.
+        assert!(!bucket.join("3").exists());
+        assert!(
+            bucket.join("0").is_file() && bucket.join("1").is_file() && bucket.join("2").is_file()
+        );
     }
 
     /// **A reclaim the backend refuses is counted, and the count is
@@ -12175,7 +12170,7 @@ mod tests {
             .await
             .expect("the engine exists");
         assert_eq!(
-            numbers.refused_reclaims, 2,
+            numbers.refused_reclaims, 1,
             "the two pieces outside the window and outside the draw were asked \
              for and refused"
         );
@@ -12332,10 +12327,10 @@ mod tests {
             .await
             .expect("a pass");
         assert_eq!(
-            pass.reclaimed, 2,
+            pass.reclaimed, 1,
             "the two outside the window and outside the draw go: {pass:?}"
         );
-        assert!((2..4).all(|piece| !bucket.join(piece.to_string()).exists()));
+        assert!(!bucket.join("3").exists());
         assert!(
             bucket.join("0").is_file(),
             "the piece under the playhead stays"
@@ -12381,10 +12376,10 @@ mod tests {
             .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass");
-        assert_eq!(*counters.reselected.lock().unwrap(), vec![0..1]);
+        assert_eq!(*counters.reselected.lock().unwrap(), vec![0..3]);
         assert_eq!(
             *counters.dropped_ranges.lock().unwrap(),
-            vec![(1..4, crate::backend::AfterRelease::LeaveDropped)]
+            vec![(3..4, crate::backend::AfterRelease::LeaveDropped)]
         );
 
         // And the clear's want-everything is left unasked in error too: a
@@ -12392,7 +12387,7 @@ mod tests {
         counters.in_error_state.store(true, Ordering::SeqCst);
         engine.pinned_files.write().insert(0);
         engine.retain(enginefs.store_registry(), &playing(0)).await;
-        assert_eq!(*counters.reselected.lock().unwrap(), vec![0..1]);
+        assert_eq!(*counters.reselected.lock().unwrap(), vec![0..3]);
     }
 
     /// **The want-set is trimmed on a paused torrent, and left alone on one
@@ -12420,10 +12415,10 @@ mod tests {
             .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass runs on a paused torrent");
-        assert_eq!(*counters.reselected.lock().unwrap(), vec![0..1]);
+        assert_eq!(*counters.reselected.lock().unwrap(), vec![0..3]);
         assert_eq!(
             *counters.dropped_ranges.lock().unwrap(),
-            vec![(1..4, crate::backend::AfterRelease::LeaveDropped)]
+            vec![(3..4, crate::backend::AfterRelease::LeaveDropped)]
         );
 
         let (enginefs, counters, init) = test_enginefs_with_init(
@@ -12459,7 +12454,7 @@ mod tests {
             .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass, once the check is over");
-        assert_eq!(*counters.reselected.lock().unwrap(), vec![0..1]);
+        assert_eq!(*counters.reselected.lock().unwrap(), vec![0..3]);
     }
 
     /// **A file left unbounded is wanted whole; a sibling an install retires
@@ -12493,10 +12488,10 @@ mod tests {
             .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass");
-        assert_eq!(*counters.reselected.lock().unwrap(), vec![0..1]);
+        assert_eq!(*counters.reselected.lock().unwrap(), vec![0..3]);
         assert_eq!(
             *counters.dropped_ranges.lock().unwrap(),
-            vec![(1..4, crate::backend::AfterRelease::LeaveDropped)]
+            vec![(3..4, crate::backend::AfterRelease::LeaveDropped)]
         );
 
         // The reader moves on to episode two: episode two is held back, and
@@ -12512,7 +12507,7 @@ mod tests {
         );
         assert_eq!(
             *counters.reselected.lock().unwrap(),
-            vec![0..1],
+            vec![0..3],
             "the file the reader left is not wanted whole"
         );
 
@@ -12524,18 +12519,18 @@ mod tests {
             counters.advertised.lock().unwrap().last(),
             Some(&(4..8, true))
         );
-        assert_eq!(*counters.reselected.lock().unwrap(), vec![0..1, 4..8]);
+        assert_eq!(*counters.reselected.lock().unwrap(), vec![0..3, 4..8]);
 
         // A pin on a bounded file: its install clears the policy and wants
         // the file whole.
         enginefs.set_cache_budget(Some(50));
         engine.begin_retention(0).await;
-        assert_eq!(*counters.reselected.lock().unwrap(), vec![0..1, 4..8]);
+        assert_eq!(*counters.reselected.lock().unwrap(), vec![0..3, 4..8]);
         engine.pinned_files.write().insert(0);
         engine.begin_retention(0).await;
         assert_eq!(
             *counters.reselected.lock().unwrap(),
-            vec![0..1, 4..8, 0..4],
+            vec![0..3, 4..8, 0..4],
             "the pinned file is wanted whole"
         );
     }
@@ -12728,7 +12723,7 @@ mod tests {
             .await
             .expect("a byte of another file stopped this file's pass");
         assert_eq!(
-            pass.reclaimed, 2,
+            pass.reclaimed, 1,
             "everything outside the one-piece window round piece 0, bar the \
              piece this file's draw shares: {pass:?}"
         );
@@ -12737,16 +12732,18 @@ mod tests {
             "the piece under this file's head"
         );
         assert!(bucket.join("1").is_file(), "the piece of the draw");
-        for piece in [2u32, 3] {
-            assert!(!bucket.join(piece.to_string()).exists());
-        }
+        assert!(
+            bucket.join("2").is_file(),
+            "inside what the consumer is being fetched"
+        );
+        assert!(!bucket.join("3").exists());
         let holding = engine.retention.holding(&0).expect("file 0's entity");
         assert_eq!(
             holding.last_position,
             Some((0, 0)),
             "a byte of file 1 moved file 0's head"
         );
-        assert_eq!(holding.windows, vec![0..1]);
+        assert_eq!(holding.windows, vec![0..3]);
         assert!(
             engine.retention.holding(&1).is_none(),
             "a byte of a file nothing bounds was remembered"
@@ -12839,7 +12836,7 @@ mod tests {
         );
         assert_eq!(
             *counters.dropped_ranges.lock().unwrap(),
-            vec![(1..4, crate::backend::AfterRelease::LeaveDropped)],
+            vec![(3..4, crate::backend::AfterRelease::LeaveDropped)],
             "and the pass the pin landed in asked the backend to forget \
              nothing: the one ask is the first pass's, which stopped wanting \
              the three pieces it did not have. A pin on a single-file torrent \
@@ -12934,7 +12931,7 @@ mod tests {
             .expect("the pass task")
             .expect("a pass ran to the end");
         assert_eq!(
-            pass.reclaimed, 2,
+            pass.reclaimed, 1,
             "two of the three pieces it set out to take, not the third: {pass:?}"
         );
         assert!(
@@ -12943,9 +12940,9 @@ mod tests {
              pass's to take"
         );
         assert!(
-            !bucket.join("2").exists(),
-            "and the run is narrowed rather than refused whole: what playback \
-             has left behind still goes"
+            bucket.join("2").is_file(),
+            "and what the reader walked into is kept whole: the run it is \
+             moving through is what a consumer is"
         );
     }
 
@@ -13034,7 +13031,7 @@ mod tests {
             .collect();
         assert_eq!(
             dropped,
-            vec![1..8, 0..1],
+            vec![3..8, 0..1],
             "the first pass stopped wanting the seven pieces it did not have; \
              then the part before the window went, the pin landed inside that \
              drop, and nothing was asked for after it: {pass:?}"
@@ -13360,21 +13357,16 @@ mod tests {
              because the torrent still wants that episode"
         );
         assert!(
-            !bucket.join("6").exists(),
-            "a piece of nobody else's still goes: this is a reclaim, not a refusal"
+            bucket.join("6").is_file(),
+            "the piece the consumer is reading ahead over is nobody's to take"
         );
-        assert_eq!(pass.reclaimed, 1, "one piece was this file's alone to give");
+        assert_eq!(pass.reclaimed, 0, "nothing was this file's alone to give");
         assert_eq!(
             *counters.dropped_ranges.lock().unwrap(),
-            vec![
-                (5..6, crate::backend::AfterRelease::LeaveDropped),
-                (7..8, crate::backend::AfterRelease::LeaveDropped),
-                (6..7, crate::backend::AfterRelease::LeaveDropped),
-            ],
+            vec![(7..8, crate::backend::AfterRelease::LeaveDropped)],
             "the backend is never even asked to forget the shared piece: it \
-             would agree, and the bytes would go. The want-set's ask is for \
-             the two pieces of this file's own it does not have, the reclaim's \
-             for the one it gives back"
+             would agree, and the bytes would go. The one ask is the want \
+             set's, for the piece of this file's own nothing is asking for"
         );
     }
 
@@ -13421,7 +13413,7 @@ mod tests {
             .collect();
         assert_eq!(
             asked,
-            vec![6..8],
+            vec![7..8],
             "pieces six and seven are this file's own and not wanted; piece \
              eight is the next episode's too and is never asked about; piece \
              five is this file's draw and is never given back at all"
@@ -13472,10 +13464,13 @@ mod tests {
             !bucket.join("8").exists(),
             "nothing else wants the piece, so it is cache like any other"
         );
-        assert!(!bucket.join("6").exists());
+        assert!(
+            bucket.join("6").is_file(),
+            "and the piece the consumer is reading ahead over is not"
+        );
         assert_eq!(
-            pass.reclaimed, 2,
-            "both pieces outside the window were this pass's to take"
+            pass.reclaimed, 1,
+            "the one piece nothing was asking for was this pass's to take"
         );
     }
 
@@ -13594,12 +13589,10 @@ mod tests {
             .await
             .expect("the next tick's pass runs: the dead one dropped the file's turn");
         assert_eq!(
-            pass.reclaimed, 3,
+            pass.reclaimed, 1,
             "and it gives back what the dead pass had decided to and never did: {pass:?}"
         );
-        assert!(
-            !bucket.join("0").exists() && !bucket.join("2").exists() && !bucket.join("3").exists()
-        );
+        assert!(!bucket.join("0").exists(), "the oldest piece of the disk");
         assert!(
             bucket.join("1").is_file(),
             "the piece under the playhead stays"
@@ -13752,22 +13745,26 @@ mod tests {
             .expect("a pass");
         assert_eq!(
             engine.retention.holding(&0).unwrap().windows,
-            vec![6..7, 0..1],
-            "a window per head, the file's own first"
+            vec![6..8],
+            "one run of disk under two reads is one consumer"
         );
-        assert_eq!(pass.reclaimed, 5, "{pass:?}");
+        assert_eq!(pass.reclaimed, 4, "{pass:?}");
         assert!(
             bucket.join("0").is_file(),
-            "the piece under the first stream's head went with the run between the heads"
+            "the piece the first stream is still promised is nobody's to take"
         );
         assert!(
             bucket.join("6").is_file(),
             "the piece under the seek's head"
         );
-        for piece in [2u32, 3, 4, 5, 7] {
+        assert!(
+            bucket.join("7").is_file(),
+            "the piece the consumer is reading ahead over"
+        );
+        for piece in [2u32, 3, 4, 5] {
             assert!(
                 !bucket.join(piece.to_string()).exists(),
-                "piece {piece} is outside both windows and stayed"
+                "piece {piece} is behind the consumer and nothing needs it"
             );
         }
     }
@@ -13801,15 +13798,21 @@ mod tests {
             .expect("a pass");
         assert_eq!(
             engine.retention.holding(&0).unwrap().windows,
-            vec![0..1],
-            "one head, one window"
+            vec![6..8, 0..3],
+            "the consumer that ended is gone from the table; what is left is \
+             the run it caused and the one the other read is in"
         );
-        assert_eq!(pass.reclaimed, 1, "{pass:?}");
+        assert_eq!(pass.reclaimed, 0, "{pass:?}");
         assert!(
-            !bucket.join("6").exists(),
-            "the piece the ended stream was inside stayed"
+            bucket.join("6").is_file(),
+            "the run the ended stream caused is still what the other read \
+             is reaching back through, and nothing needs the room"
         );
-        assert!(bucket.join("0").is_file());
+        assert!(
+            bucket.join("0").is_file(),
+            "nothing needed the room: what the ended stream left is \
+             scrub-back, and scrub-back is kept while there is disk for it"
+        );
         drop(at_start);
         assert_eq!(engine.retention.readers_of(&0), 0);
     }
@@ -14015,10 +14018,11 @@ mod tests {
 
         assert_eq!(
             pass.reclaimed, 1,
-            "every held piece of the file left behind: {pass:?}"
+            "the held piece of the file left behind that no reader is still \
+             promised: {pass:?}"
         );
         assert!(
-            !bucket.join("0").exists() && !bucket.join("1").exists(),
+            !bucket.join("1").exists(),
             "including the one it had committed for sharing"
         );
         assert!(

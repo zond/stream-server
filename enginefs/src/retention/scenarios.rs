@@ -168,7 +168,6 @@ fn field_session() -> Log {
             },
         ),
         (ms(0), reads("viewer")),
-        (ms(0), Step::Says { film: VIEWER_AT }),
         (ms(500), opens_the_second_track()),
         // The pass the field's line was written by: a response open at the
         // tail, nothing polled yet, and its next four pieces on the disk.
@@ -199,9 +198,9 @@ fn field_session() -> Log {
         .run(&script)
 }
 
-/// **The field's trace line, reproduced number for number.**
+/// **The field's failure, gone.**
 ///
-/// Diagnostics, 4 MiB pieces, a 23,346,250,742-byte film:
+/// The line the whole replacement was written for:
 ///
 /// ```text
 /// enginefs::retention::trace: a retention pass planned to reclaim inside an open
@@ -209,28 +208,16 @@ fn field_session() -> Log {
 /// lookahead_bytes=16777216
 /// ```
 ///
-/// None of those numbers is written down by the scenario. `lookahead_bytes`
-/// is what librqbit grants a read labelled `ContainerMetadata`
-/// (`MAX_CONTAINER_METADATA_WINDOW_BYTES`), which is what
-/// `playback_intent_for_request` calls a read of the last sixteen megabytes
-/// of a file -- and a second audio or subtitle track muxed near the end of
-/// `mdat` is exactly that shape, which is the misreading the whole
-/// replacement exists to end. `reader_start` is the piece the response
-/// opened in; `reader_end` is four pieces on, because four 4 MiB pieces is
-/// what 16 MiB of lookahead covers; and the three pieces between them are
-/// the ones that are on the disk, outside the viewer's window, and so in
-/// the plan. Piece 5559 is absent from the plan for the same reason the
-/// response is about to block on it: it is not on the disk.
+/// It was produced by a read of the last sixteen megabytes of a file being
+/// classified as a container-index probe -- which is what a second audio or
+/// subtitle track muxed near the end of `mdat` looks like to a rule made of
+/// range geometry. Nothing classifies anything now: a consumer is the
+/// unbroken run of disk it caused, and a track reading at twenty kilobytes
+/// a second is a consumer with a small window, not a probe with none.
 ///
-/// **And this pass keeps them.** The response is open, so
-/// [`Door::windows_now`] answers with a window round its head at the
-/// instant of every unlink and the runs are cut; nothing at the tail goes.
-/// That is the keep set working exactly as designed, and it is the
-/// exception rather than the rule -- see the next test.
-///
-/// [`Door::windows_now`]: crate::retention::owner::Door::windows_now
+/// Thirty seconds of the same session, and the line never appears.
 #[test]
-fn a_pass_plans_to_reclaim_inside_the_second_tracks_lookahead_and_keeps_it_while_it_is_open() {
+fn no_pass_plans_to_reclaim_inside_an_open_streams_lookahead() {
     // The film is the field's, and the piece arithmetic is the field's:
     // 5,567 pieces, the last one short, with piece 5560 beginning on the
     // byte every failing read stopped at.
@@ -244,221 +231,146 @@ fn a_pass_plans_to_reclaim_inside_the_second_tracks_lookahead_and_keeps_it_while
 
     let log = field_session();
     let planned = log.lines("inside an open stream's lookahead");
-    let first = planned.first().expect("the field's trace line");
-    assert_eq!(first.field("pieces"), Some("[5560, 5561, 5562]"));
-    assert_eq!(first.field("reader_start"), Some("5559"));
-    assert_eq!(first.field("reader_end"), Some("5563"));
-    assert_eq!(first.field("lookahead_bytes"), Some("16777216"));
-
-    let over_the_burst = &log.passes[0];
     assert!(
-        !over_the_burst.inside_a_lookahead().is_empty(),
-        "the first pass is not the one the trace line is about"
+        planned.is_empty(),
+        "a pass planned to take what a live read was reading ahead over: \
+         pieces={:?}",
+        planned.first().and_then(|line| line.field("pieces"))
     );
-    assert!(
-        over_the_burst
-            .kept
-            .iter()
-            .any(|window| window.contains(&5560)),
-        "the pass at {:?} kept no window over the second track: {:?}",
-        over_the_burst.at,
-        over_the_burst.kept
-    );
-    assert!(
-        over_the_burst.unlinked.iter().all(|piece| *piece < 5_000),
-        "the pass that planned to reclaim inside the lookahead also did it: {:?}",
-        over_the_burst.unlinked
-    );
-    // Nor does it stop the swarm wanting them. The fork's `drop_pieces`
-    // refuses a piece inside a live stream's lookahead, so while the
-    // response is open the backend is still being asked for the four
-    // pieces it is reading ahead over -- which is the other half of what
-    // makes the *close* the moment everything changes.
-    assert!(
-        !over_the_burst.unselected.contains(&5559),
-        "the pass stopped wanting a piece a live response was reading ahead over"
-    );
+    for pass in &log.passes {
+        assert!(
+            pass.inside_a_lookahead().is_empty(),
+            "the pass at {:?} planned inside a lookahead: {:?}",
+            pass.at,
+            pass.inside_a_lookahead()
+        );
+    }
 }
 
-/// **The keep set is asked at the door, so it protects nothing between two
-/// bursts**: the pieces the pass above kept are taken by the very next
-/// pass, whose only difference is that the second track's response had
-/// closed.
+/// **The second track's pieces stay, and they stay once it has closed.**
 ///
-/// A window is a promise not to delete, and the owner keeps it by asking
-/// the door at the instant of every unlink rather than trusting a
-/// measurement taken before two awaited backend calls. That is right, and
-/// it is why nothing is ever deleted from under a live read. What it cannot
-/// do is keep a promise to a reader that is not there -- and a track that
-/// serves 24-41 kB per response and opens forty-six of them in seventy
-/// seconds is not there for most of any given second.
+/// This is the half the old keep set could not do. A window was a promise
+/// kept by asking the door at the instant of every unlink, which is right
+/// and which protects nothing between two bursts: a track that serves
+/// 24-41 kB per response and opens forty-six of them in seventy seconds is
+/// not there for most of any given second, and every pass in the gap took
+/// its working set.
 ///
-/// Piece 5560 is the exception, and not for a reason anybody would want: it
-/// is the one piece this track managed to deliver a byte out of, so
-/// `Reader::note` filed it in the entity's `structural` set -- "the pieces
-/// a container cannot be played without". It is media data in the middle of
-/// `mdat`, it is now kept for the life of the entity, and it has taken one
-/// of the eight slots the film's actual `moov` needs.
+/// What keeps them now is not a reader being there. It is that the reads
+/// happened: they caused a run of disk, that run is a consumer, and a
+/// consumer's window is what no unlink may touch -- for as long as the
+/// consumer lasts, which is a measured idleness and not the lifetime of an
+/// HTTP response.
 #[test]
-fn the_second_tracks_pieces_go_in_the_first_pass_with_no_response_open_over_them() {
+fn the_second_tracks_pieces_stay_after_its_response_has_closed() {
     let log = field_session();
     let after_the_burst = &log.passes[1];
-    for piece in [5559, 5561, 5562, 5563] {
+    for piece in [5559, 5560, 5561, 5562, 5563] {
         assert!(
-            after_the_burst.unlinked.contains(&piece),
-            "piece {piece} survived the pass at {:?} with nothing open over it; \
-             what went, pass by pass: {:?}",
+            after_the_burst
+                .kept
+                .iter()
+                .any(|window| window.contains(&piece))
+                || !after_the_burst.unlinked.contains(&piece),
+            "piece {piece} went in the pass at {:?} with the track's response \
+             closed; what went, pass by pass: {:?}",
             after_the_burst.at,
             log.unlinked()
         );
     }
-    assert!(
-        !after_the_burst.unlinked.contains(&5560),
-        "piece 5560 went: the structural set did not keep it"
-    );
-    assert!(
-        after_the_burst.kept.contains(&(5560..5561)),
-        "5560 is kept by a window rather than as a structural piece: {:?}",
-        after_the_burst.kept
-    );
 }
 
-/// **And they are paid for again, every two seconds, for as long as the
-/// swarm keeps up.**
+/// **And nothing is paid for twice.**
 ///
-/// The three passes after the first take the same four tail pieces off the
-/// disk, because the swarm has put all four back in between -- and it puts
-/// them back because [`Backing::want`] works out what to stop wanting from
-/// the listing it took *before* the reclaim, so a piece the same pass is
-/// about to unlink is still on the disk when the drop set is computed and
-/// is therefore left selected. The pass deletes what it has just told the
-/// backend to keep wanting.
+/// The field's loop was a pass taking a piece, the swarm putting it back,
+/// and the next pass taking it again -- a hundred and seventeen megabytes
+/// of fetch every two seconds for a film playing at 2.8 MB/s. It is the
+/// shape of "1.6 GB fetched to play about a hundred megabytes".
 ///
-/// It is not only the tail. The same passes take twenty-four pieces of the
-/// *viewer's* own file -- everything between the disk's edge and the
-/// window's -- and those come back too: a hundred and seventeen megabytes
-/// of fetch every two seconds, for a film playing at 2.8 MB/s and a track
-/// reading 20 kB/s. That is the shape of "1.6 GB fetched to play about a
-/// hundred megabytes", measurable here rather than inferred from piece
-/// counts afterwards.
-///
-/// [`Backing::want`]: crate::retention::owner::Backing::want
+/// The loop cannot form here: what a pass gives up is what no consumer is
+/// asking for, so the want set does not order it back.
 #[test]
-fn the_same_pieces_are_reclaimed_and_refetched_on_every_pass() {
+fn no_piece_is_taken_and_paid_for_again() {
     let log = field_session();
-    for pass in &log.passes[1..4] {
-        assert!(
-            pass.unlinked.contains(&5559),
-            "the pass at {:?} did not take piece 5559 again: {:?}",
-            pass.at,
-            pass.unlinked
-        );
-        assert!(
-            pass.unlinked.len() >= 24,
-            "the pass at {:?} reclaimed only {} pieces",
-            pass.at,
-            pass.unlinked.len()
-        );
-    }
-}
-
-/// **The want set never orders a piece of the second track, in thirty
-/// seconds of passes -- and every pass takes its working set off the disk
-/// again.**
-///
-/// This is the half the two surveys disagreed about, and the answer is that
-/// both are involved and they do different jobs. A `Reading::Probe`'s
-/// window is kept and never wanted -- right for a sixteen-megabyte read of
-/// a container index, and a second track gets called one -- so no pass ever
-/// asks the swarm for anything at the tail. Fifteen passes, and `wanted`
-/// is `[630..696]` in every one of them.
-///
-/// The pieces come back anyway, while a response is open over them: an open
-/// stream's lookahead is pulled by librqbit's priority loop, which checks
-/// that a piece is not had, not releasing, not mid-hash-check and that the
-/// peer has it, and never that it is selected -- its own comment says
-/// "Only this loop can reserve such a piece -- `iter_queued_pieces` cannot,
-/// its bit is long gone." So the session is a loop: the pass deletes the
-/// tail, the next response's lookahead fetches it again, the next pass
-/// deletes it again. Every two seconds, for as long as anyone watches.
-///
-/// Which is why the field's twenty seconds needs the swarm as well as the
-/// policy. The loop costs only bandwidth while a refetch fits inside a
-/// burst. The field's did not: `peers=2`, `download_speed=193592`, and a
-/// 4 MiB piece at 193 kB/s takes 21.7 seconds against a burst lasting one.
-/// The read waits for a piece that is on its way -- ordered by the
-/// response's own lookahead and by nothing else, because the pass has spent
-/// thirty seconds declining to want it.
-#[test]
-fn no_pass_ever_orders_the_second_tracks_pieces_and_every_pass_deletes_them() {
-    let log = field_session();
+    let mut taken: Vec<u32> = Vec::new();
     for pass in &log.passes {
-        assert!(
-            pass.wanted.iter().all(|window| window.end <= 5_000),
-            "the pass at {:?} ordered the tail: {:?}",
-            pass.at,
-            pass.wanted
-        );
+        for piece in &pass.unlinked {
+            assert!(
+                !taken.contains(piece),
+                "piece {piece} was taken again by the pass at {:?}: the swarm \
+                 put back what the last pass gave up, which is the loop this \
+                 replaces",
+                pass.at
+            );
+            taken.push(*piece);
+        }
     }
-    // And having not wanted them, takes them: the same pieces, every pass,
-    // for the whole session. This is the cost the loop is paying.
-    let deleting: Vec<&_> = log
+}
+
+/// **Every pass orders what the second track is reading.**
+///
+/// The old want set never did, in thirty seconds of passes: a probe's
+/// window was kept and not wanted, deliberately, because ordering the whole
+/// forward reach of a window round a 16 MiB read of the tail was a hundred
+/// and thirty-eight megabytes the next pass reclaimed. The answer to that
+/// was to order nothing at all, which left the track's pieces to its own
+/// lookahead and to whatever the swarm felt like.
+///
+/// A consumer is fetched for now, and the size of what it is fetched is its
+/// own measured rate rather than a profile's: ninety seconds of twenty
+/// kilobytes a second is under two megabytes, which is not a hundred and
+/// thirty-eight.
+#[test]
+fn the_second_tracks_pieces_are_ordered_while_it_is_reading() {
+    let log = field_session();
+    let ordering_the_tail = log
         .passes
         .iter()
-        .filter(|pass| pass.unlinked.iter().any(|piece| *piece >= 5_500))
-        .collect();
+        .filter(|pass| pass.wanted.iter().any(|window| window.start >= 5_000))
+        .count();
     assert!(
-        deleting.len() >= log.passes.len() - 1,
-        "only {} of {} passes took the second track's pieces off the disk",
-        deleting.len(),
-        log.passes.len()
+        ordering_the_tail > 0,
+        "no pass ordered anything of the second track: {:?}",
+        log.passes
+            .iter()
+            .map(|pass| &pass.wanted)
+            .collect::<Vec<_>>()
     );
 }
 
-/// **And so the read waits on a piece nothing ordered.**
+/// **And the track does not block.**
 ///
-/// The field's line is "reads blocked up to 20 s on those pieces while 17
-/// seeders were connected", and this asserts the waiting but deliberately
-/// NOT the twenty seconds. The harness's swarm is instant or absent -- a
-/// beat delivers every piece that is wanted or none -- and the field's was
-/// neither: `peers=2`, `download_speed=193592`. A 4 MiB piece at 193 kB/s
-/// takes 21.7 seconds *even when it is asked for*, which is the field's
-/// 20,013 ms almost exactly. So the twenty seconds is piece size over
-/// swarm rate, and a harness with no rate cannot claim it; what it can
-/// establish is that the piece was never ordered, which the companion test
-/// above asserts and which is the defect. Sizing the swarm in bytes per
-/// beat would let this assert the duration too, and is the first thing to
-/// add if a scenario ever needs to reason about how long a stall lasts
-/// rather than whether one happens.
+/// The field's twenty-second stall was a read waiting for a piece nothing
+/// had ordered: the pass had spent thirty seconds declining to want it and
+/// had taken it off the disk four times, so the only thing fetching it was
+/// the response's own lookahead, over a swarm giving 193 kB/s.
 ///
 /// The waiting is measured per reader rather than per response, which is
 /// the only way it can be measured: the field's track opened forty-six
 /// responses in seventy seconds and no single one of them waited twenty
 /// seconds for anything.
 #[test]
-fn the_second_track_blocks_on_a_piece_no_pass_ever_ordered() {
+fn the_second_track_never_blocks_on_a_piece_a_pass_took() {
     let log = field_session();
-    assert!(
-        log.longest_block("second-track") > Duration::ZERO,
-        "the second track never waited, so this session reproduces nothing"
-    );
-    // And it blocks on a piece a pass took, rather than on one that was
-    // never there: the waiting and the deleting are the same pieces. That
-    // is the whole claim -- not that the track is starved for good, which
-    // it is not while its own lookahead can refetch, but that every burst
-    // pays for the last pass.
     let blocked: Vec<u32> = log
         .reads
         .iter()
         .filter(|read| read.reader == "second-track" && read.blocked())
         .map(|read| read.piece)
         .collect();
-    assert!(!blocked.is_empty(), "the track never parked on anything");
     for piece in &blocked {
         assert!(
-            log.passes.iter().any(|pass| pass.unlinked.contains(piece)),
-            "the track parked on piece {piece}, which no pass had taken -- \
-             then this session is about the swarm and not about retention"
+            log.passes
+                .iter()
+                .all(|pass| !pass.unselected.contains(piece)),
+            "the track parked on piece {piece}, which a pass had stopped \
+             wanting: nothing was fetching it but the response's own \
+             lookahead"
+        );
+        assert!(
+            !log.passes.iter().any(|pass| pass.unlinked.contains(piece)),
+            "the track parked on piece {piece}, which a pass had taken: the \
+             burst is paying for the last pass again"
         );
     }
 }
@@ -506,7 +418,6 @@ fn a_response_still_open_at_a_pass_has_the_piece_it_is_parked_on_ordered() {
                 },
             ),
             (ms(0), reads("viewer")),
-            (ms(0), Step::Says { film: VIEWER_AT }),
             (ms(500), opens_the_second_track()),
             // Polled *before* the pass, so it is parked and has promised.
             (ms(600), reads("second-track")),

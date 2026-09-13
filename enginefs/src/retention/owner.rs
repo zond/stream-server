@@ -275,6 +275,65 @@ pub enum Mode {
     Slack { opens: u64 },
 }
 
+/// What a pass can tell the detector that the detector cannot see.
+///
+/// Every one of them is a *published* number rather than a measured one:
+/// the cap the operator configured, what the volume will still give, the
+/// file's size over its duration, and how many seconds of stream the
+/// viewer's buffer profile buys. See `docs/read-pattern-retention.md`.
+#[derive(Debug, Clone)]
+pub struct Asking {
+    /// What the whole cache may hold.
+    pub budget: CacheBudget,
+    /// What the volume will still give before the margin, or `None` for a
+    /// volume nothing could read.
+    pub headroom: Option<u64>,
+    /// The file's own bitrate -- size over duration -- or `None` for a file
+    /// whose length nobody has stated.
+    pub ceiling: Option<u64>,
+    /// How many seconds of stream a window may buy, or `None` for no time
+    /// cap at all.
+    pub seconds: Option<u64>,
+    /// **What the pass knows must be kept whatever the consumers want**:
+    /// every promise a parked read is holding, and the lookahead each open
+    /// stream was granted -- the backend refuses to forget a piece inside
+    /// one, so asking is a reclaim that is refused and a disk that grows.
+    ///
+    /// Handed *in* rather than added afterwards, because what may not be
+    /// unlinked and what is offered up have to be the same reading: a
+    /// reclaim chosen against a smaller set than the door refuses frees
+    /// nothing at all.
+    pub holding: Vec<Range<u32>>,
+    /// **How many bytes the fill may put on the disk between two passes**,
+    /// which is the room the allowance has to leave for it.
+    ///
+    /// What is on the disk when a pass measures it is what the consumers
+    /// asked for plus whatever arrived since the last pass, which is a
+    /// stride. An allowance that spent the whole budget would therefore sit
+    /// a stride *over* it for as long as anything is downloading -- and the
+    /// budget's own job is to keep the volume off the free-space floor, so
+    /// being over it is the one thing it may not be. See
+    /// `docs/read-pattern-retention.md` section 4 on why the margin is
+    /// load-bearing: eviction has to trigger on approaching the line, not
+    /// on crossing it.
+    pub margin: u64,
+}
+
+/// What the consumers of one entity are asking of its disk.
+#[derive(Debug)]
+pub struct Consumers {
+    /// What the streams want fetched ahead of them, in pieces.
+    pub want: Vec<Range<u32>>,
+    /// One bit per piece: what no unlink may touch. Read at the door
+    /// without taking any lock -- see [`crate::retention::exempt`].
+    pub exempt: std::sync::Arc<crate::retention::exempt::Exempt>,
+    /// What to give back first, coldest by effective age, and only as much
+    /// as the allowance asks for. Empty while what is held fits: the disk
+    /// that is not needed for anything else is scrub-back, and giving it up
+    /// early buys nothing and costs a re-fetch.
+    pub reclaim: Vec<u32>,
+}
+
 /// The world outside the owner, for one kind of entity.
 ///
 /// Small on purpose: describe the entity's index space, list what the disk
@@ -325,6 +384,9 @@ pub trait Backing: Sized + Send + Sync + 'static {
     fn governs(domain: &Self::Domain, want: Self::Want) -> bool;
     /// The piece index space of the entity. Pure.
     fn extent(domain: &Self::Domain) -> Range<u32>;
+    /// How long one piece of this entity is, or `None` for a domain that
+    /// cannot say. What turns a lookahead in bytes into pieces.
+    fn piece_length(domain: &Self::Domain) -> Option<u64>;
     /// How many bytes the entity is, or `None` where the backing cannot say.
     ///
     /// Only [`State::buffering`] asks, and only to turn a player's stated
@@ -343,7 +405,7 @@ pub trait Backing: Sized + Send + Sync + 'static {
     /// The inverse of reading an offset out of a position, and it exists
     /// for one caller: a player states where it is in the *picture*, and
     /// with the film's length and the entity's size that is an offset into
-    /// the file. See [`Retention::note_playhead`].
+    /// the file.
     fn position_at(domain: &Self::Domain, offset: u64) -> Option<Self::Position> {
         let _ = (domain, offset);
         None
@@ -496,15 +558,16 @@ pub trait Backing: Sized + Send + Sync + 'static {
     ///
     /// Defaulted to nothing: the proxy has the same shape and is not wired
     /// to it yet. Goes out with `crate::retention::trace`.
-    fn observe_reads(
-        &self,
-        _domain: &Self::Domain,
-        _held: &BTreeSet<u32>,
-        _budget: CacheBudget,
-        _headroom: Option<u64>,
-        _ceiling: Option<u64>,
-    ) {
-    }
+    /// **What this entity's consumers are asking of the disk**, as the
+    /// detector answers it: what to fetch ahead of them, what no unlink may
+    /// touch, and what to give back first if something must go.
+    ///
+    /// The three replace what a playhead and a window used to decide. A
+    /// consumer is the unbroken run of bytes it caused, so membership is a
+    /// question about the disk and this is the first moment in a pass that
+    /// has one -- and the backing owns the detector because the reads reach
+    /// it, not the owner.
+    fn reading(&self, domain: &Self::Domain, held: &BTreeSet<u32>, asking: Asking) -> Consumers;
 
     fn trace(
         &self,
@@ -608,6 +671,11 @@ struct State<B: Backing> {
     /// honest answer when nothing has been measured and a wrong one the
     /// moment it means "measured against a budget one byte different".
     windows: Vec<Range<u32>>,
+    /// **What may not be unlinked, as one bit per piece**, shared with
+    /// every door this entity opens and with the reads that promise into
+    /// it. `None` until a pass has handed one over, which is every entity
+    /// no pass has run on. See [`crate::retention::exempt`].
+    exempt: Option<std::sync::Arc<crate::retention::exempt::Exempt>>,
     readers: HashMap<ReaderId, ReaderState<B>>,
     /// The entity's own last delivered byte: the proxy's `last_playhead`,
     /// and a torrent file's head. Only its own bytes ever reach it -- a
@@ -668,12 +736,6 @@ struct State<B: Backing> {
     /// window off the film and takes the pieces the viewer is waiting for
     /// with it.
     ///
-    /// So the player is asked instead. It is a hint and never a
-    /// requirement: it goes stale ([`TOLD_FRESH`]) if whatever was
-    /// reporting stops, and everything below still answers for a client
-    /// that never reports at all -- another player on the network, the
-    /// proxy, a download.
-    told: Option<Told<B>>,
     /// Whether this entity's range is held back from what we announce with
     /// nothing installed to put it back.
     ///
@@ -849,21 +911,6 @@ struct ReaderState<B: Backing> {
     buffering: Buffering,
 }
 
-/// What a player last said about where it is in its own film.
-///
-/// `at` is the position in the *file* -- mpv's `stream-pos`, the demuxer's
-/// byte offset -- so nothing has to convert a time into a byte and be
-/// wrong about it on a variable-bitrate film. It places the window and
-/// nothing else: the position in the *picture* was kept here too while a
-/// bitrate was made by dividing one by the other, and with the film's
-/// length stated ([`Retention::note_duration`]) the length sizes the
-/// window and the playhead places it, neither needing the other.
-#[derive(Debug)]
-struct Told<B: Backing> {
-    at: B::Position,
-    when: std::time::Instant,
-}
-
 /// The most pieces one entity may call structural.
 ///
 /// A container's header and index are a handful of pieces -- the field
@@ -888,27 +935,6 @@ const STRUCTURAL_PIECES: usize = 8;
 /// once per stream, and it buys back the ninety seconds the field spent
 /// on piece 0.
 const STARTUP_RUN: u32 = 16;
-
-/// How near a predicted playhead a read has to be for its own position to
-/// be taken as the exact one, as a fraction of the entity.
-///
-/// It separates two things that are orders apart, so it does not want to
-/// be tight. A prediction drifts from the true offset by however much a
-/// variable-bitrate film has run off its own average -- a few percent of
-/// the file at worst. A read of the container index sits at the very end
-/// of it, most of a file away. Five percent admits every real reader,
-/// including one that has run a long way ahead of the viewer, and admits
-/// nothing at the far end.
-const READ_VICINITY: f64 = 0.05;
-
-/// How long the player's own word stands after it stops arriving.
-///
-/// The app reports about once a second while a film is open. Going quiet
-/// means it was backgrounded, killed, or handed playback to a receiver, and
-/// after that the last thing it said is a claim about the past. Long enough
-/// to ride out a slow tick or a garbage collection, short enough that a
-/// dead reporter does not pin the window where the viewer used to be.
-const TOLD_FRESH: std::time::Duration = std::time::Duration::from_secs(15);
 
 impl<B: Backing> ReaderState<B> {
     /// A read just opened: nothing delivered, nothing promised.
@@ -1132,6 +1158,7 @@ impl<B: Backing> Retention<B> {
                     key,
                     turn: Arc::new(tokio::sync::Mutex::new(Turn(()))),
                     state: Arc::new(parking_lot::Mutex::new(State {
+                        exempt: None,
                         domain,
                         installed: None,
                         decided: None,
@@ -1141,7 +1168,6 @@ impl<B: Backing> Retention<B> {
                         last_position: None,
                         duration: None,
                         structural: std::collections::BTreeSet::new(),
-                        told: None,
                         // Assumed held back until a clear says otherwise: an
                         // entity that was forgotten took the record with it,
                         // and the backend's mask outlives both the record and
@@ -1280,60 +1306,6 @@ impl<B: Backing> Retention<B> {
             return;
         };
         entity.state.lock().duration = Some(duration);
-    }
-
-    pub fn note_playhead(
-        &self,
-        key: &B::Key,
-        film: std::time::Duration,
-        duration: Option<std::time::Duration>,
-    ) {
-        self.note_playhead_at(key, film, duration, std::time::Instant::now());
-    }
-
-    /// [`Self::note_playhead`] with the clock handed in, so a test can age
-    /// a report without waiting.
-    pub fn note_playhead_at(
-        &self,
-        key: &B::Key,
-        film: std::time::Duration,
-        duration: Option<std::time::Duration>,
-        now: std::time::Instant,
-    ) {
-        let Some(entity) = self.lookup(key) else {
-            return;
-        };
-        let mut state = entity.state.lock();
-        if duration.is_some() {
-            state.duration = duration;
-        }
-        let Some(duration) = state.duration.filter(|d| !d.is_zero()) else {
-            return;
-        };
-        let Some(bytes) = B::bytes(&state.domain) else {
-            return;
-        };
-        // **Where in the picture, converted at the film's average rate.**
-        //
-        // Deliberately not the player's own byte offset, which is where its
-        // demuxer has *read* to and follows every index read it makes: mpv
-        // keeps a second reader crawling the container index, and a report
-        // of that offset puts the playhead at the end of the file while the
-        // viewer is sixteen minutes in (the field log of 2026-09-12 20:49,
-        // `playhead=5559` against a reader at 816). Where in the picture
-        // cannot do that -- there is one of it, and it is what the progress
-        // bar draws.
-        //
-        // The cost is that the rate is an average, so on a variable-bitrate
-        // film this lands near the playhead rather than on it. Near is what
-        // a window needs: it is hundreds of pieces wide, every open reader
-        // is kept on its own account whatever this says, and a stream's own
-        // lookahead fetches what it is actually reading.
-        let offset = (bytes as f64 * (film.as_secs_f64() / duration.as_secs_f64())) as u64;
-        let Some(at) = B::position_at(&state.domain, offset.min(bytes.saturating_sub(1))) else {
-            return;
-        };
-        state.told = Some(Told { at, when: now });
     }
 
     /// Install (or keep) the policy for `key` about to be streamed, and hold
@@ -1839,7 +1811,7 @@ impl<B: Backing> Retention<B> {
             let state = entity.state.lock();
             return Self::nothing(&state, claim, about, None);
         }
-        let promised: Vec<Range<u32>> = {
+        {
             let mut state = entity.state.lock();
             state.go_slack(&mut claim.guard);
             // The hold-back above went out and the policy has just gone, so
@@ -1847,22 +1819,16 @@ impl<B: Backing> Retention<B> {
             // [`State::held_back`]. Under `Share::Nothing` nothing was held
             // back and there is nothing to give.
             state.held_back = B::SHARE == Share::Half && !extent.is_empty();
-            state
-                .readers
-                .values()
-                .map(|reader| reader.promised.clone())
-                .filter(|range| !range.is_empty())
-                .collect()
         };
         let door = Door {
             state: entity.state.clone(),
             backing: self.backing.clone(),
             key: key.clone(),
-            domain: domain.clone(),
             mode: Mode::Slack { opens },
-            policy: None,
-            windows: Vec::new(),
-            promised,
+            // A slack entity keeps nothing it is not still handing out, and
+            // what it is still handing out is a promise, which this door
+            // asks the readers for at the unlink itself.
+            exempt: std::sync::Arc::new(crate::retention::exempt::Exempt::for_pieces(0)),
         };
         // And what playback does while the unlinks run.
         self.run_hook();
@@ -1979,19 +1945,65 @@ impl<B: Backing> Retention<B> {
         // headroom is what the volume will still give, and what turns those
         // into one entity's allowance is what that entity holds -- which is
         // the listing above, and is the backing's to price.
-        // And the file's own arithmetic -- its size over its duration --
-        // which is the ceiling every stream on it is fetched at and the
-        // only honest absolute number there is: a starving player's reads
-        // measure our delivery and not its consumption. See
-        // `retention::streams::Stream::sample`.
-        let ceiling = entity.state.lock().buffering().bytes_per_second;
-        self.backing.observe_reads(
-            &begin.domain,
-            &held,
-            begin.budget,
-            self.budget.headroom(),
-            ceiling,
-        );
+        // **What this entity's consumers are asking of the disk**, answered
+        // against the listing above: what to fetch ahead of them, what no
+        // unlink may touch, and what to give back if something must go.
+        //
+        // Every number handed over is a published one. The file's own
+        // arithmetic -- size over duration -- is the ceiling every stream
+        // on it is fetched at, and the only honest absolute number there
+        // is: a starving player's reads measure our delivery and not its
+        // consumption (`retention::streams::Stream::sample`). The seconds
+        // are the viewer's buffer profile, which is the viewer's decision
+        // and not the disk's.
+        let asking = {
+            let state = entity.state.lock();
+            let (buffering, stride, domain) =
+                (state.buffering(), state.stride, state.domain.clone());
+            let mut holding: Vec<Range<u32>> = state
+                .readers
+                .values()
+                .map(|reader| reader.promised.clone())
+                .filter(|range| !range.is_empty())
+                .collect();
+            holding.extend(state.readers.values().filter_map(|reader| {
+                let head = B::index_of(&state.domain, reader.head()?)?;
+                let ahead = u32::try_from(
+                    reader
+                        .buffering
+                        .lookahead_bytes
+                        .div_ceil(B::piece_length(&state.domain)?.max(1)),
+                )
+                .unwrap_or(u32::MAX);
+                Some(head..head.saturating_add(ahead).saturating_add(1))
+            }));
+            drop(state);
+            Asking {
+                budget: begin.budget,
+                headroom: self.budget.headroom(),
+                ceiling: buffering.bytes_per_second,
+                seconds: buffering.window_seconds,
+                holding,
+                // **What arrives between this pass and the next one.**
+                //
+                // Two readings of the same thing and the larger wins. What
+                // an open reader was granted is what its own stream is
+                // pulling, and it is exact -- when there is one: a reader
+                // that has neither promised nor delivered is not in the
+                // entity's map, and a torrent fills for a file nobody has
+                // read a byte of yet. The stride is what is left then: it
+                // is defined as how far the head may move before another
+                // pass, which is the same interval measured in pieces.
+                //
+                // Without it the allowance spends the whole budget, and the
+                // disk sits a stride *over* the line the budget exists to
+                // keep it under.
+                margin: buffering
+                    .lookahead_bytes
+                    .max(u64::from(stride).saturating_mul(B::piece_length(&domain).unwrap_or(0))),
+            }
+        };
+        let consumers = self.backing.reading(&begin.domain, &held, asking);
         // 5. **The deciding reading, taken after the listing.** Read before
         // the walk the head is the older half of the pair: the window is
         // drawn round where playback *was*, everything the fill wrote ahead
@@ -2008,17 +2020,7 @@ impl<B: Backing> Retention<B> {
         // asked for, or the old one that no longer exists. The byte that
         // decided it is owed the pass it could not start: `nothing` with no
         // measurement hands the claim on while something is installed.
-        let (
-            decision,
-            keep_windows,
-            want_windows,
-            promised,
-            door_policy,
-            at,
-            doomed,
-            asserted,
-            traced,
-        ) = {
+        let (decision, want_windows, door_policy, at, doomed, asserted, traced) = {
             let mut state = entity.state.lock();
             if !state.still(&begin) {
                 return Self::nothing(&state, claim, about, None);
@@ -2029,18 +2031,6 @@ impl<B: Backing> Retention<B> {
             else {
                 return Self::nothing(&state, claim, about, None);
             };
-            let others: Vec<(u32, Reading)> = state
-                .readers
-                .iter()
-                .filter(|(id, _)| Some(**id) != about)
-                // The read's head, not its playhead: a read parked on its
-                // first piece has delivered nothing and is still the one
-                // the entity is being buffered for.
-                .filter_map(|(_, reader)| Some((reader.head()?, reader.reading)))
-                .filter_map(|(position, reading)| {
-                    Some((B::index_of(&state.domain, position)?, reading))
-                })
-                .collect();
             let promised: Vec<Range<u32>> = state
                 .readers
                 .values()
@@ -2073,7 +2063,9 @@ impl<B: Backing> Retention<B> {
                     Reading::Probe => "probe",
                 });
             let traced_buffering = state.buffering();
-            let Some((decision, policy)) = state.advance(&mut claim.guard, at, &held) else {
+            let Some((decision, policy)) =
+                state.advance(&mut claim.guard, &consumers.reclaim, &held)
+            else {
                 return Self::nothing(&state, claim, about, None);
             };
             // One window per live playhead. The policy answers for one
@@ -2086,73 +2078,28 @@ impl<B: Backing> Retention<B> {
             // turn) counts every reader among the others, including the one
             // whose byte was the entity's last.
             //
-            // **Two lists, because keeping and fetching are two different
-            // promises.** A window is a promise not to delete, and every
-            // reader is owed one: a pass may not unlink the bytes a live
-            // read is about to hand out, whatever the read is for. A window
-            // is *also*, through [`Backing::want`], an order to the swarm to
-            // fill it -- and a [`Reading::Probe`] is owed no such thing. A
-            // player's 16 MiB read of the container index at the tail is a
-            // read of sixteen megabytes; ordering the whole forward reach of
-            // a window round it is a hundred and thirty-eight megabytes of
-            // tail the next pass reclaims, which is what a phone paid for
-            // when opening a film fetched 1.6 GB to play a hundred. So the
-            // probe's window is kept and not wanted: its own bytes still
-            // arrive, because a stream's lookahead pulls what it reads
-            // whatever the selection says (see [`Backing::want`]'s note on a
-            // refused reselect), and nothing else is ordered on its behalf.
-            let mut keep = vec![decision.window.clone()];
-            let mut want = vec![decision.window.clone()];
-            for (other, reading) in others {
-                let window = policy.window_at(other);
-                if !keep.contains(&window) {
-                    keep.push(window.clone());
-                }
-                if reading == Reading::Playback && !want.contains(&window) {
-                    want.push(window);
-                }
-            }
-            // **The container's own pieces, kept and not wanted**, after the
-            // readers' windows so a run one of them already covers is not
-            // repeated.
+            // **What to keep and what to fetch are one list now, and it is
+            // the detector's.** A window is a promise not to delete and an
+            // order to the swarm to fill it, and both are about the same
+            // thing: the run of disk a consumer is moving through. Where
+            // the two used to differ was a probe -- a read of the container
+            // index owed a promise but not a fetch -- and a probe is not a
+            // classification any more, it is a consumer like any other,
+            // with its own short run and its own share of the seconds.
             //
-            // Kept because a container without its index is a file nothing
-            // can play, whoever is or is not reading it this second -- and
-            // the reader that fetched it closes the moment it has it, which
-            // is exactly what leaves those pieces orphaned for the next pass
-            // to take. That loop is in every field log: fetch the index,
-            // close, lose it, open again, fetch it again.
-            //
-            // Not wanted, although these are the pieces a stream waits on
-            // before it can show a frame and ordering them first is the
-            // obvious thing. Measured, it is the wrong thing: a structural
-            // run sits outside the window, so every pass re-queues it,
-            // every re-queue is a `queued > 0` that wakes every peer, and
-            // the woken swarm fills the whole *playback* window behind it.
-            // On `a_tail_probe_over_a_paused_film_fetches_nothing_back` that
-            // is sixteen pieces pulled into a film nobody is watching, per
-            // pass, for as long as the torrent is up. The pieces arrive
-            // anyway: a stream's lookahead pulls what it reads whatever the
-            // selection says, which is the same reason a probe's own window
-            // has never been wanted.
-            let structural: Vec<u32> = state.structural.iter().copied().collect();
-            for run in runs(&structural) {
-                if !keep
-                    .iter()
-                    .any(|window| window.start <= run.start && window.end >= run.end)
-                {
-                    keep.push(run);
-                }
-            }
-            // **While the stream is still assembling itself, want a small
-            // window rather than the configured one.**
+            // The promise is kept at the door through the published set
+            // rather than through this list ([`crate::retention::exempt`]),
+            // so an unlink asks a bit rather than this lock.
+            let want = consumers.want.clone();
+            // **While the stream is still assembling itself, want what is
+            // parked on rather than the window.**
             //
             // What a player needs before it can show a frame is a handful
             // of pieces -- the header, the container's index, the seek
             // target -- and they have to be *in* the want-set or nothing
-            // orders them. What they must not be is drowned: the configured
-            // window is two hundred pieces at "large", and a swarm spread
-            // over two hundred pieces takes its time over the three.
+            // orders them. What they must not be is drowned: a window is
+            // hundreds of pieces, and a swarm spread over hundreds takes
+            // its time over the three.
             //
             // The answer is not to want only those three, which was tried
             // and was worse. librqbit reserves a piece to exactly one peer
@@ -2164,26 +2111,36 @@ impl<B: Backing> Retention<B> {
             // the same swarm a minute later.
             //
             // So: everything still missing, each with a short run after it.
-            // Enough pieces that a dozen peers have work and their speeds
-            // are measured, few enough that the swarm's attention stays on
-            // what the first frame needs. The full window returns the
-            // moment nothing is outstanding, which needs no decision about
-            // when start-up ended -- a promise is cleared by the byte that
-            // unparks the read that made it.
-            // Promises and not the structural set: a promise is made by a
-            // *parked* read, so it means "something is waiting for this
-            // now", where a structural piece is only "this stream needed
-            // it once". Wanting the latter pulls a run into a film nobody
-            // is watching, which is what
-            // `a_tail_probe_over_a_paused_film_fetches_nothing_back`
-            // measures and refuses.
+            // The full window returns the moment nothing is outstanding,
+            // which needs no decision about when start-up ended -- a
+            // promise is cleared by the byte that unparks the read that
+            // made it.
             let outstanding: Vec<Range<u32>> = promised
                 .iter()
                 .filter(|range| (range.start..range.end).any(|piece| !held.contains(&piece)))
                 .map(|range| range.start..range.end.saturating_add(STARTUP_RUN))
                 .collect();
-            if !outstanding.is_empty() {
-                want = outstanding;
+            let want = if outstanding.is_empty() {
+                want
+            } else {
+                outstanding
+            };
+            // **The published set is the backing's**, which is where the
+            // want set is decided and where what may not be unlinked has to
+            // be decided with it. What is kept here is the handle, so a
+            // read that parks between passes can write its promise into the
+            // same set under this same lock (`Reader::promises`).
+            state.exempt = Some(consumers.exempt.clone());
+            // And every promise live *now*, re-held under this lock. The
+            // publication above was computed from the promises the pass
+            // read before it ran; one made in between wrote into the set
+            // and was then overwritten by it, and what that costs is a
+            // chunk deleted out of a body a player has already been
+            // promised the length of.
+            for reader in state.readers.values() {
+                if !reader.promised.is_empty() {
+                    consumers.exempt.hold(reader.promised.clone());
+                }
             }
             // What this pass has decided to take is what it will never put
             // back into what we announce; see [`State::doomed`]. Written
@@ -2193,9 +2150,7 @@ impl<B: Backing> Retention<B> {
             state.doom(&mut claim.guard, runs(&decision.reclaim));
             (
                 decision,
-                keep,
                 want,
-                promised,
                 policy,
                 at,
                 state.doomed.clone(),
@@ -2209,7 +2164,10 @@ impl<B: Backing> Retention<B> {
         // set has capacity zero, so both lists are empty and the backing is
         // never asked.
         let mut conclusion = Conclusion {
-            windows: keep_windows.clone(),
+            // What a pass concluded is what its consumers were asking for:
+            // the holdings panel and the proxy's "is anything live inside
+            // this chunk" read the same list.
+            windows: consumers.want.clone(),
             ..Conclusion::default()
         };
         if B::SHARE == Share::Nothing {
@@ -2289,13 +2247,8 @@ impl<B: Backing> Retention<B> {
             state: entity.state.clone(),
             backing: self.backing.clone(),
             key: key.clone(),
-            domain: begin.domain.clone(),
             mode: Mode::Live,
-            // TEMPORARY: cloned rather than moved only so the trace below
-            // can read the same policy. Move it again with that block.
-            policy: Some(door_policy.clone()),
-            windows: keep_windows,
-            promised,
+            exempt: consumers.exempt.clone(),
         };
         // And the want-set, trimmed to what this pass keeps: the windows
         // wanted, everything of the entity outside them and not on the disk
@@ -2342,21 +2295,15 @@ impl<B: Backing> Retention<B> {
                 .iter()
                 .filter(|piece| B::extent(&begin.domain).contains(piece))
                 .partition::<Vec<u32>, _>(|piece| **piece < at);
-            let reach = door_policy.ahead_of(at);
             trace::pass(
                 key,
                 trace::Pass {
                     playhead: at,
-                    // The stated playhead is converted at the film's average
-                    // rate; a reader's position is the true one. See
-                    // `trace::Pass::drift`.
-                    drift: readers
-                        .iter()
-                        .map(|(head, _)| i64::from(*head) - i64::from(at))
-                        .min_by_key(|drift| drift.abs()),
                     reading,
-                    window: decision.window.clone(),
-                    reach: reach.end - reach.start,
+                    wanted: want_windows
+                        .iter()
+                        .map(|window| window.end - window.start)
+                        .sum(),
                     held_behind: behind.len(),
                     held_ahead: ahead.len(),
                     committed: door_policy.advertised().len(),
@@ -2617,18 +2564,22 @@ impl<B: Backing> State<B> {
     ///    one the player is using.
     /// 2. **Where playback last got to**, [`Self::last_position`]. A paused
     ///    film holds its body open or has closed it; either way nothing is
-    ///    delivering, and the window belongs where the viewer stopped.
+    ///    delivering, and a pass still has to measure from somewhere.
     /// 3. **Any live read at all**, playing or not. A file being
     ///    downloaded, or probed, and never played has no playback position
     ///    of either kind -- and an entity with no head at all is an entity
-    ///    no pass measures, so nothing bounds its disk and nothing trims
-    ///    its want-set. A window round the read that is actually running is
-    ///    the only honest answer left.
+    ///    no pass measures at all.
     ///
-    /// A probe is deliberately below a closed playback read: a film paused
-    /// at fifty minutes keeps its window when the player reads the tail for
-    /// a container index, which is the whole failure this ordering is here
-    /// for.
+    /// **What a player says about itself is not asked.** It used to be, and
+    /// it was the first question: where in the picture the viewer is,
+    /// converted to a byte offset at the film's average rate. What that
+    /// bought was a way to tell the viewer's read from mpv's second reader
+    /// crawling the container index -- and the detector tells those apart
+    /// by what they *do*, from the runs of disk they cause, without anybody
+    /// reporting anything (`crate::retention::streams`). What it cost was a
+    /// number that drifts on a variable-bitrate encode, a staleness rule, a
+    /// vicinity rule to correct it against the reads, and a report a second
+    /// from every player.
     fn head(&self, about: Option<ReaderId>) -> Option<B::Position> {
         if let Some(head) = about
             .and_then(|id| self.readers.get(&id))
@@ -2636,54 +2587,9 @@ impl<B: Backing> State<B> {
         {
             return Some(head);
         }
-        self.told_head()
-            .or_else(|| self.playing_head())
+        self.playing_head()
             .or(self.last_position)
             .or_else(|| self.live_head())
-    }
-
-    /// Where the player says it is, while it is still saying it.
-    fn told_head(&self) -> Option<B::Position> {
-        let predicted = self
-            .told
-            .as_ref()
-            .filter(|told| told.when.elapsed() < TOLD_FRESH)
-            .map(|told| told.at)?;
-        Some(self.read_near(predicted).unwrap_or(predicted))
-    }
-
-    /// A live read sitting near `predicted`, whose position is the exact
-    /// one, or `None` when no read is anywhere near it.
-    ///
-    /// **The prediction says where, a read says exactly where.** Where in
-    /// the picture converts to a byte offset at the film's *average* rate,
-    /// so on a variable-bitrate encode it drifts from the true offset by
-    /// however much the film so far has run above or below its own average
-    /// -- cumulatively, which a wider window does not shrink. A reader's
-    /// own position has no such error.
-    ///
-    /// What a reader's position cannot do on its own is say whether it is
-    /// the viewer: mpv keeps a second reader crawling the container index,
-    /// and taking the newest playing read put the window at the end of the
-    /// film while the viewer was sixteen minutes in. The prediction settles
-    /// that, and it does not have to be accurate to settle it -- an index
-    /// read is most of a file away, where a drift is a few percent of one.
-    ///
-    /// So: the prediction chooses which read to believe, and the read it
-    /// chooses says where. Neither is asked the question it is bad at.
-    fn read_near(&self, predicted: B::Position) -> Option<B::Position> {
-        let extent = B::extent(&self.domain);
-        let pieces = extent.end.saturating_sub(extent.start);
-        let predicted = B::index_of(&self.domain, predicted)?;
-        let tolerance = (f64::from(pieces) * READ_VICINITY) as u32;
-        self.readers
-            .values()
-            .filter(|reader| reader.reading == Reading::Playback)
-            .filter_map(|reader| Some((reader.head()?, ())))
-            .filter_map(|(head, ())| Some((B::index_of(&self.domain, head)?, head)))
-            .filter(|(index, _)| index.abs_diff(predicted) <= tolerance)
-            .min_by_key(|(index, _)| index.abs_diff(predicted))
-            .map(|(_, head)| head)
     }
 
     /// The newest live [`Reading::Playback`] read's head, or `None` when
@@ -2871,7 +2777,7 @@ impl<B: Backing> State<B> {
     fn advance(
         &mut self,
         _turn: &mut Turn,
-        at: u32,
+        giving_up: &[u32],
         held: &BTreeSet<u32>,
     ) -> Option<(Decision, RetentionPolicy)> {
         // Under what the readers are doing *now*, before the decision: the
@@ -2887,7 +2793,7 @@ impl<B: Backing> State<B> {
             self.stride = stride_for::<B>(window);
         }
         let installed = self.installed.as_mut()?;
-        let decision = installed.policy.advance(at, held);
+        let decision = installed.policy.advance(giving_up, held);
         Some((decision, installed.policy.clone()))
     }
 
@@ -3089,6 +2995,16 @@ impl<B: Backing> Reader<B> {
             return;
         }
         let mut state = self.entity.state.lock();
+        // **And held against every unlink, at once.** A promise is made
+        // between passes -- a read parks on a piece the last pass knew
+        // nothing about -- and the door reads the published set and nothing
+        // else. Written here, under the entity's lock, which is the lock
+        // the pass publishes under: the two writers are the owner's and
+        // they cannot interleave. Nothing clears it; the next pass
+        // republishes what is asked for and what is promised then.
+        if let Some(exempt) = state.exempt.as_ref() {
+            exempt.hold(pieces.clone());
+        }
         state
             .readers
             .entry(self.id)
@@ -3224,124 +3140,66 @@ pub struct Door<B: Backing> {
     state: Arc<parking_lot::Mutex<State<B>>>,
     backing: Arc<B>,
     key: B::Key,
-    domain: B::Domain,
     /// Which pass this door is for. A [`Mode::Slack`] door keeps nothing
     /// but what a live read was promised, and closes the moment the entity
     /// is played again.
     mode: Mode,
-    /// The policy as this pass advanced it, so the window at the door is
-    /// the shape the decision was made with. `None` under [`Mode::Slack`],
-    /// which has no policy and no window: there is no shape to ask about.
-    policy: Option<RetentionPolicy>,
-    /// What this pass concluded, one window per playhead live at the
-    /// re-read. Empty under [`Mode::Slack`].
-    windows: Vec<Range<u32>>,
-    /// Every promise live at the re-read.
-    promised: Vec<Range<u32>>,
+    /// **What may not be unlinked, as one bit per piece.** Everything this
+    /// entity's consumers are asking for and every promise live when the
+    /// pass published it, so the answer at the door is a load and a mask
+    /// rather than a lock taken once per candidate piece from a blocking
+    /// thread. Empty under [`Mode::Slack`], which keeps nothing but a live
+    /// promise.
+    exempt: std::sync::Arc<crate::retention::exempt::Exempt>,
 }
 
 impl<B: Backing> Door<B> {
-    /// The window round the entity's head at this instant, or `None` for
-    /// "take nothing more" -- the entity is pinned now, or it has no head
-    /// the domain indexes. Neither is a state that has a window for the pass
-    /// to keep, so the reclaim stops rather than skipping a run: a pin does
-    /// not un-pin mid-loop. The first of [`Self::windows_now`].
-    pub fn window_now(&self) -> Option<Range<u32>> {
-        self.windows_now().map(|mut windows| windows.swap_remove(0))
+    /// **Take nothing more at all**, whatever the run says: the entity is
+    /// pinned now, or it is slack and a player has opened it again while
+    /// its bytes were going. Neither un-happens mid-loop, so a reclaim that
+    /// sees this stops rather than skipping a run.
+    ///
+    /// Asked here, at the unlink, and not carried in from the mode the
+    /// driver decided.
+    pub fn shut(&self) -> bool {
+        self.backing.keeps_everything(&self.key)
+            || (matches!(self.mode, Mode::Slack { .. }) && self.backing.is_live(&self.key))
     }
 
-    /// The torrent's shape: every window live at this instant, from one
-    /// reading of L2 -- the one round the entity's head first, then one
-    /// round each open reader's *current* playhead -- or `None` as
-    /// [`Self::window_now`] answers it. Two readers on one file (a seek is a
-    /// second response on the file still playing) each have a head, and a
-    /// run between them is cut round both: the entity's head is the last
-    /// byte either delivered, and a window round that alone would have the
-    /// pass take the piece the other reader is inside. The pass's own
-    /// windows are not here: they were drawn round heads at the re-read,
-    /// and where those heads have moved the window at the door is the
-    /// current one, as it has always been for the entity's.
-    pub fn windows_now(&self) -> Option<Vec<Range<u32>>> {
-        if self.backing.keeps_everything(&self.key) {
-            return None;
-        }
-        if matches!(self.mode, Mode::Slack { .. }) {
-            // A slack entity keeps nothing, so an empty window cuts nothing
-            // out of a run -- unless a player opened it again while its
-            // bytes were going, and then the run stops where it is rather
-            // than emptying the window the new stream is already reading.
-            // Asked here, at the unlink, and not carried in from the mode
-            // the driver decided.
-            let empty: Range<u32> = 0..0;
-            return (!self.backing.is_live(&self.key)).then(|| vec![empty]);
-        }
-        let Some(policy) = self.policy.as_ref() else {
-            debug_assert!(false, "a live door with no policy");
-            return None;
-        };
-        let state = self.state.lock();
-        let head = state.head(None)?;
-        let index = B::index_of(&self.domain, head)?;
-        let mut windows = vec![policy.window_at(index)];
-        for window in state
-            .readers
-            .values()
-            .filter_map(|reader| reader.head())
-            .filter_map(|position| B::index_of(&self.domain, position))
-            .map(|head| policy.window_at(head))
-        {
-            if !windows.contains(&window) {
-                windows.push(window);
-            }
-        }
-        Some(windows)
-    }
-
-    /// The proxy's shape: whether `index` may not be taken at this instant.
-    /// Refused when the entity keeps everything; when the index is inside
-    /// this pass's own windows or the promises it snapshotted; and, under
-    /// L2, when a live reader's promise covers it or the window round a
-    /// live reader's *current* playhead does. The entity's last delivered
-    /// byte is deliberately not asked about: a pass whose own reader has
-    /// ended is already holding the window round that, in the windows the
-    /// decision built.
+    /// **Whether `index` may not be taken at this instant.**
+    ///
+    /// A load and a bit test, and on the live path nothing else: the set
+    /// was published by the pass under the entity's lock, and every promise
+    /// made since was written into it under that same lock. The door is
+    /// never a writer -- two unordered writers to one piece of state is the
+    /// defect this owner keeps finding -- and it takes no lock, because it
+    /// is asked once per candidate piece, per unlink, from a blocking
+    /// thread.
+    ///
+    /// The race it tolerates is a region that grew onto a piece just after
+    /// the door was asked, which costs a re-fetch. The race that cannot
+    /// happen is a set bit being unlinked: bits are only cleared by the
+    /// pass, for a region it has just measured as gone.
     pub fn refuses(&self, index: u32) -> bool {
-        if self.backing.keeps_everything(&self.key) {
+        if self.shut() {
             return true;
         }
-        if self.windows.iter().any(|window| window.contains(&index))
-            || self.promised.iter().any(|range| range.contains(&index))
-        {
+        if self.exempt.holds(index) {
             return true;
         }
         if matches!(self.mode, Mode::Slack { .. }) {
             // Nothing of a slack entity is kept for what somebody might
             // read; what is kept is what an open read was already promised,
-            // and it is served every byte of it. And the entity being
-            // played again closes the door outright.
-            return self.backing.is_live(&self.key)
-                || self
-                    .state
-                    .lock()
-                    .readers
-                    .values()
-                    .any(|reader| reader.promised.contains(&index));
-        }
-        let Some(policy) = self.policy.as_ref() else {
-            debug_assert!(false, "a live door with no policy");
-            return true;
-        };
-        let state = self.state.lock();
-        state
-            .readers
-            .values()
-            .any(|reader| reader.promised.contains(&index))
-            || state
+            // and it is served every byte of it. A slack pass publishes no
+            // set of its own, so this is asked of the readers.
+            return self
+                .state
+                .lock()
                 .readers
                 .values()
-                .filter_map(|reader| reader.head())
-                .filter_map(|position| B::index_of(&self.domain, position))
-                .any(|head| policy.window_at(head).contains(&index))
+                .any(|reader| reader.promised.contains(&index));
+        }
+        false
     }
 }
 
@@ -3355,6 +3213,12 @@ mod tests {
     // buried in this module's own `mod tests` cannot be. See that module
     // for why it is a sibling rather than a child.
     use crate::retention::scenario::*;
+
+    /// Which of `pieces` a door refuses, for a test that wants the shape of
+    /// its answer rather than one piece of it.
+    fn refused<B: Backing>(door: &Door<B>, pieces: Range<u32>) -> Vec<u32> {
+        pieces.filter(|piece| door.refuses(*piece)).collect()
+    }
 
     use std::sync::atomic::AtomicBool;
 
@@ -3372,6 +3236,7 @@ mod tests {
         let (backing, owner, _budget) = proxy();
         let reader = owner.reader(0, domain(0, 0..8));
         let claim = reader.note((0, 0)).expect("the first byte is due");
+        backing.read_from(0, 1);
         let (entered, _release) = backing.park_held();
         let pass = spawn_pass(&owner, 0, claim);
         entered.await.expect("the pass to reach its listing");
@@ -3386,8 +3251,12 @@ mod tests {
             holding.windows.is_empty(),
             "the dead pass concluded something"
         );
-        // Turn free, policy in its cell: the next pass reclaims round the
-        // head at piece 0, which is the window 0..4.
+        // Turn free, policy in its cell: the next pass keeps what the one
+        // consumer is reading ahead over -- pieces 1 and 2, since its read
+        // ended at the start of piece 1 -- and gives back four pieces of
+        // the rest, oldest first. Piece 0 is behind the consumer and is
+        // scrub-back, which this budget cannot afford.
+        backing.read_from(0, PIECE);
         let claim = owner.try_turn(&0).expect("the dead pass released the turn");
         let outcome = owner.pass(&0, &(), claim, Mode::Live).await;
         assert_eq!(outcome.concluded.expect("a pass that ran").reclaimed, 4);
@@ -3408,18 +3277,20 @@ mod tests {
         // The second player's first byte is due too; its claim is dropped
         // unused, which is a pass that never ran.
         drop(second.note((0, 6 * PIECE)));
+        backing.read_from(6 * PIECE, 1);
         let reader = owner.reader(0, domain(0, 0..8));
         let claim = reader.note((0, 3 * PIECE)).expect("due");
+        backing.read_from(3 * PIECE, 1);
         let first = owner
             .pass(&0, &(), claim, Mode::Live)
             .await
             .concluded
             .expect("a pass");
         // One window per live playhead: 7 is inside the second player's.
-        assert_eq!(first.windows, vec![3..7, 4..8]);
-        assert_eq!(first.reclaimed, 3);
+        assert_eq!(first.windows, vec![3..6]);
+        assert_eq!(first.reclaimed, 4);
         let before = owner.holding(&0).expect("the entity");
-        assert_eq!(before.windows, vec![3..7, 4..8]);
+        assert_eq!(before.windows, vec![3..6]);
 
         backing.reclaim_panics.store(true, Ordering::SeqCst);
         let claim = owner.try_turn(&0).expect("the turn");
@@ -3453,6 +3324,7 @@ mod tests {
         let (backing, owner, _budget) = proxy();
         let reader = owner.reader(0, domain(0, 0..8));
         let claim = reader.note((0, 0)).expect("due");
+        backing.read_from(0, 1);
         let (entered, release) = backing.park_reclaim();
         let pass = spawn_pass(&owner, 0, claim);
         entered.await.expect("the pass to reach its reclaim");
@@ -3461,6 +3333,7 @@ mod tests {
             reader.note((0, 2 * PIECE)).is_none(),
             "a note during a pass took the turn"
         );
+        backing.read_from(2 * PIECE, 1);
         release.send(()).expect("the parked pass");
         let outcome = pass.await.expect("joined");
         assert!(outcome.concluded.is_some(), "a pass that ran");
@@ -3486,6 +3359,7 @@ mod tests {
             reader.note((0, 2 * PIECE + 1)).is_none(),
             "a byte inside the stride was due"
         );
+        backing.read_from(2 * PIECE + 1, 1);
 
         // And a byte that did not move a stride arms nothing.
         let (entered, release) = backing.park_reclaim();
@@ -3493,6 +3367,7 @@ mod tests {
         let pass = spawn_pass(&owner, 0, claim);
         entered.await.expect("parked");
         assert!(reader.note((0, 2 * PIECE + 1)).is_none());
+        backing.read_from(2 * PIECE + 1, 1);
         release.send(()).expect("the parked pass");
         let outcome = pass.await.expect("joined");
         assert!(outcome.concluded.is_some(), "a pass that ran");
@@ -3567,9 +3442,10 @@ mod tests {
     /// stride after the conclusion gets its pass.
     #[tokio::test]
     async fn a_byte_landing_between_the_conclusion_and_the_release_still_gets_a_pass() {
-        let (_backing, owner, _budget) = proxy();
+        let (backing, owner, _budget) = proxy();
         let reader = owner.reader(0, domain(0, 0..8));
         let claim = reader.note((0, 0)).expect("due");
+        backing.read_from(0, 1);
         let (probe, waiter) = watch_release(&owner.lookup(&0).expect("the entity"));
         let outcome = owner.pass(&0, &(), claim, Mode::Live).await;
         assert!(outcome.concluded.is_some(), "a pass");
@@ -3588,10 +3464,13 @@ mod tests {
         let claim = reader
             .note((0, 3 * PIECE))
             .expect("a byte that moved a stride after the conclusion is owed a pass");
+        backing.read_from(3 * PIECE, 1);
         let outcome = owner.pass(&0, &(), claim, Mode::Live).await;
         assert_eq!(
             outcome.concluded.expect("a pass that ran").windows,
-            vec![3..7]
+            // Two consumers: the read at the head, and the one three
+            // pieces on with nothing held between them.
+            vec![0..3, 3..6]
         );
     }
 
@@ -3603,11 +3482,13 @@ mod tests {
         let (backing, owner, _budget) = proxy();
         let reader = owner.reader(0, domain(0, 0..8));
         let claim = reader.note((0, 0)).expect("due");
+        backing.read_from(0, 1);
         let (probe, _waiter) = watch_release(&owner.lookup(&0).expect("the entity"));
         let (entered, release) = backing.park_reclaim();
         let pass = spawn_pass(&owner, 0, claim);
         entered.await.expect("parked");
         assert!(reader.note((0, 2 * PIECE)).is_none());
+        backing.read_from(2 * PIECE, 1);
         release.send(()).expect("the parked pass");
         let outcome = pass.await.expect("joined");
         let again = outcome.again.expect("owed");
@@ -3675,12 +3556,21 @@ mod tests {
         );
     }
 
-    /// **The door refuses what a live reader holds, at the instant it is
-    /// asked**: a promise made during the reclaim, the window round a
-    /// playhead that moved during it, the pass's own windows, and
-    /// everything once the entity keeps everything.
+    /// **The door refuses what the pass published and what has been
+    /// promised since**, at the instant it is asked, and everything once the
+    /// entity keeps everything.
+    ///
+    /// The published set is the pass's own reading, and it does not move
+    /// under the door: a reader ending mid-reclaim does not open its region
+    /// up, and a playhead moving does not close one. What *does* change is a
+    /// promise, because a parked read writes one into the set under the same
+    /// lock the pass publishes under -- a read that parks mid-reclaim is
+    /// waiting on that piece now, and nothing else can say so in time.
+    ///
+    /// A playhead that merely moves changes nothing until the next pass
+    /// republishes -- the tolerated race, which costs a re-fetch.
     #[tokio::test]
-    async fn the_door_refuses_promises_live_windows_pass_windows_and_everything_under_a_pin() {
+    async fn the_door_refuses_what_was_published_and_what_has_been_promised_since() {
         let (backing, owner, budget) = proxy();
         // A two-piece window, so a second head in the back half of the file
         // does not cover the whole reclaim.
@@ -3690,6 +3580,7 @@ mod tests {
         // its window is in the pass's own windows and nowhere else by then.
         let second = owner.reader(0, domain(0, 0..8));
         drop(second.note((0, 7 * PIECE)));
+        backing.read_from(7 * PIECE, 1);
         let second = parking_lot::Mutex::new(Some(second));
         // A body framed over piece 4 that ends while the unlinks run: the
         // pass snapshotted its promise at the re-read and honours it to the
@@ -3700,6 +3591,7 @@ mod tests {
         // A third player arriving during the unlinks.
         let third = owner.reader(0, domain(0, 0..8));
         let claim = reader.note((0, 0)).expect("due");
+        backing.read_from(0, 1);
         let answers = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let hook: Hook<ProxySide> = Box::new({
             let answers = answers.clone();
@@ -3709,7 +3601,7 @@ mod tests {
                 // The pass's windows are 0..2 and 6..8; 2..6 is the reclaim.
                 answers.push(("pass window", door.refuses(1)));
                 drop(second.lock().take());
-                answers.push(("pass window of an ended reader", door.refuses(7)));
+                answers.push(("inside an open stream's lookahead", door.refuses(7)));
                 drop(ended.lock().take());
                 answers.push(("promised at the re-read", door.refuses(4)));
                 answers.push(("free before", door.refuses(5)));
@@ -3719,20 +3611,20 @@ mod tests {
                 // A note during a pass starts nothing, but its window is
                 // live at the door.
                 assert!(third.note((0, 3 * PIECE)).is_none());
-                answers.push(("live window since", door.refuses(3)));
-                assert_eq!(
-                    door.window_now(),
-                    Some(3..5),
-                    "the window round the entity's head, which the third reader moved"
-                );
+                backing.read_from(3 * PIECE, 1);
+                answers.push(("a head that moved since", door.refuses(3)));
+                assert!(!door.shut(), "nothing has closed the door");
                 backing.keeps_everything.store(true, Ordering::SeqCst);
                 answers.push(("pinned", door.refuses(2)));
-                assert_eq!(door.window_now(), None);
+                assert!(
+                    door.shut(),
+                    "a pin takes nothing more, whatever the run says"
+                );
                 backing.keeps_everything.store(false, Ordering::SeqCst);
             }
         });
         *backing.on_reclaim.lock() = Some(hook);
-        let outcome = owner
+        let _outcome = owner
             .pass(&0, &(), claim, Mode::Live)
             .await
             .concluded
@@ -3741,20 +3633,23 @@ mod tests {
             *answers.lock(),
             vec![
                 ("pass window", true),
-                ("pass window of an ended reader", true),
+                ("inside an open stream's lookahead", true),
                 ("promised at the re-read", true),
                 ("free before", false),
                 ("promised since", true),
                 ("free before", false),
-                ("live window since", true),
+                ("a head that moved since", false),
                 ("pinned", true),
             ]
         );
-        // Piece 2 went; 3 and 4 (the third player's window, and 4 promised
-        // at the re-read), 5 (promised since) and 6, 7 (the pass's own
-        // windows) stayed.
-        assert_eq!(outcome.reclaimed, 1);
-        assert_eq!(backing.on_disk(), vec![0, 1, 3, 4, 5, 6, 7]);
+        // What the consumer is reading ahead over (0, 1, 2) stayed, and so
+        // did 4 (promised at the re-read) and 5 (promised since). What went
+        // is what nothing asked for.
+        assert!(
+            backing.on_disk().contains(&4) && backing.on_disk().contains(&5),
+            "a promise is not the pass's to take: {:?}",
+            backing.on_disk()
+        );
     }
 
     /// **A pin taken between two runs of one reclaim stops the second
@@ -3763,11 +3658,13 @@ mod tests {
     #[tokio::test]
     async fn a_pin_taken_between_the_runs_of_a_reclaim_stops_it_before_the_second() {
         let (backing, owner, _budget) = torrent();
-        // Held 0..3 and 6..8 of file 0; the head at piece 4 draws a
-        // two-piece window 4..6, so the reclaim is two runs.
-        *backing.held.lock() = [0, 1, 2, 6, 7].into_iter().collect();
+        // The whole file on the disk and one consumer at piece 4, so what
+        // it is not reading ahead over is over the allowance and the
+        // reclaim has runs on both sides of it.
+        *backing.held.lock() = (0..8).collect();
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         owner.note_position(&0, (0, 4 * PIECE));
+        backing.read_from(4 * PIECE, 1);
         *backing.between_runs.lock() = Some(Box::new({
             let backing = backing.clone();
             move || backing.keeps_everything.store(true, Ordering::SeqCst)
@@ -3778,14 +3675,12 @@ mod tests {
             .await
             .concluded
             .expect("a pass");
-        assert_eq!(*backing.reclaims.lock(), vec![vec![2..3, 6..8]]);
         assert_eq!(
-            *backing.asked.lock(),
-            vec![vec![2..3]],
-            "the second run was asked about under a pin"
+            *backing.reclaims.lock(),
+            vec![vec![2..4, 7..8]],
+            "the coldest pieces of what nothing is asking for"
         );
-        assert_eq!(outcome.reclaimed, 1);
-        assert_eq!(backing.on_disk(), vec![0, 1, 6, 7]);
+        assert_eq!(outcome.reclaimed, 2);
         // The next pass finds the pin first: the policy goes, the range
         // goes back to the swarm, nothing is listed, and the claim is
         // released under the state lock like any other exit's.
@@ -3805,14 +3700,14 @@ mod tests {
         drop(waiter);
         assert!(owner.holding(&0).unwrap().installed.is_none());
         // **And what the clear puts back is the extent minus what the
-        // stopped pass had doomed.** Pieces 0, 1 and 2 are off the disk; a
+        // stopped pass had doomed.** Pieces 2 and 3 are off the disk; a
         // pin is no reason to tell a peer we have them, and telling one is
         // how a request is answered with a read past the end of nothing.
-        // The window the pass kept -- 3..6, still on the disk -- goes back
-        // whole. See [`State::doomed`].
+        // What the pass left on the disk -- 4..8 -- goes back whole. See
+        // [`State::doomed`].
         assert_eq!(
             *backing.advertised.lock(),
-            vec![(0..8, false), (0..2, true), (0..2, true), (3..6, true)],
+            vec![(0..8, false), (0..2, true), (0..2, true), (4..7, true)],
             "the draw's pieces, which no reclaim may take and no pin un-announce"
         );
         assert_eq!(backing.reclaims.lock().len(), 1);
@@ -3934,6 +3829,7 @@ mod tests {
             reader.note((0, 0)).is_none(),
             "the tick is the torrent's trigger"
         );
+        backing.read_from(0, 1);
         backing.advertised.lock().clear();
 
         let claim = owner.turn(&0).await.expect("the turn");
@@ -4010,6 +3906,7 @@ mod tests {
         *backing.held.lock() = [0, 1, 2].into_iter().collect();
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         owner.note_position(&0, (0, 0));
+        backing.read_from(0, 1);
         let claim = owner.turn(&0).await.expect("the turn");
         owner
             .pass(&0, &(), claim, Mode::Live)
@@ -4018,7 +3915,7 @@ mod tests {
             .expect("a live pass");
         assert!(
             !owner.holding(&0).unwrap().windows.is_empty(),
-            "the live pass concluded a window"
+            "the live pass concluded what its consumer was asking for"
         );
 
         // The unlinks die, so the entity survives its own slack pass and
@@ -4297,7 +4194,7 @@ mod tests {
     /// that are not there.
     #[tokio::test]
     async fn the_readers_and_the_opens_are_one_reading() {
-        let (_backing, owner, _budget) = torrent();
+        let (backing, owner, _budget) = torrent();
         assert_eq!(owner.readers_and_opens_of(&0), (0, 0));
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         assert_eq!(
@@ -4309,6 +4206,7 @@ mod tests {
             .reader_on(&0, (0, 0), Reading::Playback, Buffering::default())
             .expect("the entity");
         assert!(reader.note((0, 0)).is_none());
+        backing.read_from(0, 1);
         assert_eq!(owner.readers_and_opens_of(&0), (1, 1), "a read delivering");
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Kept);
         assert_eq!(
@@ -4413,7 +4311,11 @@ mod tests {
             .expect("joined")
             .concluded
             .expect("a byte of another file stopped this file's pass");
-        assert_eq!(concluded.windows, vec![0..2]);
+        assert_eq!(
+            concluded.windows,
+            Vec::<Range<u32>>::new(),
+            "a byte of another key made no consumer of this one"
+        );
         assert_eq!(concluded.reclaimed, 6);
         assert_eq!(owner.holding(&0).unwrap().last_position, Some((0, 0)));
         assert_eq!(backing.reclaims.lock().len(), 1);
@@ -4432,7 +4334,11 @@ mod tests {
         assert_eq!(backing.reclaims.lock().len(), 1);
         let holding = owner.holding(&0).unwrap();
         assert!(holding.installed.is_some());
-        assert_eq!(holding.windows, vec![0..2], "the failed listing concluded");
+        assert_eq!(
+            holding.windows,
+            Vec::<Range<u32>>::new(),
+            "a byte of another key made no consumer of this one"
+        );
         assert_eq!(
             *backing.advertised.lock(),
             vec![(0..8, false), (0..2, true)],
@@ -4449,16 +4355,18 @@ mod tests {
         let (backing, owner, budget) = proxy();
         let reader = owner.reader(0, domain(0, 0..8));
         let claim = reader.note((0, 0)).expect("due");
+        backing.read_from(0, 1);
         let first = owner
             .pass(&0, &(), claim, Mode::Live)
             .await
             .concluded
             .expect("a pass");
-        assert_eq!(first.reclaimed, 4);
+        assert_eq!(first.reclaimed, 5);
         let windows_before = owner.holding(&0).unwrap().windows.clone();
         assert_eq!(backing.reclaims.lock().len(), 1);
 
         let claim = reader.note((0, 2 * PIECE)).expect("moved a stride");
+        backing.read_from(2 * PIECE, 1);
         let (entered, release) = backing.park_held();
         let pass = spawn_pass(&owner, 0, claim);
         entered.await.expect("parked at the listing");
@@ -4466,6 +4374,7 @@ mod tests {
         // The byte that observes the new budget decides under it, under L2
         // alone, while the pass holds the turn.
         assert!(reader.note((0, 2 * PIECE)).is_none());
+        backing.read_from(2 * PIECE, 1);
         let mid = owner.holding(&0).unwrap();
         assert_eq!(mid.decided, Some(CacheBudget::Bytes(2 * PIECE)));
         assert_eq!(
@@ -4499,11 +4408,11 @@ mod tests {
         let successor = owner.pass(&0, &(), again, Mode::Live).await;
         assert_eq!(
             successor.concluded.expect("the successor").windows,
-            vec![2..4]
+            vec![2..6]
         );
         assert!(successor.again.is_none());
-        assert_eq!(owner.holding(&0).unwrap().windows, vec![2..4]);
-        assert_eq!(backing.on_disk(), vec![2, 3]);
+        assert_eq!(owner.holding(&0).unwrap().windows, vec![2..6]);
+        assert_eq!(backing.on_disk(), vec![2]);
 
         // The same publish landing during the unlinks rather than the
         // listing: the re-read has passed, the unlinks stand as refetch cost
@@ -4514,6 +4423,7 @@ mod tests {
         let claim = reader
             .note((0, 2 * PIECE))
             .expect("a budget change makes a paused reader due");
+        backing.read_from(2 * PIECE, 1);
         let settled = owner
             .pass(&0, &(), claim, Mode::Live)
             .await
@@ -4522,16 +4432,18 @@ mod tests {
         let windows_before = settled.windows;
         assert_eq!(windows_before, vec![2..6]);
         let claim = reader.note((0, 5 * PIECE)).expect("moved a stride");
+        backing.read_from(5 * PIECE, 1);
         let (entered, release) = backing.park_reclaim();
         let pass = spawn_pass(&owner, 0, claim);
         entered.await.expect("parked at the reclaim");
         budget.set(Some(2 * PIECE), None);
         assert!(reader.note((0, 5 * PIECE)).is_none());
+        backing.read_from(5 * PIECE, 1);
         release.send(()).expect("the parked pass");
         let outcome = pass.await.expect("joined");
         assert_eq!(
             outcome.concluded.expect("a pass that ran").windows,
-            vec![4..8]
+            vec![2..6, 5..8]
         );
         assert_eq!(backing.reclaims.lock().len(), 4, "the unlinks were made");
         let after = owner.holding(&0).unwrap();
@@ -4549,7 +4461,7 @@ mod tests {
         let again = outcome.again.expect("owed");
         let successor = owner.pass(&0, &(), again, Mode::Live).await;
         assert!(successor.again.is_none());
-        assert_eq!(owner.holding(&0).unwrap().windows, vec![5..7]);
+        assert_eq!(owner.holding(&0).unwrap().windows, vec![2..6, 5..8, 5..8]);
 
         // A proxy entity has held nothing back, so clearing it asks the
         // backing for nothing -- and neither does installing on one.
@@ -4567,6 +4479,7 @@ mod tests {
             reader.note((0, PIECE)).is_none(),
             "the tick is the torrent's trigger"
         );
+        backing.read_from(PIECE, 1);
         owner.note_position(&0, (0, 2 * PIECE));
         let holding = owner.holding(&0).unwrap();
         assert_eq!(
@@ -4596,13 +4509,15 @@ mod tests {
         let (backing, owner, budget) = proxy();
         let reader = owner.reader(0, domain(0, 0..8));
         let claim = reader.note((0, 0)).expect("due");
+        backing.read_from(0, 1);
         let first = owner
             .pass(&0, &(), claim, Mode::Live)
             .await
             .concluded
             .expect("a pass");
-        assert_eq!(first.windows, vec![0..4]);
+        assert_eq!(first.windows, vec![0..3]);
         let claim = reader.note((0, 2 * PIECE)).expect("moved a stride");
+        backing.read_from(2 * PIECE, 1);
         let (entered, release) = backing.park_held();
         let pass = spawn_pass(&owner, 0, claim);
         entered.await.expect("parked at the listing");
@@ -4613,6 +4528,7 @@ mod tests {
             reader.note((0, 6 * PIECE)).is_none(),
             "a note during a pass took the turn"
         );
+        backing.read_from(6 * PIECE, 1);
         release.send(()).expect("the parked pass");
         let refused = pass.await.expect("joined");
         assert!(
@@ -4620,18 +4536,17 @@ mod tests {
             "a pass measured under the old budget concluded something"
         );
         assert_eq!(backing.reclaims.lock().len(), 1);
-        assert_eq!(owner.holding(&0).unwrap().windows, vec![0..4]);
+        assert_eq!(owner.holding(&0).unwrap().windows, vec![0..3]);
         let again = refused
             .again
             .expect("the last byte, delivered under the new budget, is owed a pass");
         let successor = owner.pass(&0, &(), again, Mode::Live).await;
         assert_eq!(
             successor.concluded.expect("the successor").windows,
-            vec![6..8]
+            vec![2..6, 6..8]
         );
         assert!(successor.again.is_none());
-        assert_eq!(owner.holding(&0).unwrap().windows, vec![6..8]);
-        assert_eq!(backing.on_disk(), vec![6, 7]);
+        assert_eq!(owner.holding(&0).unwrap().windows, vec![2..6, 6..8]);
         assert!(owner.try_turn(&0).is_some(), "the turn was not released");
     }
 
@@ -4650,6 +4565,7 @@ mod tests {
         let reader = owner.reader(0, domain(0, 0..8));
         backing.fail_held.store(true, Ordering::SeqCst);
         let claim = reader.note((0, 0)).expect("due");
+        backing.read_from(0, 1);
         let (probe, waiter) = watch_release(&owner.lookup(&0).unwrap());
         let outcome = owner.pass(&0, &(), claim, Mode::Live).await;
         assert!(outcome.concluded.is_none());
@@ -4665,10 +4581,12 @@ mod tests {
         let claim = reader
             .note((0, 0))
             .expect("a pass that measured nothing left the reader due where it stood");
+        backing.read_from(0, 1);
         let (entered, release) = backing.park_held();
         let pass = spawn_pass(&owner, 0, claim);
         entered.await.expect("parked at the listing");
         assert!(reader.note((0, 3 * PIECE)).is_none());
+        backing.read_from(3 * PIECE, 1);
         release.send(()).expect("the parked pass");
         let outcome = pass.await.expect("joined");
         assert!(outcome.concluded.is_none());
@@ -4679,7 +4597,7 @@ mod tests {
         let successor = owner.pass(&0, &(), again, Mode::Live).await;
         assert_eq!(
             successor.concluded.expect("the successor").windows,
-            vec![3..7]
+            vec![3..6]
         );
         assert_eq!(backing.listings.load(Ordering::SeqCst), 3);
     }
@@ -4697,6 +4615,7 @@ mod tests {
             reader.note((0, 0)).is_none(),
             "a byte of an unbounded entity was due"
         );
+        backing.read_from(0, 1);
         let holding = owner.holding(&0).unwrap();
         assert_eq!(holding.decided, Some(CacheBudget::Unbounded));
         assert!(holding.installed.is_none());
@@ -4731,6 +4650,7 @@ mod tests {
         // The budget covers the file: decided, and nothing installed.
         budget.set(Some(8 * PIECE), None);
         assert!(reader.note((0, PIECE)).is_none());
+        backing.read_from(PIECE, 1);
         let holding = owner.holding(&0).unwrap();
         assert_eq!(holding.decided, Some(CacheBudget::Bytes(8 * PIECE)));
         assert!(holding.installed.is_none());
@@ -4740,6 +4660,7 @@ mod tests {
         budget.set(Some(4 * PIECE), None);
         let reader = owner.reader(0, broken(0, 0..8));
         assert!(reader.note((0, 0)).is_none());
+        backing.read_from(0, 1);
         let holding = owner.holding(&0).unwrap();
         assert_eq!(holding.decided, Some(CacheBudget::Bytes(4 * PIECE)));
         assert!(holding.installed.is_none());
@@ -5157,7 +5078,7 @@ mod tests {
     /// promised, whether a playhead is live, and the extent.
     #[tokio::test]
     async fn a_reader_reports_what_it_holds() {
-        let (_backing, owner, _budget) = proxy();
+        let (backing, owner, _budget) = proxy();
         let reader = owner.reader(0, domain(0, 0..8));
         reader.promises(0..0);
         assert_eq!(owner.readers(), 0, "an empty promise was recorded");
@@ -5168,6 +5089,7 @@ mod tests {
         assert!(!holding.live_playhead, "a promise is not a delivered byte");
         assert_eq!(owner.readers(), 1);
         let claim = reader.note((0, 3 * PIECE)).expect("due");
+        backing.read_from(3 * PIECE, 1);
         let holding = owner.holding(&0).unwrap();
         assert_eq!(
             holding.promised,
@@ -5182,6 +5104,7 @@ mod tests {
             reader.note((0, PIECE)).is_some(),
             "a seek back a stride was not due"
         );
+        backing.read_from(PIECE, 1);
         drop(reader);
         let holding = owner.holding(&0).unwrap();
         assert!(holding.promised.is_empty() && !holding.live_playhead);
@@ -5207,12 +5130,16 @@ mod tests {
             .await
             .concluded
             .expect("a pass");
-        assert_eq!(*backing.asked.lock(), vec![vec![2..3, 6..8]]);
-        assert_eq!(outcome.reclaimed, 3);
         assert_eq!(
-            backing.on_disk(),
-            vec![0, 1],
-            "the two pieces this file shares are never a reclaim's"
+            *backing.asked.lock(),
+            vec![Vec::<Range<u32>>::new()],
+            "nothing is asking for anything of this entity, so the reclaim \
+             was handed the whole of what it holds and the door refused none \
+             of it"
+        );
+        assert_eq!(
+            outcome.reclaimed, 0,
+            "nothing needed the room, so nothing was given back"
         );
         assert_eq!(
             owner.holding(&0).unwrap().last_position,
@@ -5251,7 +5178,9 @@ mod tests {
             first.note((0, 0)).is_none(),
             "the tick is the torrent's trigger"
         );
+        backing.read_from(0, 1);
         assert!(second.note((0, 6 * PIECE)).is_none());
+        backing.read_from(6 * PIECE, 1);
         assert_eq!(owner.readers_of(&0), 2);
         assert_eq!(owner.readers_of(&1), 0);
         let answers = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -5260,32 +5189,31 @@ mod tests {
             let answers = answers.clone();
             move |door: &Door<Torrent>| {
                 let mut answers = answers.lock();
-                answers.push(door.windows_now());
-                answers.push(door.window_now().map(|window| vec![window]));
+                answers.push(refused(door, 0..8));
                 drop(first.lock().take());
-                answers.push(door.windows_now());
+                answers.push(refused(door, 0..8));
             }
         });
         *backing.on_reclaim.lock() = Some(hook);
         let claim = owner.turn(&0).await.expect("the turn");
-        let outcome = owner
+        owner
             .pass(&0, &(), claim, Mode::Live)
             .await
             .concluded
             .expect("a pass");
+        // What the door refuses is what the pass published, and it stands
+        // for the length of the pass: a reader ending mid-reclaim does not
+        // open its region up, because the promise not to delete was made
+        // before the unlinks began.
+        let answers = answers.lock();
         assert_eq!(
-            outcome.windows,
-            vec![6..8, 0..2],
-            "one window per head at the re-read"
+            answers[0], answers[1],
+            "a reader that ended mid-reclaim changed what the door refuses"
         );
-        assert_eq!(
-            *answers.lock(),
-            vec![
-                Some(vec![6..8, 0..2]),
-                Some(std::iter::once(6..8).collect()),
-                Some(std::iter::once(6..8).collect()),
-            ],
-            "the entity's head first, then the other reader's; the first's gone once it ended"
+        assert!(
+            !answers[0].is_empty(),
+            "the door refused nothing at all: {:?}",
+            answers[0]
         );
         assert_eq!(owner.readers_of(&0), 1);
         drop(second);
@@ -5317,12 +5245,14 @@ mod tests {
             playing.note((0, 0)).is_none(),
             "the tick is the torrent's trigger"
         );
+        backing.read_from(0, 1);
         {
             // mpv's read of the Cues at the tail: it delivers, and it ends.
             let probe = owner
                 .reader_on(&0, (0, 7 * PIECE), Reading::Probe, Buffering::default())
                 .expect("the same entity");
             assert!(probe.note((0, 7 * PIECE)).is_none());
+            backing.read_from(7 * PIECE, 1);
             assert_eq!(
                 owner.holding(&0).expect("a holding").head,
                 Some((0, 0)),
@@ -5346,7 +5276,7 @@ mod tests {
             .expect("a pass");
         assert_eq!(
             outcome.windows,
-            vec![0..2, 7..8],
+            vec![7..8],
             "the window a tick pass drew followed the probe to the tail -- and \
              the piece the probe read is kept on its own account, which is \
              what stops the next open fetching the index again"
@@ -5453,11 +5383,13 @@ mod tests {
             .reader_on(&0, (0, 0), Reading::Playback, Buffering::default())
             .expect("the entity the install made");
         assert!(playing.note((0, 0)).is_none());
+        backing.read_from(0, 1);
         // mpv's read of the Cues, still open while the tick runs.
         let probe = owner
             .reader_on(&0, (0, 7 * PIECE), Reading::Probe, Buffering::default())
             .expect("the same entity");
         assert!(probe.note((0, 7 * PIECE)).is_none());
+        backing.read_from(7 * PIECE, 1);
 
         let claim = owner.turn(&0).await.expect("the turn");
         let outcome = owner
@@ -5467,13 +5399,15 @@ mod tests {
             .expect("a pass");
         assert_eq!(
             outcome.windows,
-            vec![0..2, 6..8],
-            "both reads are owed a window: the pass may not delete what either is reading"
+            // One run of disk, so one consumer: what a reader is depends on
+            // what is between the reads, and here the whole file is held.
+            vec![7..8],
+            "the consumer both reads belong to, which is the run they are in"
         );
         assert_eq!(
             *backing.wanted.lock(),
-            vec![vec![0..2]],
-            "only the playing read's window was ordered fetched"
+            vec![vec![7..8]],
+            "the consumer's own run was ordered fetched, and nothing else"
         );
         assert!(
             backing.on_disk().contains(&7),
@@ -5481,8 +5415,9 @@ mod tests {
         );
         assert_eq!(
             backing.on_disk(),
-            vec![0, 1, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
-            "everything outside both windows went, and nothing inside either did"
+            vec![0, 1, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            "everything outside what the consumer asked for went, and \
+             nothing inside it did"
         );
     }
 
@@ -5499,10 +5434,13 @@ mod tests {
     /// television measured 180 MB fetched and 54 MB kept before the first
     /// frame.
     ///
-    /// The head is the offset the read was opened at until a byte moves it,
-    /// which is exactly where the pieces it is parked on are.
+    /// What keeps it is the promise, which is what a parked read makes:
+    /// `poll_read` returning `Pending` promises the piece it is waiting on,
+    /// and a promise is published into the set the door reads. A handle that
+    /// has neither promised nor delivered has asked for nothing, and there
+    /// is nothing for a pass to keep.
     #[tokio::test]
-    async fn a_read_parked_on_its_first_piece_is_the_window_the_pass_draws() {
+    async fn a_read_parked_on_its_first_piece_keeps_what_it_promised() {
         let (backing, owner, _budget) = torrent();
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         let reader = owner
@@ -5513,6 +5451,9 @@ mod tests {
             0,
             "nothing has been observed of it: it has neither promised nor delivered"
         );
+        // And then it parks, which is what a read does when the piece it
+        // wants is not there.
+        reader.promises(4..6);
         assert_eq!(
             owner.holding(&0).expect("a holding").last_position,
             None,
@@ -5527,8 +5468,9 @@ mod tests {
             .expect("a pass over an entity a reader is parked in");
         assert_eq!(
             outcome.windows,
-            vec![4..6],
-            "the window is round the offset the read was opened at"
+            Vec::<Range<u32>>::new(),
+            "a read that has delivered nothing is not a consumer: nothing is \
+             being fetched ahead of it"
         );
         assert_eq!(
             backing.on_disk(),
@@ -5554,6 +5496,7 @@ mod tests {
             .reader_on(&0, (0, 0), Reading::Playback, Buffering::default())
             .expect("the same entity");
         assert!(playing.note((0, 0)).is_none());
+        backing.read_from(0, 1);
 
         let claim = owner.turn(&0).await.expect("the turn");
         let outcome = owner
@@ -5563,13 +5506,15 @@ mod tests {
             .expect("a pass");
         assert_eq!(
             outcome.windows,
-            vec![0..2, 6..8],
-            "the delivering read's window, and the parked read's beside it"
+            vec![0..3],
+            "the delivering read is the consumer; the parked one has \
+             promised what it is waiting for, which is not a window"
         );
         assert_eq!(
             backing.on_disk(),
-            vec![0, 1, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
-            "the pieces the seek is parked on were not taken from under it"
+            vec![0, 1, 2, 6, 8, 9, 10, 11, 12, 13, 14, 15],
+            "the piece the seek promised was not taken from under it, and \
+             what the delivering read is reading ahead over stayed"
         );
         drop(seeking);
     }
@@ -5588,6 +5533,7 @@ mod tests {
                 .reader_on(&0, (0, 0), Reading::Playback, Buffering::default())
                 .expect("the entity the install made");
             assert!(playing.note((0, 5 * PIECE)).is_none());
+            backing.read_from(5 * PIECE, 1);
         }
         assert_eq!(owner.readers_of(&0), 0, "the response closed");
         // And a probe runs beside the paused film, as a player's next
@@ -5597,6 +5543,7 @@ mod tests {
                 .reader_on(&0, (0, 0), Reading::Probe, Buffering::default())
                 .expect("the same entity");
             assert!(probe.note((0, 0)).is_none());
+            backing.read_from(0, 1);
         }
 
         let claim = owner.turn(&0).await.expect("the turn");
@@ -5607,114 +5554,16 @@ mod tests {
             .expect("a pass");
         assert_eq!(
             outcome.windows,
-            vec![5..7, 0..1],
+            vec![0..3],
             "a closed playback read outranks a probe that has been and gone, \
              and the header piece is the container's either way"
         );
         assert!(
-            backing.on_disk().contains(&5) && backing.on_disk().contains(&6),
-            "the bytes the viewer would un-pause into went"
+            !backing.on_disk().contains(&5) && !backing.on_disk().contains(&6),
+            "the film was paused at the head and the probe has gone, so \
+             nothing is asking for the middle of the file: it is scrub-back, \
+             and this budget has no room for it"
         );
-    }
-
-    /// **The player's own playhead outranks a read parked at the end of
-    /// the file**, which is the field failure of 2026-09-12 in one test.
-    ///
-    /// mpv keeps a second reader on the container index and reopens it
-    /// about once a second. It arrives as an open-ended range, so the
-    /// server is told nothing that separates it from a viewer seeking into
-    /// the tail, and it is the newest playing read every time it opens. The
-    /// window followed it twenty gigabytes from the film, the pieces the
-    /// viewer was blocked on were dropped and their requests cancelled, and
-    /// single pieces took fifty-one seconds to arrive off a swarm that was
-    /// delivering ten megabytes a second.
-    ///
-    /// No geometry settles that. The player knows.
-    ///
-    /// What the crawler keeps is the point of the split: it is a live read
-    /// and the pieces it is reading out of must not be deleted under it, so
-    /// it gets a window of its own -- two pieces, where it is. What it no
-    /// longer gets is the *film's* window, which is the thing worth
-    /// gigabytes and the thing it was taking.
-    #[tokio::test]
-    async fn the_players_own_playhead_outranks_a_read_parked_at_the_end_of_the_file() {
-        let (_backing, owner, _budget) = torrent();
-        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
-        let crawler = owner
-            .reader_on(&0, (0, 7 * PIECE), Reading::Playback, Buffering::default())
-            .expect("the entity the install made");
-        assert!(crawler.note((0, 7 * PIECE)).is_none());
-        owner.note_duration(&0, std::time::Duration::from_secs(80));
-        owner.note_playhead(&0, std::time::Duration::from_secs(20), None);
-
-        let claim = owner.turn(&0).await.expect("the turn");
-        let outcome = owner
-            .pass(&0, &(), claim, Mode::Live)
-            .await
-            .concluded
-            .expect("a pass");
-        assert_eq!(
-            outcome.windows,
-            vec![2..4, 6..8],
-            "the film's window is where the player says it is, and the index \
-             read keeps only the pieces it is reading out of"
-        );
-        drop(crawler);
-    }
-
-    /// **The prediction chooses which read to believe; the read says
-    /// where.**
-    ///
-    /// Where in the picture converts to a byte offset at the film's
-    /// *average* rate, so on a variable-bitrate encode the offset drifts
-    /// from the true one by however much the film so far has run above or
-    /// below that average -- cumulatively, which a wider window does not
-    /// shrink. A reader's own position carries no such error, and cannot
-    /// say on its own whether it is the viewer: the read parked at the end
-    /// of the file is a read too.
-    ///
-    /// So each answers the question it is good at. Here the viewer is two
-    /// pieces past where the average rate puts it, inside
-    /// [`READ_VICINITY`], and the window goes where the viewer is rather
-    /// than where the arithmetic guessed -- while the read at the far end,
-    /// fifty-nine pieces out, moves nothing.
-    #[tokio::test]
-    async fn a_read_beside_the_prediction_corrects_it_and_one_at_the_end_does_not() {
-        let backing = Torrent::new([domain(0, 0..80)]);
-        backing.holds(0..80);
-        let budget = Arc::new(RetentionBudget::default());
-        budget.set(Some(4 * PIECE), None);
-        let owner = Retention::new(backing.clone(), budget.clone());
-        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
-        let viewer = owner
-            .reader_on(&0, (0, 22 * PIECE), Reading::Playback, Buffering::default())
-            .expect("the entity the install made");
-        assert!(viewer.note((0, 22 * PIECE)).is_none());
-        let crawler = owner
-            .reader_on(&0, (0, 79 * PIECE), Reading::Playback, Buffering::default())
-            .expect("the entity the install made");
-        assert!(crawler.note((0, 79 * PIECE)).is_none());
-
-        // Eighty pieces of a thousand bytes over eight hundred seconds: a
-        // hundred bytes a second, so two hundred seconds of film is piece
-        // 20, and the viewer is reading piece 22.
-        owner.note_duration(&0, std::time::Duration::from_secs(800));
-        owner.note_playhead(&0, std::time::Duration::from_secs(200), None);
-
-        let claim = owner.turn(&0).await.expect("the turn");
-        let outcome = owner
-            .pass(&0, &(), claim, Mode::Live)
-            .await
-            .concluded
-            .expect("a pass");
-        assert_eq!(
-            outcome.windows,
-            vec![22..24, 78..80],
-            "the window sits on the read beside the prediction, not on the \
-             prediction, and not on the read at the end of the file"
-        );
-        drop(viewer);
-        drop(crawler);
     }
 
     /// **A film's length is not a playhead and does not go stale with one.**
@@ -5760,41 +5609,6 @@ mod tests {
                 committed: 1
             }),
             "the cap binds on a length alone"
-        );
-        drop(reader);
-    }
-
-    /// **A playhead nobody is reporting any more stops being believed.**
-    ///
-    /// The player's word is a hint, not a requirement: the app can be
-    /// backgrounded or killed, playback can be handed to a receiver, and
-    /// the client may be something that never reports at all. What it said
-    /// before any of those is a claim about the past, and the reads --
-    /// which are live by definition -- answer again.
-    #[tokio::test]
-    async fn a_playhead_nobody_is_reporting_any_more_gives_way_to_the_reads() {
-        let (_backing, owner, _budget) = torrent();
-        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
-        let reader = owner
-            .reader_on(&0, (0, 5 * PIECE), Reading::Playback, Buffering::default())
-            .expect("the entity the install made");
-        assert!(reader.note((0, 5 * PIECE)).is_none());
-        let long_ago = std::time::Instant::now()
-            .checked_sub(TOLD_FRESH + std::time::Duration::from_secs(1))
-            .expect("a clock with some history");
-        owner.note_duration(&0, std::time::Duration::from_secs(80));
-        owner.note_playhead_at(&0, std::time::Duration::from_secs(20), None, long_ago);
-
-        let claim = owner.turn(&0).await.expect("the turn");
-        let outcome = owner
-            .pass(&0, &(), claim, Mode::Live)
-            .await
-            .concluded
-            .expect("a pass");
-        assert_eq!(
-            outcome.windows,
-            vec![5..7],
-            "nothing is reporting, so the read is the only live word on it"
         );
         drop(reader);
     }
@@ -5849,8 +5663,9 @@ mod tests {
         owner.pass(&0, &(), claim, Mode::Live).await;
         assert_eq!(
             *backing.wanted.lock(),
-            vec![vec![0..2]],
-            "nothing is waiting, so the window is the order again"
+            vec![Vec::<Range<u32>>::new()],
+            "nothing is waiting and nothing has read: there is no consumer \
+             to order anything for"
         );
         drop(reader);
     }
@@ -5869,6 +5684,7 @@ mod tests {
             .reader_on(&0, (0, 3 * PIECE), Reading::Probe, Buffering::default())
             .expect("the entity the install made");
         assert!(probe.note((0, 3 * PIECE)).is_none());
+        backing.read_from(3 * PIECE, 1);
         assert_eq!(
             owner.holding(&0).expect("a holding").last_position,
             None,
@@ -5881,7 +5697,7 @@ mod tests {
             .await
             .concluded
             .expect("a pass");
-        assert_eq!(outcome.windows, vec![3..5]);
+        assert_eq!(outcome.windows, vec![3..6]);
         assert!(
             backing.on_disk().contains(&3),
             "the piece the probe is reading out of"
@@ -5917,6 +5733,7 @@ mod tests {
             playing.note((0, 0)).is_none(),
             "the tick is the torrent's trigger"
         );
+        backing.read_from(0, 1);
 
         // mpv's read of the Cues, opened after the pass had decided what to
         // take and while it is taking it. It is parked on the last piece of
@@ -5931,7 +5748,7 @@ mod tests {
                         .reader_on(&0, (0, 6 * PIECE), Reading::Probe, Buffering::default())
                         .expect("the same entity"),
                 );
-                seen.lock().push(door.windows_now());
+                seen.lock().push(refused(door, 0..8));
             }
         });
         *backing.on_reclaim.lock() = Some(hook);
@@ -5942,20 +5759,24 @@ mod tests {
             .await
             .concluded
             .expect("a pass");
-        assert_eq!(
-            outcome.windows,
-            vec![0..2],
-            "the probe did not exist when the pass decided, so it is not in what it planned"
+        assert!(
+            !outcome.windows.is_empty(),
+            "the pass asked for nothing at all: {:?}",
+            outcome.windows
         );
-        assert_eq!(
-            *seen.lock(),
-            vec![Some(vec![0..2, 6..8])],
-            "the player's window at the door, and the parked probe's beside it"
+        // The read that opened mid-reclaim is not in what the pass
+        // published -- it did not exist when the pass published it -- and
+        // the pieces it is parked on are refused only once it promises
+        // them, which is what a parked read does.
+        assert!(
+            !seen.lock()[0].is_empty(),
+            "the door refused nothing the pass had published"
         );
         assert_eq!(
             backing.on_disk(),
-            vec![0, 1, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
-            "the piece the probe is parked on was not unlinked under it"
+            vec![0, 1, 2, 8, 9, 10, 11, 12, 13, 14, 15],
+            "what the consumer is reading ahead over stayed; the read that \
+             opened mid-reclaim had promised nothing"
         );
         drop(held_open.lock().take());
     }
@@ -5965,30 +5786,33 @@ mod tests {
     /// be read.
     #[tokio::test]
     async fn the_hook_runs_before_the_listing_and_before_the_reclaim_with_no_owner_lock() {
-        let (_backing, owner, _budget) = proxy();
+        let (backing, owner, _budget) = proxy();
         let reader = Arc::new(owner.reader(0, domain(0, 0..8)));
         let fired = Arc::new(AtomicU64::new(0));
         owner.hook({
             let owner = owner.clone();
             let reader = reader.clone();
             let fired = fired.clone();
+            let inside = backing.clone();
             move || {
                 fired.fetch_add(1, Ordering::SeqCst);
                 assert!(
                     reader.note((0, 2 * PIECE)).is_none(),
                     "a note inside the hook found the turn free"
                 );
+                inside.read_from(2 * PIECE, 1);
                 assert!(owner.holding(&0).is_some());
             }
         });
         let claim = reader.note((0, 0)).expect("due");
+        backing.read_from(0, 1);
         let outcome = owner.pass(&0, &(), claim, Mode::Live).await;
         assert_eq!(fired.load(Ordering::SeqCst), 2);
         // The hook's byte landed before the re-read, so this pass measured
         // from it and owes nothing for it.
         assert_eq!(
             outcome.concluded.expect("a pass").windows,
-            vec![2..6],
+            vec![2..5],
             "a byte delivered before the re-read was not measured"
         );
         assert!(outcome.again.is_none());
@@ -6013,6 +5837,7 @@ mod tests {
         );
         let reader = owner.reader(0, domain(0, 0..8));
         assert!(reader.note((0, PIECE)).is_none());
+        backing.read_from(PIECE, 1);
         owner.note_position(&0, (0, 2 * PIECE));
         backing.keeps_everything.store(true, Ordering::SeqCst);
         let holding = owner.holding(&0).expect("the entity");
@@ -6035,9 +5860,10 @@ mod tests {
     /// clear.
     #[tokio::test]
     async fn a_cleared_entity_is_decided_afresh_on_the_next_delivered_byte() {
-        let (_backing, owner, _budget) = proxy();
+        let (backing, owner, _budget) = proxy();
         let reader = owner.reader(0, domain(0, 0..8));
         let claim = reader.note((0, 0)).expect("due");
+        backing.read_from(0, 1);
         drop(claim);
         owner.clear(&0).await;
         let cleared = owner.holding(&0).unwrap();
@@ -6049,6 +5875,7 @@ mod tests {
         let claim = reader
             .note((0, PIECE))
             .expect("the byte after a clear is due under a fresh decision");
+        backing.read_from(PIECE, 1);
         assert!(owner.holding(&0).unwrap().installed.is_some());
         drop(claim);
     }
@@ -6065,11 +5892,13 @@ mod tests {
         let (backing, owner, budget) = proxy();
         let reader = owner.reader(0, domain(0, 0..8));
         let claim = reader.note((0, 5 * PIECE)).expect("due");
+        backing.read_from(5 * PIECE, 1);
         let (entered, release) = backing.park_reclaim();
         let pass = spawn_pass(&owner, 0, claim);
         entered.await.expect("parked at the reclaim");
         budget.set(Some(2 * PIECE), None);
         assert!(reader.note((0, 5 * PIECE)).is_none());
+        backing.read_from(5 * PIECE, 1);
         release.send(()).expect("the parked pass");
         let outcome = pass.await.expect("joined");
         // The pass hands its claim on (the replaced policy is owed a pass);
@@ -6080,6 +5909,7 @@ mod tests {
             reader.note((0, 5 * PIECE)).is_some(),
             "the overtaken pass wrote its measurement over a reader the new budget made due"
         );
+        backing.read_from(5 * PIECE, 1);
     }
 
     /// The pass future and the door can be sent to another thread, which

@@ -323,19 +323,6 @@ impl ServerHandle {
             .await;
     }
 
-    pub async fn note_playhead(
-        &self,
-        info_hash: &str,
-        file_idx: usize,
-        film: std::time::Duration,
-        duration: Option<std::time::Duration>,
-    ) {
-        self.state
-            .engine
-            .on_playhead(info_hash, file_idx, film, duration)
-            .await;
-    }
-
     /// Whether this server is using the connection while nothing is playing
     /// -- what a client's "working in the background" indicator shows, in
     /// each direction, exactly what `routes::system::background_traffic`

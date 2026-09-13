@@ -66,9 +66,9 @@ pub struct Pass<'a> {
     /// What the read that owns the head is for, or `None` when the head is
     /// the entity's own remembered one and no read is live.
     pub reading: Option<&'static str>,
-    pub window: Range<u32>,
-    /// The pieces from the playhead to the window's forward edge.
-    pub reach: u32,
+    /// How many pieces this entity's consumers are asking for between
+    /// them -- what `streams_seen` prints as `want`, totalled.
+    pub wanted: u32,
     pub held_behind: usize,
     pub held_ahead: usize,
     pub committed: usize,
@@ -78,17 +78,6 @@ pub struct Pass<'a> {
     /// The bitrate the time caps are sized from -- the entity's size over
     /// the duration a player stated -- or `None` until one is stated.
     pub bytes_per_second: Option<u64>,
-    /// **How far the stated playhead sits from the nearest live read**, in
-    /// pieces, or `None` with nothing to compare.
-    ///
-    /// The playhead is converted from where in the picture the player says
-    /// it is, at the film's *average* rate, so on a variable-bitrate encode
-    /// it drifts from the true byte offset -- cumulatively, by however much
-    /// the film so far has run above or below its own average, which a
-    /// wider window does not shrink. A reader's position is the true one.
-    /// This is the difference, so a field log settles how large that drift
-    /// actually is rather than leaving it argued about.
-    pub drift: Option<i64>,
     /// Pieces of the entity this pass stopped wanting.
     pub dropped: usize,
     /// Pieces this pass took off the disk.
@@ -146,18 +135,15 @@ pub fn pass<K: Debug>(key: &K, sample: Pass<'_>) {
     tracing::info!(
         target: "enginefs::retention::trace",
         key = %name,
-        playhead = sample.playhead,
+        head = sample.playhead,
         reading = sample.reading.unwrap_or("none"),
-        window_start = sample.window.start,
-        window_end = sample.window.end,
-        reach = sample.reach,
+        wanted = sample.wanted,
         held_behind = sample.held_behind,
         held_ahead = sample.held_ahead,
         committed = sample.committed,
         budget = ?sample.budget,
         lookahead_bytes = sample.lookahead_bytes,
         bytes_per_second = sample.bytes_per_second,
-        drift = sample.drift,
         dropped = sample.dropped,
         unlinked = sample.unlinked,
         refused_reclaims = sample.backing.map(|backing| backing.refused),

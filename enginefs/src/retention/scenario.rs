@@ -174,6 +174,11 @@ pub(crate) type Hook<S> = Box<dyn Fn(&Door<FakeBacking<S>>) + Send + Sync>;
 pub(crate) struct FakeBacking<S: Side> {
     pub(crate) domains: parking_lot::Mutex<HashMap<usize, FakeDomain>>,
     pub(crate) held: parking_lot::Mutex<BTreeSet<u32>>,
+    /// **The detector, which is the policy.** The same one both real
+    /// backings run, fed by the scenario's own reads: what a consumer is,
+    /// what it is asking for and what may go is decided here, so a
+    /// scenario measures the policy rather than a stand-in for it.
+    pub(crate) detector: parking_lot::Mutex<crate::retention::streams::Streams>,
     pub(crate) advertised: parking_lot::Mutex<Vec<(Range<u32>, bool)>>,
     pub(crate) fail_advertise: AtomicBool,
     pub(crate) fail_held: AtomicBool,
@@ -250,6 +255,7 @@ impl<S: Side> FakeBacking<S> {
             .flat_map(|domain| domain.pieces.clone())
             .collect();
         Arc::new(Self {
+            detector: parking_lot::Mutex::new(Default::default()),
             domains: parking_lot::Mutex::new(domains),
             held: parking_lot::Mutex::new(BTreeSet::new()),
             advertised: parking_lot::Mutex::new(Vec::new()),
@@ -343,6 +349,36 @@ impl<S: Side> FakeBacking<S> {
     }
 }
 
+impl<S: Side> FakeBacking<S> {
+    /// **A consumer that has just read `bytes` of this file from `at`**, as
+    /// the detector sees it.
+    ///
+    /// What makes a reader a consumer rather than a position: a delivered
+    /// byte moves the head, and a *read* is what says there is somebody
+    /// moving through the file who must be fetched for and not deleted
+    /// from under. Both real read paths report every read they serve
+    /// (`Engine::note_read`, `proxy_retention::Reader::note_read`); a test
+    /// that wants a live consumer says so here.
+    pub(crate) fn read_from(&self, at: u64, bytes: u64) {
+        self.note_read(1, at, at.saturating_add(bytes), std::time::Instant::now());
+    }
+
+    /// One served read, as the detector sees it. Called by the scenario
+    /// where a real read path would call `Engine::note_read`.
+    pub(crate) fn note_read(&self, reader: u64, begin: u64, end: u64, at: std::time::Instant) {
+        self.detector.lock().record(
+            FILE,
+            reader,
+            crate::retention::streams::Read {
+                begin,
+                end,
+                arrived: at,
+                returned: at,
+            },
+        );
+    }
+}
+
 impl<S: Side> Backing for FakeBacking<S> {
     type Key = usize;
     type Position = At;
@@ -369,6 +405,10 @@ impl<S: Side> Backing for FakeBacking<S> {
     /// a fiction.
     fn bytes(domain: &FakeDomain) -> Option<u64> {
         Some(u64::from(domain.pieces.end - domain.pieces.start) * domain.piece)
+    }
+
+    fn piece_length(domain: &FakeDomain) -> Option<u64> {
+        Some(domain.piece)
     }
 
     fn extent(domain: &FakeDomain) -> Range<u32> {
@@ -403,6 +443,69 @@ impl<S: Side> Backing for FakeBacking<S> {
         }
         let last = u64::from(domain.pieces.end - 1);
         Some((u64::from(domain.pieces.start) + offset / domain.piece).min(last) as u32)
+    }
+
+    /// What this entity's consumers are asking of the disk, from the same
+    /// detector both real backings run. See `Backing::reading`.
+    fn reading(
+        &self,
+        domain: &FakeDomain,
+        held: &BTreeSet<u32>,
+        asking: crate::retention::owner::Asking,
+    ) -> crate::retention::owner::Consumers {
+        let extent = Self::extent(domain);
+        let now = std::time::Instant::now();
+        let available = match (asking.budget, asking.headroom) {
+            (crate::retention::CacheBudget::Unbounded, _) => u64::MAX,
+            (crate::retention::CacheBudget::Bytes(cap), Some(headroom)) => cap.min(
+                (held.len() as u64)
+                    .saturating_mul(domain.piece)
+                    .saturating_add(headroom),
+            ),
+            (crate::retention::CacheBudget::Unknown, Some(headroom)) => (held.len() as u64)
+                .saturating_mul(domain.piece)
+                .saturating_add(headroom),
+            (crate::retention::CacheBudget::Bytes(cap), None) => cap,
+            (crate::retention::CacheBudget::Unknown, None) => 0,
+        };
+        // And the room the fill needs between two passes: an allowance that
+        // spent the whole budget would sit a stride over it for as long as
+        // anything is downloading.
+        let available = available.saturating_sub(asking.margin);
+        let mut streams = self.detector.lock();
+        streams.domain(
+            domain.file,
+            u64::from(extent.start) * domain.piece,
+            extent.clone(),
+            asking.ceiling,
+        );
+        streams.observe(domain.file, held, domain.piece, now);
+        let want = streams.want(
+            domain.file,
+            asking.seconds.unwrap_or(u64::MAX),
+            available,
+            domain.piece,
+        );
+        let exempt = streams.exempt(domain.file, extent.end);
+        // **What may not be unlinked is published here**, where the want
+        // set is decided: the pass's own holdings -- every promise and
+        // every open stream's lookahead -- with what the consumers are
+        // asking for. The same set is what the coldest are chosen against,
+        // because a reclaim chosen against a smaller one frees nothing: the
+        // door refuses what this publishes.
+        let mut kept = want.clone();
+        kept.extend(asking.holding.iter().cloned());
+        exempt.publish(&kept);
+        let over = (held.len() as u64)
+            .saturating_mul(domain.piece)
+            .saturating_sub(available);
+        let how_many = usize::try_from(over.div_ceil(domain.piece.max(1))).unwrap_or(0);
+        let (_, reclaim) = streams.coldest_of(domain.file, now, &kept, how_many);
+        crate::retention::owner::Consumers {
+            want,
+            exempt,
+            reclaim,
+        }
     }
 
     fn keeps_everything(&self, _key: &usize) -> bool {
@@ -536,7 +639,7 @@ impl<S: Side> Backing for FakeBacking<S> {
         let mut asked = Vec::new();
         let mut freed = 0;
         for run in runs {
-            if door.window_now().is_none() {
+            if door.shut() {
                 break;
             }
             asked.push(run.clone());
@@ -699,8 +802,6 @@ pub(crate) enum Step {
     Reads { reader: &'static str, bytes: u64 },
     /// The response ends: the player gave up, or got what it asked for.
     Closes { reader: &'static str },
-    /// The player reports where it is in the picture.
-    Says { film: Duration },
     /// The swarm delivers up to `pieces` pieces the backend still wants and
     /// the disk does not hold -- what a response's own lookahead is pulling
     /// first, then whatever else is selected.
@@ -932,10 +1033,6 @@ impl Scenario {
                 self.open.remove(reader);
                 self.republish_streams();
             }
-            Step::Says { film } => {
-                self.owner
-                    .note_playhead_at(&FILE, *film, None, self.instant());
-            }
             Step::Swarm { pieces } => self.swarm(*pieces),
             Step::Pass => self.pass(),
         }
@@ -996,6 +1093,17 @@ impl Scenario {
             .collect::<Vec<_>>();
     }
 
+    /// Which consumer a named response is, as the detector counts them: a
+    /// reopen under the same name is the same number, which is what a
+    /// player doing forty-six of them in seventy seconds looks like.
+    fn reader_id(&self, reader: &'static str) -> u64 {
+        let mut id = 0u64;
+        for byte in reader.as_bytes() {
+            id = id.wrapping_mul(31).wrapping_add(u64::from(*byte));
+        }
+        id
+    }
+
     fn reads(&mut self, reader: &'static str, bytes: u64) {
         let cursor = self.open.get(reader).expect("an open response").cursor;
         let held = self.backing.held.lock().clone();
@@ -1041,6 +1149,12 @@ impl Scenario {
         };
         {
             let now = self.instant();
+            // What the detector sees, which is what decides everything: one
+            // served read, from where the cursor was to where it got to.
+            // Fed here because this is the one place a scenario serves
+            // bytes, as `FileReader::poll_read` is on the real path.
+            self.backing
+                .note_read(self.reader_id(reader), cursor, moved, now);
             let open = self.open.get_mut(reader).expect("an open response");
             open.cursor = moved;
             open.stream = stream;

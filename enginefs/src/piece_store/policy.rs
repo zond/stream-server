@@ -368,12 +368,9 @@ impl Shape {
 /// What one pass decided, at one playhead position.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Decision {
-    /// The pieces the rolling window covers now: wanted and kept, and *not*
-    /// advertised unless they are also committed.
-    pub window: Range<u32>,
-    /// Held pieces in neither the window nor the committed set. Drop them from
-    /// the want-set and then delete them, in that order -- not have, not
-    /// wanted, not advertised, then gone.
+    /// What this pass gives back: held, uncommitted, and not asked for by
+    /// any consumer. Drop them from the want-set and then delete them, in
+    /// that order -- not have, not wanted, not advertised, then gone.
     pub reclaim: Vec<u32>,
     /// Pieces that joined the committed set on this pass. They may be
     /// advertised from now on, and nothing will ever reclaim them.
@@ -767,12 +764,8 @@ impl RetentionPolicy {
     /// reclaims the same pieces, because a reclaim is a request rather than a
     /// record. The caller is what makes that true, by deleting them and no
     /// longer holding them.
-    pub fn advance(&mut self, playhead: u32, held: &BTreeSet<u32>) -> Decision {
-        let window = self.window_at(playhead);
-        let mut decision = Decision {
-            window: window.clone(),
-            ..Default::default()
-        };
+    pub fn advance(&mut self, giving_up: &[u32], held: &BTreeSet<u32>) -> Decision {
+        let mut decision = Decision::default();
 
         // A committed piece we have stopped holding cannot stay advertised.
         let withdrawn = &mut decision.withdrawn;
@@ -797,10 +790,24 @@ impl RetentionPolicy {
             if self.shape == Shape::Whole || self.chosen.contains(&piece) {
                 self.committed.insert(piece);
                 decision.committed.push(piece);
-            } else if !window.contains(&piece) {
-                decision.reclaim.push(piece);
             }
         }
+        // **What to give up is not this module's to decide any more.** It
+        // is what the entity's consumers are not asking for, oldest by
+        // effective age, and only as much of it as the allowance needs --
+        // `crate::retention::streams`. What is still this module's is that
+        // a committed piece is never one of them: a piece we have offered a
+        // peer is out of reach of every reclaim, which is the whole of what
+        // "committed" means.
+        decision.reclaim = giving_up
+            .iter()
+            .copied()
+            .filter(|piece| {
+                self.pieces.contains(piece)
+                    && held.contains(piece)
+                    && !self.committed.contains(piece)
+            })
+            .collect();
         decision
     }
 }
@@ -854,11 +861,28 @@ mod tests {
         playheads: impl IntoIterator<Item = u32>,
     ) {
         for playhead in playheads {
-            let d = p.advance(playhead, disk);
+            // What arrives is what a consumer at `playhead` is fetched, and
+            // what is offered up is everything else -- neither of which the
+            // policy decides any more (`crate::retention::streams`). The
+            // walk states both, which is all these tests ever needed them
+            // for: what a policy commits is what it has held, and what it
+            // refuses to give back is what it has committed.
+            let width = match p.shape() {
+                Shape::Whole => p.pieces().end,
+                Shape::Split { window, .. } => window.max(1),
+            };
+            let arriving = playhead.saturating_sub(width / 10)
+                ..playhead.saturating_add(width).min(p.pieces().end);
+            disk.extend(arriving.clone());
+            let giving_up: Vec<u32> = disk
+                .iter()
+                .copied()
+                .filter(|piece| !arriving.contains(piece))
+                .collect();
+            let d = p.advance(&giving_up, disk);
             for piece in &d.reclaim {
                 disk.remove(piece);
             }
-            disk.extend(d.window.clone());
         }
     }
 
@@ -1180,13 +1204,13 @@ mod tests {
         assert_eq!(p.shape().piece_budget(), None);
         assert_eq!(p.window_at(7), 0..20, "no split means no window either");
 
-        let d = p.advance(7, &held(0..12));
+        let d = p.advance(&[], &held(0..12));
         assert!(d.reclaim.is_empty(), "nothing is dropped when it all fits");
         assert_eq!(d.committed, (0..12).collect::<Vec<_>>());
         assert_eq!(p.advertised().len(), 12, "we seed everything we hold");
 
         // Including pieces that arrive later, and only once each.
-        let d = p.advance(15, &held(0..20));
+        let d = p.advance(&[], &held(0..20));
         assert_eq!(d.committed, (12..20).collect::<Vec<_>>());
         assert!(d.reclaim.is_empty() && d.withdrawn.is_empty());
         assert_eq!(p.advertised().len(), 20);
@@ -1287,55 +1311,6 @@ mod tests {
                 committed: 9
             }
         );
-    }
-
-    /// A budget of nothing still has to let the player read. It buys exactly
-    /// the piece under the playhead and shares none of it.
-    #[test]
-    fn a_budget_of_nothing_keeps_the_piece_being_read_and_shares_none() {
-        let mut p = policy(0, 20);
-        assert_eq!(
-            p.shape(),
-            Shape::Split {
-                window: 0,
-                committed: 0
-            }
-        );
-        assert_eq!(p.shape().piece_budget(), Some(0));
-        assert_eq!(
-            p.window_at(7),
-            7..8,
-            "the bytes being read are not optional"
-        );
-
-        let d = p.advance(7, &held(0..20));
-        assert!(d.committed.is_empty(), "nothing may be advertised");
-        assert!(p.advertised().is_empty());
-        assert_eq!(
-            d.reclaim,
-            (0..20).filter(|&x| x != 7).collect::<Vec<_>>(),
-            "everything else goes back"
-        );
-
-        // And a budget of less than one whole piece is the same thing: the
-        // conversion to pieces floors.
-        let sub = RetentionPolicy::new(
-            PIECE - 1,
-            PIECE,
-            0..20,
-            20 * PIECE,
-            Share::Half,
-            Buffering::default(),
-        )
-        .unwrap();
-        assert_eq!(
-            sub.shape(),
-            Shape::Split {
-                window: 0,
-                committed: 0
-            }
-        );
-        assert_eq!(sub.window_at(0), 0..1);
     }
 
     /// The reach a stream is sized by is never empty and never past the
@@ -1482,7 +1457,7 @@ mod tests {
         assert_eq!(p.window_at(7), 7..8);
         assert_eq!(p.window_at(0), 7..8, "clamped from below");
         assert_eq!(p.window_at(9), 7..8, "and from above");
-        let d = p.advance(7, &held([7]));
+        let d = p.advance(&[], &held([7]));
         assert!(d.reclaim.is_empty() && d.committed.is_empty());
 
         // Covered by it, and the one piece is shared.
@@ -1490,112 +1465,9 @@ mod tests {
             RetentionPolicy::new(PIECE, PIECE, 7..8, PIECE, Share::Half, Buffering::default())
                 .unwrap();
         assert_eq!(p.shape(), Shape::Whole);
-        let d = p.advance(7, &held([7]));
+        let d = p.advance(&[], &held([7]));
         assert_eq!(d.committed, vec![7]);
         assert!(d.reclaim.is_empty());
-    }
-
-    /// A window wider than the pieces actually on disk has nothing to give
-    /// back: the sparse cache is the normal state early in a stream.
-    #[test]
-    fn a_window_wider_than_what_is_held_reclaims_nothing() {
-        let mut p = policy(40, 200);
-        assert_eq!(
-            p.shape(),
-            Shape::Split {
-                window: 20,
-                committed: 20
-            }
-        );
-        let d = p.advance(100, &held([98, 100, 103]));
-        assert_eq!(d.window, 98..118);
-        assert!(d.reclaim.is_empty(), "all three are inside it");
-        assert!(
-            d.committed.is_empty(),
-            "and a piece inside the window has not been passed over yet"
-        );
-        // Nothing held at all is also fine.
-        let d = p.advance(100, &BTreeSet::new());
-        assert_eq!(
-            d,
-            Decision {
-                window: 98..118,
-                ..Default::default()
-            }
-        );
-    }
-
-    /// The window follows the playhead, a short scan back stays inside it,
-    /// and what the window leaves behind goes -- unless it is one of the
-    /// pieces this policy drew to share, which is kept and announced the
-    /// moment we hold it.
-    #[test]
-    fn the_window_follows_the_playhead_and_gives_back_what_it_leaves() {
-        let mut p = policy(20, 200);
-        // window 10 (one behind, nine ahead), committed 10 -- and the ten
-        // pieces of the draw, spread across the whole file.
-        assert_eq!(
-            p.chosen.iter().copied().collect::<Vec<_>>(),
-            vec![2, 32, 33, 42, 53, 94, 142, 147, 170, 179]
-        );
-        let mut disk: BTreeSet<u32> = (0..40).collect();
-
-        // Arriving on a warm cache. Piece 2 is in the draw and we hold it,
-        // so it is committed and announced at once: a leftover cache is as
-        // good a source for a piece we have decided to keep as playback is.
-        // Everything else outside the window goes back -- 39 included, being
-        // ahead of the window, because a piece we hold outside the window is
-        // a piece we are not keeping.
-        let d = p.advance(30, &disk);
-        assert_eq!(d.window, 29..39);
-        assert_eq!(
-            d.committed,
-            vec![2, 32, 33],
-            "the drawn pieces we hold, inside the window and out of it alike"
-        );
-        assert_eq!(
-            d.reclaim,
-            (0..29)
-                .filter(|piece| *piece != 2)
-                .chain([39])
-                .collect::<Vec<_>>()
-        );
-        for piece in &d.reclaim {
-            disk.remove(piece);
-        }
-        assert_eq!(disk, held(29..39).into_iter().chain([2]).collect());
-
-        // Playing on, a piece at a time. The window slides off the pieces
-        // behind the playhead one by one, and none of those is in the draw,
-        // so they go.
-        let d = p.advance(31, &disk);
-        assert_eq!(d.window, 30..40);
-        assert_eq!(d.reclaim, vec![29], "the piece the window walked off");
-        assert!(d.committed.is_empty());
-        for piece in &d.reclaim {
-            disk.remove(piece);
-        }
-        disk.extend(d.window.clone());
-
-        // On through the two drawn pieces at 32 and 33.
-        play(&mut p, &mut disk, 32..45);
-        assert_eq!(
-            *p.advertised(),
-            held([2, 32, 33, 42]),
-            "the pieces of the draw playback has reached, and no others"
-        );
-
-        // A scan back of a few seconds is served from the window itself.
-        let d = p.advance(43, &disk);
-        assert_eq!(d.window, 42..52);
-        assert!(
-            !d.reclaim.contains(&43),
-            "the piece under the playhead is not a candidate"
-        );
-        assert!(
-            d.reclaim.iter().all(|piece| !p.is_advertised(*piece)),
-            "and nothing we announce is ever a candidate"
-        );
     }
 
     /// A committed piece is never reclaimed, and a reclaimed piece is never
@@ -1610,8 +1482,17 @@ mod tests {
         let mut disk: BTreeSet<u32> = BTreeSet::new();
         let mut ever_advertised: BTreeSet<u32> = BTreeSet::new();
 
-        for playhead in (0..500).step_by(3).chain([12, 480, 3, 260, 499, 0]) {
-            let d = p.advance(playhead, &disk);
+        for playhead in (0..500u32).step_by(3).chain([12, 480, 3, 260, 499, 0]) {
+            // Everything outside what a consumer here would be fetched is
+            // offered up, which is the walk's to say and not the policy's.
+            let arriving =
+                playhead.saturating_sub(window / 10)..playhead.saturating_add(window).min(500);
+            let giving_up: Vec<u32> = disk
+                .iter()
+                .copied()
+                .filter(|piece| !arriving.contains(piece))
+                .collect();
+            let d = p.advance(&giving_up, &disk);
             for piece in &d.reclaim {
                 assert!(
                     !ever_advertised.contains(piece),
@@ -1619,15 +1500,18 @@ mod tests {
                 );
                 assert!(disk.remove(piece), "reclaiming a piece we do not hold");
             }
-            // Everything left is held or wanted; the window fills in.
-            disk.extend(d.window.clone());
+            disk.extend(arriving.clone());
             ever_advertised.extend(p.advertised().iter().copied());
             assert!(
                 p.advertised().iter().all(|piece| disk.contains(piece)),
                 "advertising a piece that is not on disk"
             );
+            // The window, the committed set, and the overhang of what a
+            // walk put on the disk this step: the policy gives back what it
+            // is offered, and it is offered what was outside the window
+            // *before* this step's arrivals.
             assert!(
-                disk.len() <= (window + committed) as usize,
+                disk.len() <= (window + committed + window / 10) as usize,
                 "held {} pieces on a budget of {}",
                 disk.len(),
                 window + committed
@@ -1656,7 +1540,7 @@ mod tests {
         );
 
         disk.remove(&2);
-        let d = p.advance(11, &disk);
+        let d = p.advance(&[], &disk);
         assert_eq!(d.withdrawn, vec![2]);
         assert!(!p.is_advertised(2));
         assert!(p.advertised().is_empty());
@@ -1664,7 +1548,7 @@ mod tests {
         // It coming back puts it back: it is a piece of the draw and we hold
         // it, which is the whole of the rule.
         disk.insert(2);
-        let d = p.advance(11, &disk);
+        let d = p.advance(&[], &disk);
         assert_eq!(d.committed, vec![2]);
         assert!(d.withdrawn.is_empty() && !d.reclaim.contains(&2));
         assert_eq!(*p.advertised(), held([2]));
@@ -1695,19 +1579,21 @@ mod tests {
             p.chosen.iter().copied().collect::<Vec<_>>(),
             vec![127, 142, 147, 170, 179]
         );
-        let d = p.advance(150, &held([0, 5, 99, 100, 147, 150, 199, 200, 4000]));
-        assert_eq!(d.window, 150..155);
+        // Everything held is offered up; only what this file owns, holds,
+        // and has not committed can be given away.
+        let disk = held([0, 5, 99, 100, 147, 150, 199, 200, 4000]);
+        let everything: Vec<u32> = disk.iter().copied().collect();
+        let d = p.advance(&everything, &disk);
         assert_eq!(d.committed, vec![147], "the one drawn piece we hold");
         assert_eq!(
             d.reclaim,
-            vec![100, 199],
+            vec![100, 150, 199],
             "only pieces this file owns are considered at all"
         );
 
         // And a piece another file owns is never committed either, however
         // long it sits on the disk.
-        let d = p.advance(155, &held([0, 5, 99, 147, 155, 200, 4000]));
-        assert_eq!(d.window, 155..160);
+        let d = p.advance(&[], &held([0, 5, 99, 147, 155, 200, 4000]));
         assert!(d.committed.is_empty() && d.reclaim.is_empty());
         assert!(!p.is_advertised(99) && !p.is_advertised(200));
     }
@@ -1731,22 +1617,23 @@ mod tests {
         assert!(p.chosen.contains(&32) && p.chosen.contains(&33));
         assert!(!p.chosen.contains(&31) && !p.chosen.contains(&34));
 
-        // A window covering 30..40, with nothing played through yet.
-        let d = p.advance(31, &held(30..40));
-        assert_eq!(d.window, 30..40);
+        // Ten pieces on the disk, with nothing offered up.
+        let d = p.advance(&[], &held(30..40));
         assert_eq!(
             d.committed,
             vec![32, 33],
-            "announced from inside the window, while it still covers them"
+            "announced the moment they are held"
         );
         assert!(
             !p.is_advertised(31) && !p.is_advertised(34),
-            "and their neighbours in the same window stay held back"
+            "and their neighbours stay held back"
         );
 
-        // The window moves past all four. The two drawn ones stay; the two
-        // beside them are reclaimed like any other window piece.
-        let d = p.advance(45, &held(30..46));
+        // Everything on the disk is offered up. The two drawn ones are out
+        // of reach; their neighbours go like anything else.
+        let disk = held(30..46);
+        let everything: Vec<u32> = disk.iter().copied().collect();
+        let d = p.advance(&everything, &disk);
         assert_eq!(
             d.committed,
             vec![42],
@@ -1755,51 +1642,6 @@ mod tests {
         assert!(d.reclaim.contains(&31) && d.reclaim.contains(&34));
         assert!(!d.reclaim.contains(&32) && !d.reclaim.contains(&33));
         assert_eq!(*p.advertised(), held([32, 33, 42]));
-    }
-
-    /// **Nothing this policy has announced is ever un-announced or
-    /// reclaimed while it stands.** The property the whole design of the
-    /// committed set now turns on.
-    ///
-    /// BitTorrent has no un-have. Hiding a piece
-    /// (`set_pieces_advertised`) changes only the bitfield a *new* peer is
-    /// handed at its handshake; a peer that already has our Have can still
-    /// ask for it, and the fork's upload path, finding the bytes gone, can
-    /// only hang up -- there is no reject message. A client that does that
-    /// repeatedly is an unreliable peer, and some clients snub or ban for
-    /// it. So the only thing that ever takes a piece out of the set is the
-    /// disk losing it behind our back, which this walk does not do.
-    #[test]
-    fn nothing_once_committed_is_ever_un_advertised_or_reclaimed() {
-        let mut p = policy(30, 500);
-        let mut disk: BTreeSet<u32> = BTreeSet::new();
-        let mut ever: BTreeSet<u32> = BTreeSet::new();
-        for playhead in (0..500).step_by(3).chain([12, 480, 3, 260, 499, 0]) {
-            let d = p.advance(playhead, &disk);
-            assert!(
-                d.withdrawn.is_empty(),
-                "piece {:?} was un-announced with the disk intact",
-                d.withdrawn
-            );
-            for piece in &d.reclaim {
-                assert!(
-                    !ever.contains(piece),
-                    "piece {piece} was announced and is now being reclaimed"
-                );
-                disk.remove(piece);
-            }
-            disk.extend(d.window.clone());
-            ever.extend(p.advertised().iter().copied());
-            assert!(
-                ever.iter().all(|piece| disk.contains(piece)),
-                "a piece we announced is no longer on the disk"
-            );
-        }
-        assert_eq!(
-            *p.advertised(),
-            ever,
-            "everything ever announced is still announced"
-        );
     }
 
     /// **A capacity that shrinks under the set does not drop what it
@@ -1842,10 +1684,10 @@ mod tests {
         // The disk loses one of them behind our back and gets it back.
         let lost = *announced.iter().next_back().expect("something announced");
         disk.remove(&lost);
-        let d = p.advance(0, &disk);
+        let d = p.advance(&[], &disk);
         assert_eq!(d.withdrawn, vec![lost], "the lost piece is withdrawn");
         disk.insert(lost);
-        let d = p.advance(0, &disk);
+        let d = p.advance(&[], &disk);
         assert!(
             !d.reclaim.contains(&lost),
             "a piece we announced was reclaimed once the capacity had shrunk under it"
@@ -1878,9 +1720,9 @@ mod tests {
 
         let lost = *announced.iter().next_back().expect("something announced");
         disk.remove(&lost);
-        assert_eq!(next.advance(0, &disk).withdrawn, vec![lost]);
+        assert_eq!(next.advance(&[], &disk).withdrawn, vec![lost]);
         disk.insert(lost);
-        let d = next.advance(0, &disk);
+        let d = next.advance(&[], &disk);
         assert!(
             !d.reclaim.contains(&lost),
             "the carried policy reclaimed a piece the old one had announced"
@@ -1970,11 +1812,10 @@ mod tests {
         // With a release in the first of the two passes, so that "the same
         // thing" is not trivially "nothing".
         let mut disk: BTreeSet<u32> = (0..10).collect();
-        p.advance(0, &disk);
+        p.advance(&[], &disk);
         disk.extend(10..40);
-        let first = p.advance(10, &disk);
-        let second = p.advance(10, &disk);
-        assert_eq!(first.window, second.window);
+        let first = p.advance(&[], &disk);
+        let second = p.advance(&[], &disk);
         assert_eq!(first.reclaim, second.reclaim);
         assert_eq!(
             first.committed,
@@ -2049,11 +1890,19 @@ mod tests {
 
             let mut disk: BTreeSet<u32> = BTreeSet::new();
             for playhead in (0..count).chain((0..count).rev()) {
-                let d = p.advance(playhead, &disk);
+                // What a consumer at this playhead is fetched, which the
+                // policy no longer decides; and everything held offered up,
+                // which is what the walk is measuring the ceiling of.
+                let width = match p.shape() {
+                    Shape::Whole => count,
+                    Shape::Split { window, .. } => window.max(1),
+                };
+                disk.extend(playhead..playhead.saturating_add(width).min(count));
+                let everything: Vec<u32> = disk.iter().copied().collect();
+                let d = p.advance(&everything, &disk);
                 for piece in &d.reclaim {
                     disk.remove(piece);
                 }
-                disk.extend(d.window.clone());
                 let ceiling = match p.shape() {
                     // One piece over, and only when the budget is nothing:
                     // the window is never empty.

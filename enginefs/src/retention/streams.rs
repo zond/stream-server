@@ -84,6 +84,10 @@ struct Stream {
     /// what the rate asks for rather than jumping to it -- see
     /// [`Stream::grant`].
     window: u64,
+    /// When the read that last earned a grant came in, or `None` having
+    /// never been granted. A window grows for a consumer that is
+    /// consuming; see [`Stream::grant`].
+    granted_for: Option<Instant>,
 }
 
 impl Stream {
@@ -203,6 +207,17 @@ impl Stream {
     /// about five doublings -- under a second -- while a stream that turns
     /// out to be a one-shot probe has cost eight megabytes and stopped.
     fn grant(&mut self, target: u64, floor: u64) -> u64 {
+        // **And only for a consumer that is consuming.** A doubling a pass
+        // is what lets a real stream reach its window in a second; applied
+        // to a stream that has not read since the last grant it is a
+        // lookahead that goes on growing after the reading has stopped. A
+        // read of a container's index closes the moment it has what it
+        // came for, and the field measured the tail of a paused film being
+        // fetched for as long as the torrent was up.
+        if self.granted_for == Some(self.seen) {
+            return self.window.max(floor);
+        }
+        self.granted_for = Some(self.seen);
         let ceiling = if self.window == 0 {
             floor
         } else {
@@ -428,6 +443,7 @@ impl FileStreams {
             seen: read.returned,
             rate: None,
             window: 0,
+            granted_for: None,
         });
         Some(Rejected::Outside)
     }
@@ -488,10 +504,13 @@ impl FileStreams {
     /// What these streams would ask for over `seconds`, before anything is
     /// shared out -- the demand this file puts on the entity's allowance.
     fn asked(&self, seconds: u64) -> u64 {
+        // Saturating, because `seconds` is `u64::MAX` under the buffer
+        // profile that asks for the whole file: what that means is "more
+        // than there is", and the allowance is what bounds it.
         self.streams
             .iter()
             .map(|stream| stream.demand(self.ceiling).saturating_mul(seconds))
-            .sum()
+            .fold(0u64, u64::saturating_add)
     }
 
     /// Grow every stream towards its share of the allowance and answer
@@ -654,16 +673,16 @@ impl Streams {
     }
 
     /// What the LRU would give up first, and how many pieces it is watching
-    /// -- exempting everything inside a window the streams want, which is
-    /// the tier above it.
-    pub fn coldest(
+    /// -- exempting everything in `kept`, which is what no unlink may
+    /// touch: the tiers above it.
+    pub fn coldest_of(
         &self,
         file: usize,
         now: Instant,
-        want: &[Range<u32>],
+        kept: &[Range<u32>],
         how_many: usize,
     ) -> (usize, Vec<u32>) {
-        let exempt = |piece: u32| want.iter().any(|window| window.contains(&piece));
+        let exempt = |piece: u32| kept.iter().any(|window| window.contains(&piece));
         let Some(ledger) = self.by_file.get(&file).map(|streams| &streams.ledger) else {
             return (0, Vec::new());
         };
@@ -744,7 +763,7 @@ impl Streams {
             .by_file
             .values()
             .map(|streams| streams.asked(seconds))
-            .sum();
+            .fold(0u64, u64::saturating_add);
         // One factor for every stream of every file, which is what makes
         // the shares equal in seconds. Nothing to scale when it all fits.
         let share = |want: u64| {
@@ -1143,8 +1162,10 @@ mod tests {
         streams.streams[0].rate = None;
         streams.streams[0].window = 0;
 
-        // Five passes of doubling from the floor.
-        for _ in 0..5 {
+        // Five passes of doubling from the floor, with a read between each:
+        // a window grows for a consumer that is consuming.
+        for step in 0..5u64 {
+            streams.streams[0].seen = at(t0, step + 1);
             want(&mut streams, 90, u64::MAX, PIECE);
         }
         assert!(
@@ -1271,6 +1292,7 @@ mod tests {
             seen: t0,
             rate: Some(rate),
             window: u64::MAX,
+            granted_for: None,
         });
     }
 
@@ -1656,13 +1678,13 @@ mod tests {
 
         // The first file's pass, which is what puts its pieces in a ledger.
         streams.observe(0, &run(0..8), PIECE, t0);
-        let (tracked, _) = streams.coldest(0, at(t0, 1), &[], 8);
+        let (tracked, _) = streams.coldest_of(0, at(t0, 1), &[], 8);
         assert_eq!(tracked, 8, "the first file's pieces are being watched");
 
         // And the second file's pass, over a disk that holds none of them.
         streams.observe(1, &run(2_783..2_791), PIECE, at(t0, 1));
 
-        let (tracked, coldest) = streams.coldest(0, at(t0, 2), &[], 8);
+        let (tracked, coldest) = streams.coldest_of(0, at(t0, 2), &[], 8);
         assert_eq!(tracked, 8, "the first file's pieces are still watched");
         assert_eq!(
             coldest,

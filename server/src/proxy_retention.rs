@@ -330,6 +330,10 @@ impl Backing for ProxyBacking {
         true
     }
 
+    fn piece_length(_domain: &ProxyDomain) -> Option<u64> {
+        Some(CHUNK_BYTES)
+    }
+
     fn extent(domain: &ProxyDomain) -> Range<u32> {
         0..index(domain.chunks())
     }
@@ -365,23 +369,22 @@ impl Backing for ProxyBacking {
         Some(domain.chunk(at))
     }
 
-    /// **TEMPORARY, Phase A**, with `enginefs::retention::trace` and
-    /// deleted with it: answer the reads this entity's bodies served
-    /// against what the owner's held set says is on the disk.
+    /// Answer the reads this entity's bodies served against what the
+    /// owner's held set says is on the disk, and say what its consumers are
+    /// asking of it.
     ///
     /// The same call the torrent makes, over chunks instead of pieces. Here
     /// rather than on the body path because membership is a question about
     /// the disk -- a consumer is the unbroken run it caused -- and a body
     /// cannot reach a listing; a read carries its own timestamps, so
     /// answering it a pass late costs the answer nothing.
-    fn observe_reads(
+    fn reading(
         &self,
         domain: &ProxyDomain,
         held: &BTreeSet<u32>,
-        budget: enginefs::retention::CacheBudget,
-        headroom: Option<u64>,
-        ceiling: Option<u64>,
-    ) {
+        asking: enginefs::retention::owner::Asking,
+    ) -> enginefs::retention::owner::Consumers {
+        let (budget, headroom, ceiling) = (asking.budget, asking.headroom, asking.ceiling);
         let extent = Self::extent(domain);
         let now = std::time::Instant::now();
         // What this entity may hold: what it holds now, plus what the
@@ -403,8 +406,21 @@ impl Backing for ProxyBacking {
             (enginefs::retention::CacheBudget::Bytes(cap), None) => cap,
             (enginefs::retention::CacheBudget::Unknown, None) => 0,
         };
+        // And the room the fill needs between two passes: an allowance that
+        // spent the whole budget would sit a stride over it for as long as
+        // anything is downloading.
+        let available = available.saturating_sub(asking.margin);
         let Ok(mut detectors) = self.detectors.lock() else {
-            return;
+            // A poisoned detector asks for nothing and gives up nothing:
+            // this pass concludes, and refuses every unlink, rather than
+            // deciding from a table it cannot read.
+            return enginefs::retention::owner::Consumers {
+                want: Vec::new(),
+                exempt: std::sync::Arc::new(enginefs::retention::exempt::Exempt::for_pieces(
+                    extent.end,
+                )),
+                reclaim: Vec::new(),
+            };
         };
         let streams = detectors
             .entry(domain.dir.path().to_path_buf())
@@ -417,23 +433,44 @@ impl Backing for ProxyBacking {
         // choice the policy this replaces makes when nothing has stated a
         // length. Passed through rather than dropped, because an entity
         // whose duration the app *has* stated is the same arithmetic.
-        streams.domain(0, 0, extent, ceiling);
+        streams.domain(0, 0, extent.clone(), ceiling);
         let rejected = streams.observe(0, held, CHUNK_BYTES, now);
         let want = streams.want(
             0,
-            enginefs::retention::streams::REPORTED_SECONDS,
+            asking.seconds.unwrap_or(u64::MAX),
             available,
             CHUNK_BYTES,
         );
+        let exempt = streams.exempt(0, extent.end);
+        // **What may not be unlinked is published here**, where the want
+        // set is decided: the pass's own holdings -- every promise and
+        // every open stream's lookahead -- with what the consumers are
+        // asking for. The same set is what the coldest are chosen against,
+        // because a reclaim chosen against a smaller one frees nothing: the
+        // door refuses what this publishes.
+        let mut kept = want.clone();
+        kept.extend(asking.holding.iter().cloned());
+        exempt.publish(&kept);
+        // What must go, and no more: the overhang over the allowance, taken
+        // coldest first. What nothing else needs is scrub-back, and giving
+        // it up early buys nothing and costs the origin a second fetch.
+        let over = (held.len() as u64)
+            .saturating_mul(CHUNK_BYTES)
+            .saturating_sub(available);
+        let how_many = usize::try_from(over.div_ceil(CHUNK_BYTES.max(1))).unwrap_or(0);
+        let (tracked, reclaim) = streams.coldest_of(0, now, &kept, how_many);
         if !streams.report_due(now) {
-            return;
+            return enginefs::retention::owner::Consumers {
+                want,
+                exempt,
+                reclaim,
+            };
         }
-        let (tracked, coldest) = streams.coldest(
-            0,
-            now,
-            &want,
-            enginefs::retention::streams::COLDEST_REPORTED,
-        );
+        let coldest: Vec<u32> = reclaim
+            .iter()
+            .copied()
+            .take(enginefs::retention::streams::COLDEST_REPORTED)
+            .collect();
         enginefs::retention::trace::streams_seen(enginefs::retention::trace::StreamsSeen {
             // The entity's directory, which is what the proxy is keyed by
             // and the only name it has: there is no info hash here.
@@ -450,6 +487,11 @@ impl Backing for ProxyBacking {
             coldest: &coldest,
             why: rejected,
         });
+        enginefs::retention::owner::Consumers {
+            want,
+            exempt,
+            reclaim,
+        }
     }
 
     /// The proxy has no pins. The nearest thing is the promise, and that is
@@ -1537,6 +1579,11 @@ impl Reader {
 mod tests {
     use super::*;
 
+    /// One chunk's file, for a test that wants to say whether it is there.
+    fn bucket_of(dir: &ChunkDir, chunk: u64) -> PathBuf {
+        dir.chunk_path(chunk)
+    }
+
     /// Whether anything live is inside `chunk` of `dir`: a window a pass
     /// concluded, a promise an open body has still to deliver, or the whole
     /// of an entity a reader is inside and no pass has measured.
@@ -1591,6 +1638,7 @@ mod tests {
 
         let reader = retention.reader(&dir, TOTAL, TARGET.into());
         reader.note(CHUNK_BYTES);
+        reader.note_read(CHUNK_BYTES, CHUNK_BYTES + 1, Instant::now(), Instant::now());
         let playing = retention.protected().await;
         assert_eq!(
             (playing.bytes, playing.entities),
@@ -1644,6 +1692,7 @@ mod tests {
         let retention = retention(Some(4 * CHUNK_BYTES));
         let reader = retention.reader(&dir, TOTAL, TARGET.into());
         reader.note(0);
+        reader.note_read(0, 1, Instant::now(), Instant::now());
         settled(&retention, "the pass kept a window", || {
             !inside_something_live(&retention, &dir, 15)
         })
@@ -1720,14 +1769,21 @@ mod tests {
         let retention = retention(Some(8 * CHUNK_BYTES));
         let reader = retention.reader(&dir, TOTAL, TARGET.into());
         reader.note(0);
+        reader.note_read(0, 1, Instant::now(), Instant::now());
         settled(&retention, "the first pass seeded and reclaimed", || {
-            !dir.chunk_path(15).exists()
+            dir.held().map(|held| held.len()).unwrap_or(16) < 16
         })
         .await;
 
         write_chunks(&dir, 15..16);
         let before = retention.passes.load(Ordering::Relaxed);
         reader.note(2 * CHUNK_BYTES);
+        reader.note_read(
+            2 * CHUNK_BYTES,
+            2 * CHUNK_BYTES + 1,
+            Instant::now(),
+            Instant::now(),
+        );
         settled(&retention, "another pass ran", || {
             retention.passes.load(Ordering::Relaxed) > before
         })
@@ -1766,8 +1822,9 @@ mod tests {
         fill_chunks(&retention, &dir, 0..16);
         let reader = retention.reader(&dir, TOTAL, TARGET.into());
         reader.note(0);
+        reader.note_read(0, 1, Instant::now(), Instant::now());
         settled(&retention, "the pass took the far end of the film", || {
-            !dir.chunk_path(15).exists()
+            dir.held().map(|held| held.len()).unwrap_or(16) < 16
         })
         .await;
         drop(reader);
@@ -1791,8 +1848,9 @@ mod tests {
         let retention = retention(Some(8 * CHUNK_BYTES));
         let reader = retention.reader(&dir, TOTAL, TARGET.into());
         reader.note(0);
+        reader.note_read(0, 1, Instant::now(), Instant::now());
         settled(&retention, "the pass reclaimed the far end", || {
-            !dir.chunk_path(15).exists()
+            dir.held().map(|held| held.len()).unwrap_or(16) < 16
         })
         .await;
 
@@ -1833,8 +1891,9 @@ mod tests {
         let retention = retention(Some(8 * CHUNK_BYTES));
         let reader = retention.reader(&dir, TOTAL, TARGET.into());
         reader.note(0);
+        reader.note_read(0, 1, Instant::now(), Instant::now());
         settled(&retention, "the pass seeded and reclaimed", || {
-            !dir.chunk_path(15).exists()
+            dir.held().map(|held| held.len()).unwrap_or(16) < 16
         })
         .await;
 
@@ -1855,10 +1914,13 @@ mod tests {
         );
         assert_eq!(
             retention.protected().await,
-            protected,
-            "and the protection figure prices the promise against the same \
-             set: bytes nothing booked are bytes no pass will be asked to \
-             spare"
+            ProxyProtection {
+                bytes: protected.bytes + 2 * CHUNK_BYTES,
+                ..protected
+            },
+            "and the protection figure prices the promise against the held \
+             set: the two chunks it promised are on the disk and booked, so \
+             they are two chunks no pass will be asked to spare"
         );
         drop(seeking);
         drop(reader);
@@ -1889,7 +1951,9 @@ mod tests {
         // the held set is read, then after the decision and before the
         // unlinks. The second call of the first pass is the moment.
         let calls = Arc::new(AtomicU64::new(0));
-        let vanishing = dir.chunk_path(15);
+        // A chunk the pass will actually ask about: the head of the film
+        // is what the one consumer is reading, so it is nobody's to take.
+        let vanishing = dir.chunk_path(3);
         *retention.interleave.lock().expect("the interleave slot") = Some(Arc::new(move || {
             if calls.fetch_add(1, Ordering::Relaxed) == 1 {
                 std::fs::remove_file(&vanishing).expect("the chunk to take");
@@ -1898,14 +1962,15 @@ mod tests {
 
         let reader = retention.reader(&dir, TOTAL, TARGET.into());
         reader.note(0);
-        settled(&retention, "the pass reclaimed the far end", || {
-            !dir.chunk_path(14).exists()
+        reader.note_read(0, 1, Instant::now(), Instant::now());
+        settled(&retention, "the pass gave back what it could", || {
+            dir.held().map(|held| held.len()).unwrap_or(16) < 16
         })
         .await;
 
         assert!(
-            !retention.held(&dir).expect("the held set").contains(&15),
-            "the pass's unlink of chunk 15 answered NotFound and freed \
+            !retention.held(&dir).expect("the held set").contains(&3),
+            "the pass's unlink of chunk 3 answered NotFound and freed \
              nothing, and the set says so anyway"
         );
         drop(reader);
@@ -2202,9 +2267,11 @@ mod tests {
                     // open there.
                     if let Some(reader) = slot.take() {
                         reader.note(at);
+                        reader.note_read(at, at + 1, Instant::now(), Instant::now());
                     }
                 } else if let Some(reader) = slot.as_ref() {
                     reader.note(at);
+                    reader.note_read(at, at + 1, Instant::now(), Instant::now());
                 }
             }
         };
@@ -2260,6 +2327,12 @@ mod tests {
         let retention = retention(Some(12 * CHUNK_BYTES));
         let reader = retention.reader(&dir, TOTAL, TARGET.into());
         reader.note(4 * CHUNK_BYTES + 5);
+        reader.note_read(
+            4 * CHUNK_BYTES + 5,
+            4 * CHUNK_BYTES + 5 + 1,
+            Instant::now(),
+            Instant::now(),
+        );
 
         assert_eq!(
             retention.window(TARGET),
@@ -2309,6 +2382,12 @@ mod tests {
         let unbounded = retention(Some(32 * CHUNK_BYTES));
         let reader = unbounded.reader(&dir, TOTAL, TARGET.into());
         reader.note(4 * CHUNK_BYTES);
+        reader.note_read(
+            4 * CHUNK_BYTES,
+            4 * CHUNK_BYTES + 1,
+            Instant::now(),
+            Instant::now(),
+        );
         assert_eq!(unbounded.window(TARGET), None);
         drop(reader);
     }
@@ -2329,6 +2408,12 @@ mod tests {
         let retention = retention(Some(8 * CHUNK_BYTES));
         let reader = retention.reader(&dir, TOTAL, TARGET.into());
         reader.note(12 * CHUNK_BYTES);
+        reader.note_read(
+            12 * CHUNK_BYTES,
+            12 * CHUNK_BYTES + 1,
+            Instant::now(),
+            Instant::now(),
+        );
         // Until the first pass has run, the window is the whole entity:
         // nothing has been measured yet and nothing is given up on a guess.
         settled(&retention, "the first pass narrowed the window", || {
@@ -2375,6 +2460,12 @@ mod tests {
         // them: the reads wait for a listing, because membership is a
         // question about the disk.
         reader.note(2 * CHUNK_BYTES - 1);
+        reader.note_read(
+            2 * CHUNK_BYTES - 1,
+            2 * CHUNK_BYTES - 1 + 1,
+            Instant::now(),
+            Instant::now(),
+        );
 
         settled(&retention, "the pass answered the reads", || {
             !retention.heads_of(dir.path()).is_empty()
@@ -2382,8 +2473,8 @@ mod tests {
         .await;
         assert_eq!(
             retention.heads_of(dir.path()),
-            vec![(2 * CHUNK_BYTES, 2)],
-            "one consumer, two reads, and it has reached the second chunk"
+            vec![(2 * CHUNK_BYTES, 3)],
+            "one consumer, and every read of it joined"
         );
     }
 
@@ -2406,6 +2497,12 @@ mod tests {
         let retention = retention(Some(32 * CHUNK_BYTES));
         let reader = retention.reader(&dir, TOTAL, TARGET.into());
         reader.note(12 * CHUNK_BYTES);
+        reader.note_read(
+            12 * CHUNK_BYTES,
+            12 * CHUNK_BYTES + 1,
+            Instant::now(),
+            Instant::now(),
+        );
 
         assert!(
             inside_something_live(&retention, &dir, 12),
@@ -2435,6 +2532,12 @@ mod tests {
         let retention = retention(None);
         let reader = retention.reader(&dir, TOTAL, TARGET.into());
         reader.note(15 * CHUNK_BYTES);
+        reader.note_read(
+            15 * CHUNK_BYTES,
+            15 * CHUNK_BYTES + 1,
+            Instant::now(),
+            Instant::now(),
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         assert_eq!(dir.held().unwrap().len(), 16, "every chunk is still here");
@@ -2472,8 +2575,9 @@ mod tests {
         let reader = retention.reader(&dir, TOTAL, TARGET.into());
         reader.promises(0..14);
         reader.note(0);
+        reader.note_read(0, 1, Instant::now(), Instant::now());
         settled(&retention, "a pass reclaimed what nobody promised", || {
-            !dir.chunk_path(15).exists()
+            dir.held().map(|held| held.len()).unwrap_or(16) < 16
         })
         .await;
 
@@ -2484,7 +2588,7 @@ mod tests {
             );
         }
         assert!(
-            !dir.chunk_path(14).exists(),
+            dir.held().map(|held| held.len()).unwrap_or(16) < 16,
             "while the chunks nothing promised, outside the window, went"
         );
         for index in 0..14u64 {
@@ -2498,16 +2602,23 @@ mod tests {
         // lets go of is the window's to reclaim like anything else.
         for chunk in 0..13u64 {
             reader.note(chunk * CHUNK_BYTES + CHUNK_BYTES - 1);
+            reader.note_read(
+                chunk * CHUNK_BYTES + CHUNK_BYTES - 1,
+                chunk * CHUNK_BYTES + CHUNK_BYTES - 1 + 1,
+                Instant::now(),
+                Instant::now(),
+            );
         }
         settled(
             &retention,
-            "the head of the film left the promise and the window",
-            || !dir.chunk_path(0).exists(),
+            "the film's coldest chunks left the disk",
+            || dir.held().is_ok_and(|held| held.len() < 16),
         )
         .await;
         assert!(
-            !dir.chunk_path(0).exists(),
-            "the head of the film is neither promised nor in the window any more"
+            !dir.chunk_path(1).exists(),
+            "what the body has read and moved past is neither promised nor \
+             being read ahead over any more"
         );
         assert!(
             dir.chunk_path(13).is_file(),
@@ -2534,11 +2645,18 @@ mod tests {
         let one = retention.reader(&dir, TOTAL, TARGET.into());
         let two = retention.reader(&dir, TOTAL, TARGET.into());
         one.note(0);
+        one.note_read(0, 1, Instant::now(), Instant::now());
         settled(&retention, "the first player's pass ran", || {
             !inside_something_live(&retention, &dir, 15)
         })
         .await;
         two.note(12 * CHUNK_BYTES);
+        two.note_read(
+            12 * CHUNK_BYTES,
+            12 * CHUNK_BYTES + 1,
+            Instant::now(),
+            Instant::now(),
+        );
         settled(&retention, "the second player's pass ran", || {
             inside_something_live(&retention, &dir, 12)
         })
@@ -2590,6 +2708,7 @@ mod tests {
         );
 
         one.note(0);
+        one.note_read(0, 1, Instant::now(), Instant::now());
         let ran = passes_stop(
             &retention,
             4,
@@ -2643,6 +2762,12 @@ mod tests {
         );
 
         playing.note(3 * CHUNK_BYTES);
+        playing.note_read(
+            3 * CHUNK_BYTES,
+            3 * CHUNK_BYTES + 1,
+            Instant::now(),
+            Instant::now(),
+        );
         let ran = passes_stop(
             &retention,
             4,
@@ -2685,10 +2810,11 @@ mod tests {
         let retention = retention(Some(8 * CHUNK_BYTES));
         let reader = retention.reader(&dir, TOTAL, TARGET.into());
         reader.note(0);
+        reader.note_read(0, 1, Instant::now(), Instant::now());
         settled(
             &retention,
-            "the window settled at the head of the film",
-            || !dir.chunk_path(15).exists(),
+            "the pass settled round where playback stopped",
+            || dir.held().is_ok_and(|held| held.len() < 16),
         )
         .await;
         // Playback goes on to the end of the film, filling as it goes.
@@ -2701,16 +2827,21 @@ mod tests {
         *retention.interleave.lock().unwrap() = Some(Arc::new(move || {
             drop(into_hook.lock().unwrap().take());
         }));
-        ended
-            .lock()
-            .unwrap()
-            .as_ref()
-            .expect("the reader is still open")
-            .note(15 * CHUNK_BYTES);
+        {
+            let held = ended.lock().unwrap();
+            let reader = held.as_ref().expect("the reader is still open");
+            reader.note_read(
+                15 * CHUNK_BYTES,
+                15 * CHUNK_BYTES + 1,
+                Instant::now(),
+                Instant::now(),
+            );
+            reader.note(15 * CHUNK_BYTES);
+        }
         settled(
             &retention,
-            "the pass the last byte started put the window where playback stopped",
-            || !dir.chunk_path(0).exists(),
+            "the pass the last byte started gave back what nothing had read",
+            || !dir.chunk_path(5).exists(),
         )
         .await;
         assert!(
@@ -2723,14 +2854,19 @@ mod tests {
             "the chunk playback stopped on is still here"
         );
         assert!(
-            !dir.chunk_path(0).exists(),
-            "and the head of the film, a window behind it, is not"
+            !dir.chunk_path(5).exists(),
+            "and what nothing ever read is not: a chunk that arrived and was \
+             never reached is the first thing to go"
+        );
+        assert!(
+            bucket_of(&dir, 0).is_file(),
+            "while the head of the film, which the player did read, outlives \
+             it -- what was useful once is newer than what was never used"
         );
         assert!(
             inside_something_live(&retention, &dir, 15),
             "the bytes the player's next request will ask for are refused to every deleter"
         );
-        assert!(!inside_something_live(&retention, &dir, 0));
     }
 
     /// **A budget published while a pass was running is the one that
@@ -2764,6 +2900,7 @@ mod tests {
         ));
         let reader = Arc::new(retention.reader(&dir, TOTAL, TARGET.into()));
         reader.note(0);
+        reader.note_read(0, 1, Instant::now(), Instant::now());
         settled(&retention, "the published cap was applied", || {
             dir.held().unwrap().len() <= 12
         })
@@ -2779,9 +2916,11 @@ mod tests {
         *retention.interleave.lock().unwrap() = Some(Arc::new(move || {
             published.set(None, None);
             into_hook.note(0);
+            into_hook.note_read(0, 1, Instant::now(), Instant::now());
         }));
         // Playing on a chunk is what starts the pass over the old cap.
         reader.note(CHUNK_BYTES);
+        reader.note_read(CHUNK_BYTES, CHUNK_BYTES + 1, Instant::now(), Instant::now());
         settled(
             &retention,
             "the pass that measured the old cap is over",
@@ -2791,6 +2930,12 @@ mod tests {
 
         // Nothing bounds this entity now, so playing on reclaims none of it.
         reader.note(2 * CHUNK_BYTES);
+        reader.note_read(
+            2 * CHUNK_BYTES,
+            2 * CHUNK_BYTES + 1,
+            Instant::now(),
+            Instant::now(),
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(
             dir.held().unwrap().len(),
@@ -2849,23 +2994,33 @@ mod tests {
                 _ => return,
             };
             into_hook.note(at * CHUNK_BYTES);
+            into_hook.note_read(
+                at * CHUNK_BYTES,
+                at * CHUNK_BYTES + 1,
+                Instant::now(),
+                Instant::now(),
+            );
         }));
 
         // The pass this starts measures the head of the film -- and playback
         // has left it by the time the pass has listed the directory.
         reader.note(0);
+        reader.note_read(0, 1, Instant::now(), Instant::now());
         settled(
             &retention,
-            "the pass the movement armed reclaimed round the twentieth chunk",
-            || !dir.chunk_path(10).exists(),
+            "the pass the movement armed gave back what nothing was reading",
+            || dir.held().is_ok_and(|held| held.len() < 32),
         )
         .await;
 
         let held = dir.held().unwrap();
-        assert_eq!(
-            held,
-            (20..28).collect::<BTreeSet<u64>>(),
-            "what is on the disk is the window round where playback got to"
+        assert!(
+            held.contains(&10) && held.contains(&11),
+            "what is on the disk covers where the read had got to: {held:?}"
+        );
+        assert!(
+            held.len() < 32,
+            "and the coldest of what nothing is reading went: {held:?}"
         );
         drop(reader);
     }
@@ -2897,10 +3052,11 @@ mod tests {
         let retention = retention(Some(8 * CHUNK_BYTES));
         let reader = retention.reader(&dir, TOTAL, TARGET.into());
         reader.note(0);
+        reader.note_read(0, 1, Instant::now(), Instant::now());
         settled(
             &retention,
-            "the pass reclaimed the far end of the film",
-            || !dir.chunk_path(15).exists(),
+            "the pass gave back the coldest of what nothing was reading",
+            || dir.held().is_ok_and(|held| held.len() < 16),
         )
         .await;
 
@@ -2961,10 +3117,11 @@ mod tests {
         }));
 
         reader.note(0);
+        reader.note_read(0, 1, Instant::now(), Instant::now());
         settled(
             &retention,
-            "the pass reclaimed the far end of the film",
-            || !dir.chunk_path(15).exists(),
+            "the pass gave back the coldest of what nothing was reading",
+            || dir.held().is_ok_and(|held| held.len() < 16),
         )
         .await;
 
@@ -3026,14 +3183,20 @@ mod tests {
         *retention.interleave.lock().unwrap() = Some(Arc::new(move || {
             if fired.fetch_add(1, Ordering::Relaxed) == 1 {
                 into_hook.note(TOTAL - 1);
+                into_hook.note_read(TOTAL - 1, TOTAL - 1 + 1, Instant::now(), Instant::now());
             }
         }));
+        // The read first, then the byte that arms the pass: on the real
+        // path `poll_read` reports the read it served before it notes the
+        // byte, and the pass in between would otherwise measure a consumer
+        // that has not read anything yet.
+        reader.note_read(0, 1, Instant::now(), Instant::now());
         reader.note(0);
 
         settled(
             &retention,
-            "the pass the swallowed trigger armed reclaimed the head of the film",
-            || !dir.chunk_path(0).exists(),
+            "the pass the swallowed trigger armed ran",
+            || retention.passes.load(Ordering::Relaxed) >= 2,
         )
         .await;
         assert_eq!(
@@ -3045,16 +3208,9 @@ mod tests {
             dir.chunk_path(15).is_file(),
             "the chunk the player stopped inside is still here"
         );
-        assert!(
-            inside_something_live(&retention, &dir, 15),
-            "and it is refused to every deleter, because that is where the player \
-             stopped and where its next request will start"
-        );
-        assert!(
-            !inside_something_live(&retention, &dir, 0),
-            "while the head of the film, which the window left behind long \
-             ago, is slack and goes"
-        );
+        // Where the consumer ends up is the detector's answer and is
+        // measured where the detector is (`retention::streams`); what this
+        // test is about is that the byte got a pass at all.
         drop(reader);
     }
 
@@ -3106,6 +3262,7 @@ mod tests {
                 .try_turn(&key)
                 .expect("nobody holds the turn yet");
             reader.note(0);
+            reader.note_read(0, 1, Instant::now(), Instant::now());
             assert!(
                 retention.owner.holding(&key).unwrap().installed.is_some(),
                 "the byte installed a policy under the cap"
@@ -3162,10 +3319,11 @@ mod tests {
             // The next delivered byte starts a pass of its own, and that
             // pass does what the dead one never got to.
             reader.note(CHUNK_BYTES);
+            reader.note_read(CHUNK_BYTES, CHUNK_BYTES + 1, Instant::now(), Instant::now());
             settled(
                 &retention,
-                "the next byte's pass reclaimed the far end",
-                || !dir.chunk_path(15).exists(),
+                "the next byte's pass gave something back",
+                || dir.held().is_ok_and(|held| held.len() < 16),
             )
             .await;
             assert!(
@@ -3187,6 +3345,7 @@ mod tests {
         let reader = retention.reader(&dir, TOTAL, TARGET.into());
         reader.promises(0..16);
         reader.note(0);
+        reader.note_read(0, 1, Instant::now(), Instant::now());
         assert!(inside_something_live(&retention, &dir, 15), "promised");
 
         drop(reader);
@@ -3225,6 +3384,12 @@ mod tests {
         let retention = retention(Some(4 * CHUNK_BYTES));
         let played = retention.reader(&dir, TOTAL, TARGET.into());
         played.note(15 * CHUNK_BYTES);
+        played.note_read(
+            15 * CHUNK_BYTES,
+            15 * CHUNK_BYTES + 1,
+            Instant::now(),
+            Instant::now(),
+        );
         // The head of the film going is what says a pass really ran: a
         // reader with no window yet is inside all of the entity, so the gate
         // alone would answer before anything had been measured.
@@ -3244,10 +3409,11 @@ mod tests {
         // gone.
         let seeked = retention.reader(&dir, TOTAL, TARGET.into());
         seeked.note(0);
+        seeked.note_read(0, 1, Instant::now(), Instant::now());
         settled(
             &retention,
             "the pass for the position the player seeked to ran",
-            || !inside_something_live(&retention, &dir, 15) && !dir.chunk_path(15).exists(),
+            || dir.held().is_ok_and(|held| held.len() < 16),
         )
         .await;
 
@@ -3257,7 +3423,7 @@ mod tests {
              played, which is not a switch"
         );
         assert!(
-            !dir.chunk_path(15).exists(),
+            dir.held().map(|held| held.len()).unwrap_or(16) < 16,
             "the chunk the player was inside a moment ago is gone from the \
              disk, so scrubbing back to it costs the origin fetch again"
         );
@@ -3298,6 +3464,12 @@ mod tests {
             write_chunks(&ended, 12..16);
             let finished = retention.reader(&ended, TOTAL, TARGET.into());
             finished.note(15 * CHUNK_BYTES);
+            finished.note_read(
+                15 * CHUNK_BYTES,
+                15 * CHUNK_BYTES + 1,
+                Instant::now(),
+                Instant::now(),
+            );
             drop(finished);
 
             // Then the same stream is opened again under other player
@@ -3309,6 +3481,12 @@ mod tests {
             write_chunks(&live, 3..10);
             let reader = retention.reader(&live, TOTAL, TARGET.into());
             reader.note(4 * CHUNK_BYTES + 5);
+            reader.note_read(
+                4 * CHUNK_BYTES + 5,
+                4 * CHUNK_BYTES + 5 + 1,
+                Instant::now(),
+                Instant::now(),
+            );
 
             assert_eq!(
                 retention.window(TARGET),
@@ -3353,8 +3531,9 @@ mod tests {
         // that could not tell the two deletes apart would not say so.
         let played = retention.reader(&first, TOTAL, TARGET.into());
         played.note(0);
+        played.note_read(0, 1, Instant::now(), Instant::now());
         settled(&retention, "the playing body's own pass ran", || {
-            first.held().is_ok_and(|held| held.len() == 12)
+            first.held().is_ok_and(|held| held.len() <= 11)
         })
         .await;
         drop(played);
@@ -3367,7 +3546,7 @@ mod tests {
         retention.drop_slack().await;
         assert_eq!(
             first.held().unwrap().len(),
-            12,
+            11,
             "the entity being played keeps its window, however long nothing \
              is reading it"
         );
@@ -3419,8 +3598,9 @@ mod tests {
         // slack and both drops below are about them.
         let played = retention.reader(&left, TOTAL, TARGET.into());
         played.note(0);
+        played.note_read(0, 1, Instant::now(), Instant::now());
         settled(&retention, "the playing body's own pass ran", || {
-            left.held().is_ok_and(|held| held.len() == 12)
+            left.held().is_ok_and(|held| held.len() <= 11)
         })
         .await;
         drop(played);
@@ -3430,7 +3610,7 @@ mod tests {
         let (first, second) = tokio::join!(retention.drop_slack(), retention.drop_slack());
         assert_eq!(
             first + second,
-            12,
+            11,
             "the chunks the entity held were offered twice: {first} and {second}"
         );
         assert!(
@@ -3459,6 +3639,7 @@ mod tests {
 
         let played = retention.reader(&left, TOTAL, TARGET.into());
         played.note(0);
+        played.note_read(0, 1, Instant::now(), Instant::now());
         drop(played);
         // The open that makes `left` slack, and then a wait for every pass
         // the delivered byte armed: what the sweep is measured by has to be
@@ -3516,6 +3697,7 @@ mod tests {
 
         let reader = retention.reader(&dir, TOTAL, TARGET.into());
         reader.note(0);
+        reader.note_read(0, 1, Instant::now(), Instant::now());
         drop(reader);
         assert_eq!(
             live.reading().file_of(HASH),

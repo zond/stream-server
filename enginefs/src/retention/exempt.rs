@@ -97,6 +97,28 @@ impl Exempt {
         }
     }
 
+    /// Hold one more region, on top of whatever is published.
+    ///
+    /// **For a promise**, which is made between passes: a parked read is
+    /// told which pieces are coming, and those may not be unlinked whatever
+    /// the streams are doing. Never clears, because a caller that cleared
+    /// would be a second writer deciding something is over; the next
+    /// [`Self::publish`] is what takes it away, and the pass that publishes
+    /// includes every promise live at that moment.
+    ///
+    /// Written by the owner under the entity's lock, like `publish`, so the
+    /// two cannot interleave -- a promise set while a publication was
+    /// computing its words would otherwise be lost by the store that
+    /// followed it.
+    pub fn hold(&self, run: Range<u32>) {
+        for piece in run.start.min(self.pieces)..run.end.min(self.pieces) {
+            let (word, bit) = Self::slot(piece);
+            if let Some(slot) = self.words.get(word) {
+                slot.fetch_or(bit, Ordering::Release);
+            }
+        }
+    }
+
     /// How many pieces are exempt, for the trace line.
     pub fn count(&self) -> u32 {
         self.words
