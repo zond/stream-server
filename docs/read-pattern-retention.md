@@ -124,13 +124,37 @@ smaller window, and stays blocked. Arrival-of-new minus return-of-previous is
 pure consumer time by construction, because our stall happens after the read
 has arrived.
 
-This is also where the bitrate comes from. Bytes consumed per second of real
-time *is* the bitrate, so `note_duration` and the size-over-duration
-arithmetic stop being needed for anything. An earlier attempt to measure a
-rate -- `DeliveryRate`, deleted -- sampled bytes leaving the server over short
-windows and produced 3 B/s and then 17 B/s on successive runs, each of which
-collapsed the window onto its floor. Sampling the consumer's own appetite,
-over gaps it chooses, has no such failure mode.
+An earlier attempt to measure a rate -- `DeliveryRate`, deleted -- sampled
+bytes leaving the server over short windows and produced 3 B/s and then
+17 B/s on successive runs, each of which collapsed the window onto its floor.
+Sampling the consumer's own appetite, over gaps it chooses, has no such
+failure mode.
+
+### The cap, which is also the cold start
+
+The EMA starts at `file_size / duration` and is capped there.
+
+It has to start somewhere, and a stream that has served one read has measured
+nothing. It also has to be capped, because a player filling its own cache
+drains as fast as the socket allows: the early samples are not a consumption
+rate at all, and uncapped they would size the window off how fast we can
+deliver rather than how fast the film plays. The film's average bitrate
+answers both -- it is the rate a video stream converges on anyway, so the
+cap only ever binds while the measurement is meaningless.
+
+This is the one number the server cannot work out for itself, and it is why
+`note_duration` survives when `note_playhead` does not: a cap derived from
+measurement is not a cap. The API shrinks from a position every second to a
+length once per film.
+
+Two things it is not. It is the *whole file's* rate -- every track together --
+so capping each stream at it individually is loose, since it is the sum of
+all streams that cannot exceed the bitrate; only the video stream ever
+approaches it, so per-stream is the simpler and safe choice. And it is an
+*average*: through a dense scene the true local rate is higher and the window
+is undersized by the difference. That is the same variable-bitrate error that
+has come up twice before, in a place where it costs a little lookahead rather
+than a misplaced window.
 
 ## 2. The want set
 
@@ -226,23 +250,25 @@ being lookahead alone since it has nothing to seed.
 `PlaybackIntent` and `playback_intent_for_request`; `is_container_metadata_request`,
 `container_metadata_window`, `CONTAINER_METADATA_FRACTION`; `STRUCTURAL_PIECES`;
 the `Reading::{Playback, Probe}` split; keep-windows, want-windows,
-`Door::windows_now`, `window_at`; `note_duration` and bitrate-from-duration.
+`Door::windows_now`, `window_at`.
+
+**And the told playhead entirely**: `note_playhead` on `ServerHandle` and the
+FRB surface under it, `Told`, `TOLD_FRESH`, `read_near`, `READ_VICINITY`, the
+playhead fallback tiers, and `Pass::drift`. Its last job was placing a window
+round where the viewer is so that scrub-back stayed cheap, and scrub-back is
+now tier 2: it exists when there is disk for it and does not when there is
+not, which needs no position. `note_duration` stays, for the cap in §1.
+
+That deletion crosses the repo boundary -- xtremio reports the playhead once a
+second (`_reportPlayhead`, `PlayheadReport`, `PlayheadReporter`) and its pin
+would stop compiling. The two changes land together, in stage D.
 
 ## 6. Open
 
-**Does the told playhead survive?** Its remaining job is scrub-back. The LRU
-ages by *read* time and mpv reads minutes ahead of the viewer, so "keep 30
-seconds behind" measured from reads is not measured from the viewer. If
-instant scrub-back matters it stays, for biasing age and nothing else;
-`read_near`, the fallback tiers and `TOLD_FRESH` go either way, and if it does
-not matter the app stops reporting at all.
-
-**The buffer-fill phase.** While mpv is filling its cache it drains as fast as
-the socket allows, so early rate samples read as near-infinite. A huge opening
-window is deliberately fine -- download speed and disk bound it in practice,
-and `iter_next_pieces` walks a stream's queue in playback order, so an
-oversized want set still fetches the useful end first. Whether it needs a cap
-at all is a question for the Phase A trace rather than a constant to pick now.
+Nothing about the shape. What is left is the ordering of the stage-D
+deletion against xtremio's pin, and whether the lookahead cap wants to apply
+to the sum of the streams rather than to each of them, which the Phase A
+trace will say more about than an argument will.
 
 ## 7. Staging
 
