@@ -225,10 +225,47 @@ fn run_containing(held: &BTreeSet<u32>, piece: u32, bound: &Range<u32>) -> Optio
     Some(start..end)
 }
 
+/// Where one file lies in the torrent, which is what turns an offset
+/// inside it into the piece index the disk is listed by.
+///
+/// A read carries an offset in its own file; `held` is a set of torrent
+/// pieces. For a file starting at torrent offset zero those are the same
+/// number -- every single-file torrent, and the first file of every other
+/// -- so dividing the offset by the piece length is right about the field's
+/// film and wrong about the second episode of a season pack, silently: the
+/// run it looked up would be tens of thousands of pieces from the read.
+#[derive(Debug, Clone)]
+struct Geometry {
+    /// The file's first byte within the torrent.
+    offset: u64,
+    /// The torrent pieces the file lies in, which bound every run this
+    /// file's streams can be in and every window they can be granted.
+    bound: Range<u32>,
+}
+
+impl Geometry {
+    /// The torrent piece an offset inside this file falls in.
+    fn at(&self, piece: u64, offset: u64) -> u32 {
+        u32::try_from(self.offset.saturating_add(offset) / piece.max(1)).unwrap_or(u32::MAX)
+    }
+}
+
 /// Every stream detected on one file.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct FileStreams {
+    /// Where the file is, learned from the pass: the read path has a file
+    /// offset and nothing else.
+    geometry: Geometry,
     streams: Vec<Stream>,
+}
+
+impl FileStreams {
+    fn on(geometry: Geometry) -> Self {
+        Self {
+            geometry,
+            streams: Vec::new(),
+        }
+    }
 }
 
 impl FileStreams {
@@ -265,7 +302,6 @@ impl FileStreams {
         reader: u64,
         read: Read,
         held: &BTreeSet<u32>,
-        bound: &Range<u32>,
         piece: u64,
     ) -> Option<Rejected> {
         // Before the join, so an expired stream cannot be resumed and a new
@@ -274,8 +310,8 @@ impl FileStreams {
         self.streams
             .retain(|stream| now.saturating_duration_since(stream.seen) < STREAM_IDLE);
 
-        let at = |offset: u64| u32::try_from(offset / piece.max(1)).unwrap_or(u32::MAX);
-        let run = run_containing(held, at(read.begin), bound);
+        let at = |offset: u64| self.geometry.at(piece, offset);
+        let run = run_containing(held, at(read.begin), &self.geometry.bound);
         let nearest = run.and_then(|run| {
             self.streams
                 .iter()
@@ -325,6 +361,15 @@ impl FileStreams {
 /// last for minutes, so nothing is missed by not saying it sooner.
 const REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How many reads of files no pass has described yet are kept.
+///
+/// A read waits for its own file's geometry, which arrives with that file's
+/// first pass; this is the backstop for a file that somehow never gets one,
+/// so the detector's memory is bounded by something other than the length
+/// of the session. Two hundred and fifty-six is a few seconds of one
+/// consumer's reads at the rate the field measured.
+const WAITING_READS: usize = 256;
+
 /// How long a stream nothing has read from stays a stream.
 ///
 /// A placeholder the field log is meant to inform, like every constant in
@@ -359,13 +404,7 @@ impl FileStreams {
     /// streams is sixteen megabytes, and a device with less free space than
     /// that is not playing video, so it is not a case the allocation has to
     /// be shaped around.
-    fn want(
-        &mut self,
-        seconds: u64,
-        budget: u64,
-        piece: u64,
-        bound: &Range<u32>,
-    ) -> Vec<Range<u32>> {
+    fn want(&mut self, seconds: u64, budget: u64, piece: u64) -> Vec<Range<u32>> {
         let floor = FLOOR_PIECES.saturating_mul(piece);
         let asked: u64 = self
             .streams
@@ -385,11 +424,12 @@ impl FileStreams {
         for stream in &mut self.streams {
             let target = share(stream.rate.unwrap_or(0).saturating_mul(seconds));
             let bytes = stream.grant(target, floor);
-            let from = u32::try_from(stream.end / piece.max(1)).unwrap_or(u32::MAX);
-            let to = u32::try_from((stream.end.saturating_add(bytes)) / piece.max(1))
-                .unwrap_or(u32::MAX)
+            let from = self.geometry.at(piece, stream.end);
+            let to = self
+                .geometry
+                .at(piece, stream.end.saturating_add(bytes))
                 .saturating_add(1);
-            let window = from.max(bound.start)..to.min(bound.end);
+            let window = from.max(self.geometry.bound.start)..to.min(self.geometry.bound.end);
             if !window.is_empty() {
                 windows.push(window);
             }
@@ -438,12 +478,29 @@ impl Streams {
         self.pending.push((file, reader, read));
     }
 
+    /// Say where one file lies in the torrent.
+    ///
+    /// From the pass, because the pass's domain is the one place that has
+    /// it: the read path knows an offset inside a file and no more, and
+    /// every question asked here -- which run a read is in, which pieces a
+    /// window covers -- is about torrent pieces.
+    pub(crate) fn domain(&mut self, file: usize, offset: u64, bound: Range<u32>) {
+        let geometry = Geometry { offset, bound };
+        match self.by_file.entry(file) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().geometry = geometry;
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(FileStreams::on(geometry));
+            }
+        }
+    }
+
     /// Answer every read kept since the last pass against `held`, and say
     /// what the most recent one had to do.
     pub(crate) fn observe(
         &mut self,
         held: &BTreeSet<u32>,
-        bound: &Range<u32>,
         piece: u64,
         now: Instant,
     ) -> Option<Rejected> {
@@ -451,18 +508,27 @@ impl Streams {
         // finds it in the ledger to stamp.
         self.ledger.settle(held, now);
         let mut last = None;
+        let mut waiting = Vec::new();
         for (file, reader, read) in std::mem::take(&mut self.pending) {
-            let at = |offset: u64| u32::try_from(offset / piece.max(1)).unwrap_or(u32::MAX);
-            self.ledger.read(
-                at(read.begin)..=at(read.end.saturating_sub(1)),
-                read.returned,
-            );
-            last = self
-                .by_file
-                .entry(file)
-                .or_default()
-                .observe(reader, read, held, bound, piece);
+            let Some(streams) = self.by_file.get_mut(&file) else {
+                // A file no pass has described yet. Its reads are kept
+                // rather than answered: converting one with another file's
+                // geometry asks about the wrong stretch of disk entirely,
+                // and every file being read gets passes of its own.
+                waiting.push((file, reader, read));
+                continue;
+            };
+            let at = |offset: u64| streams.geometry.at(piece, offset);
+            let pieces = at(read.begin)..=at(read.end.saturating_sub(1));
+            last = streams.observe(reader, read, held, piece);
+            self.ledger.read(pieces, read.returned);
         }
+        // Bounded, because a file whose pass never comes would otherwise
+        // keep every read of the session. The newest are the ones a
+        // detector could still make something of.
+        let overflow = waiting.len().saturating_sub(WAITING_READS);
+        waiting.drain(..overflow);
+        self.pending = waiting;
         last
     }
 
@@ -511,16 +577,10 @@ impl Streams {
 
     /// What every stream on every file of this entity wants fetched ahead
     /// of it. See [`FileStreams::want`].
-    pub(crate) fn want(
-        &mut self,
-        seconds: u64,
-        budget: u64,
-        piece: u64,
-        bound: &Range<u32>,
-    ) -> Vec<Range<u32>> {
+    pub(crate) fn want(&mut self, seconds: u64, budget: u64, piece: u64) -> Vec<Range<u32>> {
         self.by_file
             .values_mut()
-            .flat_map(|streams| streams.want(seconds, budget, piece, bound))
+            .flat_map(|streams| streams.want(seconds, budget, piece))
             .collect()
     }
 
@@ -575,6 +635,15 @@ mod tests {
         0..PIECES
     }
 
+    /// The detector for a file that starts at torrent offset `offset` and
+    /// runs to the end of the torrent.
+    fn file_at(offset: u64) -> FileStreams {
+        FileStreams::on(Geometry {
+            offset,
+            bound: u32::try_from(offset / PIECE).unwrap()..PIECES,
+        })
+    }
+
     /// A disk holding every piece of `runs` and nothing else.
     fn disk(runs: &[Range<u32>]) -> BTreeSet<u32> {
         runs.iter().flat_map(|run| run.clone()).collect()
@@ -611,14 +680,13 @@ mod tests {
     fn a_reopen_behind_our_send_position_continues_the_stream() {
         let t0 = Instant::now();
         let held = run(1_460..1_470);
-        let mut streams = FileStreams::default();
+        let mut streams = file_at(0);
 
         assert_eq!(
             streams.observe(
                 1,
                 read(6_149_120_518, 6_149_382_662, t0, 0),
                 &held,
-                &whole(),
                 PIECE
             ),
             Some(Rejected::Outside),
@@ -629,7 +697,6 @@ mod tests {
                 2,
                 read(6_146_281_365, 6_146_543_509, t0, 1),
                 &held,
-                &whole(),
                 PIECE
             ),
             None,
@@ -652,13 +719,12 @@ mod tests {
         // The reads are in pieces 1466 and 1465; the eviction took 1465
         // itself, which is both the hole and where the reopen lands.
         let held = disk(&[1_460..1_465, 1_466..1_470]);
-        let mut streams = FileStreams::default();
+        let mut streams = file_at(0);
 
         streams.observe(
             1,
             read(6_149_120_518, 6_149_382_662, t0, 0),
             &held,
-            &whole(),
             PIECE,
         );
         assert_eq!(
@@ -666,7 +732,6 @@ mod tests {
                 2,
                 read(6_146_281_365, 6_146_543_509, t0, 1),
                 &held,
-                &whole(),
                 PIECE
             ),
             Some(Rejected::Outside),
@@ -690,7 +755,7 @@ mod tests {
         // Held up to the boundary of piece 5560, and not beyond.
         let held = run(5_556..5_560);
         let boundary = 23_320_330_240;
-        let mut streams = FileStreams::default();
+        let mut streams = file_at(0);
 
         for (attempt, begin) in [
             23_320_306_052u64,
@@ -705,7 +770,6 @@ mod tests {
                 2,
                 read(begin, boundary, t0, attempt as u64),
                 &held,
-                &whole(),
                 PIECE,
             );
             if attempt == 0 {
@@ -724,13 +788,12 @@ mod tests {
     fn a_second_track_in_another_run_is_its_own_stream() {
         let t0 = Instant::now();
         let held = disk(&[1_460..1_470, 5_556..5_560]);
-        let mut streams = FileStreams::default();
+        let mut streams = file_at(0);
 
         streams.observe(
             1,
             read(6_149_120_518, 6_149_382_662, t0, 0),
             &held,
-            &whole(),
             PIECE,
         );
         assert_eq!(
@@ -738,7 +801,6 @@ mod tests {
                 2,
                 read(23_320_289_113, 23_320_330_240, t0, 1),
                 &held,
-                &whole(),
                 PIECE
             ),
             Some(Rejected::Outside),
@@ -754,12 +816,11 @@ mod tests {
     fn a_read_of_what_we_do_not_hold_is_a_new_consumer() {
         let t0 = Instant::now();
         let held = run(1_460..1_470);
-        let mut streams = FileStreams::default();
+        let mut streams = file_at(0);
         streams.observe(
             1,
             read(6_149_120_518, 6_149_382_662, t0, 0),
             &held,
-            &whole(),
             PIECE,
         );
 
@@ -768,7 +829,6 @@ mod tests {
                 1,
                 read(1_000_000_000, 1_000_262_144, t0, 1),
                 &held,
-                &whole(),
                 PIECE
             ),
             Some(Rejected::Outside)
@@ -782,15 +842,14 @@ mod tests {
     fn consecutive_reads_of_one_connection_are_one_stream() {
         let t0 = Instant::now();
         let held = run(0..4);
-        let mut streams = FileStreams::default();
-        streams.observe(7, read(0, 262_144, t0, 0), &held, &whole(), PIECE);
+        let mut streams = file_at(0);
+        streams.observe(7, read(0, 262_144, t0, 0), &held, PIECE);
         for chunk in 1..4u64 {
             assert_eq!(
                 streams.observe(
                     7,
                     read(chunk * 262_144, (chunk + 1) * 262_144, t0, chunk),
                     &held,
-                    &whole(),
                     PIECE
                 ),
                 None
@@ -811,7 +870,7 @@ mod tests {
         let t0 = Instant::now();
         // Both reads and the stream's own end are inside one run.
         let held = run(1_460..1_475);
-        let mut streams = FileStreams::default();
+        let mut streams = file_at(0);
 
         // One read of 21,757,952 bytes, returned at t0.
         streams.observe(
@@ -823,7 +882,6 @@ mod tests {
                 returned: t0,
             },
             &held,
-            &whole(),
             PIECE,
         );
         // The consumer comes back one second later, 3,383,897 behind.
@@ -836,7 +894,6 @@ mod tests {
                 returned: at(t0, 1),
             },
             &held,
-            &whole(),
             PIECE,
         );
 
@@ -859,16 +916,16 @@ mod tests {
     fn a_sample_that_measures_nothing_is_refused() {
         let t0 = Instant::now();
         let held = run(0..8);
-        let mut streams = FileStreams::default();
+        let mut streams = file_at(0);
 
-        streams.observe(1, read(0, 262_144, t0, 0), &held, &whole(), PIECE);
+        streams.observe(1, read(0, 262_144, t0, 0), &held, PIECE);
         // Same instant: no time passed.
-        streams.observe(1, read(262_144, 524_288, t0, 0), &held, &whole(), PIECE);
+        streams.observe(1, read(262_144, 524_288, t0, 0), &held, PIECE);
         assert_eq!(streams.streams[0].rate, None, "a gap of zero says nothing");
 
         // A second later, but landing entirely behind what the last read
         // served: nothing was consumed.
-        streams.observe(1, read(0, 262_144, t0, 1), &held, &whole(), PIECE);
+        streams.observe(1, read(0, 262_144, t0, 1), &held, PIECE);
         assert_eq!(
             streams.streams[0].rate, None,
             "and a read that ate nothing says nothing either"
@@ -890,6 +947,29 @@ mod tests {
         });
     }
 
+    /// A window is granted where the stream is *in the torrent*, which for
+    /// a file that does not start at the beginning is not where it is in
+    /// the file.
+    ///
+    /// The old arithmetic would place this window a hundred pieces in,
+    /// outside the file's own bound, where the clamp then drags it to the
+    /// file's first piece -- fetching the head of the episode over and over
+    /// while the viewer is an hour into it.
+    #[test]
+    fn a_window_covers_the_torrent_pieces_the_stream_is_actually_in() {
+        let t0 = Instant::now();
+        let start = 2_000u64;
+        let mut streams = file_at(start * PIECE);
+        stream_at(&mut streams, 100, 3_500_000, t0);
+
+        let windows = streams.want(90, u64::MAX, PIECE);
+        assert_eq!(
+            windows[0].start,
+            u32::try_from(start).unwrap() + 100,
+            "the window begins where the consumer is: {windows:?}"
+        );
+    }
+
     /// **A disk too small for every stream is shared as equal seconds, not
     /// equal bytes.**
     ///
@@ -901,14 +981,14 @@ mod tests {
     #[test]
     fn a_short_disk_is_shared_as_seconds_and_not_as_bytes() {
         let t0 = Instant::now();
-        let mut streams = FileStreams::default();
+        let mut streams = file_at(0);
         stream_at(&mut streams, 100, 3_500_000, t0);
         stream_at(&mut streams, 5_000, 1_000_000, t0);
 
         // Sixty seconds asked for, and half of that on the disk. Rates far
         // enough above the floor that the share is what decides, not it.
         let asked = (3_500_000 + 1_000_000) * 60;
-        let windows = streams.want(60, asked / 2, PIECE, &whole());
+        let windows = streams.want(60, asked / 2, PIECE);
 
         let film = u64::from(windows[0].end - windows[0].start);
         let track = u64::from(windows[1].end - windows[1].start);
@@ -934,12 +1014,12 @@ mod tests {
     #[test]
     fn a_window_doubles_towards_its_target_rather_than_jumping_to_it() {
         let t0 = Instant::now();
-        let mut streams = FileStreams::default();
+        let mut streams = file_at(0);
         stream_at(&mut streams, 100, 3_500_000, t0);
         streams.streams[0].window = 0;
 
         let floor = FLOOR_PIECES * PIECE;
-        let first = streams.want(90, u64::MAX, PIECE, &whole());
+        let first = streams.want(90, u64::MAX, PIECE);
         assert_eq!(
             u64::from(first[0].end - first[0].start) * PIECE,
             floor + PIECE,
@@ -948,7 +1028,7 @@ mod tests {
 
         let mut granted = streams.streams[0].window;
         for _ in 0..4 {
-            streams.want(90, u64::MAX, PIECE, &whole());
+            streams.want(90, u64::MAX, PIECE);
             let now = streams.streams[0].window;
             assert!(
                 now <= granted * 2,
@@ -972,25 +1052,24 @@ mod tests {
     fn a_stream_nothing_has_read_from_stops_being_one() {
         let t0 = Instant::now();
         let held = disk(&[0..4, 2_000..2_004]);
-        let mut streams = FileStreams::default();
-        streams.observe(1, read(0, 262_144, t0, 0), &held, &whole(), PIECE);
+        let mut streams = file_at(0);
+        streams.observe(1, read(0, 262_144, t0, 0), &held, PIECE);
         streams.observe(
             2,
             read(8_388_608_000, 8_388_870_144, t0, 1),
             &held,
-            &whole(),
             PIECE,
         );
         assert_eq!(streams.streams.len(), 2);
 
         assert_eq!(
-            streams.observe(1, read(262_144, 524_288, t0, 20), &held, &whole(), PIECE),
+            streams.observe(1, read(262_144, 524_288, t0, 20), &held, PIECE),
             None
         );
         assert_eq!(streams.streams.len(), 2, "twenty seconds is not idle yet");
 
         assert_eq!(
-            streams.observe(1, read(524_288, 786_432, t0, 40), &held, &whole(), PIECE),
+            streams.observe(1, read(524_288, 786_432, t0, 40), &held, PIECE),
             None
         );
         assert_eq!(
@@ -1017,6 +1096,89 @@ mod tests {
         assert!(!streams.report_due(at(t0, 11)));
     }
 
+    /// **A read's offset is inside its file; the disk is listed by torrent
+    /// piece**, and the second episode of a season pack is where those stop
+    /// being the same number.
+    ///
+    /// The file here begins two thousand pieces into the torrent, and the
+    /// disk holds its first run and nothing else. A detector that divided
+    /// the offset by the piece length would look up piece 0, find nothing
+    /// held there, and report every read of the episode as a consumer of
+    /// its own -- which is the whole detector failing, silently, on every
+    /// torrent whose file does not start at zero.
+    #[test]
+    fn a_read_is_looked_up_at_the_piece_the_torrent_holds_it_in() {
+        let t0 = Instant::now();
+        let start = 2_000u64;
+        let held = run(u32::try_from(start).unwrap()..u32::try_from(start).unwrap() + 10);
+        let mut streams = file_at(start * PIECE);
+
+        assert_eq!(
+            streams.observe(1, read(0, 262_144, t0, 0), &held, PIECE),
+            Some(Rejected::Outside),
+            "the first read of a session joins nothing"
+        );
+        assert_eq!(
+            streams.observe(1, read(262_144, 524_288, t0, 1), &held, PIECE),
+            None,
+            "and the next one continues it: both are in the run the torrent \
+             holds at piece 2000, which is where this file begins"
+        );
+        assert_eq!(streams.streams.len(), 1);
+    }
+
+    /// A read served before its file's first pass waits for it rather than
+    /// being answered with whatever geometry is to hand.
+    ///
+    /// Nothing but the pass knows where a file lies, and the read path runs
+    /// first: a read taken on another file's geometry asks about a stretch
+    /// of disk tens of thousands of pieces from the one it was in. Kept,
+    /// because the answer is a pass away and the read is still true.
+    #[test]
+    fn a_read_of_a_file_no_pass_has_described_waits_for_one() {
+        let t0 = Instant::now();
+        let start = 2_000u32;
+        let held = run(start..start + 10);
+        let mut streams = Streams::default();
+
+        streams.record(1, 7, read(0, 262_144, t0, 0));
+        streams.observe(&held, PIECE, t0);
+        assert!(
+            streams.counts().is_empty(),
+            "nothing was attributed to a file nothing has described"
+        );
+
+        streams.domain(1, u64::from(start) * PIECE, start..PIECES);
+        streams.observe(&held, PIECE, at(t0, 1));
+        assert_eq!(
+            streams.counts(),
+            vec![(1, 1)],
+            "and the read that waited is answered against its own file"
+        );
+    }
+
+    /// What waits for a pass is bounded. A file whose pass never comes
+    /// would otherwise hold every read of the session, and the reads worth
+    /// keeping are the newest.
+    #[test]
+    fn reads_waiting_for_a_pass_do_not_accumulate_without_end() {
+        let t0 = Instant::now();
+        let mut streams = Streams::default();
+        let reads = WAITING_READS + 64;
+        for chunk in 0..reads as u64 {
+            streams.record(3, 7, read(chunk * 262_144, (chunk + 1) * 262_144, t0, chunk));
+        }
+        streams.observe(&run(0..PIECES), PIECE, t0);
+
+        streams.domain(3, 0, whole());
+        streams.observe(&run(0..PIECES), PIECE, at(t0, 1));
+        assert_eq!(
+            streams.heads(3),
+            vec![(reads as u64 * 262_144, WAITING_READS as u32)],
+            "the newest are kept, and they reach where the consumer really is"
+        );
+    }
+
     /// Files do not share streams: the same offsets in two files are two
     /// consumers, and a table keyed by file is what says so.
     #[test]
@@ -1024,9 +1186,11 @@ mod tests {
         let t0 = Instant::now();
         let held = run(0..4);
         let mut streams = Streams::default();
+        streams.domain(0, 0, whole());
+        streams.domain(1, 0, whole());
         streams.record(0, 1, read(0, 262_144, t0, 0));
         streams.record(1, 2, read(0, 262_144, t0, 1));
-        streams.observe(&held, &whole(), PIECE, t0);
+        streams.observe(&held, PIECE, t0);
 
         assert_eq!(streams.counts(), vec![(0, 1), (1, 1)]);
     }

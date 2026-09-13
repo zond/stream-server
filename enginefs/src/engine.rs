@@ -499,7 +499,11 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         let extent = Self::extent(domain);
         let now = std::time::Instant::now();
         let mut streams = self.streams.lock();
-        let rejected = streams.observe(held, &extent, domain.piece_length, now);
+        // Where this file lies, first: a read carries an offset inside its
+        // own file, and every question the detector answers is about
+        // torrent pieces.
+        streams.domain(domain.file_idx, domain.span.offset, extent.clone());
+        let rejected = streams.observe(held, domain.piece_length, now);
         if !streams.report_due(now) {
             return;
         }
@@ -511,7 +515,6 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
             crate::retention::streams::REPORTED_SECONDS,
             budget,
             domain.piece_length,
-            &extent,
         );
         // And what the LRU beneath the windows would give up first. Traced
         // rather than taken: this pass's own reclaim is still the old
