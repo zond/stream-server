@@ -8848,6 +8848,11 @@ mod tests {
         // number was picked on. Where it is not, the bytes still arriving
         // from that read are counted against the probe below, which is how
         // this failed on Windows and passed everywhere else.
+        // **And quiet counts only once a window has actually arrived.** A
+        // tick that delivered nothing in the middle of filling is a pause
+        // and not a plateau -- a slow runner has them, and breaking on one
+        // left this measuring a probe against six megabytes where it needs
+        // half a window to mean anything.
         let mut settled = 0;
         let quiet_at = std::time::Instant::now() + TEST_WAIT_BOUND;
         loop {
@@ -8858,22 +8863,17 @@ mod tests {
                 .transfer_totals()
                 .expect("a paused film's torrent is still live")
                 .fetched;
-            if fetched == settled {
+            let quiet = fetched == settled;
+            settled = fetched;
+            if quiet && settled >= RETENTION_BUDGET / 2 {
                 break;
             }
             assert!(
                 std::time::Instant::now() < quiet_at,
-                "the swarm never stopped delivering after playback stopped: \
-                 {fetched} bytes and still climbing"
+                "the swarm did not deliver a window and then stop: {settled} bytes, and \
+                 what this measures is what a moved window would re-fetch against one"
             );
-            settled = fetched;
         }
-        assert!(
-            settled >= RETENTION_BUDGET / 2,
-            "only {settled} bytes came off the swarm before the probe, which is less \
-             than the window a moved one would have re-fetched: there is nothing here \
-             for this to measure"
-        );
 
         // And mpv reads the Cues at the end of the file, and closes.
         let tail = RETENTION_FILE_BYTES as u64 - RETENTION_PIECE;
