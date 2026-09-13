@@ -494,12 +494,20 @@ impl<S: Side> Backing for FakeBacking<S> {
     /// has no swarm to have paid for anything -- and only the piece
     /// length is read, by the block that turns a reader's lookahead in
     /// bytes into the piece range it covers.
-    fn trace(&self, domain: &FakeDomain) -> Option<crate::retention::trace::Backing> {
+    fn trace(
+        &self,
+        _store: &Self::Store,
+        domain: &FakeDomain,
+    ) -> Option<crate::retention::trace::Backing> {
         Some(crate::retention::trace::Backing {
             fetched: 0,
             verified: 0,
             refused: 0,
             piece_length: domain.piece,
+            // Nothing here writes a piece twice, so the fake has nothing to
+            // report: a scenario that wanted to assert on it would have to
+            // model the storage, which this harness deliberately does not.
+            staged_over_held: 0,
         })
     }
 
