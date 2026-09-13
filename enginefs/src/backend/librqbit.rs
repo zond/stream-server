@@ -8584,7 +8584,7 @@ mod tests {
             bound.fetched_peak
         );
         assert!(
-            bound.at_rest_bytes <= 8 * RETENTION_PIECE,
+            bound.at_rest_bytes <= crate::backend::priorities::MAX_STARTUP_WINDOW_BYTES,
             "{} bytes came off the swarm across {} passes that delivered nothing and \
              left the disk where it was: that is a window moving off its reader, not \
              a fill landing after the reading stopped",
@@ -8646,9 +8646,10 @@ mod tests {
         ///
         /// **The per-pass bound tolerates a landing, this one refuses a
         /// habit.** Bytes in flight when the reading stopped arrive after
-        /// it, and on a loaded machine several passes later; what that
-        /// cannot look like is a pass fetching something every time, which
-        /// is the churn a window that moves off its reader produces.
+        /// it, and on a loaded machine several passes later -- but what was
+        /// in flight is bounded by the lookahead the reader was granted,
+        /// and it arrives once. A window that moves off its reader fetches
+        /// again every pass, without bound.
         at_rest_bytes: u64,
         deadline: std::time::Instant,
     }

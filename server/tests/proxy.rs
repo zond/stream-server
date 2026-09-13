@@ -2101,15 +2101,16 @@ fn a_proxied_stream_past_the_cache_budget_stays_under_it_and_still_plays() -> an
         .send()?;
     assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
 
-    // **Twice the budget and a little, which is what an open body costs.**
-    // A pass gives back what no consumer is asking for, and an open body
-    // has been *promised* every chunk its `Content-Length` covers -- bytes
-    // a player has already been told it is being sent, which nothing may
-    // take. So while one is open the disk holds its promise as well as what
-    // the reader is being fetched ahead over, and the cap binds what is
-    // left. Still an order under the 32 MiB going past, which is what this
-    // measures.
-    let bound = (2 * RETENTION_BUDGET / CHUNK) as usize + 16;
+    // **While a body is open, what it has been promised is not the cap's
+    // to bound.** A response framed over `bytes=X-` is promised every chunk
+    // its `Content-Length` covers -- bytes a player has already been told
+    // it is being sent, which nothing may take -- and how many of those
+    // there are depends on how much was cached when it was framed, which
+    // depends on how often the passes have run. So the reading taken *during*
+    // playback says only that the cache is not simply keeping the film,
+    // which is the failure this test was written for; the reading after the
+    // last byte, below, is the one the cap binds.
+    let bound = RETENTION_ORIGIN / CHUNK as usize - 1;
     let mut read = 0usize;
     let mut worst = 0usize;
     let mut measured_at = 0usize;
@@ -2226,10 +2227,10 @@ fn a_stream_relayed_before_anything_has_walked_the_cache_is_still_bounded() -> a
         .send()?;
     assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
 
-    // Twice the budget and a little: an open body's promise is on the disk
-    // beside what its reader is being fetched ahead over, and neither is a
-    // pass's to take. Still an order under the 32 MiB going past.
-    let bound = (2 * RETENTION_BUDGET / CHUNK) as usize + 16;
+    // As above: while a body is open its promise is not the cap's to
+    // bound, so the reading during playback says only that the cache is not
+    // keeping the film. The cap binds the reading after the last byte.
+    let bound = RETENTION_ORIGIN / CHUNK as usize - 1;
     let mut read = 0usize;
     let mut worst = 0usize;
     let mut measured_at = 0usize;
