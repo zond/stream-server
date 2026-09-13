@@ -125,20 +125,16 @@ pub(crate) struct FakeDomain {
     pub(crate) pieces: Range<u32>,
     /// Bytes per piece; every piece is full except possibly the last.
     pub(crate) piece: u64,
-    /// What the file really holds, which is what a policy is sized from.
-    pub(crate) bytes: u64,
     /// A domain no policy can be sized for: `policy` returns the error
     /// the owner has to carry out from under L2.
     pub(crate) broken: bool,
 }
 
 pub(crate) fn domain(file: usize, pieces: Range<u32>) -> FakeDomain {
-    let count = u64::from(pieces.end - pieces.start);
     FakeDomain {
         file,
         pieces,
         piece: PIECE,
-        bytes: count * PIECE,
         broken: false,
     }
 }
@@ -152,7 +148,6 @@ pub(crate) fn film_domain(file: usize, piece: u64, bytes: u64) -> FakeDomain {
         file,
         pieces: 0..pieces,
         piece,
-        bytes,
         broken: false,
     }
 }
@@ -366,8 +361,14 @@ impl<S: Side> Backing for FakeBacking<S> {
         domain.file == want
     }
 
+    /// The extent in bytes, which is what the production backing answers
+    /// too: `Engine::bytes` is the file's PIECE SPAN and not its exact
+    /// length -- they differ by up to a piece, 0.03% on the field's film.
+    /// Carrying the exact length here would model something the owner never
+    /// sees, and a scenario that could tell the two apart would be asserting
+    /// a fiction.
     fn bytes(domain: &FakeDomain) -> Option<u64> {
-        Some(domain.bytes)
+        Some(u64::from(domain.pieces.end - domain.pieces.start) * domain.piece)
     }
 
     fn extent(domain: &FakeDomain) -> Range<u32> {
@@ -386,7 +387,7 @@ impl<S: Side> Backing for FakeBacking<S> {
             budget,
             domain.piece,
             domain.pieces.clone(),
-            domain.bytes,
+            Self::bytes(domain).unwrap_or_default(),
             S::SHARE,
             buffering,
         )
@@ -1069,10 +1070,18 @@ impl Scenario {
         let held = self.backing.held.lock().clone();
         let selected = self.backing.selected.lock().clone();
         let streams = self.backing.streams.lock().clone();
+        // An open response's lookahead first, and **not** filtered by what
+        // the backend has selected. librqbit's priority loop reserves a
+        // piece on a stream's list having checked only that it is not had,
+        // not releasing, not mid-hash-check, and that the peer has it --
+        // never that it is queued. Its own comment says so: "Only this loop
+        // can reserve such a piece -- `iter_queued_pieces` cannot, its bit
+        // is long gone." So a piece a pass dropped is still pulled back by
+        // a response reading over it, which is the difference between an
+        // eviction that is a loop and one that is a wall.
         let order = streams
             .iter()
             .flat_map(|range| range.clone())
-            .filter(|piece| selected.contains(piece))
             .chain(selected.iter().copied());
         let mut arriving: BTreeSet<u32> = BTreeSet::new();
         for piece in order {

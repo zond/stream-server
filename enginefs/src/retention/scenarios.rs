@@ -105,6 +105,21 @@ fn burst(script: &mut Vec<(Duration, Step)>, from: u64, the_swarm_keeps_up: bool
     script.push((ms(from), opens_the_second_track()));
     script.push((ms(from + 200), reads("second-track")));
     script.push((ms(from + 400), reads("second-track")));
+    // While the response is still open, so its lookahead is one of the
+    // things the swarm is pulling for. Held out of the burst entirely, the
+    // scenario could only ever show the swarm working on a selection no
+    // stream was reading over -- the one case where the two halves cannot
+    // interact, and their interaction is the whole subject. Under the same
+    // gate as the beat after the pass: a swarm that has fallen behind has
+    // fallen behind here too.
+    if the_swarm_keeps_up {
+        script.push((
+            ms(from + 450),
+            Step::Swarm {
+                pieces: EVERYTHING_WANTED,
+            },
+        ));
+    }
     script.push((ms(from + 500), reads("viewer")));
     script.push((
         ms(from + 600),
@@ -348,22 +363,34 @@ fn the_same_pieces_are_reclaimed_and_refetched_on_every_pass() {
 }
 
 /// **The want set never orders a piece of the second track, in thirty
-/// seconds of passes -- and the first pass that finds one missing takes it
-/// out of the swarm's reach for good.**
+/// seconds of passes -- and every pass takes its working set off the disk
+/// again.**
 ///
-/// This is the half the two surveys disagreed about, and it is the half
-/// that turns the loop into a wall. A `Reading::Probe`'s window is kept and
-/// never wanted, which is right for a sixteen-megabyte read of a container
-/// index and is what a second track gets called, so no pass ever asks the
-/// swarm for anything at the tail. While the loop above is running that
-/// costs only bandwidth: the pieces stay selected by accident, because they
-/// were on the disk when the drop set was computed. The moment one cycle is
-/// missed they are *not* on the disk when the next pass looks, no response
-/// is open over them, and they are dropped with
-/// `AfterRelease::LeaveDropped` -- "not had, and now not wanted". Nothing
-/// puts them back, because nothing ever wanted them on purpose.
+/// This is the half the two surveys disagreed about, and the answer is that
+/// both are involved and they do different jobs. A `Reading::Probe`'s
+/// window is kept and never wanted -- right for a sixteen-megabyte read of
+/// a container index, and a second track gets called one -- so no pass ever
+/// asks the swarm for anything at the tail. Fifteen passes, and `wanted`
+/// is `[630..696]` in every one of them.
+///
+/// The pieces come back anyway, while a response is open over them: an open
+/// stream's lookahead is pulled by librqbit's priority loop, which checks
+/// that a piece is not had, not releasing, not mid-hash-check and that the
+/// peer has it, and never that it is selected -- its own comment says
+/// "Only this loop can reserve such a piece -- `iter_queued_pieces` cannot,
+/// its bit is long gone." So the session is a loop: the pass deletes the
+/// tail, the next response's lookahead fetches it again, the next pass
+/// deletes it again. Every two seconds, for as long as anyone watches.
+///
+/// Which is why the field's twenty seconds needs the swarm as well as the
+/// policy. The loop costs only bandwidth while a refetch fits inside a
+/// burst. The field's did not: `peers=2`, `download_speed=193592`, and a
+/// 4 MiB piece at 193 kB/s takes 21.7 seconds against a burst lasting one.
+/// The read waits for a piece that is on its way -- ordered by the
+/// response's own lookahead and by nothing else, because the pass has spent
+/// thirty seconds declining to want it.
 #[test]
-fn no_pass_ever_orders_a_piece_of_the_second_track_and_one_unselects_them() {
+fn no_pass_ever_orders_the_second_tracks_pieces_and_every_pass_deletes_them() {
     let log = field_session();
     for pass in &log.passes {
         assert!(
@@ -373,50 +400,65 @@ fn no_pass_ever_orders_a_piece_of_the_second_track_and_one_unselects_them() {
             pass.wanted
         );
     }
-    let trap = log
+    // And having not wanted them, takes them: the same pieces, every pass,
+    // for the whole session. This is the cost the loop is paying.
+    let deleting: Vec<&_> = log
         .passes
         .iter()
-        .find(|pass| pass.unselected.contains(&5559))
-        .expect("no pass took the piece the second track is waiting for out of the want-set");
-    assert_eq!(
-        trap.at,
-        ms(THE_SWARM_FALLS_BEHIND + 2_800),
-        "the piece left the want-set somewhere other than the first pass that found it missing"
+        .filter(|pass| pass.unlinked.iter().any(|piece| *piece >= 5_500))
+        .collect();
+    assert!(
+        deleting.len() >= log.passes.len() - 1,
+        "only {} of {} passes took the second track's pieces off the disk",
+        deleting.len(),
+        log.passes.len()
     );
 }
 
-/// **And so the read starves: twenty seconds blocked on piece 5559, with a
-/// swarm that would deliver every piece it was asked for in the beat it was
-/// asked.**
+/// **And so the read waits on a piece nothing ordered.**
 ///
 /// The field's line is "reads blocked up to 20 s on those pieces while 17
-/// seeders were connected". Here the swarm is not merely healthy, it is
-/// unlimited -- [`EVERYTHING_WANTED`] is larger than the film -- so there is
-/// exactly one reason a piece can still be missing twenty seconds later,
-/// and it is that nothing is asking for it.
+/// seeders were connected", and this asserts the waiting but deliberately
+/// NOT the twenty seconds. The harness's swarm is instant or absent -- a
+/// beat delivers every piece that is wanted or none -- and the field's was
+/// neither: `peers=2`, `download_speed=193592`. A 4 MiB piece at 193 kB/s
+/// takes 21.7 seconds *even when it is asked for*, which is the field's
+/// 20,013 ms almost exactly. So the twenty seconds is piece size over
+/// swarm rate, and a harness with no rate cannot claim it; what it can
+/// establish is that the piece was never ordered, which the companion test
+/// above asserts and which is the defect. Sizing the swarm in bytes per
+/// beat would let this assert the duration too, and is the first thing to
+/// add if a scenario ever needs to reason about how long a stall lasts
+/// rather than whether one happens.
 ///
 /// The waiting is measured per reader rather than per response, which is
 /// the only way it can be measured: the field's track opened forty-six
 /// responses in seventy seconds and no single one of them waited twenty
 /// seconds for anything.
 #[test]
-fn the_second_track_is_blocked_for_twenty_seconds_with_the_swarm_unlimited() {
+fn the_second_track_blocks_on_a_piece_no_pass_ever_ordered() {
     let log = field_session();
     assert!(
-        log.longest_block("second-track") >= Duration::from_secs(20),
-        "the second track was not starved: longest block {:?}",
-        log.longest_block("second-track")
+        log.longest_block("second-track") > Duration::ZERO,
+        "the second track never waited, so this session reproduces nothing"
     );
-    for read in log.reads.iter().filter(|read| {
-        read.reader == "second-track" && read.at > ms(THE_SWARM_FALLS_BEHIND + 2_800)
-    }) {
+    // And it blocks on a piece a pass took, rather than on one that was
+    // never there: the waiting and the deleting are the same pieces. That
+    // is the whole claim -- not that the track is starved for good, which
+    // it is not while its own lookahead can refetch, but that every burst
+    // pays for the last pass.
+    let blocked: Vec<u32> = log
+        .reads
+        .iter()
+        .filter(|read| read.reader == "second-track" && read.blocked())
+        .map(|read| read.piece)
+        .collect();
+    assert!(!blocked.is_empty(), "the track never parked on anything");
+    for piece in &blocked {
         assert!(
-            read.blocked(),
-            "a read of the second track at {:?} was served {} bytes at piece {} \
-             after the piece had left the want-set",
-            read.at,
-            read.delivered,
-            read.piece,
+            log.passes.iter().any(|pass| pass.unlinked.contains(piece)),
+            "the track parked on piece {piece}, which no pass had taken -- \
+             then this session is about the swarm and not about retention"
         );
     }
 }
