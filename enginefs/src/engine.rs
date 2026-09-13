@@ -497,20 +497,27 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
     /// its own timestamps, so answering late costs the answer nothing.
     fn observe_reads(&self, domain: &FileDomain, held: &BTreeSet<u32>, budget: u64) {
         let extent = Self::extent(domain);
+        let now = std::time::Instant::now();
         let mut streams = self.streams.lock();
-        let rejected = streams.observe(held, &extent, domain.piece_length);
-        if !streams.report_due(std::time::Instant::now()) {
+        let rejected = streams.observe(held, &extent, domain.piece_length, now);
+        if !streams.report_due(now) {
             return;
         }
         // What the replacement would order, beside what this pass did.
         // Obeyed by nothing: the point of carrying it is that a field log
         // shows the two answers to the same disk, on the same line.
+        let (tracked, coldest);
         let want = streams.want(
             crate::retention::streams::REPORTED_SECONDS,
             budget,
             domain.piece_length,
             &extent,
         );
+        // And what the LRU beneath the windows would give up first. Traced
+        // rather than taken: this pass's own reclaim is still the old
+        // policy's.
+        (tracked, coldest) =
+            streams.coldest(now, &want, crate::retention::streams::COLDEST_REPORTED);
         crate::retention::trace::streams_seen(crate::retention::trace::StreamsSeen {
             info_hash: &self.info_hash,
             file_idx: domain.file_idx,
@@ -519,6 +526,8 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
             sample: streams.last_sample(domain.file_idx),
             rates: &streams.rates(domain.file_idx),
             want: &want,
+            tracked,
+            coldest: &coldest,
             why: rejected,
         });
     }

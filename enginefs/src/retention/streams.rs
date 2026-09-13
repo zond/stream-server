@@ -196,6 +196,13 @@ const FLOOR_PIECES: u64 = 2;
 /// want set is wired to the policy that has the real number.
 pub(crate) const REPORTED_SECONDS: u64 = 90;
 
+/// How many of the LRU's next candidates the trace names.
+///
+/// Enough to see which end of the file they are at and whether they are the
+/// pieces a viewer just played, and few enough not to crowd a 400-line ring
+/// that has to hold the rest of a session.
+pub(crate) const COLDEST_REPORTED: usize = 8;
+
 /// The maximal unbroken stretch of `held` containing `piece`, inside
 /// `bound`, or `None` for a piece the disk does not have.
 ///
@@ -395,6 +402,10 @@ impl FileStreams {
 #[derive(Debug, Default)]
 pub(crate) struct Streams {
     by_file: HashMap<usize, FileStreams>,
+    /// When each piece of this entity was last any use. Kept here because
+    /// `Backing::held` answers a set with no times on it; see
+    /// [`crate::retention::ledger`].
+    ledger: super::ledger::Ledger,
     /// Reads served since the last pass, awaiting a listing to be answered
     /// against. A read carries its own timestamps, so waiting costs the
     /// answer nothing.
@@ -434,9 +445,18 @@ impl Streams {
         held: &BTreeSet<u32>,
         bound: &Range<u32>,
         piece: u64,
+        now: Instant,
     ) -> Option<Rejected> {
+        // The listing first, so a read of a piece that arrived this pass
+        // finds it in the ledger to stamp.
+        self.ledger.settle(held, now);
         let mut last = None;
         for (file, reader, read) in std::mem::take(&mut self.pending) {
+            let at = |offset: u64| u32::try_from(offset / piece.max(1)).unwrap_or(u32::MAX);
+            self.ledger.read(
+                at(read.begin)..=at(read.end.saturating_sub(1)),
+                read.returned,
+            );
             last = self
                 .by_file
                 .entry(file)
@@ -444,6 +464,22 @@ impl Streams {
                 .observe(reader, read, held, bound, piece);
         }
         last
+    }
+
+    /// What the LRU would give up first, and how many pieces it is watching
+    /// -- exempting everything inside a window the streams want, which is
+    /// the tier above it.
+    pub(crate) fn coldest(
+        &self,
+        now: Instant,
+        want: &[Range<u32>],
+        how_many: usize,
+    ) -> (usize, Vec<u32>) {
+        let exempt = |piece: u32| want.iter().any(|window| window.contains(&piece));
+        (
+            self.ledger.len(),
+            self.ledger.coldest(now, exempt, how_many),
+        )
     }
 
     /// How many streams are open on each file, for the trace line.
@@ -990,7 +1026,7 @@ mod tests {
         let mut streams = Streams::default();
         streams.record(0, 1, read(0, 262_144, t0, 0));
         streams.record(1, 2, read(0, 262_144, t0, 1));
-        streams.observe(&held, &whole(), PIECE);
+        streams.observe(&held, &whole(), PIECE, t0);
 
         assert_eq!(streams.counts(), vec![(0, 1), (1, 1)]);
     }

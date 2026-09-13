@@ -240,6 +240,11 @@ pub(crate) struct StreamsSeen<'a> {
     pub rates: &'a [Option<u64>],
     /// What the replacement policy would order, which nothing obeys.
     pub want: &'a [std::ops::Range<u32>],
+    /// How many pieces the LRU is watching.
+    pub tracked: usize,
+    /// The pieces it would give up first, oldest by effective age, with
+    /// everything inside a wanted window already excluded.
+    pub coldest: &'a [u32],
     /// Why the most recent read had to start a stream, if it did.
     pub why: Option<super::streams::Rejected>,
 }
@@ -253,6 +258,8 @@ pub(crate) fn streams_seen(seen: StreamsSeen<'_>) {
         heads = ?seen.heads,
         rates = ?seen.rates,
         want = ?seen.want,
+        tracked = seen.tracked,
+        coldest = ?seen.coldest,
         consumed = seen.sample.map(|(bytes, _)| bytes),
         gap_ms = seen.sample.map(|(_, gap)| gap.as_millis() as u64),
         why = ?seen.why,
