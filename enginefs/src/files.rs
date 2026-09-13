@@ -29,6 +29,49 @@ struct ReadCursor {
     /// intermediate polls of one read, so the reported wait is the whole
     /// wait and not the gap since the last wake-up.
     pending_since: Option<Instant>,
+    /// When the read in flight was first polled -- when the consumer asked
+    /// for it, as against when it parked.
+    ///
+    /// Latched on the first poll and kept across the rest, for the same
+    /// reason `pending_since` is: `poll_read` runs many times for one read,
+    /// once per wake-up, and a stamp overwritten on each of them says the
+    /// read arrived at the moment it was about to return. A read blocked
+    /// four seconds would then report having taken no time at all, which is
+    /// the one number the consumer actually felt.
+    arrived: Option<Instant>,
+}
+
+/// What one served read turned out to be.
+///
+/// Returned by [`ReadCursor::resume`] rather than read off the cursor
+/// afterwards, because `resume` is what advances the cursor: asked after
+/// it, `position` is the offset the *next* read starts at, and every
+/// caller wanting the offset this one ran from would have to subtract what
+/// it delivered. `log_blocked_read` did not, and named the wrong piece.
+#[derive(Debug, Clone, Copy)]
+struct Served {
+    /// The offset this read ran from -- the piece it parked on, when it
+    /// parked.
+    begin: u64,
+    /// The offset it reached, which is where the next read starts.
+    end: u64,
+    /// When the consumer asked for it.
+    arrived: Instant,
+    /// When it came back.
+    returned: Instant,
+    /// How long it spent parked, if it parked at all.
+    waited: Option<Duration>,
+}
+
+impl Served {
+    /// How long the consumer waited for this read, parked or not.
+    ///
+    /// Not [`Served::waited`], which is time spent parked on a missing
+    /// piece and is `None` for a read served from the disk. This is the
+    /// whole of it, and it is what a player experiences.
+    fn took(&self) -> Duration {
+        self.returned.saturating_duration_since(self.arrived)
+    }
 }
 
 impl ReadCursor {
@@ -36,7 +79,19 @@ impl ReadCursor {
         Self {
             position,
             pending_since: None,
+            arrived: None,
         }
+    }
+
+    /// Whether the read in flight has already been stamped.
+    fn has_arrived(&self) -> bool {
+        self.arrived.is_some()
+    }
+
+    /// The consumer asked. Call under [`ReadCursor::has_arrived`], so the
+    /// clock is read once per read rather than once per poll.
+    fn arrive(&mut self, now: Instant) {
+        self.arrived.get_or_insert(now);
     }
 
     /// The read could not be served yet.
@@ -45,26 +100,44 @@ impl ReadCursor {
     }
 
     /// The read returned. Advances the cursor by what it delivered and
-    /// yields how long it waited, if it waited at all.
-    fn resume(&mut self, now: Instant, delivered: u64) -> Option<Duration> {
+    /// says what the read was.
+    fn resume(&mut self, now: Instant, delivered: u64) -> Served {
+        let begin = self.position;
         self.position = self.position.saturating_add(delivered);
-        self.pending_since
-            .take()
-            .map(|since| now.saturating_duration_since(since))
+        let arrived = self.arrived.take();
+        debug_assert!(
+            arrived.is_some(),
+            "a read returned without having been polled"
+        );
+        Served {
+            begin,
+            end: self.position,
+            arrived: arrived.unwrap_or(now),
+            returned: now,
+            waited: self
+                .pending_since
+                .take()
+                .map(|since| now.saturating_duration_since(since)),
+        }
     }
 
     fn seek_to(&mut self, position: u64) {
         self.position = position;
         self.pending_since = None;
+        self.arrived = None;
     }
 
-    /// The absolute torrent piece the cursor sits in, `None` without a
-    /// piece length (no metadata, or a backend without pieces). `file_start`
-    /// is the file's offset within the torrent.
-    fn piece(&self, file_start: u64, piece_length: Option<u64>) -> Option<u64> {
+    /// The absolute torrent piece `offset` sits in, `None` without a piece
+    /// length (no metadata, or a backend without pieces). `file_start` is
+    /// the file's offset within the torrent.
+    ///
+    /// Takes the offset rather than reading the cursor, because the caller
+    /// that matters asks *after* [`ReadCursor::resume`] has moved it, about
+    /// the offset the read ran from.
+    fn piece_of(offset: u64, file_start: u64, piece_length: Option<u64>) -> Option<u64> {
         piece_length
             .filter(|len| *len > 0)
-            .map(|len| (file_start.saturating_add(self.position)) / len)
+            .map(|len| (file_start.saturating_add(offset)) / len)
     }
 }
 
@@ -212,15 +285,16 @@ impl<H: TorrentHandle> FileHandle<H> {
     /// been blocked for a second" check would fire whenever the runtime
     /// happened to poll again and never for the reads that block longest.
     /// The completion line always fires and carries the real wait.
-    fn log_blocked_read(&self, waited: Duration) {
+    fn log_blocked_read(&self, served: Served, waited: Duration) {
         let piece_length = self.engine.handle.piece_length();
         tracing::info!(
             info_hash = %self.engine.info_hash,
             file_idx = self.file_idx,
-            offset = self.cursor.position,
-            piece = self.cursor.piece(0, piece_length),
+            offset = served.begin,
+            piece = ReadCursor::piece_of(served.begin, 0, piece_length),
             piece_length,
             waited_ms = waited.as_millis() as u64,
+            took_ms = served.took().as_millis() as u64,
             stage = "blocked_read",
             "read waited for a piece"
         );
@@ -238,6 +312,13 @@ impl<H: TorrentHandle> AsyncRead for FileHandle<H> {
         // only when its piece arrives. So the engine says whether reads are
         // to fail instead, and a read that does park leaves its waker where
         // the engine can reach it.
+        // Stamped before anything can return, so every path out of this
+        // function has an arrival to clear and none inherits the last
+        // read's. Latched, not assigned: this runs again on every wake-up
+        // of a read that parked.
+        if !self.cursor.has_arrived() {
+            self.cursor.arrive(Instant::now());
+        }
         if self.engine.reads_refused() {
             self.cursor.resume(Instant::now(), 0);
             return Poll::Ready(Err(Self::stopped_for_space_error()));
@@ -270,10 +351,11 @@ impl<H: TorrentHandle> AsyncRead for FileHandle<H> {
                 } else {
                     0
                 };
-                if let Some(waited) = self.cursor.resume(Instant::now(), delivered)
+                let served = self.cursor.resume(Instant::now(), delivered);
+                if let Some(waited) = served.waited
                     && waited >= BLOCKED_READ_LOG_THRESHOLD
                 {
-                    self.log_blocked_read(waited);
+                    self.log_blocked_read(served, waited);
                 }
                 // Where a byte really reached a player from, which is what
                 // the retention policy calls the playhead: this read's own,
@@ -282,7 +364,7 @@ impl<H: TorrentHandle> AsyncRead for FileHandle<H> {
                 if delivered > 0
                     && let Some(reader) = &self.reader
                 {
-                    let claim = reader.note((self.file_idx, self.cursor.position));
+                    let claim = reader.note((self.file_idx, served.end));
                     debug_assert!(
                         claim.is_none(),
                         "a delivered byte claimed a torrent file's turn; the tick is its trigger"
@@ -329,26 +411,89 @@ mod tests {
     fn read_cursor_reports_the_whole_wait_at_the_offset_it_parked_on() {
         let piece = 16 * 1024 * 1024u64;
         let mut cursor = ReadCursor::new(piece);
-        assert_eq!(cursor.piece(0, Some(piece)), Some(1));
+        assert_eq!(
+            ReadCursor::piece_of(cursor.position, 0, Some(piece)),
+            Some(1)
+        );
 
         // A served read advances the cursor and reports no wait.
-        assert_eq!(cursor.resume(Instant::now(), 4096), None);
+        let t0 = Instant::now();
+        cursor.arrive(t0);
+        let served = cursor.resume(t0, 4096);
+        assert_eq!(served.waited, None);
+        assert_eq!(served.begin, piece);
+        assert_eq!(served.end, piece + 4096);
         assert_eq!(cursor.position, piece + 4096);
 
         // A read that parks, is polled again while still parked, and only
-        // then completes reports the wait from the first park.
-        let t0 = Instant::now();
+        // then completes reports the wait from the first park -- and the
+        // offset it ran from, which the cursor has moved past by the time
+        // anyone asks.
+        cursor.arrive(t0);
         cursor.park(t0);
         cursor.park(t0 + Duration::from_secs(20));
-        let waited = cursor
-            .resume(t0 + Duration::from_secs(28), 4096)
-            .expect("the read waited");
+        let served = cursor.resume(t0 + Duration::from_secs(28), 4096);
+        let waited = served.waited.expect("the read waited");
         assert_eq!(waited, Duration::from_secs(28));
         assert!(waited >= BLOCKED_READ_LOG_THRESHOLD);
+        assert_eq!(
+            served.begin,
+            piece + 4096,
+            "the offset it parked on, not the one the next read starts at"
+        );
+        assert_eq!(
+            ReadCursor::piece_of(served.begin, 0, Some(piece)),
+            Some(1),
+            "and so the piece it was actually waiting for"
+        );
         assert_eq!(cursor.position, piece + 8192);
 
         // And the next read starts unparked.
-        assert_eq!(cursor.resume(Instant::now(), 0), None);
+        cursor.arrive(Instant::now());
+        assert_eq!(cursor.resume(Instant::now(), 0).waited, None);
+    }
+
+    /// **One read is stamped once, however many times it is polled.**
+    ///
+    /// `poll_read` runs again on every wake-up of a read that parked, so a
+    /// stamp assigned rather than latched says the read arrived at the
+    /// moment it was about to return: a read blocked four seconds reports
+    /// having taken none, which is the one number the consumer actually
+    /// felt. It is also what a rate measured from the gap between reads
+    /// needs, since an arrival that moves puts our own stall inside the
+    /// previous read's gap.
+    #[test]
+    fn one_read_is_stamped_once_however_often_it_is_polled() {
+        let t0 = Instant::now();
+        let mut cursor = ReadCursor::new(0);
+
+        assert!(!cursor.has_arrived(), "nothing is in flight yet");
+        cursor.arrive(t0);
+        assert!(cursor.has_arrived());
+        // The re-polls of the same read.
+        cursor.arrive(t0 + Duration::from_secs(2));
+        cursor.arrive(t0 + Duration::from_secs(4));
+
+        let served = cursor.resume(t0 + Duration::from_secs(4), 4096);
+        assert_eq!(served.arrived, t0, "the first poll, not the last");
+        assert_eq!(served.returned, t0 + Duration::from_secs(4));
+        assert_eq!(served.took(), Duration::from_secs(4));
+        assert!(
+            !cursor.has_arrived(),
+            "and the read is done, so the next one stamps its own arrival"
+        );
+    }
+
+    /// A seek abandons the arrival with the wait: what the consumer asked
+    /// for before it seeked is not what it is asking for now, and a stamp
+    /// carried across would measure the next read from a read that never
+    /// happened.
+    #[test]
+    fn read_cursor_forgets_an_arrival_on_a_seek() {
+        let mut cursor = ReadCursor::new(0);
+        cursor.arrive(Instant::now());
+        cursor.seek_to(4_000_000_000);
+        assert!(!cursor.has_arrived());
     }
 
     /// A seek moves the cursor outright and abandons any wait: the offset
@@ -356,14 +501,28 @@ mod tests {
     #[test]
     fn read_cursor_follows_a_seek() {
         let mut cursor = ReadCursor::new(0);
+        cursor.arrive(Instant::now());
         cursor.park(Instant::now());
         cursor.seek_to(4_000_000_000);
-        assert_eq!(cursor.resume(Instant::now(), 0), None);
+        cursor.arrive(Instant::now());
+        assert_eq!(cursor.resume(Instant::now(), 0).waited, None);
         assert_eq!(cursor.position, 4_000_000_000);
         // The piece index is absolute: the file's own offset in the torrent
         // counts, not just the offset within the file.
-        assert_eq!(cursor.piece(1_000, Some(1_000_000)), Some(4_000));
-        assert_eq!(cursor.piece(0, None), None, "no metadata, no piece");
-        assert_eq!(cursor.piece(0, Some(0)), None, "never divides by zero");
+        let at = cursor.position;
+        assert_eq!(
+            ReadCursor::piece_of(at, 1_000, Some(1_000_000)),
+            Some(4_000)
+        );
+        assert_eq!(
+            ReadCursor::piece_of(at, 0, None),
+            None,
+            "no metadata, no piece"
+        );
+        assert_eq!(
+            ReadCursor::piece_of(at, 0, Some(0)),
+            None,
+            "never divides by zero"
+        );
     }
 }
