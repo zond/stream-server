@@ -8509,9 +8509,26 @@ mod tests {
         drop(reader);
         assert_eq!(read, original, "and it played: every byte is the film's");
 
-        for _ in 0..30 {
+        // Thirty passes, and then as many more as it takes for the stream
+        // to have been measured at rest enough times to mean something.
+        //
+        // **How long settling takes is the machine's business.** At rest is
+        // a pass that delivered nothing and left the disk holding what it
+        // held, which is the only reading that bounds the network tightly
+        // -- and reaching it means the fill has caught up with the window
+        // and the passes have stopped moving pieces. A fixed one-and-a-half
+        // seconds is long enough for that here and is not on the Windows
+        // runner, where this test failed on nine at-rest passes out of the
+        // ten it wants while asserting nothing about a real regression. The
+        // watch's own deadline is what stops it if the stream never settles
+        // at all, and then the assertion below says so.
+        let mut passes = 0;
+        while passes < 30
+            || (bound.at_rest < AT_REST_PASSES && std::time::Instant::now() < bound.deadline)
+        {
             tokio::time::sleep(Duration::from_millis(50)).await;
             bound.tick(read.len()).await;
+            passes += 1;
         }
         assert!(
             bound.worst > bound.budget_pieces / 2,
@@ -8525,12 +8542,21 @@ mod tests {
             bound.fetched_peak
         );
         assert!(
-            bound.at_rest >= 10,
+            bound.at_rest >= AT_REST_PASSES,
             "only {} passes found the stream at rest, so the tight half of the network \
              bound was hardly asked: the pause has to outlast the window filling",
             bound.at_rest
         );
     }
+
+    /// How many passes have to find the stream at rest before the tight
+    /// half of the network bound counts as asked.
+    ///
+    /// At rest is a pass that delivered nothing to the reader and left the
+    /// same pieces on the disk, so what came off the peers across it must
+    /// be nothing but the piece a fill was part-way through. One such pass
+    /// could be an accident of timing; ten is a plateau.
+    const AT_REST_PASSES: usize = 10;
 
     /// One retention pass at a time over a streaming engine, and the three
     /// things every pass has to leave true: the disk under the budget, no
