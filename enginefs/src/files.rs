@@ -357,6 +357,24 @@ impl<H: TorrentHandle> AsyncRead for FileHandle<H> {
                 {
                     self.log_blocked_read(served, waited);
                 }
+                // **Phase A**: what the reads of this file look like, which
+                // nothing obeys yet. Fed from here because this is the one
+                // place that sees every served read with both of its
+                // timestamps, and fed to the engine rather than to anything
+                // on this handle because a stream survives the response
+                // that was carrying it.
+                if delivered > 0 {
+                    self.engine.note_read(
+                        self.file_idx,
+                        self.reader_id,
+                        crate::retention::streams::Read {
+                            begin: served.begin,
+                            end: served.end,
+                            arrived: served.arrived,
+                            returned: served.returned,
+                        },
+                    );
+                }
                 // Where a byte really reached a player from, which is what
                 // the retention policy calls the playhead: this read's own,
                 // on the file's entity. Written after the read rather than

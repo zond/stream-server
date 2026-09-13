@@ -54,6 +54,7 @@ use crate::piece_store::{DeleteOutcome, HeldSnapshot, StoreRegistry};
 
 pub mod live;
 pub mod owner;
+pub(crate) mod streams;
 pub mod trace;
 
 /// What the server says the torrent-data volume may hold.

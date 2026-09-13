@@ -1011,6 +1011,14 @@ pub struct Engine<H: TorrentHandle> {
     /// leaves its readers parked for good unless something here wakes them.
     read_wakers: parking_lot::Mutex<HashMap<u64, std::task::Waker>>,
     next_reader_id: AtomicU64,
+    /// **Phase A only**: what the reads of this torrent look like, worked
+    /// out from the reads and obeyed by nothing. See
+    /// [`crate::retention::streams`] and `docs/read-pattern-retention.md`.
+    /// Here rather than on a `FileHandle` or a `Reader` because both of
+    /// those die with the HTTP response, and the thing being detected
+    /// survives a reopen -- one that did not would report a new stream per
+    /// reopen, manufacturing the very symptom this is measuring.
+    streams: parking_lot::Mutex<crate::retention::streams::Streams>,
     /// The retention owner for this torrent's files, keyed by file index:
     /// one policy per file, resident, with its turn beside it. What
     /// `announce`, the policy slot, its mirror and the playhead used to be
@@ -1137,6 +1145,7 @@ impl<H: TorrentHandle> Engine<H> {
             reads_refused: AtomicBool::new(false),
             read_wakers: parking_lot::Mutex::new(HashMap::new()),
             next_reader_id: AtomicU64::new(1),
+            streams: parking_lot::Mutex::new(Default::default()),
             retention,
             live,
             rest: tokio::sync::Mutex::new(()),
@@ -1284,6 +1293,34 @@ impl<H: TorrentHandle> Engine<H> {
     }
 
     /// Whether reads through this engine fail rather than wait.
+    /// **Phase A only.** Take account of one served read, and say what the
+    /// detector has found when a report is due.
+    ///
+    /// Called from `poll_read`'s delivered path, which already takes the
+    /// entity's lock through `Reader::note`; this takes one of its own,
+    /// held for the length of a `Vec` push and no longer, and never while
+    /// anything else is held.
+    pub(crate) fn note_read(
+        &self,
+        file_idx: usize,
+        reader_id: u64,
+        read: crate::retention::streams::Read,
+    ) {
+        let mut streams = self.streams.lock();
+        let rejected = streams.observe(file_idx, reader_id, read);
+        if !streams.report_due(read.returned) {
+            return;
+        }
+        crate::retention::trace::streams_seen(
+            &self.info_hash,
+            file_idx,
+            &streams.counts(),
+            &streams.heads(file_idx),
+            streams.last_sample(file_idx),
+            rejected,
+        );
+    }
+
     pub fn reads_refused(&self) -> bool {
         self.reads_refused.load(Ordering::SeqCst)
     }

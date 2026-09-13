@@ -214,3 +214,44 @@ pub fn budget_published(bytes: Option<u64>, configured: Option<u64>, from_disk: 
         "the cache budget in force"
     );
 }
+
+/// **What the read-pattern detector has found**, said every
+/// `streams::REPORT_EVERY` while a file is being read.
+///
+/// Phase A's one deliverable. Nothing obeys the detector yet; this line is
+/// how a field log answers whether its join rule works, and the answer is
+/// not a single number. `streams` too high means the rule is too tight and
+/// every HTTP reopen opened its own; too low means it is too loose and two
+/// tracks merged; two with heads twenty gigabytes apart is the shape being
+/// hoped for. `why` says which clause rejected the nearest candidate when a
+/// read had to start a stream, which is what tells those apart.
+///
+/// `consumed`/`gap_ms` are the two halves of a rate sample, raw. They are
+/// reported rather than a rate because at this seam one read is at most the
+/// 256 KiB the response asks for, so the sample may be measuring the socket
+/// draining rather than the player consuming -- which is the delivery rate
+/// a previous attempt was deleted for. Nothing should be sized from this
+/// until a log says which it is.
+///
+/// Goes out with the rest of this module.
+pub(crate) fn streams_seen(
+    info_hash: &str,
+    file_idx: usize,
+    counts: &[(usize, usize)],
+    heads: &[(u64, u32)],
+    sample: Option<(u64, Duration)>,
+    why: Option<super::streams::Rejected>,
+) {
+    tracing::info!(
+        target: "enginefs::retention::trace",
+        info_hash = %info_hash,
+        file_idx,
+        streams = ?counts,
+        heads = ?heads,
+        consumed = sample.map(|(bytes, _)| bytes),
+        gap_ms = sample.map(|(_, gap)| gap.as_millis() as u64),
+        why = ?why,
+        stage = "streams_seen",
+        "what the reads of this file look like"
+    );
+}
