@@ -257,6 +257,17 @@ pub struct FileStreams {
     /// offset and nothing else.
     geometry: Geometry,
     streams: Vec<Stream>,
+    /// When each piece of this file was last any use. Kept because
+    /// `Backing::held` answers a set with no times on it; see
+    /// [`crate::retention::ledger`].
+    ///
+    /// **Per file, because a listing is.** A pass lists the pieces of the
+    /// entity it is for, and a ledger settled against another file's
+    /// listing would find none of its own pieces in it and forget the lot
+    /// -- so every pass of every other file would reset this one's arrival
+    /// times, and an LRU built on them would rank a file nobody has touched
+    /// for a minute as freshly fetched.
+    ledger: super::ledger::Ledger,
     /// What these streams hold, published for the door to read without
     /// taking anything. See [`super::exempt`].
     exempt: std::sync::Arc<super::exempt::Exempt>,
@@ -268,6 +279,7 @@ impl FileStreams {
         Self {
             geometry,
             streams: Vec::new(),
+            ledger: super::ledger::Ledger::default(),
             exempt,
         }
     }
@@ -469,13 +481,9 @@ impl FileStreams {
 #[derive(Debug, Default)]
 pub struct Streams {
     by_file: HashMap<usize, FileStreams>,
-    /// When each piece of this entity was last any use. Kept here because
-    /// `Backing::held` answers a set with no times on it; see
-    /// [`crate::retention::ledger`].
-    ledger: super::ledger::Ledger,
-    /// Reads served since the last pass, awaiting a listing to be answered
-    /// against. A read carries its own timestamps, so waiting costs the
-    /// answer nothing.
+    /// Reads served since the last pass, awaiting the listing of their own
+    /// file to be answered against. A read carries its own timestamps, so
+    /// waiting costs the answer nothing.
     pending: Vec<(usize, u64, Read)>,
     /// When the last report went out, or `None` having said nothing yet.
     reported: Option<Instant>,
@@ -529,25 +537,44 @@ impl Streams {
 
     /// Answer every read kept since the last pass against `held`, and say
     /// what the most recent one had to do.
-    pub fn observe(&mut self, held: &BTreeSet<u32>, piece: u64, now: Instant) -> Option<Rejected> {
-        // The listing first, so a read of a piece that arrived this pass
-        // finds it in the ledger to stamp.
-        self.ledger.settle(held, now);
+    /// **A pass answers its own file's reads, against its own listing.**
+    /// `held` is what the disk holds of `file`, so it is the only set the
+    /// reads of that file can be answered against: a read of another file
+    /// looked up here is looked up in a listing that does not cover it, so
+    /// it is in no run, so it is a consumer of its own -- every read of it,
+    /// for as long as both files are being read. Those wait for their own
+    /// pass, which every file being read gets.
+    pub fn observe(
+        &mut self,
+        file: usize,
+        held: &BTreeSet<u32>,
+        piece: u64,
+        now: Instant,
+    ) -> Option<Rejected> {
+        let pending = std::mem::take(&mut self.pending);
         let mut last = None;
         let mut waiting = Vec::new();
-        for (file, reader, read) in std::mem::take(&mut self.pending) {
-            let Some(streams) = self.by_file.get_mut(&file) else {
-                // A file no pass has described yet. Its reads are kept
-                // rather than answered: converting one with another file's
-                // geometry asks about the wrong stretch of disk entirely,
-                // and every file being read gets passes of its own.
-                waiting.push((file, reader, read));
-                continue;
-            };
-            let at = |offset: u64| streams.geometry.at(piece, offset);
-            let pieces = at(read.begin)..=at(read.end.saturating_sub(1));
-            last = streams.observe(reader, read, held, piece);
-            self.ledger.read(pieces, read.returned);
+        match self.by_file.get_mut(&file) {
+            Some(streams) => {
+                // The listing first, so a read of a piece that arrived this
+                // pass finds it in the ledger to stamp.
+                streams.ledger.settle(held, now);
+                for (at_file, reader, read) in pending {
+                    if at_file != file {
+                        waiting.push((at_file, reader, read));
+                        continue;
+                    }
+                    let pieces = streams.geometry.at(piece, read.begin)
+                        ..=streams.geometry.at(piece, read.end.saturating_sub(1));
+                    last = streams.observe(reader, read, held, piece);
+                    streams.ledger.read(pieces, read.returned);
+                }
+            }
+            // A pass for a file nothing has described can answer nothing:
+            // every conversion here goes through a geometry, and the pass
+            // states that before it asks. Everything waits, and the cap
+            // below is what keeps waiting bounded.
+            None => waiting = pending,
         }
         // Bounded, because a file whose pass never comes would otherwise
         // keep every read of the session. The newest are the ones a
@@ -561,12 +588,18 @@ impl Streams {
     /// What the LRU would give up first, and how many pieces it is watching
     /// -- exempting everything inside a window the streams want, which is
     /// the tier above it.
-    pub fn coldest(&self, now: Instant, want: &[Range<u32>], how_many: usize) -> (usize, Vec<u32>) {
+    pub fn coldest(
+        &self,
+        file: usize,
+        now: Instant,
+        want: &[Range<u32>],
+        how_many: usize,
+    ) -> (usize, Vec<u32>) {
         let exempt = |piece: u32| want.iter().any(|window| window.contains(&piece));
-        (
-            self.ledger.len(),
-            self.ledger.coldest(now, exempt, how_many),
-        )
+        let Some(ledger) = self.by_file.get(&file).map(|streams| &streams.ledger) else {
+            return (0, Vec::new());
+        };
+        (ledger.len(), ledger.coldest(now, exempt, how_many))
     }
 
     /// What one file's streams hold, for a door to read without taking
@@ -1266,14 +1299,14 @@ mod tests {
         let mut streams = Streams::default();
 
         streams.record(1, 7, read(0, 262_144, t0, 0));
-        streams.observe(&held, PIECE, t0);
+        streams.observe(1, &held, PIECE, t0);
         assert!(
             streams.counts().is_empty(),
             "nothing was attributed to a file nothing has described"
         );
 
         streams.domain(1, u64::from(start) * PIECE, start..PIECES);
-        streams.observe(&held, PIECE, at(t0, 1));
+        streams.observe(1, &held, PIECE, at(t0, 1));
         assert_eq!(
             streams.counts(),
             vec![(1, 1)],
@@ -1296,10 +1329,10 @@ mod tests {
                 read(chunk * 262_144, (chunk + 1) * 262_144, t0, chunk),
             );
         }
-        streams.observe(&run(0..PIECES), PIECE, t0);
+        streams.observe(3, &run(0..PIECES), PIECE, t0);
 
         streams.domain(3, 0, whole());
-        streams.observe(&run(0..PIECES), PIECE, at(t0, 1));
+        streams.observe(3, &run(0..PIECES), PIECE, at(t0, 1));
         assert_eq!(
             streams.heads(3),
             vec![(reads as u64 * 262_144, WAITING_READS as u32)],
@@ -1320,7 +1353,7 @@ mod tests {
         // A stream a third of the way in, moving at the film's rate.
         let held = run(1_800..1_860);
         streams.record(0, 1, read(1_850 * PIECE, 1_850 * PIECE + 262_144, t0, 0));
-        streams.observe(&held, PIECE, t0);
+        streams.observe(0, &held, PIECE, t0);
         let windows = streams.want(0, 90, u64::MAX, PIECE);
 
         let exempt = streams.exempt(0, PIECES);
@@ -1356,12 +1389,45 @@ mod tests {
         streams.domain(7, 0, whole());
         let held = run(1_800..1_860);
         streams.record(7, 1, read(1_850 * PIECE, 1_850 * PIECE + 262_144, t0, 0));
-        streams.observe(&held, PIECE, t0);
+        streams.observe(7, &held, PIECE, t0);
         let windows = streams.want(7, 90, u64::MAX, PIECE);
 
         assert!(
             windows[0].clone().all(|piece| exempt.holds(piece)),
             "the handle from before the pass is the one the pass published into"
+        );
+    }
+
+    /// **A pass of one file leaves another file's ledger alone.**
+    ///
+    /// A listing covers the pieces of the file it was taken for, so a
+    /// ledger settled against another file's listing finds none of its own
+    /// pieces in it and forgets the lot. Every pass of every other file
+    /// would then reset this one's arrival times, and the LRU built on them
+    /// would rank a file nobody has touched for a minute as freshly
+    /// fetched -- and, being the newest thing there is, the last to be
+    /// given up.
+    #[test]
+    fn a_pass_of_one_file_does_not_forget_another_files_pieces() {
+        let t0 = Instant::now();
+        let mut streams = Streams::default();
+        streams.domain(0, 0, 0..2_783);
+        streams.domain(1, 2_783 * PIECE, 2_783..PIECES);
+
+        // The first file's pass, which is what puts its pieces in a ledger.
+        streams.observe(0, &run(0..8), PIECE, t0);
+        let (tracked, _) = streams.coldest(0, at(t0, 1), &[], 8);
+        assert_eq!(tracked, 8, "the first file's pieces are being watched");
+
+        // And the second file's pass, over a disk that holds none of them.
+        streams.observe(1, &run(2_783..2_791), PIECE, at(t0, 1));
+
+        let (tracked, coldest) = streams.coldest(0, at(t0, 2), &[], 8);
+        assert_eq!(tracked, 8, "the first file's pieces are still watched");
+        assert_eq!(
+            coldest,
+            (0..8).collect::<Vec<_>>(),
+            "and still at the age the pass that found them gave them"
         );
     }
 
@@ -1376,7 +1442,8 @@ mod tests {
         streams.domain(1, 0, whole());
         streams.record(0, 1, read(0, 262_144, t0, 0));
         streams.record(1, 2, read(0, 262_144, t0, 1));
-        streams.observe(&held, PIECE, t0);
+        streams.observe(0, &held, PIECE, t0);
+        streams.observe(1, &held, PIECE, t0);
 
         assert_eq!(streams.counts(), vec![(0, 1), (1, 1)]);
     }

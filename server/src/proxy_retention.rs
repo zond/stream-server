@@ -405,7 +405,7 @@ impl Backing for ProxyBacking {
         // its geometry is the trivial one -- and it is still stated, because
         // the detector converts every offset through it.
         streams.domain(0, 0, extent);
-        let rejected = streams.observe(held, CHUNK_BYTES, now);
+        let rejected = streams.observe(0, held, CHUNK_BYTES, now);
         let want = streams.want(
             0,
             enginefs::retention::streams::REPORTED_SECONDS,
@@ -415,8 +415,12 @@ impl Backing for ProxyBacking {
         if !streams.report_due(now) {
             return;
         }
-        let (tracked, coldest) =
-            streams.coldest(now, &want, enginefs::retention::streams::COLDEST_REPORTED);
+        let (tracked, coldest) = streams.coldest(
+            0,
+            now,
+            &want,
+            enginefs::retention::streams::COLDEST_REPORTED,
+        );
         enginefs::retention::trace::streams_seen(enginefs::retention::trace::StreamsSeen {
             // The entity's directory, which is what the proxy is keyed by
             // and the only name it has: there is no info hash here.

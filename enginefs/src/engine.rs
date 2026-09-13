@@ -529,7 +529,7 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         // own file, and every question the detector answers is about
         // torrent pieces.
         streams.domain(domain.file_idx, domain.span.offset, extent.clone());
-        let rejected = streams.observe(held, domain.piece_length, now);
+        let rejected = streams.observe(domain.file_idx, held, domain.piece_length, now);
         // What the replacement would order, beside what this pass did.
         // Obeyed by nothing: the point of carrying it is that a field log
         // shows the two answers to the same disk, on the same line.
@@ -552,8 +552,12 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         // And what the LRU beneath the windows would give up first. Traced
         // rather than taken: this pass's own reclaim is still the old
         // policy's.
-        (tracked, coldest) =
-            streams.coldest(now, &want, crate::retention::streams::COLDEST_REPORTED);
+        (tracked, coldest) = streams.coldest(
+            domain.file_idx,
+            now,
+            &want,
+            crate::retention::streams::COLDEST_REPORTED,
+        );
         crate::retention::trace::streams_seen(crate::retention::trace::StreamsSeen {
             info_hash: &self.info_hash,
             file_idx: domain.file_idx,
