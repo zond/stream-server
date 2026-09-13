@@ -188,6 +188,21 @@ use crate::proxy_cache::CHUNK_BYTES;
 /// directory listings per window of playback is a cheap way to buy it.
 const PASSES_PER_WINDOW: u64 = 20;
 
+/// The read-pattern detectors, one per entity, shared between the readers
+/// that feed them and the pass that answers them.
+///
+/// **Phase A**, exactly as on the torrent side: what the reads of a proxied
+/// stream look like, observed and obeyed by nothing. The proxy's shape is
+/// the same in every part that matters -- a consumer is the unbroken run of
+/// chunks it caused, membership is a question about the disk, and the disk
+/// here is the owner's own held set rather than a listing -- so the
+/// detector is the engine's, over chunk indices instead of piece indices.
+///
+/// Keyed by the entity's directory, which is what the whole owner is keyed
+/// by: two entities under one cache key index their chunks the same way and
+/// hold different bytes.
+type Detectors = Arc<Mutex<HashMap<PathBuf, enginefs::retention::streams::Streams>>>;
+
 /// A proxied entity, as the owner sees it: a chunk directory, its length,
 /// and the URL it was relayed for.
 ///
@@ -201,6 +216,8 @@ const PASSES_PER_WINDOW: u64 = 20;
 /// with. It is written when the entity is made and dies with it; at process
 /// start there are no entities, so there is no URL to read back -- which is
 /// true, this process has relayed nothing yet.
+
+
 #[derive(Clone, PartialEq)]
 struct ProxyDomain {
     dir: ChunkDir,
@@ -249,6 +266,9 @@ struct ProxyBacking {
     /// the owner takes a chunk off the disk, so it is the only place the
     /// count comes down through this backing.
     occupancy: Arc<Occupancy>,
+    /// **Phase A only**: what the reads of each entity look like, fed by
+    /// the bodies and answered by the pass. See [`Detectors`].
+    detectors: Detectors,
     /// The threads the blocking halves of a pass really ran on.
     ///
     /// A `#[tokio::test]` drives its runtime on the test's own thread, so
@@ -344,6 +364,75 @@ impl Backing for ProxyBacking {
 
     fn index_of(domain: &ProxyDomain, at: u64) -> Option<u32> {
         Some(domain.chunk(at))
+    }
+
+    /// **TEMPORARY, Phase A**, with `enginefs::retention::trace` and
+    /// deleted with it: answer the reads this entity's bodies served
+    /// against what the owner's held set says is on the disk.
+    ///
+    /// The same call the torrent makes, over chunks instead of pieces. Here
+    /// rather than on the body path because membership is a question about
+    /// the disk -- a consumer is the unbroken run it caused -- and a body
+    /// cannot reach a listing; a read carries its own timestamps, so
+    /// answering it a pass late costs the answer nothing.
+    fn observe_reads(
+        &self,
+        domain: &ProxyDomain,
+        held: &BTreeSet<u32>,
+        budget: enginefs::retention::CacheBudget,
+        headroom: Option<u64>,
+    ) {
+        let extent = Self::extent(domain);
+        let now = std::time::Instant::now();
+        // What this entity may hold: what it holds now, plus what the
+        // volume will still give before the margin. See
+        // `docs/read-pattern-retention.md` section 4, and the torrent's
+        // half of this, which reads the same.
+        let available = match (budget, headroom) {
+            (enginefs::retention::CacheBudget::Unbounded, _) => u64::MAX,
+            (_, Some(headroom)) => (held.len() as u64)
+                .saturating_mul(CHUNK_BYTES)
+                .saturating_add(headroom),
+            (enginefs::retention::CacheBudget::Bytes(cap), None) => cap,
+            (enginefs::retention::CacheBudget::Unknown, None) => 0,
+        };
+        let Ok(mut detectors) = self.detectors.lock() else {
+            return;
+        };
+        let streams = detectors.entry(domain.dir.path().to_path_buf()).or_default();
+        // The proxy's entity is one file starting at its own beginning, so
+        // its geometry is the trivial one -- and it is still stated, because
+        // the detector converts every offset through it.
+        streams.domain(0, 0, extent);
+        let rejected = streams.observe(held, CHUNK_BYTES, now);
+        let want = streams.want(
+            enginefs::retention::streams::REPORTED_SECONDS,
+            available,
+            CHUNK_BYTES,
+        );
+        if !streams.report_due(now) {
+            return;
+        }
+        let (tracked, coldest) = streams.coldest(
+            now,
+            &want,
+            enginefs::retention::streams::COLDEST_REPORTED,
+        );
+        enginefs::retention::trace::streams_seen(enginefs::retention::trace::StreamsSeen {
+            // The entity's directory, which is what the proxy is keyed by
+            // and the only name it has: there is no info hash here.
+            info_hash: &domain.dir.path().display().to_string(),
+            file_idx: 0,
+            counts: &streams.counts(),
+            heads: &streams.heads(0),
+            sample: streams.last_sample(0),
+            rates: &streams.rates(0),
+            want: &want,
+            exempt: streams.held_by_streams(0),
+            tracked,
+            coldest: &coldest,
+            why: rejected,
+        });
     }
 
     /// The proxy has no pins. The nearest thing is the promise, and that is
@@ -517,6 +606,7 @@ impl ProxyBacking {
         ProxyBacking {
             live: self.live.clone(),
             occupancy: self.occupancy.clone(),
+            detectors: self.detectors.clone(),
             #[cfg(test)]
             disk_threads: self.disk_threads.clone(),
         }
@@ -814,6 +904,13 @@ pub struct ProxyRetention {
     /// What this cache holds, in bytes, counted as chunks are written and
     /// as they go: see [`Self::occupancy`].
     occupancy: Arc<Occupancy>,
+    /// **Phase A only**: the detectors the bodies feed, shared with the
+    /// backing whose pass answers them. See [`Detectors`].
+    detectors: Detectors,
+    /// How many bodies this process has opened, which is what tells one
+    /// consumer's reads from another's in the detector. A reopen is a new
+    /// number over the same stream, and the detector is meant to say so.
+    next_reader: AtomicU64,
     /// The one place a test can be *inside* a pass.
     ///
     /// A pass reads the playheads, lists the entity's directories and
@@ -863,6 +960,11 @@ pub struct Reader {
     inner: enginefs::retention::owner::Reader<ProxyBacking>,
     key: PathBuf,
     total: u64,
+    /// Which body this is. A reopen is a new number over the same stream,
+    /// which is the thing the detector has to get right: a player seeks by
+    /// closing its connection and asking again, and a stream keyed to a
+    /// connection would be one per seek.
+    id: u64,
 }
 
 impl ProxyRetention {
@@ -874,10 +976,12 @@ impl ProxyRetention {
         #[cfg(test)]
         let disk_threads: Arc<Mutex<Vec<std::thread::ThreadId>>> = Arc::default();
         let occupancy: Arc<Occupancy> = Arc::default();
+        let detectors: Detectors = Arc::default();
         let owner = Retention::new(
             Arc::new(ProxyBacking {
                 live: live.clone(),
                 occupancy: occupancy.clone(),
+                detectors: detectors.clone(),
                 #[cfg(test)]
                 disk_threads: disk_threads.clone(),
             }),
@@ -905,6 +1009,8 @@ impl ProxyRetention {
             live,
             work,
             occupancy,
+            detectors,
+            next_reader: AtomicU64::new(1),
             #[cfg(test)]
             interleave,
             #[cfg(test)]
@@ -948,6 +1054,7 @@ impl ProxyRetention {
         }
         Reader {
             retention: self.clone(),
+            id: self.next_reader.fetch_add(1, Ordering::Relaxed),
             inner: self.owner.reader(
                 key.clone(),
                 ProxyDomain {
@@ -959,6 +1066,39 @@ impl ProxyRetention {
             key,
             total,
         }
+    }
+
+    /// **Phase A**: keep one served read until a pass can answer it.
+    ///
+    /// A lock, a hash lookup and a push, on the body path -- the same cost
+    /// as the playhead beside it. The answer waits for the pass because the
+    /// question is about the disk; the read carries its own timestamps, so
+    /// waiting costs the answer nothing.
+    fn record_read(&self, key: &Path, reader: u64, read: enginefs::retention::streams::Read) {
+        if let Ok(mut detectors) = self.detectors.lock() {
+            detectors
+                .entry(key.to_path_buf())
+                .or_default()
+                // One file per entity, so one index: the proxy's entity
+                // *is* the file.
+                .record(0, reader, read);
+        }
+    }
+
+    /// **Phase A**: where each consumer of `dir` has reached, and how many
+    /// reads took it there. What the detector has made of this entity, for
+    /// a test to read; the shipped build says it in a trace line.
+    #[cfg(test)]
+    pub(crate) fn heads_of(&self, dir: &Path) -> Vec<(u64, u32)> {
+        self.detectors
+            .lock()
+            .ok()
+            .and_then(|detectors| {
+                detectors
+                    .get(&dir.to_path_buf())
+                    .map(|streams| streams.heads(0))
+            })
+            .unwrap_or_default()
     }
 
     /// Run the pass `claim` is for, and every pass it says it owes, as one
@@ -1324,6 +1464,31 @@ impl Reader {
     /// task that cannot borrow this handle.
     pub(crate) fn retention(&self) -> Arc<ProxyRetention> {
         self.retention.clone()
+    }
+
+    /// **Phase A**: bytes `begin..end` of this entity went out to a player,
+    /// having been asked for at `arrived` and delivered at `returned`.
+    ///
+    /// Kept until a pass can say which consumer they belonged to, because
+    /// membership is a question about the disk and the body path cannot
+    /// reach a listing. Both timestamps, because the gap that measures a
+    /// consumer runs from one read's return to the next one's arrival: any
+    /// pairing that spans our own fetch books an origin's latency as the
+    /// player thinking.
+    pub(crate) fn note_read(&self, begin: u64, end: u64, arrived: std::time::Instant, returned: std::time::Instant) {
+        if self.total == 0 || end <= begin {
+            return;
+        }
+        self.retention.record_read(
+            &self.key,
+            self.id,
+            enginefs::retention::streams::Read {
+                begin,
+                end,
+                arrived,
+                returned,
+            },
+        );
     }
 
     /// A byte at `delivered_to` of this entity has reached a player.
@@ -2155,6 +2320,47 @@ mod tests {
         assert!(
             !inside_something_live(&retention, &dir, 0),
             "and the start of the film, which it played past long ago"
+        );
+    }
+
+    /// **Phase A on the proxy: a body's reads are one consumer**, answered
+    /// against the owner's held set exactly as the torrent's are.
+    ///
+    /// The proxy's shape is the same in every part that matters -- a
+    /// consumer is the unbroken run of chunks it caused, and membership is
+    /// a question about the disk -- so it runs the engine's detector over
+    /// chunk indices. What this pins is the wiring: the body path feeds it,
+    /// the pass answers it, and two reads that continue each other over a
+    /// whole run of disk are one consumer and not two.
+    #[tokio::test]
+    async fn the_reads_of_a_proxied_body_are_one_consumer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = ChunkDir::new(tmp.path().join("entity"));
+        write_chunks(&dir, 0..16);
+
+        let retention = retention(Some(8 * CHUNK_BYTES));
+        let reader = retention.reader(&dir, TOTAL, TARGET.into());
+        let t0 = Instant::now();
+        reader.note_read(0, CHUNK_BYTES, t0, t0);
+        reader.note_read(
+            CHUNK_BYTES,
+            2 * CHUNK_BYTES,
+            t0 + Duration::from_secs(1),
+            t0 + Duration::from_secs(1),
+        );
+        // The delivered byte, which is what starts the pass that answers
+        // them: the reads wait for a listing, because membership is a
+        // question about the disk.
+        reader.note(2 * CHUNK_BYTES - 1);
+
+        settled(&retention, "the pass answered the reads", || {
+            !retention.heads_of(dir.path()).is_empty()
+        })
+        .await;
+        assert_eq!(
+            retention.heads_of(dir.path()),
+            vec![(2 * CHUNK_BYTES, 2)],
+            "one consumer, two reads, and it has reached the second chunk"
         );
     }
 

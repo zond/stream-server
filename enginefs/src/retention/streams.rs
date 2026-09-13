@@ -36,7 +36,7 @@ use std::time::Instant;
 /// piece as the consumer thinking. A stream blocked on a piece would then
 /// measure as slow, be given a smaller window, and stay blocked.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Read {
+pub struct Read {
     /// The offset this read ran from.
     pub begin: u64,
     /// The offset it reached.
@@ -162,7 +162,7 @@ impl Stream {
 /// join rule too tight reports two streams having opened ten, and the two
 /// readings are told apart by how often this appears.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Rejected {
+pub enum Rejected {
     /// The read began in no run this file's streams are in -- a different
     /// stretch of disk, or a piece the disk does not hold at all.
     Outside,
@@ -194,14 +194,14 @@ const FLOOR_PIECES: u64 = 2;
 /// does not, chosen to match the profile a film plays under so a field log
 /// can be read against the policy that is still deciding. It goes when the
 /// want set is wired to the policy that has the real number.
-pub(crate) const REPORTED_SECONDS: u64 = 90;
+pub const REPORTED_SECONDS: u64 = 90;
 
 /// How many of the LRU's next candidates the trace names.
 ///
 /// Enough to see which end of the file they are at and whether they are the
 /// pieces a viewer just played, and few enough not to crowd a 400-line ring
 /// that has to hold the rest of a session.
-pub(crate) const COLDEST_REPORTED: usize = 8;
+pub const COLDEST_REPORTED: usize = 8;
 
 /// The maximal unbroken stretch of `held` containing `piece`, inside
 /// `bound`, or `None` for a piece the disk does not have.
@@ -252,7 +252,7 @@ impl Geometry {
 
 /// Every stream detected on one file.
 #[derive(Debug)]
-pub(crate) struct FileStreams {
+pub struct FileStreams {
     /// Where the file is, learned from the pass: the read path has a file
     /// offset and nothing else.
     geometry: Geometry,
@@ -449,7 +449,7 @@ impl FileStreams {
 
 /// The detected streams of one entity, by file index.
 #[derive(Debug, Default)]
-pub(crate) struct Streams {
+pub struct Streams {
     by_file: HashMap<usize, FileStreams>,
     /// When each piece of this entity was last any use. Kept here because
     /// `Backing::held` answers a set with no times on it; see
@@ -471,7 +471,7 @@ impl Streams {
     /// keyed by the entity alone, so two event types sharing it silence
     /// each other on alternate intervals, and being global wall-clock state
     /// makes it order-dependent across the tests in one binary.
-    pub(crate) fn report_due(&mut self, now: Instant) -> bool {
+    pub fn report_due(&mut self, now: Instant) -> bool {
         let due = self
             .reported
             .is_none_or(|last| now.saturating_duration_since(last) >= REPORT_EVERY);
@@ -483,7 +483,7 @@ impl Streams {
     /// Keep a served read until a pass can say which consumer it belonged
     /// to. The read path cannot answer that: membership is a question about
     /// the disk, and the disk's answer is a listing away.
-    pub(crate) fn record(&mut self, file: usize, reader: u64, read: Read) {
+    pub fn record(&mut self, file: usize, reader: u64, read: Read) {
         self.pending.push((file, reader, read));
     }
 
@@ -493,7 +493,7 @@ impl Streams {
     /// it: the read path knows an offset inside a file and no more, and
     /// every question asked here -- which run a read is in, which pieces a
     /// window covers -- is about torrent pieces.
-    pub(crate) fn domain(&mut self, file: usize, offset: u64, bound: Range<u32>) {
+    pub fn domain(&mut self, file: usize, offset: u64, bound: Range<u32>) {
         let geometry = Geometry { offset, bound };
         match self.by_file.entry(file) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
@@ -507,7 +507,7 @@ impl Streams {
 
     /// Answer every read kept since the last pass against `held`, and say
     /// what the most recent one had to do.
-    pub(crate) fn observe(
+    pub fn observe(
         &mut self,
         held: &BTreeSet<u32>,
         piece: u64,
@@ -544,7 +544,7 @@ impl Streams {
     /// What the LRU would give up first, and how many pieces it is watching
     /// -- exempting everything inside a window the streams want, which is
     /// the tier above it.
-    pub(crate) fn coldest(
+    pub fn coldest(
         &self,
         now: Instant,
         want: &[Range<u32>],
@@ -563,11 +563,7 @@ impl Streams {
     ///
     /// **Phase A**: the set is published and traced, and no door reads it
     /// yet. See [`super::exempt::Exempt::holds`].
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Phase A: published and traced, not obeyed")
-    )]
-    pub(crate) fn exempt(&mut self, file: usize) -> std::sync::Arc<super::exempt::Exempt> {
+    pub fn exempt(&mut self, file: usize) -> std::sync::Arc<super::exempt::Exempt> {
         self.by_file
             .get(&file)
             .map(|streams| streams.exempt.clone())
@@ -576,7 +572,7 @@ impl Streams {
 
     /// How many pieces of `file` its streams are holding, for the trace
     /// line: the size of the answer the door would be getting.
-    pub(crate) fn held_by_streams(&self, file: usize) -> u32 {
+    pub fn held_by_streams(&self, file: usize) -> u32 {
         self.by_file
             .get(&file)
             .map(|streams| streams.exempt.count())
@@ -584,7 +580,7 @@ impl Streams {
     }
 
     /// How many streams are open on each file, for the trace line.
-    pub(crate) fn counts(&self) -> Vec<(usize, usize)> {
+    pub fn counts(&self) -> Vec<(usize, usize)> {
         let mut counts: Vec<(usize, usize)> = self
             .by_file
             .iter()
@@ -597,7 +593,7 @@ impl Streams {
     /// Where each stream on `file` has reached, and how many reads took it
     /// there -- what a field log needs to say whether the two it found are
     /// the film and a second track, or two halves of the film.
-    pub(crate) fn heads(&self, file: usize) -> Vec<(u64, u32)> {
+    pub fn heads(&self, file: usize) -> Vec<(u64, u32)> {
         self.by_file
             .get(&file)
             .map(|streams| {
@@ -612,7 +608,7 @@ impl Streams {
 
     /// What every stream on every file of this entity wants fetched ahead
     /// of it. See [`FileStreams::want`].
-    pub(crate) fn want(&mut self, seconds: u64, budget: u64, piece: u64) -> Vec<Range<u32>> {
+    pub fn want(&mut self, seconds: u64, budget: u64, piece: u64) -> Vec<Range<u32>> {
         self.by_file
             .values_mut()
             .flat_map(|streams| streams.want(seconds, budget, piece))
@@ -628,7 +624,7 @@ impl Streams {
     /// response asks for, so a rate could be measuring the socket draining
     /// while a player fills its buffer rather than the player consuming.
     /// Nothing is sized from this until a field log says which it is.
-    pub(crate) fn rates(&self, file: usize) -> Vec<Option<u64>> {
+    pub fn rates(&self, file: usize) -> Vec<Option<u64>> {
         self.by_file
             .get(&file)
             .map(|streams| streams.streams.iter().map(|stream| stream.rate).collect())
@@ -647,7 +643,7 @@ impl Streams {
     /// while the player is filling its buffer, and its true consumption
     /// only once that buffer is full and TCP backpressure sets the pace.
     /// Phase A's job is to find out which of those the numbers look like.
-    pub(crate) fn last_sample(&self, file: usize) -> Option<(u64, std::time::Duration)> {
+    pub fn last_sample(&self, file: usize) -> Option<(u64, std::time::Duration)> {
         let streams = &self.by_file.get(&file)?.streams;
         let stream = streams.last()?;
         Some((

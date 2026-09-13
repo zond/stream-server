@@ -29,14 +29,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// One bit per piece: set means "inside a live stream's window, committed
 /// for sharing, or promised to a parked read -- may not be unlinked".
 #[derive(Debug)]
-pub(crate) struct Exempt {
+pub struct Exempt {
     /// The entity's piece count, which bounds every index.
     pieces: u32,
     words: Box<[AtomicU64]>,
 }
 
 impl Exempt {
-    pub(crate) fn for_pieces(pieces: u32) -> Self {
+    pub fn for_pieces(pieces: u32) -> Self {
         Self {
             pieces,
             words: (0..(pieces as usize).div_ceil(64))
@@ -55,16 +55,10 @@ impl Exempt {
     /// One load and a mask, `Acquire` against the owner's `Release`. This
     /// is the whole of what the door will do on the unlink path.
     ///
-    /// **Phase A**: nothing but this module's own tests calls it yet, which
-    /// is the point -- the set is published and reported for a field log
-    /// before any unlink depends on it. The `expect` fails the build the
-    /// moment a door does call it, which is where the reason for it is
-    /// re-read rather than carried on.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Phase A: published and traced, not obeyed")
-    )]
-    pub(crate) fn holds(&self, piece: u32) -> bool {
+    /// **Phase A**: no door calls it yet, which is the point -- the set is
+    /// published and reported for a field log before any unlink depends on
+    /// it.
+    pub fn holds(&self, piece: u32) -> bool {
         if piece >= self.pieces {
             return false;
         }
@@ -88,7 +82,7 @@ impl Exempt {
     /// not-exempt, and a door asking in that moment would allow an unlink
     /// it should have refused; this way a piece only ever reads as clear
     /// when it is genuinely leaving.
-    pub(crate) fn publish(&self, runs: &[Range<u32>]) {
+    pub fn publish(&self, runs: &[Range<u32>]) {
         let mut next = vec![0u64; self.words.len()];
         for run in runs {
             for piece in run.start.min(self.pieces)..run.end.min(self.pieces) {
@@ -104,7 +98,7 @@ impl Exempt {
     }
 
     /// How many pieces are exempt, for the trace line.
-    pub(crate) fn count(&self) -> u32 {
+    pub fn count(&self) -> u32 {
         self.words
             .iter()
             .map(|word| word.load(Ordering::Relaxed).count_ones())

@@ -226,7 +226,7 @@ pub fn budget_published(bytes: Option<u64>, configured: Option<u64>, from_disk: 
 }
 
 /// What the read-pattern detector has found on one file.
-pub(crate) struct StreamsSeen<'a> {
+pub struct StreamsSeen<'a> {
     pub info_hash: &'a str,
     pub file_idx: usize,
     /// How many streams on each file of the entity.
@@ -253,7 +253,7 @@ pub(crate) struct StreamsSeen<'a> {
     pub why: Option<super::streams::Rejected>,
 }
 
-pub(crate) fn streams_seen(seen: StreamsSeen<'_>) {
+pub fn streams_seen(seen: StreamsSeen<'_>) {
     tracing::info!(
         target: "enginefs::retention::trace",
         info_hash = %seen.info_hash,

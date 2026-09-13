@@ -1019,6 +1019,11 @@ impl Cached {
                 if offset > last {
                     return None;
                 }
+                // When the consumer asked, taken before the disk read: the
+                // gap that measures a consumer runs from the last read's
+                // return to this one's arrival, so anything of ours that
+                // happens after this point must not be inside it.
+                let arrived = std::time::Instant::now();
                 let index = offset / CHUNK_BYTES;
                 let start = index * CHUNK_BYTES;
                 let want = chunk_len(index, total);
@@ -1063,6 +1068,10 @@ impl Cached {
                 // between them they cover a hit, a miss and the two halves
                 // of a partial hit.
                 reader.note(to);
+                // **Phase A**: what the reads of this entity look like,
+                // which nothing obeys yet. The cached half of it -- the
+                // miss goes through `Filler::take`.
+                reader.note_read(offset, to + 1, arrived, std::time::Instant::now());
                 Some((Ok(served), to + 1))
             }
         })
@@ -1105,6 +1114,13 @@ pub struct Filler {
 
 impl Filler {
     fn take(&mut self, mut bytes: &[u8]) {
+        // Where this body was before the origin's bytes went past, and when
+        // they did: the miss half of the Phase A detector. There is no
+        // "asked" moment distinct from the arrival here -- the origin's
+        // body is pushed at us -- so a read of a miss measures the origin's
+        // delivery, which is what it is.
+        let from = self.offset;
+        let at = std::time::Instant::now();
         while !bytes.is_empty() && self.offset < self.total {
             let index = self.offset / CHUNK_BYTES;
             let want = chunk_len(index, self.total);
@@ -1166,6 +1182,7 @@ impl Filler {
         // growing and the window is what bounds that growth.
         if self.offset > 0 {
             self.reader.note(self.offset - 1);
+            self.reader.note_read(from, self.offset, at, std::time::Instant::now());
         }
     }
 }
@@ -1939,6 +1956,84 @@ mod tests {
     /// move are a chunk landing and a chunk being reclaimed, so both of
     /// them book what they did and the figure is current without a syscall.
     ///
+    /// **Phase A: a body served off the disk is a read the detector sees.**
+    ///
+    /// The cached half. It has an "asked" moment of its own -- the poll
+    /// that wants the next chunk -- so what it measures is the consumer's
+    /// own pace, which is the measurement the whole design is built on.
+    #[tokio::test]
+    async fn what_a_cached_body_served_is_a_read_the_detector_sees() {
+        use enginefs::retention::live::Live;
+        use futures_util::StreamExt as _;
+
+        let dir = tempfile::tempdir().expect("a scratch root");
+        let budget = Arc::new(enginefs::retention::RetentionBudget::default());
+        // An entity the budget does not cover, so a policy is installed and
+        // a delivered byte starts the pass that answers the reads.
+        budget.set(Some(8 * CHUNK_BYTES), None);
+        let cache = ProxyCache::new(dir.path(), budget, Arc::new(Live::default()));
+
+        let entry = entry_of(&cache, "https://host/film.mkv");
+        let total = 16 * CHUNK_BYTES;
+        let entity = entry
+            .dir
+            .join(entity_dir_name(total, "video/mp4", VALIDATOR));
+        std::fs::create_dir_all(chunk_path(&entity, 0).parent().unwrap()).unwrap();
+        for index in 0..2 {
+            write_chunk(&entity, index, &vec![7u8; CHUNK_BYTES as usize]);
+        }
+
+        let cached = entry
+            .look_up(Some(&format!("bytes=0-{}", 2 * CHUNK_BYTES - 1)))
+            .expect("the two chunks are here");
+        let served: Vec<Result<Bytes, io::Error>> = cached.body().collect().await;
+        assert_eq!(served.len(), 2, "two chunks went out");
+        cache.settled().await;
+
+        assert_eq!(
+            cache.retention().heads_of(&entity),
+            vec![(2 * CHUNK_BYTES, 2)],
+            "one consumer, and both of its reads joined it"
+        );
+    }
+
+    /// **Phase A: what a fill pushed to the player is a read the detector
+    /// sees.**
+    ///
+    /// The miss is the half that matters most here -- it is when the cache
+    /// is growing -- and it is the half with no "asked" moment of its own:
+    /// the origin's body is pushed at us, so what a read of a miss measures
+    /// is the origin's delivery. What this pins is that the body path
+    /// reports it at all, and reports the span it actually pushed.
+    #[tokio::test]
+    async fn what_a_fill_pushed_is_a_read_the_detector_sees() {
+        use enginefs::retention::live::Live;
+
+        let dir = tempfile::tempdir().expect("a scratch root");
+        let live = Arc::new(Live::default());
+        let budget = Arc::new(enginefs::retention::RetentionBudget::default());
+        budget.set(Some(8 * CHUNK_BYTES), None);
+        let cache = ProxyCache::new(dir.path(), budget, live);
+
+        let entry = entry_of(&cache, "https://host/film.mkv");
+        // An entity the budget does not cover, so a policy is installed and
+        // a delivered byte starts a pass: with nothing to reclaim there is
+        // nothing to pass over, which is true of the cache and not of this.
+        let total = 16 * CHUNK_BYTES;
+        let entity = entry
+            .dir
+            .join(entity_dir_name(total, "video/mp4", VALIDATOR));
+        let mut filler = entry.fill(total, "video/mp4", VALIDATOR, 0);
+        filler.take(&vec![7u8; 2 * CHUNK_BYTES as usize]);
+        cache.settled().await;
+
+        assert_eq!(
+            cache.retention().heads_of(&entity),
+            vec![(2 * CHUNK_BYTES, 1)],
+            "one consumer, one read, and it has pushed two chunks"
+        );
+    }
+
     /// The count is asserted against the directory itself at each step
     /// rather than against an arithmetic of chunk lengths: what it has to
     /// be right about is the disk, and a count that agreed with a
