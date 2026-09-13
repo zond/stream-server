@@ -240,6 +240,11 @@ pub struct StreamsSeen<'a> {
     pub rates: &'a [Option<u64>],
     /// What the replacement policy would order, which nothing obeys.
     pub want: &'a [std::ops::Range<u32>],
+    /// What this entity was allowed to hold when that was sized: what it
+    /// holds now plus the volume's headroom. Without it a narrow want set
+    /// cannot be told apart -- a slow start, a share squeezed by another
+    /// stream, and a disk with nothing left all look the same.
+    pub allowed: u64,
     /// How many pieces of this file its streams are holding -- the size of
     /// the answer the door would get from the published set, beside the
     /// windows it was computed from.
@@ -262,6 +267,7 @@ pub fn streams_seen(seen: StreamsSeen<'_>) {
         heads = ?seen.heads,
         rates = ?seen.rates,
         want = ?seen.want,
+        allowed = seen.allowed,
         exempt = seen.exempt,
         tracked = seen.tracked,
         coldest = ?seen.coldest,

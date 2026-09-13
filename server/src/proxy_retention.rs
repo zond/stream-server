@@ -427,6 +427,7 @@ impl Backing for ProxyBacking {
             sample: streams.last_sample(0),
             rates: &streams.rates(0),
             want: &want,
+            allowed: available,
             exempt: streams.held_by_streams(0),
             tracked,
             coldest: &coldest,

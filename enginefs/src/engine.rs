@@ -562,6 +562,7 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
             sample: streams.last_sample(domain.file_idx),
             rates: &streams.rates(domain.file_idx),
             want: &want,
+            allowed: available,
             exempt: streams.held_by_streams(domain.file_idx),
             tracked,
             coldest: &coldest,
