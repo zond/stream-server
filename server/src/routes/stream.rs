@@ -91,11 +91,21 @@ impl BodyProgress {
 
 /// How often an open stream reports what the torrent is doing.
 ///
-/// Once a second, and only while a body is open: the owner's capture of
-/// four stalling streams had nothing between "response ready" and silence,
-/// so there was no way to tell a dead swarm from a slow one, or either from
-/// a window waiting on a piece bigger than itself.
-const STREAM_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(1);
+/// Only while a body is open: the owner's capture of four stalling streams
+/// had nothing between "response ready" and silence, so there was no way to
+/// tell a dead swarm from a slow one, or either from a window waiting on a
+/// piece bigger than itself.
+///
+/// Five seconds, not the one it was. This is the loudest emitter in the
+/// process and it is per open response, so on a film with two tracks being
+/// read it alone is two lines a second -- and the diagnostics report a
+/// tester actually sends back is a 400-line ring, which at that rate holds
+/// between eighty seconds and two minutes. Every report of a stall arrived
+/// containing the two minutes *after* the interesting part, with the
+/// start-up it was opened to explain already evicted. A stall is not a
+/// second-by-second phenomenon and nothing here was ever read at that
+/// resolution.
+const STREAM_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Log what the torrent behind an open stream is doing, once a second,
 /// until the task is aborted (the body ended) or the engine is gone.
