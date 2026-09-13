@@ -121,6 +121,12 @@ impl FileStreams {
     /// playheads merge into one, which is the failure the whole design is
     /// for.
     fn observe(&mut self, reader: u64, read: Read) -> Option<Rejected> {
+        // Before the join, so an expired stream cannot be resumed and a new
+        // one starting where it left off is reported honestly as new.
+        let now = read.returned;
+        self.streams
+            .retain(|stream| now.saturating_duration_since(stream.seen) < STREAM_IDLE);
+
         let mut nearest: Option<(usize, u64)> = None;
         let mut inside_any = false;
         for (index, stream) in self.streams.iter().enumerate() {
@@ -175,6 +181,18 @@ impl FileStreams {
 /// response; the streams being looked for form over tens of seconds and
 /// last for minutes, so nothing is missed by not saying it sooner.
 const REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a stream nothing has read from stays a stream.
+///
+/// A placeholder the field log is meant to inform, like every constant in
+/// `docs/read-pattern-retention.md`. Too short and a slow second track --
+/// one measured at roughly 20 kB/s, reading forty kilobytes at a time --
+/// expires between its own reads and is counted again and again, which
+/// looks exactly like a join rule that is too tight. Too long and a
+/// response that ended minutes ago is still reported as something being
+/// read. Thirty seconds is longer than any gap that track left and shorter
+/// than a viewer's pause.
+const STREAM_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The detected streams of one entity, by file index.
 #[derive(Debug, Default)]
@@ -410,6 +428,33 @@ mod tests {
             streams.streams[0].begin, 0,
             "the same connection, so the span was never reset"
         );
+    }
+
+    /// **A stream nothing has read from for a while stops being one.**
+    ///
+    /// Without this a two-hour film accumulates a stream per seek, for
+    /// ever, and the count the field log is being read for stops meaning
+    /// anything. Pruned before the join so an expired stream cannot be
+    /// resumed by a read that happens to land in its old span.
+    #[test]
+    fn a_stream_nothing_has_read_from_stops_being_one() {
+        let t0 = Instant::now();
+        let mut streams = FileStreams::default();
+        streams.observe(1, read(0, 262_144, t0, 0));
+        streams.observe(2, read(9_000_000_000, 9_000_262_144, t0, 1));
+        assert_eq!(streams.streams.len(), 2);
+
+        // One of them keeps reading; the other never does again.
+        assert_eq!(streams.observe(1, read(262_144, 524_288, t0, 20)), None);
+        assert_eq!(streams.streams.len(), 2, "twenty seconds is not idle yet");
+
+        assert_eq!(streams.observe(1, read(524_288, 786_432, t0, 40)), None);
+        assert_eq!(
+            streams.streams.len(),
+            1,
+            "the one that stopped reading is gone; the one that did not is not"
+        );
+        assert_eq!(streams.streams[0].end, 786_432);
     }
 
     /// The report is throttled on the detector's own clock, not on a global

@@ -27,6 +27,10 @@ use std::path::PathBuf;
 fn offline_config() -> stream_server::ServerConfig {
     stream_server::ServerConfig {
         resolve_dht_bootstrap_names: false,
+        // Neither file adds a BitTorrent torrent today, so nothing here
+        // reaches `merged_trackers` -- but the two halves of "offline"
+        // belong together, and `embed.rs` paid for having only one of them.
+        use_public_trackers: false,
         // An embedder that keeps a pin record and has nothing in it yet.
         // `None` is not the same thing -- it is "nobody said", which keeps
         // every torrent's data and reports it all as pinned -- and it has a
