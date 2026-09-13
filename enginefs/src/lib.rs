@@ -530,6 +530,9 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     pub backend: Arc<B>,
     engines: EngineRegistry<B::Handle>,
     tracker_manager: Arc<crate::trackers::TrackerManager>,
+    /// Whether a torrent is added with the public tracker lists or with
+    /// nothing but what its caller named. See [`crate::backend::PublicTrackers`].
+    public_trackers: crate::backend::PublicTrackers,
     pub cache_dir: std::path::PathBuf,
     pub download_dir: std::path::PathBuf,
     /// Track active streams per info_hash for legacy compatibility
@@ -897,7 +900,14 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         cache_dir: std::path::PathBuf,
         download_dir: std::path::PathBuf,
     ) -> Self {
-        Self::new_with_backend_and_storage(backend, restored_handles, cache_dir, download_dir, None)
+        Self::new_with_backend_and_storage(
+            backend,
+            restored_handles,
+            cache_dir,
+            download_dir,
+            None,
+            crate::backend::PublicTrackers::Use,
+        )
     }
 
     pub fn new_with_backend_and_storage(
@@ -906,6 +916,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         cache_dir: std::path::PathBuf,
         download_dir: std::path::PathBuf,
         tracker_storage: Option<Arc<dyn crate::trackers::TrackerStorage>>,
+        public_trackers: crate::backend::PublicTrackers,
     ) -> Self {
         let clock = Clock::start();
         let volumes = Arc::new(crate::reconcile::Volumes::new(
@@ -952,16 +963,25 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
 
         let engines = Arc::new(RwLock::new(engines_map));
 
-        // Create tracker manager with or without storage
-        let tracker_manager = match tracker_storage {
-            Some(storage) => Arc::new(crate::trackers::TrackerManager::new_with_storage(storage)),
-            None => Arc::new(crate::trackers::TrackerManager::new()),
+        // Create tracker manager with or without storage. `Off` gets one
+        // that fetches nothing: its refresh task is the first outbound
+        // request this process makes, and it is made before anybody adds a
+        // torrent.
+        let tracker_manager = match (public_trackers, tracker_storage) {
+            (crate::backend::PublicTrackers::Off, _) => {
+                Arc::new(crate::trackers::TrackerManager::offline())
+            }
+            (_, Some(storage)) => {
+                Arc::new(crate::trackers::TrackerManager::new_with_storage(storage))
+            }
+            (_, None) => Arc::new(crate::trackers::TrackerManager::new()),
         };
 
         let efs = Self {
             backend: Arc::new(backend),
             engines: engines.clone(),
             tracker_manager,
+            public_trackers,
             cache_dir,
             download_dir: download_dir.clone(),
             active_streams: Arc::new(RwLock::new(HashMap::new())),
@@ -1909,8 +1929,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// tracker manager's cached list (ranked by RTT), and any request-supplied
     /// extras, sorted and de-duplicated.
     async fn merged_trackers(&self, extra_trackers: Option<Vec<String>>) -> Vec<String> {
-        let mut trackers: Vec<String> = DEFAULT_TRACKERS.iter().map(|s| s.to_string()).collect();
-        trackers.extend(self.tracker_manager.get_trackers().await);
+        let mut trackers: Vec<String> = Vec::new();
+        if self.public_trackers == crate::backend::PublicTrackers::Use {
+            trackers.extend(DEFAULT_TRACKERS.iter().map(|s| s.to_string()));
+            trackers.extend(self.tracker_manager.get_trackers().await);
+        }
         if let Some(extra) = extra_trackers {
             trackers.extend(extra);
         }
@@ -4634,6 +4657,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         download_dir: std::path::PathBuf,
         tracker_storage: Option<Arc<dyn crate::trackers::TrackerStorage>>,
         pins: Option<crate::piece_store::PinSet>,
+        public_trackers: crate::backend::PublicTrackers,
         open_session: F,
     ) -> Result<Self>
     where
@@ -4648,6 +4672,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             cache_dir,
             download_dir,
             tracker_storage,
+            public_trackers,
         );
         efs.apply_pins(pins).await;
         Ok(efs)
@@ -4668,6 +4693,7 @@ impl BackendEngineFS<LibrqbitBackend> {
             download_dir,
             None,
             None,
+            crate::backend::PublicTrackers::Use,
             move || {
                 LibrqbitBackend::new(
                     session_dir,
@@ -4696,6 +4722,7 @@ impl BackendEngineFS<LibrqbitBackend> {
     ) -> Result<Self> {
         let download_dir = root_dir.join("rqbit-downloads");
         let resolvers = config.dht_bootstrap_dns.resolvers_in(&download_dir);
+        let public_trackers = config.public_trackers;
         let tuning = crate::backend::librqbit::SessionTuning::from_settings(
             &config.speed_profile,
             &config.privacy,
@@ -4706,6 +4733,7 @@ impl BackendEngineFS<LibrqbitBackend> {
             download_dir,
             tracker_storage,
             pins,
+            public_trackers,
             move || {
                 LibrqbitBackend::new_with_settings(
                     session_dir,
@@ -5635,6 +5663,53 @@ mod tests {
 
     fn test_enginefs() -> (BackendEngineFS<FakeBackend>, Arc<FakeCounters>) {
         test_enginefs_with_file_count(1)
+    }
+
+    /// **A caller that named no trackers gets no trackers.**
+    ///
+    /// `merged_trackers` prepends the built-in public list and whatever the
+    /// tracker manager has fetched, *below* whatever the request asked for,
+    /// so passing an empty list never meant what it looked like. Every test
+    /// in `server/tests/embed.rs` passed one and every one of them announced
+    /// to twenty-seven public trackers and scraped them; a Windows CI
+    /// failure printed the list, with a scrape 59 seconds old, which is how
+    /// this was noticed at all.
+    #[tokio::test]
+    async fn public_trackers_off_adds_a_torrent_with_only_what_the_caller_named() {
+        let root = fake_engine_root();
+        let offline = BackendEngineFS::new_with_backend_and_storage(
+            FakeBackend::new(vec![]),
+            HashMap::new(),
+            root.join("cache"),
+            root.join("downloads"),
+            None,
+            crate::backend::PublicTrackers::Off,
+        );
+        assert_eq!(
+            offline.merged_trackers(None).await,
+            Vec::<String>::new(),
+            "nothing was asked for, so nothing is announced to"
+        );
+        assert_eq!(
+            offline
+                .merged_trackers(Some(vec!["udp://named.invalid:6969/announce".to_string()]))
+                .await,
+            vec!["udp://named.invalid:6969/announce".to_string()],
+            "and what was asked for is all there is"
+        );
+
+        let online = BackendEngineFS::new_with_backend_and_storage(
+            FakeBackend::new(vec![]),
+            HashMap::new(),
+            root.join("cache"),
+            root.join("downloads"),
+            None,
+            crate::backend::PublicTrackers::Use,
+        );
+        assert!(
+            online.merged_trackers(None).await.len() > 1,
+            "while the default is still a torrent that can find peers"
+        );
     }
 
     /// An observer -- the per-stream progress logger, a diagnostics sweep --
@@ -9818,6 +9893,7 @@ mod tests {
             download_dir.clone(),
             None,
             Some(pins),
+            crate::backend::PublicTrackers::Use,
             {
                 let pieces = pieces.clone();
                 let seen = seen.clone();

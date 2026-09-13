@@ -170,6 +170,13 @@ pub struct ServerConfig {
     /// librqbit to resolve itself. **Tests set this**, so `cargo test` makes
     /// no DNS query and no DoH request of its own.
     pub resolve_dht_bootstrap_names: bool,
+    /// Whether a torrent is added with the built-in and fetched public
+    /// tracker lists, or with nothing but the trackers a request named.
+    ///
+    /// The other half of [`ServerConfig::resolve_dht_bootstrap_names`]:
+    /// together they are what "makes no outbound request of its own" means,
+    /// and neither is enough alone. Defaults to `true`; tests set it false.
+    pub use_public_trackers: bool,
 }
 
 /// The one configuration: a server inside a host process. There used to be a
@@ -189,6 +196,7 @@ impl Default for ServerConfig {
             torrent_listen_port: TorrentListenPort::Ephemeral,
             lan_media_addr: None,
             resolve_dht_bootstrap_names: true,
+            use_public_trackers: true,
         }
     }
 }
@@ -1078,6 +1086,11 @@ pub async fn run(
             enginefs::backend::dht_bootstrap::DhtBootstrapDns::Resolve
         } else {
             enginefs::backend::dht_bootstrap::DhtBootstrapDns::Off
+        },
+        public_trackers: if cfg.use_public_trackers {
+            enginefs::backend::PublicTrackers::Use
+        } else {
+            enginefs::backend::PublicTrackers::Off
         },
     };
 

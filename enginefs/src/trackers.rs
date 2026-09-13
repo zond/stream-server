@@ -47,6 +47,21 @@ impl Default for TrackerManager {
 
 impl TrackerManager {
     /// Create a new TrackerManager without persistence (legacy behavior)
+    /// A manager that fetches nothing and knows no trackers.
+    ///
+    /// For a process that must make no outbound request of its own -- the
+    /// other half of `DhtBootstrapDns::Off`. [`TrackerManager::new`] spawns
+    /// a task whose first act is an HTTP GET of the default tracker list,
+    /// before anybody has added a torrent, so "offline" cannot be arranged
+    /// after the fact by clearing the list.
+    pub fn offline() -> Self {
+        Self {
+            trackers: Arc::new(RwLock::new(Vec::new())),
+            storage: None,
+            refresh_task: Arc::new(parking_lot::Mutex::new(None)),
+        }
+    }
+
     pub fn new() -> Self {
         let instance = Self {
             trackers: Arc::new(RwLock::new(Vec::new())),

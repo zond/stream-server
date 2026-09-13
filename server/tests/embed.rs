@@ -25,13 +25,22 @@ fn bearer_client(handle: &ServerHandle) -> anyhow::Result<reqwest::blocking::Cli
 
 /// The base config every test here spreads from: `ServerConfig::default()`
 /// with DHT bootstrap name resolution turned off, so starting a server makes
-/// no DNS query and no DNS-over-HTTPS request. The stock configs leave it on
-/// (that is asserted below); tests must stay offline, and on a runner with
-/// no DNS at all the resolution ladder would otherwise spend its whole
-/// budget failing, once per server.
+/// no DNS query and no DNS-over-HTTPS request, and with the public tracker
+/// lists off, so adding a torrent announces to nothing. The stock configs
+/// leave both on (that is asserted below); tests must stay offline, and on a
+/// runner with no DNS at all the resolution ladder would otherwise spend its
+/// whole budget failing, once per server.
+///
+/// The tracker half was missing until a Windows CI failure printed a
+/// torrent's `sources`: twenty-seven public trackers, one of them answering
+/// a scrape 59 seconds old. Every test in this file was doing live tracker
+/// I/O. `real_torrent` passes `trackers: Vec::new()`, which looked like
+/// enough and never was -- `EngineFS::merged_trackers` prepends the built-in
+/// list and whatever the tracker manager has fetched, below the caller.
 fn offline_config() -> ServerConfig {
     ServerConfig {
         resolve_dht_bootstrap_names: false,
+        use_public_trackers: false,
         // An embedder that keeps a pin record and has nothing in it yet.
         // `None` is not the same thing -- it is "nobody said", which keeps
         // every torrent's data and reports it all as pinned -- and it has a
@@ -44,10 +53,12 @@ fn offline_config() -> ServerConfig {
 }
 
 /// Resolving bootstrap names is on in the stock configuration -- the Android
-/// embed is the case it exists for.
+/// embed is the case it exists for -- and so are the public trackers, which
+/// are how a real torrent finds peers at all.
 #[test]
 fn the_stock_config_resolves_dht_bootstrap_names() {
     assert!(ServerConfig::default().resolve_dht_bootstrap_names);
+    assert!(ServerConfig::default().use_public_trackers);
 }
 
 /// Every launch generates a per-launch token. There is no way to ask for an

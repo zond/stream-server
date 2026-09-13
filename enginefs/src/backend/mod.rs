@@ -1319,6 +1319,29 @@ pub struct BackendConfig {
     /// outbound request at start-up, and every test.
     #[serde(default)]
     pub dht_bootstrap_dns: dht_bootstrap::DhtBootstrapDns,
+    /// Whether a torrent is added with the built-in public tracker list and
+    /// whatever the tracker manager has fetched, or with nothing but the
+    /// trackers its caller supplied.
+    ///
+    /// `Use` for anything that means to find peers. `Off` is the other half
+    /// of `DhtBootstrapDns::Off`: together they are what "makes no outbound
+    /// request of its own" means, and neither is enough alone. A test that
+    /// adds a torrent with `trackers: Vec::new()` still announced to
+    /// twenty-seven public trackers and scraped them, because the list is
+    /// merged in below the caller.
+    #[serde(default)]
+    pub public_trackers: PublicTrackers,
+}
+
+/// Whether the built-in and fetched public trackers are used at all.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PublicTrackers {
+    /// The built-in list, plus whatever the tracker manager fetched.
+    #[default]
+    Use,
+    /// Only the trackers a caller names. Nothing is fetched and nothing is
+    /// announced to or scraped that the caller did not ask for.
+    Off,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
