@@ -504,18 +504,24 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         // torrent pieces.
         streams.domain(domain.file_idx, domain.span.offset, extent.clone());
         let rejected = streams.observe(held, domain.piece_length, now);
-        if !streams.report_due(now) {
-            return;
-        }
         // What the replacement would order, beside what this pass did.
         // Obeyed by nothing: the point of carrying it is that a field log
         // shows the two answers to the same disk, on the same line.
-        let (tracked, coldest);
+        //
+        // Every pass, and not only the ones that report. A window grows
+        // towards what its rate asks for by doubling, one step per grant,
+        // so grants that happened only when a log line was due would tie
+        // how fast a consumer is fetched for to how often this server
+        // talks about it.
         let want = streams.want(
             crate::retention::streams::REPORTED_SECONDS,
             budget,
             domain.piece_length,
         );
+        if !streams.report_due(now) {
+            return;
+        }
+        let (tracked, coldest);
         // And what the LRU beneath the windows would give up first. Traced
         // rather than taken: this pass's own reclaim is still the old
         // policy's.
@@ -529,6 +535,7 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
             sample: streams.last_sample(domain.file_idx),
             rates: &streams.rates(domain.file_idx),
             want: &want,
+            exempt: streams.held_by_streams(domain.file_idx),
             tracked,
             coldest: &coldest,
             why: rejected,
@@ -2232,6 +2239,77 @@ mod pin_tests {
             }),
             Arc::new(RetentionBudget::default()),
         )
+    }
+
+    /// **A window grows on every pass, not only on the ones that say so.**
+    ///
+    /// A stream is granted its lookahead by doubling, one step per grant,
+    /// and the grant happens where the want set is computed. Computing it
+    /// inside the report throttle tied how fast a consumer is fetched for
+    /// to how often this server writes a log line about it -- a tenth of a
+    /// grant a second, so the five doublings that reach a full window take
+    /// fifty seconds instead of the fraction of one the doubling was
+    /// designed around.
+    #[test]
+    fn a_window_grows_on_every_pass_and_not_only_on_reported_ones() {
+        use crate::retention::streams::Read;
+
+        let streams: Arc<parking_lot::Mutex<crate::retention::streams::Streams>> = Arc::default();
+        let backing = TorrentBacking {
+            handle: PinnedHandle {
+                reselected: Arc::default(),
+            },
+            info_hash: "pinned".to_string(),
+            live: Arc::new(Live::new()),
+            pinned: Arc::default(),
+            pins_unknown: Arc::default(),
+            refused: Arc::new(AtomicUsize::new(0)),
+            streams: streams.clone(),
+        };
+        let domain = FileDomain {
+            file_idx: 0,
+            span: FilePieceSpan {
+                pieces: 0..8,
+                offset: 0,
+                bytes: 8 * PIECE,
+            },
+            piece_length: PIECE,
+        };
+        let held: BTreeSet<u32> = (0..8).collect();
+        let t0 = std::time::Instant::now();
+
+        streams.lock().record(
+            0,
+            1,
+            Read {
+                begin: 0,
+                end: PIECE,
+                arrived: t0,
+                returned: t0,
+            },
+        );
+        backing.observe_reads(&domain, &held, u64::MAX);
+        let first = streams.lock().held_by_streams(0);
+
+        // One second later, a piece further on: a measured rate, and a pass
+        // too soon after the last one to report anything.
+        streams.lock().record(
+            0,
+            1,
+            Read {
+                begin: PIECE,
+                end: 2 * PIECE,
+                arrived: t0 + std::time::Duration::from_secs(1),
+                returned: t0 + std::time::Duration::from_secs(1),
+            },
+        );
+        backing.observe_reads(&domain, &held, u64::MAX);
+        let second = streams.lock().held_by_streams(0);
+
+        assert!(
+            second > first,
+            "the pass that said nothing still grew the window: {first} then {second}"
+        );
     }
 
     /// **A file the backend cannot place is a refusal to drop, not a

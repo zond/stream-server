@@ -52,6 +52,7 @@ use std::sync::Arc;
 use crate::backend::{AfterRelease, FilePieceSpan, TorrentHandle};
 use crate::piece_store::{DeleteOutcome, HeldSnapshot, StoreRegistry};
 
+pub(crate) mod exempt;
 pub(crate) mod ledger;
 pub mod live;
 pub mod owner;

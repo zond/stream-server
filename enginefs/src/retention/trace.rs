@@ -240,6 +240,10 @@ pub(crate) struct StreamsSeen<'a> {
     pub rates: &'a [Option<u64>],
     /// What the replacement policy would order, which nothing obeys.
     pub want: &'a [std::ops::Range<u32>],
+    /// How many pieces of this file its streams are holding -- the size of
+    /// the answer the door would get from the published set, beside the
+    /// windows it was computed from.
+    pub exempt: u32,
     /// How many pieces the LRU is watching.
     pub tracked: usize,
     /// The pieces it would give up first, oldest by effective age, with
@@ -258,6 +262,7 @@ pub(crate) fn streams_seen(seen: StreamsSeen<'_>) {
         heads = ?seen.heads,
         rates = ?seen.rates,
         want = ?seen.want,
+        exempt = seen.exempt,
         tracked = seen.tracked,
         coldest = ?seen.coldest,
         consumed = seen.sample.map(|(bytes, _)| bytes),

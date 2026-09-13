@@ -257,13 +257,18 @@ pub(crate) struct FileStreams {
     /// offset and nothing else.
     geometry: Geometry,
     streams: Vec<Stream>,
+    /// What these streams hold, published for the door to read without
+    /// taking anything. See [`super::exempt`].
+    exempt: std::sync::Arc<super::exempt::Exempt>,
 }
 
 impl FileStreams {
     fn on(geometry: Geometry) -> Self {
+        let exempt = std::sync::Arc::new(super::exempt::Exempt::for_pieces(geometry.bound.end));
         Self {
             geometry,
             streams: Vec::new(),
+            exempt,
         }
     }
 }
@@ -434,6 +439,10 @@ impl FileStreams {
                 windows.push(window);
             }
         }
+        // What a window covers is what may not be unlinked, so the answer
+        // is published here, where it is decided, rather than recomputed at
+        // a door that would have to take this lock to do it.
+        self.exempt.publish(&windows);
         windows
     }
 }
@@ -546,6 +555,32 @@ impl Streams {
             self.ledger.len(),
             self.ledger.coldest(now, exempt, how_many),
         )
+    }
+
+    /// What one file's streams hold, for a door to read without taking
+    /// this lock. Empty -- refusing nothing -- for a file no pass has
+    /// described, which is a file no stream is on.
+    ///
+    /// **Phase A**: the set is published and traced, and no door reads it
+    /// yet. See [`super::exempt::Exempt::holds`].
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Phase A: published and traced, not obeyed")
+    )]
+    pub(crate) fn exempt(&mut self, file: usize) -> std::sync::Arc<super::exempt::Exempt> {
+        self.by_file
+            .get(&file)
+            .map(|streams| streams.exempt.clone())
+            .unwrap_or_else(|| std::sync::Arc::new(super::exempt::Exempt::for_pieces(0)))
+    }
+
+    /// How many pieces of `file` its streams are holding, for the trace
+    /// line: the size of the answer the door would be getting.
+    pub(crate) fn held_by_streams(&self, file: usize) -> u32 {
+        self.by_file
+            .get(&file)
+            .map(|streams| streams.exempt.count())
+            .unwrap_or(0)
     }
 
     /// How many streams are open on each file, for the trace line.
@@ -1177,6 +1212,45 @@ mod tests {
             vec![(reads as u64 * 262_144, WAITING_READS as u32)],
             "the newest are kept, and they reach where the consumer really is"
         );
+    }
+
+    /// **What a pass grants is what the door is told**, and the telling
+    /// costs the door nothing: the set the pass published is read with a
+    /// load and a bit test, against a lock this file would otherwise have
+    /// to be asked for once per candidate piece, per unlink, from a
+    /// blocking thread.
+    #[test]
+    fn the_door_reads_the_window_the_pass_granted() {
+        let t0 = Instant::now();
+        let mut streams = Streams::default();
+        streams.domain(0, 0, whole());
+        // A stream a third of the way in, moving at the film's rate.
+        let held = run(1_800..1_860);
+        streams.record(0, 1, read(1_850 * PIECE, 1_850 * PIECE + 262_144, t0, 0));
+        streams.observe(&held, PIECE, t0);
+        let windows = streams.want(90, u64::MAX, PIECE);
+
+        let exempt = streams.exempt(0);
+        let window = windows[0].clone();
+        assert!(
+            window.clone().all(|piece| exempt.holds(piece)),
+            "every piece of the granted window is held: {window:?}"
+        );
+        assert!(
+            !exempt.holds(window.start - 1) && !exempt.holds(window.end),
+            "and nothing on either side of it is"
+        );
+    }
+
+    /// A file no pass has described holds nothing, rather than holding
+    /// everything: a door asking about a file nothing is reading gets an
+    /// answer, and the answer is that it may take what it likes.
+    #[test]
+    fn a_file_no_pass_has_described_refuses_nothing() {
+        let mut streams = Streams::default();
+        let exempt = streams.exempt(7);
+        assert!(!exempt.holds(0));
+        assert_eq!(exempt.count(), 0);
     }
 
     /// Files do not share streams: the same offsets in two files are two
