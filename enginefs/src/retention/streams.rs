@@ -511,6 +511,10 @@ impl Streams {
     /// it: the read path knows an offset inside a file and no more, and
     /// every question asked here -- which run a read is in, which pieces a
     /// window covers -- is about torrent pieces.
+    /// Only the geometry is written for a file already here, never the
+    /// whole entry: the exempt set is a handle a door may already be
+    /// holding, and replacing it would leave that door reading a set
+    /// nothing publishes into.
     pub fn domain(&mut self, file: usize, offset: u64, bound: Range<u32>) {
         let geometry = Geometry { offset, bound };
         match self.by_file.entry(file) {
@@ -566,16 +570,32 @@ impl Streams {
     }
 
     /// What one file's streams hold, for a door to read without taking
-    /// this lock. Empty -- refusing nothing -- for a file no pass has
-    /// described, which is a file no stream is on.
+    /// this lock.
+    ///
+    /// **The same handle for the life of the entity**, whether or not a
+    /// pass has described the file yet: a door is meant to keep this and
+    /// ask it per unlink without coming back here, and one handed a fresh
+    /// empty set before the first pass would refuse nothing for as long as
+    /// it held it. So a file asked about before its first pass is made
+    /// here, with the extent the caller knows and the trivial geometry;
+    /// the pass overwrites the geometry and keeps the set.
+    ///
+    /// Empty until something is published into it, which is the right
+    /// answer for a file no stream is on.
     ///
     /// **Phase A**: the set is published and traced, and no door reads it
     /// yet. See [`super::exempt::Exempt::holds`].
-    pub fn exempt(&mut self, file: usize) -> std::sync::Arc<super::exempt::Exempt> {
+    pub fn exempt(&mut self, file: usize, pieces: u32) -> std::sync::Arc<super::exempt::Exempt> {
         self.by_file
-            .get(&file)
-            .map(|streams| streams.exempt.clone())
-            .unwrap_or_else(|| std::sync::Arc::new(super::exempt::Exempt::for_pieces(0)))
+            .entry(file)
+            .or_insert_with(|| {
+                FileStreams::on(Geometry {
+                    offset: 0,
+                    bound: 0..pieces,
+                })
+            })
+            .exempt
+            .clone()
     }
 
     /// How many pieces of `file` its streams are holding, for the trace
@@ -1303,7 +1323,7 @@ mod tests {
         streams.observe(&held, PIECE, t0);
         let windows = streams.want(0, 90, u64::MAX, PIECE);
 
-        let exempt = streams.exempt(0);
+        let exempt = streams.exempt(0, PIECES);
         let window = windows[0].clone();
         assert!(
             window.clone().all(|piece| exempt.holds(piece)),
@@ -1318,12 +1338,31 @@ mod tests {
     /// A file no pass has described holds nothing, rather than holding
     /// everything: a door asking about a file nothing is reading gets an
     /// answer, and the answer is that it may take what it likes.
+    ///
+    /// **And it is the same answer it will keep getting.** A door is meant
+    /// to hold this handle and ask it per unlink; handed a fresh empty set
+    /// each time it asked early, it would refuse nothing for as long as it
+    /// held one -- which is the whole life of a stream that opened before
+    /// its first pass.
     #[test]
-    fn a_file_no_pass_has_described_refuses_nothing() {
+    fn a_file_no_pass_has_described_refuses_nothing_yet() {
+        let t0 = Instant::now();
         let mut streams = Streams::default();
-        let exempt = streams.exempt(7);
+        let exempt = streams.exempt(7, PIECES);
         assert!(!exempt.holds(0));
         assert_eq!(exempt.count(), 0);
+
+        // The file's first pass, on the handle already handed out.
+        streams.domain(7, 0, whole());
+        let held = run(1_800..1_860);
+        streams.record(7, 1, read(1_850 * PIECE, 1_850 * PIECE + 262_144, t0, 0));
+        streams.observe(&held, PIECE, t0);
+        let windows = streams.want(7, 90, u64::MAX, PIECE);
+
+        assert!(
+            windows[0].clone().all(|piece| exempt.holds(piece)),
+            "the handle from before the pass is the one the pass published into"
+        );
     }
 
     /// Files do not share streams: the same offsets in two files are two
