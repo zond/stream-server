@@ -716,14 +716,6 @@ struct State<B: Backing> {
     /// covers the header and only the tail is orphaned. It is the offset
     /// case that needs all three at once.
     ///
-    /// They are the entity's and not a reader's on purpose. Held by the
-    /// reader, they last exactly as long as the connection reading them --
-    /// and a player closes that connection the moment it has the index, so
-    /// the pieces are orphaned, reclaimed, and re-fetched when it opens the
-    /// next one. That loop is in every field log. Held here they are
-    /// settled once for the life of the stream, which is also all they cost:
-    /// [`STRUCTURAL_PIECES`] of a film's several thousand.
-    structural: std::collections::BTreeSet<u32>,
     /// What the player said about itself, and when it said it.
     ///
     /// Everything else here infers the playhead from the byte ranges the
@@ -911,14 +903,6 @@ struct ReaderState<B: Backing> {
     buffering: Buffering,
 }
 
-/// The most pieces one entity may call structural.
-///
-/// A container's header and index are a handful of pieces -- the field
-/// film's `moov` is 10.7 MB of a 23 GB file -- and this is a ceiling on a
-/// pathological one rather than a size anything is expected to reach. It
-/// bounds what a probe can pin: past it, further probe reads are ordinary
-/// reads that the window keeps while they are open and no longer.
-const STRUCTURAL_PIECES: usize = 8;
 
 /// How many pieces to want after each one a stream is still waiting for,
 /// before the configured window takes over.
@@ -1167,7 +1151,6 @@ impl<B: Backing> Retention<B> {
                         readers: HashMap::new(),
                         last_position: None,
                         duration: None,
-                        structural: std::collections::BTreeSet::new(),
                         // Assumed held back until a clear says otherwise: an
                         // entity that was forgotten took the record with it,
                         // and the backend's mask outlives both the record and
@@ -3064,20 +3047,6 @@ impl<B: Backing> Reader<B> {
                 None
             };
             let index = B::index_of(&state.domain, at);
-            // **What a probe reads is what the container is made of.** The
-            // geometry that made this read a probe is the server's only
-            // evidence of where a container keeps its index, and the pieces
-            // it actually touches are that evidence exactly -- no guess at
-            // an index's size, no piece pinned that was not read, and
-            // nothing assumed about a format. The header needs no entry of
-            // its own: a player reads it as playback, from the front, and
-            // the window is over it while it does.
-            if self.reading == Reading::Probe
-                && let Some(index) = index
-                && state.structural.len() < STRUCTURAL_PIECES
-            {
-                state.structural.insert(index);
-            }
             let (bounded, stride) = (state.installed.is_some(), state.stride);
             let reader = state.readers.entry(self.id).or_insert_with(|| {
                 ReaderState::opened(self.reading, self.opened_at, self.buffering)
