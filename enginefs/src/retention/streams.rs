@@ -63,8 +63,9 @@ impl Read {
 struct Stream {
     /// Which response is feeding it now. A change is a reopen.
     reader: u64,
-    /// The furthest this consumer has been served, never walked back by a
-    /// re-read.
+    /// Where this consumer is: the end of its last read. A scrub back
+    /// moves it back, because that is where the viewer now is and where a
+    /// window would belong.
     end: u64,
     /// The read before this one, which is what the next sample is measured
     /// against.
@@ -145,11 +146,15 @@ impl FileStreams {
             if stream.reader != reader {
                 stream.reader = reader;
             }
-            // A high-water mark, never a position. A re-read or a scrub back
-            // is the same consumer and belongs to this stream, but letting
-            // it move the stream backwards would walk the window back over
-            // ground already played.
-            stream.end = stream.end.max(read.end);
+            // Wherever the last read ended, backwards included. A scrub
+            // back is not ground already played -- it is ground about to be
+            // played again, and a window belongs where the viewer is. The
+            // cost is a transient demuxer re-read dragging the position a
+            // few hundred kilobytes back until the next read jumps forward;
+            // the two readings can never differ by more than
+            // `SAME_CONSUMER`, since further than that is a stream of its
+            // own.
+            stream.end = read.end;
             stream.last = read;
             stream.reads = stream.reads.saturating_add(1);
             stream.seen = read.returned;
@@ -333,8 +338,8 @@ mod tests {
 
         assert_eq!(streams.streams.len(), 1);
         assert_eq!(
-            streams.streams[0].end, 6_149_382_662,
-            "and the stream's reach did not walk backwards with it"
+            streams.streams[0].end, 6_146_543_509,
+            "and the stream is where the consumer is, not where it had got to"
         );
     }
 
@@ -448,8 +453,8 @@ mod tests {
 
         assert_eq!(streams.streams.len(), 1);
         assert_eq!(
-            streams.streams[0].end, 6_200_262_144,
-            "and its reach is still its reach"
+            streams.streams[0].end, 6_170_262_144,
+            "and it is where the viewer scrubbed to"
         );
     }
 
