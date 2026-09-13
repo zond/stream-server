@@ -483,13 +483,18 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
 
     /// **TEMPORARY**, with [`crate::retention::trace`]: the counters the
     /// owner cannot read, and the piece length a lookahead is measured in.
-    fn trace(&self, domain: &FileDomain) -> Option<crate::retention::trace::Backing> {
+    fn trace(
+        &self,
+        store: &Arc<StoreRegistry>,
+        domain: &FileDomain,
+    ) -> Option<crate::retention::trace::Backing> {
         let transfer = self.handle.transfer_totals()?;
         Some(crate::retention::trace::Backing {
             fetched: transfer.fetched,
             verified: transfer.verified,
             refused: self.refused.load(Ordering::Relaxed),
             piece_length: domain.piece_length,
+            staged_over_held: store.staged_over_held(&self.info_hash),
         })
     }
 

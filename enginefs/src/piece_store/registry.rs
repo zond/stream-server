@@ -103,6 +103,17 @@ impl StoreRegistry {
         self.live(info_hash)?.held()
     }
 
+    /// How many times a staged copy has been opened over a piece the store
+    /// for `info_hash` holds, or 0 for a hash with no registered store.
+    ///
+    /// A backend writing into a piece it was told was finished. Zero is the
+    /// only good answer; see `PieceStoreInner::open_for_write`.
+    pub fn staged_over_held(&self, info_hash: &str) -> u64 {
+        self.live(info_hash)
+            .map(|inner| inner.staged_over_held())
+            .unwrap_or(0)
+    }
+
     /// Unlink `pieces` of `info_hash` through its registered store, so the
     /// store forgets its cached handles and clears its held bits with the
     /// files; or say why not.

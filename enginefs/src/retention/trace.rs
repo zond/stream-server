@@ -49,6 +49,15 @@ pub struct Backing {
     pub refused: usize,
     /// Bytes per piece, for turning a lookahead into a piece range.
     pub piece_length: u64,
+    /// How many times a staged copy has been opened over a piece the store
+    /// holds -- a backend writing into a piece it was told was finished.
+    ///
+    /// Zero on a healthy run, and it stays in the pass line because the
+    /// failure it names has a silent half: a read past the end of the fresh
+    /// staged file shows up as `reading N bytes at X of piece P`, but a read
+    /// inside a sparse hole in it returns zeros and looks like quiet media.
+    /// This number is the only thing that distinguishes them.
+    pub staged_over_held: u64,
 }
 
 /// What one pass decided, as the owner saw it.
@@ -152,6 +161,7 @@ pub fn pass<K: Debug>(key: &K, sample: Pass<'_>) {
         dropped = sample.dropped,
         unlinked = sample.unlinked,
         refused_reclaims = sample.backing.map(|backing| backing.refused),
+        staged_over_held = sample.backing.map(|backing| backing.staged_over_held),
         fetched_since,
         verified_since,
         // What the swarm was paid for and nothing kept, over this interval.

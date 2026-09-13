@@ -157,6 +157,10 @@ pub(super) struct Inner {
     /// there is one falls through to the complete copy -- so a stale entry
     /// costs one probe, never a wrong answer.
     staged: Mutex<BTreeSet<u32>>,
+    /// How many times a staged copy has been opened over a piece this store
+    /// still holds -- see [`Self::open_for_write`]. Never reset; a field log
+    /// reads the number, not the rate.
+    staged_over_held: AtomicU64,
     /// Which pieces are complete on disk -- see the type doc. Not advisory:
     /// a bit is set only after the rename that made the piece ours and
     /// cleared only by an unlink that removed it, so a reader of this set
@@ -290,6 +294,21 @@ impl HeldBits {
         for (slot, word) in self.words.iter().zip(words) {
             slot.store(word, Ordering::Release);
         }
+    }
+
+    /// Whether this store holds `piece`, without copying the set.
+    ///
+    /// [`Self::snapshot`] answers the same question for a caller that will
+    /// ask about many pieces; this is for the one that asks about one, on a
+    /// path where copying eighty-seven words to test one bit would be the
+    /// expensive half.
+    fn holds(&self, piece: u32) -> bool {
+        let Some((word, bit)) = self.slot_in_layout(piece) else {
+            return false;
+        };
+        self.words
+            .get(word)
+            .is_some_and(|word| word.load(Ordering::Acquire) & bit != 0)
     }
 
     fn snapshot(&self) -> Vec<u64> {
@@ -428,6 +447,7 @@ impl PieceStore {
                 registration,
                 removed_files: Mutex::new(BTreeSet::new()),
                 staged: Mutex::new(BTreeSet::new()),
+                staged_over_held: AtomicU64::new(0),
                 held,
                 seeded: AtomicBool::new(false),
                 checking: AtomicBool::new(false),
@@ -474,6 +494,13 @@ impl PieceStore {
     /// say why it is left open rather than papered over with an empty file.
     /// [`TorrentStorage::has_piece`] answers a different question and does not
     /// have that hole -- see there.
+    /// How many times a staged copy has been opened over a piece this store
+    /// holds -- see [`PieceStoreInner::open_for_write`]. Zero is the only
+    /// good answer.
+    pub fn staged_over_held(&self) -> u64 {
+        self.inner.staged_over_held()
+    }
+
     pub fn has_piece(&self, piece: u32) -> bool {
         self.inner.chunks.has_chunk(u64::from(piece))
     }
@@ -641,6 +668,16 @@ impl PieceStore {
 }
 
 impl Inner {
+    /// How many times a staged copy has been opened over a piece this store
+    /// holds: a backend writing into a piece it was told was finished.
+    ///
+    /// Zero is the only good answer. See [`Self::open_for_write`] for why it
+    /// is counted rather than refused, and for the silent failure it is the
+    /// only signal of.
+    pub(super) fn staged_over_held(&self) -> u64 {
+        self.staged_over_held.load(Ordering::Relaxed)
+    }
+
     pub(super) fn held(&self) -> Option<HeldSnapshot> {
         if !self.seeded.load(Ordering::Acquire) {
             return None;
@@ -932,6 +969,33 @@ impl Inner {
             // to see the staged bytes, so a cached complete handle -- the
             // old copy -- must not answer for the piece any more.
             self.forget_handles(piece);
+            // **And if we still hold the piece, somebody is writing into a
+            // finished one.** The two copies are meant to exist together in
+            // exactly one case -- a piece the policy dropped, being fetched
+            // again before its old file is unlinked -- and the drop clears
+            // the held bit before the re-fetch starts. Held *and* staged is
+            // therefore not a race we tolerate, it is a backend writing
+            // where it was told the piece was done.
+            //
+            // It is counted rather than refused because refusing would
+            // discard the legitimate case if the clear and the write ever
+            // reorder, and because the damage is already done by the time
+            // the file is opened. What it buys is a number: the same bug in
+            // librqbit served reads past the end of the fresh staged file
+            // (`reading N bytes at X of piece P`, visible in a field log)
+            // and, where the staged file was sparse, served ZEROS from
+            // inside the hole -- which appears in no log at all and is
+            // indistinguishable from media that happens to be quiet. This
+            // is the only signal that case has.
+            if self.held.holds(piece) {
+                self.staged_over_held.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    piece,
+                    path = %self.staging_path(piece).display(),
+                    stage = "staged_over_held",
+                    "a staged copy was opened over a piece this store holds"
+                );
+            }
         }
         let file = self
             .chunks
@@ -3250,6 +3314,46 @@ mod tests {
         store
             .remove_directory_if_empty(Path::new(""))
             .expect("and again on a directory that is already gone");
+    }
+
+    /// **A write into a piece this store holds is counted, and it is the
+    /// only signal one of them has.**
+    ///
+    /// The two copies of a piece exist together in exactly one legitimate
+    /// case: one the policy dropped, being fetched again before its old file
+    /// is unlinked -- and the drop clears the held bit before the re-fetch
+    /// begins. Held *and* freshly staged is a backend writing where it was
+    /// told the piece was finished.
+    ///
+    /// It matters because the damage has a silent half. The same bug in
+    /// librqbit served reads past the end of the new staged file, which a
+    /// field log shows as `reading N bytes at X of piece P`; where the
+    /// staged file was sparse it served ZEROS out of the hole, which is
+    /// indistinguishable from media that happens to be quiet and appears in
+    /// no log at all. This count is what tells the two runs apart.
+    #[test]
+    fn a_staged_copy_over_a_held_piece_is_counted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path(), PIECE_LENGTH, &SPECS);
+        let global = global_bytes(store.layout().total_length());
+        fill(&store, &global, 8);
+        assert!(store.has_piece(0), "the fixture completed piece 0");
+        assert_eq!(
+            store.staged_over_held(),
+            0,
+            "writing a piece and completing it is not writing over it"
+        );
+
+        // What a backend does when it re-requests a piece it was already
+        // told was done: a write, which opens a staged copy over the
+        // complete one.
+        store.pwrite_all(0, 0, &[7u8]).unwrap();
+
+        assert_eq!(
+            store.staged_over_held(),
+            1,
+            "a staged copy opened over a piece the store holds"
+        );
     }
 
     /// Pre-allocation is what makes the cache full of sparse files whose

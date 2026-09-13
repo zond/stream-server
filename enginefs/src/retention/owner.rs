@@ -484,7 +484,11 @@ pub trait Backing: Sized + Send + Sync + 'static {
     }
     /// **TEMPORARY**, with [`crate::retention::trace`] and deleted with it:
     /// what the backing can say about the entity that the owner cannot.
-    fn trace(&self, _domain: &Self::Domain) -> Option<crate::retention::trace::Backing> {
+    fn trace(
+        &self,
+        _store: &Self::Store,
+        _domain: &Self::Domain,
+    ) -> Option<crate::retention::trace::Backing> {
         None
     }
     /// Take `runs` off the disk, asking `door` at the backing's own
@@ -2268,7 +2272,7 @@ impl<B: Backing> Retention<B> {
         // with that module.
         {
             let (readers, reading, buffering) = traced;
-            let backing = self.backing.trace(&begin.domain);
+            let backing = self.backing.trace(store, &begin.domain);
             if let Some(piece_length) = backing.map(|backing| backing.piece_length) {
                 for (head, lookahead) in &readers {
                     let ahead = head.saturating_add(
