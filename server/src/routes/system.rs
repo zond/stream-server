@@ -429,6 +429,20 @@ pub async fn prepare_torrent_data_root(raw: &str) -> anyhow::Result<std::path::P
     if let Err(error) = tokio::fs::remove_file(&probe).await {
         tracing::debug!(path = %probe.display(), %error, "could not remove the write probe");
     }
+    // **And that it can be listed**, which is not implied by being writable
+    // and is what the cache is built on. Every have-record this server keeps
+    // is seeded by reading a directory: the piece store's at startup, and
+    // the proxy cache's whenever an entity is first opened. A volume that
+    // will not list is one where a chunk we wrote is a chunk we cannot find
+    // again, so there is no degraded mode to offer -- a listing that fails
+    // and is read as "empty" is worse than one that does not run, because
+    // it says the cache holds nothing and has retention delete in the dark.
+    // That is not hypothetical: one transient directory error once withdrew
+    // every committed piece of a file from what this server announces,
+    // after peers had been told, and there is no un-Have.
+    let _listing = tokio::fs::read_dir(&path)
+        .await
+        .map_err(|e| anyhow::anyhow!("cacheRoot {raw:?} cannot be listed: {e}"))?;
     Ok(resolved_path(&path))
 }
 
@@ -1369,6 +1383,44 @@ mod tests {
                 .await
                 .is_err(),
             "an existing directory nothing can write is not a usable root"
+        );
+    }
+
+    /// **A root that will not list is refused at startup**, which is the
+    /// only place it can be refused usefully.
+    ///
+    /// Everything this server knows about what it holds comes from reading a
+    /// directory -- the piece store's have-record at startup, the proxy
+    /// cache's whenever an entity is opened. There is no degraded mode: a
+    /// listing that fails and is read as "empty" says the cache holds
+    /// nothing, and retention then deletes in the dark. One transient
+    /// directory error once withdrew every committed piece of a file from
+    /// what this server announces, after peers had been told, and there is
+    /// no un-Have. So the embedder is handed an error and stops, rather
+    /// than running on a volume where a chunk written is a chunk that
+    /// cannot be found again.
+    ///
+    /// Write permission does not imply it: `0o333` is a directory that
+    /// takes a file and will not say what is in it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepare_torrent_data_root_refuses_a_directory_it_cannot_list() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("write-only");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o333)).unwrap();
+        // Root ignores the mode, and so does any filesystem mounted without
+        // permission support; a test that cannot make the case cannot judge
+        // it.
+        if std::fs::read_dir(&root).is_ok() {
+            return;
+        }
+        assert!(
+            super::prepare_torrent_data_root(root.to_str().unwrap())
+                .await
+                .is_err(),
+            "a directory that takes a write and will not list is not a usable root"
         );
     }
 
