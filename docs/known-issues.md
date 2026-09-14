@@ -102,9 +102,22 @@ what we have *and* leave the blocked chunk unfetched.
    pass that takes both its readings in that gap empties and forgets the
    entity, and the stream handed out ends up with no owner reader, so the
    file is never bounded.
-4. A zip inside a torrent still inflates on the reactor:
-   `server/src/archives/zip.rs` has no `spawn_blocking`. RAR, 7z, tar and
-   tgz are on the blocking pool.
+4. A zip **inside a torrent** inflates on a reactor worker, and that is a
+   deliberate trade rather than an oversight -- `archives/zip.rs:153`. A zip
+   on disk is already inflated on a thread of its own driving the reader
+   through `runtime.block_on`; the torrent form stays a `tokio::spawn`
+   because its reads park waiting for pieces and a plain thread parked in
+   one is never woken when the runtime goes down, so it would hang
+   shutdown. `INFLATE_CHUNK_BYTES` (256 KiB) is what keeps it to bursts
+   between yields.
+
+   The trade may no longer be necessary. `engine.rs:1166` keeps a
+   `read_wakers` map and `files.rs:318` has parked reads check
+   `reads_refused()` and fail -- machinery that exists for "stopped for
+   space", and that already proves the engine can reach into a parked read
+   and end it. A shutdown that used the same path would let the torrent
+   form move to a thread like the disk form. Not a bug; an improvement with
+   a prerequisite.
 5. `enginefs/src/retention/trace.rs` is still compiled in. Its own header
    says to delete it once a field log shows the pass settling; that is the
    call to make after the next viewing.
