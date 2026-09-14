@@ -291,9 +291,12 @@ pub struct Asking {
     /// The file's own bitrate -- size over duration -- or `None` for a file
     /// whose length nobody has stated.
     pub ceiling: Option<u64>,
-    /// How many seconds of stream a window may buy, or `None` for no time
-    /// cap at all.
-    pub seconds: Option<u64>,
+    /// How many seconds of stream a window may buy. Never "no cap": the
+    /// `Maximum` profile, and an entity no reader has stated a profile for,
+    /// are [`crate::backend::priorities::MAXIMUM_WINDOW_SECONDS`], a
+    /// finite number the sharing arithmetic can multiply without
+    /// saturating.
+    pub seconds: u64,
     /// **What the pass knows must be kept whatever the consumers want**:
     /// every promise a parked read is holding, and the lookahead each open
     /// stream was granted -- the backend refuses to forget a piece inside
@@ -317,6 +320,47 @@ pub struct Asking {
     /// load-bearing: eviction has to trigger on approaching the line, not
     /// on crossing it.
     pub margin: u64,
+    /// **The one reading of the clock this pass makes**, taken on the far
+    /// side of the listing. Every backing's `reading` measures against
+    /// this -- idle streams, the report throttle, the LRU -- rather than
+    /// reading the clock inside the rule it then compares, which is the
+    /// shape of bug that never converges.
+    pub now: std::time::Instant,
+}
+
+impl Asking {
+    /// **What this entity may hold**, given `held` bytes on its disk: what
+    /// it holds now plus what the volume will still give before the
+    /// margin, under the configured cap -- less the room the fill needs
+    /// between two passes.
+    ///
+    /// `docs/read-pattern-retention.md` section 4. Its own usage has to be
+    /// in there or the allowance shrinks as the cache fills and never
+    /// converges -- a stream would stop well short of the disk with nothing
+    /// to explain why. The cap is over the whole cache and is what an
+    /// entity is bounded by when there is no reading of the volume at all;
+    /// where there is one, the smaller of the two, like every other reading
+    /// of this: the volume said 381 GB free on the field's phone against a
+    /// configured 10.7 GB, and an allowance that took the disk's word alone
+    /// let one entity's want set grow to the whole film. A budget nobody
+    /// has stated yet, over a volume nothing has read, is not a licence to
+    /// want everything: every stream falls to its floor, which is what a
+    /// stream with no measurement gets anyway.
+    ///
+    /// One computation for every backing, so the scenarios test the same
+    /// arithmetic the torrent and the proxy run.
+    pub fn allowance(&self, held: u64) -> u64 {
+        let available = match (self.budget, self.headroom) {
+            (CacheBudget::Unbounded, _) => u64::MAX,
+            (CacheBudget::Bytes(cap), Some(headroom)) => cap.min(held.saturating_add(headroom)),
+            (CacheBudget::Unknown, Some(headroom)) => held.saturating_add(headroom),
+            (CacheBudget::Bytes(cap), None) => cap,
+            (CacheBudget::Unknown, None) => 0,
+        };
+        // An allowance that spent the whole budget would sit a stride over
+        // it for as long as anything is downloading.
+        available.saturating_sub(self.margin)
+    }
 }
 
 /// What the consumers of one entity are asking of its disk.
@@ -1894,6 +1938,9 @@ impl<B: Backing> Retention<B> {
             let state = entity.state.lock();
             return Self::nothing(&state, claim, about, Some(begin.at));
         };
+        // The one reading of the clock, on the far side of the listing;
+        // see `Asking::now`.
+        let now = std::time::Instant::now();
         // **What this entity's consumers are asking of the disk**, answered
         // against the listing above: what to fetch ahead of them, what no
         // unlink may touch, and what to give back if something must go.
@@ -1934,7 +1981,12 @@ impl<B: Backing> Retention<B> {
                 budget: begin.budget,
                 headroom: self.budget.headroom(),
                 ceiling: buffering.bytes_per_second,
-                seconds: buffering.window_seconds,
+                // No reader has stated a profile: the whole file, bounded
+                // by the allowance, as under `Maximum`.
+                seconds: buffering
+                    .window_seconds
+                    .unwrap_or(crate::backend::priorities::MAXIMUM_WINDOW_SECONDS),
+                now,
                 holding,
                 // **What arrives between this pass and the next one.**
                 //
@@ -2514,27 +2566,21 @@ impl<B: Backing> State<B> {
             seed: self.seed,
             ..Buffering::default()
         };
-        // No reader at all asks for no time cap, which is the shape that
-        // leaves the byte arithmetic alone: an entity nothing is reading is
-        // not one to start capping in seconds.
-        let mut any = false;
         for reader in self.readers.values() {
             asked.lookahead_bytes = asked.lookahead_bytes.max(reader.buffering.lookahead_bytes);
-            // The most generous profile in force wins, and `None` -- the
-            // whole file -- beats every number: a second reader asking for
-            // less must not shrink the window under the one already open.
-            asked.window_seconds =
-                match (any, asked.window_seconds, reader.buffering.window_seconds) {
-                    (false, _, seconds) => seconds,
-                    (true, Some(a), Some(b)) => Some(a.max(b)),
-                    _ => None,
-                };
+            // The most generous profile in force wins: a second reader
+            // asking for less must not shrink the window under the one
+            // already open. `None` is a reader that stated no profile and
+            // says nothing either way; the `Maximum` profile is a number.
+            asked.window_seconds = match (asked.window_seconds, reader.buffering.window_seconds) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
             asked.committed_seconds =
                 match (asked.committed_seconds, reader.buffering.committed_seconds) {
                     (Some(a), Some(b)) => Some(a.max(b)),
                     (a, b) => a.or(b),
                 };
-            any = true;
         }
         // **Computed, never measured.** Size over duration is the film's
         // bitrate by arithmetic: exact at the first report, nothing to
@@ -5842,6 +5888,51 @@ mod tests {
     /// The pass future and the door can be sent to another thread, which
     /// is what the proxy's driver does with the one and the proxy's
     /// blocking closure with the other.
+    /// **One allowance for every backing.** The torrent, the proxy and the
+    /// scenario fake each carried their own copy of this arithmetic, and
+    /// the scenarios tested the fake's. What this entity may hold is the
+    /// smaller of the configured cap and what it holds plus the volume's
+    /// headroom, less the margin the fill needs; an unknown budget over an
+    /// unread volume is nothing.
+    #[test]
+    fn the_allowance_is_the_smaller_of_cap_and_volume_less_the_margin() {
+        use crate::retention::CacheBudget;
+        let asking = |budget, headroom, margin| super::Asking {
+            budget,
+            headroom,
+            ceiling: None,
+            seconds: 90,
+            holding: Vec::new(),
+            margin,
+            now: std::time::Instant::now(),
+        };
+        assert_eq!(
+            asking(CacheBudget::Unbounded, None, 5).allowance(100),
+            u64::MAX - 5
+        );
+        assert_eq!(
+            asking(CacheBudget::Bytes(1_000), Some(200), 0).allowance(100),
+            300,
+            "the volume binds"
+        );
+        assert_eq!(
+            asking(CacheBudget::Bytes(250), Some(200), 0).allowance(100),
+            250,
+            "the cap binds"
+        );
+        assert_eq!(
+            asking(CacheBudget::Unknown, Some(200), 50).allowance(100),
+            250,
+            "no cap stated: what is held plus the headroom, less the margin"
+        );
+        assert_eq!(asking(CacheBudget::Bytes(250), None, 0).allowance(100), 250);
+        assert_eq!(
+            asking(CacheBudget::Unknown, None, 0).allowance(100),
+            0,
+            "nothing stated and nothing read is not a licence"
+        );
+    }
+
     #[test]
     fn the_pass_and_the_door_are_send() {
         fn pass<'a, B: Backing>(

@@ -251,7 +251,7 @@ impl Opening {
             (self.file_idx, self.start_offset),
             crate::piece_store::Buffering {
                 lookahead_bytes: self.lookahead_bytes,
-                window_seconds: self.buffer.window_seconds(),
+                window_seconds: Some(self.buffer.window_seconds()),
                 committed_seconds: Some(crate::backend::priorities::COMMITTED_SECONDS),
                 // The entity's, from its size and the film's length, not
                 // this read's to ask for: see `Buffering::bytes_per_second`.

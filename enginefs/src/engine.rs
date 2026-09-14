@@ -556,42 +556,12 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         held: &BTreeSet<u32>,
         asking: crate::retention::owner::Asking,
     ) -> crate::retention::owner::Consumers {
-        let (budget, headroom, ceiling) = (asking.budget, asking.headroom, asking.ceiling);
+        let ceiling = asking.ceiling;
         let extent = Self::extent(domain);
-        let now = std::time::Instant::now();
-        // **What this entity may hold: what it holds now, plus what the
-        // volume will still give before the margin.**
-        // `docs/read-pattern-retention.md` section 4. Its own usage has to
-        // be in there or the allowance shrinks as the cache fills and never
-        // converges -- a stream would stop well short of the disk with
-        // nothing to explain why. The cap is over the whole cache and is
-        // what an entity is bounded by when there is no reading of the
-        // volume at all.
-        let available = match (budget, headroom) {
-            (crate::retention::CacheBudget::Unbounded, _) => u64::MAX,
-            // **The smaller of the two, like every other reading of this.**
-            // The volume said 381 GB free on the field's phone against a
-            // configured 10.7 GB, and an allowance that took the disk's
-            // word alone let one entity's want set grow to the whole film.
-            (crate::retention::CacheBudget::Bytes(cap), Some(headroom)) => cap.min(
-                (held.len() as u64)
-                    .saturating_mul(domain.piece_length)
-                    .saturating_add(headroom),
-            ),
-            (crate::retention::CacheBudget::Unknown, Some(headroom)) => (held.len() as u64)
-                .saturating_mul(domain.piece_length)
-                .saturating_add(headroom),
-            (crate::retention::CacheBudget::Bytes(cap), None) => cap,
-            // A budget nobody has stated yet, over a volume nothing has
-            // read: not a licence to want everything. Every stream falls to
-            // its floor, which is what a stream with no measurement gets
-            // anyway.
-            (crate::retention::CacheBudget::Unknown, None) => 0,
-        };
-        // And the room the fill needs between two passes: an allowance that
-        // spent the whole budget would sit a stride over it for as long as
-        // anything is downloading.
-        let available = available.saturating_sub(asking.margin);
+        let now = asking.now;
+        // **What this entity may hold**: [`Asking::allowance`] has the
+        // argument.
+        let available = asking.allowance((held.len() as u64).saturating_mul(domain.piece_length));
         let mut streams = self.streams.lock();
         // Where this file lies, first: a read carries an offset inside its
         // own file, and every question the detector answers is about
@@ -609,10 +579,7 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         // about it.
         let want = streams.want(
             domain.file_idx,
-            // No time cap is the `Maximum` buffer profile, which asks for
-            // the whole file; the allowance is then the only bound, which
-            // is what that profile means.
-            asking.seconds.unwrap_or(u64::MAX),
+            asking.seconds,
             available,
             domain.piece_length,
         );
@@ -2275,8 +2242,7 @@ impl<H: TorrentHandle> Engine<H> {
             .min(
                 self.retention
                     .bitrate(&file_idx)
-                    .zip(buffer.window_seconds())
-                    .map(|(rate, seconds)| rate.saturating_mul(seconds))
+                    .map(|rate| rate.saturating_mul(buffer.window_seconds()))
                     .unwrap_or_else(|| priorities::librqbit_stream_lookahead_bytes(intent)),
             )
             // And never further than the whole cache may hold: past that
@@ -2489,9 +2455,10 @@ mod pin_tests {
                 // A film of one piece a second, so a read of a whole piece
                 // carries a second of picture.
                 ceiling: Some(PIECE),
-                seconds: Some(90),
+                seconds: 90,
                 holding: Vec::new(),
                 margin: 0,
+                now: std::time::Instant::now(),
             },
         );
         let first = streams.lock().held_by_streams(0);
@@ -2517,9 +2484,10 @@ mod pin_tests {
                 // A film of one piece a second, so a read of a whole piece
                 // carries a second of picture.
                 ceiling: Some(PIECE),
-                seconds: Some(90),
+                seconds: 90,
                 holding: Vec::new(),
                 margin: 0,
+                now: std::time::Instant::now(),
             },
         );
         let second = streams.lock().held_by_streams(0);
@@ -2588,9 +2556,10 @@ mod pin_tests {
                         // A volume with room for one more piece and no more.
                         headroom: Some(PIECE),
                         ceiling: Some(PIECE),
-                        seconds: Some(90),
+                        seconds: 90,
                         holding: Vec::new(),
                         margin: 0,
+                        now: std::time::Instant::now(),
                     },
                 );
             }
@@ -2663,9 +2632,10 @@ mod pin_tests {
                     // A film of a piece a second: ninety seconds of it is
                     // ninety pieces, which is most of this file.
                     ceiling: Some(PIECE),
-                    seconds: Some(90),
+                    seconds: 90,
                     holding: Vec::new(),
                     margin: 0,
+                    now: std::time::Instant::now(),
                 },
             );
         }

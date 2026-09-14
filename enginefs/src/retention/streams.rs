@@ -443,9 +443,7 @@ impl FileStreams {
     ) -> Option<Rejected> {
         // Before the join, so an expired stream cannot be resumed and a new
         // one starting where it left off is reported honestly as new.
-        let now = read.returned;
-        self.streams
-            .retain(|stream| now.saturating_duration_since(stream.seen) < STREAM_IDLE);
+        self.expire(read.returned);
 
         let at = |offset: u64| self.geometry.at(piece, offset);
         let run = run_containing(held, at(read.begin), &self.geometry.bound);
@@ -557,12 +555,18 @@ impl FileStreams {
     /// streams is sixteen megabytes, and a device with less free space than
     /// that is not playing video, so it is not a case the allocation has to
     /// be shaped around.
+    /// Forget every stream not read for [`STREAM_IDLE`] as of `now`.
+    fn expire(&mut self, now: Instant) {
+        self.streams
+            .retain(|stream| now.saturating_duration_since(stream.seen) < STREAM_IDLE);
+    }
+
     /// What these streams would ask for over `seconds`, before anything is
     /// shared out -- the demand this file puts on the entity's allowance.
     fn asked(&self, seconds: u64) -> u64 {
-        // Saturating, because `seconds` is `u64::MAX` under the buffer
-        // profile that asks for the whole file: what that means is "more
-        // than there is", and the allowance is what bounds it.
+        // Saturating against a `seconds` nobody should hand in: the
+        // `Maximum` profile is a finite day, precisely so this does not
+        // saturate and hand every stream the whole allowance.
         self.streams
             .iter()
             .map(|stream| stream.demand(self.ceiling).saturating_mul(seconds))
@@ -694,6 +698,14 @@ impl Streams {
         piece: u64,
         now: Instant,
     ) -> Option<Rejected> {
+        // **Every file's idle streams, not only this one's.** A stream
+        // expires by not being read, and a file nobody reads any more has
+        // no pass of its own to notice: its streams sat in the map with
+        // their windows published as exempt for as long as another file of
+        // the entity kept being played.
+        for streams in self.by_file.values_mut() {
+            streams.expire(now);
+        }
         let pending = std::mem::take(&mut self.pending);
         let mut last = None;
         let mut waiting = Vec::new();
@@ -1550,6 +1562,66 @@ mod tests {
         assert!(
             film > track * 3 && film < track * 4,
             "the windows are not in the ratio of the rates: {film} against {track}"
+        );
+    }
+
+    /// **Under the `Maximum` profile the shares are still equal seconds.**
+    ///
+    /// `Maximum` asks for the whole file, and for a while it was `u64::MAX`
+    /// seconds: every stream's demand saturated to `u64::MAX`, the scaling
+    /// factor came out as one, and each stream of the entity was granted
+    /// the whole allowance on its own -- two files being read together were
+    /// promised twice the disk there is. A day is longer than any film and
+    /// leaves the arithmetic intact.
+    #[test]
+    fn under_the_maximum_profile_the_shares_are_still_equal_seconds() {
+        let t0 = Instant::now();
+        let mut streams = Streams::default();
+        stream_on(&mut streams, 0, 0, 100, 3_500_000, t0);
+        stream_on(&mut streams, 1, 2_783, 100, 1_000_000, t0);
+
+        let seconds = crate::backend::priorities::MAXIMUM_WINDOW_SECONDS;
+        let budget = 60 * PIECE;
+        let mut windows = Vec::new();
+        for _ in 0..10 {
+            streams.want(0, seconds, budget, PIECE);
+            windows = streams.want(1, seconds, budget, PIECE);
+        }
+
+        let width = |of: &Range<u32>| u64::from(of.end - of.start);
+        let film: u64 = windows.iter().filter(|w| w.start < 2_783).map(width).sum();
+        let track: u64 = windows.iter().filter(|w| w.start >= 2_783).map(width).sum();
+        assert!(
+            film + track <= 60 + 2 * FLOOR_PIECES,
+            "together promised more than the sixty pieces allowed: {film} + {track}"
+        );
+        assert!(
+            film > track * 3 && film < track * 4,
+            "the windows are not in the ratio of the rates: {film} against {track}"
+        );
+    }
+
+    /// **A pass of one file expires the idle streams of another.**
+    ///
+    /// A stream expires by not being read, and `FileStreams::observe` runs
+    /// only on a read of its own file -- so a file nobody reads any more
+    /// had no pass to notice, and its streams sat in the map with their
+    /// windows published as exempt for as long as another file of the
+    /// entity kept being played: a season pack's finished episode holding
+    /// its window against the reclaim through the whole of the next.
+    #[test]
+    fn a_pass_of_one_file_expires_the_idle_streams_of_another() {
+        let t0 = Instant::now();
+        let mut streams = Streams::default();
+        stream_on(&mut streams, 0, 0, 100, 3_500_000, t0);
+        stream_on(&mut streams, 1, 2_783, 100, 3_500_000, t0);
+        let held = run(0..PIECES);
+
+        // A minute on, a pass for file 1 alone.
+        streams.observe(1, &held, PIECE, t0 + std::time::Duration::from_secs(60));
+        assert!(
+            streams.by_file[&0].streams.is_empty(),
+            "file 0's stream, unread for a minute, survived file 1's pass"
         );
     }
 

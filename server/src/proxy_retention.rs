@@ -385,32 +385,12 @@ impl Backing for ProxyBacking {
         held: &BTreeSet<u32>,
         asking: enginefs::retention::owner::Asking,
     ) -> enginefs::retention::owner::Consumers {
-        let (budget, headroom, ceiling) = (asking.budget, asking.headroom, asking.ceiling);
+        let ceiling = asking.ceiling;
         let extent = Self::extent(domain);
-        let now = std::time::Instant::now();
-        // What this entity may hold: what it holds now, plus what the
-        // volume will still give before the margin. See
-        // `docs/read-pattern-retention.md` section 4, and the torrent's
-        // half of this, which reads the same.
-        let available = match (budget, headroom) {
-            (enginefs::retention::CacheBudget::Unbounded, _) => u64::MAX,
-            // The smaller of the two: what the operator configured is a
-            // cap on this cache whatever the volume has left.
-            (enginefs::retention::CacheBudget::Bytes(cap), Some(headroom)) => cap.min(
-                (held.len() as u64)
-                    .saturating_mul(CHUNK_BYTES)
-                    .saturating_add(headroom),
-            ),
-            (enginefs::retention::CacheBudget::Unknown, Some(headroom)) => (held.len() as u64)
-                .saturating_mul(CHUNK_BYTES)
-                .saturating_add(headroom),
-            (enginefs::retention::CacheBudget::Bytes(cap), None) => cap,
-            (enginefs::retention::CacheBudget::Unknown, None) => 0,
-        };
-        // And the room the fill needs between two passes: an allowance that
-        // spent the whole budget would sit a stride over it for as long as
-        // anything is downloading.
-        let available = available.saturating_sub(asking.margin);
+        let now = asking.now;
+        // What this entity may hold: `Asking::allowance` has the argument,
+        // and the torrent's half of this reads the same.
+        let available = asking.allowance((held.len() as u64).saturating_mul(CHUNK_BYTES));
         let Ok(mut detectors) = self.detectors.lock() else {
             // A poisoned detector asks for nothing and gives up nothing:
             // this pass concludes, and refuses every unlink, rather than
@@ -437,12 +417,7 @@ impl Backing for ProxyBacking {
         // whose duration the app *has* stated is the same arithmetic.
         streams.domain(0, 0, extent.clone(), ceiling);
         let rejected = streams.observe(0, held, CHUNK_BYTES, now);
-        let want = streams.want(
-            0,
-            asking.seconds.unwrap_or(u64::MAX),
-            available,
-            CHUNK_BYTES,
-        );
+        let want = streams.want(0, asking.seconds, available, CHUNK_BYTES);
         let exempt = streams.exempt(0, extent.end);
         // **What may not be unlinked is published here**, where the want
         // set is decided: the pass's own holdings -- every promise and

@@ -60,6 +60,19 @@ pub enum BufferProfile {
     Maximum,
 }
 
+/// What [`BufferProfile::Maximum`] asks for, in seconds: a day, which is
+/// longer than any film, so the file's end and the allowance are what bound
+/// it.
+///
+/// **A number and not "no cap"**, because the sharing is arithmetic over
+/// it: every stream's rate times the seconds, scaled by one factor so the
+/// total fits the allowance. `u64::MAX` stood here once and saturated --
+/// every stream's demand became `u64::MAX`, the factor became one, and
+/// each stream of an entity was granted the whole allowance on its own.
+/// A day of a 20 MB/s film is under two terabytes, which the arithmetic
+/// takes in its stride.
+pub const MAXIMUM_WINDOW_SECONDS: u64 = 24 * 60 * 60;
+
 impl BufferProfile {
     /// Every profile, in ascending window order -- for enumerating the choice
     /// in a UI or a test.
@@ -85,18 +98,19 @@ impl BufferProfile {
     }
 
     /// How many seconds of the stream the retention window's forward reach
-    /// may buy, or `None` for [`Self::Maximum`], which asks for the file.
+    /// may buy; [`MAXIMUM_WINDOW_SECONDS`] for [`Self::Maximum`], which
+    /// asks for the file.
     ///
     /// The unit is the one the viewer chose in: "how much of this film do I
     /// want in hand", not "what fraction of my disk". The bytes it comes to
     /// are the film's own bitrate times this, and it is only ever a *cap*
     /// -- the budget and the lookahead floor still bound it from the other
     /// side.
-    pub const fn window_seconds(self) -> Option<u64> {
+    pub const fn window_seconds(self) -> u64 {
         match self {
-            Self::Normal => Some(90),
-            Self::Large => Some(4 * 60),
-            Self::Maximum => None,
+            Self::Normal => 90,
+            Self::Large => 4 * 60,
+            Self::Maximum => MAXIMUM_WINDOW_SECONDS,
         }
     }
 }
@@ -423,9 +437,16 @@ mod tests {
     /// multiplying it would be scaling a guess.
     #[test]
     fn the_fallback_is_the_same_under_every_buffer_profile() {
-        assert_eq!(BufferProfile::Normal.window_seconds(), Some(90));
-        assert_eq!(BufferProfile::Large.window_seconds(), Some(4 * 60));
-        assert_eq!(BufferProfile::Maximum.window_seconds(), None);
+        assert_eq!(BufferProfile::Normal.window_seconds(), 90);
+        assert_eq!(BufferProfile::Large.window_seconds(), 4 * 60);
+        assert_eq!(
+            BufferProfile::Maximum.window_seconds(),
+            MAXIMUM_WINDOW_SECONDS
+        );
+        assert!(
+            MAXIMUM_WINDOW_SECONDS < u64::MAX / (100 * 1024 * 1024),
+            "a hundred megabytes a second for the maximum window must not saturate"
+        );
         for fetching in [Fetching::Streaming, Fetching::Download] {
             let bytes = librqbit_stream_lookahead_bytes(fetching);
             for profile in BufferProfile::ALL {

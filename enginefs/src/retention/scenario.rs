@@ -453,24 +453,8 @@ impl<S: Side> Backing for FakeBacking<S> {
         asking: crate::retention::owner::Asking,
     ) -> crate::retention::owner::Consumers {
         let extent = Self::extent(domain);
-        let now = std::time::Instant::now();
-        let available = match (asking.budget, asking.headroom) {
-            (crate::retention::CacheBudget::Unbounded, _) => u64::MAX,
-            (crate::retention::CacheBudget::Bytes(cap), Some(headroom)) => cap.min(
-                (held.len() as u64)
-                    .saturating_mul(domain.piece)
-                    .saturating_add(headroom),
-            ),
-            (crate::retention::CacheBudget::Unknown, Some(headroom)) => (held.len() as u64)
-                .saturating_mul(domain.piece)
-                .saturating_add(headroom),
-            (crate::retention::CacheBudget::Bytes(cap), None) => cap,
-            (crate::retention::CacheBudget::Unknown, None) => 0,
-        };
-        // And the room the fill needs between two passes: an allowance that
-        // spent the whole budget would sit a stride over it for as long as
-        // anything is downloading.
-        let available = available.saturating_sub(asking.margin);
+        let now = asking.now;
+        let available = asking.allowance((held.len() as u64).saturating_mul(domain.piece));
         let mut streams = self.detector.lock();
         streams.domain(
             domain.file,
@@ -479,12 +463,7 @@ impl<S: Side> Backing for FakeBacking<S> {
             asking.ceiling,
         );
         streams.observe(domain.file, held, domain.piece, now);
-        let want = streams.want(
-            domain.file,
-            asking.seconds.unwrap_or(u64::MAX),
-            available,
-            domain.piece,
-        );
+        let want = streams.want(domain.file, asking.seconds, available, domain.piece);
         let exempt = streams.exempt(domain.file, extent.end);
         // **What may not be unlinked is published here**, where the want
         // set is decided: the pass's own holdings -- every promise and

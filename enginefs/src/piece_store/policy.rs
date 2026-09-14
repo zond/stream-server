@@ -194,8 +194,10 @@ pub struct Buffering {
     /// read yet.
     pub lookahead_bytes: u64,
     /// How many seconds of this stream the window's forward reach may buy,
-    /// or `None` for no time cap at all -- the `Maximum` buffer profile,
-    /// which asks for the whole file.
+    /// or `None` for a reader that stated no profile. The `Maximum`
+    /// profile is a number here too
+    /// ([`crate::backend::priorities::MAXIMUM_WINDOW_SECONDS`]), so the
+    /// sharing arithmetic never saturates.
     ///
     /// **This is the user's decision and the disk is only the ceiling.**
     /// Sized from the budget alone, the forward reach is a fixed fraction
