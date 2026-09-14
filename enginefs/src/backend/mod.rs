@@ -185,9 +185,13 @@ impl TransferTotals {
     /// duplication as much as it is anything thrown away -- see
     /// [`Self::verified`] for what is in it and how to read it.
     ///
-    /// Saturating, because the two counters are read from one snapshot
-    /// but a torrent restored from disk starts with verified bytes it
-    /// never fetched.
+    /// Saturating, and defensively: `verified` counts only pieces
+    /// completed off peers in this session -- a torrent restored from disk
+    /// seeds its `have` bytes and not this counter, and a partial piece it
+    /// restored is fetched whole again -- so within a live torrent
+    /// `verified <= fetched` always and the subtraction cannot go
+    /// negative. The saturation is for a fork rev that seeds the counter
+    /// from disk, which the pinned one does not.
     pub fn unverified(self) -> u64 {
         self.fetched.saturating_sub(self.verified)
     }
@@ -872,7 +876,7 @@ pub struct StatsFile {
     pub progress: f64,
     /// Bytes of this file's initial priority window (the head of the file a
     /// fresh stream fetches first, see
-    /// `priorities::librqbit_stream_lookahead_bytes(DirectInitial, ..)`) that are
+    /// `priorities::librqbit_stream_lookahead_bytes(Fetching::Streaming)`) that are
     /// already verified on disk. Omitted while the torrent has no piece map
     /// (resolving metadata / hash-checking / error).
     #[serde(default, skip_serializing_if = "Option::is_none")]
