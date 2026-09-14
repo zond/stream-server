@@ -679,6 +679,48 @@ impl ServerHandle {
         .flatten()
     }
 
+    /// Ask the reconciler what it wants of `info_hash` *as the timer would
+    /// ask it*, now, and answer the ladder's verdict --
+    /// `EngineFS::reconcile_hash` with `Trigger::Timer`. `None` when this
+    /// server holds no such torrent.
+    ///
+    /// Doc-hidden, not part of the embedder API. It is here because the
+    /// reconciler's decision is otherwise unobservable from outside, and a
+    /// test that wants to assert one had to *sleep past a tick and look at
+    /// the torrent afterwards* -- which is a weak oracle for a `Run` and no
+    /// oracle at all for a `Stop`. A negative read off the swarm flag
+    /// cannot tell "the ladder said stop" from "the ladder said run and
+    /// the actuator's `RECONCILE_MIN_DWELL` swallowed the start", and the
+    /// dwell is fifteen seconds -- longer than any sleep a test should be
+    /// spending. The verdict returned here is taken before the actuator
+    /// runs, so it is the policy under test rather than its shadow.
+    ///
+    /// It is the timer's question and not a playback's on purpose: the two
+    /// are measured against different free-space lines
+    /// (`reconcile::line`), and the hysteresis only exists on the timer's
+    /// side. Asking costs one volume probe (`probed` starts false, so the
+    /// declaration a test made with `pretend_volume_space` is read fresh)
+    /// and takes that torrent's reconcile lock, so a driven pass and the
+    /// background loop cannot interleave.
+    ///
+    /// **It acts, like any other pass.** This is not a dry run: the
+    /// decision is applied through the same actuator the tick uses. On a
+    /// torrent already in the state the verdict asks for -- which is what
+    /// these assertions are about -- that is no call at all.
+    #[doc(hidden)]
+    pub fn reconcile_as_timer(
+        &self,
+        info_hash: &str,
+    ) -> anyhow::Result<Option<enginefs::reconcile::Verdict>> {
+        let engine = self.state.engine.clone();
+        let info_hash = info_hash.to_lowercase();
+        self.block_on_server(async move {
+            engine
+                .reconcile_hash(&info_hash, enginefs::reconcile::Trigger::Timer)
+                .await
+        })
+    }
+
     /// The address librqbit accepts peer connections on, or `None` when
     /// the session is not listening. With [`TorrentListenPort::Ephemeral`]
     /// this is the port the OS assigned; a fixed range reports the port

@@ -1574,6 +1574,23 @@ fn file_pieces(stats: &serde_json::Value, idx: usize, piece_length: u64) -> std:
 /// magnitude slower than an idle machine.
 const CHECK_WAIT_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// The verdict the reconciler's ladder reaches when the *free-space* arm is
+/// what stopped a torrent -- what `ServerHandle::reconcile_as_timer` must
+/// answer for a torrent held back by the volume rather than by anything
+/// else.
+///
+/// Spelled out as its own thing because `for_space` is the load-bearing
+/// half. A bare `Decision::Stop` is nearly free to satisfy: the ladder's
+/// last arm stops every torrent nobody is playing and nothing has pinned,
+/// which is most torrents in most tests, so an assertion on the decision
+/// alone passes whether the free-space policy works or has been deleted.
+fn free_space_stop() -> enginefs::reconcile::Verdict {
+    enginefs::reconcile::Verdict {
+        decision: enginefs::reconcile::Decision::Stop,
+        for_space: true,
+    }
+}
+
 /// Poll `/{infoHash}/stats.json` until the torrent is out of `checking`
 /// (bounded), returning the last stats.
 fn stats_after_check(
@@ -3766,12 +3783,26 @@ fn a_restart_leaves_a_torrent_stopped_and_a_stream_request_starts_it() -> anyhow
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    // And it stays that way while nobody asks: several reconciler ticks
-    // (its interval is two seconds) go by.
-    std::thread::sleep(enginefs::reconcile::RECONCILE_INTERVAL * 3);
+    // And it stays that way while nobody asks. Asked rather than waited
+    // for: the timer's own question, put to the ladder synchronously, so
+    // what is read is the decision itself and not a torrent that happens
+    // not to have moved yet. A sleep proves nothing here -- a `Run` the
+    // actuator declined to act on looks exactly like a `Stop` from
+    // outside, and `for_space` is not on the wire at all.
+    //
+    // `for_space` is the whole of the claim. Nothing is playing this
+    // torrent either, so the ladder's idle arm would answer `Stop` for a
+    // torrent on a volume with all the room in the world; only the
+    // free-space arm firing says the *margin* is what is holding it, which
+    // is the policy this test exists for.
+    assert_eq!(
+        handle.reconcile_as_timer(&info_hash)?,
+        Some(free_space_stop()),
+        "the timer must not start a torrent into a volume inside the resume margin"
+    );
     assert!(
         swarm_paused(&client)?,
-        "the timer must not start a torrent into a volume inside the resume margin"
+        "and having decided that, it must have left the torrent stopped"
     );
 
     // A player's first request for a file it has not seen before, which is
@@ -3903,14 +3934,26 @@ fn an_archive_member_request_starts_the_torrent_it_reads_from() -> anyhow::Resul
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
-    // Room above the floor, inside the resume margin: several ticks go by
-    // and the timer leaves it stopped.
+    // Room above the floor, inside the resume margin: the timer, asked,
+    // leaves it stopped.
+    //
+    // Asked and not slept past, and here that is the difference between a
+    // test and a decoration. The stop above was made by this process
+    // moments ago, so `RECONCILE_MIN_DWELL` -- fifteen seconds -- is still
+    // running, and it suppresses a timer's start whatever the ladder
+    // wants. Any sleep short enough to belong in a suite expires inside
+    // that window, so the torrent is still paused for a reason that has
+    // nothing to do with the resume margin this line is about.
     stream_server::pretend_volume_space(&cache_root, FLOOR + MARGIN - 1);
     stream_server::pretend_available_space(&cache_root, FLOOR + MARGIN - 1);
-    std::thread::sleep(enginefs::reconcile::RECONCILE_INTERVAL * 3);
+    assert_eq!(
+        handle.reconcile_as_timer(&info_hash)?,
+        Some(free_space_stop()),
+        "the timer must not start a torrent into a volume inside the resume margin"
+    );
     assert!(
         swarm_paused(&client)?,
-        "the timer must not start a torrent into a volume inside the resume margin"
+        "and having decided that, it must have left the torrent stopped"
     );
 
     // `torrent:<info hash>/<path in the torrent>` is one path segment, so
@@ -4209,16 +4252,16 @@ fn an_archive_member_read_lets_the_torrent_be_stopped_again_when_it_is_done() ->
         member_payload(MEMBER_LEN).as_slice(),
         "the member served out of the torrent"
     );
-    std::thread::sleep(enginefs::reconcile::RECONCILE_INTERVAL * 3);
-    assert!(
-        !swarm_paused(&client, &base, &info_hash)?,
-        "the read left the torrent running, and stopping reading is not \
-         playing something else"
-    );
-
     // The body is over, so the registration it made is over: the drop
     // spawns the `on_stream_end` that ends it, and nothing else ever will.
     // Bounded rather than immediate because that end is spawned.
+    //
+    // This waits *before* the assertion below, and that order is the whole
+    // point of it. With a registration still open the reconciler reads
+    // `playing` off the reader count and answers `Run` for a reason that
+    // has nothing to do with what is being tested; only once the register
+    // is provably empty can a `Run` come from anywhere but the liveness
+    // cell, which is the claim.
     let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
     while handle.background_traffic()?.playing {
         anyhow::ensure!(
@@ -4228,6 +4271,19 @@ fn an_archive_member_read_lets_the_torrent_be_stopped_again_when_it_is_done() ->
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    assert_eq!(
+        handle.reconcile_as_timer(&info_hash)?,
+        Some(enginefs::reconcile::Verdict {
+            decision: enginefs::reconcile::Decision::Run,
+            for_space: false,
+        }),
+        "the read left the torrent running, and stopping reading is not \
+         playing something else"
+    );
+    assert!(
+        !swarm_paused(&client, &base, &info_hash)?,
+        "and having decided that, the timer must have left it running"
+    );
 
     // The viewer moves on: the second torrent is the one being played now.
     anonymous

@@ -2221,8 +2221,27 @@ impl<H: TorrentHandle> Engine<H> {
             .min(self.retention.cap().unwrap_or(u64::MAX))
             .max(1);
 
+        let opening = crate::files::Opening {
+            file_idx,
+            start_offset,
+            lookahead_bytes,
+            buffer,
+        };
+        // Before the backend's open, and it has to be before: the install
+        // above has already counted this open, so a pass whose mode reading
+        // lands inside that await finds the count it expects and no reader
+        // yet, takes the policy back, and -- over a file with nothing on
+        // the disk to refuse it -- forgets the entity. The read that
+        // arrives after that has nothing left to note a byte to, for the
+        // rest of the film. See [`crate::files::Opening::reader_on`].
+        //
+        // A reader that turns out to have no stream is not a leak: dropping
+        // it takes its entry off the entity and changes nothing else, which
+        // is the state a failed open left before this too.
+        let reader = opening.reader_on(&self.retention);
+
         let reader_start = Instant::now();
-        let reader = self
+        let stream = self
             .handle
             .get_file_reader(file_idx, start_offset, priority, None, lookahead_bytes)
             .await
@@ -2242,14 +2261,10 @@ impl<H: TorrentHandle> Engine<H> {
         Ok(FileHandle::new(
             length,
             name,
-            reader,
+            stream,
             self.clone(),
-            crate::files::Opening {
-                file_idx,
-                start_offset,
-                lookahead_bytes,
-                buffer,
-            },
+            opening,
+            reader,
         ))
     }
 }

@@ -1195,14 +1195,28 @@ impl<B: Backing> Retention<B> {
     /// head would be measured against, so its bytes are not remembered. L1
     /// only, no I/O.
     ///
-    /// `at` is where the read was opened, `reading` what it is for and
-    /// `buffering` what it asks of the cache -- the lookahead it was
-    /// granted and the seconds its buffer profile wants held
-    /// ([`Buffering`]). The first two are recorded here, at the open,
-    /// rather than waiting for a delivered byte: the policy is installed before this is called, so the very
-    /// first pass over the entity can draw its window round a read that is
-    /// still parked on its first piece, and a probe never gets to claim the
-    /// entity's head at all.
+    /// `at` is where the read was opened and `buffering` what it asks of the
+    /// cache -- the lookahead it was granted and the seconds its buffer
+    /// profile wants held ([`Buffering`]). Both are recorded here, at the
+    /// open, rather than waiting for a delivered byte: the policy is
+    /// installed before this is called, so the very first pass over the
+    /// entity can draw its window round a read that is still parked on its
+    /// first piece, and a probe never gets to claim the entity's head at
+    /// all.
+    ///
+    /// **And the caller opens the reader before it opens the stream the
+    /// read will be served from**, not only before the first byte. Between
+    /// the install and this call the entity stands with the open already
+    /// counted and no reader on it, and every await the caller spends in
+    /// there is a window for a slack pass: the count is what
+    /// [`Self::readers_and_opens_of`] compares, so the pass finds it equal,
+    /// finds nothing observed, and takes the policy back. If it also
+    /// reclaims everything the entity holds -- which a file with nothing on
+    /// the disk yet trivially satisfies -- [`Self::forget_empty`] takes the
+    /// entity, and the reader opened afterwards is `None`: that read notes
+    /// no byte for the rest of its life and nothing re-installs a policy,
+    /// because an install runs only at an open. Opened first, the reader's
+    /// `Arc` on the entity is what keeps `forget_empty` off it.
     pub fn reader_on(
         self: &Arc<Self>,
         key: &B::Key,
@@ -2470,6 +2484,15 @@ impl<B: Backing> Retention<B> {
     /// reader opens and moves no liveness cell, and takes the bytes the
     /// stream is about to read. The gap the count exists to close, reopened
     /// one lock-release wide by the reading of it.
+    ///
+    /// **It closes one direction only.** An install that *preceded* this
+    /// reading is already inside the count, so the comparison is equal and
+    /// nothing here says the stream it belongs to is still on its way --
+    /// exactly the state an opener is in between its install and its
+    /// reader. Nothing in this reading can close that; what closes it is
+    /// the opener taking its reader before it awaits anything, so the
+    /// entity is held by something the pass cannot forget. See
+    /// [`Self::reader_on`].
     pub fn readers_and_opens_of(&self, key: &B::Key) -> (usize, u64) {
         self.lookup(key)
             .map(|entity| {

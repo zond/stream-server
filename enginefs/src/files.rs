@@ -161,23 +161,29 @@ pub struct FileHandle<H: TorrentHandle> {
     /// response on the file still playing -- are two heads, each with a
     /// window at the pass's door, where one head per torrent had the pass
     /// take the piece the other response was inside. `None` for a file the
-    /// owner has no entity for ([`Retention::reader_on`]): nothing could
-    /// bound it, and its bytes are not remembered.
+    /// owner has no entity for: nothing could bound it, and its bytes are
+    /// not remembered.
     ///
-    /// [`Retention::reader_on`]: crate::retention::owner::Retention::reader_on
+    /// Taken by [`Opening::reader_on`] and handed in, rather than opened
+    /// here: it has to be on the entity before the backend stream is asked
+    /// for, and this handle does not exist until after that await. See
+    /// there for what runs in the gap.
     reader: Option<crate::retention::owner::Reader<crate::engine::TorrentBacking<H>>>,
 }
 
 /// What one read of one file is: where in the torrent, where in the file,
-/// what the read is for, and how far ahead the backend granted it.
+/// how far ahead it will be fetched, and how much of the film its viewer
+/// asked to have buffered.
 ///
 /// A struct rather than four more parameters because the last two arrived
-/// together and mean nothing apart: the intent is what the owner is told
-/// the read is *for* ([`Fetching::reading`]), and the lookahead is
-/// what the backend really granted it, which the owner keeps as the floor
-/// no later budget may size the window under.
+/// together and mean nothing apart: the lookahead is what the backend is
+/// granted for this stream, which the owner keeps as the floor no later
+/// budget may size the window under, and the buffer profile is the seconds
+/// that number was computed from.
 ///
-/// [`Fetching::reading`]: crate::backend::priorities::Fetching::reading
+/// Built before the backend stream is asked for, because that is when the
+/// reader on the file's entity has to be taken -- see
+/// [`Self::reader_on`].
 #[derive(Debug, Clone, Copy)]
 pub struct Opening {
     /// Which file of the torrent.
@@ -196,53 +202,56 @@ pub struct Opening {
     pub buffer: crate::backend::priorities::BufferProfile,
 }
 
-impl<H: TorrentHandle> FileHandle<H> {
-    /// A handle over `stream`, reading `file_idx` from `start_offset`.
-    /// Opened after the engine has installed the file's retention policy
-    /// (`Engine::try_get_file_with_intent` does, before it asks the backend
-    /// for the stream), so the reader this takes on the file's entity is
-    /// there before the first byte is noted to it.
+impl Opening {
+    /// This read's [`Reader`] on the file's entity, or `None` when the owner
+    /// has no entity for the file -- one nothing could bound, with no
+    /// metadata to name its pieces by, so there is nothing a head would be
+    /// measured against and its bytes are not remembered.
     ///
-    /// `intent` reaches the owner as what the read is *for*
-    /// ([`Fetching::reading`]). The owner needs it: a player's read of
-    /// the container index at the tail delivers bytes exactly like the
-    /// response playing the film, and only the intent tells them apart
-    /// before the damage -- the probe's byte claiming the file's head and
-    /// the window sliding to the end of the file under a player still at
-    /// 0:00.
+    /// **Called before the backend stream is asked for, and it has to be.**
+    /// `Engine::begin_retention` installs the policy and counts the open;
+    /// the reader is what puts a head on the entity that install made. In
+    /// between sits one await, the backend's own open, and it is long
+    /// enough to lose the file for good. A retention pass whose mode
+    /// reading lands in there finds `opens` already counting this open --
+    /// so the slack pass's "did a stream open since the reading" comparison
+    /// finds it equal -- and no *observed* reader, because nothing has been
+    /// read yet. It throws the policy just installed away, reclaims, and,
+    /// for a file with nothing on the disk yet (the next episode, opened
+    /// while the last one's connection is still closing), finds the entity
+    /// empty and forgets it. A reader taken after that finds no entity at
+    /// all: `None` for the handle's whole life, every byte of the episode
+    /// unremembered, and nothing to reinstall a policy because an install
+    /// runs only at an open. Taken here, the reader's own `Arc` on the
+    /// entity outlives that pass and the read stays on the file.
     ///
-    /// `lookahead_bytes` is what the backend really granted this stream --
-    /// already the smaller of the intent's cap and the window's forward
-    /// reach -- and the owner keeps the largest one open on the file as the
-    /// floor no later budget may size the window under
-    /// ([`crate::piece_store::Buffering`]).
+    /// It does not close the race, only its permanent half. A reader that
+    /// has opened and not yet delivered a byte is still not an observed one
+    /// ([`Retention::readers_of`]), so a pass reading the mode between this
+    /// call and the first `poll_read` still discards the policy, and
+    /// nothing installs another until the next open. Honouring the raw
+    /// reader map instead is the design question the owner argues against
+    /// in [`Retention::readers_and_opens_of`]: a handed-out-and-abandoned
+    /// stream would block slack for ever.
     ///
-    /// And `start_offset` reaches it too, so the read has a head from the
-    /// open rather than from its first delivered byte: a reader parked on
-    /// the piece it is waiting for is the one the file is being buffered
+    /// `start_offset` reaches the owner too, so the read has a head from
+    /// the open rather than from its first delivered byte: a reader parked
+    /// on the piece it is waiting for is the one the file is being buffered
     /// for, and an entity with no head is one no pass draws a window for.
     ///
-    /// [`Fetching::reading`]: crate::backend::priorities::Fetching::reading
-    pub fn new(
-        size: u64,
-        name: String,
-        stream: Box<dyn FileStreamTrait>,
-        engine: Arc<crate::engine::Engine<H>>,
-        opening: Opening,
-    ) -> Self {
-        let Opening {
-            file_idx,
-            start_offset,
-            lookahead_bytes,
-            buffer,
-        } = opening;
-        let reader_id = engine.next_reader_id();
-        let reader = engine.retention.reader_on(
-            &file_idx,
-            (file_idx, start_offset),
+    /// [`Reader`]: crate::retention::owner::Reader
+    /// [`Retention::readers_of`]: crate::retention::owner::Retention::readers_of
+    /// [`Retention::readers_and_opens_of`]: crate::retention::owner::Retention::readers_and_opens_of
+    pub(crate) fn reader_on<H: TorrentHandle>(
+        &self,
+        retention: &Arc<crate::retention::owner::Retention<crate::engine::TorrentBacking<H>>>,
+    ) -> Option<crate::retention::owner::Reader<crate::engine::TorrentBacking<H>>> {
+        retention.reader_on(
+            &self.file_idx,
+            (self.file_idx, self.start_offset),
             crate::piece_store::Buffering {
-                lookahead_bytes,
-                window_seconds: buffer.window_seconds(),
+                lookahead_bytes: self.lookahead_bytes,
+                window_seconds: self.buffer.window_seconds(),
                 committed_seconds: Some(crate::backend::priorities::COMMITTED_SECONDS),
                 // The entity's, from its size and the film's length, not
                 // this read's to ask for: see `Buffering::bytes_per_second`.
@@ -251,7 +260,36 @@ impl<H: TorrentHandle> FileHandle<H> {
                 // shares the same pieces. See `Retention::reader_on`.
                 seed: 0,
             },
-        );
+        )
+    }
+}
+
+impl<H: TorrentHandle> FileHandle<H> {
+    /// A handle over `stream`, reading `opening.file_idx` from
+    /// `opening.start_offset`, with the reader that read already has on the
+    /// file's entity.
+    ///
+    /// `reader` is handed in rather than taken here because it has to exist
+    /// before `stream` does: the engine installs the policy, takes the
+    /// reader ([`Opening::reader_on`], which is where the argument lives),
+    /// and only then awaits the backend's open. A handle exists after that
+    /// await, which is too late -- a retention pass can have forgotten the
+    /// entity by then, leaving this read unable to note a byte for the rest
+    /// of its life.
+    pub(crate) fn new(
+        size: u64,
+        name: String,
+        stream: Box<dyn FileStreamTrait>,
+        engine: Arc<crate::engine::Engine<H>>,
+        opening: Opening,
+        reader: Option<crate::retention::owner::Reader<crate::engine::TorrentBacking<H>>>,
+    ) -> Self {
+        let Opening {
+            file_idx,
+            start_offset,
+            ..
+        } = opening;
+        let reader_id = engine.next_reader_id();
         Self {
             size,
             name,

@@ -1305,7 +1305,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// One pass of the reconciler: what every torrent should be doing, from
     /// what is true of it now, and the calls that make it so. Returns the
     /// decisions in registry order, for tests and for a caller that wants
-    /// them.
+    /// them -- the decisions alone, where [`Self::reconcile_hash`] answers
+    /// with the whole [`crate::reconcile::Verdict`]: a sweep over every
+    /// torrent is read for what happened, and the arm that took each stop
+    /// is a question about one torrent.
     ///
     /// One free-space probe per distinct output folder, and no `stats()`
     /// anywhere: every question asked of a handle here
@@ -1360,11 +1363,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         // the viewer has just opened.
         let live = self.live.reading();
         for engine in engines {
-            if let Some(decision) = self
+            if let Some(verdict) = self
                 .reconcile_engine(&engine, crate::reconcile::Trigger::Timer, now, &mut probed)
                 .await
             {
-                decisions.push((engine.info_hash.clone(), decision));
+                decisions.push((engine.info_hash.clone(), verdict.decision));
             }
             // The retention pass rides this tick rather than a timer of its
             // own: it is the same interval, over the same engines, and it
@@ -1391,11 +1394,20 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// condition. A caller must therefore have had its stream open write the
     /// cell before it asks, or it will be told what to do with a torrent
     /// nobody is watching.
+    ///
+    /// The whole [`crate::reconcile::Verdict`] and not just its decision,
+    /// which [`Self::reconcile_tick`] hands back: a caller asking about one
+    /// torrent is usually asking *why*, and the two stops are different
+    /// answers -- only the free-space one is a statement about the device.
+    /// Nothing in the process reads it (every production caller reconciles
+    /// for the effect and drops the answer); what does is a test asserting
+    /// a policy, where "stopped" and "stopped because the volume is inside
+    /// the resume margin" are claims of very different strength.
     pub async fn reconcile_hash(
         &self,
         info_hash: &str,
         trigger: crate::reconcile::Trigger,
-    ) -> Option<crate::reconcile::Decision> {
+    ) -> Option<crate::reconcile::Verdict> {
         let engine = self.peek_engine(info_hash).await?;
         let now = self.clock.now_secs();
         let mut probed = false;
@@ -1430,7 +1442,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         trigger: crate::reconcile::Trigger,
         now: u64,
         probed: &mut bool,
-    ) -> Option<crate::reconcile::Decision> {
+    ) -> Option<crate::reconcile::Verdict> {
         if engine.handle.manages_playback_lifecycle() {
             return None;
         }
@@ -1529,7 +1541,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             // one.
             crate::reconcile::Decision::Leave => {}
         }
-        Some(verdict.decision)
+        Some(verdict)
     }
 
     /// The ladder's `Stop`, for both of its arms: stop the torrent if it is
@@ -4858,6 +4870,22 @@ mod tests {
         reselected: Mutex<Vec<std::ops::Range<u32>>>,
         /// The lookahead every reader was opened with, in order.
         lookaheads: Mutex<Vec<u64>>,
+        /// Test knob: park the next `get_file_reader` call, the way
+        /// `advertise_gate` parks a pass. The fake sends on the first
+        /// channel as it enters the call and waits on the second before
+        /// returning, so a test can ask what a retention pass does to a
+        /// file whose policy is installed and whose stream has not come
+        /// back yet -- the one gap an opener really has. Runs once and is
+        /// gone.
+        reader_gate: Mutex<
+            Option<(
+                tokio::sync::oneshot::Sender<()>,
+                tokio::sync::oneshot::Receiver<()>,
+            )>,
+        >,
+        /// Test knob: every `get_file_reader` fails -- librqbit's answer for
+        /// a torrent whose state has gone between the open and the stream.
+        refuses_reader: AtomicBool,
         /// What happens on the first `drop_pieces` of a test, from inside
         /// the call: where a test puts what a user or a reader does while
         /// the pass has one part of a run released and the next still to
@@ -5618,6 +5646,16 @@ mod tests {
             lookahead_bytes: u64,
         ) -> Result<Box<dyn FileStreamTrait>> {
             self.gate().await?;
+            // Parked inside the call, if a test asked for it: see
+            // `FakeCounters::reader_gate`.
+            let gate = self.counters.reader_gate.lock().unwrap().take();
+            if let Some((entered, release)) = gate {
+                let _ = entered.send(());
+                let _ = release.await;
+            }
+            if self.counters.refuses_reader.load(Ordering::SeqCst) {
+                anyhow::bail!("this fake will not open a reader");
+            }
             self.counters.get_file_reader.fetch_add(1, Ordering::SeqCst);
             self.counters
                 .lookaheads
@@ -7322,7 +7360,8 @@ mod tests {
         assert_eq!(
             enginefs
                 .reconcile_hash(TEST_HASH, Trigger::PlaybackStart)
-                .await,
+                .await
+                .map(|verdict| verdict.decision),
             Some(Decision::Run)
         );
     }
@@ -8178,17 +8217,20 @@ mod tests {
         let probe_available = available.clone();
         enginefs.set_free_space_probe(move |_| Ok(probe_available.load(Ordering::SeqCst)));
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        let opening = crate::files::Opening {
+            file_idx: 0,
+            start_offset: 0,
+            lookahead_bytes: 0,
+            buffer: crate::backend::priorities::BufferProfile::Normal,
+        };
+        let on_entity = opening.reader_on(&engine.retention);
         let mut reader = crate::files::FileHandle::new(
             100,
             "video-0.mkv".to_string(),
             Box::new(ParkedStream),
             engine.clone(),
-            crate::files::Opening {
-                file_idx: 0,
-                start_offset: 0,
-                lookahead_bytes: 0,
-                buffer: crate::backend::priorities::BufferProfile::Normal,
-            },
+            opening,
+            on_entity,
         );
         engine.active_streams.fetch_add(1, Ordering::SeqCst);
 
@@ -8350,17 +8392,20 @@ mod tests {
         // Inline rather than `poll_a_read`, which drops its handle before it
         // returns -- and a closed read promises nothing, correctly.
         use tokio::io::AsyncRead;
+        let opening = crate::files::Opening {
+            file_idx: 0,
+            start_offset: 0,
+            lookahead_bytes: 0,
+            buffer: crate::backend::priorities::BufferProfile::Normal,
+        };
+        let on_entity = opening.reader_on(&engine.retention);
         let mut reader = crate::files::FileHandle::new(
             100,
             "video-0.mkv".to_string(),
             Box::new(ParkedStream),
             engine.clone(),
-            crate::files::Opening {
-                file_idx: 0,
-                start_offset: 0,
-                lookahead_bytes: 0,
-                buffer: crate::backend::priorities::BufferProfile::Normal,
-            },
+            opening,
+            on_entity,
         );
         engine.active_streams.fetch_add(1, Ordering::SeqCst);
         let mut buf = [0u8; 16];
@@ -8392,17 +8437,20 @@ mod tests {
     /// the code under test writes. What a player actually gets is this.
     async fn poll_a_read(engine: &Arc<Engine<FakeHandle>>) -> Option<std::io::Error> {
         use tokio::io::AsyncRead;
+        let opening = crate::files::Opening {
+            file_idx: 0,
+            start_offset: 0,
+            lookahead_bytes: 0,
+            buffer: crate::backend::priorities::BufferProfile::Normal,
+        };
+        let on_entity = opening.reader_on(&engine.retention);
         let mut reader = crate::files::FileHandle::new(
             100,
             "video-0.mkv".to_string(),
             Box::new(ParkedStream),
             engine.clone(),
-            crate::files::Opening {
-                file_idx: 0,
-                start_offset: 0,
-                lookahead_bytes: 0,
-                buffer: crate::backend::priorities::BufferProfile::Normal,
-            },
+            opening,
+            on_entity,
         );
         // Balanced by `FileHandle::drop`, which subtracts one.
         engine.active_streams.fetch_add(1, Ordering::SeqCst);
@@ -11637,6 +11685,120 @@ mod tests {
             reaches[0] < 100,
             "and the bound is inside episode two rather than a hundred bytes \
              of episode one past it: {reaches:?}"
+        );
+    }
+
+    /// **The read is on its file's entity before the backend stream it will
+    /// be served from exists.**
+    ///
+    /// Opening a file installs its policy, which counts the open on the
+    /// entity, and only then awaits the backend for a stream. That await is
+    /// the whole exposure: a tick that reads the file's mode inside it sees
+    /// the count the pass expects -- the open is already in it -- and no
+    /// reader, because none has been taken yet. So the slack pass's "did a
+    /// stream open since the reading" test passes, the policy just
+    /// installed is thrown away, and a file with nothing on the disk yet
+    /// reclaims all nothing of it and is forgotten. The read that arrives
+    /// after that finds no entity to be a reader of, and notes not one of
+    /// the bytes it goes on to deliver for the rest of the film -- so
+    /// nothing bounds the episode, which is the failure the whole subsystem
+    /// exists to prevent.
+    ///
+    /// The one this really happens to is the next episode, opened while the
+    /// last one's connection is still closing: the liveness cell is kept on
+    /// the old file, so the new one is read as an aside rather than as what
+    /// is playing.
+    #[tokio::test]
+    async fn a_read_opened_under_a_slack_pass_still_notes_its_bytes() {
+        use crate::backend::priorities::{BufferProfile, Fetching};
+        use tokio::io::AsyncReadExt;
+        let (enginefs, counters) = test_enginefs_with_files(vec![
+            ("Show.S01E01.mkv".into(), 100),
+            ("Show.S01E02.mkv".into(), 100),
+        ]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let _store = seeded_store(&enginefs, &engine);
+
+        // The backend's open, parked: the gap between the install and the
+        // reader, held open for as long as the test needs it.
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *counters.reader_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        let opening = tokio::spawn({
+            let engine = engine.clone();
+            async move {
+                engine
+                    .try_get_file_with_intent(1, 0, 255, Fetching::Streaming, BufferProfile::Normal)
+                    .await
+            }
+        });
+        entered_rx.await.expect("the backend's open was entered");
+
+        // Episode one is what is playing, so the tick reads episode two as
+        // slack -- an aside nothing has been observed reading.
+        engine.retain(enginefs.store_registry(), &playing(0)).await;
+
+        let _ = release_tx.send(());
+        let mut handle = opening
+            .await
+            .expect("the open returned")
+            .expect("a reader on episode two");
+
+        // One delivered byte is what tells the owner where this read is.
+        let mut byte = [0u8; 1];
+        handle.read_exact(&mut byte).await.expect("a byte");
+        assert_eq!(
+            engine.retention.readers_of(&1),
+            1,
+            "the pass ran inside the open and the read is still the entity's: \
+             a read whose reader was taken after the pass has no entity to be \
+             on, and every byte it delivers is unremembered"
+        );
+    }
+
+    /// **A backend open that fails leaves no reader behind on the file.**
+    ///
+    /// The reader is taken before the stream is asked for, so a failed open
+    /// has one to give back. Dropping it takes its entry off the entity and
+    /// does nothing else -- no turn, no policy -- which is exactly the
+    /// state a failed open left before: an entity with a policy and nobody
+    /// reading it, for the next slack pass to clear. An entry left behind
+    /// would be a reader that never ends, and a slack pass would never
+    /// again find the entity empty enough to forget.
+    #[tokio::test]
+    async fn a_backend_open_that_fails_leaves_no_reader_on_the_file() {
+        use crate::backend::priorities::{BufferProfile, Fetching};
+        let (enginefs, counters) = test_enginefs_with_files(vec![
+            ("Show.S01E01.mkv".into(), 100),
+            ("Show.S01E02.mkv".into(), 100),
+        ]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let _store = seeded_store(&enginefs, &engine);
+
+        counters.refuses_reader.store(true, Ordering::SeqCst);
+        engine
+            .try_get_file_with_intent(1, 0, 255, Fetching::Streaming, BufferProfile::Normal)
+            .await
+            .err()
+            .expect("the fake refuses to open a reader");
+        assert_eq!(
+            engine.retention.readers_of(&1),
+            0,
+            "nothing is reading a file whose stream never opened"
+        );
+
+        // And the entity is forgettable: the slack pass over an aside that
+        // holds nothing takes it, which it can only do when the reader map
+        // is empty.
+        engine.retain(enginefs.store_registry(), &playing(0)).await;
+        assert!(
+            !engine.retention.keys().contains(&1),
+            "the entity of a file with no reader and nothing on the disk is \
+             forgotten; one holding a reader that never ended is kept for ever"
         );
     }
 
