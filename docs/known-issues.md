@@ -1,7 +1,8 @@
 # Known issues, redundancy and stale docs
 
-Verified against the tree at `fbb8d79` on 2026-09-14. Every entry here was
-checked against the code on that date, not carried over from notes: two
+Verified against the tree at `5c7923c`, last checked 2026-09-14. Every
+entry here was checked against the code on that date, not carried over
+from notes: two
 items on the previous list (a standalone binary binding `0.0.0.0`, and a
 JNI embed that never reclaims) turned out to describe crates this workspace
 no longer has, which is why this file exists and the notes did not.
@@ -62,18 +63,17 @@ Still stale:
   coldest thing on the disk rather than as a tenth of a window. The README's
   two statements of the same thing were corrected; `AGENTS.md`'s were left
   for a pass over that file.
-* The **Phase A** label on the detector's plumbing -- `owner.rs`,
-  `engine.rs`, `files.rs`, `proxy_retention.rs` and `proxy_cache.rs`, about
-  a dozen places -- reads as "carried for a trace line, obeyed by nothing".
-  It is load-bearing now. One sweep, when the trace module goes.
-* `retention::streams::REPORTED_SECONDS` is unused: its own doc says it goes
+* The **Phase A** label survives in five files, and it stopped being true
+  at the swap: `enginefs/src/files.rs:394`, `engine.rs`,
+  `retention/streams.rs`, `retention/owner.rs`, `server/src/proxy_cache.rs`
+  (four places) and `server/src/proxy_retention.rs`. It described a
+  detector that was observed and obeyed by nothing; the detector decides
+  what is kept now. The copies in `exempt.rs`, `ledger.rs` and `streams.rs`'s
+  module header were corrected on 2026-09-14; these were not.
+* `retention::streams::REPORTED_SECONDS` has no reader -- only its own
+  definition at `streams.rs:281`. Its doc says it goes
   when the want set is wired to the policy with the real number, which has
   happened. A deletion rather than a doc fix.
-* `README.md` around line 374 documents the `/stream-numbers.json`
-  `transfer` object as `downloadedBytes`/`uploadedBytes`/`ratio`. The
-  server also sends `unverifiedBytes` and, beside it, `refusedReclaims` --
-  the two numbers the retention work added and the ones a client most needs
-  to draw. The documented wire shape is two fields behind the real one.
 * `enginefs/src/retention/scenario.rs`'s `CONTAINER_METADATA_LOOKAHEAD` and
   `PLAYBACK_LOOKAHEAD` keep the field's numbers under the names of
   constants that no longer exist. Deliberate -- a scenario should stay the
