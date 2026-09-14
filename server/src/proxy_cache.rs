@@ -1068,9 +1068,9 @@ impl Cached {
                 // between them they cover a hit, a miss and the two halves
                 // of a partial hit.
                 reader.note(to);
-                // **Phase A**: what the reads of this entity look like,
-                // which nothing obeys yet. The cached half of it -- the
-                // miss goes through `Filler::take`.
+                // **What the reads of this entity look like**, which is
+                // what a pass keeps and gives back by. The cached half of
+                // it -- the miss goes through `Filler::take`.
                 reader.note_read(offset, to + 1, arrived, std::time::Instant::now());
                 Some((Ok(served), to + 1))
             }
@@ -1115,7 +1115,7 @@ pub struct Filler {
 impl Filler {
     fn take(&mut self, mut bytes: &[u8]) {
         // Where this body was before the origin's bytes went past, and when
-        // they did: the miss half of the Phase A detector. There is no
+        // they did: the miss half of what the detector sees. There is no
         // "asked" moment distinct from the arrival here -- the origin's
         // body is pushed at us -- so a read of a miss measures the origin's
         // delivery, which is what it is.
@@ -1281,6 +1281,15 @@ pub struct SweepReport {
     /// Cached resources removed -- one per key directory under the root.
     pub removed: usize,
     /// What they occupied, in bytes as the volume counts them.
+    ///
+    /// **Counted as it is written and as it goes, and nothing walks the
+    /// tree to learn it.** The budget's disk arm used to be sized from
+    /// whatever an eviction pass had last counted, which is 0 until the
+    /// first walk of the root finishes -- minutes, on a television with
+    /// sixteen thousand cache files, and the whole of a film. The two
+    /// places this cache's bytes move are a chunk landing and a chunk
+    /// being reclaimed, so both of them book what they did and the figure
+    /// is current without a syscall.
     pub freed_bytes: u64,
     /// Entries that could not be read or removed. Logged, never fatal.
     pub errors: usize,
@@ -1947,17 +1956,8 @@ mod tests {
         assert_eq!((whole.first, whole.last), (0, total - 1));
     }
 
-    /// **What this cache holds is counted as it is written and as it goes,
-    /// and nothing walks the tree to learn it.**
-    ///
-    /// The budget's disk arm used to be sized from whatever an eviction
-    /// pass had last counted, which is 0 until the first walk of the root
-    /// finishes -- minutes, on a television with sixteen thousand cache
-    /// files, and the whole of a film. The two places this cache's bytes
-    /// move are a chunk landing and a chunk being reclaimed, so both of
-    /// them book what they did and the figure is current without a syscall.
-    ///
-    /// **Phase A: a body served off the disk is a read the detector sees.**
+    /// **A body served off the disk is a read the detector sees**, and
+    /// what the detector sees is what the pass then keeps and reclaims by.
     ///
     /// The cached half. It has an "asked" moment of its own -- the poll
     /// that wants the next chunk -- so what it measures is the consumer's
@@ -1998,8 +1998,8 @@ mod tests {
         );
     }
 
-    /// **Phase A: what a fill pushed to the player is a read the detector
-    /// sees.**
+    /// **What a fill pushed to the player is a read the detector sees**,
+    /// and so a consumer of the entity the pass decides about.
     ///
     /// The miss is the half that matters most here -- it is when the cache
     /// is growing -- and it is the half with no "asked" moment of its own:

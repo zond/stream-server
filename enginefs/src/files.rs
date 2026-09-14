@@ -407,12 +407,12 @@ impl<H: TorrentHandle> AsyncRead for FileHandle<H> {
                 {
                     self.log_blocked_read(served, waited);
                 }
-                // **Phase A**: what the reads of this file look like, which
-                // nothing obeys yet. Fed from here because this is the one
-                // place that sees every served read with both of its
-                // timestamps, and fed to the engine rather than to anything
-                // on this handle because a stream survives the response
-                // that was carrying it.
+                // **What the reads of this file look like**, which is what
+                // a pass fetches, keeps and gives back by. Fed from here
+                // because this is the one place that sees every served read
+                // with both of its timestamps, and fed to the engine rather
+                // than to anything on this handle because a stream survives
+                // the response that was carrying it.
                 if delivered > 0 {
                     self.engine.note_read(
                         self.file_idx,

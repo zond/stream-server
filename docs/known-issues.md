@@ -55,25 +55,6 @@ which a pass now obeys.
 
 Still stale:
 
-* `AGENTS.md` describes the retention policy as a rolling window "90%
-  ahead, 10% behind" (three places on the `enginefs`/proxy rows) and the
-  driver as "fed the playhead a reader actually reached". What is kept is
-  now the forward run each detected consumer is being fetched into, plus
-  what an open read was promised; what is behind a consumer survives as the
-  coldest thing on the disk rather than as a tenth of a window. The README's
-  two statements of the same thing were corrected; `AGENTS.md`'s were left
-  for a pass over that file.
-* The **Phase A** label survives in five files, and it stopped being true
-  at the swap: `enginefs/src/files.rs:394`, `engine.rs`,
-  `retention/streams.rs`, `retention/owner.rs`, `server/src/proxy_cache.rs`
-  (four places) and `server/src/proxy_retention.rs`. It described a
-  detector that was observed and obeyed by nothing; the detector decides
-  what is kept now. The copies in `exempt.rs`, `ledger.rs` and `streams.rs`'s
-  module header were corrected on 2026-09-14; these were not.
-* `retention::streams::REPORTED_SECONDS` has no reader -- only its own
-  definition at `streams.rs:281`. Its doc says it goes
-  when the want set is wired to the policy with the real number, which has
-  happened. A deletion rather than a doc fix.
 * `enginefs/src/retention/scenario.rs`'s `CONTAINER_METADATA_LOOKAHEAD` and
   `PLAYBACK_LOOKAHEAD` keep the field's numbers under the names of
   constants that no longer exist. Deliberate -- a scenario should stay the

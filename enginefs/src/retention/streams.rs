@@ -272,14 +272,6 @@ const RATE_SMOOTHING_EIGHTHS: u64 = 1;
 /// called a lookahead.
 const FLOOR_PIECES: u64 = 2;
 
-/// The lookahead the trace reports a want set for, while nothing obeys it.
-///
-/// A stand-in for the buffer profile, which the owner knows and this side
-/// does not, chosen to match the profile a film plays under so a field log
-/// can be read against the policy that is still deciding. It goes when the
-/// want set is wired to the policy that has the real number.
-pub const REPORTED_SECONDS: u64 = 90;
-
 /// How many of the LRU's next candidates the trace names.
 ///
 /// Enough to see which end of the file they are at and whether they are the
@@ -842,7 +834,9 @@ impl Streams {
     /// instead of them: at this seam a read is at most the 256 KiB the
     /// response asks for, so a rate could be measuring the socket draining
     /// while a player fills its buffer rather than the player consuming.
-    /// Nothing is sized from this until a field log says which it is.
+    /// So nothing is ever sized from this alone: a window is sized from the
+    /// film's own arithmetic, which a measured rate may only lower
+    /// ([`Stream::demand`]).
     pub fn rates(&self, file: usize) -> Vec<Option<u64>> {
         self.by_file
             .get(&file)
@@ -861,7 +855,11 @@ impl Streams {
     /// the gap is however long the socket took -- which is a delivery rate
     /// while the player is filling its buffer, and its true consumption
     /// only once that buffer is full and TCP backpressure sets the pace.
-    /// Phase A's job is to find out which of those the numbers look like.
+    /// Which of the two a number is, is what [`Stream::sample`] settles:
+    /// most of them are delivery, so a sample is refused unless the player
+    /// came back later than the picture it was carrying, and what survives
+    /// may only ever lower the film's own arithmetic. These two halves stay
+    /// raw so a field log can be read against the window a pass sized.
     pub fn last_sample(&self, file: usize) -> Option<(u64, std::time::Duration)> {
         let streams = &self.by_file.get(&file)?.streams;
         let stream = streams.last()?;

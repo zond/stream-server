@@ -191,9 +191,9 @@ const PASSES_PER_WINDOW: u64 = 20;
 /// The read-pattern detectors, one per entity, shared between the readers
 /// that feed them and the pass that answers them.
 ///
-/// **Phase A**, exactly as on the torrent side: what the reads of a proxied
-/// stream look like, observed and obeyed by nothing. The proxy's shape is
-/// the same in every part that matters -- a consumer is the unbroken run of
+/// **What the reads of a proxied stream look like**, and what its passes
+/// keep, fetch and give back by, exactly as on the torrent side. The
+/// proxy's shape is the same in every part that matters -- a consumer is the unbroken run of
 /// chunks it caused, membership is a question about the disk, and the disk
 /// here is the owner's own held set rather than a listing -- so the
 /// detector is the engine's, over chunk indices instead of piece indices.
@@ -264,8 +264,10 @@ struct ProxyBacking {
     /// the owner takes a chunk off the disk, so it is the only place the
     /// count comes down through this backing.
     occupancy: Arc<Occupancy>,
-    /// **Phase A only**: what the reads of each entity look like, fed by
-    /// the bodies and answered by the pass. See [`Detectors`].
+    /// **What this backing decides from**: what the reads of each entity
+    /// look like, fed by the bodies and answered by
+    /// [`ProxyBacking::reading`], which draws the want set, the exempt bits
+    /// and the reclaim out of them. See [`Detectors`].
     detectors: Detectors,
     /// The threads the blocking halves of a pass really ran on.
     ///
@@ -969,8 +971,9 @@ pub struct ProxyRetention {
     /// What this cache holds, in bytes, counted as chunks are written and
     /// as they go: see [`Self::occupancy`].
     occupancy: Arc<Occupancy>,
-    /// **Phase A only**: the detectors the bodies feed, shared with the
-    /// backing whose pass answers them. See [`Detectors`].
+    /// The detectors the bodies feed, shared with the backing whose pass
+    /// answers them and sizes every window it keeps from them. See
+    /// [`Detectors`].
     detectors: Detectors,
     /// How many bodies this process has opened, which is what tells one
     /// consumer's reads from another's in the detector. A reopen is a new
@@ -1133,7 +1136,7 @@ impl ProxyRetention {
         }
     }
 
-    /// **Phase A**: keep one served read until a pass can answer it.
+    /// Keep one served read until a pass can answer it.
     ///
     /// A lock, a hash lookup and a push, on the body path -- the same cost
     /// as the playhead beside it. The answer waits for the pass because the
@@ -1150,7 +1153,7 @@ impl ProxyRetention {
         }
     }
 
-    /// **Phase A**: where each consumer of `dir` has reached, and how many
+    /// Where each consumer of `dir` has reached, and how many
     /// reads took it there. What the detector has made of this entity, for
     /// a test to read; the shipped build says it in a trace line.
     #[cfg(test)]
@@ -1531,8 +1534,8 @@ impl Reader {
         self.retention.clone()
     }
 
-    /// **Phase A**: bytes `begin..end` of this entity went out to a player,
-    /// having been asked for at `arrived` and delivered at `returned`.
+    /// Bytes `begin..end` of this entity went out to a player, having been
+    /// asked for at `arrived` and delivered at `returned`.
     ///
     /// Kept until a pass can say which consumer they belonged to, because
     /// membership is a question about the disk and the body path cannot
@@ -2437,8 +2440,8 @@ mod tests {
         );
     }
 
-    /// **Phase A on the proxy: a body's reads are one consumer**, answered
-    /// against the owner's held set exactly as the torrent's are.
+    /// **A body's reads are one consumer**, answered against the owner's
+    /// held set exactly as the torrent's are.
     ///
     /// The proxy's shape is the same in every part that matters -- a
     /// consumer is the unbroken run of chunks it caused, and membership is

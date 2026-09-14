@@ -564,20 +564,6 @@ pub trait Backing: Sized + Send + Sync + 'static {
     fn want_all(&self, _domain: &Self::Domain) -> impl Future<Output = ()> + Send {
         async {}
     }
-    /// **TEMPORARY**, with [`crate::retention::trace`] and deleted with it:
-    /// what the backing can say about the entity that the owner cannot.
-    /// **Phase A only**: hand the backing the reads served since the last
-    /// pass, together with what the listing just found on the disk.
-    ///
-    /// Membership is a question about the disk -- a consumer is the
-    /// unbroken run of bytes it caused -- so it is answered here, where the
-    /// listing is, and not on the read path, which cannot reach one
-    /// cheaply. A read carries its own timestamps, so nothing is lost by
-    /// answering late; the pass is the first moment the question *can* be
-    /// answered.
-    ///
-    /// Defaulted to nothing: the proxy has the same shape and is not wired
-    /// to it yet. Goes out with `crate::retention::trace`.
     /// **What this entity's consumers are asking of the disk**, as the
     /// detector answers it: what to fetch ahead of them, what no unlink may
     /// touch, and what to give back first if something must go.
@@ -586,9 +572,12 @@ pub trait Backing: Sized + Send + Sync + 'static {
     /// consumer is the unbroken run of bytes it caused, so membership is a
     /// question about the disk and this is the first moment in a pass that
     /// has one -- and the backing owns the detector because the reads reach
-    /// it, not the owner.
+    /// it, not the owner. A read carries its own timestamps, so nothing is
+    /// lost by answering it here rather than where it was served.
     fn reading(&self, domain: &Self::Domain, held: &BTreeSet<u32>, asking: Asking) -> Consumers;
 
+    /// **TEMPORARY**, with [`crate::retention::trace`] and deleted with it:
+    /// what the backing can say about the entity that the owner cannot.
     fn trace(
         &self,
         _store: &Self::Store,
@@ -1905,15 +1894,6 @@ impl<B: Backing> Retention<B> {
             let state = entity.state.lock();
             return Self::nothing(&state, claim, about, Some(begin.at));
         };
-        // **Phase A**: the reads served since the last pass, answered
-        // against the listing above. Here because membership is a question
-        // about the disk and this is the first place in the pass that knows
-        // what is on it. Observed and obeyed by nothing.
-        // Both published numbers, and the backing decides what its own
-        // entity may take from them: the cap is over the whole cache, the
-        // headroom is what the volume will still give, and what turns those
-        // into one entity's allowance is what that entity holds -- which is
-        // the listing above, and is the backing's to price.
         // **What this entity's consumers are asking of the disk**, answered
         // against the listing above: what to fetch ahead of them, what no
         // unlink may touch, and what to give back if something must go.
@@ -1924,7 +1904,10 @@ impl<B: Backing> Retention<B> {
         // is: a starving player's reads measure our delivery and not its
         // consumption (`retention::streams::Stream::sample`). The seconds
         // are the viewer's buffer profile, which is the viewer's decision
-        // and not the disk's.
+        // and not the disk's. The cap is over the whole cache and the
+        // headroom is what the volume will still give; what turns those two
+        // into this entity's allowance is what this entity holds -- the
+        // listing above -- and that is the backing's to price.
         let asking = {
             let state = entity.state.lock();
             let (buffering, stride, domain) =

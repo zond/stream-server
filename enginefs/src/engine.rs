@@ -360,9 +360,11 @@ pub(crate) struct TorrentBacking<H: TorrentHandle> {
     /// property, and the owner asks about it before every pass and at every
     /// door.
     pinned: Arc<parking_lot::RwLock<BTreeSet<usize>>>,
-    /// **Phase A only**: the engine's read-pattern detector, shared the way
-    /// `live` and `pinned` are. The pass hands it the listing because
-    /// membership is a question about the disk; see
+    /// **What a pass decides from**: the engine's read-pattern detector,
+    /// shared the way `live` and `pinned` are. The pass hands it the
+    /// listing because membership is a question about the disk, and takes
+    /// back what to fetch, what no unlink may touch and what to give back
+    /// first -- see [`crate::retention::owner::Backing::reading`] and
     /// [`crate::retention::streams`].
     streams: Arc<parking_lot::Mutex<crate::retention::streams::Streams>>,
     /// Whether the embedder named a pin set at boot, shared with the whole
@@ -1220,9 +1222,11 @@ pub struct Engine<H: TorrentHandle> {
     /// leaves its readers parked for good unless something here wakes them.
     read_wakers: parking_lot::Mutex<HashMap<u64, std::task::Waker>>,
     next_reader_id: AtomicU64,
-    /// **Phase A only**: what the reads of this torrent look like, worked
-    /// out from the reads and obeyed by nothing. See
-    /// [`crate::retention::streams`] and `docs/read-pattern-retention.md`.
+    /// **What the reads of this torrent look like**, worked out from the
+    /// reads themselves and obeyed by every pass over its files: what is
+    /// fetched, what may not be unlinked and what is given back are all
+    /// answered from here. See [`crate::retention::streams`] and
+    /// `docs/read-pattern-retention.md`.
     /// Here rather than on a `FileHandle` or a `Reader` because both of
     /// those die with the HTTP response, and the thing being detected
     /// survives a reopen -- one that did not would report a new stream per
@@ -1505,9 +1509,8 @@ impl<H: TorrentHandle> Engine<H> {
         self.reads_refused.store(false, Ordering::SeqCst);
     }
 
-    /// Whether reads through this engine fail rather than wait.
-    /// **Phase A only.** Take account of one served read, and say what the
-    /// detector has found when a report is due.
+    /// Take account of one served read: the detector this feeds is what
+    /// the entity's next pass draws its windows from.
     ///
     /// Called from `poll_read`'s delivered path, which already takes the
     /// entity's lock through `Reader::note`; this takes one of its own,
@@ -1522,6 +1525,7 @@ impl<H: TorrentHandle> Engine<H> {
         self.streams.lock().record(file_idx, reader_id, read);
     }
 
+    /// Whether reads through this engine fail rather than wait.
     pub fn reads_refused(&self) -> bool {
         self.reads_refused.load(Ordering::SeqCst)
     }
