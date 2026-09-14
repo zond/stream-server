@@ -252,4 +252,10 @@ whose job was partly to say "not real" or "leave it". Three did.
   window is drawn at the tail and the head reads there. The field's disk
   keeps the two apart because the pieces between are not held. See
   `docs/review-2026-09-14.md` N1.
+- **`a_stream_wider_than_its_window_is_fetched_inside_it` is timing-bound.**
+  It failed twice in about eight runs on 2026-09-15 while the machine was
+  building APKs beside it, and passed on every rerun; it measures bytes
+  fetched across a pass against a four-piece slack over a real librqbit
+  swarm. Not a regression of anything that day; wants either a wider
+  slack or a fake swarm.
 
