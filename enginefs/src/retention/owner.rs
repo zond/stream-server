@@ -307,6 +307,12 @@ pub struct Asking {
     /// reclaim chosen against a smaller set than the door refuses frees
     /// nothing at all.
     pub holding: Vec<Range<u32>>,
+    /// **The committed set**, as runs: the pieces the policy has offered a
+    /// peer and will never reclaim (`RetentionPolicy::advance` vetoes
+    /// them). Inside the allowance and outside the reclaim, so the disk
+    /// settles at the cap and not at the cap plus the committed set; see
+    /// [`Self::allowance`].
+    pub committed: Vec<Range<u32>>,
     /// **How many bytes the fill may put on the disk between two passes**,
     /// which is the room the allowance has to leave for it.
     ///
@@ -347,9 +353,23 @@ impl Asking {
     /// want everything: every stream falls to its floor, which is what a
     /// stream with no measurement gets anyway.
     ///
+    /// **Less the committed set.** Those pieces are on the disk and stay
+    /// there whatever the consumers ask for -- a piece offered to a peer is
+    /// out of reach of every reclaim -- so an allowance that did not count
+    /// them let the disk settle at the cap *plus* the committed set, by up
+    /// to `COMMITTED_SECONDS` of film. Masked under the Normal profile,
+    /// whose margin happened to be as large; exposed under Maximum.
+    ///
     /// One computation for every backing, so the scenarios test the same
-    /// arithmetic the torrent and the proxy run.
-    pub fn allowance(&self, held: u64) -> u64 {
+    /// arithmetic the torrent and the proxy run. `piece` is the piece
+    /// length and `held` how many pieces the listing found.
+    ///
+    /// Only `Bytes` reaches this in the shipped drivers: a policy is
+    /// installed from a `Bytes` budget alone, and no policy means no pass.
+    /// The other arms are the shapes the type admits, answered the safe way
+    /// round -- nothing stated over nothing read is not a licence.
+    pub fn allowance(&self, piece: u64, held: usize) -> u64 {
+        let held = (held as u64).saturating_mul(piece);
         let available = match (self.budget, self.headroom) {
             (CacheBudget::Unbounded, _) => u64::MAX,
             (CacheBudget::Bytes(cap), Some(headroom)) => cap.min(held.saturating_add(headroom)),
@@ -359,8 +379,30 @@ impl Asking {
         };
         // An allowance that spent the whole budget would sit a stride over
         // it for as long as anything is downloading.
-        available.saturating_sub(self.margin)
+        available
+            .saturating_sub(self.margin)
+            .saturating_sub(self.committed_pieces().saturating_mul(piece))
     }
+
+    /// How many pieces the committed set holds.
+    fn committed_pieces(&self) -> u64 {
+        self.committed
+            .iter()
+            .map(|run| u64::from(run.end.saturating_sub(run.start)))
+            .sum()
+    }
+}
+
+/// A set of pieces as its runs, ascending.
+fn runs_of(pieces: &BTreeSet<u32>) -> Vec<Range<u32>> {
+    let mut runs: Vec<Range<u32>> = Vec::new();
+    for &piece in pieces {
+        match runs.last_mut() {
+            Some(run) if run.end == piece => run.end = piece + 1,
+            _ => runs.push(piece..piece + 1),
+        }
+    }
+    runs
 }
 
 /// What the consumers of one entity are asking of its disk.
@@ -739,6 +781,15 @@ struct State<B: Backing> {
     /// silent and the reader that asked has ended: one of the questions
     /// [`Self::head`] asks, and the last resort under [`Consumers::at`].
     last_position: Option<B::Position>,
+    /// **Where the entity is being consumed, as the detector last said**:
+    /// the piece the busiest stream had reached at the last pass
+    /// ([`Consumers::at`]), or `None` when the detector was silent -- no
+    /// pass yet, nothing reading it for `STREAM_IDLE`, or the policy gone.
+    /// What [`Self::holding`] reports as the head ahead of every reading
+    /// off the readers: which of several readers is the viewer is a
+    /// question about behaviour, and mpv's index crawler is regularly the
+    /// newest reader with a head at the tail of the file.
+    consumed_at: Option<u32>,
     /// How long this entity's film is, where a player has said.
     ///
     /// **A property of the film and not of a report**, which is why it sits
@@ -1058,15 +1109,19 @@ pub struct Holding<B: Backing> {
     pub promised: Vec<Range<u32>>,
     /// Some reader has delivered a byte and has not ended.
     pub live_playhead: bool,
-    /// The entity's head, as a pass measures it and in the same order
-    /// ([`State::head`]): a live playing read's, else where playback last
-    /// got to, else any live read's. `None` when nothing has ever read it.
+    /// Where the entity is being consumed: the detector's answer from the
+    /// last pass ([`State::consumed_at`], the piece its busiest stream had
+    /// reached), and only when the detector is silent the readers' head in
+    /// the order [`State::head`] asks -- a live read's, else where playback
+    /// last got to. `None` when nothing has ever read it.
     ///
-    /// **This, and not [`Self::last_position`], is what a reading of the
-    /// window has to split at.** The two differ exactly when a probe is or
-    /// has been open, and that is the reading that had the overlay show a
-    /// 4K film at 0:00 with fifty megabytes "behind" the playhead and four
-    /// ahead.
+    /// **This, and not [`Self::last_position`] or the newest reader, is
+    /// what a reading of the window has to split at.** mpv keeps an index
+    /// crawler open beside the viewer and reopens it about once a second,
+    /// so the newest reader is regularly one parked at the tail of the
+    /// file: that is the reading that had the overlay show a 4K film at
+    /// 0:00 with fifty megabytes "behind" the playhead and four ahead. The
+    /// detector tells the two apart by what they eat.
     pub head: Option<B::Position>,
     /// The entity's last delivered *playback* byte, and `None` until one
     /// has gone out. A probe's bytes never move it.
@@ -1171,6 +1226,7 @@ impl<B: Backing> Retention<B> {
                         windows: Vec::new(),
                         readers: HashMap::new(),
                         last_position: None,
+                        consumed_at: None,
                         duration: None,
                         // Assumed held back until a clear says otherwise: an
                         // entity that was forgotten took the record with it,
@@ -1768,12 +1824,10 @@ impl<B: Backing> Retention<B> {
         // (rule 1), and so is the liveness cell beside it.
         if self.backing.keeps_everything(key) {
             self.release_to_pin(&entity, &mut claim).await;
-            let state = entity.state.lock();
-            return Self::nothing(&state, claim, about, None);
+            return Self::slack_nothing(claim);
         }
         if self.backing.is_live(key) {
-            let state = entity.state.lock();
-            return Self::nothing(&state, claim, about, None);
+            return Self::slack_nothing(claim);
         }
         {
             let state = entity.state.lock();
@@ -1783,7 +1837,7 @@ impl<B: Backing> Retention<B> {
                     "a stream opened on this entity since its mode was decided; \
                      the slack pass takes nothing"
                 );
-                return Self::nothing(&state, claim, about, None);
+                return Self::slack_nothing(claim);
             }
         }
         let domain = entity.state.lock().domain.clone();
@@ -1795,8 +1849,7 @@ impl<B: Backing> Retention<B> {
                 key = ?key,
                 "the slack pass has no reading of the disk; this pass takes nothing"
             );
-            let state = entity.state.lock();
-            return Self::nothing(&state, claim, about, None);
+            return Self::slack_nothing(claim);
         };
         // Un-advertisable before anything is unlinked, and re-issued every
         // tick for as long as the entity holds anything: a delete refused
@@ -1810,8 +1863,7 @@ impl<B: Backing> Retention<B> {
                 error = %format!("{error:#}"),
                 "could not hold a slack entity's pieces back from what we announce; not deleting them this pass"
             );
-            let state = entity.state.lock();
-            return Self::nothing(&state, claim, about, None);
+            return Self::slack_nothing(claim);
         }
         {
             let mut state = entity.state.lock();
@@ -1959,6 +2011,11 @@ impl<B: Backing> Retention<B> {
             let state = entity.state.lock();
             let (buffering, stride, domain) =
                 (state.buffering(), state.stride, state.domain.clone());
+            let committed = state
+                .installed
+                .as_ref()
+                .map(|installed| runs_of(installed.policy.advertised()))
+                .unwrap_or_default();
             let mut holding: Vec<Range<u32>> = state
                 .readers
                 .values()
@@ -1988,6 +2045,7 @@ impl<B: Backing> Retention<B> {
                     .unwrap_or(crate::backend::priorities::MAXIMUM_WINDOW_SECONDS),
                 now,
                 holding,
+                committed,
                 // **What arrives between this pass and the next one.**
                 //
                 // Two readings of the same thing and the larger wins. What
@@ -2135,6 +2193,9 @@ impl<B: Backing> Retention<B> {
             // read that parks between passes can write its promise into the
             // same set under this same lock (`Reader::promises`).
             state.exempt = Some(consumers.exempt.clone());
+            // Where the detector found the entity being consumed, for the
+            // head every reading splits at ([`State::consumed_at`]).
+            state.consumed_at = consumers.at;
             // And every promise live *now*, re-held under this lock. The
             // publication above was computed from the promises the pass
             // read before it ran; one made in between wrote into the set
@@ -2362,6 +2423,24 @@ impl<B: Backing> Retention<B> {
     /// The end of a pass that concluded nothing: `again` decided under the
     /// L2 guard the caller holds, and the claim dropped or handed on before
     /// that guard goes (rule 3). `measured` as for [`State::owes_a_pass`].
+    /// A slack pass that takes nothing lets its turn go and hands nothing
+    /// on. **Every exit before `go_slack`, not only the last**: they are
+    /// all the entity turning out to be pinned or live, or a listing that
+    /// failed, and the slack driver has nowhere to hand a claim to --
+    /// `drop_slack` reads nothing back. Under [`Trigger::OnMove`]
+    /// [`Self::release`] would answer "again" here whenever a policy stands
+    /// and a head is in the domain, so the claim was handed back and
+    /// dropped unread; a driver that looped on the answer would spin. A
+    /// byte due on an entity that has become live is the next live pass's,
+    /// armed by the byte after it.
+    fn slack_nothing(claim: Claim) -> Outcome {
+        drop(claim);
+        Outcome {
+            concluded: None,
+            again: None,
+        }
+    }
+
     fn nothing(
         state: &State<B>,
         claim: Claim,
@@ -2618,9 +2697,12 @@ impl<B: Backing> State<B> {
     /// **The detector outranks all three, and this is the fallback under
     /// it.** Which of several readers of one file is the viewer is a
     /// question about behaviour, and `Consumers::at` is what answers it
-    /// from the bytes each stream has eaten; the pass asks that first and
-    /// only falls here when nothing has read the entity lately. What is
-    /// left below is the order for an entity the detector is silent about.
+    /// from the bytes each stream has eaten; [`Self::holding`] reports
+    /// that first ([`Self::consumed_at`]) and only falls here when the
+    /// detector is silent. The pass's own cadence -- where it measures
+    /// from, whether it is owed another -- is this order throughout, since
+    /// it has to be a fixed point of itself. What is below is the order
+    /// for an entity the detector is silent about.
     ///
     /// 1. **A read that is playing it now**, at its head -- the last byte
     ///    it delivered, or where it was opened if it is still parked on its
@@ -2819,6 +2901,7 @@ impl<B: Backing> State<B> {
     fn forget_policy(&mut self, _turn: &mut Turn) {
         self.installed = None;
         self.decided = None;
+        self.consumed_at = None;
         // The doomed runs were this policy's decision; a later policy makes
         // its own.
         self.doomed = Vec::new();
@@ -2916,6 +2999,18 @@ impl<B: Backing> State<B> {
         self.installed = None;
         self.decided = None;
         self.windows = Vec::new();
+        self.consumed_at = None;
+    }
+
+    /// [`Self::consumed_at`] as a position, or `None` when the detector
+    /// was silent or the backing cannot make one. To the piece: a file
+    /// that starts inside a piece is placed at that piece's start, which
+    /// is the granularity every reading of this has anyway.
+    fn consumed_head(&self) -> Option<B::Position> {
+        let piece = self.consumed_at?;
+        let extent = B::extent(&self.domain);
+        let offset = u64::from(piece.saturating_sub(extent.start)) * B::piece_length(&self.domain)?;
+        B::position_at(&self.domain, offset)
     }
 
     fn holding(&self) -> Holding<B> {
@@ -2939,7 +3034,7 @@ impl<B: Backing> State<B> {
                 .readers
                 .values()
                 .any(|reader| reader.playhead.is_some()),
-            head: self.head(None),
+            head: self.consumed_head().or_else(|| self.head(None)),
             last_position: self.last_position,
             decided: self.decided,
         }
@@ -5903,33 +5998,151 @@ mod tests {
             ceiling: None,
             seconds: 90,
             holding: Vec::new(),
+            committed: Vec::new(),
             margin,
             now: std::time::Instant::now(),
         };
         assert_eq!(
-            asking(CacheBudget::Unbounded, None, 5).allowance(100),
+            asking(CacheBudget::Unbounded, None, 5).allowance(1, 100),
             u64::MAX - 5
         );
         assert_eq!(
-            asking(CacheBudget::Bytes(1_000), Some(200), 0).allowance(100),
+            asking(CacheBudget::Bytes(1_000), Some(200), 0).allowance(1, 100),
             300,
             "the volume binds"
         );
         assert_eq!(
-            asking(CacheBudget::Bytes(250), Some(200), 0).allowance(100),
+            asking(CacheBudget::Bytes(250), Some(200), 0).allowance(1, 100),
             250,
             "the cap binds"
         );
         assert_eq!(
-            asking(CacheBudget::Unknown, Some(200), 50).allowance(100),
+            asking(CacheBudget::Unknown, Some(200), 50).allowance(1, 100),
             250,
             "no cap stated: what is held plus the headroom, less the margin"
         );
-        assert_eq!(asking(CacheBudget::Bytes(250), None, 0).allowance(100), 250);
         assert_eq!(
-            asking(CacheBudget::Unknown, None, 0).allowance(100),
+            asking(CacheBudget::Bytes(250), None, 0).allowance(1, 100),
+            250
+        );
+        assert_eq!(
+            asking(CacheBudget::Unknown, None, 0).allowance(1, 100),
             0,
             "nothing stated and nothing read is not a licence"
+        );
+        // Ten pieces of a thousand bytes held, three of them committed,
+        // under a cap of six pieces: the window may be three.
+        let mut committed = asking(CacheBudget::Bytes(6_000), None, 0);
+        committed.committed = vec![0..2, 5..6];
+        assert_eq!(
+            committed.allowance(1_000, 10),
+            3_000,
+            "the committed set is on the disk whatever the consumers ask for"
+        );
+    }
+
+    /// **The head a reading splits at is where the entity is consumed,
+    /// not the newest reader's.**
+    ///
+    /// mpv keeps an index crawler open beside the viewer and reopens it
+    /// about once a second, so the newest reader with a head is regularly
+    /// one parked at the tail. The detector tells them apart by what they
+    /// eat, and the holding reports its answer.
+    #[tokio::test]
+    async fn the_holding_head_is_where_the_entity_is_consumed_not_the_newest_readers() {
+        let (backing, owner, _budget) = torrent();
+        // The field's disk: the viewer's run at the head of the file and
+        // the tail piece the crawler reads, nothing between. (A fully
+        // cached film joins the two reads into one stream by the
+        // detector's same-run rule; see `docs/known-issues.md`.)
+        *backing.held.lock() = [0u32, 1, 2, 3, 7].into_iter().chain(8..16).collect();
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        // The viewer, three pieces into the file and eating.
+        let viewer = owner.reader(0, domain(0, 0..8));
+        viewer.note((0, 2 * PIECE));
+        backing.read_from(0, 3 * PIECE);
+        // The crawler, opened after it and parked at the tail, with one
+        // small read to its name.
+        let crawler = owner.reader(0, domain(0, 0..8));
+        crawler.note((0, 7 * PIECE));
+        backing.read_from(7 * PIECE, 1);
+        // The torrent passes on its tick.
+        let claim = owner.turn(&0).await.expect("the turn");
+
+        owner
+            .pass(&0, &(), claim, Mode::Live)
+            .await
+            .concluded
+            .expect("a pass");
+        let head = owner.holding(&0).unwrap().head.expect("a head");
+        assert_eq!(
+            Torrent::index_of(&domain(0, 0..8), head),
+            Some(3),
+            "the split landed on the crawler at the tail, not on the viewer"
+        );
+    }
+
+    /// **A promise made while the backing is publishing is held after
+    /// it.**
+    ///
+    /// The backing publishes what may not be unlinked with no owner lock
+    /// held, and a read can park and promise a piece between the pass's
+    /// reading of the promises and that publication; the publication is a
+    /// whole-word store and overwrites the promise's bit. Step 5 re-holds
+    /// every live promise under the entity's lock, and that is the only
+    /// thing that keeps a chunk out of a body a player has been promised
+    /// the length of.
+    #[tokio::test]
+    async fn a_promise_made_under_the_publication_is_re_held_after_it() {
+        let (backing, owner, _budget) = proxy();
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        let reader = owner.reader(0, domain(0, 0..8));
+        let claim = reader.note((0, 0)).expect("due");
+        backing.read_from(0, 1);
+        // A second read parks on piece 6 while the backing is inside its
+        // reading, after the pass took its snapshot of the promises.
+        let late = owner.reader(0, domain(0, 0..8));
+        *backing.on_reading.lock() = Some(Box::new(move || late.promises(6..7)));
+
+        owner
+            .pass(&0, &(), claim, Mode::Live)
+            .await
+            .concluded
+            .expect("a pass");
+        let exempt = owner
+            .entity(0, domain(0, 0..8))
+            .state
+            .lock()
+            .exempt
+            .clone()
+            .expect("the pass published");
+        assert!(
+            exempt.holds(6),
+            "the promise made under the publication was overwritten by it"
+        );
+    }
+
+    /// **A slack pass that finds the entity live hands no claim on.**
+    ///
+    /// Under [`Trigger::OnMove`] the ordinary release answers "again"
+    /// whenever a policy stands and a head is in the domain, and every
+    /// early exit of the slack pass used to take it: the claim came back
+    /// `Some` to a driver that reads nothing back, and a driver that looped
+    /// on it would have spun.
+    #[tokio::test]
+    async fn a_slack_pass_that_finds_the_entity_live_hands_no_claim_on() {
+        let (backing, owner, _budget) = proxy();
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        owner.note_position(&0, (0, 0));
+        let opens = owner.opens_of(&0);
+        backing.is_live.store(true, Ordering::SeqCst);
+
+        let claim = owner.turn(&0).await.expect("the turn");
+        let outcome = owner.pass(&0, &(), claim, Mode::Slack { opens }).await;
+        assert!(outcome.concluded.is_none(), "nothing was concluded");
+        assert!(
+            outcome.again.is_none(),
+            "a slack pass that took nothing handed its claim on"
         );
     }
 

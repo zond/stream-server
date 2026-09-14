@@ -561,7 +561,7 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         let now = asking.now;
         // **What this entity may hold**: [`Asking::allowance`] has the
         // argument.
-        let available = asking.allowance((held.len() as u64).saturating_mul(domain.piece_length));
+        let available = asking.allowance(domain.piece_length, held.len());
         let mut streams = self.streams.lock();
         // Where this file lies, first: a read carries an offset inside its
         // own file, and every question the detector answers is about
@@ -592,6 +592,9 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         // door refuses what this publishes.
         let mut kept = want.clone();
         kept.extend(asking.holding.iter().cloned());
+        // And the committed set: on the disk whatever is asked for, so the
+        // coldest quota is not spent on pieces the policy then vetoes.
+        kept.extend(asking.committed.iter().cloned());
         exempt.publish(&kept);
         // **What must go, and no more.** The disk that nothing else needs
         // is scrub-back: giving it up before something asks for the room
@@ -1602,12 +1605,12 @@ impl<H: TorrentHandle> Engine<H> {
     ) -> Option<crate::retention::PolicyReading> {
         let holding = self.retention.holding(&file_idx)?;
         let installed = holding.installed?;
-        // The entity's head and not its last delivered byte: the two part
-        // company exactly when a probe is or has been open, and this is the
-        // reading a client draws the behind/ahead split from. On the
-        // television the split read 50.3 MB behind and 4.2 ahead with the
-        // player at 0:00, because mpv's read of the tail had left the
-        // file's head at the end of the file.
+        // The entity's head as the detector last placed it, and not its
+        // last delivered byte or its newest reader's: this is the reading
+        // a client draws the behind/ahead split from. On the television
+        // the split read 50.3 MB behind and 4.2 ahead with the player at
+        // 0:00, because mpv's read of the tail had left the file's head at
+        // the end of the file; see `Holding::head`.
         let playhead = TorrentBacking::<H>::index_of(&holding.domain, holding.head?)?;
         Some(crate::retention::PolicyReading::new(
             installed.pieces,
@@ -2408,6 +2411,66 @@ mod pin_tests {
     /// grant a second, so the five doublings that reach a full window take
     /// fifty seconds instead of the fraction of one the doubling was
     /// designed around.
+    /// **The committed set is not offered for reclaim.**
+    ///
+    /// `RetentionPolicy::advance` vetoes a committed piece whatever the
+    /// coldest list says, so a list that named them spent its quota on
+    /// pieces that were never going to go: once the coldest few were all
+    /// committed, a pass over its allowance freed nothing while warmer
+    /// pieces stayed. The committed set is kept beside the want set, so the
+    /// quota lands on pieces a reclaim can take.
+    #[test]
+    fn the_committed_set_is_not_offered_for_reclaim() {
+        let streams: Arc<parking_lot::Mutex<crate::retention::streams::Streams>> = Arc::default();
+        let backing = TorrentBacking {
+            handle: PinnedHandle {
+                reselected: Arc::default(),
+            },
+            info_hash: "pinned".to_string(),
+            live: Arc::new(Live::new()),
+            pinned: Arc::default(),
+            pins_unknown: Arc::default(),
+            refused: Arc::new(AtomicUsize::new(0)),
+            streams: streams.clone(),
+        };
+        let domain = FileDomain {
+            file_idx: 0,
+            span: FilePieceSpan {
+                pieces: 0..8,
+                offset: 0,
+                bytes: 8 * PIECE,
+            },
+            piece_length: PIECE,
+        };
+        let held: BTreeSet<u32> = (0..8).collect();
+        // Nothing read lately, the whole file on the disk, and an allowance
+        // the committed set alone fills: everything else must go, and
+        // nothing of the committed set is even offered.
+        let consumers = backing.reading(
+            &domain,
+            &held,
+            crate::retention::owner::Asking {
+                budget: crate::retention::CacheBudget::Bytes(2 * PIECE),
+                headroom: None,
+                ceiling: None,
+                seconds: 90,
+                holding: Vec::new(),
+                committed: Vec::from([0..2]),
+                margin: 0,
+                now: std::time::Instant::now(),
+            },
+        );
+        assert!(
+            !consumers.reclaim.is_empty(),
+            "an entity over its allowance was offered nothing to reclaim"
+        );
+        assert!(
+            !consumers.reclaim.contains(&0) && !consumers.reclaim.contains(&1),
+            "a committed piece was offered for reclaim: {:?}",
+            consumers.reclaim
+        );
+    }
+
     #[test]
     fn a_window_grows_on_every_pass_and_not_only_on_reported_ones() {
         use crate::retention::streams::Read;
@@ -2457,6 +2520,7 @@ mod pin_tests {
                 ceiling: Some(PIECE),
                 seconds: 90,
                 holding: Vec::new(),
+                committed: Vec::new(),
                 margin: 0,
                 now: std::time::Instant::now(),
             },
@@ -2486,6 +2550,7 @@ mod pin_tests {
                 ceiling: Some(PIECE),
                 seconds: 90,
                 holding: Vec::new(),
+                committed: Vec::new(),
                 margin: 0,
                 now: std::time::Instant::now(),
             },
@@ -2558,6 +2623,7 @@ mod pin_tests {
                         ceiling: Some(PIECE),
                         seconds: 90,
                         holding: Vec::new(),
+                        committed: Vec::new(),
                         margin: 0,
                         now: std::time::Instant::now(),
                     },
@@ -2634,6 +2700,7 @@ mod pin_tests {
                     ceiling: Some(PIECE),
                     seconds: 90,
                     holding: Vec::new(),
+                    committed: Vec::new(),
                     margin: 0,
                     now: std::time::Instant::now(),
                 },

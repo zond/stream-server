@@ -589,7 +589,18 @@ impl FileStreams {
             let target = share(stream.demand(ceiling).saturating_mul(seconds));
             stream.grant(target, floor);
         }
-        self.windows(piece)
+        let windows = self.windows(piece);
+        // What a window covers is what may not be unlinked, so the answer
+        // is published here, where it is known, rather than recomputed at a
+        // door that would have to take this lock to do it. **Here and not
+        // in [`Self::windows`]**: that is also what a pass of *another*
+        // file reads for this one, and a publication from there rewrote
+        // this file's set with its windows alone -- without the promises
+        // its own pass had published beside them. The set is this file's
+        // pass's to write, and the backing overwrites it a call later with
+        // the windows and the promises together.
+        self.exempt.publish(&windows);
+        windows
     }
 
     /// Where the windows already granted reach, granting nothing.
@@ -600,8 +611,7 @@ impl FileStreams {
     /// lookahead at a rate set by how many files are being read rather than
     /// by its own.
     fn windows(&self, piece: u64) -> Vec<Range<u32>> {
-        let windows: Vec<Range<u32>> = self
-            .streams
+        self.streams
             .iter()
             .filter_map(|stream| {
                 let from = self.geometry.at(piece, stream.end);
@@ -612,12 +622,7 @@ impl FileStreams {
                 let window = from.max(self.geometry.bound.start)..to.min(self.geometry.bound.end);
                 (!window.is_empty()).then_some(window)
             })
-            .collect();
-        // What a window covers is what may not be unlinked, so the answer
-        // is published here, where it is known, rather than recomputed at a
-        // door that would have to take this lock to do it.
-        self.exempt.publish(&windows);
-        windows
+            .collect()
     }
 }
 
@@ -1622,6 +1627,33 @@ mod tests {
         assert!(
             streams.by_file[&0].streams.is_empty(),
             "file 0's stream, unread for a minute, survived file 1's pass"
+        );
+    }
+
+    /// **A pass of one file does not write into another file's exempt
+    /// set.**
+    ///
+    /// The set is what that file's door reads, and it holds the promises of
+    /// that file's parked reads beside the windows its own pass published.
+    /// Reporting file 1's windows for file 0's pass used to republish them
+    /// into file 1's set alone, and the promise bit went with it.
+    #[test]
+    fn a_pass_of_one_file_does_not_publish_into_anothers_exempt_set() {
+        let t0 = Instant::now();
+        let mut streams = Streams::default();
+        stream_on(&mut streams, 0, 0, 100, 3_500_000, t0);
+        stream_on(&mut streams, 1, 2_783, 100, 3_500_000, t0);
+        // Windows at the floor, so the parked piece below is outside them.
+        for file in [0, 1] {
+            streams.by_file.get_mut(&file).unwrap().streams[0].window = 0;
+        }
+        // A read of file 1 parks on a piece far from its stream.
+        streams.by_file[&1].exempt.hold(4_000..4_001);
+
+        streams.want(0, 90, u64::MAX, PIECE);
+        assert!(
+            streams.by_file[&1].exempt.holds(4_000),
+            "file 0's pass overwrote file 1's promise"
         );
     }
 

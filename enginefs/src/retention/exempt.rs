@@ -100,10 +100,14 @@ impl Exempt {
     /// [`Self::publish`] is what takes it away, and the pass that publishes
     /// includes every promise live at that moment.
     ///
-    /// Written by the owner under the entity's lock, like `publish`, so the
-    /// two cannot interleave -- a promise set while a publication was
-    /// computing its words would otherwise be lost by the store that
-    /// followed it.
+    /// Written by the owner under the entity's lock. `publish` is not: the
+    /// backing publishes from inside its `reading`, with no owner lock
+    /// held, so a promise set while a publication was computing its words
+    /// *is* lost by the store that follows it. What makes the two writers
+    /// safe is the pass re-holding every live promise under the lock at
+    /// its step 5, after it has taken the published set over
+    /// (`Retention::pass`). Every hold made between two passes lands in a
+    /// set nothing is publishing into.
     pub fn hold(&self, run: Range<u32>) {
         for piece in run.start.min(self.pieces)..run.end.min(self.pieces) {
             let (word, bit) = Self::slot(piece);

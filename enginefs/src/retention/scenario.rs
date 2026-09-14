@@ -237,6 +237,9 @@ pub(crate) struct FakeBacking<S: Side> {
     pub(crate) on_advertise: parking_lot::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     /// Run inside `reclaim` with the door, before any run is walked.
     pub(crate) on_reclaim: parking_lot::Mutex<Option<Hook<S>>>,
+    /// Run inside `reading`, after the detector has seen the reads and
+    /// before what may not be unlinked is published.
+    pub(crate) on_reading: parking_lot::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     /// Run between two runs of one reclaim.
     pub(crate) between_runs: parking_lot::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     pub(crate) _side: PhantomData<S>,
@@ -278,6 +281,7 @@ impl<S: Side> FakeBacking<S> {
             entered: parking_lot::Mutex::new(None),
             on_advertise: parking_lot::Mutex::new(None),
             on_reclaim: parking_lot::Mutex::new(None),
+            on_reading: parking_lot::Mutex::new(None),
             between_runs: parking_lot::Mutex::new(None),
             _side: PhantomData,
         })
@@ -454,7 +458,7 @@ impl<S: Side> Backing for FakeBacking<S> {
     ) -> crate::retention::owner::Consumers {
         let extent = Self::extent(domain);
         let now = asking.now;
-        let available = asking.allowance((held.len() as u64).saturating_mul(domain.piece));
+        let available = asking.allowance(domain.piece, held.len());
         let mut streams = self.detector.lock();
         streams.domain(
             domain.file,
@@ -463,6 +467,11 @@ impl<S: Side> Backing for FakeBacking<S> {
             asking.ceiling,
         );
         streams.observe(domain.file, held, domain.piece, now);
+        // Where a test puts a read that parks while the backing is inside
+        // its reading, after the pass took its snapshot of the promises.
+        if let Some(hook) = self.on_reading.lock().as_ref() {
+            hook();
+        }
         let want = streams.want(domain.file, asking.seconds, available, domain.piece);
         let exempt = streams.exempt(domain.file, extent.end);
         // **What may not be unlinked is published here**, where the want
@@ -473,6 +482,7 @@ impl<S: Side> Backing for FakeBacking<S> {
         // door refuses what this publishes.
         let mut kept = want.clone();
         kept.extend(asking.holding.iter().cloned());
+        kept.extend(asking.committed.iter().cloned());
         exempt.publish(&kept);
         let over = (held.len() as u64)
             .saturating_mul(domain.piece)

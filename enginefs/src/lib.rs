@@ -10586,6 +10586,57 @@ mod tests {
         );
     }
 
+    /// **And a pin taken on the neighbour under the want step wants the
+    /// boundary piece again**, whether or not it arrived under the drop.
+    ///
+    /// The 'want' half of the race the reclaim path closes in
+    /// `a_pin_that_lands_inside_a_run_is_wanted_again_after_it`: the want
+    /// step's `drop_pieces(run, LeaveDropped)` is in flight when the
+    /// neighbour is pinned, and the boundary piece it shares is not on the
+    /// disk -- so nothing arrives, nothing is unlinked, and without the
+    /// re-want after the run the piece is neither had nor wanted, the
+    /// pinned download one piece short.
+    #[tokio::test]
+    async fn a_pin_taken_on_the_neighbour_under_the_want_step_wants_the_boundary_piece_again() {
+        let (enginefs, counters) = a_neighbour_the_backend_does_not_want_yet();
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("4"), [7u8; 25]).unwrap();
+        let _store = seeded_store(&enginefs, &engine);
+        engine.begin_retention(1).await;
+        engine.note_playhead(1, 0);
+        counters.reselected.lock().unwrap().clear();
+        // The third episode is pinned while the backend is forgetting the
+        // pieces outside the window; piece 8 never arrives.
+        *counters.on_first_drop.lock().unwrap() = Some(Box::new({
+            let pinned = engine.pinned_files.clone();
+            move || {
+                pinned.write().insert(2);
+            }
+        }));
+        engine
+            .retain(enginefs.store_registry(), &playing(1))
+            .await
+            .expect("a pass");
+        assert!(
+            counters
+                .dropped_ranges
+                .lock()
+                .unwrap()
+                .first()
+                .is_some_and(|(range, _)| range.contains(&8)),
+            "the fixture's drop is the want step's, over the boundary piece"
+        );
+        let reselected = counters.reselected.lock().unwrap().clone();
+        assert!(
+            reselected.iter().any(|span| span.contains(&8)),
+            "the boundary piece the newly pinned neighbour shares was dropped \
+             under the want step and never wanted again. reselected: {reselected:?}"
+        );
+    }
+
     /// **What a file beside a pinned one holds back never hides the piece
     /// the two share.**
     ///
@@ -12037,7 +12088,8 @@ mod tests {
     /// its pieces minus what was dropped -- is the window, the committed
     /// set and what is on the disk; moving the head re-wants exactly the
     /// pieces the window moved onto. Eight pieces of twenty-five bytes under
-    /// a budget of four: a two-piece window and two committed.
+    /// a budget of four: the window and the committed set together are the
+    /// four, so one piece committed is a three-piece window.
     #[tokio::test]
     async fn a_pass_wants_the_window_and_the_committed_set_and_nothing_else_it_lacks() {
         let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 200)]);
@@ -12086,12 +12138,13 @@ mod tests {
         );
         assert_eq!(
             selected(),
-            std::collections::BTreeSet::from([0, 1, 2, 3, 4, 5]),
-            "the window, the committed set and what is on the disk"
+            std::collections::BTreeSet::from([0, 1, 2, 3, 4]),
+            "the window, the committed set and what is on the disk -- and the \
+             two together within the budget"
         );
         assert_eq!(
             counters.reselected.lock().unwrap().last(),
-            Some(&(2..6)),
+            Some(&(2..5)),
             "the pieces the consumer moved onto are wanted again"
         );
     }

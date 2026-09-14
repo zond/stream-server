@@ -390,7 +390,7 @@ impl Backing for ProxyBacking {
         let now = asking.now;
         // What this entity may hold: `Asking::allowance` has the argument,
         // and the torrent's half of this reads the same.
-        let available = asking.allowance((held.len() as u64).saturating_mul(CHUNK_BYTES));
+        let available = asking.allowance(CHUNK_BYTES, held.len());
         let Ok(mut detectors) = self.detectors.lock() else {
             // A poisoned detector asks for nothing and gives up nothing:
             // this pass concludes, and refuses every unlink, rather than
@@ -427,6 +427,7 @@ impl Backing for ProxyBacking {
         // door refuses what this publishes.
         let mut kept = want.clone();
         kept.extend(asking.holding.iter().cloned());
+        kept.extend(asking.committed.iter().cloned());
         exempt.publish(&kept);
         // What must go, and no more: the overhang over the allowance, taken
         // coldest first. What nothing else needs is scrub-back, and giving

@@ -623,6 +623,16 @@ impl Entry {
             None => (0, total.checked_sub(1)?),
         };
 
+        // **Promised before the disk is read**, over every chunk the range
+        // could be framed around. A pass unlinks what nothing has promised,
+        // and it honours a promise from the instant it is made: a chunk
+        // this walk finds and the pass then takes would be framed into a
+        // body and fail at the read, a transfer ending short of its
+        // `Content-Length`. Narrowed to what was found once the walk is
+        // done; a lookup that finds nothing drops the reader, and the
+        // promise with it.
+        let reader = self.retention.reader(&dir, total, self.target.clone());
+        reader.promises(first / CHUNK_BYTES..last / CHUNK_BYTES + 1);
         let mut held_to: Option<u64> = None;
         let mut index = first / CHUNK_BYTES;
         // The bucket directory being read from, listed once and consulted
@@ -659,9 +669,8 @@ impl Entry {
         if range.is_none() && held_to < last {
             return None;
         }
-        // What a response framed around this will have promised: every
-        // chunk from the one the range starts in to the one it ends in.
-        let reader = self.retention.reader(&dir, total, self.target.clone());
+        // What a response framed around this has promised: every chunk from
+        // the one the range starts in to the one it ends in, and no more.
         reader.promises(first / CHUNK_BYTES..held_to / CHUNK_BYTES + 1);
         Some(Cached {
             dir,
@@ -993,10 +1002,10 @@ impl Cached {
 
     /// The cached bytes themselves, `first..=held_to`, a chunk at a time.
     ///
-    /// A read that fails -- the retention pass took the chunk between the
-    /// lookup and here, which is an ordinary race and not a fault -- ends the stream with
-    /// an error rather than a short body, so the player sees a broken source
-    /// instead of a file that ended early.
+    /// A read that fails -- a chunk gone from under a promise made before
+    /// the lookup read the disk, which the door is there to make impossible
+    /// -- ends the stream with an error rather than a short body, so the
+    /// player sees a broken source instead of a file that ended early.
     ///
     /// **This is where a chunk's length is checked, and the only place.** A
     /// chunk file is never written at any length but its entity's, so one
