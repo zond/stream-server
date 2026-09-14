@@ -3108,21 +3108,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         self.start_stream(info_hash, file_idx, true).await;
     }
 
-    /// **Where the player says it is**, which is the one thing about a
-    /// viewing this process cannot work out for itself.
-    ///
-    /// `offset` is the player's own byte offset into the file -- mpv's
-    /// `stream-pos` -- and `film` its position in the picture; together
-    /// they are the playhead and the film's bitrate without either being
-    /// inferred from the shape of a `Range` header. See
-    /// [`crate::retention::owner::Retention::note_playhead`] for why that
-    /// matters and what it replaces.
-    ///
-    /// Cheap and lock-light on purpose: an embedder calls it about once a
-    /// second per open film, and it takes no turn, installs nothing and
-    /// starts nothing. A torrent this process is not running, or a file
-    /// nothing has installed a policy on, is nothing to remember -- the
-    /// call is a hint, and dropping one costs the freshness of a hint.
     /// **How long the film is**, with no position: what a cast can say and
     /// nothing else, since a receiver reports seconds and those do not
     /// convert to a byte offset without a constant bitrate. The length is
@@ -10137,7 +10122,7 @@ mod tests {
         // being played would window it and reclaim what falls outside.
         enginefs.set_cache_budget(Some(1));
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
         assert!(
             !engine.standing().await.policies.is_empty(),
             "the fixture is one whose policy would give a piece up"
@@ -10201,7 +10186,7 @@ mod tests {
         let _store = seeded_store(&enginefs, &engine);
         enginefs.set_cache_budget(Some(1));
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
         assert!(
             !engine.standing().await.policies.is_empty(),
             "the fixture is one whose policy would give a piece up"
@@ -10370,7 +10355,7 @@ mod tests {
 
         enginefs.on_stream_start(TEST_HASH, 1).await;
         engine.begin_retention(1).await;
-        engine.note_playhead(1, 0);
+        engine.test_read_at(1, 0);
         engine.retain(enginefs.store_registry(), &playing(1)).await;
         let standing = engine.standing().await;
         assert_eq!(
@@ -10430,7 +10415,7 @@ mod tests {
         std::fs::create_dir_all(&bucket).unwrap();
         std::fs::write(bucket.join("4"), [7u8; 25]).unwrap();
         engine.begin_retention(1).await;
-        engine.note_playhead(1, 0);
+        engine.test_read_at(1, 0);
         let _store = seeded_store(&enginefs, &engine);
         engine
             .retain(enginefs.store_registry(), &playing(1))
@@ -10554,7 +10539,7 @@ mod tests {
         std::fs::write(bucket.join("4"), [7u8; 25]).unwrap();
         let store = Arc::new(seeded_store(&enginefs, &engine));
         engine.begin_retention(1).await;
-        engine.note_playhead(1, 0);
+        engine.test_read_at(1, 0);
         // Piece 8 completes, and the third episode is pinned, while the
         // backend is forgetting the pieces outside the window.
         *counters.on_first_drop.lock().unwrap() = Some(Box::new({
@@ -10606,7 +10591,7 @@ mod tests {
         std::fs::write(bucket.join("4"), [7u8; 25]).unwrap();
         let _store = seeded_store(&enginefs, &engine);
         engine.begin_retention(1).await;
-        engine.note_playhead(1, 0);
+        engine.test_read_at(1, 0);
         counters.reselected.lock().unwrap().clear();
         // The third episode is pinned while the backend is forgetting the
         // pieces outside the window; piece 8 never arrives.
@@ -10661,7 +10646,7 @@ mod tests {
         }
         let _store = seeded_store(&enginefs, &engine);
         engine.begin_retention(1).await;
-        engine.note_playhead(1, 0);
+        engine.test_read_at(1, 0);
         engine
             .retain(enginefs.store_registry(), &playing(1))
             .await
@@ -11174,7 +11159,7 @@ mod tests {
 
         // A reader sixty bytes into the file: piece two.
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 60);
+        engine.test_read_at(0, 60);
         let _store = seeded_store(&enginefs, &engine);
 
         let numbers = enginefs
@@ -11352,7 +11337,7 @@ mod tests {
 
         // A reader twenty-five bytes into the second episode: piece five.
         engine.begin_retention(1).await;
-        engine.note_playhead(1, 25);
+        engine.test_read_at(1, 25);
         let _store = seeded_store(&enginefs, &engine);
 
         let numbers = enginefs
@@ -11405,7 +11390,7 @@ mod tests {
         // Now it is the stream being played, with a pass behind it.
         enginefs.on_stream_start(TEST_HASH, 0).await;
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
         engine
             .retain(enginefs.store_registry(), &playing(0))
             .await
@@ -11563,7 +11548,7 @@ mod tests {
         enginefs.set_cache_budget(Some(50));
         enginefs.on_stream_start(TEST_HASH, 0).await;
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
 
         enginefs.reconcile_tick().await;
         for piece in [0u32, 1, 2, 3] {
@@ -11605,7 +11590,7 @@ mod tests {
 
         enginefs.on_stream_start(TEST_HASH, 0).await;
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
         engine
             .retain(enginefs.store_registry(), &playing(0))
             .await
@@ -11667,7 +11652,7 @@ mod tests {
 
         enginefs.on_stream_start(TEST_HASH, 0).await;
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
         // A pass that concludes nothing: with no budget to measure against
         // there is nothing for it to keep or take.
         engine.retain(enginefs.store_registry(), &playing(0)).await;
@@ -11714,7 +11699,7 @@ mod tests {
 
         let store = seeded_store(&enginefs, &engine);
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
         engine
             .retain(enginefs.store_registry(), &playing(0))
             .await
@@ -11735,7 +11720,7 @@ mod tests {
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         *counters.advertise_gate.lock().unwrap() = Some((entered_tx, release_rx));
-        engine.note_playhead(0, 25);
+        engine.test_read_at(0, 25);
         let running = tokio::spawn({
             let engine = engine.clone();
             let registry = enginefs.store_registry().clone();
@@ -11802,7 +11787,7 @@ mod tests {
         let seeded = listings();
         assert!(seeded > 0, "the seed listed the directory");
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
 
         let first = engine
             .retain(enginefs.store_registry(), &playing(0))
@@ -11812,7 +11797,7 @@ mod tests {
             first.reclaimed > 0,
             "the pass read the seeded set and gave the far pieces back: {first:?}"
         );
-        engine.note_playhead(0, 75);
+        engine.test_read_at(0, 75);
         for _ in 0..49 {
             engine.retain(enginefs.store_registry(), &playing(0)).await;
         }
@@ -11913,7 +11898,7 @@ mod tests {
         // it is being fetched: without one there is nothing asking for
         // anything, and a stream's own cap is the only bound there is.
         engine.begin_retention(1).await;
-        engine.note_playhead(1, 0);
+        engine.test_read_at(1, 0);
         let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
         std::fs::create_dir_all(&bucket).unwrap();
         for piece in [4u32, 5, 6] {
@@ -12104,7 +12089,7 @@ mod tests {
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let store = seeded_store(&enginefs, &engine);
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
         let selected = || -> std::collections::BTreeSet<u32> {
             let dropped = counters.dropped.lock().unwrap();
             (0..8).filter(|piece| !dropped.contains(piece)).collect()
@@ -12127,7 +12112,7 @@ mod tests {
             std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
         }
         store.init_for_tests().unwrap();
-        engine.note_playhead(0, 50);
+        engine.test_read_at(0, 50);
         let pass = engine
             .retain(enginefs.store_registry(), &playing(0))
             .await
@@ -12175,7 +12160,7 @@ mod tests {
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let store = Arc::new(seeded_store(&enginefs, &engine));
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
         // Piece 2 completes while the backend is forgetting 1..4.
         *counters.on_first_drop.lock().unwrap() = Some(Box::new({
             let store = store.clone();
@@ -12241,7 +12226,7 @@ mod tests {
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let store = Arc::new(seeded_store(&enginefs, &engine));
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
         // Piece 2 completes and the user pins the file while the backend is
         // forgetting 1..4.
         *counters.on_first_drop.lock().unwrap() = Some(Box::new({
@@ -12308,7 +12293,7 @@ mod tests {
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let store = Arc::new(seeded_store(&enginefs, &engine));
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
         // Piece 2 completes and the reader seeks onto it while the backend
         // is forgetting 1..4.
         *counters.on_first_drop.lock().unwrap() = Some(Box::new({
@@ -12318,7 +12303,7 @@ mod tests {
             move || {
                 std::fs::write(bucket.join("2"), [7u8; 25]).unwrap();
                 store.init_for_tests().unwrap();
-                engine.note_playhead(0, 50);
+                engine.test_read_at(0, 50);
             }
         }));
 
@@ -12445,7 +12430,7 @@ mod tests {
         }
         let _store = seeded_store(&enginefs, &engine);
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
 
         let pass = engine
             .retain(enginefs.store_registry(), &playing(0))
@@ -12515,7 +12500,7 @@ mod tests {
         }
         let _store = seeded_store(&enginefs, &engine);
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
         counters.paused.store(true, Ordering::SeqCst);
         assert_eq!(engine.handle.run_state(), RunState::Paused);
 
@@ -12563,7 +12548,7 @@ mod tests {
         }
         let _store = seeded_store(&enginefs, &engine);
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
         let pass = engine
             .retain(enginefs.store_registry(), &playing(0))
             .await
@@ -12635,7 +12620,7 @@ mod tests {
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
         enginefs.set_cache_budget(Some(50));
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 25);
+        engine.test_read_at(0, 25);
         assert!(
             engine.policy_reading(0).is_some(),
             "a policy stands and the reader is inside the file"
@@ -12691,7 +12676,7 @@ mod tests {
         }
         let _store = seeded_store(&enginefs, &engine);
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
         let all_here = || (0..4).all(|piece| bucket.join(piece.to_string()).is_file());
 
         // The check is running again -- a restart out of error re-checks
@@ -12763,7 +12748,7 @@ mod tests {
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let _store = seeded_store(&enginefs, &engine);
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
 
         counters.in_error_state.store(true, Ordering::SeqCst);
         engine
@@ -12814,7 +12799,7 @@ mod tests {
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let _store = seeded_store(&enginefs, &engine);
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
         counters.paused.store(true, Ordering::SeqCst);
         engine
             .retain(enginefs.store_registry(), &playing(0))
@@ -12841,7 +12826,7 @@ mod tests {
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let _store = seeded_store(&enginefs, &engine);
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
         assert!(
             engine
                 .retain(enginefs.store_registry(), &playing(0))
@@ -12888,7 +12873,7 @@ mod tests {
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let _store = seeded_store(&enginefs, &engine);
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
         engine
             .retain(enginefs.store_registry(), &playing(0))
             .await
@@ -12944,7 +12929,9 @@ mod tests {
     /// when the pass began.**
     ///
     /// The pass reads the held set and then the playhead, and between the
-    /// two it holds none of the locks `note_playhead` takes -- the reading
+    /// two it holds none of the locks the report of a delivered byte takes
+    /// (`test_read_at` here, the reader's `poll_read` in production) -- the
+    /// reading
     /// used to be a directory walk on the blocking pool with the pass
     /// suspended across it, and it is a memory read now, but the gap is
     /// the same gap and the owner's hook puts playback inside it. A byte
@@ -12980,14 +12967,14 @@ mod tests {
 
         let _store = seeded_store(&enginefs, &engine);
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
 
         // Playback, in the gap this pass has: from inside the pass, as it
         // starts its listing. See `Engine::interleave` for why not a queued
         // task.
         *engine.interleave.lock() = Some(Box::new({
             let engine = engine.clone();
-            move || engine.note_playhead(0, 75)
+            move || engine.test_read_at(0, 75)
         }));
 
         let pass = engine
@@ -13039,14 +13026,14 @@ mod tests {
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let store = seeded_store(&enginefs, &engine);
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
         engine
             .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass");
         std::fs::write(bucket.join("1"), [7u8; 25]).unwrap();
         store.init_for_tests().unwrap();
-        engine.note_playhead(0, 25);
+        engine.test_read_at(0, 25);
         let pass = engine
             .retain(enginefs.store_registry(), &playing(0))
             .await
@@ -13115,12 +13102,12 @@ mod tests {
         }
         let _store = seeded_store(&enginefs, &engine);
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
 
         // The next episode is read while the pass lists.
         *engine.interleave.lock() = Some(Box::new({
             let engine = engine.clone();
-            move || engine.note_playhead(1, 0)
+            move || engine.test_read_at(1, 0)
         }));
 
         let pass = engine
@@ -13197,7 +13184,7 @@ mod tests {
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let store = seeded_store(&enginefs, &engine);
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
         engine
             .retain(enginefs.store_registry(), &playing(0))
             .await
@@ -13213,7 +13200,7 @@ mod tests {
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         *counters.advertise_gate.lock().unwrap() = Some((entered_tx, release_rx));
-        engine.note_playhead(0, 25);
+        engine.test_read_at(0, 25);
         let running = tokio::spawn({
             let engine = engine.clone();
             let registry = enginefs.store_registry().clone();
@@ -13265,7 +13252,8 @@ mod tests {
     /// rather than stopping it.**
     ///
     /// The playhead the window was drawn round is as old as the pin above:
-    /// `note_playhead` runs on every delivered byte and takes none of the
+    /// the report of a delivered byte (`test_read_at` here, the reader's
+    /// `poll_read` in production) runs on every one and takes none of the
     /// pass's locks, so playback walks on while the pass commits and
     /// withdraws. librqbit refuses to drop what its own live stream is
     /// about to read, but that refusal is the forward lookahead alone (4
@@ -13301,7 +13289,7 @@ mod tests {
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let store = seeded_store(&enginefs, &engine);
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
         engine
             .retain(enginefs.store_registry(), &playing(0))
             .await
@@ -13317,7 +13305,7 @@ mod tests {
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         *counters.advertise_gate.lock().unwrap() = Some((entered_tx, release_rx));
-        engine.note_playhead(0, 25);
+        engine.test_read_at(0, 25);
         let running = tokio::spawn({
             let engine = engine.clone();
             let registry = enginefs.store_registry().clone();
@@ -13328,7 +13316,7 @@ mod tests {
             .expect("the pass reached the call it makes to announce a committed piece")
             .expect("the fake said so");
         // Playback, while the pass is parked: piece 3 of 4.
-        engine.note_playhead(0, 75);
+        engine.test_read_at(0, 75);
 
         release_tx.send(()).expect("the pass is waiting on this");
         let pass = running
@@ -13385,7 +13373,7 @@ mod tests {
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let store = seeded_store(&enginefs, &engine);
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
         engine
             .retain(enginefs.store_registry(), &playing(0))
             .await
@@ -13408,7 +13396,7 @@ mod tests {
                 engine.pinned_files.write().insert(0);
             }
         }));
-        engine.note_playhead(0, 25);
+        engine.test_read_at(0, 25);
         let running = tokio::spawn({
             let engine = engine.clone();
             let registry = enginefs.store_registry().clone();
@@ -13420,7 +13408,7 @@ mod tests {
             .expect("the fake said so");
         // A seek to piece 4 while the pass is parked: the window at the door
         // is now inside the run 2..8.
-        engine.note_playhead(0, 4 * 25);
+        engine.test_read_at(0, 4 * 25);
 
         release_tx.send(()).expect("the pass is waiting on this");
         let pass = running
@@ -13490,7 +13478,7 @@ mod tests {
 
         let _store = seeded_store(&enginefs, &engine);
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
         let pass = engine
             .retain(enginefs.store_registry(), &playing(0))
             .await
@@ -13541,7 +13529,7 @@ mod tests {
 
         // A reader is inside the *other* file: this one's numbers left with
         // it.
-        engine.note_playhead(1, 0);
+        engine.test_read_at(1, 0);
         let numbers = enginefs
             .torrent_stream_numbers(TEST_HASH, 0)
             .await
@@ -13554,7 +13542,7 @@ mod tests {
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
         enginefs.set_cache_budget(Some(1_000_000));
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
         let numbers = enginefs
             .torrent_stream_numbers(TEST_HASH, 0)
             .await
@@ -13599,7 +13587,7 @@ mod tests {
         enginefs.set_cache_budget(Some(50));
         let _store = seeded(&enginefs, &engine);
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 25);
+        engine.test_read_at(0, 25);
         assert_eq!(
             bounded(&enginefs).await,
             (
@@ -13638,7 +13626,7 @@ mod tests {
         enginefs.set_cache_budget(Some(50));
         let _store = seeded(&enginefs, &engine);
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 25);
+        engine.test_read_at(0, 25);
         assert!(
             bounded(&enginefs).await.0.is_some(),
             "bounded to begin with"
@@ -13673,7 +13661,7 @@ mod tests {
 
         let _store = seeded_store(&enginefs, &engine);
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
         engine
             .retain(enginefs.store_registry(), &playing(0))
             .await
@@ -13689,7 +13677,7 @@ mod tests {
         );
 
         // Playback walks on to the second piece, which releases the first.
-        engine.note_playhead(0, 25);
+        engine.test_read_at(0, 25);
         engine
             .retain(enginefs.store_registry(), &playing(0))
             .await
@@ -13749,7 +13737,7 @@ mod tests {
         // A reader at the top of episode two: piece four is the window, and
         // pieces six and eight are outside it.
         engine.begin_retention(1).await;
-        engine.note_playhead(1, 0);
+        engine.test_read_at(1, 0);
         let _store = seeded_store(&enginefs, &engine);
         let pass = engine
             .retain(enginefs.store_registry(), &playing(1))
@@ -13802,7 +13790,7 @@ mod tests {
             std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
         }
         engine.begin_retention(1).await;
-        engine.note_playhead(1, 0);
+        engine.test_read_at(1, 0);
         let _store = seeded_store(&enginefs, &engine);
         engine
             .retain(enginefs.store_registry(), &playing(1))
@@ -13858,7 +13846,7 @@ mod tests {
         }
 
         engine.begin_retention(1).await;
-        engine.note_playhead(1, 0);
+        engine.test_read_at(1, 0);
         let _store = seeded_store(&enginefs, &engine);
         let pass = engine
             .retain(enginefs.store_registry(), &playing(1))
@@ -13902,7 +13890,7 @@ mod tests {
         enginefs.set_cache_budget(Some(1));
 
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
         assert!(
             !engine.standing().await.policies.is_empty(),
             "before the pin, a policy bounds the file"
@@ -13952,7 +13940,7 @@ mod tests {
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let store = seeded_store(&enginefs, &engine);
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
         engine
             .retain(enginefs.store_registry(), &playing(0))
             .await
@@ -13964,7 +13952,7 @@ mod tests {
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (_release_tx, release_rx) = tokio::sync::oneshot::channel();
         *counters.advertise_gate.lock().unwrap() = Some((entered_tx, release_rx));
-        engine.note_playhead(0, 25);
+        engine.test_read_at(0, 25);
         let running = tokio::spawn({
             let engine = engine.clone();
             let registry = enginefs.store_registry().clone();
@@ -14023,7 +14011,7 @@ mod tests {
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
         enginefs.set_cache_budget(Some(50));
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
         assert_eq!(
             *counters.advertised.lock().unwrap(),
             vec![(0..4, false)],
@@ -14287,7 +14275,7 @@ mod tests {
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
         enginefs.set_cache_budget(Some(50));
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
         assert_eq!(*counters.advertised.lock().unwrap(), vec![(0..4, false)]);
 
         // The viewer seeks: a second reader opens on the same file.
@@ -14331,14 +14319,14 @@ mod tests {
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let store = seeded_store(&enginefs, &engine);
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
         engine
             .retain(enginefs.store_registry(), &playing(0))
             .await
             .expect("a pass");
         std::fs::write(bucket.join("1"), [7u8; 25]).unwrap();
         store.init_for_tests().unwrap();
-        engine.note_playhead(0, 25);
+        engine.test_read_at(0, 25);
         engine
             .retain(enginefs.store_registry(), &playing(0))
             .await
@@ -14412,7 +14400,7 @@ mod tests {
         // The viewer reads file 1: piece 4.
         std::fs::write(bucket.join("4"), [7u8; 25]).unwrap();
         store.init_for_tests().unwrap();
-        engine.note_playhead(1, 0);
+        engine.test_read_at(1, 0);
         let live = enginefs.live().reading();
         let pass = engine
             .retain(enginefs.store_registry(), &live)
@@ -14446,7 +14434,7 @@ mod tests {
         // releases.
         std::fs::write(bucket.join("5"), [7u8; 25]).unwrap();
         store.init_for_tests().unwrap();
-        engine.note_playhead(1, 25);
+        engine.test_read_at(1, 25);
         let pass = engine
             .retain(enginefs.store_registry(), &live)
             .await
@@ -14490,7 +14478,7 @@ mod tests {
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let _store = seeded_store(&enginefs, &engine);
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
         // Stopped, so the ladder's own `Run` has a call to make -- and that
         // call is what the tick can be parked in, which is the gap between
         // its two halves.
@@ -14943,7 +14931,7 @@ mod tests {
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let _store = seeded_store(&enginefs, &engine);
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
 
         // The viewer opens something else, and a response is still
         // delivering this file.
@@ -14997,7 +14985,7 @@ mod tests {
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let _store = seeded_store(&enginefs, &engine);
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
         let windows = || {
             engine
                 .retention
@@ -15124,7 +15112,7 @@ mod tests {
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let _store = seeded_store(&enginefs, &engine);
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
 
         counters.advertised.lock().unwrap().clear();
         enginefs.drop_slack().await;
@@ -15184,7 +15172,7 @@ mod tests {
         }
         let _store = seeded_store(&enginefs, &engine);
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
 
         // The viewer opens something else, and comes back while the first
         // run of the pass that follows is being unlinked.
@@ -15341,7 +15329,7 @@ mod tests {
         // this file's turn.
         enginefs.on_stream_start(TEST_HASH, 0).await;
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
         counters.advertised.lock().unwrap().clear();
 
         engine.retain(enginefs.store_registry(), &tick).await;
@@ -15405,9 +15393,9 @@ mod tests {
         std::fs::write(bucket.join("4"), [7u8; 25]).unwrap();
         let _store = seeded_store(&enginefs, &engine);
         engine.begin_retention(0).await;
-        engine.note_playhead(0, 0);
+        engine.test_read_at(0, 0);
         engine.begin_retention(1).await;
-        engine.note_playhead(1, 0);
+        engine.test_read_at(1, 0);
 
         // Nothing is playing: the tick's reading makes both files slack.
         nothing_torrent_is_playing(&enginefs);

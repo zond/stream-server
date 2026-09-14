@@ -525,7 +525,7 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
     /// The torrent piece a reader at `offset` of `file` is sitting on.
     /// Always `Some`: a file's entity hears only its own bytes -- the
     /// [`FileHandle`]'s reader is on the file it reads, and the tests'
-    /// `Engine::note_playhead` names the file the byte was in -- so `file`
+    /// `Engine::test_read_at` names the file the byte was in -- so `file`
     /// is this domain's, and a position that is not would be a reader
     /// mis-keyed, not a head that left.
     ///
@@ -1555,7 +1555,7 @@ impl<H: TorrentHandle> Engine<H> {
     ///
     /// [`FileHandle`]: crate::files::FileHandle
     #[cfg(test)]
-    pub(crate) fn note_playhead(&self, file_idx: usize, offset: u64) {
+    pub(crate) fn test_read_at(&self, file_idx: usize, offset: u64) {
         self.retention.note_position(&file_idx, (file_idx, offset));
         // And the read that put a consumer there, which is what the
         // detector answers everything from: a position says where

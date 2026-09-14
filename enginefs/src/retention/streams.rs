@@ -187,9 +187,9 @@ impl Stream {
         // `rates=[Some(367710)]` against a 3,568,061 B/s film, a want set
         // of eight pieces where the arithmetic allows seventy-seven).
         //
-        // Seeded, the same sample moves the rate by a sixteenth, and the
-        // transition out of "no measurement" is continuous rather than a
-        // step.
+        // Seeded, the same sample moves the rate by an eighth -- one part
+        // in `RATE_SMOOTHING` -- and the transition out of "no measurement"
+        // is continuous rather than a step.
         self.rate = Some(match self.rate.or(ceiling) {
             None => sample,
             Some(rate) => (rate * (RATE_SMOOTHING - 1) + sample) / RATE_SMOOTHING,
@@ -233,14 +233,17 @@ impl Stream {
     /// and the reason the policy this replaces keeps a probe's window and
     /// never wants it.
     ///
-    /// Doubling costs the real consumer nothing. At the field's fourteen
-    /// reads a second, a film reaches a 315 MB window from the floor in
-    /// about five doublings -- under a second -- while a stream that turns
-    /// out to be a one-shot probe has cost eight megabytes and stopped.
+    /// Doubling costs the real consumer nothing. A grant is one step per
+    /// pass of this file, not per read: a film reaches a 315 MB window
+    /// from the 8 MB floor in six doublings, so six passes -- a dozen
+    /// seconds at the reconciler's two-second tick, six stride moves for
+    /// the proxy -- while a stream that turns out to be a one-shot probe
+    /// has cost eight megabytes and stopped.
     fn grant(&mut self, target: u64, floor: u64) -> u64 {
         // **And only for a consumer that is consuming.** A doubling a pass
-        // is what lets a real stream reach its window in a second; applied
-        // to a stream that has not read since the last grant it is a
+        // is what lets a real stream reach its window in a handful of
+        // passes; applied to a stream that has not read since the last
+        // grant it is a
         // lookahead that goes on growing after the reading has stopped. A
         // read of a container's index closes the moment it has what it
         // came for, and the field measured the tail of a paused film being
@@ -463,10 +466,11 @@ impl FileStreams {
             // back is not ground already played -- it is ground about to be
             // played again, and a window belongs where the viewer is. The
             // cost is a transient demuxer re-read dragging the position a
-            // few hundred kilobytes back until the next read jumps forward;
-            // the two readings can never differ by more than
-            // `SAME_CONSUMER`, since further than that is a stream of its
-            // own.
+            // few hundred kilobytes back until the next read jumps forward.
+            // What bounds how far the two readings can differ is the held
+            // run: a read joins this stream only while the stream's last
+            // byte and the read's first are in one run of held pieces, and
+            // a read past a hole is a stream of its own.
             stream.end = read.end;
             stream.eaten = stream
                 .eaten
@@ -1286,8 +1290,8 @@ mod tests {
         // **One sample moves the rate; it does not set it.** The rate is
         // seeded from the film's arithmetic, which is where `demand` has
         // this stream anyway while `rate` is `None`, so an admitted sample
-        // is a correction to that and not a replacement of it -- a
-        // sixteenth of the way, here.
+        // is a correction to that and not a replacement of it -- an eighth
+        // of the way, one part in `RATE_SMOOTHING`, here.
         let once = streams.streams[0]
             .rate
             .expect("a real gap is a measurement");
@@ -1695,8 +1699,8 @@ mod tests {
     /// anything that opens and closes -- would otherwise be handed a film's
     /// worth of lookahead off a single sample. That is the build that
     /// fetched 1.6 GB to play 100 MB. Doubling costs a real consumer
-    /// nothing: at the field's fourteen reads a second it reaches a full
-    /// window in about five doublings.
+    /// nothing: the grant is one doubling per pass of its file, and it
+    /// reaches a full window in six of them.
     #[test]
     fn a_window_doubles_towards_its_target_rather_than_jumping_to_it() {
         let t0 = Instant::now();
@@ -1724,7 +1728,7 @@ mod tests {
         }
         assert!(
             granted < 3_500_000 * 90,
-            "five doublings from eight megabytes is not yet a full window"
+            "five passes from the floor is not yet a full window"
         );
     }
 
