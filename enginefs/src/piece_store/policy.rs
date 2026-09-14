@@ -33,10 +33,10 @@
 //! Where the split falls is not a half any more. Both parts are bounded in
 //! *time* first ([`Buffering`]) -- so many seconds of this stream at the rate
 //! bytes are really leaving the server at -- and the budget is only the
-//! ceiling. The committed part yields first and the window yields last: it
-//! also has a floor, the lookahead an open stream was already granted, which
-//! beats every cap here because the alternative is a stream fetching exactly
-//! what the next pass deletes.
+//! ceiling. The committed part yields first, and it yields to a floor too:
+//! the lookahead an open stream was already granted is pinned as surely as
+//! the committed set is, the two have to fit under the budget together, and
+//! the committed half is the one that can give ([`Buffering`]).
 //!
 //! **Only what is committed is advertised** -- once an engine can be told
 //! that. That is the whole of being a good citizen here: a piece we might
@@ -169,24 +169,31 @@ impl Share {
     }
 }
 
-/// What a reader on this entity has already been promised, and what the
-/// window must therefore be big enough to hold.
+/// What a reader on this entity has already been granted, and what the
+/// budget must therefore leave room for.
 ///
-/// **A window smaller than an open stream's lookahead is a disk
-/// permanently over budget.** The lookahead is fixed when the reader opens
-/// (`Engine::try_get_file_with_intent`) and there is no setter for it in
-/// the fork, while the budget is republished every sixty seconds from the
-/// volume's free space and a shrink resizes the policy under readers that
-/// are already open. The stream then fetches past the window forever: the
-/// fork's `drop_pieces` refuses a piece inside `streams.wanted_ranges`, so
-/// the pass does not fetch-and-reclaim in a loop -- it simply never gets
-/// the bytes back, and pays a wasted `drop_pieces` per tick to be refused
-/// again. The window is what yields, because it is the half that can.
+/// **An open stream's lookahead and the committed set are both pinned, and
+/// together they have to fit under the budget.** The lookahead is fixed
+/// when the reader opens (`Engine::try_get_file_with_intent`) and there is
+/// no setter for it in the fork; the backend refuses to forget a piece
+/// inside it, and every pass hands it in as
+/// [`crate::retention::owner::Asking::holding`] so that no reclaim is
+/// chosen against it. The committed set is what `advance` never reclaims.
+/// Nothing here bounds what a stream fetches or what a pass takes back --
+/// that went with the read-pattern rewrite, see [`Shape::Split`] -- so
+/// what this number does is size the committed half. The budget is
+/// republished every sixty seconds from the volume's free space and a
+/// shrink resizes the policy under readers that are already open; a
+/// committed set drawn at half of the new budget, beside a lookahead
+/// granted under the old one, would leave the pass less than nothing to
+/// reclaim and a disk that cannot come back under its budget until the
+/// stream ends. The committed half is what yields, because it is the half
+/// that can.
 ///
 /// The number is what a reader was *granted*, not what its buffer profile
-/// would have liked: the grant is already the smaller of the profile's cap
-/// and the window's forward reach at the open, so this is a no-op at the
-/// moment a reader opens and binds only when the budget moves under it.
+/// would have liked: the grant is already cut to what the last pass said
+/// the entity is asking for and to the whole cache, so the floor binds
+/// when the budget moves under a reader that is already open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Buffering {
     /// The largest lookahead granted to a reader open on this entity, in
@@ -540,9 +547,10 @@ impl RetentionPolicy {
         let budget = (budget_bytes / piece_length) as u32;
         // The floor, and the committed half is what yields to it -- to
         // nothing, if that is what it takes. Sharing is generosity; a
-        // window narrower than what an open stream is already fetching is a
-        // disk that can never come back under its budget. See
-        // [`Buffering`].
+        // committed set that, beside the lookahead an open stream is
+        // already pinning, overfills the budget is a disk that can never
+        // come back under it, because neither is a set the pass may
+        // reclaim. See [`Buffering`].
         let floor = window_for_reach(buffering.lookahead_bytes, piece_length);
         // Three numbers, composed in one order: what the disk can hold,
         // what the viewer asked for in time, and what an open stream is
@@ -565,10 +573,10 @@ impl RetentionPolicy {
             if cap < floor {
                 // The floor is bigger than the time the design wants to
                 // buffer, which means the playback lookahead is. The
-                // alternative to letting the floor win is a stream fetching
-                // exactly what the pass then deletes, so it wins -- and the
-                // fact is said out loud, because it is a statement about
-                // the constants and not about this file.
+                // alternative to letting the floor win is a committed set
+                // with no room left beside the lookahead, so it wins -- and
+                // the fact is said out loud, because it is a statement
+                // about the constants and not about this file.
                 tracing::info!(
                     floor_pieces = floor,
                     cap_pieces = cap,
@@ -1032,51 +1040,37 @@ mod tests {
         );
     }
 
-    /// **The window never reaches less far than a stream already open on
-    /// the file is fetching.**
+    /// **The committed half leaves room for whatever lookahead a stream
+    /// already open on the file was granted, at every budget.**
     ///
-    /// The grant is cut to the window's forward reach at the open, so the
-    /// floor is a no-op there by construction; what it is for is the
-    /// *next* budget, republished sixty seconds later off a volume that has
-    /// filled. That policy is built without the reader in view and used to
-    /// be free to halve the window under it, leaving the stream fetching
-    /// pieces the pass cannot take back -- the fork refuses to drop a piece
-    /// inside `streams.wanted_ranges` -- so the disk sat over budget for
-    /// the life of the stream and paid a refused `drop_pieces` per tick.
+    /// What the floor is for is the *next* budget, republished sixty
+    /// seconds later off a volume that has filled. That policy is built
+    /// without the reader in view, and used to be free to give half of it
+    /// to the committed set under a stream whose lookahead the backend
+    /// will not forget a piece of -- two pinned sets that between them
+    /// overfilled the budget, so the disk sat over it for the life of the
+    /// stream and paid a refused `drop_pieces` per tick. What is asserted
+    /// is the arithmetic itself, `committed <= budget - floor`, and not
+    /// `piece_budget`, which nothing in production reads; and the
+    /// lookahead varies, because a floor that only ever had one piece to
+    /// cover was only ever checked at a budget of one.
     #[test]
-    fn the_window_covers_every_profiles_granted_lookahead_at_every_budget() {
-        use crate::backend::priorities::{
-            BufferProfile, Fetching, librqbit_stream_lookahead_bytes,
-        };
+    fn the_committed_half_leaves_room_for_every_granted_lookahead_at_every_budget() {
         const MIB: u64 = 1 << 20;
         // The field device's piece length, and a file far longer than any
         // budget here so nothing is clamped against its ends.
         let piece = 4 * MIB;
         let pieces = 0..4000;
         let bytes = 4000 * piece;
-        for profile in BufferProfile::ALL {
-            // The most a playback reader can be granted under this profile.
-            let cap = librqbit_stream_lookahead_bytes(Fetching::Streaming);
-            for budget_pieces in 1..=400u64 {
-                let budget = budget_pieces * piece;
-                let at_open = RetentionPolicy::new(
-                    budget,
-                    piece,
-                    pieces.clone(),
-                    bytes,
-                    Share::Half,
-                    Buffering::default(),
-                )
-                .expect("a consistent file");
-                // What `Engine::try_get_file_with_intent` really hands the
-                // stream: the intent's cap cut to the window's reach.
-                let reach = at_open.shape().piece_budget().unwrap_or(0);
-                let granted = (u64::from(reach) * piece).min(cap).max(1);
-                // And the policy the next budget publication builds over
-                // it, sixty seconds later on a volume that has filled: a
-                // smaller budget, built without the open reader in view.
-                let later = RetentionPolicy::new(
-                    budget / 2,
+        // Lookaheads in half-piece steps, so the ceiling to whole pieces is
+        // exercised as well as the exact multiples, from under one piece to
+        // well past the small budgets.
+        for half_pieces in 1..=80u64 {
+            let granted = half_pieces * piece / 2;
+            let floor = window_for_reach(granted, piece);
+            for budget_pieces in 1..=200u32 {
+                let policy = RetentionPolicy::new(
+                    u64::from(budget_pieces) * piece,
                     piece,
                     pieces.clone(),
                     bytes,
@@ -1087,11 +1081,20 @@ mod tests {
                     },
                 )
                 .expect("a consistent file");
-                let reach = later.shape().piece_budget().unwrap_or(0);
+                let Shape::Split {
+                    unshared,
+                    committed,
+                } = policy.shape()
+                else {
+                    panic!("a budget of {budget_pieces} pieces covers a file of 4000");
+                };
                 assert!(
-                    u64::from(reach) * piece >= granted,
-                    "{profile:?} at {budget_pieces} pieces halved: a reach of {} for a lookahead of {granted}",
-                    u64::from(reach) * piece
+                    unshared >= floor,
+                    "lookahead {granted} at {budget_pieces} pieces: unshared {unshared} under a floor of {floor}"
+                );
+                assert!(
+                    committed <= budget_pieces.saturating_sub(floor),
+                    "lookahead {granted} at {budget_pieces} pieces: committed {committed} beside a floor of {floor}"
                 );
             }
         }
@@ -1099,10 +1102,10 @@ mod tests {
 
     /// **The committed half yields to the floor, to nothing if it must.**
     ///
-    /// Sharing is generosity and playback is the job. A window narrower
-    /// than what an open stream is already fetching cannot come back under
-    /// budget at all, so there is nothing to protect by keeping half the
-    /// budget for a peer.
+    /// Sharing is generosity and playback is the job. A committed set that
+    /// overfills the budget beside the lookahead an open stream is already
+    /// pinning cannot come back under budget at all, so there is nothing to
+    /// protect by keeping half the budget for a peer.
     #[test]
     fn the_committed_half_yields_to_the_windows_floor() {
         let buffering = Buffering {
@@ -1142,7 +1145,7 @@ mod tests {
                 unshared: 9,
                 committed: 0
             },
-            "the window takes the whole budget and then some, and the committed half is nothing"
+            "the floor takes the whole budget and then some, and the committed half is nothing"
         );
         assert_eq!(
             u64::from(tight.shape().piece_budget().unwrap_or(0)) * PIECE,

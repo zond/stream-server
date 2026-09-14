@@ -807,33 +807,6 @@ struct State<B: Backing> {
     /// which sizes the window exactly, and leaves where it is to the reads,
     /// which for a receiver are plainly sequential.
     duration: Option<std::time::Duration>,
-    /// **The pieces a container cannot be played without**, whatever the
-    /// playhead is over.
-    ///
-    /// A window is one contiguous range round one head, and playing from an
-    /// offset needs three: the header at the front, the index -- an mp4
-    /// `moov` at the tail, MKV Cues -- and the playback point itself. The
-    /// window holds one of those, so the other two are outside it and the
-    /// next pass reclaims them. The field log of 2026-09-12 is that: a film
-    /// opened at 939 s spent 34 s on the head piece and 67 s on the index,
-    /// and the index pieces were taken from under the read of them.
-    ///
-    /// Playing from the *start* hides it, because the playhead's own window
-    /// covers the header and only the tail is orphaned. It is the offset
-    /// case that needs all three at once.
-    ///
-    /// What the player said about itself, and when it said it.
-    ///
-    /// Everything else here infers the playhead from the byte ranges the
-    /// player asked for, and a byte range does not say what it is for. Six
-    /// weeks of this module are that inference: whether an open-ended range
-    /// near the end of a file is a seek or a container index, whether a
-    /// reader parked twenty gigabytes away crawling an index is "playing",
-    /// which of two live reads is the viewer. Every one of those is a guess
-    /// at a fact the player holds exactly, and each wrong guess moves the
-    /// window off the film and takes the pieces the viewer is waiting for
-    /// with it.
-    ///
     /// Whether this entity's range is held back from what we announce with
     /// nothing installed to put it back.
     ///
@@ -968,10 +941,11 @@ struct ReaderState<B: Backing> {
     /// a proxied body is fetched by its own response and reads nothing
     /// ahead, and its viewer chooses no profile).
     ///
-    /// The window may never be sized under the largest lookahead here; see
-    /// [`Buffering`]. It is what the reader was *granted*, which is already
-    /// cut to the window's forward reach at the open, so it binds only when
-    /// the budget moves under a reader that is already open.
+    /// The committed half is sized to leave room for the largest lookahead
+    /// here; see [`Buffering`]. It is what the reader was *granted*, already
+    /// cut to what the last pass said the entity is asking for and to the
+    /// whole cache, so it binds when the budget moves under a reader that is
+    /// already open.
     /// [`Buffering::bytes_per_second`] is not this read's to state and is
     /// always `None` in it; the entity states it.
     buffering: Buffering,
@@ -1123,8 +1097,10 @@ pub struct Holding<B: Backing> {
     /// 0:00 with fifty megabytes "behind" the playhead and four ahead. The
     /// detector tells the two apart by what they eat.
     pub head: Option<B::Position>,
-    /// The entity's last delivered *playback* byte, and `None` until one
-    /// has gone out. A probe's bytes never move it.
+    /// The entity's last delivered byte, from any reader, and `None` until
+    /// one has gone out. Every delivered byte moves it ([`Reader::note`]);
+    /// which of the readers is the viewer is the detector's question, not
+    /// this field's.
     pub last_position: Option<B::Position>,
     /// The budget the entity was last decided under, on the delivered byte;
     /// `None` before any decision and under [`Install::OnOpen`].
@@ -1261,8 +1237,6 @@ impl<B: Backing> Retention<B> {
     /// window for one to place: a proxied entity has nothing installed on
     /// it until its first delivered byte ([`Install::OnDeliveredByte`]), so
     /// a read parked before that byte has nothing to be kept inside of.
-    /// (was: every proxied read is a playback read -- the proxy serves one
-    /// body per player and has no probe of its own.
     pub fn reader(self: &Arc<Self>, key: B::Key, domain: B::Domain) -> Reader<B> {
         Reader {
             owner: self.clone(),
@@ -3133,8 +3107,6 @@ pub struct Reader<B: Backing> {
     owner: Arc<Retention<B>>,
     entity: Arc<Entity<B>>,
     id: ReaderId,
-    /// What this read is for, carried here so the entry this handle makes
-    /// on its first promise or byte says so too.
     /// Where this read was opened; see [`ReaderState::opened_at`].
     opened_at: Option<B::Position>,
     /// What this read asks of the cache; see [`ReaderState::buffering`].
@@ -3260,8 +3232,8 @@ impl<B: Backing> Reader<B> {
                 }
                 None => false,
             };
-            // The entity keeps what a playing read measured, so the time
-            // caps survive the read that measured them; see [`State::rate`].
+            // A due byte tries the turn, under L2 (rule 3): `None` is a
+            // pass in flight, and its conclusion asks the same head again.
             let claim = due
                 .then(|| self.entity.turn.clone().try_lock_owned().ok())
                 .flatten()
