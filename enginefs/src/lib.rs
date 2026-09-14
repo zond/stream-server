@@ -10312,6 +10312,63 @@ mod tests {
         );
     }
 
+    /// **A pin that lands mid-run leaves the neighbour wanting its boundary
+    /// piece again, rather than neither having nor wanting it.**
+    ///
+    /// The readings above close the window to one loop iteration: a pin
+    /// taken before the run is read keeps its piece. What they cannot close
+    /// is the pin landing *inside* the run -- `pin_download_locked` writes
+    /// the set under `pin_locks`, which no pass takes, so it is a real
+    /// cross-thread window and not an await interleaving.
+    ///
+    /// What that costs is not corruption. `drop_pieces` clears the have-bit
+    /// before the unlink, so nothing is advertised over a hole. It is that
+    /// `AfterRelease::LeaveDropped` skips the reselect, so the freshly
+    /// pinned neighbour's boundary piece ends up **neither had nor
+    /// wanted**: a pinned download one piece short of done until something
+    /// wants it again.
+    ///
+    /// Something does today -- the owner's pin exit calls `want_whole` --
+    /// but only because a fresh entity is seeded `held_back = true` for an
+    /// unrelated reason, three modules away, with no test tying the two
+    /// together. That is the shape that keeps costing this codebase, so the
+    /// run is checked against the pins once more after it is acted on.
+    #[tokio::test]
+    async fn a_pin_that_lands_inside_a_run_is_wanted_again_after_it() {
+        let (enginefs, counters) = a_neighbour_the_backend_does_not_want_yet();
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        // Contiguous, so they are one run: the pin lands while the run that
+        // *contains* the boundary piece is being released, which is the case
+        // the per-iteration re-reads cannot reach.
+        for piece in [7u32, 8] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let _store = seeded_store(&enginefs, &engine);
+        engine.begin_retention(1).await;
+        counters.reselected.lock().unwrap().clear();
+        // The neighbour is pinned while the run is being dropped, so the
+        // reading that would have spared its piece has already happened.
+        *counters.on_first_drop.lock().unwrap() = Some(Box::new({
+            let pinned = engine.pinned_files.clone();
+            move || {
+                pinned.write().insert(2);
+            }
+        }));
+        nothing_torrent_is_playing(&enginefs);
+        enginefs.drop_slack().await;
+
+        let reselected = counters.reselected.lock().unwrap().clone();
+        assert!(
+            reselected.iter().any(|span| span.contains(&8)),
+            "the piece the newly pinned neighbour shares with this file was \
+             dropped and never wanted again; the pin is a piece short until \
+             something unrelated happens to re-want it. reselected: {reselected:?}"
+        );
+    }
+
     /// **And a pin taken on the neighbour under the want step keeps the
     /// boundary piece that arrived under it.**
     ///
@@ -13942,13 +13999,16 @@ mod tests {
         assert_eq!(engine.retention.readers_of(&0), 0);
     }
 
-    /// **The install comes before the stream, and the stream's reader is on
-    /// the entity the install made**: the file has a holding the moment
-    /// `get_file` returns, before any byte has gone out, and the first byte
-    /// lands on it rather than on nothing. This is the ordering that keeps
-    /// a torrent file's head from ever being a byte noted into no entity,
-    /// which is not remembered -- production order, which the fixtures
-    /// above follow.
+    /// **The install comes before the stream, the stream's reader is on the
+    /// entity the install made, and the reader is on it before the stream
+    /// is asked for**: the file has a holding the moment `get_file`
+    /// returns, before any byte has gone out, and the first byte lands on
+    /// it rather than on nothing. This is the ordering that keeps a torrent
+    /// file's head from ever being a byte noted into no entity, which is
+    /// not remembered -- production order, which the fixtures above follow.
+    ///
+    /// The reader counts from the open and not from its first byte, because
+    /// it promises the piece it was opened on: see [`files::Opening::reader_on`].
     #[tokio::test]
     async fn get_file_installs_before_the_first_byte_is_noted() {
         use crate::backend::priorities::{BufferProfile, Fetching};
@@ -13971,8 +14031,10 @@ mod tests {
         assert!(!holding.live_playhead);
         assert_eq!(
             engine.retention.readers_of(&0),
-            0,
-            "a reader that has delivered nothing"
+            1,
+            "a read that has delivered nothing is still a read the pass must \
+             see: it has promised the piece it was opened on, and a pass that \
+             counted it for nothing took that piece out from under it"
         );
         let mut byte = [0u8; 1];
         stream.read_exact(&mut byte).await.expect("a byte");

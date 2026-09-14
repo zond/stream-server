@@ -246,7 +246,7 @@ impl Opening {
         &self,
         retention: &Arc<crate::retention::owner::Retention<crate::engine::TorrentBacking<H>>>,
     ) -> Option<crate::retention::owner::Reader<crate::engine::TorrentBacking<H>>> {
-        retention.reader_on(
+        let reader = retention.reader_on(
             &self.file_idx,
             (self.file_idx, self.start_offset),
             crate::piece_store::Buffering {
@@ -260,7 +260,23 @@ impl Opening {
                 // shares the same pieces. See `Retention::reader_on`.
                 seed: 0,
             },
-        )
+        );
+        // **And promised the piece it opened on, before the gap.** A reader
+        // is not *observed* until it has promised or delivered
+        // (`ReaderState::observed`), so a pass landing between this and the
+        // read's first poll still reads the file as one nothing is using
+        // and takes the pieces under it. The promise is not a trick to look
+        // busy: this read is about to ask for exactly that piece, which is
+        // what a promise says, and it is one piece rather than a window.
+        //
+        // It is also why the window stays bounded by behaviour rather than
+        // by a clock: a handle that is opened and never read holds one
+        // piece until it is dropped, which is the same promise any parked
+        // read makes.
+        if let Some(reader) = reader.as_ref() {
+            reader.promises_at((self.file_idx, self.start_offset));
+        }
+        reader
     }
 }
 

@@ -377,6 +377,56 @@ pub(crate) struct TorrentBacking<H: TorrentHandle> {
 }
 
 impl<H: TorrentHandle> TorrentBacking<H> {
+    /// Want again whatever a neighbour pinned **since this run was
+    /// planned** shares with it.
+    ///
+    /// **The pin set is read before a run is acted on and the pin can land
+    /// after.** Every reading of it -- at plan time, at the door, in
+    /// `reclaim_rest` -- closes the window to one loop iteration and no
+    /// further: `pin_download_locked` writes the set under `pin_locks`,
+    /// which no pass takes, so a pin arriving between the read and the
+    /// `drop_pieces` is a genuine cross-thread window rather than an await
+    /// interleaving.
+    ///
+    /// What it costs when it lands there is not corruption -- the have-bit
+    /// is cleared before the unlink either way, so nothing is advertised
+    /// over a hole. It is that `AfterRelease::LeaveDropped` skips the
+    /// reselect, leaving the newly pinned neighbour's boundary piece
+    /// **neither had nor wanted**: a pinned download one piece short of
+    /// done, for as long as nothing re-wants it.
+    ///
+    /// **Something does today, and that is the reason this exists.** The
+    /// heal is the retention owner's pin exit calling `want_whole`, which
+    /// is conditional on the clear (`Retention::release_to_pin`), and the
+    /// state it would not heal is unreachable only because a fresh entity
+    /// is seeded `held_back = true` (`State::held_back`) -- a default that
+    /// is there for an unrelated reason and does not know it is holding
+    /// this up. A correctness property of pinned downloads should not rest
+    /// on a default three modules away that no test ties to it.
+    ///
+    /// So the run is checked against the pins once more after it has been
+    /// acted on, and anything a pin has since claimed is wanted again. The
+    /// cost of the race becomes one boundary piece fetched twice, which is
+    /// what the design already accepts of a boundary piece everywhere else.
+    async fn rewant_pins_crossed_by(&self, run: &Range<u32>, domain: &FileDomain) {
+        let pinned = pinned_spans(&self.handle, &self.pinned, Some(domain.file_idx)).await;
+        for span in pinned
+            .into_iter()
+            .filter(|span| span.start < run.end && run.start < span.end)
+        {
+            if let Err(error) = self.handle.reselect_pieces(span.clone()).await {
+                tracing::warn!(
+                    info_hash = %self.info_hash,
+                    first = span.start,
+                    end = span.end,
+                    error = %format!("{error:#}"),
+                    "a neighbour pinned under this pass could not be wanted again; \
+                     its boundary piece waits for the next pass over it"
+                );
+            }
+        }
+    }
+
     /// Want every piece of `ranges` again, one backend call per range; a
     /// refusal is logged and the stream's own lookahead still pulls what it
     /// is about to read.
@@ -871,6 +921,10 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
                     "could not stop wanting the pieces outside the window; the swarm will fill them"
                 ),
             }
+            // Outside the match: a pin that landed under the drop has to be
+            // wanted again whether or not anything arrived under it, and
+            // whether or not the backend handed back a claim.
+            self.rewant_pins_crossed_by(&run, domain).await;
         }
     }
 
@@ -992,10 +1046,12 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
             if parts.len() == 1 && parts[0] == run {
                 let asked = (run.end - run.start) as usize;
                 let freed =
-                    crate::retention::release(&self.handle, store, &self.info_hash, run).await;
+                    crate::retention::release(&self.handle, store, &self.info_hash, run.clone())
+                        .await;
                 self.refused
                     .fetch_add(asked.saturating_sub(freed), Ordering::Relaxed);
                 reclaimed += freed;
+                self.rewant_pins_crossed_by(&run, domain).await;
             } else {
                 // Strictly fewer pieces than `run`, so this converges: a
                 // part is released or shrinks again on every turn through
