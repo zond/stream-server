@@ -225,14 +225,18 @@ impl Opening {
     /// runs only at an open. Taken here, the reader's own `Arc` on the
     /// entity outlives that pass and the read stays on the file.
     ///
-    /// It does not close the race, only its permanent half. A reader that
-    /// has opened and not yet delivered a byte is still not an observed one
-    /// ([`Retention::readers_of`]), so a pass reading the mode between this
-    /// call and the first `poll_read` still discards the policy, and
-    /// nothing installs another until the next open. Honouring the raw
-    /// reader map instead is the design question the owner argues against
-    /// in [`Retention::readers_and_opens_of`]: a handed-out-and-abandoned
-    /// stream would block slack for ever.
+    /// Taking the reader here closes the permanent half of the race, and
+    /// on its own only that half. A reader that has opened and not yet
+    /// delivered a byte is not an observed one ([`Retention::readers_of`]),
+    /// so a pass reading the mode between this call and the first
+    /// `poll_read` would still discard the policy, and nothing would
+    /// install another until the next open. Honouring the raw reader map
+    /// instead is the design question the owner argues against in
+    /// [`Retention::readers_and_opens_of`]: a handed-out-and-abandoned
+    /// stream would block slack for ever. What closes the other half is
+    /// the promise made below, the moment the reader exists: a promise is
+    /// what makes a reader observed, and this read is about to ask for
+    /// exactly the piece it promises.
     ///
     /// `start_offset` reaches the owner too, so the read has a head from
     /// the open rather than from its first delivered byte: a reader parked

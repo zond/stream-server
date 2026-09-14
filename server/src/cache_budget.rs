@@ -114,10 +114,13 @@ pub(crate) struct CacheLimit {
     /// Bytes the volume holding the cache will still give an unprivileged
     /// writer, or `None` when it could not be read.
     pub(crate) available: Option<u64>,
-    /// The free space to hold back, from the same reading of the same
-    /// volume as `available`: see [`enginefs::free_space_floor`]. Carried
-    /// rather than looked up, because a cap sized against one volume's
-    /// floor and another's free space is not a cap at all.
+    /// The free space to hold back, read from the same volume as
+    /// `available` -- a second `statvfs` of the same path rather than the
+    /// same one, which is fine for a size that does not move between two
+    /// calls the way the free space can ([`enginefs::volume_total`]): see
+    /// [`enginefs::free_space_floor`]. Carried rather than looked up,
+    /// because a cap sized against one volume's floor and another's free
+    /// space is not a cap at all.
     pub(crate) floor: u64,
 }
 
