@@ -2455,7 +2455,7 @@ mod pin_tests {
                 ceiling: None,
                 seconds: 90,
                 holding: Vec::new(),
-                committed: Vec::from([0..2]),
+                committed: std::iter::once(0..2).collect(),
                 margin: 0,
                 now: std::time::Instant::now(),
             },
