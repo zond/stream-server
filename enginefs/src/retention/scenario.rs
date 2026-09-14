@@ -635,6 +635,13 @@ impl<S: Side> Backing for FakeBacking<S> {
             asked.push(run.clone());
             for index in run {
                 if !door.refuses(index) && self.held.lock().remove(&index) {
+                    // As the torrent's `drop_pieces(.., LeaveDropped)`: a
+                    // piece the pass takes is neither had nor wanted, so
+                    // the swarm does not put it straight back. Left
+                    // selected, the fake fetched every reclaimed piece
+                    // again on the next beat and every pass took it again
+                    // -- the field's loop, manufactured by the fake.
+                    self.selected.lock().remove(&index);
                     freed += 1;
                 }
             }
@@ -1147,7 +1154,7 @@ impl Scenario {
             let open = self.open.get_mut(reader).expect("an open response");
             open.cursor = moved;
             open.stream = stream;
-            let claim = open.reader.note_at((FILE, moved), now);
+            let claim = open.reader.note((FILE, moved));
             assert!(
                 claim.is_none(),
                 "a delivered byte claimed a torrent file's turn; the tick is its trigger"

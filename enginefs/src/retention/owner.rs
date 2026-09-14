@@ -3182,22 +3182,13 @@ impl<B: Backing> Reader<B> {
     /// 3): `Some` is a claim the caller must hand to [`Retention::pass`];
     /// `None` is a pass in flight, and the pass's conclusion asks the same
     /// head again.
-    pub fn note(&self, at: B::Position) -> Option<Claim> {
-        self.note_at(at, std::time::Instant::now())
-    }
-
-    /// [`Self::note`] with the clock handed in, so a test can put two
-    /// deliveries a measurable distance apart without waiting.
     ///
-    /// `pub(crate)` for the scenario harness, which is a sibling module
-    /// ([`crate::retention::scenario`]) and drives every delivered byte
-    /// through here: a scenario has one clock of its own and hands it to
-    /// everything it calls, because the policy this one is being replaced
-    /// by keys its retention on time and a scenario that could not put two
-    /// reads a measured distance apart could not test it. `note` itself
-    /// stays the production entry, and is the only caller that reads a
-    /// clock.
-    pub(crate) fn note_at(&self, at: B::Position, _now: std::time::Instant) -> Option<Claim> {
+    /// No clock: nothing here is timed. The reads a detector measures are
+    /// stamped where they are served ([`crate::retention::streams::Read`]),
+    /// and the pass measures against the clock it is handed
+    /// ([`Retention::pass_at`]); a `note_at(at, now)` that took a clock and
+    /// discarded it stood here for a while and said otherwise.
+    pub fn note(&self, at: B::Position) -> Option<Claim> {
         let budget = self.owner.budget.get();
         let (claim, refused) = {
             let mut state = self.entity.state.lock();

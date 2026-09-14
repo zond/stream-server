@@ -25,6 +25,16 @@ use super::scenario::{
 /// gibibytes too.
 const BUDGET: u64 = 4 * 1024 * 1024 * 1024;
 
+/// A budget the session's disk does not fit in: ninety-four pieces held
+/// against room for eighty, so every pass has an overhang to reclaim.
+///
+/// The field's budget above never binds -- what a pass unlinks is the
+/// overhang over the allowance, and there is none -- so every assertion
+/// about what *went* held over an empty list. The same session under this
+/// budget is where those assertions are real; `binding_session` says so
+/// by checking that something was unlinked at all.
+const BINDING_BUDGET: u64 = 80 * 4 * 1024 * 1024;
+
 /// Where the viewer is: sixteen minutes into the film, which is where the
 /// field's log put them.
 const VIEWER_AT: Duration = Duration::from_secs(16 * 60);
@@ -160,6 +170,23 @@ fn burst(script: &mut Vec<(Duration, Step)>, from: u64, the_swarm_keeps_up: bool
 /// makes no promise until the first blocked read -- which is what keeps
 /// this scenario the state the field's line was written from.
 fn field_session() -> Log {
+    field_session_under(BUDGET)
+}
+
+/// [`field_session`] under a budget the disk does not fit in, so passes
+/// reclaim; asserts that they did, which is what makes the tests that run
+/// over both sessions mean something here.
+fn binding_session() -> Log {
+    let log = field_session_under(BINDING_BUDGET);
+    assert!(
+        !log.unlinked().is_empty(),
+        "under a budget the disk does not fit in, no pass unlinked anything: the \
+         session's 'what went' assertions are vacuous"
+    );
+    log
+}
+
+fn field_session_under(budget: u64) -> Log {
     let film = FIELD_FILM;
     let mut script = vec![
         (
@@ -196,7 +223,7 @@ fn field_session() -> Log {
         // every burst is identical.
         burst(&mut script, from, from != THE_SWARM_FALLS_BEHIND);
     }
-    Scenario::new(film, BUDGET)
+    Scenario::new(film, budget)
         .on_disk(620..710)
         .on_disk(5560..5564)
         .run(&script)
@@ -267,20 +294,21 @@ fn no_pass_plans_to_reclaim_inside_an_open_streams_lookahead() {
 /// HTTP response.
 #[test]
 fn the_second_tracks_pieces_stay_after_its_response_has_closed() {
-    let log = field_session();
-    let after_the_burst = &log.passes[1];
-    for piece in [5559, 5560, 5561, 5562, 5563] {
-        assert!(
-            after_the_burst
-                .kept
-                .iter()
-                .any(|window| window.contains(&piece))
-                || !after_the_burst.unlinked.contains(&piece),
-            "piece {piece} went in the pass at {:?} with the track's response \
-             closed; what went, pass by pass: {:?}",
-            after_the_burst.at,
-            log.unlinked()
-        );
+    for log in [field_session(), binding_session()] {
+        let after_the_burst = &log.passes[1];
+        for piece in [5559, 5560, 5561, 5562, 5563] {
+            assert!(
+                after_the_burst
+                    .kept
+                    .iter()
+                    .any(|window| window.contains(&piece))
+                    || !after_the_burst.unlinked.contains(&piece),
+                "piece {piece} went in the pass at {:?} with the track's response \
+                 closed; what went, pass by pass: {:?}",
+                after_the_burst.at,
+                log.unlinked()
+            );
+        }
     }
 }
 
@@ -295,7 +323,12 @@ fn the_second_tracks_pieces_stay_after_its_response_has_closed() {
 /// asking for, so the want set does not order it back.
 #[test]
 fn no_piece_is_taken_and_paid_for_again() {
-    let log = field_session();
+    for log in [field_session(), binding_session()] {
+        no_piece_is_taken_and_paid_for_again_in(&log);
+    }
+}
+
+fn no_piece_is_taken_and_paid_for_again_in(log: &Log) {
     let mut taken: Vec<u32> = Vec::new();
     for pass in &log.passes {
         for piece in &pass.unlinked {
@@ -355,7 +388,12 @@ fn the_second_tracks_pieces_are_ordered_while_it_is_reading() {
 /// seconds for anything.
 #[test]
 fn the_second_track_never_blocks_on_a_piece_a_pass_took() {
-    let log = field_session();
+    for log in [field_session(), binding_session()] {
+        the_second_track_never_blocks_on_a_piece_a_pass_took_in(&log);
+    }
+}
+
+fn the_second_track_never_blocks_on_a_piece_a_pass_took_in(log: &Log) {
     let blocked: Vec<u32> = log
         .reads
         .iter()
