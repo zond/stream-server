@@ -123,37 +123,67 @@ number when the piece checks.
 
 ### Open in this repo
 
-3. `begin_retention` (which counts the open) and `reader_on` are separated
-   by the `get_file_reader` await -- `engine.rs:2189`, `2227`, `2242`. A
-   pass that takes both its readings in that gap empties and forgets the
-   entity, and the stream handed out ends up with no owner reader, so the
-   file is never bounded.
-4. A zip **inside a torrent** inflates on a reactor worker, and that is a
-   deliberate trade rather than an oversight -- `archives/zip.rs:153`. A zip
-   on disk is already inflated on a thread of its own driving the reader
-   through `runtime.block_on`; the torrent form stays a `tokio::spawn`
-   because its reads park waiting for pieces and a plain thread parked in
-   one is never woken when the runtime goes down, so it would hang
-   shutdown. `INFLATE_CHUNK_BYTES` (256 KiB) is what keeps it to bursts
-   between yields.
+Every item below was verified against the tree on 2026-09-14 by a reading
+whose job was partly to say "not real" or "leave it". Three did.
 
-   The trade may no longer be necessary. `engine.rs:1166` keeps a
-   `read_wakers` map and `files.rs:318` has parked reads check
-   `reads_refused()` and fail -- machinery that exists for "stopped for
-   space", and that already proves the engine can reach into a parked read
-   and end it. A shutdown that used the same path would let the torrent
-   form move to a thread like the disk form. Not a bug; an improvement with
-   a prerequisite.
-5. `enginefs/src/retention/trace.rs` is still compiled in. Its own header
-   says to delete it once a field log shows the pass settling; that is the
-   call to make after the next viewing.
-6. `server/tests/embed.rs` has 19 sleep-based waits; three of them are
-   negatives that need an enginefs tick hook to be assertions rather than
-   guesses.
-7. The narrow boundary-piece race around a pin landing mid-drop. The next
-   tick heals it in almost every case.
-8. `unrar-rs`'s licence asks that binary redistributions reproduce its
-   licence file; packages ship the GPL text but not that file.
+2. **The retention trace module stays, for now** -- `enginefs/src/retention/trace.rs`.
+   Its exit condition is met (the pass has settled over three logs), but it
+   is the *only* place `fetched`/`verified`/`unverified` reach a log at
+   all: the permanent replacement is a lifetime total on
+   `/stream-numbers.json` drawn in the app, not a line in the diagnostics
+   ring a tester sends back. Item 1 above is unmeasured and its named check
+   is the unverified figure. Deleting the instrument before reading the
+   measurement it exists for is the wrong order. **Revisit after the next
+   viewing on `f6753192`.**
+
+   When it goes, the cascade is larger than it looks, and two things are
+   decisions rather than consequences: `server/src/routes/stream.rs:1179`
+   is a fifth call site the compiler will *not* name, and
+   `staged_over_held` (`piece_store/registry.rs:111`, `store.rs:163,480`)
+   loses its only reader -- its own doc argues it is the only signal
+   separating a read inside a sparse hole from quiet media, so it wants a
+   permanent home beside `refused_reclaims` rather than deletion.
+
+3. **The zip-inside-a-torrent reactor trade stays** -- and the prerequisite
+   I recorded for it does not exist. The torrent-form reader is not a
+   `FileHandle` at all: `server/src/routes/archive.rs:791` takes a raw
+   librqbit `FileStream` through `TorrentHandle::get_file_reader` and wraps
+   it in the route's own `BackendStreamWrapper`, so `read_wakers` /
+   `reads_refused` cannot reach into it. The hang risk is also worse than
+   recorded: `ABANDONED_AFTER` fires on the next *write*, which a thread
+   parked in a torrent read never reaches, so it would leak forever holding
+   the engine `Arc`, the cache handle and the stream. Leave it.
+
+4. **The boundary-piece race is real but not where this file said.**
+   `TorrentStorage::remove_file` has no per-file production caller --
+   librqbit reaches it only on a whole-torrent delete-with-files -- so its
+   boundary rule never races a pin. The race is in `Engine::reclaim`
+   (`engine.rs:961`) and `Engine::want` (`:821`), where the pin set is read
+   and then acted on with no lock spanning the two. The tick does heal it,
+   though not by the mechanism the old note implied. Left alone; what would
+   make it matter is a pin arriving faster than a tick.
+
+   Also noted while looking: `store.rs`'s `removed_files` set is
+   insert-only and never cleared on a re-pin. Unreachable today, and
+   exactly the read-once-trust-later shape that keeps recurring here.
+
+5. `server/tests/embed.rs`'s other fourteen sleeps stay. Each is the
+   backoff tail of a bounded poll on a positive observable, guarded by an
+   assertion against `CHECK_WAIT_BOUND`, so a regression fails rather than
+   hangs. They decide how often a condition is asked, not whether it holds.
+
+6. **The install-to-reader race is narrowed, not closed** (`e2ded80`). A
+   reader that has opened and not yet delivered is not an *observed*
+   reader, so a pass landing between `Opening::reader_on` and the first
+   `poll_read` still reclaims. It can no longer forget the entity, which
+   was the unrecoverable half.
+
+7. `unrar-rs`: **not an issue.** xtremio has shipped `LICENSE-unrar-rs`
+   inside the build since `25be0ac` (2026-09-12), and this workspace builds
+   no binary to ship anything from. The obligation is narrower than
+   recorded, too: the crate's LICENSE line 14 asks a binary redistribution
+   reproduce "related license information", whose substantive payload is
+   the unRAR restriction paragraph at its lines 26-34.
 
 ### Standing hazards
 
