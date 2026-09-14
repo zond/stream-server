@@ -793,12 +793,10 @@ async fn stream_file(
                         0,
                         7,
                         None,
+                        // Archive members are read whole and sequentially,
+                        // and no player ever states a duration for one.
                         enginefs::backend::priorities::librqbit_stream_lookahead_bytes(
-                            enginefs::backend::priorities::PlaybackIntent::DirectInitial,
-                            // Archive members are read whole, sequentially,
-                            // from a session the viewer never gets a buffer
-                            // choice for.
-                            enginefs::backend::priorities::BufferProfile::Normal,
+                            enginefs::backend::priorities::Fetching::Download,
                         ),
                     )
                     .await // 7 = high priority

@@ -2317,8 +2317,7 @@ impl TorrentHandle for LibrqbitHandle {
         // file, to the lookahead its reader was really opened with, which is
         // narrower under a retention window smaller than the cap.
         let startup_cap = crate::backend::priorities::librqbit_stream_lookahead_bytes(
-            crate::backend::priorities::PlaybackIntent::DirectInitial,
-            crate::backend::priorities::BufferProfile::Normal,
+            crate::backend::priorities::Fetching::Streaming,
         );
 
         let pinned = self.pinned_set();
@@ -5486,8 +5485,7 @@ mod tests {
                 0,
                 None,
                 crate::backend::priorities::librqbit_stream_lookahead_bytes(
-                    crate::backend::priorities::PlaybackIntent::DirectSeek,
-                    crate::backend::priorities::BufferProfile::Normal,
+                    crate::backend::priorities::Fetching::Streaming,
                 ),
             )
             .await
@@ -5548,8 +5546,7 @@ mod tests {
                 0,
                 None,
                 crate::backend::priorities::librqbit_stream_lookahead_bytes(
-                    crate::backend::priorities::PlaybackIntent::DirectInitial,
-                    crate::backend::priorities::BufferProfile::Normal,
+                    crate::backend::priorities::Fetching::Streaming,
                 ),
             )
             .await
@@ -5574,8 +5571,7 @@ mod tests {
                 0,
                 None,
                 crate::backend::priorities::librqbit_stream_lookahead_bytes(
-                    crate::backend::priorities::PlaybackIntent::DirectSeek,
-                    crate::backend::priorities::BufferProfile::Normal,
+                    crate::backend::priorities::Fetching::Streaming,
                 ),
             )
             .await
@@ -5607,8 +5603,7 @@ mod tests {
         let (_backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
         handle.handle.wait_until_initialized().await.unwrap();
         let lookahead = crate::backend::priorities::librqbit_stream_lookahead_bytes(
-            crate::backend::priorities::PlaybackIntent::DirectSeek,
-            crate::backend::priorities::BufferProfile::Normal,
+            crate::backend::priorities::Fetching::Streaming,
         );
         let in_flight =
             |stats: EngineStats| stats.files[0].in_flight_piece.map(|piece| piece.index);
@@ -5669,8 +5664,7 @@ mod tests {
                 0,
                 None,
                 crate::backend::priorities::librqbit_stream_lookahead_bytes(
-                    crate::backend::priorities::PlaybackIntent::DirectInitial,
-                    crate::backend::priorities::BufferProfile::Normal,
+                    crate::backend::priorities::Fetching::Streaming,
                 ),
             )
             .await
@@ -5782,7 +5776,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn get_file_reader_opens_the_stream_with_the_lookahead_it_is_handed() {
         use crate::backend::TorrentHandle;
-        use crate::backend::priorities::{BufferProfile, PlaybackIntent};
+        use crate::backend::priorities::Fetching;
         use tokio::io::AsyncReadExt;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
@@ -5797,10 +5791,8 @@ mod tests {
             "a stream that reads nothing ahead is refused, so the number handed in is \
              the one the stream is opened with"
         );
-        let widest = crate::backend::priorities::librqbit_stream_lookahead_bytes(
-            PlaybackIntent::DirectSeek,
-            BufferProfile::Maximum,
-        );
+        let widest =
+            crate::backend::priorities::librqbit_stream_lookahead_bytes(Fetching::Streaming);
         for lookahead in [1, widest] {
             let mut reader = handle
                 .get_file_reader(0, 0, 100, None, lookahead)
@@ -5845,14 +5837,13 @@ mod tests {
     }
 
     /// And the other half of that measure: a reader opened to fetch further
-    /// ahead than the startup window -- every request after the first
-    /// carries a 128 MiB cap -- is still judged over the 4 MiB startup
-    /// window, which is what every buffer profile is shown. Five megabytes
-    /// of file, so the two can be told apart.
+    /// ahead than the startup window -- a stream sized from the film's own
+    /// bitrate reads far past it -- is still judged over the streaming
+    /// window. Five megabytes of file, so the two can be told apart.
     #[tokio::test(flavor = "multi_thread")]
     async fn startup_readiness_is_capped_at_the_startup_window_however_far_the_reader_fetches() {
         use crate::backend::TorrentHandle;
-        use crate::backend::priorities::{BufferProfile, PlaybackIntent};
+        use crate::backend::priorities::Fetching;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
         let payload = dir.join("payload.bin");
@@ -5861,16 +5852,14 @@ mod tests {
         let (_backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
         handle.handle.wait_until_initialized().await.unwrap();
 
-        let startup = crate::backend::priorities::librqbit_stream_lookahead_bytes(
-            PlaybackIntent::DirectInitial,
-            BufferProfile::Normal,
-        );
-        let seek = crate::backend::priorities::librqbit_stream_lookahead_bytes(
-            PlaybackIntent::DirectSeek,
-            BufferProfile::Normal,
-        );
-        assert!(startup < 5 * 1024 * 1024 && seek > 5 * 1024 * 1024);
-        let _reader = handle.get_file_reader(0, 0, 100, None, seek).await.unwrap();
+        let startup =
+            crate::backend::priorities::librqbit_stream_lookahead_bytes(Fetching::Streaming);
+        let reaching_past_the_file = 5 * 1024 * 1024 + 1;
+        assert!(startup < reaching_past_the_file);
+        let _reader = handle
+            .get_file_reader(0, 0, 100, None, reaching_past_the_file)
+            .await
+            .unwrap();
         let stats = TorrentHandle::stats(&handle).await;
         assert_eq!(
             stats.files[0].initial_window_bytes,
@@ -6101,7 +6090,7 @@ mod tests {
     /// still hash-checking (8 MiB of payload widens that window).
     #[tokio::test(flavor = "multi_thread")]
     async fn selection_and_reader_wait_for_initializing_torrent() {
-        use crate::backend::priorities::{BufferProfile, PlaybackIntent};
+        use crate::backend::priorities::Fetching;
         use crate::backend::{TorrentFilePriorityPlan, TorrentHandle};
         use tokio::io::AsyncReadExt;
         let tmp = tempfile::tempdir().unwrap();
@@ -6136,10 +6125,7 @@ mod tests {
                 0,
                 1,
                 None,
-                crate::backend::priorities::librqbit_stream_lookahead_bytes(
-                    PlaybackIntent::DirectInitial,
-                    BufferProfile::Normal,
-                ),
+                crate::backend::priorities::librqbit_stream_lookahead_bytes(Fetching::Streaming),
             )
             .await
             .expect("reader opens after initialization");
@@ -7673,7 +7659,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn multifile_selection_lifecycle() {
-        use crate::backend::priorities::{BufferProfile, PlaybackIntent};
+        use crate::backend::priorities::Fetching;
         use crate::backend::{TorrentFilePriorityPlan, TorrentHandle};
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
@@ -7718,10 +7704,7 @@ mod tests {
                 0,
                 0,
                 None,
-                crate::backend::priorities::librqbit_stream_lookahead_bytes(
-                    PlaybackIntent::DirectInitial,
-                    BufferProfile::Normal,
-                ),
+                crate::backend::priorities::librqbit_stream_lookahead_bytes(Fetching::Streaming),
             )
             .await
             .unwrap();
@@ -8251,7 +8234,7 @@ mod tests {
     /// window and a 32-piece committed half.
     ///
     /// The window is narrower than every playback intent's lookahead cap
-    /// but the startup one (`MAX_STARTUP_WINDOW_BYTES`, 4 MiB = 16 pieces;
+    /// but the startup one (`STREAMING_LOOKAHEAD_BYTES`, 4 MiB = 16 pieces;
     /// the seek and sequential caps are 128 MiB, four times the file), and
     /// it does not have to be wider: the reader is opened with the smaller
     /// of the cap and the window's reach, so what the stream is about to
@@ -8322,7 +8305,7 @@ mod tests {
                 0,
                 0,
                 255,
-                crate::backend::priorities::PlaybackIntent::DirectInitial,
+                crate::backend::priorities::Fetching::Streaming,
                 crate::backend::priorities::BufferProfile::Normal,
             )
             .await
@@ -8445,7 +8428,7 @@ mod tests {
     /// **The bound under a lookahead wider than the window, and with the
     /// player's read of the container index beside it.** The same stream,
     /// opened with the intent every request after the first carries
-    /// (`DirectSeek`, a 128 MiB cap: four times this file), never has more
+    /// (the download fallback, wider than this file), never has more
     /// on disk than the budget, never has more off the swarm than the
     /// budget and what it has delivered can account for, and no pass is
     /// refused a piece it set out to reclaim.
@@ -8505,10 +8488,9 @@ mod tests {
 
         assert!(
             crate::backend::priorities::librqbit_stream_lookahead_bytes(
-                crate::backend::priorities::PlaybackIntent::DirectSeek,
-                crate::backend::priorities::BufferProfile::Normal,
+                crate::backend::priorities::Fetching::Download
             ) > RETENTION_FILE_BYTES as u64,
-            "the intent's cap has to be wider than the file, or the window is not what bounds it"
+            "the fallback has to be wider than the file, or the window is not what bounds it"
         );
         // **The film's own length, which is what a stream's lookahead is
         // made of.** Four hundred seconds of a 32 MiB file is 84 kB a
@@ -8523,7 +8505,7 @@ mod tests {
                 0,
                 0,
                 255,
-                crate::backend::priorities::PlaybackIntent::DirectSeek,
+                crate::backend::priorities::Fetching::Streaming,
                 crate::backend::priorities::BufferProfile::Normal,
             )
             .await
@@ -8605,7 +8587,7 @@ mod tests {
             bound.fetched_peak
         );
         assert!(
-            bound.at_rest_bytes <= crate::backend::priorities::MAX_STARTUP_WINDOW_BYTES,
+            bound.at_rest_bytes <= crate::backend::priorities::STREAMING_LOOKAHEAD_BYTES,
             "{} bytes came off the swarm across {} passes that delivered nothing and \
              left the disk where it was: that is a window moving off its reader, not \
              a fill landing after the reading stopped",
@@ -8764,7 +8746,7 @@ mod tests {
         /// **mpv's read of the container index at the tail**, which is what
         /// made the field measurement above what it was: a second reader on
         /// the same file, opened near its end with the intent that names it
-        /// (`ContainerMetadata`), which delivers a few bytes and closes
+        /// which delivers a few bytes and closes
         /// before the next pass runs.
         ///
         /// That read used to claim the file's head, and a head is not given
@@ -8784,7 +8766,7 @@ mod tests {
                     0,
                     tail,
                     255,
-                    crate::backend::priorities::PlaybackIntent::ContainerMetadata,
+                    crate::backend::priorities::Fetching::Streaming,
                     crate::backend::priorities::BufferProfile::Normal,
                 )
                 .await
@@ -8910,7 +8892,7 @@ mod tests {
                 0,
                 0,
                 255,
-                crate::backend::priorities::PlaybackIntent::DirectInitial,
+                crate::backend::priorities::Fetching::Streaming,
                 crate::backend::priorities::BufferProfile::Normal,
             )
             .await
@@ -8977,7 +8959,7 @@ mod tests {
                 0,
                 tail,
                 255,
-                crate::backend::priorities::PlaybackIntent::ContainerMetadata,
+                crate::backend::priorities::Fetching::Streaming,
                 crate::backend::priorities::BufferProfile::Normal,
             )
             .await
@@ -9081,7 +9063,7 @@ mod tests {
                 0,
                 0,
                 255,
-                crate::backend::priorities::PlaybackIntent::DirectInitial,
+                crate::backend::priorities::Fetching::Streaming,
                 crate::backend::priorities::BufferProfile::Normal,
             )
             .await
@@ -9188,7 +9170,7 @@ mod tests {
                 0,
                 0,
                 255,
-                crate::backend::priorities::PlaybackIntent::DirectInitial,
+                crate::backend::priorities::Fetching::Streaming,
                 crate::backend::priorities::BufferProfile::Normal,
             )
             .await
@@ -9351,7 +9333,7 @@ mod tests {
                 0,
                 0,
                 255,
-                crate::backend::priorities::PlaybackIntent::DirectInitial,
+                crate::backend::priorities::Fetching::Streaming,
                 crate::backend::priorities::BufferProfile::Normal,
             )
             .await
@@ -9458,7 +9440,7 @@ mod tests {
                 0,
                 0,
                 255,
-                crate::backend::priorities::PlaybackIntent::DirectInitial,
+                crate::backend::priorities::Fetching::Streaming,
                 crate::backend::priorities::BufferProfile::Normal,
             )
             .await
@@ -9606,7 +9588,7 @@ mod tests {
                 0,
                 0,
                 255,
-                crate::backend::priorities::PlaybackIntent::DirectInitial,
+                crate::backend::priorities::Fetching::Streaming,
                 crate::backend::priorities::BufferProfile::Normal,
             )
             .await

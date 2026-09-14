@@ -1,33 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-/// Startup is gated on the actual first readable bytes. Keep speculative work
-/// near MPV's 4 MiB network buffer so rare seek/Cues pieces are not starved by
-/// a large urgent head window.
-pub const MAX_STARTUP_WINDOW_BYTES: u64 = 4 * 1024 * 1024;
-pub const MAX_SEEK_HOT_WINDOW_BYTES: u64 = 128 * 1024 * 1024;
-pub const MAX_WARM_WINDOW_BYTES: u64 = 256 * 1024 * 1024;
-pub const MAX_CONTAINER_METADATA_WINDOW_BYTES: u64 = 16 * 1024 * 1024;
-
-/// A container's index is a fraction of the container, so the window that
-/// recognises one has to scale with the file rather than sit at a constant.
-///
-/// The field film of 2026-09-12 is 23 GB with a 10.7 MB `moov`, and mpv
-/// does not read that once and stop: it keeps a second reader crawling the
-/// region for as long as the film is open, reopening about once a second.
-/// In that log the crawler sat 25.96 MB from the end -- past the 16 MiB
-/// constant, so it arrived as `DirectSeek`, became the newest playing read
-/// every time it reopened, and took the retention window 4,700 pieces away
-/// from the viewer: `playhead=5559` with the reader at piece 806.
-///
-/// A five-hundred-and-twelfth is 45 MB of that film, and leaves the
-/// constant in charge of anything under 8 GB. What it costs is a viewer
-/// seeking to within thirteen seconds of the end of a 23 GB film being read
-/// as an index fetch -- which costs them the retention window over the
-/// seconds they have left, and nothing else.
-const CONTAINER_METADATA_FRACTION: u64 = 512;
-pub const MAX_DOWNLOAD_RANGE_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
-pub const SMALL_FILE_BYTES: u64 = 64 * 1024 * 1024;
-
 /// How much of the film the committed set may come to, stated as seconds of
 /// it, whatever the buffer profile.
 ///
@@ -40,84 +12,27 @@ pub const SMALL_FILE_BYTES: u64 = 64 * 1024 * 1024;
 /// as the buffer is.
 pub const COMMITTED_SECONDS: u64 = 90;
 
-/// Start treating reads as "container metadata" when they fall in the last 10MB
-/// or the last 5% of the file, whichever starts earlier.
-/// How much of the end of a file an index read may cover; see
-/// [`CONTAINER_METADATA_FRACTION`].
-pub fn container_metadata_window(file_size: u64) -> u64 {
-    MAX_CONTAINER_METADATA_WINDOW_BYTES.max(file_size / CONTAINER_METADATA_FRACTION)
-}
-
-pub fn container_metadata_start(file_size: u64) -> u64 {
-    if file_size == 0 {
-        0
-    } else if file_size < SMALL_FILE_BYTES {
-        file_size.saturating_mul(95) / 100
-    } else {
-        file_size
-            .saturating_sub(10 * 1024 * 1024)
-            .min(file_size.saturating_mul(95) / 100)
-    }
-}
-
-/// Whether a read of `requested_len` bytes from `start` of a file of
-/// `file_size` is a player fetching the container's index rather than
-/// somebody watching from there.
+/// **How much of the film the viewer wants in hand**, in seconds of it.
 ///
-/// **The geometry is the whole question, and the length clause is what
-/// makes it safe.** An open-ended `Range: bytes=X-` reaches here with
-/// `requested_len` already resolved to `file_size - start`, so asking for
-/// at most [`MAX_CONTAINER_METADATA_WINDOW_BYTES`] *is* asking to start
-/// within that far of the end: on a 23 GB film, the last 4.6 seconds. A
-/// viewer who drags the scrubber into the last ten minutes asks for the
-/// 2 GB that are left and is playback, by this clause, without needing to
-/// be asked whether the range named an end.
-///
-/// It is deliberately not asked, because the answer is wrong. The player
-/// this serves reads the container index with an open-ended range like
-/// every other read it makes -- the field log has libmpv fetching 10.7 MB
-/// at EOF as `bytes=23335526369-` -- so requiring a bounded range made
-/// [`PlaybackIntent::ContainerMetadata`] unreachable and classified that
-/// read as a seek to the end of the film. What that cost is in
-/// [`crate::retention::owner::Reading`]: the index read became the newest
-/// playing read, the window relocated to the tail for the thirty seconds
-/// it was open, and the pieces the viewer was waiting on at the front of
-/// the film queued behind it.
-///
-/// What is traded for it is a viewer who seeks to within
-/// [`MAX_CONTAINER_METADATA_WINDOW_BYTES`] of the end -- a few seconds of
-/// a film, under a minute of a small file -- being read as a probe, and
-/// getting no retention window round the little there is left to watch.
-/// Their stream's own lookahead still fetches it.
-pub fn is_container_metadata_request(start: u64, requested_len: u64, file_size: u64) -> bool {
-    start > 0
-        && file_size > 0
-        && requested_len > 0
-        && requested_len <= container_metadata_window(file_size)
-        && start >= container_metadata_start(file_size)
-}
-
-/// How far ahead a *playback* stream reads.
-///
-/// The read-ahead windows are constants tuned for a healthy connection and a
-/// patient player. A spotty link -- or a receiver with a shallower buffer than
-/// mpv's -- wants more of the file fetched before it is needed, at the cost of
+/// A spotty link -- or a receiver with a shallower buffer than mpv's --
+/// wants more of the file fetched before it is needed, at the cost of
 /// downloading further ahead than will necessarily be watched. This is that
-/// choice, as a multiplier applied to the playback windows.
+/// choice, and it is stated in the unit the viewer chose in: "how much of
+/// this film do I want in hand", not "what fraction of my disk".
 ///
-/// It deliberately does **not** touch the startup window
-/// ([`MAX_STARTUP_WINDOW_BYTES`]): the narrow first-frame want-set is what
-/// makes playback start quickly, and widening it would spend that latency to
-/// buy read-ahead the very next request already provides. Every profile
-/// starts a stream the same way and differs only once bytes are flowing.
+/// **It is one number and it governs both halves**: how far ahead the
+/// stream reads and how long the retention window may be
+/// ([`Self::window_seconds`]), because the two are the same question asked
+/// of the swarm and of the disk. The bytes it comes to are the film's own
+/// bitrate times these seconds. Sized from the disk instead, the forward
+/// reach was a fraction of `cacheSize`, so a viewer who gave the app a
+/// bigger cache silently bought a bigger mobile-data bill.
 ///
-/// **It is also how long the retention window may be, in time**
-/// ([`Self::window_seconds`]). Sized from the disk alone, the forward reach
-/// is a fraction of `cacheSize`, so a viewer who gave the app a bigger cache
-/// silently bought a bigger mobile-data bill: the window fetched what the
-/// disk could hold rather than what the playback needed. The profile says
-/// how many seconds of *this stream* the buffer is worth, measured from the
-/// rate bytes really leave the server at, and the disk is only the ceiling.
+/// It does not scale the fallback a stream reads ahead at before a duration
+/// has been stated ([`STREAMING_LOOKAHEAD_BYTES`]): those first seconds are
+/// where a narrow want-set makes the first frame arrive, and multiplying a
+/// number that exists because nothing is known yet would be scaling a
+/// guess.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum BufferProfile {
@@ -169,26 +84,14 @@ impl BufferProfile {
             .find(|profile| value.eq_ignore_ascii_case(profile.as_str()))
     }
 
-    /// The multiplier this profile applies to a playback window.
-    const fn window_scale(self) -> u64 {
-        match self {
-            Self::Normal => 1,
-            Self::Large => 2,
-            Self::Maximum => 4,
-        }
-    }
-
-    /// Scale a playback read-ahead window in bytes. Saturating, so no profile
-    /// can wrap a large window round to a small one.
     /// How many seconds of the stream the retention window's forward reach
     /// may buy, or `None` for [`Self::Maximum`], which asks for the file.
     ///
     /// The unit is the one the viewer chose in: "how much of this film do I
     /// want in hand", not "what fraction of my disk". The bytes it comes to
-    /// are the film's own bitrate times this, floored at
-    /// `SMALLEST_TIME_CAP_BYTES` so a low-bitrate stream still gets a
-    /// sensible buffer, and it is only ever a *cap* -- the budget and the
-    /// lookahead floor still bound it from the other side.
+    /// are the film's own bitrate times this, and it is only ever a *cap*
+    /// -- the budget and the lookahead floor still bound it from the other
+    /// side.
     pub const fn window_seconds(self) -> Option<u64> {
         match self {
             Self::Normal => Some(90),
@@ -196,89 +99,72 @@ impl BufferProfile {
             Self::Maximum => None,
         }
     }
-
-    pub const fn scale_playback_window(self, bytes: u64) -> u64 {
-        bytes.saturating_mul(self.window_scale())
-    }
 }
 
+/// What a read is for, which after the read-pattern rewrite is one bit:
+/// whether somebody is watching it or it is being fetched for later.
+///
+/// **This decides one number and nothing else** -- how far ahead of the
+/// reader the swarm is asked to fetch *when the film's own arithmetic
+/// cannot say*. A playing stream reads ahead at the film's bitrate times
+/// the seconds the viewer asked to have buffered
+/// (`Engine::try_get_file_with_intent`), and what is kept on the disk comes
+/// from the read-pattern detector; neither asks this.
+///
+/// **It used to be eight variants classifying the geometry of the range
+/// header** -- a first read, a seek, a sequential read, a full download, a
+/// ranged download, a crawl over the container index at the tail, a probe,
+/// a background fetch -- each with a window of its own, and an arm telling
+/// the retention which reader was the viewer. Every one of those questions
+/// is now answered by watching what the reads do
+/// (`crate::retention::streams`): in the field log of 2026-09-14 mpv's
+/// index crawler measured 91 B/s beside the viewer's 1.2 MB/s, two reads a
+/// range header cannot tell apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum PlaybackIntent {
-    DirectInitial,
-    DirectSeek,
-    DirectSequential,
-    DownloadFull,
-    DownloadRange,
-    ContainerMetadata,
-    InternalProbe,
-    Background,
+pub enum Fetching {
+    /// Somebody is watching. The fallback is deliberately small: a stream
+    /// that has not been told a duration yet is a stream in its first
+    /// seconds, where a narrow want-set is what makes the first frame
+    /// arrive -- and the next request, by which time a duration has usually
+    /// been stated, is sized from the film.
+    Streaming,
+    /// A file being fetched for later, which **never has a duration**: a
+    /// duration is stated by a player, and nothing has played this. So for
+    /// a download the fallback is not a fallback but the number in force
+    /// for the whole fetch, and it is sized to keep the swarm busy rather
+    /// than to sit a fixed distance ahead of a playhead that does not
+    /// exist.
+    Download,
 }
 
-impl PlaybackIntent {
-    /// Whether a read made with this intent is somebody *playing* the file,
-    /// and so whether its position is the file's own -- what the retention
-    /// window is drawn round, what the stats split behind and ahead at, and
-    /// what a paused film leaves behind. See [`Reading`].
-    ///
-    /// Only the three direct intents are. The others are all reads of a
-    /// region nobody is watching from: the container index at the tail
-    /// (`ContainerMetadata`, which is a *player's* request and delivers
-    /// bytes like any other), the server's own probe, a background fetch,
-    /// and a download -- a download walks the whole file at whatever rate
-    /// the swarm gives, and letting it carry the file's head would move the
-    /// window off the viewer who is watching the same file while it runs.
-    /// Each of them still gets a window of its own round where it is
-    /// reading while it is open ([`Reading::Probe`]); none of them leaves
-    /// one behind.
-    ///
-    /// [`Reading`]: crate::retention::owner::Reading
-    pub fn reading(self) -> crate::retention::owner::Reading {
-        use crate::retention::owner::Reading;
-        match self {
-            Self::DirectInitial | Self::DirectSeek | Self::DirectSequential => Reading::Playback,
-            Self::DownloadFull
-            | Self::DownloadRange
-            | Self::ContainerMetadata
-            | Self::InternalProbe
-            | Self::Background => Reading::Probe,
-        }
-    }
-}
+/// What a playing stream reads ahead of itself before a duration has been
+/// stated; see [`Fetching::Streaming`].
+pub const STREAMING_LOOKAHEAD_BYTES: u64 = 4 * 1024 * 1024;
 
-/// The most a stream reads ahead of itself, in bytes, by playback intent:
-/// the cap on librqbit's per-stream lookahead, in place of its fixed 32 MiB
-/// default.
+/// What a download reads ahead of itself, for its whole life; see
+/// [`Fetching::Download`].
+pub const DOWNLOAD_LOOKAHEAD_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The most a stream reads ahead of itself, in bytes, **when the film's own
+/// arithmetic cannot say**: the cap on librqbit's per-stream lookahead, in
+/// place of its fixed 32 MiB default.
 ///
-/// **One of two inputs.** `Engine::try_get_file_with_intent` opens the
-/// reader with the smaller of this and the retention window's reach ahead of
-/// the reader (`Engine::fetch_bound`), so a stream never asks the swarm for a
-/// piece the next retention pass would reclaim; this is the whole of the
-/// lookahead only for a file nothing bounds. `stream_with_options` rejects a
-/// zero window, so the result is at least 1 (all constants are already > 0).
+/// **One of two inputs even then.** The reader is opened with the smaller of
+/// this and the retention window's reach ahead of it
+/// (`Engine::fetch_bound`), so a stream never asks the swarm for a piece the
+/// next retention pass would reclaim. `stream_with_options` rejects a zero
+/// window, so the result is at least 1 (both constants are already > 0).
 ///
-/// `buffer` is the viewer's read-ahead choice and scales the playback windows
-/// only -- never the startup one, see [`BufferProfile`].
-pub fn librqbit_stream_lookahead_bytes(intent: PlaybackIntent, buffer: BufferProfile) -> u64 {
-    match intent {
-        // First-frame latency: narrow the startup want-set (4 MiB) so the head
-        // pieces verify faster than under librqbit's 32 MiB default. This is
-        // the one window the buffer profile leaves alone: widening it would
-        // trade first-frame latency away for read-ahead the next request
-        // (already DirectSequential, already scaled) supplies anyway.
-        PlaybackIntent::DirectInitial => MAX_STARTUP_WINDOW_BYTES,
-        // Hot read-ahead once playing / after a seek -- what the viewer's
-        // buffer choice is actually about.
-        PlaybackIntent::DirectSeek | PlaybackIntent::DirectSequential => {
-            buffer.scale_playback_window(MAX_SEEK_HOT_WINDOW_BYTES)
-        }
-        PlaybackIntent::DownloadFull => MAX_WARM_WINDOW_BYTES,
-        PlaybackIntent::DownloadRange => MAX_DOWNLOAD_RANGE_WINDOW_BYTES,
-        PlaybackIntent::ContainerMetadata
-        | PlaybackIntent::InternalProbe
-        | PlaybackIntent::Background => MAX_CONTAINER_METADATA_WINDOW_BYTES,
+/// **The buffer profile does not scale it.** The profile says how many
+/// seconds of the stream to hold, which is applied where the seconds are
+/// known; multiplying a fallback that exists because nothing is known would
+/// be scaling a guess.
+pub const fn librqbit_stream_lookahead_bytes(fetching: Fetching) -> u64 {
+    match fetching {
+        Fetching::Streaming => STREAMING_LOOKAHEAD_BYTES,
+        Fetching::Download => DOWNLOAD_LOOKAHEAD_BYTES,
     }
-    .max(1)
 }
 
 /// Progress of the priority window a stream is waiting on: how much of it is
@@ -381,136 +267,26 @@ impl Default for EngineCacheConfig {
 mod tests {
     use super::*;
 
+    /// **Two numbers, and which one a read gets.** A stream reading ahead
+    /// before a duration has been stated gets the small one, because those
+    /// are the seconds a narrow want-set buys a first frame in; a download
+    /// gets the large one for its whole life, because nothing will ever
+    /// state it a duration to be sized from.
     #[test]
-    fn small_file_metadata_starts_at_final_five_percent() {
-        let file_size = 8 * 1024 * 1024;
-        assert_eq!(container_metadata_start(file_size), file_size * 95 / 100);
-        assert!(!is_container_metadata_request(1024 * 1024, 1024, file_size));
-        assert!(is_container_metadata_request(
-            container_metadata_start(file_size),
-            1024,
-            file_size
-        ));
-    }
-
-    /// **Where an open-ended range stops being a seek and starts being an
-    /// index read**, which is the only thing separating the two.
-    ///
-    /// Both arrive as `Range: bytes=X-`, and both reach here with the
-    /// length resolved to `file_size - start`. So the length clause is the
-    /// question: a seek into the tail leaves gigabytes to play and an index
-    /// read leaves megabytes.
-    #[test]
-    fn an_open_ended_range_is_an_index_read_only_within_a_window_of_the_end() {
-        let file_size = 10 * 1024 * 1024 * 1024;
-        let open_ended =
-            |start: u64| is_container_metadata_request(start, file_size - start, file_size);
-        // A viewer who dragged the scrubber into the last ten minutes: the
-        // geometry says "near the end", and the half-gigabyte they asked
-        // for says they are watching it.
-        assert!(!open_ended(container_metadata_start(file_size)));
-        // libmpv reading the container index, which is the shape the field
-        // log caught being called a seek.
-        // The window scales with the file: twenty mebibytes of a 10 GiB
-        // one, not the sixteen the constant alone would allow -- an index
-        // is a fraction of its container, and mpv's crawler on the field's
-        // 23 GB film sat 25.96 MB out, past any constant.
-        let window = container_metadata_window(file_size);
-        assert_eq!(window, file_size / 512);
-        assert!(open_ended(file_size - window));
-        assert!(!open_ended(file_size - window - 1));
-    }
-
-    /// **mpv's index crawler, at the size it really was.**
-    ///
-    /// The field film of 2026-09-12: 23,346,250,742 bytes, and a second
-    /// reader parked 25,962,800 from the end, reopening about once a second
-    /// for the whole viewing. Under the 16 MiB constant that read arrived as
-    /// `DirectSeek`, so it was the newest *playing* read every time it
-    /// opened and the retention window followed it to the end of the film --
-    /// `playhead=5559` with the viewer's own reader at piece 806.
-    #[test]
-    fn the_field_crawler_is_an_index_read_and_not_a_seek() {
-        let file_size = 23_346_250_742;
-        let crawler = 25_962_800;
-        assert!(
-            is_container_metadata_request(file_size - crawler, crawler, file_size),
-            "the crawler is the container's index, not somebody watching from there"
-        );
-        // And a viewer who really is near the end still is: a minute of a
-        // 23 Mbps film is far more than the window.
-        let minute = 3_400_000 * 60;
-        assert!(!is_container_metadata_request(
-            file_size - minute,
-            minute,
-            file_size
-        ));
-    }
-
-    #[test]
-    fn large_near_end_playback_range_is_not_metadata_when_range_is_large() {
-        let file_size = 10 * 1024 * 1024 * 1024;
-        let start = container_metadata_start(file_size);
-
-        let window = container_metadata_window(file_size);
-        assert!(is_container_metadata_request(start, window, file_size));
-        assert!(!is_container_metadata_request(start, window + 1, file_size));
-    }
-
-    #[test]
-    fn librqbit_lookahead_maps_each_intent_to_its_window_cap() {
+    fn the_fallback_is_one_of_two_numbers() {
         assert_eq!(
-            librqbit_stream_lookahead_bytes(PlaybackIntent::DirectInitial, BufferProfile::Normal),
-            MAX_STARTUP_WINDOW_BYTES
+            librqbit_stream_lookahead_bytes(Fetching::Streaming),
+            STREAMING_LOOKAHEAD_BYTES
         );
         assert_eq!(
-            librqbit_stream_lookahead_bytes(PlaybackIntent::DirectSeek, BufferProfile::Normal),
-            MAX_SEEK_HOT_WINDOW_BYTES
+            librqbit_stream_lookahead_bytes(Fetching::Download),
+            DOWNLOAD_LOOKAHEAD_BYTES
         );
-        assert_eq!(
-            librqbit_stream_lookahead_bytes(
-                PlaybackIntent::DirectSequential,
-                BufferProfile::Normal
-            ),
-            MAX_SEEK_HOT_WINDOW_BYTES
-        );
-        assert_eq!(
-            librqbit_stream_lookahead_bytes(PlaybackIntent::DownloadFull, BufferProfile::Normal),
-            MAX_WARM_WINDOW_BYTES
-        );
-        assert_eq!(
-            librqbit_stream_lookahead_bytes(PlaybackIntent::DownloadRange, BufferProfile::Normal),
-            MAX_DOWNLOAD_RANGE_WINDOW_BYTES
-        );
-        assert_eq!(
-            librqbit_stream_lookahead_bytes(
-                PlaybackIntent::ContainerMetadata,
-                BufferProfile::Normal
-            ),
-            MAX_CONTAINER_METADATA_WINDOW_BYTES
-        );
-        assert_eq!(
-            librqbit_stream_lookahead_bytes(PlaybackIntent::InternalProbe, BufferProfile::Normal),
-            MAX_CONTAINER_METADATA_WINDOW_BYTES
-        );
-        assert_eq!(
-            librqbit_stream_lookahead_bytes(PlaybackIntent::Background, BufferProfile::Normal),
-            MAX_CONTAINER_METADATA_WINDOW_BYTES
-        );
-        // Every intent must produce a positive window (stream_with_options
-        // rejects 0).
-        for intent in [
-            PlaybackIntent::DirectInitial,
-            PlaybackIntent::DirectSeek,
-            PlaybackIntent::DirectSequential,
-            PlaybackIntent::DownloadFull,
-            PlaybackIntent::DownloadRange,
-            PlaybackIntent::ContainerMetadata,
-            PlaybackIntent::InternalProbe,
-            PlaybackIntent::Background,
-        ] {
-            assert!(librqbit_stream_lookahead_bytes(intent, BufferProfile::Normal) > 0);
+        // `stream_with_options` rejects a zero window.
+        for fetching in [Fetching::Streaming, Fetching::Download] {
+            assert!(librqbit_stream_lookahead_bytes(fetching) > 0);
         }
+        const { assert!(DOWNLOAD_LOOKAHEAD_BYTES > STREAMING_LOOKAHEAD_BYTES) };
     }
 
     #[test]
@@ -546,13 +322,13 @@ mod tests {
         let file_len = 8 * 1024 * 1024 * 1024u64;
         let have_none = |_: u64| false;
         assert_eq!(
-            initial_window_progress(0, file_len, piece, MAX_STARTUP_WINDOW_BYTES, 0, have_none),
+            initial_window_progress(0, file_len, piece, STREAMING_LOOKAHEAD_BYTES, 0, have_none),
             (0, piece),
             "the window is the piece, not the 4 MiB inside it"
         );
         let have_first = |p: u64| p == 0;
         assert_eq!(
-            initial_window_progress(0, file_len, piece, MAX_STARTUP_WINDOW_BYTES, 0, have_first),
+            initial_window_progress(0, file_len, piece, STREAMING_LOOKAHEAD_BYTES, 0, have_first),
             (piece, piece),
             "and one piece is the whole of it"
         );
@@ -586,13 +362,13 @@ mod tests {
         // and the tail piece is clipped to the file's end.
         let have_all = |_: u64| true;
         assert_eq!(
-            initial_window_progress(0, 300, 256, MAX_STARTUP_WINDOW_BYTES, 0, have_all),
+            initial_window_progress(0, 300, 256, STREAMING_LOOKAHEAD_BYTES, 0, have_all),
             (300, 300)
         );
         // Only the second piece (bytes 256..300 of the file) is present.
         let have_second = |p: u64| p == 1;
         assert_eq!(
-            initial_window_progress(0, 300, 256, MAX_STARTUP_WINDOW_BYTES, 0, have_second),
+            initial_window_progress(0, 300, 256, STREAMING_LOOKAHEAD_BYTES, 0, have_second),
             (44, 300)
         );
     }
@@ -641,60 +417,22 @@ mod tests {
         assert_eq!(BufferProfile::default(), BufferProfile::Normal);
     }
 
+    /// **The buffer profile scales the seconds, not the fallback.** What a
+    /// stream reads ahead is those seconds times the film's bitrate; the
+    /// fallback exists precisely because neither is known yet, and
+    /// multiplying it would be scaling a guess.
     #[test]
-    fn buffer_profiles_scale_the_playback_lookahead_window() {
-        let normal =
-            librqbit_stream_lookahead_bytes(PlaybackIntent::DirectSeek, BufferProfile::Normal);
-        assert_eq!(normal, MAX_SEEK_HOT_WINDOW_BYTES);
-        assert_eq!(
-            librqbit_stream_lookahead_bytes(PlaybackIntent::DirectSeek, BufferProfile::Large),
-            2 * MAX_SEEK_HOT_WINDOW_BYTES
-        );
-        assert_eq!(
-            librqbit_stream_lookahead_bytes(PlaybackIntent::DirectSeek, BufferProfile::Maximum),
-            4 * MAX_SEEK_HOT_WINDOW_BYTES
-        );
-        // The window a playing stream actually uses is the sequential one, and
-        // it scales the same way.
-        for profile in BufferProfile::ALL {
-            assert_eq!(
-                librqbit_stream_lookahead_bytes(PlaybackIntent::DirectSequential, profile),
-                librqbit_stream_lookahead_bytes(PlaybackIntent::DirectSeek, profile),
-                "profile {}",
-                profile.as_str()
-            );
-        }
-    }
-
-    #[test]
-    fn the_startup_window_is_the_same_under_every_buffer_profile() {
-        // Deliberate: the narrow first-frame want-set is what makes playback
-        // start quickly. Widening it would trade that latency away.
-        for profile in BufferProfile::ALL {
-            assert_eq!(
-                librqbit_stream_lookahead_bytes(PlaybackIntent::DirectInitial, profile),
-                MAX_STARTUP_WINDOW_BYTES,
-                "profile {}",
-                profile.as_str()
-            );
-        }
-    }
-
-    #[test]
-    fn non_playback_windows_ignore_the_buffer_profile() {
-        for intent in [
-            PlaybackIntent::DownloadFull,
-            PlaybackIntent::DownloadRange,
-            PlaybackIntent::ContainerMetadata,
-            PlaybackIntent::InternalProbe,
-            PlaybackIntent::Background,
-        ] {
-            let normal = librqbit_stream_lookahead_bytes(intent, BufferProfile::Normal);
+    fn the_fallback_is_the_same_under_every_buffer_profile() {
+        assert_eq!(BufferProfile::Normal.window_seconds(), Some(90));
+        assert_eq!(BufferProfile::Large.window_seconds(), Some(4 * 60));
+        assert_eq!(BufferProfile::Maximum.window_seconds(), None);
+        for fetching in [Fetching::Streaming, Fetching::Download] {
+            let bytes = librqbit_stream_lookahead_bytes(fetching);
             for profile in BufferProfile::ALL {
                 assert_eq!(
-                    librqbit_stream_lookahead_bytes(intent, profile),
-                    normal,
-                    "{intent:?} under {}",
+                    librqbit_stream_lookahead_bytes(fetching),
+                    bytes,
+                    "{fetching:?} under {}",
                     profile.as_str()
                 );
             }

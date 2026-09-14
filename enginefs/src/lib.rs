@@ -3254,7 +3254,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     file_idx,
                     start_offset: 0,
                     priority: 0,
-                    intent: crate::backend::priorities::PlaybackIntent::Background,
                     bitrate_bytes_per_sec: None,
                 };
                 self.activate_multifile_file(info_hash, playing, Some(aside), source)
@@ -5273,7 +5272,7 @@ mod tests {
                     let window = initialized.then(|| {
                         let total = file
                             .length
-                            .min(crate::backend::priorities::MAX_STARTUP_WINDOW_BYTES);
+                            .min(crate::backend::priorities::STREAMING_LOOKAHEAD_BYTES);
                         (downloaded.min(total), total)
                     });
                     let stats_file = StatsFile {
@@ -5999,7 +5998,7 @@ mod tests {
     // blocks (no error, no empty body) and succeeds once the torrent is ready.
     #[tokio::test(start_paused = true)]
     async fn get_file_waits_for_initializing_torrent_then_succeeds() {
-        use crate::backend::priorities::{BufferProfile, PlaybackIntent};
+        use crate::backend::priorities::{BufferProfile, Fetching};
         use tokio::io::AsyncReadExt;
         let (enginefs, counters, init) =
             test_enginefs_initializing(2, crate::backend::librqbit::TORRENT_INIT_TIMEOUT);
@@ -6016,13 +6015,7 @@ mod tests {
 
         let started = tokio::time::Instant::now();
         let mut file = engine
-            .try_get_file_with_intent(
-                1,
-                0,
-                1,
-                PlaybackIntent::DirectInitial,
-                BufferProfile::Normal,
-            )
+            .try_get_file_with_intent(1, 0, 1, Fetching::Streaming, BufferProfile::Normal)
             .await
             .expect("get_file must succeed once the torrent initializes");
         flipper.await.unwrap();
@@ -6055,7 +6048,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn get_file_fails_cleanly_when_torrent_never_initializes() {
         use crate::backend::librqbit::TorrentInitError;
-        use crate::backend::priorities::{BufferProfile, PlaybackIntent};
+        use crate::backend::priorities::{BufferProfile, Fetching};
         let init_timeout = Duration::from_secs(3);
         let (enginefs, counters, init) = test_enginefs_initializing(2, init_timeout);
         let engine = enginefs.get_engine(TEST_HASH).await.expect("engine");
@@ -6064,13 +6057,7 @@ mod tests {
         // Outer bound is the "no hang" assertion (virtual time auto-advances).
         let result = tokio::time::timeout(
             Duration::from_secs(30),
-            engine.try_get_file_with_intent(
-                1,
-                0,
-                1,
-                PlaybackIntent::DirectInitial,
-                BufferProfile::Normal,
-            ),
+            engine.try_get_file_with_intent(1, 0, 1, Fetching::Streaming, BufferProfile::Normal),
         )
         .await
         .expect("get_file must not hang past the initialization timeout");
@@ -6108,7 +6095,6 @@ mod tests {
     // the latest plan winning when several were issued in the window.
     #[tokio::test(start_paused = true)]
     async fn deferred_reconcile_is_applied_once_initialized() {
-        use crate::backend::priorities::PlaybackIntent;
         let (enginefs, counters, init) =
             test_enginefs_initializing(3, crate::backend::librqbit::TORRENT_INIT_TIMEOUT);
 
@@ -6117,7 +6103,6 @@ mod tests {
                 file_idx,
                 start_offset: 0,
                 priority: 1,
-                intent: PlaybackIntent::DirectInitial,
                 bitrate_bytes_per_sec: None,
             })
         };
@@ -8204,7 +8189,6 @@ mod tests {
             crate::files::Opening {
                 file_idx: 0,
                 start_offset: 0,
-                intent: crate::backend::priorities::PlaybackIntent::DirectInitial,
                 lookahead_bytes: 0,
                 buffer: crate::backend::priorities::BufferProfile::Normal,
             },
@@ -8377,7 +8361,6 @@ mod tests {
             crate::files::Opening {
                 file_idx: 0,
                 start_offset: 0,
-                intent: crate::backend::priorities::PlaybackIntent::DirectInitial,
                 lookahead_bytes: 0,
                 buffer: crate::backend::priorities::BufferProfile::Normal,
             },
@@ -8420,7 +8403,6 @@ mod tests {
             crate::files::Opening {
                 file_idx: 0,
                 start_offset: 0,
-                intent: crate::backend::priorities::PlaybackIntent::DirectInitial,
                 lookahead_bytes: 0,
                 buffer: crate::backend::priorities::BufferProfile::Normal,
             },
@@ -10920,23 +10902,13 @@ mod tests {
         // question, because that is when it is showing a spinner.
         let playing = engine
             .retention
-            .reader_on(
-                &0,
-                (0, 0),
-                crate::retention::owner::Reading::Playback,
-                crate::piece_store::Buffering::default(),
-            )
+            .reader_on(&0, (0, 0), crate::piece_store::Buffering::default())
             .expect("file 0 has an entity");
         // And mpv's read of the tail for the Cues, which delivers and ends.
         {
             let probe = engine
                 .retention
-                .reader_on(
-                    &0,
-                    (0, 99),
-                    crate::retention::owner::Reading::Probe,
-                    crate::piece_store::Buffering::default(),
-                )
+                .reader_on(&0, (0, 99), crate::piece_store::Buffering::default())
                 .expect("file 0 has an entity");
             assert!(probe.note((0, 99)).is_none());
         }
@@ -11544,7 +11516,7 @@ mod tests {
     /// session.
     #[tokio::test]
     async fn a_stream_reads_ahead_by_the_seconds_the_film_states() {
-        use crate::backend::priorities::{BufferProfile, PlaybackIntent};
+        use crate::backend::priorities::{BufferProfile, Fetching};
         let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 200)]);
         counters.pieces_per_file.store(40, Ordering::SeqCst);
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
@@ -11554,7 +11526,7 @@ mod tests {
 
         // Nothing has stated a length: the intent's own cap stands.
         let _first = engine
-            .try_get_file_with_intent(0, 0, 255, PlaybackIntent::DirectSeek, BufferProfile::Normal)
+            .try_get_file_with_intent(0, 0, 255, Fetching::Streaming, BufferProfile::Normal)
             .await
             .expect("a reader");
         assert_eq!(
@@ -11569,7 +11541,7 @@ mod tests {
         engine.begin_retention(0).await;
         engine.told_duration(0, std::time::Duration::from_secs(20));
         let _second = engine
-            .try_get_file_with_intent(0, 0, 255, PlaybackIntent::DirectSeek, BufferProfile::Normal)
+            .try_get_file_with_intent(0, 0, 255, Fetching::Streaming, BufferProfile::Normal)
             .await
             .expect("a reader");
         assert_eq!(
@@ -11582,7 +11554,7 @@ mod tests {
         // reading what no pass can keep.
         enginefs.set_cache_budget(Some(500));
         let _bounded = engine
-            .try_get_file_with_intent(0, 0, 255, PlaybackIntent::DirectSeek, BufferProfile::Normal)
+            .try_get_file_with_intent(0, 0, 255, Fetching::Streaming, BufferProfile::Normal)
             .await
             .expect("a reader");
         assert_eq!(
@@ -11603,7 +11575,7 @@ mod tests {
     /// beyond, is bounded to the one byte the stream insists on.
     #[tokio::test]
     async fn a_reader_in_a_later_file_is_bounded_from_its_own_offset() {
-        use crate::backend::priorities::{BufferProfile, PlaybackIntent};
+        use crate::backend::priorities::{BufferProfile, Fetching};
         let (enginefs, counters) = test_enginefs_with_files(vec![
             ("Show.S01E01.mkv".into(), 100),
             ("Show.S01E02.mkv".into(), 200),
@@ -11649,11 +11621,11 @@ mod tests {
         // the first fetches its file's offset past the window, which is the
         // whole first episode for the second.
         let _at_start = engine
-            .try_get_file_with_intent(1, 0, 255, PlaybackIntent::DirectSeek, BufferProfile::Normal)
+            .try_get_file_with_intent(1, 0, 255, Fetching::Streaming, BufferProfile::Normal)
             .await
             .expect("a reader");
         let _three_in = engine
-            .try_get_file_with_intent(1, 3, 255, PlaybackIntent::DirectSeek, BufferProfile::Normal)
+            .try_get_file_with_intent(1, 3, 255, Fetching::Streaming, BufferProfile::Normal)
             .await
             .expect("a reader");
         let reaches = counters.lookaheads.lock().unwrap().clone();
@@ -11957,23 +11929,13 @@ mod tests {
         let first = Arc::new(
             engine
                 .retention
-                .reader_on(
-                    &0,
-                    (0, 0),
-                    crate::retention::owner::Reading::Playback,
-                    crate::piece_store::Buffering::default(),
-                )
+                .reader_on(&0, (0, 0), crate::piece_store::Buffering::default())
                 .expect("the entity"),
         );
         let second = Arc::new(
             engine
                 .retention
-                .reader_on(
-                    &0,
-                    (0, 0),
-                    crate::retention::owner::Reading::Playback,
-                    crate::piece_store::Buffering::default(),
-                )
+                .reader_on(&0, (0, 0), crate::piece_store::Buffering::default())
                 .expect("the entity"),
         );
         assert!(first.note((0, 0)).is_none());
@@ -13693,7 +13655,7 @@ mod tests {
         crate::files::FileHandle<FakeHandle>,
         crate::files::FileHandle<FakeHandle>,
     ) {
-        use crate::backend::priorities::{BufferProfile, PlaybackIntent};
+        use crate::backend::priorities::{BufferProfile, Fetching};
         use tokio::io::AsyncReadExt;
         let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 200)]);
         counters.pieces_per_file.store(8, Ordering::SeqCst);
@@ -13709,17 +13671,11 @@ mod tests {
         }
         let store = seeded_store(&enginefs, &engine);
         let mut at_start = engine
-            .try_get_file_with_intent(0, 0, 255, PlaybackIntent::DirectSeek, BufferProfile::Normal)
+            .try_get_file_with_intent(0, 0, 255, Fetching::Streaming, BufferProfile::Normal)
             .await
             .expect("a stream at the start");
         let mut seek = engine
-            .try_get_file_with_intent(
-                0,
-                150,
-                255,
-                PlaybackIntent::DirectSeek,
-                BufferProfile::Normal,
-            )
+            .try_get_file_with_intent(0, 150, 255, Fetching::Streaming, BufferProfile::Normal)
             .await
             .expect("a stream at byte 150");
         let mut byte = [0u8; 1];
@@ -13836,7 +13792,7 @@ mod tests {
     /// above follow.
     #[tokio::test]
     async fn get_file_installs_before_the_first_byte_is_noted() {
-        use crate::backend::priorities::{BufferProfile, PlaybackIntent};
+        use crate::backend::priorities::{BufferProfile, Fetching};
         use tokio::io::AsyncReadExt;
         let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 200)]);
         counters.pieces_per_file.store(8, Ordering::SeqCst);
@@ -13844,13 +13800,7 @@ mod tests {
         enginefs.set_cache_budget(Some(50));
         assert!(engine.retention.holding(&0).is_none());
         let mut stream = engine
-            .try_get_file_with_intent(
-                0,
-                25,
-                255,
-                PlaybackIntent::DirectSeek,
-                BufferProfile::Normal,
-            )
+            .try_get_file_with_intent(0, 25, 255, Fetching::Streaming, BufferProfile::Normal)
             .await
             .expect("a stream");
         let holding = engine
@@ -14177,12 +14127,7 @@ mod tests {
         // A response is still delivering file 0.
         let reader = engine
             .retention
-            .reader_on(
-                &0,
-                (0, 0),
-                crate::retention::owner::Reading::Playback,
-                crate::piece_store::Buffering::default(),
-            )
+            .reader_on(&0, (0, 0), crate::piece_store::Buffering::default())
             .expect("file 0 has an entity");
         reader.promises(0..1);
 
@@ -14220,12 +14165,7 @@ mod tests {
         engine.begin_retention(0).await;
         let reader = engine
             .retention
-            .reader_on(
-                &0,
-                (0, 0),
-                crate::retention::owner::Reading::Playback,
-                crate::piece_store::Buffering::default(),
-            )
+            .reader_on(&0, (0, 0), crate::piece_store::Buffering::default())
             .expect("file 0 has an entity");
         reader.promises(0..1);
 
@@ -14303,22 +14243,12 @@ mod tests {
         engine.begin_retention(0).await;
         let first = engine
             .retention
-            .reader_on(
-                &0,
-                (0, 0),
-                crate::retention::owner::Reading::Playback,
-                crate::piece_store::Buffering::default(),
-            )
+            .reader_on(&0, (0, 0), crate::piece_store::Buffering::default())
             .expect("an entity");
         first.promises(0..1);
         let second = engine
             .retention
-            .reader_on(
-                &0,
-                (0, 0),
-                crate::retention::owner::Reading::Playback,
-                crate::piece_store::Buffering::default(),
-            )
+            .reader_on(&0, (0, 0), crate::piece_store::Buffering::default())
             .expect("an entity");
         second.promises(0..1);
 
@@ -14326,12 +14256,7 @@ mod tests {
         engine.begin_retention(1).await;
         let next = engine
             .retention
-            .reader_on(
-                &1,
-                (1, 0),
-                crate::retention::owner::Reading::Playback,
-                crate::piece_store::Buffering::default(),
-            )
+            .reader_on(&1, (1, 0), crate::piece_store::Buffering::default())
             .expect("an entity");
         next.promises(0..1);
         assert_eq!(enginefs.live().reading().file_of(TEST_HASH), Some(0));
@@ -14383,12 +14308,7 @@ mod tests {
         engine.begin_retention(0).await;
         let first = engine
             .retention
-            .reader_on(
-                &0,
-                (0, 0),
-                crate::retention::owner::Reading::Playback,
-                crate::piece_store::Buffering::default(),
-            )
+            .reader_on(&0, (0, 0), crate::piece_store::Buffering::default())
             .expect("an entity");
         first.promises(0..1);
 
@@ -14432,12 +14352,7 @@ mod tests {
         engine.begin_retention(0).await;
         let first = engine
             .retention
-            .reader_on(
-                &0,
-                (0, 0),
-                crate::retention::owner::Reading::Playback,
-                crate::piece_store::Buffering::default(),
-            )
+            .reader_on(&0, (0, 0), crate::piece_store::Buffering::default())
             .expect("an entity");
         first.promises(0..1);
         let enginefs = Arc::new(enginefs);
@@ -14492,12 +14407,7 @@ mod tests {
         engine.begin_retention(0).await;
         let before = engine
             .retention
-            .reader_on(
-                &0,
-                (0, 0),
-                crate::retention::owner::Reading::Playback,
-                crate::piece_store::Buffering::default(),
-            )
+            .reader_on(&0, (0, 0), crate::piece_store::Buffering::default())
             .expect("an entity");
         before.promises(0..1);
         // A subtitle opened beside the film.
@@ -14553,12 +14463,7 @@ mod tests {
         enginefs.live().open(torrent(1), false);
         let reader = engine
             .retention
-            .reader_on(
-                &1,
-                (1, 0),
-                crate::retention::owner::Reading::Playback,
-                crate::piece_store::Buffering::default(),
-            )
+            .reader_on(&1, (1, 0), crate::piece_store::Buffering::default())
             .expect("file 1 has an entity");
         reader.promises(0..1);
         drop(registry);
@@ -14601,12 +14506,7 @@ mod tests {
         // delivering this file.
         let reader = engine
             .retention
-            .reader_on(
-                &0,
-                (0, 0),
-                crate::retention::owner::Reading::Playback,
-                crate::piece_store::Buffering::default(),
-            )
+            .reader_on(&0, (0, 0), crate::piece_store::Buffering::default())
             .expect("file 0 has an entity");
         reader.promises(0..1);
         nothing_torrent_is_playing(&enginefs);

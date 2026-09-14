@@ -551,7 +551,7 @@ impl RetentionPolicy {
         {
             if cap < floor {
                 // The floor is bigger than the time the design wants to
-                // buffer, which means MAX_SEEK_HOT_WINDOW_BYTES is. The
+                // buffer, which means the playback lookahead is. The
                 // alternative to letting the floor win is a stream fetching
                 // exactly what the pass then deletes, so it wins -- and the
                 // fact is said out loud, because it is a statement about
@@ -927,9 +927,9 @@ mod tests {
     /// **Where the floor and the cap disagree, the floor wins.**
     ///
     /// The alternative is a stream fetching exactly what the pass then
-    /// deletes. It says something true when it happens -- that
-    /// `MAX_SEEK_HOT_WINDOW_BYTES` is wider than the time the profile wants
-    /// to buffer -- which is why the policy says it out loud.
+    /// deletes. It says something true when it happens -- that the
+    /// lookahead granted is wider than the time the profile wants to
+    /// buffer -- which is why the policy says it out loud.
     #[test]
     fn a_lookahead_wider_than_the_time_cap_wins_over_it() {
         const MIB: u64 = 1 << 20;
@@ -1029,7 +1029,7 @@ mod tests {
     #[test]
     fn the_window_covers_every_profiles_granted_lookahead_at_every_budget() {
         use crate::backend::priorities::{
-            BufferProfile, PlaybackIntent, librqbit_stream_lookahead_bytes,
+            BufferProfile, Fetching, librqbit_stream_lookahead_bytes,
         };
         const MIB: u64 = 1 << 20;
         // The field device's piece length, and a file far longer than any
@@ -1039,7 +1039,7 @@ mod tests {
         let bytes = 4000 * piece;
         for profile in BufferProfile::ALL {
             // The most a playback reader can be granted under this profile.
-            let cap = librqbit_stream_lookahead_bytes(PlaybackIntent::DirectSeek, profile);
+            let cap = librqbit_stream_lookahead_bytes(Fetching::Streaming);
             for budget_pieces in 1..=400u64 {
                 let budget = budget_pieces * piece;
                 let at_open = RetentionPolicy::new(

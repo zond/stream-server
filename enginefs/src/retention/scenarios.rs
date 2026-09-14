@@ -10,7 +10,6 @@
 
 use std::time::Duration;
 
-use super::owner::Reading;
 use super::scenario::{
     CONTAINER_METADATA_LOOKAHEAD, FIELD_FILM, Film, Log, NORMAL_WINDOW_SECONDS, PLAYBACK_LOOKAHEAD,
     Scenario, Step,
@@ -84,7 +83,6 @@ fn opens_the_second_track() -> Step {
     Step::Opens {
         reader: "second-track",
         offset: SECOND_TRACK_AT,
-        reading: Reading::Probe,
         lookahead: CONTAINER_METADATA_LOOKAHEAD,
         window_seconds: Some(NORMAL_WINDOW_SECONDS),
     }
@@ -162,7 +160,6 @@ fn field_session() -> Log {
             Step::Opens {
                 reader: "viewer",
                 offset: viewer_offset(&film),
-                reading: Reading::Playback,
                 lookahead: PLAYBACK_LOOKAHEAD,
                 window_seconds: Some(NORMAL_WINDOW_SECONDS),
             },
@@ -412,7 +409,6 @@ fn a_response_still_open_at_a_pass_has_the_piece_it_is_parked_on_ordered() {
                 Step::Opens {
                     reader: "viewer",
                     offset: viewer_offset(&film),
-                    reading: Reading::Playback,
                     lookahead: PLAYBACK_LOOKAHEAD,
                     window_seconds: Some(NORMAL_WINDOW_SECONDS),
                 },

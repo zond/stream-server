@@ -2,8 +2,6 @@ use anyhow::Result;
 use std::ops::Range;
 use tokio::io::{AsyncRead, AsyncSeek};
 
-use priorities::PlaybackIntent;
-
 pub mod dht_bootstrap;
 pub mod librqbit;
 
@@ -664,7 +662,6 @@ pub struct HotFilePriorityPlan {
     pub file_idx: usize,
     pub start_offset: u64,
     pub priority: u8,
-    pub intent: PlaybackIntent,
     pub bitrate_bytes_per_sec: Option<u64>,
 }
 

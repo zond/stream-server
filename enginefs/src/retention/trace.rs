@@ -62,10 +62,10 @@ pub struct Backing {
 
 /// What one pass decided, as the owner saw it.
 pub struct Pass<'a> {
+    /// **Where the entity is being consumed**, from the read-pattern
+    /// detector: the head of the stream that has eaten the most of it. The
+    /// readers' own answer only where the detector has none.
     pub playhead: u32,
-    /// What the read that owns the head is for, or `None` when the head is
-    /// the entity's own remembered one and no read is live.
-    pub reading: Option<&'static str>,
     /// How many pieces this entity's consumers are asking for between
     /// them -- what `streams_seen` prints as `want`, totalled.
     pub wanted: u32,
@@ -136,7 +136,6 @@ pub fn pass<K: Debug>(key: &K, sample: Pass<'_>) {
         target: "enginefs::retention::trace",
         key = %name,
         head = sample.playhead,
-        reading = sample.reading.unwrap_or("none"),
         wanted = sample.wanted,
         held_behind = sample.held_behind,
         held_ahead = sample.held_ahead,

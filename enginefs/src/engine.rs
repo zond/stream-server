@@ -1,6 +1,6 @@
 use crate::backend::{
     EngineStats, FilePieceSpan, TorrentHandle,
-    priorities::{self, BufferProfile, PlaybackIntent},
+    priorities::{self, BufferProfile, Fetching},
 };
 use crate::cache::DataCache;
 use crate::piece_store::{HeldSnapshot, RetentionPolicy, Share, StoreRegistry};
@@ -589,11 +589,15 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
             .saturating_sub(available);
         let how_many = usize::try_from(over.div_ceil(domain.piece_length.max(1))).unwrap_or(0);
         let (tracked, reclaim) = streams.coldest_of(domain.file_idx, now, &kept, how_many);
+        // Who, among this file's readers, the viewer is; see
+        // [`crate::retention::owner::Consumers::at`].
+        let at = streams.busiest(domain.file_idx, domain.piece_length);
         if !streams.report_due(now) {
             return crate::retention::owner::Consumers {
                 want,
                 exempt,
                 reclaim,
+                at,
             };
         }
         let coldest: Vec<u32> = reclaim
@@ -619,6 +623,7 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
             want,
             exempt,
             reclaim,
+            at,
         }
     }
 
@@ -2117,7 +2122,7 @@ impl<H: TorrentHandle> Engine<H> {
         file_idx: usize,
         start_offset: u64,
         priority: u8,
-        intent: PlaybackIntent,
+        intent: Fetching,
         buffer: BufferProfile,
     ) -> Result<FileHandle<H>, GetFileError> {
         let startup = Instant::now();
@@ -2144,7 +2149,7 @@ impl<H: TorrentHandle> Engine<H> {
         if !self.handle.manages_playback_lifecycle()
             && priority != 255
             && start_offset == 0
-            && matches!(intent, PlaybackIntent::DirectInitial)
+            && matches!(intent, Fetching::Streaming)
         {
             let prepare_start = Instant::now();
             match self.handle.prepare_file_for_streaming(file_idx).await {
@@ -2208,7 +2213,7 @@ impl<H: TorrentHandle> Engine<H> {
                     .bitrate(&file_idx)
                     .zip(buffer.window_seconds())
                     .map(|(rate, seconds)| rate.saturating_mul(seconds))
-                    .unwrap_or_else(|| priorities::librqbit_stream_lookahead_bytes(intent, buffer)),
+                    .unwrap_or_else(|| priorities::librqbit_stream_lookahead_bytes(intent)),
             )
             // And never further than the whole cache may hold: past that
             // the pass cannot keep what the stream pulls, and the backend
@@ -2242,7 +2247,6 @@ impl<H: TorrentHandle> Engine<H> {
             crate::files::Opening {
                 file_idx,
                 start_offset,
-                intent,
                 lookahead_bytes,
                 buffer,
             },

@@ -1,7 +1,7 @@
 //! **What is reading this file, worked out from the reads themselves.**
 //!
 //! The retention layer decides what to keep and what to fetch from a
-//! *classification*: [`Reading`] from a [`PlaybackIntent`], derived by
+//! *classification*: [`Reading`] from a [`Fetching`], derived by
 //! `playback_intent_for_request` from a priority header, two download flags
 //! and the geometry of a `Range`. A player states none of that. It sends a
 //! byte range, and every field failure this module exists to end has been
@@ -21,7 +21,7 @@
 //! what the later phases do with the answer.
 //!
 //! [`Reading`]: super::owner::Reading
-//! [`PlaybackIntent`]: crate::backend::priorities::PlaybackIntent
+//! [`Fetching`]: crate::backend::priorities::Fetching
 
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
@@ -73,6 +73,17 @@ struct Stream {
     last: Read,
     /// How many reads have joined, first included.
     reads: u32,
+    /// Every byte those reads asked for, summed over the stream's life.
+    ///
+    /// **What says which of a file's readers is the viewer.** A rate can
+    /// only be measured once a read comes back late, and a stream that has
+    /// not measured one is priced at the film's own arithmetic -- so by
+    /// rate a crawler that has just started outranks a viewer who has been
+    /// measured slower than the film's average. Bytes asked for need no
+    /// such admission rule and separate the two by orders of magnitude:
+    /// in the field log of 2026-09-14 the viewer's reads ran to tens of
+    /// megabytes a body against the crawler's 39 kB.
+    eaten: u64,
     /// When the last one did.
     seen: Instant,
     /// How fast this consumer is eating the file, in bytes a second, or
@@ -429,6 +440,9 @@ impl FileStreams {
             // `SAME_CONSUMER`, since further than that is a stream of its
             // own.
             stream.end = read.end;
+            stream.eaten = stream
+                .eaten
+                .saturating_add(read.end.saturating_sub(read.begin));
             stream.last = read;
             stream.reads = stream.reads.saturating_add(1);
             stream.seen = read.returned;
@@ -438,6 +452,7 @@ impl FileStreams {
         self.streams.push(Stream {
             reader,
             end: read.end,
+            eaten: read.end.saturating_sub(read.begin),
             last: read,
             reads: 1,
             seen: read.returned,
@@ -446,6 +461,17 @@ impl FileStreams {
             granted_for: None,
         });
         Some(Rejected::Outside)
+    }
+}
+
+impl FileStreams {
+    /// The piece this file is being consumed at; see
+    /// [`Streams::busiest`].
+    fn busiest(&self, piece: u64) -> Option<u32> {
+        self.streams
+            .iter()
+            .max_by_key(|stream| stream.eaten)
+            .map(|stream| self.geometry.at(piece, stream.end))
     }
 }
 
@@ -788,6 +814,26 @@ impl Streams {
         windows
     }
 
+    /// **The piece the file is being consumed at**: where its busiest
+    /// stream has reached, or `None` for a file nothing is reading.
+    ///
+    /// Busiest by the bytes its reads have asked for ([`Stream::eaten`]),
+    /// not by its measured rate: a rate is admitted only from a read that
+    /// came back late, so a stream that has measured none is priced at the
+    /// film's own arithmetic and would outrank a viewer measured slower
+    /// than the film's average. `piece` is the torrent's piece length,
+    /// because the answer is a torrent piece and a stream's head is an
+    /// offset inside its file.
+    ///
+    /// **What this is for is the pass's cadence and its trace line**, and
+    /// not what is kept: a file being read by a viewer and by mpv's index
+    /// crawler has two streams, both of them a player's, and which one is
+    /// the viewer is exactly what a rate says and a range header does not.
+    /// See [`crate::retention::owner::Consumers::at`].
+    pub fn busiest(&self, file: usize, piece: u64) -> Option<u32> {
+        self.by_file.get(&file)?.busiest(piece)
+    }
+
     /// What each stream on `file` has measured its consumer to be eating,
     /// in bytes a second, or `None` for one that has not had two reads far
     /// enough apart to say.
@@ -905,6 +951,51 @@ mod tests {
             "and the reopen behind it is the same consumer: the disk is whole between them"
         );
         assert_eq!(streams.streams.len(), 1);
+    }
+
+    /// **Which of a file's readers is the viewer, when both are a
+    /// player's.**
+    ///
+    /// mpv keeps a second reader crawling the container's index for as long
+    /// as a film is open, reopening about once a second; in the field log
+    /// of 2026-09-14 it took 39 kB an open against the viewer's tens of
+    /// megabytes, and both arrive as `Range: bytes=X-` over the same file.
+    /// The crawler is the *newest* reader most of the time and the
+    /// *longest-lived* stream some of the time, so neither recency nor age
+    /// can be asked. Bytes eaten can.
+    #[test]
+    fn the_busiest_stream_is_the_one_that_has_eaten_the_most() {
+        let t0 = Instant::now();
+        let tail = PIECES as u64 * PIECE - 4 * PIECE;
+        // Two runs with a hole between them, so the two readers cannot be
+        // taken for one consumer.
+        let held = disk(&[0..8, (PIECES - 4)..PIECES]);
+        let mut streams = file_at(0);
+
+        // The viewer, from the head, reading megabytes.
+        streams.observe(1, read(0, PIECE, t0, 0), &held, PIECE);
+        streams.observe(1, read(PIECE, 3 * PIECE, t0, 1), &held, PIECE);
+        // The crawler at the tail, opened later and nibbling.
+        streams.observe(2, read(tail, tail + 39_316, t0, 2), &held, PIECE);
+        assert_eq!(streams.streams.len(), 2, "a hole apart, so two consumers");
+
+        assert_eq!(
+            streams.busiest(PIECE),
+            Some(3),
+            "the newest reader is at the tail; the one eating the file is not"
+        );
+
+        // And it follows the bytes rather than the order: let the crawler
+        // outgrow the viewer and it becomes the answer.
+        for step in 0..200u64 {
+            let from = tail + 39_316 + step * 262_144;
+            streams.observe(2, read(from, from + 262_144, t0, 3 + step), &held, PIECE);
+        }
+        assert_eq!(
+            streams.busiest(PIECE).map(|piece| piece >= PIECES - 4),
+            Some(true),
+            "whoever is eating the file is where the file is being consumed"
+        );
     }
 
     /// **A hole in the disk is what ends a stream**, and it is the only
@@ -1287,6 +1378,7 @@ mod tests {
         streams.streams.push(Stream {
             reader: 1,
             end: u64::from(piece) * PIECE,
+            eaten: PIECE,
             last: read(0, 0, t0, 0),
             reads: 1,
             seen: t0,

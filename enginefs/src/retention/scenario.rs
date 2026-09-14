@@ -75,8 +75,7 @@ use std::time::{Duration, Instant};
 use crate::piece_store::{Buffering, RetentionPolicy, Share};
 use crate::retention::RetentionBudget;
 use crate::retention::owner::{
-    Backing, Claim, Door, Install, InstallOutcome, Mode, Outcome, Reader, Reading, Retention,
-    Trigger,
+    Backing, Claim, Door, Install, InstallOutcome, Mode, Outcome, Reader, Retention, Trigger,
 };
 
 pub(crate) const PIECE: u64 = 1000;
@@ -501,10 +500,12 @@ impl<S: Side> Backing for FakeBacking<S> {
             .saturating_sub(available);
         let how_many = usize::try_from(over.div_ceil(domain.piece.max(1))).unwrap_or(0);
         let (_, reclaim) = streams.coldest_of(domain.file, now, &kept, how_many);
+        let at = streams.busiest(domain.file, domain.piece);
         crate::retention::owner::Consumers {
             want,
             exempt,
             reclaim,
+            at,
         }
     }
 
@@ -741,14 +742,17 @@ pub(crate) const FIELD_FILM: Film = Film {
     duration: Duration::from_secs(8400),
 };
 
-/// The lookahead librqbit grants a read labelled `ContainerMetadata`
-/// (`priorities::MAX_CONTAINER_METADATA_WINDOW_BYTES`), and the number the
-/// field's trace line carries: `lookahead_bytes=16777216`. Named here so a
-/// scenario says which read it is opening rather than a magic number.
+/// The lookahead the field's second-track reads were granted, and the
+/// number that trace line carries: `lookahead_bytes=16777216`. It was a
+/// constant of its own then (`MAX_CONTAINER_METADATA_WINDOW_BYTES`); what a
+/// read like it gets now is the film's bitrate times the viewer's seconds,
+/// like every other read. Kept at the field's number so the scenario stays
+/// the measurement it was taken from.
 pub(crate) const CONTAINER_METADATA_LOOKAHEAD: u64 = 16 * 1024 * 1024;
 
-/// The lookahead a seek or a sequential playback read is granted at the
-/// `Normal` profile (`priorities::MAX_SEEK_HOT_WINDOW_BYTES`).
+/// The lookahead a playback read was granted at the `Normal` profile when
+/// the profile scaled a constant. Now it is the bitrate times the seconds;
+/// kept for the same reason.
 pub(crate) const PLAYBACK_LOOKAHEAD: u64 = 128 * 1024 * 1024;
 
 /// The seconds of stream the `Normal` buffer profile asks to hold
@@ -785,7 +789,6 @@ pub(crate) enum Step {
     Opens {
         reader: &'static str,
         offset: u64,
-        reading: Reading,
         lookahead: u64,
         window_seconds: Option<u64>,
     },
@@ -1024,10 +1027,9 @@ impl Scenario {
             Step::Opens {
                 reader,
                 offset,
-                reading,
                 lookahead,
                 window_seconds,
-            } => self.opens(reader, *offset, *reading, *lookahead, *window_seconds),
+            } => self.opens(reader, *offset, *lookahead, *window_seconds),
             Step::Reads { reader, bytes } => self.reads(reader, *bytes),
             Step::Closes { reader } => {
                 self.open.remove(reader);
@@ -1042,7 +1044,6 @@ impl Scenario {
         &mut self,
         reader: &'static str,
         offset: u64,
-        reading: Reading,
         lookahead: u64,
         window_seconds: Option<u64>,
     ) {
@@ -1051,7 +1052,6 @@ impl Scenario {
             .reader_on(
                 &FILE,
                 (FILE, offset),
-                reading,
                 Buffering {
                     lookahead_bytes: lookahead,
                     window_seconds,

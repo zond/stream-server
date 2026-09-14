@@ -13,7 +13,7 @@ use enginefs::EngineFS;
 use enginefs::backend::librqbit::{LibrqbitHandle, TorrentInitError};
 use enginefs::backend::{
     TorrentHandle,
-    priorities::{BufferProfile, PlaybackIntent},
+    priorities::{BufferProfile, Fetching},
 };
 use enginefs::engine::{Engine, GetFileError};
 use futures_util::Stream;
@@ -419,35 +419,28 @@ impl PlaybackQuery {
     }
 }
 
-fn playback_intent_for_request(
-    priority: u8,
-    start: u64,
-    requested_len: u64,
-    file_size: u64,
-    is_download: bool,
-    is_partial: bool,
-) -> PlaybackIntent {
-    if priority == 255 {
-        return PlaybackIntent::InternalProbe;
+/// What a read is for, from the only two things the request really says:
+/// who asked, and whether it is a download.
+///
+/// **The range is not read at all any more.** Its offset and length used to
+/// be classified into eight intents -- a first read, a seek, a sequential
+/// read, a crawl over the container index at the tail
+/// (`is_container_metadata_request`) -- each with a read-ahead window of
+/// its own, and one of them telling the retention which reader was the
+/// viewer. Every one of those questions is now answered by watching what
+/// the reads do, so this is down to the one bit a read cannot be watched
+/// into telling us: whether anybody is waiting for these bytes at a rate.
+fn playback_intent_for_request(priority: u8, is_download: bool) -> Fetching {
+    // The server's own reads -- priority 255 is the reconciler's probe, 0 a
+    // background fetch -- read a header and stop, so the small number is
+    // the right one for them too.
+    if priority == 255 || priority == 0 {
+        return Fetching::Streaming;
     }
-    if priority == 0 {
-        return PlaybackIntent::Background;
-    }
-    if is_download && (!is_partial || requested_len >= file_size.saturating_sub(start)) {
-        return PlaybackIntent::DownloadFull;
-    }
-    if is_download && is_partial {
-        return PlaybackIntent::DownloadRange;
-    }
-    if enginefs::backend::priorities::is_container_metadata_request(start, requested_len, file_size)
-    {
-        return PlaybackIntent::ContainerMetadata;
-    }
-
-    if start == 0 {
-        PlaybackIntent::DirectInitial
+    if is_download {
+        Fetching::Download
     } else {
-        PlaybackIntent::DirectSeek
+        Fetching::Streaming
     }
 }
 
@@ -1183,22 +1176,15 @@ async fn stream_video_with(
     } else {
         1
     };
-    let playback_intent = playback_intent_for_request(
-        priority,
-        start,
-        requested_content_length,
-        size,
-        is_download,
-        is_partial,
-    );
+    let playback_intent = playback_intent_for_request(priority, is_download);
     // **TEMPORARY, with `enginefs::retention::trace`.** What the player
     // actually asked for, before anything here interprets it.
     //
     // `intent` is *our* label -- `playback_intent_for_request` derives it
-    // from the priority header, the download flags and the geometry. A
-    // player says none of that; it sends a byte range. So the range itself
-    // is logged beside the label, because a question about what a player is
-    // doing cannot be answered by reading back our own guess about it.
+    // from the priority header and the download flag. A player says neither;
+    // it sends a byte range. So the range itself is logged beside the label,
+    // because a question about what a player is doing cannot be answered by
+    // reading back our own guess about it.
     //
     // What this is here to identify: a reader that spent the whole of the
     // 2026-09-12 20:49 session reopening once a second at
@@ -1660,119 +1646,46 @@ mod tests {
         readiness.expect("a writable temp dir with room on it should pass");
     }
 
-    #[test]
-    fn full_download_uses_download_full_intent() {
-        assert_eq!(
-            playback_intent_for_request(1, 0, 10_000, 10_000, true, false),
-            PlaybackIntent::DownloadFull
-        );
-    }
-
-    #[test]
-    fn ranged_download_uses_download_range_intent() {
-        assert_eq!(
-            playback_intent_for_request(1, 500, 1, 10_000, true, true),
-            PlaybackIntent::DownloadRange
-        );
-    }
-
-    #[test]
-    fn full_file_range_download_uses_download_full_intent() {
-        assert_eq!(
-            playback_intent_for_request(1, 0, 10_000, 10_000, true, true),
-            PlaybackIntent::DownloadFull
-        );
-    }
-
-    #[test]
-    fn resumed_full_remaining_download_uses_download_full_intent() {
-        assert_eq!(
-            playback_intent_for_request(1, 5_000, 5_000, 10_000, true, true),
-            PlaybackIntent::DownloadFull
-        );
-    }
-
-    #[test]
-    fn playback_without_range_is_direct_initial_not_download() {
-        assert_eq!(
-            playback_intent_for_request(1, 0, 10_000, 10_000, false, false),
-            PlaybackIntent::DirectInitial
-        );
-    }
-
-    #[test]
-    fn tail_playback_range_is_container_metadata() {
-        let file_size = 100 * 1024 * 1024;
-        let tail = enginefs::backend::priorities::container_metadata_start(file_size);
-        assert_eq!(
-            playback_intent_for_request(1, tail, 1024, file_size, false, true),
-            PlaybackIntent::ContainerMetadata
-        );
-    }
-
-    /// An index read and a seek into the tail both arrive as
-    /// `Range: bytes=X-`; what separates them is how much film is left.
-    /// See `priorities::is_container_metadata_request`.
-    #[test]
-    fn an_open_ended_range_is_a_seek_until_there_is_only_an_index_left() {
-        let file_size = 10 * 1024 * 1024 * 1024;
-        let tail = enginefs::backend::priorities::container_metadata_start(file_size);
-        assert_eq!(
-            playback_intent_for_request(1, tail, file_size - tail, file_size, false, true),
-            PlaybackIntent::DirectSeek,
-            "half a gigabyte left to play is somebody watching it"
-        );
-        let index = file_size - enginefs::backend::priorities::MAX_CONTAINER_METADATA_WINDOW_BYTES;
-        assert_eq!(
-            playback_intent_for_request(1, index, file_size - index, file_size, false, true),
-            PlaybackIntent::ContainerMetadata
-        );
-    }
-
-    /// **On a small enough file the two cannot be told apart, and the
-    /// index read wins.**
+    /// **A download is a download whatever range it asks for, and a
+    /// player's read is a player's read wherever in the file it lands.**
     ///
-    /// `container_metadata_start` is the last 5% of a small file, and 5% of
-    /// a hundred megabytes is inside
-    /// `MAX_CONTAINER_METADATA_WINDOW_BYTES`. So there is no room between
-    /// "near the end" and "short enough", and a seek into the last few
-    /// seconds of a short file is read as a probe. That is the documented
-    /// trade: the reader's own lookahead still fetches what it plays, and
-    /// it only loses the retention window round the seconds that are left.
+    /// mpv's index crawler and a viewer seeking into the last minutes of a
+    /// film both arrive as `Range: bytes=X-` over the same bytes; the
+    /// geometry that used to separate them separated them wrongly about as
+    /// often as rightly. The detector prices them apart by what they
+    /// consume -- 91 B/s against 1.2 MB/s in the field log of 2026-09-14.
     #[test]
-    fn on_a_small_file_a_tail_seek_is_indistinguishable_from_the_index() {
-        let file_size = 100 * 1024 * 1024;
-        let tail = enginefs::backend::priorities::container_metadata_start(file_size);
-        assert_eq!(
-            playback_intent_for_request(1, tail, file_size - tail, file_size, false, true),
-            PlaybackIntent::ContainerMetadata
-        );
+    fn what_a_read_is_for_is_who_asked_and_not_what_it_asked_for() {
+        let file_size: u64 = 10 * 1024 * 1024 * 1024;
+        for start in [0, 1024, file_size - 25_962_800, file_size - 1024] {
+            assert_eq!(
+                playback_intent_for_request(1, true),
+                Fetching::Download,
+                "a download, asking from {start}"
+            );
+            assert_eq!(
+                playback_intent_for_request(1, false),
+                Fetching::Streaming,
+                "a player, asking from {start}"
+            );
+        }
     }
 
+    /// The server's own reads: priority 255 is the reconciler's probe, 0 a
+    /// background fetch. Both read a header and stop.
     #[test]
-    fn large_tail_playback_range_stays_direct_seek() {
-        let file_size = 100 * 1024 * 1024;
-        let tail = enginefs::backend::priorities::container_metadata_start(file_size);
-        assert_eq!(
-            playback_intent_for_request(
-                1,
-                tail,
-                enginefs::backend::priorities::MAX_CONTAINER_METADATA_WINDOW_BYTES + 1,
-                file_size,
-                false,
-                true
-            ),
-            PlaybackIntent::DirectSeek
-        );
-    }
-
-    #[test]
-    fn small_file_non_tail_range_stays_direct_seek() {
-        let file_size = 8 * 1024 * 1024;
-        assert_eq!(
-            playback_intent_for_request(1, 1024 * 1024, 1024, file_size, false, true),
-            PlaybackIntent::DirectSeek
-        );
+    fn the_servers_own_reads_take_the_streaming_window() {
+        for priority in [0, 255] {
+            assert_eq!(
+                playback_intent_for_request(priority, false),
+                Fetching::Streaming
+            );
+            assert_eq!(
+                playback_intent_for_request(priority, true),
+                Fetching::Streaming,
+                "a probe is not turned into a download by a query parameter"
+            );
+        }
     }
 
     #[test]

@@ -135,8 +135,8 @@
 //!    *want*-windows and what is on the disk, asking the same [`Door`] the
 //!    reclaim asks before it unlinks anything that arrived under the pass.
 //!    Two window lists come out of step 5, not one: every reader is owed a
-//!    window that is not deleted under it, and only a [`Reading::Playback`]
-//!    reader is owed one that is fetched for it.
+//!    window that is not deleted under it, and what is fetched is what the
+//!    detector's consumers are asking for.
 //! 7. Test hook.
 //! 8. [`Backing::reclaim`] with a [`Door`] that answers both
 //!    [`Door::window_now`] and [`Door::refuses`] from one reading of L2.
@@ -332,6 +332,26 @@ pub struct Consumers {
     /// that is not needed for anything else is scrub-back, and giving it up
     /// early buys nothing and costs a re-fetch.
     pub reclaim: Vec<u32>,
+    /// **The piece the entity is being consumed at**: where the detector's
+    /// busiest stream has reached, and `None` for a backing with no
+    /// detector or an entity nothing has read lately.
+    ///
+    /// *Who* the viewer is, among several readers of one file, is a
+    /// question about behaviour and the detector is what answers it: mpv
+    /// keeps a second reader crawling the container's index for as long as
+    /// a film is open, reopening about once a second, so the newest read
+    /// and the longest-lived read are both regularly that crawler rather
+    /// than the viewer. It used to be told from the geometry of the range
+    /// header (`is_container_metadata_request`), which is the thing this
+    /// replaces; the measured rates in the field log of 2026-09-14 were
+    /// 91 B/s for the crawler against 1.2 MB/s for the viewer, and the
+    /// two reads look identical from the wire.
+    ///
+    /// **It is a cadence and a reporting number, not a retention one.**
+    /// What is kept, fetched and given back comes from [`Self::want`],
+    /// [`Self::exempt`] and [`Self::reclaim`], each of which is about every
+    /// stream and not just this one.
+    pub at: Option<u32>,
 }
 
 /// The world outside the owner, for one kind of entity.
@@ -503,9 +523,9 @@ pub trait Backing: Sized + Send + Sync + 'static {
     /// the entity that is in no window and not `held`.
     ///
     /// `windows` here is the pass's *want*-windows and not the ones the
-    /// [`Door`] keeps: a [`Reading::Probe`]'s window is kept and never
-    /// ordered, because a probe reads sixteen megabytes and a window round
-    /// it orders a whole forward reach. The committed set needs
+    /// [`Door`] keeps: every open read's lookahead is kept and never
+    /// ordered, because what to fetch is the detector's answer and what may
+    /// not be deleted is every live read's. The committed set needs
     /// no clause of its own: [`RetentionPolicy::advance`] keeps it inside
     /// the held set it was handed, and `held` is that reading.
     ///
@@ -833,36 +853,6 @@ struct Installed {
     asserted_epoch: Option<u64>,
 }
 
-/// What a read is for. The entity's head is a *playing* read's position
-/// and nothing else's.
-///
-/// A player opens more than one read of a file and only one of them is
-/// watching it: mpv reads the tail for the container's index (MKV Cues, an
-/// mp4 `moov`) before the first frame, and a download or a background fetch
-/// walks the file for its own reasons. Every one of those delivers bytes,
-/// and every one of them used to write the entity's `last_position` -- so
-/// a probe of the tail moved the entity's head to the end of the file while
-/// the player sat at 0:00, the window slid there, the want-set was
-/// re-queued round it, and the head the player was parked on was unlinked
-/// and fetched again by the stream's priority path on every one of the
-/// reconciler's two-second ticks. Measured on a television: 64% of
-/// everything fetched in the first eighteen seconds of a 4K film was
-/// thrown away with the player still showing 0:00.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum Reading {
-    /// Somebody is playing the entity from here. This position is the
-    /// entity's: where a pass with no reader of its own measures from, what
-    /// the window is drawn round, what the stats split behind and ahead at,
-    /// and what stays behind once the read ends -- a paused film keeps its
-    /// window.
-    Playback,
-    /// A one-off read of a region nobody is playing: a container's index,
-    /// an internal probe, a download. It has a window of its own while it
-    /// is open, because a pass may not delete what a live read is about to
-    /// deliver, and it leaves nothing behind when it ends.
-    Probe,
-}
-
 /// One open read of one entity.
 struct ReaderState<B: Backing> {
     /// The position of the last byte this read delivered, and `None` until
@@ -880,8 +870,6 @@ struct ReaderState<B: Backing> {
     /// stayed the whole file, and a cold open fetched 180 MB in the seconds
     /// before the first frame.
     opened_at: Option<B::Position>,
-    /// What this read is for; see [`Reading`].
-    reading: Reading,
     /// The pieces this read has promised off the disk and not yet
     /// delivered. Nothing may unlink one of them.
     promised: Range<u32>,
@@ -921,11 +909,10 @@ const STARTUP_RUN: u32 = 16;
 
 impl<B: Backing> ReaderState<B> {
     /// A read just opened: nothing delivered, nothing promised.
-    fn opened(reading: Reading, opened_at: Option<B::Position>, buffering: Buffering) -> Self {
+    fn opened(opened_at: Option<B::Position>, buffering: Buffering) -> Self {
         Self {
             playhead: None,
             opened_at,
-            reading,
             promised: 0..0,
             passed_at: None,
             buffering,
@@ -1183,14 +1170,13 @@ impl<B: Backing> Retention<B> {
     /// window for one to place: a proxied entity has nothing installed on
     /// it until its first delivered byte ([`Install::OnDeliveredByte`]), so
     /// a read parked before that byte has nothing to be kept inside of.
-    /// Every proxied read is [`Reading::Playback`] -- the proxy serves one
+    /// (was: every proxied read is a playback read -- the proxy serves one
     /// body per player and has no probe of its own.
     pub fn reader(self: &Arc<Self>, key: B::Key, domain: B::Domain) -> Reader<B> {
         Reader {
             owner: self.clone(),
             entity: self.entity(key, domain),
             id: ReaderId(self.next_reader.fetch_add(1, Ordering::Relaxed)),
-            reading: Reading::Playback,
             opened_at: None,
             // A proxied body is fetched by its own response and reads
             // nothing ahead of the bytes it is relaying, so there is no
@@ -1219,7 +1205,6 @@ impl<B: Backing> Retention<B> {
         self: &Arc<Self>,
         key: &B::Key,
         at: B::Position,
-        reading: Reading,
         buffering: Buffering,
     ) -> Option<Reader<B>> {
         let entity = self.lookup(key)?;
@@ -1228,12 +1213,11 @@ impl<B: Backing> Retention<B> {
             .state
             .lock()
             .readers
-            .insert(id, ReaderState::opened(reading, Some(at), buffering));
+            .insert(id, ReaderState::opened(Some(at), buffering));
         Some(Reader {
             owner: self.clone(),
             entity,
             id,
-            reading,
             opened_at: Some(at),
             buffering,
         })
@@ -2002,17 +1986,32 @@ impl<B: Backing> Retention<B> {
         // asked for, or the old one that no longer exists. The byte that
         // decided it is owed the pass it could not start: `nothing` with no
         // measurement hands the claim on while something is installed.
-        let (decision, want_windows, door_policy, at, doomed, asserted, traced) = {
+        let (decision, want_windows, door_policy, at, consumed_at, doomed, asserted, traced) = {
             let mut state = entity.state.lock();
             if !state.still(&begin) {
                 return Self::nothing(&state, claim, about, None);
             }
+            // **The cadence's head, which is the readers'.** A pass is
+            // owed another one when a byte moved this head a stride while
+            // the pass held the turn, and that chain terminates only
+            // because nothing a pass does moves it; measured from one
+            // source and compared against another it would never
+            // terminate, and the proxy's cache never settled.
             let Some(at) = state
                 .head(about)
                 .and_then(|head| B::index_of(&state.domain, head))
             else {
                 return Self::nothing(&state, claim, about, None);
             };
+            // **Where the entity is being consumed, which is the
+            // detector's.** Which of several readers of one file is the
+            // viewer is a question about behaviour, and the readers cannot
+            // answer it: mpv keeps an index crawler open beside the viewer
+            // for the life of a film. What this is for is saying where the
+            // entity is -- the trace's head, and the split of what is held
+            // behind it and ahead -- and not what a pass keeps. See
+            // [`Consumers::at`].
+            let consumed_at = consumers.at.unwrap_or(at);
             let promised: Vec<Range<u32>> = state
                 .readers
                 .values()
@@ -2032,18 +2031,6 @@ impl<B: Backing> Retention<B> {
                     ))
                 })
                 .collect();
-            let traced_reading = about
-                .and_then(|about| state.readers.get(&about))
-                .or_else(|| {
-                    state
-                        .readers
-                        .values()
-                        .find(|reader| reader.reading == Reading::Playback)
-                })
-                .map(|reader| match reader.reading {
-                    Reading::Playback => "playback",
-                    Reading::Probe => "probe",
-                });
             let traced_buffering = state.buffering();
             let Some((decision, policy)) =
                 state.advance(&mut claim.guard, &consumers.reclaim, &held)
@@ -2135,9 +2122,10 @@ impl<B: Backing> Retention<B> {
                 want,
                 policy,
                 at,
+                consumed_at,
                 state.doomed.clone(),
                 state.asserted_epoch(),
-                (traced_readers, traced_reading, traced_buffering),
+                (traced_readers, traced_buffering),
             )
         };
         // 6. Advertise what is committed before reclaiming: the two sets are
@@ -2250,7 +2238,7 @@ impl<B: Backing> Retention<B> {
         // TEMPORARY: see [`crate::retention::trace`], and delete this block
         // with that module.
         {
-            let (readers, reading, buffering) = traced;
+            let (readers, buffering) = traced;
             let backing = self.backing.trace(store, &begin.domain);
             if let Some(piece_length) = backing.map(|backing| backing.piece_length) {
                 for (head, lookahead) in &readers {
@@ -2276,12 +2264,11 @@ impl<B: Backing> Retention<B> {
             let (behind, ahead) = held
                 .iter()
                 .filter(|piece| B::extent(&begin.domain).contains(piece))
-                .partition::<Vec<u32>, _>(|piece| **piece < at);
+                .partition::<Vec<u32>, _>(|piece| **piece < consumed_at);
             trace::pass(
                 key,
                 trace::Pass {
-                    playhead: at,
-                    reading,
+                    playhead: consumed_at,
                     wanted: want_windows
                         .iter()
                         .map(|window| window.end - window.start)
@@ -2590,6 +2577,13 @@ impl<B: Backing> State<B> {
     /// reading ask for, is three questions in order and each one answers
     /// only what it knows:
     ///
+    /// **The detector outranks all three, and this is the fallback under
+    /// it.** Which of several readers of one file is the viewer is a
+    /// question about behaviour, and `Consumers::at` is what answers it
+    /// from the bytes each stream has eaten; the pass asks that first and
+    /// only falls here when nothing has read the entity lately. What is
+    /// left below is the order for an entity the detector is silent about.
+    ///
     /// 1. **A read that is playing it now**, at its head -- the last byte
     ///    it delivered, or where it was opened if it is still parked on its
     ///    first piece. The newest of them, because a seek is a second
@@ -2603,16 +2597,19 @@ impl<B: Backing> State<B> {
     ///    of either kind -- and an entity with no head at all is an entity
     ///    no pass measures at all.
     ///
-    /// **What a player says about itself is not asked.** It used to be, and
-    /// it was the first question: where in the picture the viewer is,
-    /// converted to a byte offset at the film's average rate. What that
-    /// bought was a way to tell the viewer's read from mpv's second reader
-    /// crawling the container index -- and the detector tells those apart
-    /// by what they *do*, from the runs of disk they cause, without anybody
-    /// reporting anything (`crate::retention::streams`). What it cost was a
-    /// number that drifts on a variable-bitrate encode, a staleness rule, a
-    /// vicinity rule to correct it against the reads, and a report a second
-    /// from every player.
+    /// **What a player says about itself is not asked, and neither is what
+    /// its range header looks like.** The first used to be the first
+    /// question -- where in the picture the viewer is, converted to a byte
+    /// offset at the film's average rate -- and cost a number that drifts
+    /// on a variable-bitrate encode, a staleness rule, a vicinity rule to
+    /// correct it against the reads, and a report a second from every
+    /// player. The second was `is_container_metadata_request`, which read a
+    /// range's offset and length for mpv's crawl over the container index
+    /// so that read would not be taken for the viewer, and got it wrong in
+    /// both directions: a viewer seeking into the last minutes of a film
+    /// looked like an index read, and a crawler further out than the
+    /// constant allowed looked like a seek. Both are answered by what the
+    /// reads *do* (`crate::retention::streams`).
     fn head(&self, about: Option<ReaderId>) -> Option<B::Position> {
         if let Some(head) = about
             .and_then(|id| self.readers.get(&id))
@@ -2620,29 +2617,14 @@ impl<B: Backing> State<B> {
         {
             return Some(head);
         }
-        self.playing_head()
-            .or(self.last_position)
-            .or_else(|| self.live_head())
+        self.live_head().or(self.last_position)
     }
 
-    /// The newest live [`Reading::Playback`] read's head, or `None` when
-    /// nothing is playing this entity. Newest by [`ReaderId`], which is
+    /// The newest live read's head. Newest by [`ReaderId`], which is
     /// handed out in open order.
-    fn playing_head(&self) -> Option<B::Position> {
-        self.reader_head(|reader| matches!(reader.reading, Reading::Playback))
-    }
-
-    /// The newest live read's head whatever it is for. The last resort of
-    /// [`Self::head`]: better a window round a download than no window at
-    /// all.
     fn live_head(&self) -> Option<B::Position> {
-        self.reader_head(|_| true)
-    }
-
-    fn reader_head(&self, mut want: impl FnMut(&ReaderState<B>) -> bool) -> Option<B::Position> {
         self.readers
             .iter()
-            .filter(|(_, reader)| want(reader))
             .filter_map(|(id, reader)| Some((*id, reader.head()?)))
             .max_by_key(|(id, _)| id.0)
             .map(|(_, head)| head)
@@ -2994,7 +2976,6 @@ pub struct Reader<B: Backing> {
     id: ReaderId,
     /// What this read is for, carried here so the entry this handle makes
     /// on its first promise or byte says so too.
-    reading: Reading,
     /// Where this read was opened; see [`ReaderState::opened_at`].
     opened_at: Option<B::Position>,
     /// What this read asks of the cache; see [`ReaderState::buffering`].
@@ -3041,22 +3022,24 @@ impl<B: Backing> Reader<B> {
         state
             .readers
             .entry(self.id)
-            .or_insert_with(|| ReaderState::opened(self.reading, self.opened_at, self.buffering))
+            .or_insert_with(|| ReaderState::opened(self.opened_at, self.buffering))
             .promised = pieces;
     }
 
     /// A byte at `at` of this entity has reached a player.
     ///
-    /// **The entity's `last_position` moves only for a
-    /// [`Reading::Playback`] read.** A probe delivers bytes like anything
-    /// else, and what it delivers is not where the entity is being played:
-    /// mpv's read of the container index at the tail used to leave the
-    /// entity's head at the end of the file after the probe had closed, and
-    /// the next tick pass drew its window there, un-queued the head the
-    /// player was parked on, unlinked it, and watched the stream fetch it
-    /// back. This reader's own playhead is written either way -- what a
-    /// live read is about to deliver is not a pass's to take, whatever the
-    /// read is for.
+    /// **Every delivered byte moves the entity's `last_position`, and it is
+    /// the last resort under the detector.** It used to be written only by
+    /// a read declared to be playback, because mpv's read of the container
+    /// index at the tail would otherwise leave the entity's head at the end
+    /// of the file after that read had closed -- and the next tick pass
+    /// drew its window there, un-queued the head the player was parked on,
+    /// unlinked it, and watched the stream fetch it back. Nothing is
+    /// declared now: where the entity is being consumed is
+    /// [`Consumers::at`], from the bytes each detected stream has eaten,
+    /// and this value is only what a pass falls back to when no stream has
+    /// read the entity lately -- which is a film nobody is watching, whose
+    /// crawler has stopped too.
     ///
     /// The budget is read before L2 (a copy-out of a foreign lock, rule 2);
     /// under L2 the entity's `last_position`, an
@@ -3087,9 +3070,7 @@ impl<B: Backing> Reader<B> {
         let budget = self.owner.budget.get();
         let (claim, refused) = {
             let mut state = self.entity.state.lock();
-            if self.reading == Reading::Playback {
-                state.last_position = Some(at);
-            }
+            state.last_position = Some(at);
             let refused = if B::INSTALL == Install::OnDeliveredByte && state.decided != Some(budget)
             {
                 state.install_now(budget).err()
@@ -3098,9 +3079,10 @@ impl<B: Backing> Reader<B> {
             };
             let index = B::index_of(&state.domain, at);
             let (bounded, stride) = (state.installed.is_some(), state.stride);
-            let reader = state.readers.entry(self.id).or_insert_with(|| {
-                ReaderState::opened(self.reading, self.opened_at, self.buffering)
-            });
+            let reader = state
+                .readers
+                .entry(self.id)
+                .or_insert_with(|| ReaderState::opened(self.opened_at, self.buffering));
             reader.playhead = Some(at);
             let due = match index {
                 Some(index) => {
@@ -3842,7 +3824,7 @@ mod tests {
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         let opens = owner.opens_of(&0);
         let reader = owner
-            .reader_on(&0, (0, 0), Reading::Playback, Buffering::default())
+            .reader_on(&0, (0, 0), Buffering::default())
             .expect("the entity the install made");
         assert!(
             reader.note((0, 0)).is_none(),
@@ -4222,7 +4204,7 @@ mod tests {
             "opened, nothing read"
         );
         let reader = owner
-            .reader_on(&0, (0, 0), Reading::Playback, Buffering::default())
+            .reader_on(&0, (0, 0), Buffering::default())
             .expect("the entity");
         assert!(reader.note((0, 0)).is_none());
         backing.read_from(0, 1);
@@ -4258,7 +4240,7 @@ mod tests {
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         let opens = owner.opens_of(&0);
         let reader = owner
-            .reader_on(&0, (0, 0), Reading::Playback, Buffering::default())
+            .reader_on(&0, (0, 0), Buffering::default())
             .expect("the entity the install made");
         assert_eq!(owner.readers_of(&0), 0, "it has delivered nothing");
 
@@ -5177,15 +5159,13 @@ mod tests {
         let (backing, owner, _budget) = torrent();
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         let first = owner
-            .reader_on(&0, (0, 0), Reading::Playback, Buffering::default())
+            .reader_on(&0, (0, 0), Buffering::default())
             .expect("the entity install made");
         let second = owner
-            .reader_on(&0, (0, 6 * PIECE), Reading::Playback, Buffering::default())
+            .reader_on(&0, (0, 6 * PIECE), Buffering::default())
             .expect("the same entity");
         assert!(
-            owner
-                .reader_on(&9, (9, 0), Reading::Playback, Buffering::default())
-                .is_none(),
+            owner.reader_on(&9, (9, 0), Buffering::default()).is_none(),
             "a reader was opened on a key with no entity"
         );
         assert_eq!(
@@ -5239,76 +5219,6 @@ mod tests {
         assert_eq!(owner.readers_of(&0), 0);
     }
 
-    /// **A probe's byte is not the entity's head, and a probe that has
-    /// closed leaves nothing behind at all.**
-    ///
-    /// The field bug, in the smallest shape that has it. A player opens the
-    /// film at the head and mpv reads the container index at the tail
-    /// before the first frame: two reads of one file, both delivering
-    /// bytes. The tail read used to write the entity's `last_position`,
-    /// and it outlived the read -- `Reader::drop` deliberately leaves that
-    /// value, which is what a paused film needs -- so the next tick pass,
-    /// which is about the entity and no reader, measured from the end of
-    /// the file. The window slid there, the head the player was parked on
-    /// stopped being wanted and was unlinked, and the stream's priority
-    /// path fetched it straight back, once every two-second tick, at
-    /// twenty-five megabytes a second.
-    #[tokio::test]
-    async fn a_tail_probe_that_has_closed_does_not_move_the_window_off_the_player() {
-        let (backing, owner, _budget) = torrent();
-        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
-        let playing = owner
-            .reader_on(&0, (0, 0), Reading::Playback, Buffering::default())
-            .expect("the entity the install made");
-        assert!(
-            playing.note((0, 0)).is_none(),
-            "the tick is the torrent's trigger"
-        );
-        backing.read_from(0, 1);
-        {
-            // mpv's read of the Cues at the tail: it delivers, and it ends.
-            let probe = owner
-                .reader_on(&0, (0, 7 * PIECE), Reading::Probe, Buffering::default())
-                .expect("the same entity");
-            assert!(probe.note((0, 7 * PIECE)).is_none());
-            backing.read_from(7 * PIECE, 1);
-            assert_eq!(
-                owner.holding(&0).expect("a holding").head,
-                Some((0, 0)),
-                "a live probe claimed the entity's head from the player"
-            );
-        }
-        let holding = owner.holding(&0).expect("a holding");
-        assert_eq!(
-            holding.last_position,
-            Some((0, 0)),
-            "the probe's byte was remembered as where playback got to"
-        );
-        assert_eq!(holding.head, Some((0, 0)));
-
-        // The tick's pass: about the entity, about no reader.
-        let claim = owner.turn(&0).await.expect("the turn");
-        let outcome = owner
-            .pass(&0, &(), claim, Mode::Live)
-            .await
-            .concluded
-            .expect("a pass");
-        assert_eq!(
-            outcome.windows,
-            vec![7..8],
-            "the window a tick pass drew followed the probe to the tail -- and \
-             the piece the probe read is kept on its own account, which is \
-             what stops the next open fetching the index again"
-        );
-        assert_eq!(
-            backing.on_disk(),
-            vec![0, 1, 7, 8, 9, 10, 11, 12, 13, 14, 15],
-            "the pieces under the player were reclaimed and its stream will \
-             fetch them again -- but not piece 7, the index the probe read, \
-             which the entity keeps whether or not anything is reading it"
-        );
-    }
-
     /// **The film's length is the bitrate, and nothing has to measure it.**
     ///
     /// Size over duration is arithmetic: exact at the first report, with
@@ -5326,7 +5236,7 @@ mod tests {
             ..Buffering::default()
         };
         let reader = owner
-            .reader_on(&0, (0, 0), Reading::Playback, asks)
+            .reader_on(&0, (0, 0), asks)
             .expect("the entity the install made");
 
         // File 0 is eight pieces of a thousand bytes. Eighty seconds of film
@@ -5366,7 +5276,6 @@ mod tests {
             .reader_on(
                 &0,
                 (0, 0),
-                Reading::Playback,
                 Buffering {
                     lookahead_bytes: 5 * PIECE,
                     ..Buffering::default()
@@ -5413,13 +5322,13 @@ mod tests {
         let (backing, owner, _budget) = torrent();
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         let playing = owner
-            .reader_on(&0, (0, 0), Reading::Playback, Buffering::default())
+            .reader_on(&0, (0, 0), Buffering::default())
             .expect("the entity the install made");
         assert!(playing.note((0, 0)).is_none());
         backing.read_from(0, 1);
         // mpv's read of the Cues, still open while the tick runs.
         let probe = owner
-            .reader_on(&0, (0, 7 * PIECE), Reading::Probe, Buffering::default())
+            .reader_on(&0, (0, 7 * PIECE), Buffering::default())
             .expect("the same entity");
         assert!(probe.note((0, 7 * PIECE)).is_none());
         backing.read_from(7 * PIECE, 1);
@@ -5477,7 +5386,7 @@ mod tests {
         let (backing, owner, _budget) = torrent();
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         let reader = owner
-            .reader_on(&0, (0, 4 * PIECE), Reading::Playback, Buffering::default())
+            .reader_on(&0, (0, 4 * PIECE), Buffering::default())
             .expect("the entity the install made");
         assert_eq!(
             owner.readers_of(&0),
@@ -5523,10 +5432,10 @@ mod tests {
         let (backing, owner, _budget) = torrent();
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         let seeking = owner
-            .reader_on(&0, (0, 6 * PIECE), Reading::Playback, Buffering::default())
+            .reader_on(&0, (0, 6 * PIECE), Buffering::default())
             .expect("the entity the install made");
         let playing = owner
-            .reader_on(&0, (0, 0), Reading::Playback, Buffering::default())
+            .reader_on(&0, (0, 0), Buffering::default())
             .expect("the same entity");
         assert!(playing.note((0, 0)).is_none());
         backing.read_from(0, 1);
@@ -5563,7 +5472,7 @@ mod tests {
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         {
             let playing = owner
-                .reader_on(&0, (0, 0), Reading::Playback, Buffering::default())
+                .reader_on(&0, (0, 0), Buffering::default())
                 .expect("the entity the install made");
             assert!(playing.note((0, 5 * PIECE)).is_none());
             backing.read_from(5 * PIECE, 1);
@@ -5573,7 +5482,7 @@ mod tests {
         // container read does. It does not take the window off it.
         {
             let probe = owner
-                .reader_on(&0, (0, 0), Reading::Probe, Buffering::default())
+                .reader_on(&0, (0, 0), Buffering::default())
                 .expect("the same entity");
             assert!(probe.note((0, 0)).is_none());
             backing.read_from(0, 1);
@@ -5617,7 +5526,6 @@ mod tests {
             .reader_on(
                 &0,
                 (0, 0),
-                Reading::Playback,
                 Buffering {
                     window_seconds: Some(10),
                     committed_seconds: Some(10),
@@ -5661,7 +5569,7 @@ mod tests {
         backing.held.lock().remove(&6);
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         let reader = owner
-            .reader_on(&0, (0, 0), Reading::Playback, Buffering::default())
+            .reader_on(&0, (0, 0), Buffering::default())
             .expect("the entity the install made");
         reader.promises(6..7);
 
@@ -5687,7 +5595,7 @@ mod tests {
         let (backing, owner, _budget) = torrent();
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         let reader = owner
-            .reader_on(&0, (0, 0), Reading::Playback, Buffering::default())
+            .reader_on(&0, (0, 0), Buffering::default())
             .expect("the entity the install made");
         // `torrent()` holds every piece, so this promise is already met.
         reader.promises(6..7);
@@ -5704,25 +5612,18 @@ mod tests {
     }
 
     /// **An entity nothing has ever played is still bounded.** A download,
-    /// or a probe, on a file no viewer has opened has no playback position
-    /// of either kind -- and an entity with no head is one no pass
-    /// measures, so nothing would trim its want-set or take anything off
-    /// its disk. The last resort of [`State::head`] is the live read
-    /// itself.
+    /// or a probe, on a file no viewer has opened is a live read like any
+    /// other -- and an entity with no head is one no pass measures, so
+    /// nothing would trim its want-set or take anything off its disk.
     #[tokio::test]
     async fn a_file_only_a_probe_is_reading_is_bounded_round_the_probe() {
         let (backing, owner, _budget) = torrent();
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         let probe = owner
-            .reader_on(&0, (0, 3 * PIECE), Reading::Probe, Buffering::default())
+            .reader_on(&0, (0, 3 * PIECE), Buffering::default())
             .expect("the entity the install made");
         assert!(probe.note((0, 3 * PIECE)).is_none());
         backing.read_from(3 * PIECE, 1);
-        assert_eq!(
-            owner.holding(&0).expect("a holding").last_position,
-            None,
-            "a probe's byte is not where playback got to"
-        );
 
         let claim = owner.turn(&0).await.expect("the turn");
         let outcome = owner
@@ -5760,7 +5661,7 @@ mod tests {
         let (backing, owner, _budget) = torrent();
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         let playing = owner
-            .reader_on(&0, (0, 0), Reading::Playback, Buffering::default())
+            .reader_on(&0, (0, 0), Buffering::default())
             .expect("the entity the install made");
         assert!(
             playing.note((0, 0)).is_none(),
@@ -5778,7 +5679,7 @@ mod tests {
             move |door: &Door<Torrent>| {
                 *held_open.lock() = Some(
                     owner
-                        .reader_on(&0, (0, 6 * PIECE), Reading::Probe, Buffering::default())
+                        .reader_on(&0, (0, 6 * PIECE), Buffering::default())
                         .expect("the same entity"),
                 );
                 seen.lock().push(refused(door, 0..8));

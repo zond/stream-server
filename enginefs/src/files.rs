@@ -173,19 +173,17 @@ pub struct FileHandle<H: TorrentHandle> {
 ///
 /// A struct rather than four more parameters because the last two arrived
 /// together and mean nothing apart: the intent is what the owner is told
-/// the read is *for* ([`PlaybackIntent::reading`]), and the lookahead is
+/// the read is *for* ([`Fetching::reading`]), and the lookahead is
 /// what the backend really granted it, which the owner keeps as the floor
 /// no later budget may size the window under.
 ///
-/// [`PlaybackIntent::reading`]: crate::backend::priorities::PlaybackIntent::reading
+/// [`Fetching::reading`]: crate::backend::priorities::Fetching::reading
 #[derive(Debug, Clone, Copy)]
 pub struct Opening {
     /// Which file of the torrent.
     pub file_idx: usize,
     /// The offset in that file the read starts at.
     pub start_offset: u64,
-    /// What the read is for.
-    pub intent: crate::backend::priorities::PlaybackIntent,
     /// The stream lookahead the backend granted, in bytes: already the
     /// smaller of the intent's cap and the window's forward reach. See
     /// [`crate::piece_store::Buffering`].
@@ -206,7 +204,7 @@ impl<H: TorrentHandle> FileHandle<H> {
     /// there before the first byte is noted to it.
     ///
     /// `intent` reaches the owner as what the read is *for*
-    /// ([`PlaybackIntent::reading`]). The owner needs it: a player's read of
+    /// ([`Fetching::reading`]). The owner needs it: a player's read of
     /// the container index at the tail delivers bytes exactly like the
     /// response playing the film, and only the intent tells them apart
     /// before the damage -- the probe's byte claiming the file's head and
@@ -224,7 +222,7 @@ impl<H: TorrentHandle> FileHandle<H> {
     /// the piece it is waiting for is the one the file is being buffered
     /// for, and an entity with no head is one no pass draws a window for.
     ///
-    /// [`PlaybackIntent::reading`]: crate::backend::priorities::PlaybackIntent::reading
+    /// [`Fetching::reading`]: crate::backend::priorities::Fetching::reading
     pub fn new(
         size: u64,
         name: String,
@@ -235,7 +233,6 @@ impl<H: TorrentHandle> FileHandle<H> {
         let Opening {
             file_idx,
             start_offset,
-            intent,
             lookahead_bytes,
             buffer,
         } = opening;
@@ -243,7 +240,6 @@ impl<H: TorrentHandle> FileHandle<H> {
         let reader = engine.retention.reader_on(
             &file_idx,
             (file_idx, start_offset),
-            intent.reading(),
             crate::piece_store::Buffering {
                 lookahead_bytes,
                 window_seconds: buffer.window_seconds(),

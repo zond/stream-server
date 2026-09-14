@@ -420,6 +420,7 @@ impl Backing for ProxyBacking {
                     extent.end,
                 )),
                 reclaim: Vec::new(),
+                at: None,
             };
         };
         let streams = detectors
@@ -459,11 +460,16 @@ impl Backing for ProxyBacking {
             .saturating_sub(available);
         let how_many = usize::try_from(over.div_ceil(CHUNK_BYTES.max(1))).unwrap_or(0);
         let (tracked, reclaim) = streams.coldest_of(0, now, &kept, how_many);
+        // One body is one reader here, but a proxied entity can still be
+        // read by two of them; see
+        // [`enginefs::retention::owner::Consumers::at`].
+        let at = streams.busiest(0, CHUNK_BYTES);
         if !streams.report_due(now) {
             return enginefs::retention::owner::Consumers {
                 want,
                 exempt,
                 reclaim,
+                at,
             };
         }
         let coldest: Vec<u32> = reclaim
@@ -491,6 +497,7 @@ impl Backing for ProxyBacking {
             want,
             exempt,
             reclaim,
+            at,
         }
     }
 

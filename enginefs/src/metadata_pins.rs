@@ -2,7 +2,7 @@
 //!
 //! Container seek indexes frequently live at the *end* of the file, far from
 //! the playback head. A player cannot start until it has read them, so when a
-//! tail-seek (`ContainerMetadata`) request — or the background metadata
+//! tail-seek request — or the background metadata
 //! inspector — locates those pieces, they are pinned here. Concurrent head
 //! streams read this registry and rank the pinned pieces ABOVE their own
 //! read-ahead (re-asserting priority 7 + an immediate deadline after the
