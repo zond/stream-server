@@ -301,8 +301,9 @@ pub(crate) async fn publish_now(state: &AppState) -> Option<u64> {
             let available =
                 available_space_off_the_reactor(state.engine.download_dir.clone()).await;
             // The floor is a share of the volume, so it is read from the
-            // same volume and at the same moment as the space it holds
-            // back; see `enginefs::free_space_floor`.
+            // same volume as the space it holds back -- beside it, a second
+            // `statvfs` on the same path, which a size that does not move
+            // between two calls can afford; see `enginefs::free_space_floor`.
             let root = state.engine.download_dir.clone();
             let floor = enginefs::free_space_floor(
                 tokio::task::spawn_blocking(move || enginefs::volume_total(&root))

@@ -48,7 +48,10 @@ Found while fixing them, and fixed with them: the doc block of a deleted
 method left sitting over the method after it
 (`ServerHandle::note_duration`, `Retention::note_duration` -- both were
 carrying the told playhead's documentation, including a link to a deleted
-`EngineFS::on_playhead`); the broken links `Door::window_now`, `Told` and
+`EngineFS::on_playhead`; a third, `EngineFS::on_duration`, carrying the
+same block with a link to the deleted `Retention::note_playhead`, was
+missed here and fixed by the review of the 14th); the broken links
+`Door::window_now`, `Told` and
 `streams::Reading`; and the "observed, never obeyed" headers on
 `retention::streams`, `retention::exempt` and `retention::ledger`, each of
 which a pass now obeys.
