@@ -221,10 +221,14 @@ reads point at it.
 
 ## 4. The disk budget
 
-There is no configured cache ceiling. Data is dropped when a stream closes or
-the viewer starts a different one (pins excepted), so the cache is already
-bounded by the session; a `cacheSize` setting under that is a second ceiling
-below a real one.
+*Not done as written.* The plan was no configured cache ceiling at all:
+data is dropped when a stream closes or the viewer starts a different one
+(pins excepted), so the cache is already bounded by the session, and a
+`cacheSize` setting under that is a second ceiling below a real one. What
+landed keeps `cacheSize` as an operator cap -- the enforced cap is the
+smaller of it and the formula below (`CacheLimit::effective`), and
+`cacheSize` alone when the volume cannot be read. The rest of this section
+is as built.
 
 ```
 available = our_usage + (free_disk - margin)
@@ -407,12 +411,21 @@ Order:
    no un-Have.
 1. The scenario harness, proved against the old policy.
 2. Membership from disk: runs, births, and the one-past-the-edge clause.
-3. Rate from the consumer, with **slow start** -- seeded at zero, not at the
-   film bitrate. Seeded at the bitrate a new stream is handed 315 MB on a
-   90 s profile; one-shot that is ~12 MB actually fetched, which does not
-   re-buy the 1.6 GB probe regression, but 46 reopens in 70 seconds that
-   miss is 0.5-4.6 GB, which does. Slow start makes a spurious stream cost
-   8 MiB, and the film reaches its full window in under a second.
+3. Rate from the consumer, with **slow start**. As planned the rate was to
+   be seeded at zero rather than at the film bitrate, on the argument that a
+   stream seeded at the bitrate is handed 315 MB on a 90 s profile -- ~12 MB
+   actually fetched one-shot, which does not re-buy the 1.6 GB probe
+   regression, but 46 reopens in 70 seconds that miss is 0.5-4.6 GB, which
+   does. As shipped the seed is the other way round and the slow start is
+   somewhere else: an unmeasured stream is fetched at the film's arithmetic
+   ceiling from the start (`Stream::demand`, since `6248f14`), the first
+   admitted sample is averaged into that ceiling rather than replacing it
+   (`Stream::sample`, `df41134`/`77309fa` -- one low sample used to collapse
+   the window outright), and a measurement can only lower the rate. What
+   bounds a spurious stream is the window, not the rate: `Stream::grant`
+   grows it a doubling at a time from the floor, so a one-shot probe has
+   cost 8 MiB and stopped, and the film reaches its full window in under a
+   second.
 4. The want set: equal seconds, the demand floor, the next piece.
 5. The LRU, the per-piece ledger, and the tiers.
 6. The exempt bitmap: one `Arc<[AtomicU64]>` bit per piece, written only by
@@ -425,7 +438,9 @@ Order:
 ### Where this stands
 
 **Landed.** 0-8: the detector, the ledger, the exempt bitmap, the disk
-budget, and the swap. What a pass keeps, fetches and gives back is now an
+budget -- as `occupied + available - floor`, with `cacheSize` kept as an
+operator cap over it rather than retired as section 4 opens by proposing
+-- and the swap. What a pass keeps, fetches and gives back is now an
 answer about what an entity's consumers are doing, on both backings, and
 the told playhead is gone from both repos.
 
@@ -465,8 +480,9 @@ not what is reclaimed, not which reader is the viewer. `Reading` did not
 survive; where the entity is being consumed is `Consumers::at`, from the
 bytes each detected stream has eaten, and an entity's own last delivered
 byte is the fallback under it. `Shape` survives as the sharing draw and the
-pass's stride -- its `window` is no longer a window, which is a misnaming
-recorded in `docs/known-issues.md`.
+pass's stride -- what was its `window` is no longer one, and is named
+`unshared` since `ff1605b`: the part of the budget the sharing draw may
+not have.
 
 **Measured, not claimed.** The disk peaks at 71 pieces of a 64-piece budget
 on the torrent -- a stream's own lookahead is never taken, and what the

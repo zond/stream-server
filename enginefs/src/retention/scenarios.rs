@@ -154,8 +154,11 @@ fn burst(script: &mut Vec<(Duration, Step)>, from: u64, the_swarm_keeps_up: bool
 /// The first response is opened and not yet polled when the pass runs,
 /// which is the instant the field's line describes: a response has a head
 /// from the moment it opens (`ReaderState::opened_at`) and has promised
-/// nothing, because a promise is made by `poll_read`'s `Poll::Pending` arm
-/// and it has not been polled.
+/// nothing. That is the harness's ordering, and not production's any more:
+/// since `6744894` a read promises the piece it was opened on the moment
+/// its reader exists (`Opening::reader_on`), while the harness's `opens`
+/// makes no promise until the first blocked read -- which is what keeps
+/// this scenario the state the field's line was written from.
 fn field_session() -> Log {
     let film = FIELD_FILM;
     let mut script = vec![

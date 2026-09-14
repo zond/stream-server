@@ -107,8 +107,9 @@ impl BodyProgress {
 /// resolution.
 const STREAM_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Log what the torrent behind an open stream is doing, once a second,
-/// until the task is aborted (the body ended) or the engine is gone.
+/// Log what the torrent behind an open stream is doing, once every
+/// [`STREAM_PROGRESS_LOG_INTERVAL`], until the task is aborted (the body
+/// ended) or the engine is gone.
 ///
 /// `peek_engine`, not `get_engine`: watching a stream must not be what
 /// keeps its torrent out of the idle sweep -- the open reader already does

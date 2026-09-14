@@ -184,8 +184,10 @@ use crate::proxy_cache::CHUNK_BYTES;
 /// subtler than that: what is on the disk when a pass measures it is the
 /// window plus whatever the fill wrote since the last pass, which is a
 /// stride. A twentieth of the budget is a small enough overhang to be
-/// invisible against the free-space floor the cap keeps back, and twenty
-/// directory listings per window of playback is a cheap way to buy it.
+/// invisible against the free-space floor the cap keeps back, and what
+/// twenty passes per window of playback cost now -- each one the entity's
+/// lock, a walk of the detector's consumers and the unlinks it decides on,
+/// with no listing in it -- is a cheap way to buy it.
 const PASSES_PER_WINDOW: u64 = 20;
 
 /// The read-pattern detectors, one per entity, shared between the readers
@@ -738,11 +740,17 @@ pub(crate) enum OnDisk {
 /// * A chunk on the disk this does **not** name costs a re-fetch of bytes
 ///   we already had, and leaves those bytes standing until the entity is
 ///   dropped whole. Money and disk, and nothing a player can see.
-/// * A chunk this names that is **not** on the disk is a read that fails. A
-///   lookup frames a `Content-Length` round the run it was told we hold and
-///   the body then finds a hole in it, which is a truncated response to a
-///   range the player was promised -- and once membership drives the want
-///   set, a run the policy believes is cached and therefore never fetches.
+/// * A chunk this names that is **not** on the disk is a lie every consumer
+///   of the set acts on. Today those are the pass ([`ProxyBacking::held`]:
+///   an absent chunk offered up for reclaim, a want set that skips fetching
+///   a run it believes is cached, an over-count against the budget) and the
+///   panel ([`ProxyRetention::window`], a window drawn round bytes that are
+///   not there). The lookup is not among them yet -- `Entry::look_up` still
+///   lists the bucket it walks -- and the day step 0 moves it onto this set
+///   the direction turns from a wrong plan into a read that fails: a
+///   `Content-Length` framed round the run it was told we hold, and the body
+///   then finding a hole in it, which is a truncated response to a range the
+///   player was promised.
 ///
 /// So the shape is chosen so only the survivable direction is reachable:
 /// every mutation is booked *into* this inside the same critical section
@@ -1333,8 +1341,10 @@ impl ProxyRetention {
     /// overwrite, so the origin was asked for those bytes at every play --
     /// and it has to be booked here rather than through the count alone,
     /// because a chunk the held set still named after the unlink is the
-    /// dangerous direction: the next lookup would frame a body round bytes
-    /// that are not there.
+    /// dangerous direction: the next pass would offer it for reclaim and
+    /// leave it out of the want set as already cached, and the lookup, once
+    /// step 0 moves it onto the set, would frame a body round bytes that
+    /// are not there.
     ///
     /// A file that has already gone is [`OnDisk::Gone`] and frees nothing.
     /// Blocking; call it off the reactor.
@@ -1820,10 +1830,12 @@ mod tests {
     ///
     /// The dangerous direction, ruled out where it would arise: the pass is
     /// the proxy's biggest deleter of chunks, and a set that still named
-    /// what it unlinked would have the next lookup frame a `Content-Length`
-    /// round bytes that are not there. The unlink and the withdrawal are
-    /// one critical section, so there is no instant between them for a
-    /// lookup to read.
+    /// what it unlinked would have the next pass plan round chunks that are
+    /// not there -- and, once the lookup reads this set rather than the
+    /// directory (section 10, step 0), frame a `Content-Length` round bytes
+    /// that are not there. The unlink and the withdrawal are one critical
+    /// section, so there is no instant between them for a reader of the set
+    /// to see.
     #[tokio::test]
     async fn what_a_pass_unlinks_comes_out_of_the_held_set_with_it() {
         let tmp = tempfile::tempdir().unwrap();

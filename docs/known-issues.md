@@ -28,11 +28,12 @@ read-pattern detector answers that from behaviour instead.
   `trace::pass` -- the entity head it prints and the `held_behind`/
   `held_ahead` split. Nothing keeps, fetches or reclaims because of them.
   They die with the trace module.
-* `Shape::Split`'s `window` is no longer a window. One production read
+* `Shape::Split`'s `window` was no longer a window -- one production read
   (`stride_for`, and only under `Trigger::OnMove`, so the proxy; the torrent
   is `Trigger::External` and never reads it), plus it is the subtrahend that
-  sizes `committed` in `shape_for`. Misnamed rather than unused: it is "the
-  part of the budget the sharing draw may not have".
+  sizes `committed` in `shape_for`; misnamed rather than unused, it is "the
+  part of the budget the sharing draw may not have". **Renamed `unshared`
+  in `ff1605b`**, which is the name to grep for now.
 * `Shape::piece_budget` is called only from tests.
 
 ## Stale docs
@@ -64,7 +65,8 @@ Still stale:
 
 ### In the field
 
-**Settled 2026-09-14 (`73f77b0`, rqbit `bb6bad9b`).** The unverified figure
+**Settled 2026-09-14 (`d9ad179`, rqbit `bb6bad9b`; the build measured was
+xtremio `73f77b0`, which pins that commit).** The unverified figure
 was the duplication the fork itself was doing, and the numbers close:
 
 | log | fetched | verified | unverified |
@@ -162,14 +164,21 @@ whose job was partly to say "not real" or "leave it". Three did.
    parked in a torrent read never reaches, so it would leak forever holding
    the engine `Arc`, the cache handle and the stream. Leave it.
 
-4. **The boundary-piece race is real but not where this file said.**
-   `TorrentStorage::remove_file` has no per-file production caller --
-   librqbit reaches it only on a whole-torrent delete-with-files -- so its
-   boundary rule never races a pin. The race is in `Engine::reclaim`
-   (`engine.rs:961`) and `Engine::want` (`:821`), where the pin set is read
-   and then acted on with no lock spanning the two. The tick does heal it,
-   though not by the mechanism the old note implied. Left alone; what would
-   make it matter is a pin arriving faster than a tick.
+4. **The boundary-piece race is real but not where this file said, and it
+   is healed where it is.** `TorrentStorage::remove_file` has no per-file
+   production caller -- librqbit reaches it only on a whole-torrent
+   delete-with-files -- so its boundary rule never races a pin. The race is
+   in `TorrentBacking::want` and `TorrentBacking::reclaim` (`engine.rs`,
+   the `Backing` impl), where the pin set is read and then acted on with no
+   lock spanning the two: `pin_download_locked` writes it under
+   `pin_locks`, which no pass takes, so it is a cross-thread window rather
+   than an await interleaving. Since `6744894` every acted-on run is
+   checked against the pins once more afterwards
+   (`TorrentBacking::rewant_pins_crossed_by`) and anything a pin has since
+   claimed is wanted again, so what the race costs is one boundary piece
+   fetched twice -- which the design accepts of a boundary piece everywhere
+   else -- rather than a pinned download left one piece short of done until
+   a heal that was conditional on a default three modules away.
 
    Also noted while looking: `store.rs`'s `removed_files` set is
    insert-only and never cleared on a re-pin. Unreachable today, and
@@ -180,11 +189,21 @@ whose job was partly to say "not real" or "leave it". Three did.
    assertion against `CHECK_WAIT_BOUND`, so a regression fails rather than
    hangs. They decide how often a condition is asked, not whether it holds.
 
-6. **The install-to-reader race is narrowed, not closed** (`e2ded80`). A
-   reader that has opened and not yet delivered is not an *observed*
-   reader, so a pass landing between `Opening::reader_on` and the first
-   `poll_read` still reclaims. It can no longer forget the entity, which
-   was the unrecoverable half.
+6. **The install-to-reader race is closed** (`e2ded80`, then `6744894`).
+   `e2ded80` took the reader before the backend open, which was the
+   unrecoverable half: a pass in that await could forget the entity, and no
+   reader taken afterwards would find one. What it left was a reader that
+   had opened and not yet delivered, which was not an *observed* one, so a
+   pass landing between `Opening::reader_on` and the first `poll_read`
+   still reclaimed under it. `6744894` has the reader promise the piece it
+   was opened on (`files.rs`, right after `reader_on`), and a promise is
+   what makes a reader observed -- so an opened-and-unread handle holds one
+   piece for as long as it exists, and the window closes on the handle's
+   lifetime rather than on a clock. What remains is not a window over an
+   await: `Retention::reader_on` inserts the unobserved `ReaderState` under
+   one acquisition of the entity's lock and `Reader::promises_at` writes
+   the promise under a second, a few instructions later on the same
+   thread -- the class of gap item 4 describes for the pin set.
 
 7. `unrar-rs`: **not an issue.** xtremio has shipped `LICENSE-unrar-rs`
    inside the build since `25be0ac` (2026-09-12), and this workspace builds
