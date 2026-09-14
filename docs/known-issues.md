@@ -102,6 +102,32 @@ number when the piece checks.
    shorten and the figure climbs, spreading is costing a round trip per
    peer and `CLAIMS_PER_PEER` is too low.
 
+2. **A stalling link shrinks the window that would have ridden it out.**
+   Field log 2026-09-14 18:21, a wifi-to-mobile switch: `rates=[Some(367710)]`
+   against a 3,568,061 B/s film, and a want set of eight pieces where the
+   film's own arithmetic allows seventy-seven -- about nine seconds of
+   buffer on a link that repeatedly dropped to 32 kB/s for tens of seconds.
+
+   Why the measurement reads low there: a starving player asks again the
+   instant it is answered, so its reads are refused by `Stream::sample`'s
+   admission rule; what survives admission is the moments the player had
+   some buffer and idled, and a long idle over a small read is a *low*
+   sample. On a link that alternates stalling and bursting the admitted
+   samples are systematically the low ones.
+
+   **Half-addressed** (`77309fa`): the rate is seeded from the film's
+   arithmetic rather than set outright by the first admitted sample, so one
+   sample can no longer collapse the window. What is *not* addressed is a
+   sustained bad patch, where the decay still arrives after a dozen-odd
+   samples. Widening the memory was tried and put back -- it only helps a
+   stream that is seeded, and a proxied stream states no duration, so the
+   widening gave it the cost without the benefit (Windows caught it).
+
+   If this needs more, the lever is the admission rule telling a slow
+   consumer from a slow link, not a constant: those two produce identical
+   evidence in delivered bytes, and the film's own size over its duration
+   is the only number immune to it.
+
 ### Open in this repo
 
 Every item below was verified against the tree on 2026-09-14 by a reading
@@ -175,6 +201,12 @@ whose job was partly to say "not real" or "leave it". Three did.
   twice: `server` and `enginefs` each carry their own `librqbit`
   dependency, and xtremio carries a third for test fixtures. The check is
   `grep -c 'name = "librqbit"$' Cargo.lock`, which must answer 1.
+* **A green local test run is not a green gate.** xtremio's CI failed on
+  `cargo fmt --check` in its `rust/` crate for nine consecutive pushes
+  before anyone looked: `flutter test` passing locally says nothing about
+  it, and the fmt gate runs before clippy and the tests, so the whole Rust
+  job never ran. Check `gh run list -R zond/<repo>` after pushing -- and
+  note that in the forks `gh` targets upstream unless `-R` names the fork.
 * **Never `git checkout <file>` to undo an experiment.** It restores from
   HEAD, not from the working tree, so it discards everything uncommitted in
   that file. Copy the file to the scratchpad and copy it back instead.
