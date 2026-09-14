@@ -65,9 +65,13 @@ fn ms(at: u64) -> Duration {
     Duration::from_millis(at)
 }
 
-/// The viewer's byte offset at [`VIEWER_AT`], as the player's own report
-/// converts it -- at the film's average rate, which is what
-/// `Retention::note_playhead_at` does with it.
+/// The viewer's byte offset at [`VIEWER_AT`], converted at the film's
+/// average rate.
+///
+/// Nothing tells the server where a viewer is any more -- where an entity
+/// is being consumed is where its reads are -- so this is the scenario's
+/// own arithmetic, turning the time the field report states into the offset
+/// the viewer's response is opened at.
 fn viewer_offset(film: &Film) -> u64 {
     (film.bytes as f64 * (VIEWER_AT.as_secs_f64() / film.duration.as_secs_f64())) as u64
 }

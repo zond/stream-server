@@ -293,24 +293,14 @@ impl ServerHandle {
         routes::system::dht_status(&self.state)
     }
 
-    /// **Tell the server where the player is**, which is the one fact about
-    /// a viewing it cannot see for itself: `offset` is the player's own
-    /// byte offset into the file and `film` its position in the picture.
-    ///
-    /// Everything the retention window does with a playhead it otherwise
-    /// infers from the byte ranges a player asks for, and those do not
-    /// carry it -- a container index read and a seek into the tail are the
-    /// same request. An embedder that has a real player should call this
-    /// about once a second per open film; see
-    /// [`enginefs::EngineFS::on_playhead`].
-    ///
-    /// Nothing depends on it. Stop calling and the hint goes stale in
-    /// fifteen seconds and the inference answers again, which is what a
-    /// client that never calls gets throughout.
     /// **Tell the server how long the film is**, without saying where the
     /// player is in it -- which is all a cast can say, the receiver doing
-    /// the reading and reporting only seconds. The length is what sizes the
-    /// retention window; see [`enginefs::EngineFS::on_duration`].
+    /// the reading and reporting only seconds, and which is all anything
+    /// says now: where a viewer is, is where its reads are. The length is
+    /// the one fact about a viewing this server cannot work out for itself,
+    /// and it is what sizes the retention window and the stream's own
+    /// read-ahead, both of which are stated in seconds of film; see
+    /// [`enginefs::EngineFS::on_duration`].
     pub async fn note_duration(
         &self,
         info_hash: &str,

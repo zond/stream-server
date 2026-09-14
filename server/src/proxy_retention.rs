@@ -253,10 +253,9 @@ struct ProxyBacking {
     /// reads ([`enginefs::retention::live`]). Asked at the top of every
     /// slack pass, and then once per candidate chunk at its [`Door`]: this
     /// backing reclaims chunk by chunk ([`ProxyBacking::reclaim`]) rather
-    /// than run by run through `Door::windows_now`, which is the torrent's
-    /// shape, so every unlink it is about to make asks the cell again and a
-    /// body that opens on an entity while its bytes are going stops the run
-    /// where it stands. That is a read of the watch's lock from a blocking
+    /// than run by run as the torrent does, so every unlink it is about to
+    /// make asks the cell again and a body that opens on an entity while
+    /// its bytes are going stops the run where it stands. That is a read of the watch's lock from a blocking
     /// thread per chunk, which is why [`Live::is_proxy`] borrows rather
     /// than clones.
     live: Arc<Live>,

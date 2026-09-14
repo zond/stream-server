@@ -17,7 +17,8 @@
 //!
 //! **`None` is "nobody told me", and it is not "nothing is pinned".** An
 //! embedder that passes no set -- one whose own record would not read, one
-//! that has not got that far, the standalone binary -- gets [`PinsUnknown`]:
+//! that has not got that far, a test or a tool that links these crates
+//! without a downloads list of its own -- gets [`PinsUnknown`]:
 //! nothing is swept, every restored torrent is kept and reported as pinned,
 //! and nothing is ever deleted for want of a claim. Treating silence as an
 //! empty set is what would delete every offline download a user has, which

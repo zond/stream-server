@@ -225,7 +225,7 @@ pub(crate) struct FakeBacking<S: Side> {
     /// pieces that pass stopped the swarm from ever fetching.
     pub(crate) dropped: parking_lot::Mutex<Vec<Vec<u32>>>,
     /// The runs each `reclaim` call really asked the door about, which
-    /// stops at the first `window_now` of `None`.
+    /// stops at the first run a `shut` door refuses outright.
     pub(crate) asked: parking_lot::Mutex<Vec<Vec<Range<u32>>>>,
     pub(crate) reclaim_panics: AtomicBool,
     pub(crate) park_held: parking_lot::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
@@ -615,9 +615,9 @@ impl<S: Side> Backing for FakeBacking<S> {
         })
     }
 
-    /// Both shapes at once: `window_now` gates each run as the torrent
-    /// does, `refuses` gates each index as the proxy does, and the disk
-    /// loses what neither refused.
+    /// Both shapes at once: `shut` gates each run as the torrent does,
+    /// `refuses` gates each index as both backings do, and the disk loses
+    /// what neither refused.
     async fn reclaim(
         &self,
         _store: &(),

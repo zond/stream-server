@@ -546,15 +546,9 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         // torrent pieces.
         streams.domain(domain.file_idx, domain.span.offset, extent.clone(), ceiling);
         let rejected = streams.observe(domain.file_idx, held, domain.piece_length, now);
-        // What the replacement would order, beside what this pass did.
-        // Obeyed by nothing: the point of carrying it is that a field log
-        // shows the two answers to the same disk, on the same line.
-        //
-        // Every pass, and not only the ones that report. A window grows
-        // towards what its rate asks for by doubling, one step per grant,
-        // so grants that happened only when a log line was due would tie
-        // how fast a consumer is fetched for to how often this server
-        // talks about it.
+        // **What the consumers are asking for, which is what this pass
+        // orders.** The detector's answer is the want set, the exempt set
+        // and the reclaim below; nothing here classifies a read any more.
         //
         // Every pass, and not only the ones that report: a window grows
         // towards what its rate asks for by doubling, one step per grant,
@@ -794,8 +788,10 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
     /// with the piece on the disk; librqbit has forgotten the piece, and the
     /// pin's next pass wants the whole file again and downloads it back over
     /// the same bytes. One piece fetched twice, against a piece of a pinned
-    /// file deleted. And a piece inside any open reader's window now
-    /// ([`Door::windows_now`]) stays, as the reclaim leaves it.
+    /// file deleted. And a piece the pass published as exempt -- what this
+    /// file's consumers are being fetched for, and what an open read has
+    /// been promised ([`Door::refuses`]) -- stays, as the reclaim leaves
+    /// it.
     async fn want(
         &self,
         store: &Arc<StoreRegistry>,
@@ -902,36 +898,39 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
     /// to catch: every advertise is made under this file's turn, which the
     /// pass holds throughout.
     ///
-    /// [`Door::windows_now`] answers `None` for a pin taken since the pass
-    /// began, and it stops the reclaim rather than skipping a run: a pin
-    /// does not un-pin mid-loop. A pinned file's pieces are the expensive
+    /// [`Door::shut`] answers `true` for a pin taken since the pass began,
+    /// and it stops the reclaim rather than skipping a run: a pin does not
+    /// un-pin mid-loop. A pinned file's pieces are the expensive
     /// ones to get wrong -- `AfterRelease::LeaveDropped` leaves them neither
     /// held nor wanted, and the pin's own reconcile short-circuits an
     /// unchanged selection, so nothing re-queues them and the download the
     /// user asked for stays short of them until a restart hash-checks the
     /// file off the disk.
     ///
-    /// `Some` narrows the run by the window at the file's head and by the
-    /// window round every open reader's *current* position -- a seek is a
-    /// second reader on the file still playing, and the piece under it is
-    /// not the pass's to take because the other reader delivered the last
-    /// byte. librqbit refuses a piece its own live stream is about to read,
-    /// but that is `queue_range`, the forward lookahead alone, so it cannot
-    /// see the tenth of the window that sits behind the playhead for a scan
-    /// back, it is empty whenever no stream is open, and
+    /// [`Door::refuses`] narrows the run piece by piece, against the set
+    /// the pass published under the entity's lock: the run of the file
+    /// every consumer the detector found is moving through
+    /// (`crate::retention::streams`), and every promise an open read has
+    /// been made. A seek is a second consumer on the file still playing,
+    /// and the piece under it is not the pass's to take.
+    ///
+    /// librqbit refuses a piece its own live stream is about to read, but
+    /// that is `queue_range`, the forward lookahead alone: it says nothing
+    /// about the disk behind a consumer, which is what a scan back is
+    /// served from, it is empty whenever no stream is open, and
     /// `TorrentHandle::drop_pieces` promises it of no backend.
     ///
     /// Per run and not per piece: `release` is the unit that holds the
     /// claim across the unlink, and `runs` exists so that two hundred
     /// consecutive pieces are one call and not two hundred locks on the
-    /// torrent. And asked again before every *part* of a run: a window at
-    /// the door can fall inside a run and cut it in two, and the second
+    /// torrent. And asked again before every *part* of a run: a piece the
+    /// door refuses can fall inside a run and cut it in two, and the second
     /// part is then given back only after the first has been released -- a
     /// `drop_pieces` and an unlink batch later. Handing the second part to
     /// `release` on the same answer is the reading the door exists to
     /// refuse, one level down: a pin taken during the first part's unlink
     /// would have the second part's pieces dropped out of a download the
-    /// user has just asked to keep. So a run the windows have narrowed or
+    /// user has just asked to keep. So a run the door has narrowed or
     /// split goes back on the list in its parts, and each part is asked
     /// about in its own turn; only a run the door lets through whole is
     /// released.
@@ -1631,8 +1630,9 @@ impl<H: TorrentHandle> Engine<H> {
             .retention
             .reach(&file_idx, (file_idx, start_offset))
             .map(|(domain, ahead)| {
-                // `ahead` is never empty (`RetentionPolicy::ahead_of`), so
-                // `end - 1` is the last piece the window reaches.
+                // `reach` only ever answers with a window that ends past
+                // the index it was asked about, so `end >= 1` and `end - 1`
+                // is the last piece the window reaches.
                 (u64::from(ahead.end - 1) * domain.piece_length)
                     .saturating_sub(domain.span.offset)
                     .saturating_sub(start_offset)

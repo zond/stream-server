@@ -4,8 +4,6 @@ use tokio::io::{AsyncRead, AsyncSeek};
 
 pub mod dht_bootstrap;
 pub mod librqbit;
-
-pub mod metadata;
 pub mod priorities;
 
 pub trait FileStreamTrait: AsyncRead + AsyncSeek + Unpin + Send + Sync {}

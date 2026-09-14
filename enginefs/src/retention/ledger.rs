@@ -7,9 +7,11 @@
 //! pass's listing against the last, and its reads are stamped exactly
 //! because the read path carries its own clock.
 //!
-//! **Phase A: nothing is evicted from this.** The order is computed and
-//! traced so a field log can be read against what the policy still deciding
-//! actually took; see `docs/read-pattern-retention.md`.
+//! **This is the order things are given back in.** The coldest of what no
+//! consumer is asking for is what a pass reclaims
+//! ([`super::streams::Streams::coldest_of`]), and the same order is traced
+//! so a field log can be read against what a pass took; see
+//! `docs/read-pattern-retention.md`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};

@@ -253,14 +253,13 @@ impl Buffering {
 /// below this, and the budget is still what bounds it from above.
 const SMALLEST_TIME_CAP_BYTES: u64 = 64 * 1024 * 1024;
 
-/// The smallest window whose forward reach ([`RetentionPolicy::ahead_of`])
-/// covers `bytes`.
+/// The smallest window whose forward reach covers `bytes`.
 ///
-/// The reach is the window less the tenth of it that sits behind the
-/// playhead, so the floor is stated on the reach and converted here rather
-/// than being applied to the window directly: a floor read as a window
-/// would leave the forward reach a tenth short of the lookahead it exists
-/// to cover, which is the whole of what it is for.
+/// The reach is the window less the `BEHIND_PERCENT` of it that sits
+/// behind the playhead, so the floor is stated on the reach and converted
+/// here rather than being applied to the window directly: a floor read as
+/// a window would leave the forward reach a tenth short of the lookahead it
+/// exists to cover, which is the whole of what it is for.
 fn window_for_reach(bytes: u64, piece_length: u64) -> u32 {
     debug_assert!(piece_length > 0, "a piece length of zero");
     let pieces = bytes.div_ceil(piece_length.max(1)).min(u64::from(u32::MAX));

@@ -8233,15 +8233,14 @@ mod tests {
     /// Half the file: 64 pieces, so the policy splits it into a 32-piece
     /// window and a 32-piece committed half.
     ///
-    /// The window is narrower than every playback intent's lookahead cap
-    /// but the startup one (`STREAMING_LOOKAHEAD_BYTES`, 4 MiB = 16 pieces;
-    /// the seek and sequential caps are 128 MiB, four times the file), and
-    /// it does not have to be wider: the reader is opened with the smaller
-    /// of the cap and the window's reach, so what the stream is about to
-    /// read -- which librqbit rightly refuses to drop -- is inside what the
-    /// policy is keeping anyway, whatever the intent. The bound below is the
-    /// policy's to keep under either cap; `a_stream_wider_than_its_window_
-    /// is_fetched_inside_it` is the one that would not have held before.
+    /// The window is narrower than the lookahead a stream with no stated
+    /// duration falls back to (`STREAMING_LOOKAHEAD_BYTES`, 4 MiB = 16
+    /// pieces), and it does not have to be wider: the reader is opened with
+    /// the smaller of that and the window's reach, so what the stream is
+    /// about to read -- which librqbit rightly refuses to drop -- is inside
+    /// what the policy is keeping anyway. The bound below is the policy's to
+    /// keep either way; `a_stream_wider_than_its_window_is_fetched_inside_it`
+    /// is the one that would not have held before.
     const RETENTION_BUDGET: u64 = 16 * 1024 * 1024;
 
     /// **The bound.** A torrent streamed end to end, well past a cache

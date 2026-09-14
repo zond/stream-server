@@ -1,19 +1,21 @@
 # Read-pattern retention
 
-**Status: designed, not built.** Nothing in `enginefs::retention` works this
-way yet. This is the agreed shape, written down so the reasoning survives the
-session that produced it; the constants named here are placeholders and the
-staging at the end is the order to build it in.
+**Status: built, and this is how `enginefs::retention` works.** Stages 0-8
+have landed (see *Where this stands*, at the end, which records what the
+field log changed on the way). The sections below are kept as they were
+written -- the reasoning, not a description of the code -- so where a
+number here and a constant in the tree disagree, the tree is the answer.
+The staging at the end is the order it was built in.
 
-## Why the current design has to go
+## Why the design that was there had to go
 
-The retention owner decides what to keep and what to fetch from a *reading*:
+The retention owner decided what to keep and what to fetch from a *reading*:
 `Reading::{Playback, Probe}`, derived from a `PlaybackIntent`, derived in turn
 by `playback_intent_for_request` from a priority header, two download flags and
 the geometry of a byte range. A player states none of that. It sends a range.
 
-Every field failure of the last week is that derivation being wrong, and each
-one was diagnosed as something else first:
+Every field failure of the week before this was written is that derivation
+being wrong, and each one was diagnosed as something else first:
 
 - `is_container_metadata_request` recognises "the container index" from two
   invented constants -- a window of `max(16 MiB, file_size / 512)` and a start
@@ -247,28 +249,50 @@ being lookahead alone since it has nothing to seed.
 
 ## 5. What this deletes
 
-`PlaybackIntent` and `playback_intent_for_request`; `is_container_metadata_request`,
-`container_metadata_window`, `CONTAINER_METADATA_FRACTION`; `STRUCTURAL_PIECES`;
-the `Reading::{Playback, Probe}` split; keep-windows, want-windows,
-`Door::windows_now`, `window_at`.
+**All of this went, in `fbb8d79` and the commits leading up to it.** Kept as a
+list because it is the shape of the thing that was removed, and because a
+name here turning up in a doc comment is how the next reader knows that
+comment is stale.
+
+`PlaybackIntent`, with all eight of its variants, and the constants that
+sized them (`MAX_STARTUP_WINDOW_BYTES`, `MAX_SEEK_HOT_WINDOW_BYTES`,
+`MAX_WARM_WINDOW_BYTES`, `MAX_CONTAINER_METADATA_WINDOW_BYTES`,
+`MAX_DOWNLOAD_RANGE_WINDOW_BYTES`, `SMALL_FILE_BYTES`);
+`is_container_metadata_request`, `container_metadata_window`,
+`container_metadata_start`, `CONTAINER_METADATA_FRACTION`;
+`STRUCTURAL_PIECES`; the `Reading::{Playback, Probe}` split;
+`BufferProfile::scale_playback_window`; `Opening::intent`; keep-windows,
+want-windows, `Door::windows_now`, `RetentionPolicy::window_at`,
+`RetentionPolicy::ahead_of`.
+
+One name on that list survives its subject: `playback_intent_for_request`
+(`server/src/routes/stream.rs`) still exists, reading nothing but the
+priority and the download flag and answering a `Fetching` of `Streaming`
+or `Download`. It classifies no geometry, and the range is not read at all.
 
 **And the told playhead entirely**: `note_playhead` on `ServerHandle` and the
 FRB surface under it, `Told`, `TOLD_FRESH`, `read_near`, `READ_VICINITY`, the
-playhead fallback tiers, and `Pass::drift`. Its last job was placing a window
-round where the viewer is so that scrub-back stayed cheap, and scrub-back is
-now tier 2: it exists when there is disk for it and does not when there is
-not, which needs no position. `note_duration` stays, for the cap in §1.
+playhead fallback tiers, `Pass::drift`, and `Retention::note_playhead`/
+`note_playhead_at`. Its last job was placing a window round where the viewer
+is so that scrub-back stayed cheap, and scrub-back is now tier 2: it exists
+when there is disk for it and does not when there is not, which needs no
+position. `note_duration` stays, for the cap in §1 -- and it is now what
+sizes the stream's own read-ahead too, not only the disk's window.
 
-That deletion crosses the repo boundary -- xtremio reports the playhead once a
-second (`_reportPlayhead`, `PlayheadReport`, `PlayheadReporter`) and its pin
-would stop compiling. The two changes land together, in stage D.
+That deletion crossed the repo boundary -- xtremio reported the playhead once
+a second (`_reportPlayhead`, `PlayheadReport`, `PlayheadReporter`) and its pin
+would have stopped compiling. The two changes landed together, in stage D.
 
 ## 6. Open
 
-Nothing about the shape. What is left is the ordering of the stage-D
-deletion against xtremio's pin, and whether the lookahead cap wants to apply
-to the sum of the streams rather than to each of them, which the Phase A
-trace will say more about than an argument will.
+Nothing about the shape, and nothing about the staging: stage D landed with
+xtremio, and the lookahead cap does apply to the sum of the streams --
+`Streams::want` scales every stream's demand by `budget / asked` when the
+disk cannot cover them all, which is what makes the shares equal in seconds
+rather than equal in bytes. The field log settled it, as expected.
+
+What is open is in `docs/known-issues.md`, and it is about the swarm rather
+than about this policy.
 
 ## 7. What a stream is
 
@@ -327,6 +351,12 @@ lookahead names pieces that are precisely not held yet. Deriving the second
 from the first would leave nothing ever asking for anything.
 
 ## 9. When a pass runs
+
+**This one did not land with the rest.** The torrent still runs a pass on the
+reconciler's tick and the proxy still triggers on delivered bytes, so
+`Trigger`, `stride`, `owes_a_pass` and the again-chain are all still there.
+Nothing in the detector depends on changing that; it is the last piece of
+this design that is still a proposal.
 
 On events, never on a timer:
 
@@ -422,14 +452,21 @@ buys, bounded by what the last pass published as wanted and by what the
 whole cache may hold. One number, one source, the same arithmetic the want
 set is made of: `window_at` and `ahead_of` are gone with it.
 
-**What is left of the old model, and why.** `PlaybackIntent` survives as
-the fallback for a stream whose length nobody has stated -- the first open
-of a session, before the player has said how long the film is, and any file
-mpv cannot put a duration on. There is no seconds-to-bytes conversion
-without a duration, and the intent's constants are the only other basis
-there has ever been. `Reading` survives saying whose delivered byte is the
-entity's remembered position. `Shape` survives as the sharing draw and the
-pass's stride.
+**What is left of the old model, and why.** Not `PlaybackIntent`: what
+stands in its place is `Fetching`, two variants and one question --
+`Streaming` or `Download` -- and it decides exactly one number, how far a
+stream reads ahead *before a duration has been stated*
+(`STREAMING_LOOKAHEAD_BYTES`, 4 MiB; `DOWNLOAD_LOOKAHEAD_BYTES`, 256 MiB for
+a fetch no player will ever state one for). That is the first open of a
+session and any file a player can put no length on: there is no
+seconds-to-bytes conversion without a duration, and a constant is the only
+other basis there has ever been. Nothing else asks it -- not what is kept,
+not what is reclaimed, not which reader is the viewer. `Reading` did not
+survive; where the entity is being consumed is `Consumers::at`, from the
+bytes each detected stream has eaten, and an entity's own last delivered
+byte is the fallback under it. `Shape` survives as the sharing draw and the
+pass's stride -- its `window` is no longer a window, which is a misnaming
+recorded in `docs/known-issues.md`.
 
 **Measured, not claimed.** The disk peaks at 71 pieces of a 64-piece budget
 on the torrent -- a stream's own lookahead is never taken, and what the

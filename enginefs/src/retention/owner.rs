@@ -138,8 +138,8 @@
 //!    window that is not deleted under it, and what is fetched is what the
 //!    detector's consumers are asking for.
 //! 7. Test hook.
-//! 8. [`Backing::reclaim`] with a [`Door`] that answers both
-//!    [`Door::window_now`] and [`Door::refuses`] from one reading of L2.
+//! 8. [`Backing::reclaim`] with a [`Door`] that answers [`Door::shut`] from
+//!    the backing and [`Door::refuses`] from the set this pass published.
 //! 9. Conclude under L2: `passed_at` and the windows only if the budget and
 //!    domain are still the ones measured, and `again` decided from the same
 //!    `head` the pass measured from, with the SAME claim handed back to the
@@ -463,11 +463,11 @@ pub trait Backing: Sized + Send + Sync + 'static {
     /// decided from a reading taken before the driver's first entity, and a
     /// viewer can have started this file since. Then again at the [`Door`],
     /// as often as the backing's [`Self::reclaim`] asks it -- once per run
-    /// where that asks through [`Door::windows_now`], once per candidate
-    /// index where it asks through [`Door::refuses`] -- because a player
-    /// can open the file again while its bytes are going, and the run has
-    /// to stop where it is rather than empty the window the new stream is
-    /// already reading. A copy-out read like [`Self::keeps_everything`],
+    /// where that asks through [`Door::shut`], once per candidate index
+    /// where it asks through [`Door::refuses`] -- because a player can open
+    /// the file again while its bytes are going, and the run has to stop
+    /// where it is rather than empty the window the new stream is already
+    /// reading. A copy-out read like [`Self::keeps_everything`],
     /// with no owner lock held, so it is on the path of every unlink the
     /// per-index shape makes.
     ///
@@ -598,12 +598,13 @@ pub trait Backing: Sized + Send + Sync + 'static {
     }
     /// Take `runs` off the disk, asking `door` at the backing's own
     /// granularity **at the instant of each unlink**, and say how many
-    /// pieces went. The torrent asks [`Door::window_now`] before every part
-    /// of every run and cuts the run with `outside`; the proxy asks
-    /// [`Door::refuses`] per chunk inside one blocking closure, so the
-    /// asking and the unlink cannot be separated by a suspension. A closure
-    /// that dies reports what it can vouch for, which is nothing: the
-    /// policy is untouched either way, because it never left its cell.
+    /// pieces went. The torrent asks [`Door::shut`] before every part of
+    /// every run and [`Door::refuses`] per piece, cutting the run where the
+    /// door refuses one; the proxy asks [`Door::refuses`] per chunk inside
+    /// one blocking closure, so the asking and the unlink cannot be
+    /// separated by a suspension. A closure that dies reports what it can
+    /// vouch for, which is nothing: the policy is untouched either way,
+    /// because it never left its cell.
     fn reclaim(
         &self,
         store: &Self::Store,
@@ -701,17 +702,18 @@ struct State<B: Backing> {
     /// and a torrent file's head. Only its own bytes ever reach it -- a
     /// [`Reader`] is on one entity, [`Retention::note_position`] names one
     /// key -- so a file whose reader has gone on to another file keeps the
-    /// head it last had. What a pass measures from once the reader that
-    /// asked has ended, and what [`Door::window_now`] draws the window
-    /// round.
+    /// head it last had. What a pass measures from when the detector is
+    /// silent and the reader that asked has ended: one of the questions
+    /// [`Self::head`] asks, and the last resort under [`Consumers::at`].
     last_position: Option<B::Position>,
     /// How long this entity's film is, where a player has said.
     ///
     /// **A property of the film and not of a report**, which is why it sits
-    /// here rather than on [`Told`] and never goes stale: with the entity's
-    /// own size ([`Backing::bytes`]) it is the bitrate, a film does not
-    /// change length, and a viewer who hands playback to a receiver stops
-    /// reporting a position without the film becoming any shorter.
+    /// here rather than on a position report and never goes stale: with
+    /// the entity's own size ([`Backing::bytes`]) it is the bitrate, a film
+    /// does not change length, and a viewer who hands playback to a
+    /// receiver stops reporting a position without the film becoming any
+    /// shorter.
     ///
     /// It is also the only thing a cast can state. The receiver does the
     /// reading and reports where it is in *seconds*; converting that to a
@@ -1240,30 +1242,17 @@ impl<B: Backing> Retention<B> {
         state.last_position = Some(at);
     }
 
-    /// **The player's own account of where it is**: `at` in the file (its
-    /// demuxer's byte offset), `film` in the picture, and whether it is
-    /// playing rather than paused or stalled.
+    /// **How long the entity's film is**, without saying where anything is
+    /// in it; see [`State::duration`]. What a cast can state.
     ///
-    /// This is the fact every other path here infers, and infers from byte
-    /// ranges that do not carry it. A player asks for the container index
-    /// with the same kind of request it asks for a seek with, and keeps a
-    /// second reader crawling that index while it plays; nothing in a
-    /// `Range` header separates those from the viewer. Told directly, the
-    /// window goes where the film is being watched and the guessing stops
-    /// mattering -- it stays underneath, for a client that says nothing.
-    ///
-    /// It also gives the time caps their number without measuring it:
+    /// It gives the time caps their number without measuring anything:
     /// bytes of file over seconds of film is the bitrate by definition, so
     /// a pause, a stall, a reconnect and a burst are all invisible to it.
-    /// A sample is taken only between two reports that were both playing
-    /// and that moved forwards in both, which is the whole of what makes
-    /// one honest -- a seek moves `film` without playing through it, and
-    /// one end of a pause is not a rate.
+    /// Where the viewer is, nobody states any more -- it is where the reads
+    /// are ([`crate::retention::streams`]).
     ///
     /// L2 only, like [`Self::note_position`]: no turn, no install, and a
     /// key with no entity is nothing to remember.
-    /// **How long the entity's film is**, without saying where anything is
-    /// in it; see [`State::duration`]. What a cast can state.
     pub fn note_duration(&self, key: &B::Key, duration: std::time::Duration) {
         if duration.is_zero() {
             return;
@@ -2037,15 +2026,12 @@ impl<B: Backing> Retention<B> {
             else {
                 return Self::nothing(&state, claim, about, None);
             };
-            // One window per live playhead. The policy answers for one
-            // playhead at a time -- that is what a window is about -- and an
-            // entity two players are inside has two of them. `window_at` and
-            // not a second `advance`: a pass is one decision about what to
-            // give back, and the other readers' windows are inputs to it.
-            // Two heads in one window are one window: a pass about the
-            // entity rather than a reader (the tick, a re-arm from the
-            // turn) counts every reader among the others, including the one
-            // whose byte was the entity's last.
+            // **One list per entity, not one window per playhead.** The
+            // policy used to answer for one playhead at a time and the
+            // pass unioned a window round each reader; what is kept and
+            // fetched is now the run of the file each detected consumer is
+            // moving through, and the policy sizes that rather than placing
+            // it. A pass is still one decision about what to give back.
             //
             // **What to keep and what to fetch are one list now, and it is
             // the detector's.** A window is a promise not to delete and an
@@ -2375,12 +2361,12 @@ impl<B: Backing> Retention<B> {
         Some(entity.state.lock().holding())
     }
 
-    /// How far ahead of `at` the resident policy's window reaches
-    /// ([`RetentionPolicy::ahead_of`]), with the domain it is measured in,
-    /// or `None` when nothing bounds the entity or `at` is not in its
-    /// domain. One L2 reading and no I/O: what a reader about to open is
-    /// sized by, so the pieces it asks the backend to fetch ahead are pieces
-    /// the next pass will keep.
+    /// How far ahead of `at` the window this position is in reaches, with
+    /// the domain it is measured in, or `None` when nothing bounds the
+    /// entity, `at` is not in its domain, or no window of the last pass
+    /// reaches past it. One L2 reading and no I/O: what a reader about to
+    /// open is sized by, so the pieces it asks the backend to fetch ahead
+    /// are pieces the next pass will keep.
     pub fn reach(&self, key: &B::Key, at: B::Position) -> Option<(B::Domain, Range<u32>)> {
         let entity = self.lookup(key)?;
         let state = entity.state.lock();
@@ -3654,7 +3640,7 @@ mod tests {
     }
 
     /// **A pin taken between two runs of one reclaim stops the second
-    /// run**: `window_now` answers `None` and the run is never asked
+    /// run**: [`Door::shut`] answers `true` and the run is never asked
     /// about.
     #[tokio::test]
     async fn a_pin_taken_between_the_runs_of_a_reclaim_stops_it_before_the_second() {
@@ -5113,8 +5099,8 @@ mod tests {
 
     /// **A byte in file B between two runs of file A's reclaim leaves A's
     /// pass concluding normally on A's own head**: the byte is B's, A's
-    /// head is where it was, `window_now` still answers A's window, and the
-    /// second run is asked about and taken.
+    /// head is where it was, A's door still refuses exactly what A's pass
+    /// published, and the second run is asked about and taken.
     #[tokio::test]
     async fn a_byte_in_another_file_between_the_runs_of_a_reclaim_leaves_it_running() {
         let (backing, owner, _budget) = torrent();
@@ -5149,11 +5135,12 @@ mod tests {
         );
     }
 
-    /// **Two readers on one entity each have a window at the door of the
-    /// torrent's shape.** The entity's head is the last byte either
-    /// delivered, and `windows_now` answers the window round it and the one
-    /// round every other open reader's current playhead, from one reading;
-    /// a reader that has ended is not among them, and its window goes.
+    /// **Two readers on one entity are both covered by what the door
+    /// refuses.** The entity's head is the last byte either delivered, and
+    /// what the door refuses is the set the pass published, which covers
+    /// what every consumer of the entity is being fetched for; it stands
+    /// for the length of the pass, so a reader that ends mid-reclaim does
+    /// not open its region up.
     #[tokio::test]
     async fn the_torrents_door_answers_a_window_per_open_reader() {
         let (backing, owner, _budget) = torrent();

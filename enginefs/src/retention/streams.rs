@@ -1,26 +1,26 @@
 //! **What is reading this file, worked out from the reads themselves.**
 //!
-//! The retention layer decides what to keep and what to fetch from a
-//! *classification*: [`Reading`] from a [`Fetching`], derived by
-//! `playback_intent_for_request` from a priority header, two download flags
-//! and the geometry of a `Range`. A player states none of that. It sends a
-//! byte range, and every field failure this module exists to end has been
-//! that derivation guessing wrong -- a live second track labelled container
-//! metadata and starved for twenty seconds while seventeen seeders were
-//! connected, a read fifteen megabytes inside `mdat` taken for the
-//! container index.
+//! The retention layer used to decide what to keep and what to fetch from a
+//! *classification*: a `Reading` of `Playback` or `Probe`, derived from a
+//! `PlaybackIntent`, derived in turn from a priority header, two download
+//! flags and the geometry of a `Range`. A player states none of that. It
+//! sends a byte range, and every field failure this module exists to end
+//! was that derivation guessing wrong -- a live second track labelled
+//! container metadata and starved for twenty seconds while seventeen
+//! seeders were connected, a read fifteen megabytes inside `mdat` taken for
+//! the container index.
 //!
 //! Nothing here asks what a read means. It watches where reads go.
 //!
-//! **Phase A: this module is observed and never obeyed.** Nothing reads a
-//! [`Stream`] to decide anything; the one consumer is a trace line, and the
-//! question it exists to answer is whether the join rule below sees two
-//! streams on a film with two tracks, or twenty-two -- one per HTTP
-//! reopen -- or one, having merged the tracks. See
-//! `docs/read-pattern-retention.md`, which this implements and which says
-//! what the later phases do with the answer.
+//! **This is what a pass obeys.** What an entity's consumers are fetched
+//! for ([`Streams::want`]), what no unlink may touch ([`Streams::exempt`]),
+//! what is given back first ([`Streams::coldest_of`]) and which of a file's
+//! readers is the viewer ([`Streams::busiest`]) are all answered from here,
+//! through `Backing::reading` on both backings. The only thing [`Fetching`]
+//! is still asked is how far a stream reads ahead before a duration has
+//! been stated. See `docs/read-pattern-retention.md`, which this
+//! implements.
 //!
-//! [`Reading`]: super::owner::Reading
 //! [`Fetching`]: crate::backend::priorities::Fetching
 
 use std::collections::{BTreeSet, HashMap};
@@ -729,8 +729,8 @@ impl Streams {
     /// Empty until something is published into it, which is the right
     /// answer for a file no stream is on.
     ///
-    /// **Phase A**: the set is published and traced, and no door reads it
-    /// yet. See [`super::exempt::Exempt::holds`].
+    /// Published under the owner's lock and read at the door with a load
+    /// and a bit test. See [`super::exempt::Exempt::holds`].
     pub fn exempt(&mut self, file: usize, pieces: u32) -> std::sync::Arc<super::exempt::Exempt> {
         self.by_file
             .entry(file)

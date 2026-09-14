@@ -12,22 +12,14 @@ through flutter_rust_bridge.
 
 ## Redundant
 
-### Dead modules
+### Dead modules -- deleted
 
-1,332 lines across four modules, each referenced only by its own `pub mod`
-line. They are `pub`, which is why `-D warnings` never caught them. They
-carry 13 tests between them, all exercising code nothing runs.
-
-| Module | Lines | What it was |
-| --- | --- | --- |
-| `enginefs/src/backend/metadata.rs` | 987 | `MetadataInspector`, `ContainerType`, `KeyframeInfo` |
-| `enginefs/src/piece_waiter.rs` | 126 | superseded by `files.rs`'s blocked-read path |
-| `enginefs/src/metadata_cache.rs` | 117 | |
-| `enginefs/src/metadata_pins.rs` | 102 | pinned the Cues/`moov` pieces a tail-seek request located |
-
-The last two are the design deleted in `fbb8d79`: inspect the container,
-guess where its index is, treat those pieces specially. The read-pattern
-detector answers that from behaviour instead.
+The four modules this list carried -- 1,332 lines, each reachable only
+through its own `pub mod` line, and `pub`, which is why `-D warnings` never
+caught them -- are gone, with the 13 tests that exercised code nothing ran.
+Two of them were the last of the design dropped in `fbb8d79`: inspect the
+container, guess where its index is, treat those pieces specially. The
+read-pattern detector answers that from behaviour instead.
 
 ### Smaller
 
@@ -44,25 +36,39 @@ detector answers that from behaviour instead.
 
 ## Stale docs
 
-* Intra-doc links to deleted items: `Door::windows_now`
-  (`retention/trace.rs`, `engine.rs` x2), `RetentionPolicy::ahead_of`
-  (`piece_store/policy.rs`, `engine.rs`), `Retention::note_playhead_at`
-  (`retention/scenarios.rs`).
-* `README.md:313` gives a playing stream's lookahead as
-  `128 MiB (MAX_SEEK_HOT_WINDOW_BYTES)`. It is the film's bitrate times the
-  profile's seconds, with a 4 MiB fallback before a duration is stated.
-* `AGENTS.md:23` lists `note_playhead` among `ServerHandle`'s methods. It
-  was deleted with the told playhead.
-* `docs/read-pattern-retention.md` section "what to delete" still lists
-  `PlaybackIntent`, `playback_intent_for_request`,
-  `is_container_metadata_request`, `Door::windows_now` and `window_at` as
-  pending; they are gone. "What is left of the old model: `PlaybackIntent`
-  survives as ..." is false.
-* `enginefs/src/piece_store/pin_record.rs:20` names "the standalone binary"
-  as a caller that gets `PinsUnknown`. There is no standalone binary. The
-  mechanism itself is live and correct, and xtremio does hand in a pin set
-  (`pins_applied applied=0` in the field log), so the never-reclaims
-  condition does not arise in the only embedder there is.
+**Fixed on 2026-09-14.** The five entries this list carried -- the intra-doc
+links to `Door::windows_now`, `RetentionPolicy::ahead_of` and
+`Retention::note_playhead_at`; `README.md`'s buffer-profile table;
+`AGENTS.md:23`'s `note_playhead`; this design document's "what to delete"
+and "what is left of the old model"; and `pin_record.rs`'s standalone
+binary -- were all rewritten against the code as it stands.
+
+Found while fixing them, and fixed with them: the doc block of a deleted
+method left sitting over the method after it
+(`ServerHandle::note_duration`, `Retention::note_duration` -- both were
+carrying the told playhead's documentation, including a link to a deleted
+`EngineFS::on_playhead`); the broken links `Door::window_now`, `Told` and
+`streams::Reading`; and the "observed, never obeyed" headers on
+`retention::streams`, `retention::exempt` and `retention::ledger`, each of
+which a pass now obeys.
+
+Still stale:
+
+* `AGENTS.md` describes the retention policy as a rolling window "90%
+  ahead, 10% behind" (three places on the `enginefs`/proxy rows) and the
+  driver as "fed the playhead a reader actually reached". What is kept is
+  now the forward run each detected consumer is being fetched into, plus
+  what an open read was promised; what is behind a consumer survives as the
+  coldest thing on the disk rather than as a tenth of a window. The README's
+  two statements of the same thing were corrected; `AGENTS.md`'s were left
+  for a pass over that file.
+* The **Phase A** label on the detector's plumbing -- `owner.rs`,
+  `engine.rs`, `files.rs`, `proxy_retention.rs` and `proxy_cache.rs`, about
+  a dozen places -- reads as "carried for a trace line, obeyed by nothing".
+  It is load-bearing now. One sweep, when the trace module goes.
+* `retention::streams::REPORTED_SECONDS` is unused: its own doc says it goes
+  when the want set is wired to the policy with the real number, which has
+  happened. A deletion rather than a doc fix.
 * `enginefs/src/retention/scenario.rs`'s `CONTAINER_METADATA_LOOKAHEAD` and
   `PLAYBACK_LOOKAHEAD` keep the field's numbers under the names of
   constants that no longer exist. Deliberate -- a scenario should stay the

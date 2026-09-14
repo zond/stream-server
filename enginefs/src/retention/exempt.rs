@@ -1,12 +1,13 @@
 //! **What may not be unlinked, answerable without taking a lock.**
 //!
-//! The door is asked once per run-part on the torrent and once per
+//! The door is asked once per candidate piece on the torrent and once per
 //! candidate chunk on the proxy, from a blocking thread, at the instant of
-//! every unlink. Today each of those asks takes the entity's state lock and
-//! walks its readers. That was affordable while the answer was one piece of
-//! arithmetic over one window; it is not affordable as a walk of a stream
-//! table, and a lock taken per chunk on a blocking thread is a contention
-//! point on the path that is already the slowest thing a pass does.
+//! every unlink. Each of those asks used to take the entity's state lock
+//! and walk its readers. That was affordable while the answer was one piece
+//! of arithmetic over one window; it is not affordable as a walk of a
+//! stream table, and a lock taken per chunk on a blocking thread is a
+//! contention point on the path that is already the slowest thing a pass
+//! does.
 //!
 //! So the answer is published instead: one bit per piece, written only by
 //! the owner and only under its own lock, read by the door with a load and
@@ -18,10 +19,6 @@
 //! module's own owner has spent four review rounds finding in other places.
 //! The door refuses or does not refuse, and the owner alone decides what
 //! the bits say.
-//!
-//! **Phase A: written and reported, never consulted.** The door still takes
-//! its lock; this is populated beside it so a field log says how much of an
-//! entity the new policy would be holding, before anything depends on it.
 
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -53,11 +50,8 @@ impl Exempt {
     ///
     ///
     /// One load and a mask, `Acquire` against the owner's `Release`. This
-    /// is the whole of what the door will do on the unlink path.
-    ///
-    /// **Phase A**: no door calls it yet, which is the point -- the set is
-    /// published and reported for a field log before any unlink depends on
-    /// it.
+    /// is the whole of what the door does on the unlink path
+    /// ([`super::owner::Door::refuses`]).
     pub fn holds(&self, piece: u32) -> bool {
         if piece >= self.pieces {
             return false;
