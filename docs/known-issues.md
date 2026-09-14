@@ -218,3 +218,16 @@ whose job was partly to say "not real" or "leave it". Three did.
   build at all (`librqbit-dualstack-sockets` `bind_device`).
 * xtremio's remove/add race when a title is re-added while being removed,
   and `remove()` never releasing a row's replaces debt.
+
+## Found 2026-09-15, not yet fixed
+
+- **The detector joins a read to a stream by held run alone.** A read
+  whose first piece is in the same run of held pieces as a stream's end
+  is that stream's, however far apart the two are; the `SAME_CONSUMER`
+  bound the comment in `FileStreams::observe` describes was never
+  written. On a fully held file (a rewatch, a film that fits the cache)
+  mpv's index crawl at the tail is folded into the viewer's stream, the
+  window is drawn at the tail and the head reads there. The field's disk
+  keeps the two apart because the pieces between are not held. See
+  `docs/review-2026-09-14.md` N1.
+
