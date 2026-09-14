@@ -4450,6 +4450,61 @@ fn head_on_the_torrent_left(budget: std::time::Duration) -> anyhow::Result<Optio
 /// A volume cannot be filled on demand, so the reading is declared through
 /// `pretend_available_space`, keyed by this test's own cache root so no
 /// other server in the run sees it.
+/// **A television with room above its own floor gets its stream.** The
+/// floor is a share of the volume (`enginefs::free_space_floor`), and every
+/// reader of it -- the route's gate and the reconciler the same request then
+/// runs -- takes the same one, or the gate admits what the ladder stops.
+#[test]
+fn a_television_above_its_own_floor_streams() -> anyhow::Result<()> {
+    const MIB: u64 = 1024 * 1024;
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    let (handle, base, _info_hash, _idx, _payload) =
+        lan_media_server(config_dir.path(), cache_dir.path(), src.path(), None)?;
+    let cache_root = resolved(&cache_dir.path().join("cache"));
+    let client = bearer_client(&handle)?;
+    let anonymous = reqwest::blocking::Client::new();
+
+    // A torrent that wants every byte it has, on a 4 GB volume with 300 MiB
+    // free: under the phone's 512 MB, over the 128 MB its own size allows.
+    let wanting = src.path().join("Wanted");
+    std::fs::create_dir_all(&wanting)?;
+    write_payload(&wanting.join("wanted.bin"), 64 * 1024);
+    let (wanting_torrent, wanting_hash) = real_torrent(&wanting);
+    client
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": hex::encode(&wanting_torrent) }))
+        .send()?
+        .error_for_status()?;
+    let wanting_stats = stats_after_check(&client, &base, &wanting_hash)?;
+    let wanting_idx = file_index(&wanting_stats, "wanted.bin");
+    enginefs::pretend_volume_total(&cache_root, 4 * 1024 * MIB);
+    enginefs::pretend_volume_space(&cache_root, 300 * MIB);
+    stream_server::pretend_available_space(&cache_root, 300 * MIB);
+
+    let response = anonymous
+        .get(format!("{base}/{wanting_hash}/{wanting_idx}"))
+        .header(reqwest::header::RANGE, "bytes=0-1023")
+        .timeout(std::time::Duration::from_secs(2))
+        .send();
+    match response {
+        Ok(response) => assert_ne!(
+            response.status(),
+            reqwest::StatusCode::INSUFFICIENT_STORAGE,
+            "300 MiB free on a 4 GB volume is room above its floor, and the \
+             stream was refused for space"
+        ),
+        // No peer brings these bytes, so a request that got past the floor
+        // waits until this client gives up -- the proof it was not refused.
+        Err(error) => assert!(error.is_timeout(), "{error}"),
+    }
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
 #[test]
 fn a_stream_below_the_free_space_floor_is_refused_not_degraded() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;

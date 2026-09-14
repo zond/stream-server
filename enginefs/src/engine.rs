@@ -1438,7 +1438,11 @@ impl<H: TorrentHandle> Engine<H> {
         let run_state = self.handle.run_state();
         matches!(run_state, crate::backend::RunState::Paused)
             && crate::reconcile::volume_is_short(
-                crate::reconcile::line(crate::reconcile::Trigger::Timer, run_state),
+                crate::reconcile::line(
+                    crate::reconcile::Trigger::Timer,
+                    run_state,
+                    self.volumes.floor(),
+                ),
                 self.handle.has_metadata().await,
                 self.handle.is_finished().await,
                 self.volumes.available(),
@@ -1462,8 +1466,8 @@ impl<H: TorrentHandle> Engine<H> {
     /// byte. Not the backend's output folder, which is a name with no
     /// payload under it.
     ///
-    /// **At [`crate::CACHE_FREE_SPACE_FLOOR`], not at the reconciler's
-    /// hysteresis line.** What reads this is a client's statistics
+    /// **At the volume's floor ([`crate::reconcile::Volumes::floor`]), not
+    /// at the reconciler's hysteresis line.** What reads this is a client's statistics
     /// (`phase: error`, [`STOPPED_FOR_SPACE_MESSAGE`]) and the stream
     /// route's disk gate, and both are asking about the *device*, which the
     /// rest of this server judges at the floor: it is what
@@ -1493,7 +1497,7 @@ impl<H: TorrentHandle> Engine<H> {
         let run_state = self.handle.run_state();
         matches!(run_state, crate::backend::RunState::Paused)
             && crate::reconcile::volume_is_short(
-                crate::CACHE_FREE_SPACE_FLOOR,
+                self.volumes.floor(),
                 self.handle.has_metadata().await,
                 self.handle.is_finished().await,
                 self.volumes.available(),

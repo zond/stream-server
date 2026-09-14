@@ -41,13 +41,19 @@ use crate::backend::{
 const INACTIVE_TORRENT_REMOVE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
 /// Free space the cache is kept out of on the volume the torrents write to.
 ///
-/// One number, three readers, and it is one number so they cannot drift:
-/// the server's stream route refuses to start a stream that would write to
-/// disk with less than this free; the published cap keeps the cache out of
-/// it (`cache_budget::cap_to_publish`); and the engine's reconciler stops a
-/// torrent that is writing when the volume falls under it
-/// ([`reconcile::desired`]'s free-space arm). The third is what makes the
-/// other two hold. librqbit's storage writes the whole file it wants and
+/// **The most it is ever set to.** The floor a device is actually held to
+/// is [`free_space_floor`] of that device's size, read beside its free
+/// space and carried with the reading ([`reconcile::Volumes::floor`]), and
+/// every reader takes it from there: the server's stream route refuses to
+/// start a stream that would write to disk with less than it free; the
+/// published cap keeps the cache out of it (`cache_budget::cap_to_publish`);
+/// and the engine's reconciler stops a torrent that is writing when the
+/// volume falls under it ([`reconcile::desired`]'s free-space arm). The
+/// third is what makes the other two hold -- and the three moving together
+/// is what a 4 GB television proved matters: for an afternoon the gate
+/// admitted at 128 MB while the ladder still stopped at 512 MB, so the same
+/// request that passed the gate stopped its own torrent before the first
+/// byte. librqbit's storage writes the whole file it wants and
 /// stops only at ENOSPC, which it treats as a fatal torrent error -- so
 /// without the reconciler a torrent larger than the free space ran the
 /// volume to zero in 40 s at full speed on the television that prompted
@@ -103,12 +109,16 @@ pub fn free_space_floor(total: Option<u64>) -> u64 {
 
 /// The volume's size in bytes, or `None` where it will not say.
 ///
-/// Read beside every reading of its free space, from the same `statvfs`
-/// the free space comes from, because [`free_space_floor`] needs both and
-/// two readings taken apart could size the floor against a volume the
-/// available space is not on.
+/// Read beside every reading of its free space, because
+/// [`free_space_floor`] needs both. It is a second `statvfs` and not the
+/// same one, which is fine for the size -- it does not move between two
+/// calls the way the free space can -- and wrong for nothing else: a size
+/// and a free space taken a microsecond apart are still one device's.
+///
+/// A test declares a size with [`pretend_volume_total`], the way
+/// [`pretend_volume_space`] declares the free space.
 pub fn volume_total(path: &std::path::Path) -> Option<u64> {
-    fs4::total_space(path).ok()
+    declared_volume_total(path).or_else(|| fs4::total_space(path).ok())
 }
 /// How often the reconciler reads the volume. One `statvfs` per tick, since
 /// there is one volume -- the piece store's -- microseconds, so it can
@@ -331,6 +341,31 @@ pub fn pretend_volume_space(root: impl Into<std::path::PathBuf>, bytes: u64) {
         .lock();
     declared.retain(|(declared, _)| *declared != root);
     declared.push((root, bytes));
+}
+
+/// Sizes a test has declared for a root and everything under it -- the
+/// second half of [`pretend_volume_space`], for [`free_space_floor`].
+static DECLARED_VOLUME_TOTAL: std::sync::OnceLock<DeclaredVolumeSpace> = std::sync::OnceLock::new();
+
+/// Declare how big the volume under `root` is, for every [`volume_total`]
+/// of a path below it from now on. A test seam only, like
+/// [`pretend_volume_space`]: it is what lets a test be a 4 GB television.
+#[doc(hidden)]
+pub fn pretend_volume_total(root: impl Into<std::path::PathBuf>, bytes: u64) {
+    let root = root.into();
+    let mut declared = DECLARED_VOLUME_TOTAL
+        .get_or_init(|| parking_lot::Mutex::new(Vec::new()))
+        .lock();
+    declared.retain(|(declared, _)| *declared != root);
+    declared.push((root, bytes));
+}
+
+fn declared_volume_total(path: &std::path::Path) -> Option<u64> {
+    let declared = DECLARED_VOLUME_TOTAL.get()?.lock();
+    declared
+        .iter()
+        .find(|(root, _)| path.starts_with(root))
+        .map(|(_, bytes)| *bytes)
 }
 
 /// What [`pretend_volume_space`] declared for `path`, if anything.
@@ -1529,6 +1564,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             has_metadata: engine.handle.has_metadata().await,
             finished: engine.handle.is_finished().await,
             available: self.volumes.available(),
+            floor: self.volumes.floor(),
             // One lock read of the state librqbit already holds, like the
             // run state beside it. Only the `Error` arm reads it, and only
             // the error state can make it true.
@@ -1664,7 +1700,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             tracing::warn!(
                 info_hash = %engine.info_hash,
                 available = ?conditions.available,
-                floor = CACHE_FREE_SPACE_FLOOR,
+                floor = conditions.floor,
                 pinned = conditions.pinned,
                 "torrent_stopped_for_space"
             );
@@ -1879,10 +1915,21 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 None
             }
         };
-        if available.is_some_and(|available| available < crate::reconcile::resume_line()) {
+        // The volume's size, from beside the free space: it sizes the floor
+        // the reading is judged against. Walked up like the probe, since the
+        // folder may not exist yet, and off the worker for the same reason.
+        let total = {
+            let folder = folder.to_path_buf();
+            tokio::task::spawn_blocking(move || folder.ancestors().find_map(crate::volume_total))
+                .await
+                .ok()
+                .flatten()
+        };
+        let floor = crate::free_space_floor(total);
+        if available.is_some_and(|available| available < crate::reconcile::resume_line(floor)) {
             self.slack_bell.ring();
         }
-        self.volumes.record(available, now);
+        self.volumes.record(available, total, now);
     }
 
     /// The free space of the volume under `folder` (or its nearest existing
@@ -7642,6 +7689,38 @@ mod tests {
     /// no such record any more, and while there was one, every test in this
     /// area asserted on it and so none of them could see a stop that did
     /// not happen.
+    /// **Every reader of the floor moves with the volume, or none may.**
+    /// The stream route and the published cap were sized to the volume in
+    /// `44796b7`; the reconciler was not, so on the 4 GB television the
+    /// commit was for, the request the gate admitted at 128 MB stopped its
+    /// own torrent at 512 MB before the first byte went out. The floor is
+    /// read from the same probe as the free space now, and the ladder, the
+    /// statistics and the gate all ask the reading for it.
+    #[tokio::test(start_paused = true)]
+    async fn a_television_above_its_own_floor_is_not_stopped_at_the_phones() {
+        const MIB: u64 = 1024 * 1024;
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(422 * MIB));
+        pretend_volume_total(enginefs.volumes.data_folder(), 4 * 1024 * MIB);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+
+        enginefs.reconcile_tick().await;
+        enginefs.reconcile_tick().await;
+        assert_eq!(
+            enginefs.volumes.floor(),
+            CACHE_FREE_SPACE_FLOOR_MIN,
+            "the reading carries the floor its volume's size allows"
+        );
+        assert_eq!(
+            run_state_of(&enginefs, TEST_HASH).await,
+            RunState::Live,
+            "422 MB free on a 4 GB volume is room, and the ladder stopped the torrent anyway"
+        );
+        assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), 0);
+        assert!(!engine.is_stopped_for_space().await);
+        assert!(!engine.held_stopped_for_space().await);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_writing_torrent_is_stopped_under_the_floor_and_started_over_the_margin() {
         let (mut enginefs, counters) = test_enginefs_for_reconciler(1);

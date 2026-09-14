@@ -24,7 +24,9 @@
 //! stopped, I meant it".
 
 use crate::backend::RunState;
-use crate::{CACHE_FREE_SPACE_FLOOR, FREE_SPACE_RESUME_MARGIN, FREE_SPACE_WATCH_INTERVAL};
+use crate::{
+    CACHE_FREE_SPACE_FLOOR, FREE_SPACE_RESUME_MARGIN, FREE_SPACE_WATCH_INTERVAL, free_space_floor,
+};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -153,6 +155,13 @@ pub struct Conditions {
     /// Free bytes on the volume the torrent writes to, or `None` when the
     /// probe failed. `None` is "unknown", never "full".
     pub available: Option<u64>,
+    /// The free space to keep on that volume, sized to it
+    /// ([`crate::free_space_floor`]) and read beside `available` -- the two
+    /// are one reading of one device ([`Volumes::record`]). Carried rather
+    /// than looked up so the ladder measures against the floor the reading
+    /// was taken under, not one recomputed from a volume it may since have
+    /// left.
+    pub floor: u64,
 }
 
 /// Whether this torrent should be running, from the conditions alone.
@@ -269,7 +278,7 @@ pub fn verdict(conditions: &Conditions, trigger: Trigger) -> Verdict {
         RunState::Error if conditions.settled => {
             let has_room = conditions
                 .available
-                .is_some_and(|available| available >= resume_line());
+                .is_some_and(|available| available >= resume_line(conditions.floor));
             return arm(
                 if conditions.out_of_space && has_room && (conditions.playing || conditions.pinned)
                 {
@@ -288,7 +297,7 @@ pub fn verdict(conditions: &Conditions, trigger: Trigger) -> Verdict {
         return arm(Decision::Run);
     }
     if volume_is_short(
-        line(trigger, conditions.run_state),
+        line(trigger, conditions.run_state, conditions.floor),
         conditions.has_metadata,
         conditions.finished,
         conditions.available,
@@ -382,12 +391,17 @@ pub fn volume_is_short(
 /// on a volume that has room above the floor is owed their stream.
 ///
 /// It is the ladder's alone. A reader that is not deciding whether to make
-/// a start/stop call wants [`CACHE_FREE_SPACE_FLOOR`] -- see
-/// [`volume_is_short`].
-pub(crate) fn line(trigger: Trigger, observed: RunState) -> u64 {
+/// a start/stop call wants the floor itself -- see [`volume_is_short`].
+///
+/// `floor` is the volume's own ([`Volumes::floor`]): the constant was one
+/// number for every device until a 4 GB television made it more than the
+/// device had free, and every reader of it has to move together or the
+/// stream route admits what the ladder then stops (see
+/// [`crate::free_space_floor`]).
+pub(crate) fn line(trigger: Trigger, observed: RunState, floor: u64) -> u64 {
     match (trigger, observed) {
-        (Trigger::PlaybackStart, _) | (_, RunState::Live) => CACHE_FREE_SPACE_FLOOR,
-        _ => resume_line(),
+        (Trigger::PlaybackStart, _) | (_, RunState::Live) => floor,
+        _ => resume_line(floor),
     }
 }
 
@@ -428,11 +442,15 @@ pub struct Volumes {
     reading: parking_lot::Mutex<Reading>,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct Reading {
     /// Free bytes at the last probe, or `None` when that probe failed.
     /// `None` is "unknown" everywhere, never "full".
     available: Option<u64>,
+    /// The floor the volume is held to, from the same probe:
+    /// [`crate::free_space_floor`] of the volume's size. The constant until
+    /// the first probe, and for a volume that will not say its size.
+    floor: u64,
     /// The clock reading when this volume was first seen with less than
     /// [`CACHE_FREE_SPACE_FLOOR`] + [`FREE_SPACE_RESUME_MARGIN`] free.
     ///
@@ -443,12 +461,31 @@ struct Reading {
     short_since: Option<u64>,
 }
 
+impl Default for Reading {
+    fn default() -> Self {
+        Self {
+            available: None,
+            floor: CACHE_FREE_SPACE_FLOOR,
+            short_since: None,
+        }
+    }
+}
+
 impl Volumes {
     pub(crate) fn new(data_folder: std::path::PathBuf) -> Self {
         Self {
             data_folder,
             reading: Default::default(),
         }
+    }
+
+    /// The free space this volume is held to: [`crate::free_space_floor`]
+    /// of its size at the last probe. Every reader that asks "is this
+    /// device short?" -- the ladder, the statistics, the stream route's
+    /// gate -- takes its floor from here, so they cannot disagree about
+    /// one device.
+    pub fn floor(&self) -> u64 {
+        self.reading.lock().floor
     }
 
     /// The folder whose free space decides whether any torrent in this
@@ -465,11 +502,17 @@ impl Volumes {
     /// that it cleared, and starting or clearing the stall clock on a
     /// `statvfs` that stopped answering would fail a player's reads because
     /// of a broken environment rather than because of a full disk.
-    pub(crate) fn record(&self, available: Option<u64>, now_secs: u64) {
+    ///
+    /// `total` is the volume's size from the same probe, or `None` where it
+    /// would not say; it sizes the floor the reading is judged against. A
+    /// volume that will not say its size is held to the whole constant --
+    /// a failed reading is not a licence to cut the margin.
+    pub(crate) fn record(&self, available: Option<u64>, total: Option<u64>, now_secs: u64) {
         let mut reading = self.reading.lock();
         reading.available = available;
+        reading.floor = free_space_floor(total);
         match available {
-            Some(available) if available < resume_line() => {
+            Some(available) if available < resume_line(reading.floor) => {
                 reading.short_since.get_or_insert(now_secs);
             }
             Some(_) => reading.short_since = None,
@@ -505,8 +548,8 @@ impl Volumes {
 /// bell is rung under ([`crate::retention::SlackBell`]), so that the slack
 /// is given back while the volume is still inside the band rather than
 /// once it is under the floor.
-pub(crate) fn resume_line() -> u64 {
-    CACHE_FREE_SPACE_FLOOR.saturating_add(FREE_SPACE_RESUME_MARGIN)
+pub(crate) fn resume_line(floor: u64) -> u64 {
+    floor.saturating_add(FREE_SPACE_RESUME_MARGIN)
 }
 
 /// One lock per info hash, so that reconciling one torrent never queues
@@ -679,33 +722,38 @@ mod tests {
         assert_eq!(volumes.short_for(100), None);
 
         // Room: no clock at all.
-        volumes.record(Some(u64::MAX), 100);
+        volumes.record(Some(u64::MAX), None, 100);
         assert_eq!(volumes.available(), Some(u64::MAX));
         assert_eq!(volumes.short_for(200), None);
 
         // Short: the clock starts, and a later short reading does not
         // restart it.
-        volumes.record(Some(CACHE_FREE_SPACE_FLOOR - 1), 200);
-        volumes.record(Some(0), 210);
+        volumes.record(Some(CACHE_FREE_SPACE_FLOOR - 1), None, 200);
+        volumes.record(Some(0), None, 210);
         assert_eq!(volumes.short_for(230), Some(Duration::from_secs(30)));
 
         // Over the floor but inside the resume margin: still short.
         volumes.record(
             Some(CACHE_FREE_SPACE_FLOOR + FREE_SPACE_RESUME_MARGIN - 1),
+            None,
             240,
         );
         assert_eq!(volumes.short_for(240), Some(Duration::from_secs(40)));
 
         // A probe that failed leaves the clock exactly as it was, and the
         // reading unknown.
-        volumes.record(None, 250);
+        volumes.record(None, None, 250);
         assert_eq!(volumes.short_for(250), Some(Duration::from_secs(50)));
         assert_eq!(volumes.available(), None);
 
         // Cleared: the clock stops, and going short again starts a new one.
-        volumes.record(Some(CACHE_FREE_SPACE_FLOOR + FREE_SPACE_RESUME_MARGIN), 260);
+        volumes.record(
+            Some(CACHE_FREE_SPACE_FLOOR + FREE_SPACE_RESUME_MARGIN),
+            None,
+            260,
+        );
         assert_eq!(volumes.short_for(260), None);
-        volumes.record(Some(0), 300);
+        volumes.record(Some(0), None, 300);
         assert_eq!(volumes.short_for(310), Some(Duration::from_secs(10)));
 
         // The folder it is a reading of is the one the session's storage
@@ -730,8 +778,41 @@ mod tests {
             has_metadata: true,
             finished: false,
             available: Some(u64::MAX),
+            floor: CACHE_FREE_SPACE_FLOOR,
             out_of_space: false,
         }
+    }
+
+    /// **The ladder measures against the volume's own floor, not the
+    /// constant.** A 4 GB television with 422 MB free is under the 512 MB
+    /// the constant names and over the 128 MB its own size allows; for an
+    /// afternoon the stream route admitted such a request and the ladder,
+    /// still on the constant, stopped the torrent it had just started.
+    #[test]
+    fn the_ladder_measures_against_the_volumes_own_floor() {
+        const MIB: u64 = 1024 * 1024;
+        let television = Conditions {
+            available: Some(422 * MIB),
+            floor: free_space_floor(Some(4 * 1024 * MIB)),
+            ..healthy()
+        };
+        assert_eq!(television.floor, crate::CACHE_FREE_SPACE_FLOOR_MIN);
+        let on_the_timer = verdict(&television, Trigger::Timer);
+        assert!(
+            !on_the_timer.for_space,
+            "a volume above its own floor was stopped for space: {on_the_timer:?}"
+        );
+        assert!(
+            !verdict(&television, Trigger::PlaybackStart).for_space,
+            "and a playback starting on it is not refused either"
+        );
+
+        // The same free space under the phone's floor is short, as it was.
+        let phone = Conditions {
+            floor: CACHE_FREE_SPACE_FLOOR,
+            ..television
+        };
+        assert!(verdict(&phone, Trigger::Timer).for_space);
     }
 
     /// The ladder's own bottom, and the arm that replaced the idle one: a

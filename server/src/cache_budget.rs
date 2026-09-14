@@ -94,6 +94,7 @@ use crate::state::AppState;
 /// (`enginefs::PIN_FREE_SPACE_MARGIN`, 500 MiB, checked once when a pin is
 /// accepted), so a pin can settle the volume below this line by design; the
 /// reconciler stops it there like any other writer.
+#[cfg(test)]
 pub(crate) use enginefs::CACHE_FREE_SPACE_FLOOR;
 
 /// What caps the cache on one run: what the operator configured and what the
@@ -691,6 +692,29 @@ mod tests {
         assert_eq!(
             configured_too_high.effective(3 * gib),
             television.effective(3 * gib)
+        );
+    }
+
+    /// **The cap subtracts the floor it was handed, not the constant.** On a
+    /// 4 GB television with 422 MiB free the difference is the whole cache:
+    /// 294 MiB of room against none.
+    #[test]
+    fn the_cap_keeps_the_volumes_own_floor_free() {
+        const MIB: u64 = 1024 * 1024;
+        let television = CacheLimit {
+            configured: u64::MAX,
+            available: Some(422 * MIB),
+            floor: enginefs::CACHE_FREE_SPACE_FLOOR_MIN,
+        };
+        assert_eq!(television.effective(0), Some(422 * MIB - 128 * MIB));
+        let phone = CacheLimit {
+            floor: CACHE_FREE_SPACE_FLOOR,
+            ..television
+        };
+        assert_eq!(
+            phone.effective(0),
+            Some(0),
+            "under the constant there is no room at all"
         );
     }
 

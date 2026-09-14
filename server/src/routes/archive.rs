@@ -210,11 +210,14 @@ where
     async fn reread(&mut self) {
         let probe = self.probe.clone();
         let dir = self.dir.clone();
-        self.room = tokio::task::spawn_blocking(move || probe(&dir))
-            .await
-            .ok()
-            .flatten()
-            .map(|available| available.saturating_sub(crate::cache_budget::CACHE_FREE_SPACE_FLOOR));
+        self.room = tokio::task::spawn_blocking(move || {
+            // The floor is the volume's own, read beside its free space.
+            let floor = enginefs::free_space_floor(enginefs::volume_total(&dir));
+            probe(&dir).map(|available| available.saturating_sub(floor))
+        })
+        .await
+        .ok()
+        .flatten();
         self.written_since = 0;
     }
 

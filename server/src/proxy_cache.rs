@@ -303,6 +303,9 @@ pub(crate) struct VolumeFloor {
 struct FloorReading {
     at: std::time::Instant,
     available: Option<u64>,
+    /// The floor the volume is held to, sized to it from the same reading
+    /// (`enginefs::free_space_floor`).
+    floor: u64,
     /// Bytes let through since the reading was taken.
     written: u64,
 }
@@ -334,6 +337,7 @@ impl VolumeFloor {
             *reading = Some(FloorReading {
                 at: std::time::Instant::now(),
                 available: (self.probe)(&self.root),
+                floor: enginefs::free_space_floor(enginefs::volume_total(&self.root)),
                 written: 0,
             });
         }
@@ -344,7 +348,7 @@ impl VolumeFloor {
         let after = available
             .saturating_sub(reading.written)
             .saturating_sub(len);
-        if after < crate::cache_budget::CACHE_FREE_SPACE_FLOOR {
+        if after < reading.floor {
             return false;
         }
         reading.written += len;
