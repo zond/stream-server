@@ -69,6 +69,11 @@ Still stale:
 * `retention::streams::REPORTED_SECONDS` is unused: its own doc says it goes
   when the want set is wired to the policy with the real number, which has
   happened. A deletion rather than a doc fix.
+* `README.md` around line 374 documents the `/stream-numbers.json`
+  `transfer` object as `downloadedBytes`/`uploadedBytes`/`ratio`. The
+  server also sends `unverifiedBytes` and, beside it, `refusedReclaims` --
+  the two numbers the retention work added and the ones a client most needs
+  to draw. The documented wire shape is two fields behind the real one.
 * `enginefs/src/retention/scenario.rs`'s `CONTAINER_METADATA_LOOKAHEAD` and
   `PLAYBACK_LOOKAHEAD` keep the field's numbers under the names of
   constants that no longer exist. Deliberate -- a scenario should stay the
@@ -96,23 +101,25 @@ that has delivered nothing over at least as long. 5.7% is about the
 in-flight floor -- chunks of pieces not yet complete, which leave the
 number when the piece checks.
 
-1. **Head-of-line blocking is what is left, and it is no longer a
-   bandwidth problem.** In the same log a read blocked 13.4 s on piece 965
-   and 7.6 s on piece 966 while the swarm delivered 12-16 MB/s from 16-17
-   connected seeders. Every other blocked read was 1.2-2.6 s.
+1. **Head-of-line blocking**, which is no longer a bandwidth problem: in
+   the 15:05 log a read blocked 13.4 s on piece 965 and 7.6 s on piece 966
+   while the swarm delivered 12-16 MB/s from 16-17 connected seeders, with
+   every other blocked read at 1.2-2.6 s.
 
-   The likely cause is visible in `InflightPiece::claim`: `unclaimed
-   .pop_front()` never asks how many claims of this piece the asking peer
-   already holds, and the request loop comes back for another claim as soon
-   as it has *sent* the last one's requests, not when they arrive. With
-   `DEFAULT_PEER_REQUEST_WINDOW` at 128 chunks against a 16-chunk claim,
-   one peer can hold eight claims -- so two peers take all sixteen claims
-   of a 4 MiB piece, and the piece is back to "the slowest of two", which
-   is what splitting exists to prevent. A cap on claims per peer per piece
-   would spread it over eight.
+   **A fix is in and unmeasured** (rqbit `f6753192`): `unclaimed
+   .pop_front()` never asked how many claims of a piece the asking peer
+   already held, and a peer comes back for another as soon as it has *sent*
+   the last one's requests -- so with a 128-chunk request window against a
+   16-chunk claim, two peers took all sixteen claims of a 4 MiB piece and
+   it was fetched at the speed of the slower of them. A peer now takes
+   `CLAIMS_PER_PEER` and moves to the next piece the stream needs; the
+   shares it passed over are what it comes back to if the lookahead has
+   nothing else, so a piece with few peers cannot stall for want of more.
 
-   Not yet tried, and worth measuring rather than assuming: the fix costs a
-   round trip of latency per peer on a piece nobody else wants.
+   What says whether it worked: the long blocked reads, against an
+   unverified figure that must stay near its 5.7% floor. If the reads
+   shorten and the figure climbs, spreading is costing a round trip per
+   peer and `CLAIMS_PER_PEER` is too low.
 
 ### Open in this repo
 
@@ -147,6 +154,19 @@ number when the piece checks.
    tick heals it in almost every case.
 8. `unrar-rs`'s licence asks that binary redistributions reproduce its
    licence file; packages ship the GPL text but not that file.
+
+### Standing hazards
+
+* **Pin by full sha, everywhere.** Cargo keys a git source on the literal
+  `rev` string, so a short rev in one crate and a full sha in another are
+  two sources -- and the whole torrent engine is compiled twice into one
+  binary, which `cargo check` is perfectly happy with. It has happened
+  twice: `server` and `enginefs` each carry their own `librqbit`
+  dependency, and xtremio carries a third for test fixtures. The check is
+  `grep -c 'name = "librqbit"$' Cargo.lock`, which must answer 1.
+* **Never `git checkout <file>` to undo an experiment.** It restores from
+  HEAD, not from the working tree, so it discards everything uncommitted in
+  that file. Copy the file to the scratchpad and copy it back instead.
 
 ### Other repos, not verified on this date
 
