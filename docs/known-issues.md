@@ -76,30 +76,43 @@ Still stale:
 
 ## Open issues
 
-### In the field, unexplained
+### In the field
 
-Both from the 2026-09-14 04:20 log, on `xtremio 836394c` /
-`stream-server fb85c49` / `librqbit 9897615c` (the fork with piece
-splitting; confirmed in `Cargo.lock`).
+**Settled 2026-09-14 (`73f77b0`, rqbit `bb6bad9b`).** The unverified figure
+was the duplication the fork itself was doing, and the numbers close:
 
-1. **A read blocked 29.6 s on piece 872 and 21.3 s on piece 889** while the
-   swarm delivered 5-7 MB/s from 20+ connected seeders and the piece was at
-   the front of the want set. Splitting mitigates slow peers; it does not
-   promise a deadline, so this is a thing to explain rather than a verdict
-   on the split. Nothing currently logged says which peers held that piece
-   or what they were doing with it.
-2. **About 210 MB of 592 MB fetched never passed a hash check** over the
-   logged window -- `fetched_bytes` against `downloaded_and_checked_bytes`,
-   both monotonic counters, summed over the pass lines' deltas. `unlinked`
-   was 0 throughout, so it is not deletion. Candidates: chunks in flight
-   (bounded, should not accumulate), duplicate chunks, or pieces cancelled
-   mid-flight. Neighbouring symptom: six
-   `we already requested ChunkInfo { piece_index: 895, chunk_index: 186..191 }`
-   warnings, all to one peer.
+| log | fetched | verified | unverified |
+| --- | --- | --- | --- |
+| 04:20 | 592 MB | 382 MB | 35.5% |
+| 06:52 | 416 MB | 281 MB | 32.4% |
+| 15:05 | 708 MB | 668 MB | **5.7%** |
 
-These two may be one thing. A claim that overlaps another, or is re-issued
-while its chunks are still outstanding, would waste bandwidth re-fetching
-what we have *and* leave the blocked chunk unfetched.
+Three changes, in the order they mattered: a request is filtered against
+`chunk_status` before it goes out; splitting and second copies are confined
+to the first two pieces of the lookahead, so every piece past them is
+fetched by one peer and stolen if that peer is ten times slower; and a
+second copy is paid for by a delivery of the same piece, against a claim
+that has delivered nothing over at least as long. 5.7% is about the
+in-flight floor -- chunks of pieces not yet complete, which leave the
+number when the piece checks.
+
+1. **Head-of-line blocking is what is left, and it is no longer a
+   bandwidth problem.** In the same log a read blocked 13.4 s on piece 965
+   and 7.6 s on piece 966 while the swarm delivered 12-16 MB/s from 16-17
+   connected seeders. Every other blocked read was 1.2-2.6 s.
+
+   The likely cause is visible in `InflightPiece::claim`: `unclaimed
+   .pop_front()` never asks how many claims of this piece the asking peer
+   already holds, and the request loop comes back for another claim as soon
+   as it has *sent* the last one's requests, not when they arrive. With
+   `DEFAULT_PEER_REQUEST_WINDOW` at 128 chunks against a 16-chunk claim,
+   one peer can hold eight claims -- so two peers take all sixteen claims
+   of a 4 MiB piece, and the piece is back to "the slowest of two", which
+   is what splitting exists to prevent. A cap on claims per peer per piece
+   would spread it over eight.
+
+   Not yet tried, and worth measuring rather than assuming: the fix costs a
+   round trip of latency per peer on a piece nobody else wants.
 
 ### Open in this repo
 
