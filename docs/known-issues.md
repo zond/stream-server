@@ -87,15 +87,16 @@ number when the piece checks.
    while the swarm delivered 12-16 MB/s from 16-17 connected seeders, with
    every other blocked read at 1.2-2.6 s.
 
-   **A fix is in and unmeasured** (rqbit `f6753192`): `unclaimed
-   .pop_front()` never asked how many claims of a piece the asking peer
-   already held, and a peer comes back for another as soon as it has *sent*
-   the last one's requests -- so with a 128-chunk request window against a
-   16-chunk claim, two peers took all sixteen claims of a 4 MiB piece and
-   it was fetched at the speed of the slower of them. A peer now takes
-   `CLAIMS_PER_PEER` and moves to the next piece the stream needs; the
-   shares it passed over are what it comes back to if the lookahead has
-   nothing else, so a piece with few peers cannot stall for want of more.
+   **A fix is in and unmeasured** (rqbit `a31258c0`, replacing `f6753192`
+   the same day): every takeover on the piece a stream waits on -- cutting
+   a whole head piece, doubling a stalled claim -- is now justified by one
+   comparison: the asker's last chunk took less time than we have waited
+   on the holder. A peer over its `CLAIMS_PER_PEER` share takes another
+   only once a chunk of its own has landed since the last share went out;
+   a peer that has never delivered outpaces nobody and proves itself on
+   the ordinary queue. The full design and what it replaced (blind
+   doubling, proof-by-finished-claim, a 100 ms grace timer, the `idle`
+   escape) is rqbit's `crates/librqbit/src/CLAIMS.md`.
 
    What says whether it worked: the long blocked reads, against an
    unverified figure that must stay near its 5.7% floor. If the reads
@@ -141,7 +142,7 @@ whose job was partly to say "not real" or "leave it". Three did.
    ring a tester sends back. Item 1 above is unmeasured and its named check
    is the unverified figure. Deleting the instrument before reading the
    measurement it exists for is the wrong order. **Revisit after the next
-   viewing on `f6753192`.**
+   viewing on `a31258c0`.**
 
    When it goes, the cascade is larger than it looks, and two things are
    decisions rather than consequences: `server/src/routes/stream.rs:1179`
