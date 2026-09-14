@@ -36,16 +36,17 @@ pub const COMMITTED_SECONDS: u64 = 90;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum BufferProfile {
-    /// About a minute and a half of the stream buffered ahead, and today's
-    /// read-ahead cap. The default.
+    /// About a minute and a half of the stream in hand: 90 s of it, at the
+    /// film's bitrate, read ahead and kept. The default.
     #[default]
     Normal,
-    /// About four minutes ahead, and twice the playback read-ahead.
+    /// About four minutes in hand: 240 s of the stream, at the film's
+    /// bitrate.
     Large,
     /// **The whole file, while you are watching it**, where the cache
-    /// budget covers it -- there is no time cap at all -- and the widest
-    /// window the budget allows where it does not. Four times the playback
-    /// read-ahead.
+    /// budget covers it -- the cap is [`MAXIMUM_WINDOW_SECONDS`], a day,
+    /// which no film reaches -- and the widest window the budget allows
+    /// where it does not.
     ///
     /// **Maximum is for this viewing; a pin is for later.** The retention
     /// owner takes these bytes back as soon as the stream is not the live
