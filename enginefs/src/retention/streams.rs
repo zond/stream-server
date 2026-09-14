@@ -277,27 +277,28 @@ pub enum Rejected {
 /// A player's reads are bursty -- it drains as fast as the socket allows
 /// until its own buffer is full, then asks only as often as it plays -- so
 /// a rate that followed each sample would swing between the link's speed
-/// and the film's.
+/// and the film's. A seventh of the old number and one of the new settles
+/// over roughly a dozen reads.
 ///
-/// **Sixteen, and it is a compromise between two real costs.** Only
-/// *admitted* samples move this ([`Stream::sample`]), and admission is
-/// biased low on a bad link, so a short memory tracks a stalling link down
-/// and leaves the stream with a window too thin to ride the next stall out.
-/// A long memory holds near the film's arithmetic through a bad patch --
-/// which is what it is for -- but it is also how long a consumer that
-/// really is slow keeps a film-sized window: seeded at the ceiling, an
-/// index crawler nibbling forty kilobytes a read is fetched as a film until
-/// this decays, and that is mobile data spent on a track nobody is
-/// watching.
+/// **It was widened to a sixteenth and put back.** The argument for
+/// widening is real -- only *admitted* samples move this
+/// ([`Stream::sample`]), and admission is biased low on a bad link, so a
+/// short memory tracks a stalling link down and leaves the stream too thin
+/// to ride the next stall out. What the widening missed is that the seed
+/// it was paired with only exists where a duration does. A proxied stream
+/// states none, so its first admitted sample still sets the rate outright,
+/// and a longer memory only makes that one sample stickier: on Windows,
+/// where the first read of a test is slower and so the first sample is
+/// lower, the cache kept three chunks of a played run where the assertion
+/// wanted four.
 ///
-/// So it is set where a thirty-second bad patch is survivable and a
-/// crawler is demoted in about as long, and **what says whether that was
-/// right is the crawler's own want set in a field log** -- it was three
-/// pieces at a measured 2,688 B/s on 2026-09-14 15:05. If it is fat there,
-/// the answer is not a bigger number here: it is that one time constant
-/// cannot serve both, and the admission rule is what needs to tell them
-/// apart.
-const RATE_SMOOTHING: u64 = 16;
+/// So the width may only be widened for streams that are seeded, and that
+/// is a second constant for one idea. The seed is what removes the cliff
+/// -- one sample can no longer collapse the window -- and the width is
+/// second order beside it: at either value the decay takes a dozen-odd
+/// admitted samples, which is not the difference between riding a bad
+/// patch out and not.
+const RATE_SMOOTHING: u64 = 8;
 
 /// The smallest window a stream is ever granted, in pieces.
 ///
