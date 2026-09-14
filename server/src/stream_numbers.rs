@@ -326,7 +326,7 @@ fn torrent_stream(url: &Url) -> Option<(String, StreamFile)> {
 /// while `stats.json` answers about the same stream would be this
 /// dispatch disagreeing with the route it claims to mirror.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum StreamFile {
+pub(crate) enum StreamFile {
     /// An index, which names its file with no list to consult.
     Index(usize),
     /// `-1`, with the `f=` filters that narrow it -- the same values
@@ -338,7 +338,7 @@ enum StreamFile {
 impl StreamFile {
     /// The `{fileIdx}` segment, with `filters` read only where they are
     /// wanted -- `-1` is the only spelling that consults them.
-    fn parse(file_idx: &str, filters: impl FnOnce() -> Vec<String>) -> Option<Self> {
+    pub(crate) fn parse(file_idx: &str, filters: impl FnOnce() -> Vec<String>) -> Option<Self> {
         match file_idx {
             "-1" => Some(Self::Auto(filters())),
             index => Some(Self::Index(index.parse().ok()?)),
@@ -354,7 +354,7 @@ impl StreamFile {
     /// index needs no lookup at all, so the ordinary URL costs nothing
     /// here; only `-1` asks for the file list, which is the same list the
     /// stream route resolves it against.
-    async fn resolve(&self, engines: &EngineFS, info_hash: &str) -> Option<usize> {
+    pub(crate) async fn resolve(&self, engines: &EngineFS, info_hash: &str) -> Option<usize> {
         let filters = match self {
             Self::Index(index) => return Some(*index),
             Self::Auto(filters) => filters,

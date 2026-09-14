@@ -301,12 +301,29 @@ impl ServerHandle {
     /// and it is what sizes the retention window and the stream's own
     /// read-ahead, both of which are stated in seconds of film; see
     /// [`enginefs::EngineFS::on_duration`].
+    ///
+    /// `file_idx` is the `{fileIdx}` segment of the player's URL as the
+    /// core wrote it, `-1` included, and `filters` its `f=` values: an
+    /// addon that names no file leaves the choice to this server, so the
+    /// file the length is about is the one the stream route resolved it
+    /// to, by the same rule (`routes::compat::resolve_file_idx`, through
+    /// [`stream_numbers::StreamFile`]). Reported against the addon's index
+    /// instead, a length for such a stream never arrived at all -- and
+    /// those are most streams.
     pub async fn note_duration(
         &self,
         info_hash: &str,
-        file_idx: usize,
+        file_idx: &str,
+        filters: &[String],
         duration: std::time::Duration,
     ) {
+        let Some(file) = crate::stream_numbers::StreamFile::parse(file_idx, || filters.to_vec())
+        else {
+            return;
+        };
+        let Some(file_idx) = file.resolve(&self.state.engine, info_hash).await else {
+            return;
+        };
         self.state
             .engine
             .on_duration(info_hash, file_idx, duration)
