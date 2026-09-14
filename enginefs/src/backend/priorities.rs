@@ -72,6 +72,8 @@ pub enum BufferProfile {
 /// A day of a 20 MB/s film is under two terabytes, which the arithmetic
 /// takes in its stride.
 pub const MAXIMUM_WINDOW_SECONDS: u64 = 24 * 60 * 60;
+// A hundred megabytes a second for the maximum window must not saturate.
+const _: () = assert!(MAXIMUM_WINDOW_SECONDS < u64::MAX / (100 * 1024 * 1024));
 
 impl BufferProfile {
     /// Every profile, in ascending window order -- for enumerating the choice
@@ -442,10 +444,6 @@ mod tests {
         assert_eq!(
             BufferProfile::Maximum.window_seconds(),
             MAXIMUM_WINDOW_SECONDS
-        );
-        assert!(
-            MAXIMUM_WINDOW_SECONDS < u64::MAX / (100 * 1024 * 1024),
-            "a hundred megabytes a second for the maximum window must not saturate"
         );
         for fetching in [Fetching::Streaming, Fetching::Download] {
             let bytes = librqbit_stream_lookahead_bytes(fetching);
