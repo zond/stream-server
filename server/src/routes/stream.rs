@@ -600,7 +600,9 @@ fn ensure_download_disk_ready(root: &FsPath) -> Result<(), String> {
     // The same floor the published cap keeps free
     // (`CacheLimit::effective`) and the same one the engine's reconciler
     // stops a torrent at.
-    let required = crate::cache_budget::CACHE_FREE_SPACE_FLOOR;
+    // Sized to the volume, because 512 MB is a thousandth of a phone and an
+    // eighth of a 4 GB television; see `enginefs::free_space_floor`.
+    let required = enginefs::free_space_floor(enginefs::volume_total(root));
     let available = available_space_for_path(root).ok_or_else(|| {
         format!(
             "could not determine available disk space for download cache: {}",

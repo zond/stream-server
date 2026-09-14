@@ -61,6 +61,55 @@ const INACTIVE_TORRENT_REMOVE_TIMEOUT: Duration = Duration::from_secs(300); // 5
 /// can therefore settle the volume under this line by design, and the
 /// reconciler stops it there like anything else.
 pub const CACHE_FREE_SPACE_FLOOR: u64 = 512 * 1024 * 1024;
+
+/// The least the floor is ever cut to, on a volume too small to give
+/// [`CACHE_FREE_SPACE_FLOOR`].
+///
+/// The floor absorbs what a torrent writes past the line before anything
+/// sees it: one [`FREE_SPACE_WATCH_INTERVAL`] of writing, which is 40 MB at
+/// the 20 MB/s the television managed. This is three of those, so the
+/// mechanism the floor exists for still works at the bottom of the range --
+/// what is given up is the wide margin above it, and that is given up only
+/// where keeping it would mean refusing to play at all.
+pub const CACHE_FREE_SPACE_FLOOR_MIN: u64 = 128 * 1024 * 1024;
+
+/// How much of a volume the floor may be, where a whole
+/// [`CACHE_FREE_SPACE_FLOOR`] would be too much of it.
+const FLOOR_SHARE_OF_VOLUME: u64 = 32;
+
+/// The free space to keep the cache out of on a volume of `total` bytes.
+///
+/// **512 MB is a share of a phone and the whole of a television.** The
+/// constant was chosen on a 500 GB device, where it is a thousandth of the
+/// volume and costs nothing to hold back. A Chromecast with Google TV has a
+/// 4 GB userdata partition -- and `/storage/emulated` is the same
+/// partition, so there is no second volume to fall back to -- of which
+/// 512 MB is an eighth, and at 90% full it is more free space than the
+/// device has. The server refused to start a stream at all, which is the
+/// floor working exactly as written and the device being unusable anyway.
+///
+/// So the floor is a thirty-second of the volume, clamped: a phone and any
+/// box with room keep the 512 MB they had, and a 4 GB device keeps
+/// [`CACHE_FREE_SPACE_FLOOR_MIN`] and can play.
+///
+/// **`None` is "the volume would not say", and it answers the old
+/// constant.** A reading that failed is not a licence to cut the margin --
+/// that is the reading a full disk is most likely to give.
+pub fn free_space_floor(total: Option<u64>) -> u64 {
+    total.map_or(CACHE_FREE_SPACE_FLOOR, |total| {
+        (total / FLOOR_SHARE_OF_VOLUME).clamp(CACHE_FREE_SPACE_FLOOR_MIN, CACHE_FREE_SPACE_FLOOR)
+    })
+}
+
+/// The volume's size in bytes, or `None` where it will not say.
+///
+/// Read beside every reading of its free space, from the same `statvfs`
+/// the free space comes from, because [`free_space_floor`] needs both and
+/// two readings taken apart could size the floor against a volume the
+/// available space is not on.
+pub fn volume_total(path: &std::path::Path) -> Option<u64> {
+    fs4::total_space(path).ok()
+}
 /// How often the reconciler reads the volume. One `statvfs` per tick, since
 /// there is one volume -- the piece store's -- microseconds, so it can
 /// afford to be short, and it has to be: a torrent at 20 MB/s writes 40 MB
@@ -4793,6 +4842,47 @@ impl BackendEngineFS<LibrqbitBackend> {
 
 #[cfg(test)]
 mod tests {
+
+    /// **512 MB is a share of a phone and the whole of a television.**
+    ///
+    /// The floor absorbs what a torrent writes past the line between two
+    /// readings of the volume, so it has to stay well above one interval of
+    /// writing -- and it was set on a 500 GB device where holding back half
+    /// a gigabyte costs a thousandth of the disk. A Chromecast with Google
+    /// TV has a 4 GB userdata partition with no second volume behind it,
+    /// 90% full: 512 MB is more free space than the device has, so the
+    /// stream route refused to play at all, correctly and uselessly.
+    #[test]
+    fn the_floor_is_a_share_of_the_volume_it_holds_back() {
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * MIB;
+
+        // The television this was written on, and any box with room: the
+        // floor they always had.
+        assert_eq!(free_space_floor(Some(493 * GIB)), CACHE_FREE_SPACE_FLOOR);
+        assert_eq!(free_space_floor(Some(16 * GIB)), CACHE_FREE_SPACE_FLOOR);
+
+        // The Chromecast: 4 GB of userdata, of which 422 MB was free. A
+        // whole floor is more than it has; a share of it leaves the cache
+        // enough to play from.
+        let chromecast = free_space_floor(Some(4 * GIB));
+        assert_eq!(chromecast, CACHE_FREE_SPACE_FLOOR_MIN);
+        assert!(
+            422 * MIB > chromecast + 128 * MIB,
+            "the floor left too little of a nearly-full 4 GB volume to stream into"
+        );
+
+        // It never goes below the minimum, whatever the volume: the floor
+        // exists to absorb a torrent overshooting between two readings, and
+        // that is a quantity of writing, not a fraction of anything.
+        assert_eq!(free_space_floor(Some(64 * MIB)), CACHE_FREE_SPACE_FLOOR_MIN);
+        assert_eq!(free_space_floor(Some(0)), CACHE_FREE_SPACE_FLOOR_MIN);
+
+        // And a volume that would not say its size is not an excuse to cut
+        // the margin -- that is the reading a full disk is most likely to
+        // give.
+        assert_eq!(free_space_floor(None), CACHE_FREE_SPACE_FLOOR);
+    }
     use super::*;
     use crate::backend::librqbit::{DeferredSelection, await_initialized};
     use crate::backend::{

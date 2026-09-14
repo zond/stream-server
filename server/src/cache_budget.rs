@@ -113,6 +113,11 @@ pub(crate) struct CacheLimit {
     /// Bytes the volume holding the cache will still give an unprivileged
     /// writer, or `None` when it could not be read.
     pub(crate) available: Option<u64>,
+    /// The free space to hold back, from the same reading of the same
+    /// volume as `available`: see [`enginefs::free_space_floor`]. Carried
+    /// rather than looked up, because a cap sized against one volume's
+    /// floor and another's free space is not a cap at all.
+    pub(crate) floor: u64,
 }
 
 impl CacheLimit {
@@ -125,6 +130,7 @@ impl CacheLimit {
         Self {
             configured,
             available: None,
+            floor: CACHE_FREE_SPACE_FLOOR,
         }
     }
 
@@ -132,7 +138,7 @@ impl CacheLimit {
     /// cap at all.
     ///
     /// `occupied + available` is what the volume would offer if the cache
-    /// were empty, so holding [`CACHE_FREE_SPACE_FLOOR`] of that back leaves
+    /// were empty, so holding [`Self::floor`] of that back leaves
     /// the most the cache may occupy without the free space crossing the
     /// floor. Saturating throughout: a volume already under the floor yields
     /// a cap below current occupancy, which is exactly the case where
@@ -143,7 +149,7 @@ impl CacheLimit {
         let from_disk = self.available.map(|available| {
             occupied
                 .saturating_add(available)
-                .saturating_sub(CACHE_FREE_SPACE_FLOOR)
+                .saturating_sub(self.floor)
         });
         match (configured, from_disk) {
             (Some(configured), Some(from_disk)) => Some(configured.min(from_disk)),
@@ -224,10 +230,16 @@ const BUDGET_INTERVAL: Duration = Duration::from_secs(60);
 /// `configured` is `settings.cacheSize`, `available` one `statvfs` of the
 /// volume, and `occupied` what the owners of the cache say they hold -- see
 /// this module's header for what each of the three costs.
-fn cap_to_publish(configured: u64, available: Option<u64>, occupied: u64) -> Option<u64> {
+fn cap_to_publish(
+    configured: u64,
+    available: Option<u64>,
+    occupied: u64,
+    floor: u64,
+) -> Option<u64> {
     CacheLimit {
         configured,
         available,
+        floor,
     }
     .effective(occupied)
 }
@@ -287,9 +299,19 @@ pub(crate) async fn publish_now(state: &AppState) -> Option<u64> {
             // the engine is where it is now.
             let available =
                 available_space_off_the_reactor(state.engine.download_dir.clone()).await;
+            // The floor is a share of the volume, so it is read from the
+            // same volume and at the same moment as the space it holds
+            // back; see `enginefs::free_space_floor`.
+            let root = state.engine.download_dir.clone();
+            let floor = enginefs::free_space_floor(
+                tokio::task::spawn_blocking(move || enginefs::volume_total(&root))
+                    .await
+                    .ok()
+                    .flatten(),
+            );
             let occupied =
                 state.engine.cache_occupancy() + state.proxy_cache.retention().occupancy();
-            (configured, available, occupied)
+            (configured, available, occupied, floor)
         },
     )
     .await
@@ -312,29 +334,25 @@ async fn publish_in_turn<F, Fut>(
 ) -> Option<u64>
 where
     F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = (u64, Option<u64>, u64)>,
+    Fut: std::future::Future<Output = (u64, Option<u64>, u64, u64)>,
 {
     let _turn = turn.lock().await;
-    let (configured, available, occupied) = read().await;
-    let cap = cap_to_publish(configured, available, occupied);
+    let (configured, available, occupied, floor) = read().await;
+    let cap = cap_to_publish(configured, available, occupied, floor);
     // What the volume will still give before the margin, published beside
     // the cap because it is the other half of the same `statvfs` and the
     // two must not be read from different moments: an entity's own
     // allowance is this plus what it already holds
     // (`docs/read-pattern-retention.md` section 4), so a fresh cap over a
     // stale headroom sizes a lookahead against a disk that never existed.
-    let headroom = available.map(|available| available.saturating_sub(CACHE_FREE_SPACE_FLOOR));
+    let headroom = available.map(|available| available.saturating_sub(floor));
     // TEMPORARY: see `enginefs::retention::trace`, and delete this line with
     // that module. The pass reports the budget in force; this is the only
     // place that knows which of the two numbers it came from.
     enginefs::retention::trace::budget_published(
         cap,
         (configured != 0).then_some(configured),
-        available.map(|available| {
-            occupied
-                .saturating_add(available)
-                .saturating_sub(CACHE_FREE_SPACE_FLOOR)
-        }),
+        available.map(|available| occupied.saturating_add(available).saturating_sub(floor)),
     );
     publish(budget, cap, headroom);
     cap
@@ -436,7 +454,12 @@ mod tests {
              as its being uncappable"
         );
         assert_eq!(
-            cap_to_publish(u64::MAX, Some(free), registry.occupancy()),
+            cap_to_publish(
+                u64::MAX,
+                Some(free),
+                registry.occupancy(),
+                CACHE_FREE_SPACE_FLOOR
+            ),
             Some(8 * MIB),
             "the free space above the floor, with nothing assumed on top of it"
         );
@@ -457,7 +480,12 @@ mod tests {
 
         assert_eq!(registry.occupancy(), MIB);
         assert_eq!(
-            cap_to_publish(u64::MAX, Some(free), registry.occupancy()),
+            cap_to_publish(
+                u64::MAX,
+                Some(free),
+                registry.occupancy(),
+                CACHE_FREE_SPACE_FLOOR
+            ),
             Some(9 * MIB),
             "what the cache already holds is room it may keep on holding, \
              from the moment it holds it"
@@ -502,7 +530,8 @@ mod tests {
             cap_to_publish(
                 u64::MAX,
                 Some(free),
-                registry.occupancy() + proxy.occupancy()
+                registry.occupancy() + proxy.occupancy(),
+                CACHE_FREE_SPACE_FLOOR,
             ),
             Some(11 * MIB),
             "the volume's headroom plus what both owners hold"
@@ -522,11 +551,9 @@ mod tests {
         let budget = RetentionBudget::default();
 
         let free = CACHE_FREE_SPACE_FLOOR + 8 * MIB;
-        publish_in_turn(
-            &turn,
-            &budget,
-            || async move { (u64::MAX, Some(free), 4 * MIB) },
-        )
+        publish_in_turn(&turn, &budget, || async move {
+            (u64::MAX, Some(free), 4 * MIB, CACHE_FREE_SPACE_FLOOR)
+        })
         .await;
 
         assert_eq!(
@@ -549,7 +576,10 @@ mod tests {
         let turn = tokio::sync::Mutex::new(());
         let budget = RetentionBudget::default();
 
-        publish_in_turn(&turn, &budget, || async move { (100 * MIB, None, 0) }).await;
+        publish_in_turn(&turn, &budget, || async move {
+            (100 * MIB, None, 0, CACHE_FREE_SPACE_FLOOR)
+        })
+        .await;
 
         assert_eq!(budget.get(), CacheBudget::Bytes(100 * MIB));
         assert_eq!(budget.headroom(), None);
@@ -572,7 +602,12 @@ mod tests {
             let (turn, budget, configured) = (turn.clone(), budget.clone(), configured.clone());
             async move {
                 publish_in_turn(&turn, &budget, || async move {
-                    (configured.load(Ordering::SeqCst), None, 0)
+                    (
+                        configured.load(Ordering::SeqCst),
+                        None,
+                        0,
+                        CACHE_FREE_SPACE_FLOOR,
+                    )
                 })
                 .await
             }
@@ -598,7 +633,12 @@ mod tests {
             "nothing has published one yet"
         );
 
-        let cap = cap_to_publish(u64::MAX, Some(CACHE_FREE_SPACE_FLOOR + 8 * MIB), 0);
+        let cap = cap_to_publish(
+            u64::MAX,
+            Some(CACHE_FREE_SPACE_FLOOR + 8 * MIB),
+            0,
+            CACHE_FREE_SPACE_FLOOR,
+        );
         publish(&budget, cap, Some(8 * MIB));
         assert_eq!(
             budget.get(),
@@ -625,6 +665,7 @@ mod tests {
         let roomy = CacheLimit {
             configured: 2 * gib,
             available: Some(8 * gib),
+            floor: CACHE_FREE_SPACE_FLOOR,
         };
         assert_eq!(roomy.effective(gib), Some(2 * gib));
 
@@ -634,6 +675,7 @@ mod tests {
         let television = CacheLimit {
             configured: u64::MAX,
             available: Some(523 * 1024 * 1024),
+            floor: CACHE_FREE_SPACE_FLOOR,
         };
         assert_eq!(
             television.effective(3 * gib),
@@ -664,6 +706,7 @@ mod tests {
                 let limit = CacheLimit {
                     configured: u64::MAX,
                     available: Some(available),
+                    floor: CACHE_FREE_SPACE_FLOOR,
                 };
                 let effective = limit.effective(occupied).unwrap();
                 let free_at_the_cap = occupied + available - effective.min(occupied + available);
@@ -679,6 +722,7 @@ mod tests {
         let squeezed = CacheLimit {
             configured: u64::MAX,
             available: Some(1024),
+            floor: CACHE_FREE_SPACE_FLOOR,
         };
         assert!(squeezed.effective(4096).unwrap() < 4096);
 
@@ -686,6 +730,7 @@ mod tests {
         let full = CacheLimit {
             configured: u64::MAX,
             available: Some(0),
+            floor: CACHE_FREE_SPACE_FLOOR,
         };
         assert_eq!(full.effective(0), Some(0));
     }
@@ -719,6 +764,7 @@ mod tests {
             let limit = CacheLimit {
                 configured,
                 available: None,
+                floor: CACHE_FREE_SPACE_FLOOR,
             };
             assert_eq!(limit, CacheLimit::configured(configured));
             assert_eq!(limit.effective(4096), expected);

@@ -113,6 +113,15 @@ pub(crate) async fn usage(state: &AppState) -> CacheUsage {
             state.engine.download_dir.clone(),
         )
         .await,
+        floor: {
+            let root = state.engine.download_dir.clone();
+            enginefs::free_space_floor(
+                tokio::task::spawn_blocking(move || enginefs::volume_total(&root))
+                    .await
+                    .ok()
+                    .flatten(),
+            )
+        },
     };
     let torrents = state.engine.cache_holdings().await;
     let proxy = state.proxy_cache.retention();
