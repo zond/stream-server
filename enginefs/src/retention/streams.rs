@@ -168,11 +168,31 @@ impl Stream {
             return;
         }
         let sample = (consumed as f64 / gap.as_secs_f64()) as u64;
-        self.rate = Some(match self.rate {
+        // **Seeded from the film's own arithmetic, not from the first
+        // sample.** A stream nothing has measured is already fetched at the
+        // ceiling -- that is what `demand` does with a `None` rate -- so
+        // taking the first admitted sample whole was a step out of it with
+        // no averaging behind it at all, and the first admitted sample is
+        // the one most likely to be wrong.
+        //
+        // It is wrong in a particular direction, which is why this matters.
+        // A starving player asks again the instant it is answered, so its
+        // reads are refused here; what survives admission is the moments
+        // the player had some buffer and idled, and a long idle over a
+        // small read is a *low* sample. On a link that alternates stalling
+        // and bursting, the admitted samples are systematically the low
+        // ones -- so one of them used to collapse the window to a tenth of
+        // the film's rate, on exactly the link where a buffer is worth
+        // most (field log 2026-09-14 18:21, a wifi-to-mobile switch:
+        // `rates=[Some(367710)]` against a 3,568,061 B/s film, a want set
+        // of eight pieces where the arithmetic allows seventy-seven).
+        //
+        // Seeded, the same sample moves the rate by a sixteenth, and the
+        // transition out of "no measurement" is continuous rather than a
+        // step.
+        self.rate = Some(match self.rate.or(ceiling) {
             None => sample,
-            Some(rate) => {
-                (rate * (8 - RATE_SMOOTHING_EIGHTHS) + sample * RATE_SMOOTHING_EIGHTHS) / 8
-            }
+            Some(rate) => (rate * (RATE_SMOOTHING - 1) + sample) / RATE_SMOOTHING,
         });
     }
 
@@ -252,15 +272,32 @@ pub enum Rejected {
     Outside,
 }
 
-/// How much of a new sample the rate takes, in eighths.
+/// One over how much of a new sample the rate takes.
 ///
 /// A player's reads are bursty -- it drains as fast as the socket allows
 /// until its own buffer is full, then asks only as often as it plays -- so
 /// a rate that followed each sample would swing between the link's speed
-/// and the film's. Seven eighths of the old number and one of the new
-/// settles over roughly a dozen reads, which at fourteen reads a second is
-/// under a second of film.
-const RATE_SMOOTHING_EIGHTHS: u64 = 1;
+/// and the film's.
+///
+/// **Sixteen, and it is a compromise between two real costs.** Only
+/// *admitted* samples move this ([`Stream::sample`]), and admission is
+/// biased low on a bad link, so a short memory tracks a stalling link down
+/// and leaves the stream with a window too thin to ride the next stall out.
+/// A long memory holds near the film's arithmetic through a bad patch --
+/// which is what it is for -- but it is also how long a consumer that
+/// really is slow keeps a film-sized window: seeded at the ceiling, an
+/// index crawler nibbling forty kilobytes a read is fetched as a film until
+/// this decays, and that is mobile data spent on a track nobody is
+/// watching.
+///
+/// So it is set where a thirty-second bad patch is survivable and a
+/// crawler is demoted in about as long, and **what says whether that was
+/// right is the crawler's own want set in a field log** -- it was three
+/// pieces at a measured 2,688 B/s on 2026-09-14 15:05. If it is fat there,
+/// the answer is not a bigger number here: it is that one time constant
+/// cannot serve both, and the admission rule is what needs to tell them
+/// apart.
+const RATE_SMOOTHING: u64 = 16;
 
 /// The smallest window a stream is ever granted, in pieces.
 ///
@@ -1228,11 +1265,41 @@ mod tests {
             PIECE,
         );
 
-        let rate = streams.streams[0]
+        // **One sample moves the rate; it does not set it.** The rate is
+        // seeded from the film's arithmetic, which is where `demand` has
+        // this stream anyway while `rate` is `None`, so an admitted sample
+        // is a correction to that and not a replacement of it -- a
+        // sixteenth of the way, here.
+        let once = streams.streams[0]
             .rate
             .expect("a real gap is a measurement");
-        assert_eq!(rate, 262_144);
-        assert!(rate < ceiling, "and a measurement can only say slower");
+        assert_eq!(
+            once,
+            (ceiling * (RATE_SMOOTHING - 1) + 262_144) / RATE_SMOOTHING
+        );
+        assert!(once < ceiling, "and a measurement can only say slower");
+
+        // And it keeps saying it: the same consumer, measured again and
+        // again, converges on what it is really eating.
+        for second in 2..60u64 {
+            streams.observe(
+                1,
+                Read {
+                    begin: 262_144 * second,
+                    end: 262_144 * (second + 1),
+                    arrived: t0 + Duration::from_secs(second),
+                    returned: t0 + Duration::from_secs(second),
+                },
+                &held,
+                PIECE,
+            );
+        }
+        let settled = streams.streams[0].rate.expect("still measured");
+        assert!(
+            settled < once && settled < 2 * 262_144,
+            "sixty seconds of a consumer eating 256 KiB a second did not \
+             settle near 256 KiB a second: {settled}"
+        );
     }
 
     /// **A stream nothing has measured is fetched at the film's own
