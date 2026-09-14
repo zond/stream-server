@@ -1214,7 +1214,7 @@ pub struct Engine<H: TorrentHandle> {
     /// the disk permanently over budget, plus a wasted `drop_pieces` per
     /// tick for as long as the stream lives -- and while this was
     /// `#[cfg(test)]` there was no way to see it happening on a device. It
-    /// and the waste figure beside it are what made the 1.6 GB open
+    /// and the unverified figure beside it are what made the 1.6 GB open
     /// visible, so they stay.
     pub(crate) refused_reclaims: Arc<AtomicUsize>,
 }

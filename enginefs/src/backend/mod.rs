@@ -147,13 +147,24 @@ pub struct TransferTotals {
     /// Bytes received from peers that went on to verify and be kept --
     /// librqbit's `downloaded_and_checked_bytes`.
     ///
-    /// **The difference from [`Self::fetched`] is waste**, and it is the
-    /// number that made the retention bug visible: a phone that fetched
-    /// 1.6 GB to play a hundred megabytes had fetched pieces the next
-    /// retention pass deleted, or pieces a peer beat us to, and nothing
-    /// downstream could see either. A healthy session's waste is a few
-    /// per cent of endgame duplication; a session whose window is
-    /// fighting its own fetches is a multiple.
+    /// **The difference from [`Self::fetched`] is unverified**, and it is
+    /// the number that made the retention bug visible: a phone that
+    /// fetched 1.6 GB to play a hundred megabytes had fetched pieces the
+    /// next retention pass deleted, or pieces a peer beat us to, and
+    /// nothing downstream could see either.
+    ///
+    /// **Unverified, not "wasted": the subtraction cannot tell which.**
+    /// It is every byte a peer sent that no piece hash has vouched for
+    /// yet, and three different things sit in it. Chunks of a piece still
+    /// in flight are in it and leave it the moment that piece completes
+    /// and checks. So is the deliberate second copy of a chunk, asked of
+    /// a fast peer to get a piece out from under a stalled one -- bytes
+    /// spent on purpose to rescue a read. And so is what really was
+    /// thrown away: a piece deleted before it could complete, or one a
+    /// peer beat us to. Nothing here separates the three, so read it as a
+    /// level and not as a verdict on anybody: a few per cent of what was
+    /// played is the ordinary cost of duplication in flight; a multiple
+    /// of it is a session whose window is fighting its own fetches.
     pub verified: u64,
     /// Bytes sent to peers.
     pub uploaded: u64,
@@ -169,11 +180,15 @@ impl TransferTotals {
         }
     }
 
-    /// Bytes fetched that never became a piece we kept; see
-    /// [`Self::verified`]. Saturating, because the two counters are read
-    /// from one snapshot but a torrent restored from disk starts with
-    /// verified bytes it never fetched.
-    pub fn wasted(self) -> u64 {
+    /// Bytes fetched that no piece hash has vouched for: `fetched` less
+    /// [`Self::verified`], which is in-flight chunks and deliberate
+    /// duplication as much as it is anything thrown away -- see
+    /// [`Self::verified`] for what is in it and how to read it.
+    ///
+    /// Saturating, because the two counters are read from one snapshot
+    /// but a torrent restored from disk starts with verified bytes it
+    /// never fetched.
+    pub fn unverified(self) -> u64 {
         self.fetched.saturating_sub(self.verified)
     }
 }

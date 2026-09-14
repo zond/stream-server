@@ -10,11 +10,13 @@
 //!
 //! **What closes this**: a field log from the device that opened the film,
 //! showing `ahead` holding at roughly the profile's seconds of the stream,
-//! `dropped`/`unlinked` settling to a piece or two per pass, and `waste`
-//! staying near zero over a viewing. When that log exists, delete this
+//! `dropped`/`unlinked` settling to a piece or two per pass, and
+//! `unverified_since` staying a few per cent of `fetched_since` over a
+//! viewing. When that log exists, delete this
 //! module and its call sites -- `git rm` and the compiler names the rest.
 //! The two numbers that stay are [`crate::retention::TorrentStreamNumbers`]'s
-//! `refused_reclaims` and the waste figure the app draws beside it; those
+//! `refused_reclaims` and the unverified figure the app draws beside it;
+//! those
 //! are the permanent version of this and are already wired.
 //!
 //! It logs at INFO on the `enginefs` target, which `DEFAULT_LOG_FILTER`
@@ -149,8 +151,11 @@ pub fn pass<K: Debug>(key: &K, sample: Pass<'_>) {
         staged_over_held = sample.backing.map(|backing| backing.staged_over_held),
         fetched_since,
         verified_since,
-        // What the swarm was paid for and nothing kept, over this interval.
-        wasted_since = fetched_since.saturating_sub(verified_since),
+        // Fetched over this interval and not vouched for by a piece hash:
+        // chunks still in flight, the second copy of a chunk asked of a
+        // fast peer on purpose, and what was really thrown away, with
+        // nothing here telling the three apart. A level, not a verdict.
+        unverified_since = fetched_since.saturating_sub(verified_since),
         held_since,
         "retention pass"
     );

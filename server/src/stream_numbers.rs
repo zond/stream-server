@@ -106,7 +106,7 @@ pub struct Sharing {
     /// lookahead still covers and this policy's window no longer does: the
     /// disk cannot come back under budget while that stream lives, and
     /// every tick spends a `drop_pieces` to be refused again. It and
-    /// [`Transfer::wasted_bytes`] are the two numbers that made a phone
+    /// [`Transfer::unverified_bytes`] are the two numbers that made a phone
     /// fetching 1.6 GB to play a hundred megabytes legible, and they stay
     /// for that reason.
     ///
@@ -129,14 +129,21 @@ pub struct Sharing {
 pub struct Transfer {
     /// Bytes this torrent has fetched from peers **in this session**.
     pub downloaded_bytes: u64,
-    /// Bytes fetched that never became a piece we kept: `fetched` less
-    /// librqbit's `downloaded_and_checked_bytes`.
+    /// Bytes fetched that no piece hash has vouched for:
+    /// [`Self::downloaded_bytes`] less librqbit's
+    /// `downloaded_and_checked_bytes`.
     ///
-    /// A few per cent is the endgame duplicating the last pieces of a
-    /// download and is normal. A multiple of what was played is a stream
+    /// **Not "wasted", because the subtraction cannot tell.** Chunks of a
+    /// piece still in flight are in it and leave it when that piece checks;
+    /// so is the second copy of a chunk this server asked a fast peer for
+    /// on purpose, to get a piece out from under a stalled one; and so is
+    /// what really was thrown away, a piece deleted before it completed or
+    /// one a peer beat us to. A client should draw it as a level rather
+    /// than as loss: a few per cent of what was played is the ordinary
+    /// cost of duplication in flight, and a multiple of it is a stream
     /// fetching what its own retention pass is deleting, which is the bug
     /// this figure exists to show.
-    pub wasted_bytes: u64,
+    pub unverified_bytes: u64,
     /// Bytes this torrent has sent to peers **in this session**.
     pub uploaded_bytes: u64,
     /// Uploaded over downloaded, the form every BitTorrent client shows.
@@ -162,7 +169,7 @@ impl Sharing {
     ) -> Option<Self> {
         let transfer = transfer.map(|transfer| Transfer {
             downloaded_bytes: transfer.fetched,
-            wasted_bytes: transfer.wasted(),
+            unverified_bytes: transfer.unverified(),
             uploaded_bytes: transfer.uploaded,
             ratio: (transfer.fetched > 0)
                 .then(|| transfer.uploaded as f64 / transfer.fetched as f64),
@@ -530,7 +537,7 @@ mod tests {
                     "committedBytes": 859_832_320u64,
                     "transfer": {
                         "downloadedBytes": 4_800,
-                        "wastedBytes": 400,
+                        "unverifiedBytes": 400,
                         "uploadedBytes": 2_100,
                         "ratio": 2_100.0 / 4_800.0,
                     },
