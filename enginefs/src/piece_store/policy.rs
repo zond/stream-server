@@ -341,8 +341,18 @@ pub enum Shape {
     Whole,
     /// It does not, so it is split: see [`Share`] for what decides where.
     Split {
-        /// Pieces the rolling window may cover.
-        window: u32,
+        /// Pieces the sharing draw may **not** have.
+        ///
+        /// **It was a rolling window and is not one now.** The forward
+        /// reach round a playhead went with the read-pattern rewrite: what
+        /// is fetched and kept is what the detector's consumers ask for
+        /// (`crate::retention::streams`), which no number here bounds. What
+        /// is left of it is this -- the part of the budget `committed` may
+        /// not take, which is what sizes `committed` at all -- and, on a
+        /// backing whose passes run off a moving byte rather than a tick,
+        /// how far that byte may move between two of them
+        /// (`stride_for`).
+        unshared: u32,
         /// Pieces the committed set may hold.
         committed: u32,
     },
@@ -352,14 +362,16 @@ impl Shape {
     /// The most pieces this shape intends to hold at once, or `None` when it
     /// holds the whole file.
     ///
-    /// The window and the committed set can overlap only in the sense that a
-    /// committed piece may be read back into the window's range; they are
-    /// disjoint as *sets*, because a piece is committed exactly when the window
-    /// lets go of it. So the two halves sum, and the sum is the budget.
+    /// The two halves are disjoint as *sets* -- a piece is committed
+    /// exactly when the unshared half lets go of it -- so they sum, and the
+    /// sum is the budget.
     pub fn piece_budget(self) -> Option<u32> {
         match self {
             Self::Whole => None,
-            Self::Split { window, committed } => Some(window.saturating_add(committed)),
+            Self::Split {
+                unshared,
+                committed,
+            } => Some(unshared.saturating_add(committed)),
         }
     }
 }
@@ -574,7 +586,7 @@ impl RetentionPolicy {
             committed = committed.min(cap);
         }
         Shape::Split {
-            window,
+            unshared: window,
             committed: if share == Share::Nothing {
                 0
             } else {
@@ -781,7 +793,11 @@ mod tests {
     }
 
     /// The same file under a stream nothing can be shared from: `/proxy`'s.
-    fn unshared(budget_pieces: u64, count: u32) -> RetentionPolicy {
+    ///
+    /// Not to be confused with `Shape::Split`'s `unshared`, which is a size
+    /// and exists on both sides; this is `Share::Nothing`, the backing that
+    /// has no peers to share with at all.
+    fn shares_nothing(budget_pieces: u64, count: u32) -> RetentionPolicy {
         RetentionPolicy::new(
             budget_pieces * PIECE,
             PIECE,
@@ -814,7 +830,7 @@ mod tests {
             // refuses to give back is what it has committed.
             let width = match p.shape() {
                 Shape::Whole => p.pieces().end,
-                Shape::Split { window, .. } => window.max(1),
+                Shape::Split { unshared, .. } => unshared.max(1),
             };
             let arriving = playhead.saturating_sub(width / 10)
                 ..playhead.saturating_add(width).min(p.pieces().end);
@@ -872,7 +888,7 @@ mod tests {
         assert_eq!(
             timed(watching(3, Some(90))),
             Shape::Split {
-                window: 75,
+                unshared: 75,
                 committed: 67
             },
             "ninety seconds of forward reach and ninety of sharing: 568 MiB of a 10 GiB cache, \
@@ -881,7 +897,7 @@ mod tests {
         assert_eq!(
             timed(watching(3, Some(4 * 60))),
             Shape::Split {
-                window: 199,
+                unshared: 199,
                 committed: 67
             },
             "the Large profile buys four minutes of the same stream"
@@ -900,7 +916,7 @@ mod tests {
         assert_eq!(
             timed(watching(3, None)),
             Shape::Split {
-                window: 2493,
+                unshared: 2493,
                 committed: 67
             },
             "no cap on the window, and it takes everything the committed set does not"
@@ -938,7 +954,7 @@ mod tests {
                 ..watching(3, Some(90))
             }),
             Shape::Split {
-                window: 166,
+                unshared: 166,
                 committed: 67
             },
             "the window holds the 600 MiB an open stream is fetching, not the 90 seconds asked for"
@@ -960,7 +976,7 @@ mod tests {
                 ..Buffering::default()
             }),
             Shape::Split {
-                window: 1280,
+                unshared: 1280,
                 committed: 1280
             },
             "no rate, no time cap: the budget halved, as before"
@@ -996,7 +1012,7 @@ mod tests {
         assert_eq!(
             p.shape(),
             Shape::Split {
-                window: 1280,
+                unshared: 1280,
                 committed: 1280
             }
         );
@@ -1004,7 +1020,7 @@ mod tests {
         assert_eq!(
             p.shape(),
             Shape::Split {
-                window: 75,
+                unshared: 75,
                 committed: 67
             }
         );
@@ -1103,7 +1119,7 @@ mod tests {
         assert_eq!(
             roomy.shape(),
             Shape::Split {
-                window: 20,
+                unshared: 20,
                 committed: 20
             },
             "a reach of eighteen pieces already covers nine: the floor is a no-op"
@@ -1121,7 +1137,7 @@ mod tests {
         assert_eq!(
             tight.shape(),
             Shape::Split {
-                window: 9,
+                unshared: 9,
                 committed: 0
             },
             "the window takes the whole budget and then some, and the committed half is nothing"
@@ -1171,18 +1187,18 @@ mod tests {
     #[test]
     fn a_stream_nothing_can_be_shared_from_spends_the_whole_budget_on_the_window() {
         let shared = policy(10, 40);
-        let alone = unshared(10, 40);
+        let alone = shares_nothing(10, 40);
         assert_eq!(
             shared.shape(),
             Shape::Split {
-                window: 5,
+                unshared: 5,
                 committed: 5
             }
         );
         assert_eq!(
             alone.shape(),
             Shape::Split {
-                window: 10,
+                unshared: 10,
                 committed: 0
             },
             "twice the window, because none of it is being kept for a peer"
@@ -1199,7 +1215,7 @@ mod tests {
     /// disk holds a window and no more.
     #[test]
     fn an_unshared_stream_commits_nothing_and_holds_only_its_window() {
-        let mut p = unshared(10, 40);
+        let mut p = shares_nothing(10, 40);
         let mut disk = BTreeSet::new();
         play(&mut p, &mut disk, 0..40);
         assert!(
@@ -1249,7 +1265,7 @@ mod tests {
         assert_eq!(
             short.shape(),
             Shape::Split {
-                window: 10,
+                unshared: 10,
                 committed: 9
             }
         );
@@ -1260,10 +1276,14 @@ mod tests {
     #[test]
     fn nothing_outside_the_committed_set_is_ever_advertised() {
         let mut p = policy(30, 500);
-        let Shape::Split { window, committed } = p.shape() else {
+        let Shape::Split {
+            unshared,
+            committed,
+        } = p.shape()
+        else {
             panic!("a 500-piece file does not fit in 30 pieces");
         };
-        assert_eq!((window, committed), (15, 15));
+        assert_eq!((unshared, committed), (15, 15));
         let mut disk: BTreeSet<u32> = BTreeSet::new();
         let mut ever_advertised: BTreeSet<u32> = BTreeSet::new();
 
@@ -1271,7 +1291,7 @@ mod tests {
             // Everything outside what a consumer here would be fetched is
             // offered up, which is the walk's to say and not the policy's.
             let arriving =
-                playhead.saturating_sub(window / 10)..playhead.saturating_add(window).min(500);
+                playhead.saturating_sub(unshared / 10)..playhead.saturating_add(unshared).min(500);
             let giving_up: Vec<u32> = disk
                 .iter()
                 .copied()
@@ -1291,15 +1311,15 @@ mod tests {
                 p.advertised().iter().all(|piece| disk.contains(piece)),
                 "advertising a piece that is not on disk"
             );
-            // The window, the committed set, and the overhang of what a
+            // The unshared, the committed set, and the overhang of what a
             // walk put on the disk this step: the policy gives back what it
-            // is offered, and it is offered what was outside the window
+            // is offered, and it is offered what was outside the unshared
             // *before* this step's arrivals.
             assert!(
-                disk.len() <= (window + committed + window / 10) as usize,
+                disk.len() <= (unshared + committed + unshared / 10) as usize,
                 "held {} pieces on a budget of {}",
                 disk.len(),
-                window + committed
+                unshared + committed
             );
         }
         assert_eq!(p.advertised().len(), committed as usize);
@@ -1355,7 +1375,7 @@ mod tests {
         assert_eq!(
             p.shape(),
             Shape::Split {
-                window: 5,
+                unshared: 5,
                 committed: 5
             }
         );
@@ -1662,14 +1682,17 @@ mod tests {
             .unwrap();
             match p.shape() {
                 Shape::Whole => assert!(budget_bytes >= bytes),
-                Shape::Split { window, committed } => {
+                Shape::Split {
+                    unshared,
+                    committed,
+                } => {
                     assert!(budget_bytes < bytes);
                     assert_eq!(
-                        u64::from(window + committed),
+                        u64::from(unshared + committed),
                         budget_bytes / PIECE,
                         "the halves must sum to the budget"
                     );
-                    assert!(window >= committed, "the odd piece goes to the window");
+                    assert!(unshared >= committed, "the odd piece goes to the unshared");
                 }
             }
 
@@ -1680,7 +1703,7 @@ mod tests {
                 // which is what the walk is measuring the ceiling of.
                 let width = match p.shape() {
                     Shape::Whole => count,
-                    Shape::Split { window, .. } => window.max(1),
+                    Shape::Split { unshared, .. } => unshared.max(1),
                 };
                 disk.extend(playhead..playhead.saturating_add(width).min(count));
                 let everything: Vec<u32> = disk.iter().copied().collect();
@@ -1692,7 +1715,10 @@ mod tests {
                     // One piece over, and only when the budget is nothing:
                     // the window is never empty.
                     Shape::Whole => count as usize,
-                    Shape::Split { window, committed } => (window.max(1) + committed) as usize,
+                    Shape::Split {
+                        unshared,
+                        committed,
+                    } => (unshared.max(1) + committed) as usize,
                 };
                 assert!(
                     disk.len() <= ceiling,

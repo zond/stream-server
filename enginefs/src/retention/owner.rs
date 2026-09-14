@@ -2697,12 +2697,12 @@ impl<B: Backing> State<B> {
             return Ok(());
         };
         let policy = B::policy(&self.domain, bytes, self.buffering())?;
-        let Shape::Split { window, .. } = policy.shape() else {
+        let Shape::Split { unshared, .. } = policy.shape() else {
             // The budget covers it: nothing here will reclaim anything, and
             // a reader inside it is inside all of it.
             return Ok(());
         };
-        self.stride = stride_for::<B>(window);
+        self.stride = stride_for::<B>(unshared);
         self.installed = Some(Installed {
             budget,
             policy,
@@ -2717,7 +2717,7 @@ impl<B: Backing> State<B> {
     /// is still the one in force. Under the turn.
     fn resize_policy(&mut self, _turn: &mut Turn, budget: CacheBudget, policy: RetentionPolicy) {
         self.stride = match policy.shape() {
-            Shape::Split { window, .. } => stride_for::<B>(window),
+            Shape::Split { unshared, .. } => stride_for::<B>(unshared),
             Shape::Whole => 1,
         };
         for reader in self.readers.values_mut() {
@@ -2744,7 +2744,7 @@ impl<B: Backing> State<B> {
     ) {
         self.domain = domain;
         self.stride = match policy.shape() {
-            Shape::Split { window, .. } => stride_for::<B>(window),
+            Shape::Split { unshared, .. } => stride_for::<B>(unshared),
             Shape::Whole => 1,
         };
         for reader in self.readers.values_mut() {
@@ -2795,9 +2795,9 @@ impl<B: Backing> State<B> {
         let buffering = self.buffering();
         let installed = self.installed.as_mut()?;
         if installed.policy.observe(buffering)
-            && let Shape::Split { window, .. } = installed.policy.shape()
+            && let Shape::Split { unshared, .. } = installed.policy.shape()
         {
-            self.stride = stride_for::<B>(window);
+            self.stride = stride_for::<B>(unshared);
         }
         let installed = self.installed.as_mut()?;
         let decision = installed.policy.advance(giving_up, held);
@@ -5243,7 +5243,7 @@ mod tests {
                 .and_then(|holding| holding.installed)
                 .map(|installed| installed.shape),
             Some(Shape::Split {
-                window: 5,
+                unshared: 5,
                 committed: 1
             }),
             "one report, nothing to measure it against, and the cap binds"
@@ -5539,7 +5539,7 @@ mod tests {
                 .and_then(|holding| holding.installed)
                 .map(|installed| installed.shape),
             Some(Shape::Split {
-                window: 5,
+                unshared: 5,
                 committed: 1
             }),
             "the cap binds on a length alone"
