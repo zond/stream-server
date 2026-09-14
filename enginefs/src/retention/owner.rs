@@ -1747,8 +1747,26 @@ impl<B: Backing> Retention<B> {
     /// -- and it leaves nothing installed. [`Mode::Live`] is the pass the
     /// rest of this file describes.
     pub async fn pass(&self, key: &B::Key, store: &B::Store, claim: Claim, mode: Mode) -> Outcome {
+        self.pass_at(key, store, claim, mode, std::time::Instant::now())
+            .await
+    }
+
+    /// [`Self::pass`] with the clock handed in: `now` is what the pass
+    /// measures against on the far side of its listing ([`Asking::now`]),
+    /// so a harness that stamps its reads from its own clock can run the
+    /// pass on that clock too. A pass that read the wall clock beside reads
+    /// stamped `t0 + elapsed` saw no time pass at all: no stream ever
+    /// idled, no report was ever due.
+    pub async fn pass_at(
+        &self,
+        key: &B::Key,
+        store: &B::Store,
+        claim: Claim,
+        mode: Mode,
+        now: std::time::Instant,
+    ) -> Outcome {
         match mode {
-            Mode::Live => self.live_pass(key, store, claim).await,
+            Mode::Live => self.live_pass(key, store, claim, now).await,
             Mode::Slack { opens } => self.slack_pass(key, store, claim, opens).await,
         }
     }
@@ -1829,16 +1847,19 @@ impl<B: Backing> Retention<B> {
         if self.backing.is_live(key) {
             return Self::slack_nothing(claim);
         }
-        {
+        // Read under L2 and logged after it (rule 2: no tracing under the
+        // lock).
+        let opened_since = {
             let state = entity.state.lock();
-            if state.opens != opens || state.observed_readers() > 0 {
-                tracing::debug!(
-                    key = ?key,
-                    "a stream opened on this entity since its mode was decided; \
-                     the slack pass takes nothing"
-                );
-                return Self::slack_nothing(claim);
-            }
+            state.opens != opens || state.observed_readers() > 0
+        };
+        if opened_since {
+            tracing::debug!(
+                key = ?key,
+                "a stream opened on this entity since its mode was decided; \
+                 the slack pass takes nothing"
+            );
+            return Self::slack_nothing(claim);
         }
         let domain = entity.state.lock().domain.clone();
         let extent = B::extent(&domain);
@@ -1938,7 +1959,13 @@ impl<B: Backing> Retention<B> {
     /// that measured nothing because the policy was replaced under it owes
     /// one outright, because the byte that replaced it was due and could not
     /// start one.
-    async fn live_pass(&self, key: &B::Key, store: &B::Store, mut claim: Claim) -> Outcome {
+    async fn live_pass(
+        &self,
+        key: &B::Key,
+        store: &B::Store,
+        mut claim: Claim,
+        now: std::time::Instant,
+    ) -> Outcome {
         let Some(entity) = self.lookup(key) else {
             // No entity: no L2 to decide under, and no note that could race
             // the release, because a note is made on an entity.
@@ -1990,9 +2017,8 @@ impl<B: Backing> Retention<B> {
             let state = entity.state.lock();
             return Self::nothing(&state, claim, about, Some(begin.at));
         };
-        // The one reading of the clock, on the far side of the listing;
-        // see `Asking::now`.
-        let now = std::time::Instant::now();
+        // The one reading of the clock this pass measures against, handed
+        // in by `pass_at`; see `Asking::now`.
         // **What this entity's consumers are asking of the disk**, answered
         // against the listing above: what to fetch ahead of them, what no
         // unlink may touch, and what to give back if something must go.
@@ -6119,6 +6145,41 @@ mod tests {
         assert!(
             exempt.holds(6),
             "the promise made under the publication was overwritten by it"
+        );
+    }
+
+    /// **The pass runs on the clock it is handed.**
+    ///
+    /// The scenario harness stamps its reads from its own clock, `t0`
+    /// plus the beat's offset, and ran the pass on the wall clock beside
+    /// them: to the detector no time ever passed, so no stream in any
+    /// scenario ever idled and no report was ever due. A pass handed
+    /// `t0 + 60 s` after a read at `t0` finds that stream gone.
+    #[tokio::test]
+    async fn the_pass_measures_against_the_clock_it_is_handed() {
+        let (backing, owner, _budget) = torrent();
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        let t0 = std::time::Instant::now();
+        owner.note_position(&0, (0, 0));
+        backing.note_read(1, 0, PIECE, t0);
+
+        let claim = owner.turn(&0).await.expect("the turn");
+        let concluded = owner
+            .pass_at(
+                &0,
+                &(),
+                claim,
+                Mode::Live,
+                t0 + std::time::Duration::from_secs(60),
+            )
+            .await
+            .concluded
+            .expect("a pass");
+        assert!(
+            concluded.windows.is_empty(),
+            "a stream last read a minute ago on the pass's clock was still granted a \
+             window: {:?}",
+            concluded.windows
         );
     }
 

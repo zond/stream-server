@@ -99,6 +99,11 @@ struct Stream {
     /// never been granted. A window grows for a consumer that is
     /// consuming; see [`Stream::grant`].
     granted_for: Option<Instant>,
+    /// The last sample [`Self::sample`] admitted: what the consumer ate and
+    /// the gap it took, from the previous read's return to this one's
+    /// arrival. Kept raw for the trace ([`Streams::last_sample`]), so a
+    /// reading of the field log can check the rate's arithmetic.
+    sampled: Option<(u64, std::time::Duration)>,
 }
 
 impl Stream {
@@ -168,6 +173,7 @@ impl Stream {
             return;
         }
         let sample = (consumed as f64 / gap.as_secs_f64()) as u64;
+        self.sampled = Some((consumed, gap));
         // **Seeded from the film's own arithmetic, not from the first
         // sample.** A stream nothing has measured is already fetched at the
         // ceiling -- that is what `demand` does with a `None` rate -- so
@@ -487,6 +493,7 @@ impl FileStreams {
             rate: None,
             window: 0,
             granted_for: None,
+            sampled: None,
         });
         Some(Rejected::Outside)
     }
@@ -703,14 +710,6 @@ impl Streams {
         piece: u64,
         now: Instant,
     ) -> Option<Rejected> {
-        // **Every file's idle streams, not only this one's.** A stream
-        // expires by not being read, and a file nobody reads any more has
-        // no pass of its own to notice: its streams sat in the map with
-        // their windows published as exempt for as long as another file of
-        // the entity kept being played.
-        for streams in self.by_file.values_mut() {
-            streams.expire(now);
-        }
         let pending = std::mem::take(&mut self.pending);
         let mut last = None;
         let mut waiting = Vec::new();
@@ -742,6 +741,15 @@ impl Streams {
         let overflow = waiting.len().saturating_sub(WAITING_READS);
         waiting.drain(..overflow);
         self.pending = waiting;
+        // **Every file's idle streams, not only this one's.** A stream
+        // expires by not being read, and a file nobody reads any more has
+        // no pass of its own to notice: its streams sat in the map with
+        // their windows published as exempt for as long as another file of
+        // the entity kept being played. After the reads above, so a stream
+        // a stale read just started is judged as of `now` like the rest.
+        for streams in self.by_file.values_mut() {
+            streams.expire(now);
+        }
         last
     }
 
@@ -916,12 +924,7 @@ impl Streams {
     /// may only ever lower the film's own arithmetic. These two halves stay
     /// raw so a field log can be read against the window a pass sized.
     pub fn last_sample(&self, file: usize) -> Option<(u64, std::time::Duration)> {
-        let streams = &self.by_file.get(&file)?.streams;
-        let stream = streams.last()?;
-        Some((
-            stream.last.size(),
-            stream.last.returned - stream.last.arrived,
-        ))
+        self.by_file.get(&file)?.streams.last()?.sampled
     }
 }
 
@@ -1412,6 +1415,52 @@ mod tests {
         );
     }
 
+    /// **The last sample reported is the one the rate was made from.**
+    ///
+    /// The trace prints `consumed` and `gap_ms` as the two halves of the
+    /// last rate sample, so a reading of the field log can check the
+    /// arithmetic. What it printed was the last read's size beside how long
+    /// *we* took to serve it -- `returned - arrived`, the one pairing the
+    /// `Read` doc rules out, since it books a stall on a missing piece as
+    /// the consumer thinking. The sample is the previous read's bytes over
+    /// the gap from its return to the next read's arrival.
+    #[test]
+    fn the_last_sample_is_what_the_rate_was_made_from() {
+        let t0 = Instant::now();
+        let held = run(0..8);
+        let mut streams = file_at(0);
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        // Served in 300 ms; the consumer came back 700 ms after that.
+        streams.observe(
+            1,
+            Read {
+                begin: 0,
+                end: 262_144,
+                arrived: ms(0),
+                returned: ms(300),
+            },
+            &held,
+            PIECE,
+        );
+        streams.observe(
+            1,
+            Read {
+                begin: 262_144,
+                end: 524_288,
+                arrived: ms(1_000),
+                returned: ms(1_100),
+            },
+            &held,
+            PIECE,
+        );
+        assert_eq!(
+            streams.streams[0].sampled,
+            Some((262_144, Duration::from_millis(700))),
+            "the sample is the bytes the consumer ate over the gap it took, not \
+             our own service latency"
+        );
+    }
+
     /// A sample that measures nothing is refused rather than folded in.
     ///
     /// Two shapes of nothing. A gap of zero divides by it -- and `inf as
@@ -1468,6 +1517,7 @@ mod tests {
             rate: Some(rate),
             window: u64::MAX,
             granted_for: None,
+            sampled: None,
         });
     }
 

@@ -38,6 +38,18 @@ use crate::retention::CacheBudget;
 /// making the log the reason the phone is busy.
 const INTERVAL: Duration = Duration::from_secs(10);
 
+/// How long an entity nobody has passed over stays in [`SEEN`]. The map is
+/// keyed by entity and only ever grew: on the proxy that is one entry per
+/// URL ever proxied, for the life of the process. An entity quiet for this
+/// long is forgotten; if it is passed over again its first line is a
+/// fresh one with no deltas, which is what a new entity gets.
+const STALE: Duration = Duration::from_secs(60);
+
+/// Forget every entity not seen for [`STALE`] as of `now`.
+fn sweep(seen: &mut HashMap<String, Was>, now: Instant) {
+    seen.retain(|_, was| now.duration_since(was.at) < STALE);
+}
+
 /// What the backing can say that the owner cannot; `None` for a backing
 /// that counts none of it (the proxy).
 #[derive(Debug, Clone, Copy)]
@@ -120,6 +132,7 @@ pub fn pass<K: Debug>(key: &K, sample: Pass<'_>) {
                         held as i64 - was.held as i64,
                     )
                 });
+                sweep(&mut seen, now);
                 seen.insert(
                     name.clone(),
                     Was {
@@ -269,4 +282,28 @@ pub fn streams_seen(seen: StreamsSeen<'_>) {
         stage = "streams_seen",
         "what the reads of this file look like"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **An entity nobody passes over any more is forgotten.** The map
+    /// grew by one entry per proxied URL for the life of the process.
+    #[test]
+    fn an_entity_not_seen_for_a_minute_leaves_the_map() {
+        let now = Instant::now();
+        let was = |at: Instant| Was {
+            at,
+            fetched: 0,
+            verified: 0,
+            held: 0,
+        };
+        let mut seen = HashMap::new();
+        seen.insert("stale".to_string(), was(now - 2 * STALE));
+        seen.insert("fresh".to_string(), was(now - INTERVAL));
+        sweep(&mut seen, now);
+        assert_eq!(seen.len(), 1, "the stale entity stayed: {:?}", seen.keys());
+        assert!(seen.contains_key("fresh"));
+    }
 }

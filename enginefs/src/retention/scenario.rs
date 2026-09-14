@@ -1207,6 +1207,9 @@ impl Scenario {
     }
 
     fn pass(&mut self) {
+        // The pass runs on the scenario's clock, the one its reads are
+        // stamped from; see `Retention::pass_at`.
+        let now = self.instant();
         let before = self.backing.held.lock().clone();
         let claim = self
             .runtime
@@ -1217,7 +1220,7 @@ impl Scenario {
             let owner = self.owner.clone();
             let runtime = &self.runtime;
             tracing::subscriber::with_default(Collector(lines.clone()), || {
-                runtime.block_on(owner.pass(&FILE, &(), claim, Mode::Live))
+                runtime.block_on(owner.pass_at(&FILE, &(), claim, Mode::Live, now))
             })
         };
         let after = self.backing.held.lock().clone();

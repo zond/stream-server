@@ -1389,9 +1389,17 @@ mod tests {
         // Everything held is offered up; only what this file owns, holds,
         // and has not committed can be given away.
         let disk = held([0, 5, 99, 100, 147, 150, 199, 200, 4000]);
-        let everything: Vec<u32> = disk.iter().copied().collect();
+        // And one piece of this file the disk does not hold, offered up
+        // anyway -- a ledger entry a moment staler than the listing.
+        let mut everything: Vec<u32> = disk.iter().copied().collect();
+        everything.push(160);
         let d = p.advance(&everything, &disk);
         assert_eq!(d.committed, vec![147], "the one drawn piece we hold");
+        assert!(
+            !d.reclaim.contains(&160),
+            "a piece the disk does not hold was offered for reclaim: {:?}",
+            d.reclaim
+        );
         assert_eq!(
             d.reclaim,
             vec![100, 150, 199],
