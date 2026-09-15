@@ -66,106 +66,10 @@ Still stale:
 
 ## Open issues
 
-### In the field
-
-**Settled 2026-09-14 (`d9ad179`, rqbit `bb6bad9b`; the build measured was
-xtremio `73f77b0`, which pins that commit).** The unverified figure
-was the duplication the fork itself was doing, and the numbers close:
-
-| log | fetched | verified | unverified |
-| --- | --- | --- | --- |
-| 04:20 | 592 MB | 382 MB | 35.5% |
-| 06:52 | 416 MB | 281 MB | 32.4% |
-| 15:05 | 708 MB | 668 MB | **5.7%** |
-
-Three changes, in the order they mattered: a request is filtered against
-`chunk_status` before it goes out; splitting and second copies are confined
-to the first two pieces of the lookahead, so every piece past them is
-fetched by one peer and stolen if that peer is ten times slower; and a
-second copy is paid for by a delivery of the same piece, against a claim
-that has delivered nothing over at least as long. 5.7% is about the
-in-flight floor -- chunks of pieces not yet complete, which leave the
-number when the piece checks.
-
-1. **Head-of-line blocking**, which is no longer a bandwidth problem: in
-   the 15:05 log a read blocked 13.4 s on piece 965 and 7.6 s on piece 966
-   while the swarm delivered 12-16 MB/s from 16-17 connected seeders, with
-   every other blocked read at 1.2-2.6 s.
-
-   **A fix is in and unmeasured** (rqbit `a31258c0`, replacing `f6753192`
-   the same day): every takeover on the piece a stream waits on -- cutting
-   a whole head piece, doubling a stalled claim -- is now justified by one
-   comparison: the asker's last chunk took less time than we have waited
-   on the holder. A peer over its `CLAIMS_PER_PEER` share takes another
-   only once a chunk of its own has landed since the last share went out;
-   a peer that has never delivered outpaces nobody and proves itself on
-   the ordinary queue. The full design and what it replaced (blind
-   doubling, proof-by-finished-claim, a 100 ms grace timer, the `idle`
-   escape) is rqbit's `crates/librqbit/src/CLAIMS.md`.
-
-   What says whether it worked: the long blocked reads, against an
-   unverified figure that must stay near its 5.7% floor. If the reads
-   shorten and the figure climbs, spreading is costing a round trip per
-   peer and `CLAIMS_PER_PEER` is too low.
-
-2. **A stalling link shrinks the window that would have ridden it out.**
-   Field log 2026-09-14 18:21, a wifi-to-mobile switch: `rates=[Some(367710)]`
-   against a 3,568,061 B/s film, and a want set of eight pieces where the
-   film's own arithmetic allows seventy-seven -- about nine seconds of
-   buffer on a link that repeatedly dropped to 32 kB/s for tens of seconds.
-
-   Why the measurement reads low there: a starving player asks again the
-   instant it is answered, so its reads are refused by `Stream::sample`'s
-   admission rule; what survives admission is the moments the player had
-   some buffer and idled, and a long idle over a small read is a *low*
-   sample. On a link that alternates stalling and bursting the admitted
-   samples are systematically the low ones.
-
-   **Half-addressed** (`77309fa`): the rate is seeded from the film's
-   arithmetic rather than set outright by the first admitted sample, so one
-   sample can no longer collapse the window. What is *not* addressed is a
-   sustained bad patch, where the decay still arrives after a dozen-odd
-   samples. Widening the memory was tried and put back -- it only helps a
-   stream that is seeded, and a proxied stream states no duration, so the
-   widening gave it the cost without the benefit (Windows caught it).
-
-   If this needs more, the lever is the admission rule telling a slow
-   consumer from a slow link, not a constant: those two produce identical
-   evidence in delivered bytes, and the film's own size over its duration
-   is the only number immune to it.
-
 ### Open in this repo
 
 Every item below was verified against the tree on 2026-09-14 by a reading
 whose job was partly to say "not real" or "leave it". Three did.
-
-2. **The retention trace module stays, for now** -- `enginefs/src/retention/trace.rs`.
-   Its exit condition is met (the pass has settled over three logs), but it
-   is the *only* place `fetched`/`verified`/`unverified` reach a log at
-   all: the permanent replacement is a lifetime total on
-   `/stream-numbers.json` drawn in the app, not a line in the diagnostics
-   ring a tester sends back. Item 1 above is unmeasured and its named check
-   is the unverified figure. Deleting the instrument before reading the
-   measurement it exists for is the wrong order. **Revisit after the next
-   viewing on `a31258c0`.**
-
-   When it goes, the cascade is larger than it looks, and two things are
-   decisions rather than consequences: `server/src/routes/stream.rs:1179`
-   is a fifth call site the compiler will *not* name, and
-   `staged_over_held` (`piece_store/registry.rs:111`, `store.rs:163,480`)
-   loses its only reader -- its own doc argues it is the only signal
-   separating a read inside a sparse hole from quiet media, so it wants a
-   permanent home beside `refused_reclaims` rather than deletion.
-
-3. **The zip-inside-a-torrent reactor trade stays** -- and the prerequisite
-   I recorded for it does not exist. The torrent-form reader is not a
-   `FileHandle` at all: `server/src/routes/archive.rs:791` takes a raw
-   librqbit `FileStream` through `TorrentHandle::get_file_reader` and wraps
-   it in the route's own `BackendStreamWrapper`, so `read_wakers` /
-   `reads_refused` cannot reach into it. The hang risk is also worse than
-   recorded: `ABANDONED_AFTER` fires on the next *write*, which a thread
-   parked in a torrent read never reaches, so it would leak forever holding
-   the engine `Arc`, the cache handle and the stream. Leave it.
 
 4. **The boundary-piece race is real but not where this file said, and it
    is healed where it is.** `TorrentStorage::remove_file` has no per-file
@@ -236,21 +140,11 @@ whose job was partly to say "not real" or "leave it". Three did.
 
 ### Other repos, not verified on this date
 
-* xtremio's Windows and macOS builds have only ever run in CI; iOS does not
-  build at all (`librqbit-dualstack-sockets` `bind_device`).
 * xtremio's remove/add race when a title is re-added while being removed,
   and `remove()` never releasing a row's replaces debt.
 
 ## Found 2026-09-15, not yet fixed
 
-- **The detector joins a read to a stream by held run alone** -- by design,
-  the disk being what a mistake costs. What went wrong on a fully held film
-  was the position following the last read, so mpv's tail crawl dragged
-  the viewer's stream to the tail. Fixed in 78663e6: the position is a
-  byte-weighted average of where reads end, so the crawler's 91 bytes move
-  it by a rounding error and a viewer's seek converges in a couple of
-  dozen reads; a read about to run out of held bytes places it outright.
-  See `docs/review-2026-09-14.md` N1.
 - **`a_stream_wider_than_its_window_is_fetched_inside_it` is timing-bound.**
   It failed twice in about eight runs on 2026-09-15 while the machine was
   building APKs beside it, and passed on every rerun; it measures bytes
@@ -258,7 +152,37 @@ whose job was partly to say "not real" or "leave it". Three did.
   swarm. Not a regression of anything that day; wants either a wider
   slack or a fake swarm. Its precondition -- the cache filling past half
   the budget in the time allowed -- also failed once on the Windows runner
-  (29 pieces of 32), same cause.
+  (29 pieces of 32), same cause. The LAN media toggle test's loopback probe
+  (`set_lan_media_toggles...`) flakes the same way on CI and passes on a
+  rerun.
+
+## Closed 2026-09-15
+
+Closed by zond after the fifth field log. Kept here in one line each so
+nobody reopens them without knowing why they were shut.
+
+- **Head-of-line blocking.** Verified fixed: the fifth log (xtremio
+  `7de2dea`, rqbit `cc969c7b`) had no read wait over 1.5 s. The design is
+  rqbit's `crates/librqbit/src/CLAIMS.md`.
+- **The retention trace module's keep-until-verified hold.** Its condition
+  is met. The module, and xtremio's TEMPORARY mpv instrumentation, are still
+  in the code; removing them is a separate change, and `staged_over_held`
+  wants a permanent home beside `refused_reclaims` when they go.
+- **A stalling link shrinks the window that would have ridden it out.**
+  Accepted as a cost of streaming a torrent. The seeded rate stops one
+  sample collapsing the window; a sustained bad patch still shrinks it.
+- **A seek to unheld ground ramps its window from the two-piece floor.**
+  Accepted as a cost of streaming a torrent: audio, subtitle and video
+  streams cannot be told apart, so a new stream has no window to inherit.
+- **The zip-inside-a-torrent reactor trade.** Not going to be worked on.
+  The archive route's torrent reader is a raw `FileStream`, not a
+  `FileHandle`, and a thread parked in it would never reach
+  `ABANDONED_AFTER`.
+- **xtremio's desktop builds only run in CI, and iOS does not build**
+  (`librqbit-dualstack-sockets` `bind_device`). Not going to be worked on.
+- **The detector dragging a viewer's stream to mpv's tail crawl.** Fixed
+  in `78663e6` (the byte-weighted position); it was still listed under
+  "not yet fixed".
 
 ## First field log on the latency claim rules (2026-09-15 06:09, xtremio a58f5f0)
 

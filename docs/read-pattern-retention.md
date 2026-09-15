@@ -301,8 +301,9 @@ xtremio, and the lookahead cap does apply to the sum of the streams --
 disk cannot cover them all, which is what makes the shares equal in seconds
 rather than equal in bytes. The field log settled it, as expected.
 
-What is open is in `docs/known-issues.md`, and it is about the swarm rather
-than about this policy.
+What was left open was about the swarm rather than about this policy, and
+was closed on 2026-09-15 as a cost of streaming a torrent; see "Closed
+2026-09-15" in `docs/known-issues.md`.
 
 ## 7. What a stream is
 
