@@ -2,6 +2,8 @@
 name = "enginefs"
 version = "0.1.8"
 edition = "2024"
+# The repository's LICENSE. Unlike `server`, nothing here links GPL code.
+license = "MIT"
 
 [features]
 # Lets a test register an extra trust anchor, so `server`'s proxy tests can
@@ -25,7 +27,7 @@ test-hooks = []
 # `sha1-crypto-hash` (openssl-backed) to `sha1-ring` (aws-lc-rs-backed) and keeps
 # reqwest on rustls, so nothing here pulls in openssl-sys. `http-api-client` is
 # kept because backend/librqbit.rs uses librqbit::api::TorrentIdOrHash.
-librqbit = { git = "https://github.com/zond/rqbit", rev = "cc969c7b12b12417b812f988859a8a854b84c39a", default-features = false, features = [
+librqbit = { git = "https://github.com/zond/rqbit", rev = "cd4d660a9ede70d2484d9d5930ff19c126edc048", default-features = false, features = [
     "rust-tls",
     "http-api-client",
 ] }
@@ -36,7 +38,7 @@ librqbit = { git = "https://github.com/zond/rqbit", rev = "cc969c7b12b12417b812f
 # and would not satisfy the trait. `default-features=false` keeps its
 # `sha1-crypto-hash` default out of the feature union, which is what the note
 # above is protecting.
-librqbit-core = { git = "https://github.com/zond/rqbit", rev = "cc969c7b12b12417b812f988859a8a854b84c39a", default-features = false }
+librqbit-core = { git = "https://github.com/zond/rqbit", rev = "cd4d660a9ede70d2484d9d5930ff19c126edc048", default-features = false }
 tokio = { version = "1.42.0", features = [
     "rt-multi-thread",
     "macros",
