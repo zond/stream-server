@@ -4946,6 +4946,9 @@ mod tests {
 
     #[derive(Default)]
     struct FakeCounters {
+        /// Every `piece_claims_at` the blocked-read probe asked, as
+        /// `(file_idx, offset)`.
+        claims_asked: Mutex<Vec<(usize, u64)>>,
         reconcile_file_priorities: AtomicUsize,
         prepare_file_for_streaming: AtomicUsize,
         get_file_reader: AtomicUsize,
@@ -5578,6 +5581,21 @@ mod tests {
         /// can be sized without a layout.
         fn piece_length(&self) -> Option<u64> {
             Some(self.files.first()?.length / self.pieces_per_file())
+        }
+
+        fn piece_claims_at(&self, file_idx: usize, offset: u64) -> Vec<crate::backend::ClaimLine> {
+            self.counters
+                .claims_asked
+                .lock()
+                .unwrap()
+                .push((file_idx, offset));
+            vec![crate::backend::ClaimLine {
+                peer: "10.0.0.1:6881".to_string(),
+                chunks: 0..16,
+                missing: 3,
+                waited_ms: 1_500,
+                latency_ms: Some(120),
+            }]
         }
 
         async fn drop_pieces(
@@ -8578,6 +8596,62 @@ mod tests {
                 .promised,
             vec![0..1],
             "the piece under the parked read's cursor"
+        );
+        drop(reader);
+        drop(enginefs);
+    }
+
+    /// **A read parked for two seconds asks who holds its piece.**
+    ///
+    /// The blocked-read log fires on completion and cannot say why the
+    /// read waited: the piece is done by then and its claims are gone. The
+    /// probe asks the backend while the read is still parked, so the
+    /// field's 24- and 30-second blocks come back with holders, missing
+    /// chunks, waits and latencies beside them rather than a guess.
+    #[tokio::test]
+    async fn a_read_parked_for_two_seconds_asks_who_holds_its_piece() {
+        let (enginefs, counters) = test_enginefs_for_reconciler(1);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.reconcile_tick().await;
+        engine.retention.install(0, 0).await;
+
+        use tokio::io::AsyncRead;
+        let opening = crate::files::Opening {
+            file_idx: 0,
+            start_offset: 40,
+            lookahead_bytes: 0,
+            buffer: crate::backend::priorities::BufferProfile::Normal,
+        };
+        let on_entity = opening.reader_on(&engine.retention);
+        let mut reader = crate::files::FileHandle::new(
+            100,
+            "video-0.mkv".to_string(),
+            Box::new(ParkedStream),
+            engine.clone(),
+            opening,
+            on_entity,
+        );
+        engine.active_streams.fetch_add(1, Ordering::SeqCst);
+        let mut buf = [0u8; 16];
+        let parked = std::future::poll_fn(|cx| {
+            let polled = std::pin::Pin::new(&mut reader)
+                .poll_read(cx, &mut tokio::io::ReadBuf::new(&mut buf));
+            std::task::Poll::Ready(matches!(polled, std::task::Poll::Pending))
+        })
+        .await;
+        assert!(parked, "`ParkedStream` never completes a read");
+        assert!(
+            counters.claims_asked.lock().unwrap().is_empty(),
+            "nothing is asked the moment a read parks; most waits are short"
+        );
+
+        tokio::time::sleep(crate::files::BLOCKED_READ_PROBE_AFTER + Duration::from_millis(500))
+            .await;
+        assert_eq!(
+            *counters.claims_asked.lock().unwrap(),
+            vec![(0, 40)],
+            "two seconds into the wait, the backend was asked who holds the piece under \
+             the read"
         );
         drop(reader);
         drop(enginefs);

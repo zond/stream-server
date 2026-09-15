@@ -15,6 +15,14 @@ use tokio::io::{AsyncRead, AsyncSeek};
 /// side like nothing happening.
 pub const BLOCKED_READ_LOG_THRESHOLD: Duration = Duration::from_secs(1);
 
+/// How long a read waits on a piece before its holders are logged
+/// ([`FileHandle::arm_blocked_probe`]), and how much longer before they are
+/// logged once more. Two seconds is past any wait a healthy swarm produces;
+/// the second line, ten seconds in, is for the reads that block for
+/// thirty, so the log shows whether the holders changed.
+pub(crate) const BLOCKED_READ_PROBE_AFTER: Duration = Duration::from_secs(2);
+const BLOCKED_READ_PROBE_AGAIN: Duration = Duration::from_secs(8);
+
 /// Where the reader is and how long its current read has been parked.
 ///
 /// Split out from [`FileHandle`] so the arithmetic behind the blocked-read
@@ -169,6 +177,10 @@ pub struct FileHandle<H: TorrentHandle> {
     /// for, and this handle does not exist until after that await. See
     /// there for what runs in the gap.
     reader: Option<crate::retention::owner::Reader<crate::engine::TorrentBacking<H>>>,
+    /// Whether a probe of the piece this read is parked on is armed; see
+    /// [`Self::arm_blocked_probe`]. Set when the read parks, cleared when
+    /// it is served, read by the probe task before it logs.
+    probe: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// What one read of one file is: where in the torrent, where in the file,
@@ -319,7 +331,59 @@ impl<H: TorrentHandle> FileHandle<H> {
             cursor: ReadCursor::new(start_offset),
             reader_id,
             reader,
+            probe: Arc::default(),
         }
+    }
+
+    /// **Say who holds the piece this read is waiting on**, two seconds in
+    /// and again ten seconds in, if it is still waiting by then.
+    ///
+    /// The blocked-read log fires on completion and says how long; it
+    /// cannot say why, because by then the piece is done and its claims
+    /// are gone. The field's 24- and 30-second blocks on the latency claim
+    /// rules (2026-09-15) could only be guessed at. This asks the backend
+    /// while the read is parked: each holder, its chunks, how many are
+    /// missing, how long since it last delivered and what its own last
+    /// chunk took -- the two halves of the takeover rule, so the line says
+    /// why nobody took the claim over. A task rather than a check in
+    /// `poll_read`, which is not polled while the read is parked.
+    fn arm_blocked_probe(&self) {
+        if self.probe.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let probe = self.probe.clone();
+        let engine = self.engine.clone();
+        let (file_idx, offset) = (self.file_idx, self.cursor.position);
+        runtime.spawn(async move {
+            let mut waited = Duration::ZERO;
+            for delay in [BLOCKED_READ_PROBE_AFTER, BLOCKED_READ_PROBE_AGAIN] {
+                tokio::time::sleep(delay).await;
+                waited += delay;
+                if !probe.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                let claims = engine.handle.piece_claims_at(file_idx, offset);
+                let piece_length = engine.handle.piece_length();
+                tracing::info!(
+                    info_hash = %engine.info_hash,
+                    file_idx,
+                    offset,
+                    piece = ReadCursor::piece_of(offset, 0, piece_length),
+                    waited_ms = waited.as_millis() as u64,
+                    holders = claims.len(),
+                    claims = %claims
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                    stage = "blocked_read_claims",
+                    "a read is waiting on a piece; who holds it"
+                );
+            }
+        });
     }
 
     /// The error a read on a torrent stopped for want of disk space fails
@@ -384,6 +448,7 @@ impl<H: TorrentHandle> AsyncRead for FileHandle<H> {
                 self.engine
                     .register_read_waker(self.reader_id, cx.waker().clone());
                 self.cursor.park(Instant::now());
+                self.arm_blocked_probe();
                 // **What this read is blocked on**, which is the one thing
                 // the swarm should be fetching before anything else.
                 //
@@ -400,6 +465,7 @@ impl<H: TorrentHandle> AsyncRead for FileHandle<H> {
                 }
             }
             Poll::Ready(ref result) => {
+                self.probe.store(false, std::sync::atomic::Ordering::SeqCst);
                 let delivered = if result.is_ok() {
                     buf.filled().len().saturating_sub(before) as u64
                 } else {

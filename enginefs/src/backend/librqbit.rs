@@ -2763,6 +2763,31 @@ impl TorrentHandle for LibrqbitHandle {
             .map(|m| m.lengths().default_piece_length() as u64)
     }
 
+    fn piece_claims_at(&self, file_idx: usize, offset: u64) -> Vec<crate::backend::ClaimLine> {
+        let Some(metadata) = self.handle.metadata.load_full() else {
+            return Vec::new();
+        };
+        let Some(file) = metadata.file_infos.get(file_idx) else {
+            return Vec::new();
+        };
+        let piece_length = u64::from(metadata.lengths().default_piece_length()).max(1);
+        let Ok(piece) = u32::try_from(file.offset_in_torrent.saturating_add(offset) / piece_length)
+        else {
+            return Vec::new();
+        };
+        self.handle
+            .piece_claims(piece)
+            .into_iter()
+            .map(|claim| crate::backend::ClaimLine {
+                peer: claim.peer.to_string(),
+                chunks: claim.chunks,
+                missing: claim.missing,
+                waited_ms: claim.waited.as_millis() as u64,
+                latency_ms: claim.latency.map(|latency| latency.as_millis() as u64),
+            })
+            .collect()
+    }
+
     /// Select `file_idx` as the only wanted file (exclusive downloading, per
     /// the trait contract) on multi-file torrents. Blocks (bounded) while the
     /// torrent is still Initializing -- librqbit refuses selection updates in

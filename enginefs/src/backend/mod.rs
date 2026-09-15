@@ -307,6 +307,43 @@ pub enum RunState {
 // over (`engine::TorrentBacking<H>`), and the owner's `Backing` is `'static`
 // so a pass can be spawned as a task. Every handle is a concrete type with
 // no borrow in it, so nothing is excluded.
+/// One holder of a claim on a piece a read is waiting on, as the blocked
+/// read's diagnostic prints it: the two halves of the backend's takeover
+/// rule (rqbit's `CLAIMS.md`) beside what is left to fetch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimLine {
+    /// The peer, as an address.
+    pub peer: String,
+    /// The chunks of the piece it holds.
+    pub chunks: Range<u32>,
+    /// How many of them have not landed.
+    pub missing: u32,
+    /// How long we have waited on its last delivery of this piece, or
+    /// since it was asked if it has delivered nothing.
+    pub waited_ms: u64,
+    /// How long its own last chunk took, request to arrival; `None` for a
+    /// peer that has never delivered.
+    pub latency_ms: Option<u64>,
+}
+
+impl std::fmt::Display for ClaimLine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {}..{} missing={} waited={}ms latency={}",
+            self.peer,
+            self.chunks.start,
+            self.chunks.end,
+            self.missing,
+            self.waited_ms,
+            match self.latency_ms {
+                Some(ms) => format!("{ms}ms"),
+                None => "none".to_string(),
+            }
+        )
+    }
+}
+
 #[async_trait::async_trait]
 pub trait TorrentHandle: Send + Sync + Clone + 'static {
     fn info_hash(&self) -> String;
@@ -632,6 +669,14 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
     /// until metadata resolves, or for a backend without pieces.
     fn piece_length(&self) -> Option<u64> {
         None
+    }
+    /// Who holds the piece under `offset` of `file_idx`, and how each is
+    /// doing -- the diagnostic a read that has waited seconds on that piece
+    /// logs, so the log says why nobody took the claim over rather than
+    /// leaving it to be guessed. Empty for a backend without claims, a
+    /// piece nobody holds, or a torrent that is not live.
+    fn piece_claims_at(&self, _file_idx: usize, _offset: u64) -> Vec<ClaimLine> {
+        Vec::new()
     }
     /// Open a reader on `file_idx` at `start_offset` that asks the backend
     /// to fetch `lookahead_bytes` ahead of wherever it reads, and no more.
