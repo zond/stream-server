@@ -71,46 +71,8 @@ Still stale:
 Each entry carries its plan, agreed with zond on 2026-09-15. Order is the
 order to do them in.
 
-- **The pin set is read at one moment and acted on at another.** The pass
-  reads `pinned` (`engine.rs:362`, an `RwLock<BTreeSet>` on the engine)
-  through `pinned_spans` while deciding, then awaits the backend to drop
-  or release; `pin_download_locked` (`lib.rs:3630`) writes the set under
-  no lock the pass takes. Since `6744894` `rewant_pins_crossed_by` re-reads
-  the pins after every act and re-wants what a pin has since claimed, so
-  the cost is one boundary piece fetched twice -- but the decision itself
-  can be made on stale pins for the whole pass, and the heal is an
-  after-the-fact re-ask, the shape every retention defect has had.
-
-  *Plan.* The owner design, applied to pins: the pinned set moves into the
-  entity's retention state and is written through the owner
-  (`Retention::pin`/`unpin`, under the lock the pass decides under), so a
-  decision is made against the current pins by construction. The act
-  still happens outside the lock; a pin that arrives while a run is doomed
-  finds it marked so and is answered by the owner re-wanting it when the
-  act reports back -- one explicit state, not a window. That replaces the
-  global `rewant_pins_crossed_by` re-read with owner-local reconciliation.
-  Proof: the six existing pin tests in `enginefs/src/lib.rs` (from
-  `a_pin_that_lands_inside_a_run_is_wanted_again_after_it` on) plus two
-  new ones using the fake backend's gates: a pin landing before the
-  decision keeps the piece with no drop at all, and a pin landing between
-  decide and act re-wants it exactly once; mutation reads the pins outside
-  the lock.
-
-- **`removed_files` is insert-only.** `piece_store/store.rs:150`, a
-  `Mutex<BTreeSet<usize>>` inserted into only by `TorrentStorage::remove_file`
-  (`store.rs:1462`) and consulted there to decide whether a boundary piece
-  may go once every owning file is in the set. Never cleared, so a file
-  removed and then pinned again would still count as gone. Unreachable
-  today (librqbit calls `remove_file` only on a whole-torrent delete), and
-  the read-once-trust-later shape.
-
-  *Plan.* Delete the memo. `remove_file` decides from the live selection
-  at the moment it is called -- which files of the torrent are wanted now
-  -- instead of from a record of which have been removed. If the store
-  cannot see the selection, the fallback is to clear a file's entry when
-  it is wanted again (`reselect`/pin path). Proof: remove file A, pin it
-  again, remove file B that shares a boundary piece with A; the piece
-  survives. Mutation keeps the memo.
+- **Nothing.** Every item that was open here on 2026-09-15 is under
+  "Closed" below with what was done about it.
 
 ### Standing hazards
 
@@ -139,6 +101,34 @@ nobody reopens them without knowing why they were shut.
 - **Head-of-line blocking.** Verified fixed: the fifth log (xtremio
   `7de2dea`, rqbit `cc969c7b`) had no read wait over 1.5 s. The design is
   rqbit's `crates/librqbit/src/CLAIMS.md`.
+- **The pin set read at one moment and acted on at another.** Fixed
+  2026-09-16, and narrower than the plan said. The plan proposed moving the
+  pinned set into the retention owner's state. Read against the code, the
+  owner is per torrent already and the pin set is one shared set with one
+  writer path; what the design (`proxy-retention-owner-design`: decide
+  inside, act outside, report back) requires is that the reading that
+  decides is taken immediately before each act, and that the act's own
+  window -- foreign, awaited code that no lock may span -- is reconciled
+  after it. The reclaim step already did both. The want step read the pins
+  once, in `alone`, and then awaited one drop per run: a pin landing under
+  the first run's drop reached the last run as a plan made without it, and
+  the neighbour's boundary piece was dropped and wanted back. Now each run
+  is read against the pins as they stand when it is about to go
+  (`TorrentBacking::want`, `drop_run`), and `rewant_pins_crossed_by` stays
+  as the reconciliation of the act itself. Test:
+  `a_pin_taken_under_the_want_steps_first_run_keeps_the_piece_out_of_the_second`,
+  which fails when the plan's reading is trusted again. The residual cost
+  of a pin landing *inside* an act is unchanged and inherent: one boundary
+  piece fetched twice.
+- **`removed_files` insert-only.** Fixed 2026-09-16 by making a write take
+  the file back out: `pwrite_all` for a file removes it from the memo, so a
+  file removed and then written again -- re-added, re-pinned -- counts as
+  present when its neighbour is removed and the piece they share stays.
+  The memo itself stays, because it is what lets a whole-torrent delete
+  take a boundary piece once every owner is gone; the store has no view of
+  the selection to decide from instead. Test:
+  `a_file_written_again_after_its_removal_keeps_the_piece_it_shares`,
+  which fails without the write-path removal.
 - **The two clock-bound tests.** Fixed 2026-09-16. The swarm tests no
   longer ask how much may land across one 50 ms pass; "at rest" is a pass
   across which nothing came off the swarm with the reader parked and the

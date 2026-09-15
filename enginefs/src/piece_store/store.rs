@@ -146,7 +146,10 @@ pub(super) struct Inner {
     /// while the old one may not have been dropped yet.
     registration: Option<Registration>,
     /// File ids [`PieceStore::remove_file`] has been asked to drop. A piece
-    /// may only go when every file that owns bytes in it is in here.
+    /// may only go when every file that owns bytes in it is in here. A file
+    /// written again (`pwrite_all`) leaves the set: it is present again,
+    /// whatever this was told about it before, and the piece it shares
+    /// with a neighbour is its to keep when the neighbour goes.
     removed_files: Mutex<BTreeSet<usize>>,
     /// Pieces that have a staged copy, as far as this process knows: added
     /// by the first write to one, removed when it is completed or deleted,
@@ -1421,6 +1424,14 @@ impl TorrentStorage for PieceStore {
 
     fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
         self.ensure_live()?;
+        // A file being written is a file that is back, whatever
+        // `remove_file` was told about it before: see `removed_files`.
+        {
+            let mut removed = self.inner.removed_files.lock();
+            if !removed.is_empty() {
+                removed.remove(&file_id);
+            }
+        }
         let mut written = 0usize;
         for segment in self
             .inner
@@ -2207,6 +2218,69 @@ mod tests {
         );
         assert_eq!(store.layout().piece_count(), 4);
         assert!(!store.piece_path(4).exists());
+    }
+
+    /// **A file written again after its removal is present again**, and
+    /// the piece it shares with a neighbour stays when the neighbour goes.
+    ///
+    /// `remove_file` is asked once per file of a torrent being deleted, so
+    /// it remembers which files are gone and takes a shared piece with the
+    /// last of its owners. Remembered for good, a file removed and then
+    /// written again -- re-added, re-pinned -- would still count as gone,
+    /// and its neighbour's removal would take the piece the two share out
+    /// from under it.
+    #[test]
+    fn a_file_written_again_after_its_removal_keeps_the_piece_it_shares() {
+        let specs = [
+            FileSpec {
+                len: 10,
+                padding: false,
+            },
+            FileSpec {
+                len: 13,
+                padding: false,
+            },
+        ];
+        let tmp = tempfile::tempdir().unwrap();
+        let global = global_bytes(23);
+        let fill_both = |store: &PieceStore| {
+            store.pwrite_all(0, 0, &global[0..10]).unwrap();
+            store.pwrite_all(1, 0, &global[10..23]).unwrap();
+            for piece in 0..3 {
+                store.complete_piece(piece).unwrap();
+            }
+        };
+
+        // What the memo is for: removed one after the other, the shared
+        // piece goes with its last owner and not before.
+        let store = open_store(&tmp.path().join("gone"), PIECE_LENGTH, &specs);
+        fill_both(&store);
+        store.remove_file(0, Path::new("a")).unwrap();
+        assert!(
+            !store.has_piece(0),
+            "the first file's own piece goes with it"
+        );
+        assert!(store.has_piece(1), "piece 1 is still the second file's");
+        store.remove_file(1, Path::new("b")).unwrap();
+        assert!(
+            !store.has_piece(1) && !store.has_piece(2),
+            "and goes with its last owner"
+        );
+
+        // Removed, written again, and the neighbour removed: the shared
+        // piece is the first file's to keep.
+        let store = open_store(&tmp.path().join("back"), PIECE_LENGTH, &specs);
+        fill_both(&store);
+        store.remove_file(0, Path::new("a")).unwrap();
+        store.pwrite_all(0, 0, &global[0..8]).unwrap();
+        store.complete_piece(0).unwrap();
+        store.remove_file(1, Path::new("b")).unwrap();
+        assert!(store.has_piece(0));
+        assert!(
+            store.has_piece(1),
+            "piece 1 was taken with the second file though the first is back"
+        );
+        assert!(!store.has_piece(2), "the second file's own piece went");
     }
 
     /// The seed and the delete have to be one predicate about one kind of

@@ -379,6 +379,75 @@ pub(crate) struct TorrentBacking<H: TorrentHandle> {
 }
 
 impl<H: TorrentHandle> TorrentBacking<H> {
+    /// Stop wanting `run` (`AfterRelease::LeaveDropped`), unlink what
+    /// arrived under the drop that nothing keeps, and want again whatever a
+    /// neighbour pinned under it. One run of [`Self::want`].
+    async fn drop_run(
+        &self,
+        store: &Arc<StoreRegistry>,
+        domain: &FileDomain,
+        door: &Door<Self>,
+        run: Range<u32>,
+    ) {
+        {
+            match self
+                .handle
+                .drop_pieces(run.clone(), crate::backend::AfterRelease::LeaveDropped)
+                .await
+            {
+                Ok(Some(claim)) => {
+                    // A neighbour pinned under the drop keeps what it shares
+                    // with this file, as it does at the reclaim's door.
+                    let pinned =
+                        pinned_spans(&self.handle, &self.pinned, Some(domain.file_idx)).await;
+                    let arrived: Vec<u32> = match (store.held(&self.info_hash), !door.shut()) {
+                        (Some(now), true) => {
+                            let now = now.in_range(run.clone());
+                            claim
+                                .pieces()
+                                .iter()
+                                .copied()
+                                .filter(|piece| {
+                                    now.contains(piece)
+                                        && !door.refuses(*piece)
+                                        && !pinned.iter().any(|span| span.contains(piece))
+                                })
+                                .collect()
+                        }
+                        // No store to read, or a door that says take
+                        // nothing: whatever arrived stays.
+                        _ => Vec::new(),
+                    };
+                    if arrived.is_empty() {
+                        // Nothing of these is ours to take off the disk:
+                        // released at once.
+                        drop(claim);
+                    } else {
+                        tracing::debug!(
+                            info_hash = %self.info_hash,
+                            pieces = arrived.len(),
+                            "pieces outside the window arrived under the pass; unlinking what the backend forgot"
+                        );
+                        crate::retention::unlink(store, &self.info_hash, arrived, Some(claim))
+                            .await;
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    info_hash = %self.info_hash,
+                    first = run.start,
+                    end = run.end,
+                    error = %format!("{error:#}"),
+                    "could not stop wanting the pieces outside the window; the swarm will fill them"
+                ),
+            }
+            // Outside the match: a pin that landed under the drop has to be
+            // wanted again whether or not anything arrived under it, and
+            // whether or not the backend handed back a claim.
+            self.rewant_pins_crossed_by(&run, domain).await;
+        }
+    }
+
     /// Want again whatever a neighbour pinned **since this run was
     /// planned** shares with it.
     ///
@@ -842,62 +911,26 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
             })
             .collect();
         let alone = self.alone(domain, &unwanted).await;
-        for run in crate::retention::runs(&alone) {
-            match self
-                .handle
-                .drop_pieces(run.clone(), crate::backend::AfterRelease::LeaveDropped)
-                .await
-            {
-                Ok(Some(claim)) => {
-                    // A neighbour pinned under the drop keeps what it shares
-                    // with this file, as it does at the reclaim's door.
-                    let pinned =
-                        pinned_spans(&self.handle, &self.pinned, Some(domain.file_idx)).await;
-                    let arrived: Vec<u32> = match (store.held(&self.info_hash), !door.shut()) {
-                        (Some(now), true) => {
-                            let now = now.in_range(run.clone());
-                            claim
-                                .pieces()
-                                .iter()
-                                .copied()
-                                .filter(|piece| {
-                                    now.contains(piece)
-                                        && !door.refuses(*piece)
-                                        && !pinned.iter().any(|span| span.contains(piece))
-                                })
-                                .collect()
-                        }
-                        // No store to read, or a door that says take
-                        // nothing: whatever arrived stays.
-                        _ => Vec::new(),
-                    };
-                    if arrived.is_empty() {
-                        // Nothing of these is ours to take off the disk:
-                        // released at once.
-                        drop(claim);
-                    } else {
-                        tracing::debug!(
-                            info_hash = %self.info_hash,
-                            pieces = arrived.len(),
-                            "pieces outside the window arrived under the pass; unlinking what the backend forgot"
-                        );
-                        crate::retention::unlink(store, &self.info_hash, arrived, Some(claim))
-                            .await;
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => tracing::warn!(
-                    info_hash = %self.info_hash,
-                    first = run.start,
-                    end = run.end,
-                    error = %format!("{error:#}"),
-                    "could not stop wanting the pieces outside the window; the swarm will fill them"
-                ),
+        for planned in crate::retention::runs(&alone) {
+            // **The reading that decides is the one taken here, right
+            // before the act.** `alone` read the pin set once, for every
+            // run, and the drops are awaited one after another: a pin that
+            // lands under the first run's drop used to reach the last run
+            // as a plan made without it, and the pinned neighbour's boundary
+            // piece was dropped and then wanted back. So each run is asked
+            // against the pins as they stand when it is about to go, as the
+            // reclaim asks at every run; what the plan read is a filter on
+            // the work, not the decision. The window that is left is the
+            // act itself, which no reading closes: `rewant_pins_crossed_by`
+            // reconciles after it.
+            let pinned = pinned_spans(&self.handle, &self.pinned, Some(domain.file_idx)).await;
+            let unpinned: Vec<u32> = planned
+                .clone()
+                .filter(|piece| !pinned.iter().any(|span| span.contains(piece)))
+                .collect();
+            for run in crate::retention::runs(&unpinned) {
+                self.drop_run(store, domain, door, run).await;
             }
-            // Outside the match: a pin that landed under the drop has to be
-            // wanted again whether or not anything arrived under it, and
-            // whether or not the backend handed back a claim.
-            self.rewant_pins_crossed_by(&run, domain).await;
         }
     }
 

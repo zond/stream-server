@@ -10784,6 +10784,68 @@ mod tests {
         );
     }
 
+    /// **A pin taken under the want step's first run keeps the boundary
+    /// piece out of its later runs altogether.**
+    ///
+    /// The plan named every run before the first was dropped, and the
+    /// drops are awaited in turn. Read once, the pin set the plan saw is
+    /// what the last run would be dropped by, and the pinned neighbour's
+    /// boundary piece would go and be wanted back. Read again at each run
+    /// -- as the reclaim reads it -- the run that holds the piece is never
+    /// dropped at all.
+    ///
+    /// Eight pieces an episode, so the stretch behind the window is long
+    /// enough to be split: piece 13 is on the disk, the pieces outside the
+    /// window come as two runs, and the piece the second and third episodes
+    /// share -- 16 -- is in the second. The pin lands under the first.
+    #[tokio::test]
+    async fn a_pin_taken_under_the_want_steps_first_run_keeps_the_piece_out_of_the_second() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![
+            ("Show.S01E01.mkv".into(), 200),
+            ("Show.S01E02.mkv".into(), 210),
+            ("Show.S01E03.mkv".into(), 200),
+        ]);
+        counters.pieces_per_file.store(8, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        *counters.wanted_files.lock().unwrap() = Some([0, 1].into_iter().collect());
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("13"), [7u8; 25]).unwrap();
+        let _store = seeded_store(&enginefs, &engine);
+        engine.begin_retention(1).await;
+        engine.test_read_at(1, 0);
+        *counters.on_first_drop.lock().unwrap() = Some(Box::new({
+            let pinned = engine.pinned_files.clone();
+            move || {
+                pinned.write().insert(2);
+            }
+        }));
+        engine
+            .retain(enginefs.store_registry(), &playing(1))
+            .await
+            .expect("a pass");
+        let dropped = counters.dropped_ranges.lock().unwrap().clone();
+        assert!(
+            dropped
+                .first()
+                .is_some_and(|(range, _)| range.end <= 13 && !range.contains(&16)),
+            "the fixture's first drop is the run below the held piece: {dropped:?}"
+        );
+        assert!(
+            dropped.iter().any(|(range, _)| range.start > 13),
+            "and there is a second run above it, or the pin had nothing to be read against: \
+             {dropped:?}"
+        );
+        assert!(
+            dropped.iter().all(|(range, _)| !range.contains(&16)),
+            "piece sixteen was dropped after the neighbour that owns it was pinned: {dropped:?}"
+        );
+    }
+
     /// **And a pin taken on the neighbour under the want step wants the
     /// boundary piece again**, whether or not it arrived under the drop.
     ///
