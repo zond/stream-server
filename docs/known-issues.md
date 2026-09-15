@@ -112,29 +112,6 @@ order to do them in.
   again, remove file B that shares a boundary piece with A; the piece
   survives. Mutation keeps the memo.
 
-- **Two tests depend on the clock.**
-  `a_stream_wider_than_its_window_is_fetched_inside_it`
-  (`backend/librqbit.rs:8505`) and its precondition
-  `a_stream_past_the_cache_budget_stays_under_it_and_still_plays`
-  (`:8304`) run a real loopback swarm and decide "at rest" by sampling
-  every 50 ms for consecutive unchanged ticks, needing ten of them inside
-  60 s; under load the swarm never holds still for the sampler and the
-  test fails without anything being wrong. `set_lan_media_toggles_the_listener_and_the_setting_can_forbid_it`
-  (`server/tests/embed.rs:5179`) spawns a probe thread and asserts it
-  served at least one request, with nothing ordering the thread's first
-  request before the main thread stops it.
-
-  *Plan.* The LAN test: the probe reports its first served request on a
-  channel and the main thread waits for it before it toggles anything --
-  a barrier, no sleep. The swarm tests: replace the sampled "at rest" with
-  the pass's own accounting, which is deterministic -- a pass reporting
-  `fetched_since == 0` with the reader idle *is* rest -- and bound the
-  precondition on `held` reaching half the budget rather than on a fixed
-  number of passes. If that still flakes, the next step is a fake
-  `TorrentHandle` whose piece arrival the test drives (the `FakeHandle`
-  and `FakeCounters` in `enginefs/src/lib.rs` are the model), which is a
-  bigger change and not the first move.
-
 ### Standing hazards
 
 * **Pin by full sha, everywhere.** Cargo keys a git source on the literal
@@ -162,6 +139,19 @@ nobody reopens them without knowing why they were shut.
 - **Head-of-line blocking.** Verified fixed: the fifth log (xtremio
   `7de2dea`, rqbit `cc969c7b`) had no read wait over 1.5 s. The design is
   rqbit's `crates/librqbit/src/CLAIMS.md`.
+- **The two clock-bound tests.** Fixed 2026-09-16. The swarm tests no
+  longer ask how much may land across one 50 ms pass; "at rest" is a pass
+  across which nothing came off the swarm with the reader parked and the
+  disk unchanged, counted to ten in a row, and the wait is bounded only by
+  the test's deadline. The plateau is read during the pause, where the
+  torrent is live, not after playback, where the finished torrent is paused
+  and has no counter to read (which is why the old count was never reset).
+  The precondition test parks the player and lets the fill stop moving
+  before it asks whether the cache filled, and waits for the swarm to stay
+  quiet rather than for a rate. The LAN test's probe thread reports its
+  first served request before the toggling starts. Three runs each under
+  a full CPU load passed; a churn mutation (the whole file re-wanted every
+  pass) still fails the test, on the total-fetched bound.
 - **The retention trace module's keep-until-verified hold**, and then
   the trace and mpv's verbose log themselves: **built as a setting**
   (stream-server `7acaa6e`, xtremio the same day). "Verbose logging" in

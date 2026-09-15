@@ -8354,6 +8354,47 @@ mod tests {
         let mut buf = vec![0u8; 64 * 1024];
         let mut worst = 0usize;
         let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
+        // **The cache has to fill for the bound to be about anything**, and
+        // whether it fills under a reader that never stops is a race
+        // between the seeder and the reader that a loaded runner loses (29
+        // pieces of 32, once, on Windows). So the player buffers four
+        // megabytes and pauses, and the fill is given until it stops moving
+        // -- however long that is here -- before the film plays on. The
+        // disk bound is asked on every pass of that too.
+        while read.len() < 4 * 1024 * 1024 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stream stalled at {} bytes",
+                read.len()
+            );
+            let n = reader.read(&mut buf).await.expect("read");
+            assert_ne!(n, 0, "the stream ended early at {}", read.len());
+            read.extend_from_slice(&buf[..n]);
+        }
+        let mut still = 0;
+        let mut was_held = None;
+        while still < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the fill never stopped moving with the player paused: {worst} pieces at most"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            efs.reconcile_tick().await;
+            let held = efs
+                .store_registry()
+                .held(&hash)
+                .expect("the running torrent's store is registered")
+                .count() as usize;
+            worst = worst.max(held);
+            assert!(
+                held <= budget_pieces + 16,
+                "{held} pieces on disk with the player paused at {} bytes, budget is \
+                 {budget_pieces}",
+                read.len()
+            );
+            still = if was_held == Some(held) { still + 1 } else { 0 };
+            was_held = Some(held);
+        }
         while read.len() < original.len() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -8415,44 +8456,34 @@ mod tests {
         // occupancy cannot show -- what the peers sent us while nothing was
         // being read at all.
         // The playback read above leaves requests in flight, and bytes
-        // still arriving from it are not bytes the policy asked for again.
-        // So the measurement starts where the swarm goes quiet rather than
-        // where the reader stopped -- on a runner slower than this one
-        // those two are a long way apart, and the difference is booked
-        // against the policy. A swarm that never goes quiet is the very bug
-        // this guards, and says so.
-        let mut settled = 0;
+        // still arriving from it are not bytes the policy asked for again;
+        // on a loaded runner they arrive a good while after the reader
+        // stopped. So nothing here says how soon the swarm has to go
+        // quiet, or how much may land in the meantime: what is asked is
+        // that it *does* go quiet and *stay* quiet -- ten passes running
+        // with nothing off the peers -- before the deadline. A policy that
+        // wants again what it released fetches on every pass and never
+        // gets there, and the deadline says so.
+        let mut quiet = 0;
+        let mut was_fetched = None;
         let quiet_at = std::time::Instant::now() + TEST_WAIT_BOUND;
-        loop {
+        while quiet < 10 {
             tokio::time::sleep(Duration::from_millis(50)).await;
             efs.reconcile_tick().await;
             let fetched = engine.handle.transfer_totals().unwrap_or_default().fetched;
-            if fetched == settled {
-                break;
-            }
             assert!(
                 std::time::Instant::now() < quiet_at,
-                "the swarm never stopped delivering after playback ended: {fetched} bytes \
-                 and still climbing, so what the policy released is being wanted again"
+                "the swarm never stayed quiet for ten passes after playback ended: \
+                 {fetched} bytes and still climbing, so what the policy released is \
+                 being wanted again"
             );
-            settled = fetched;
+            quiet = if was_fetched == Some(fetched) {
+                quiet + 1
+            } else {
+                0
+            };
+            was_fetched = Some(fetched);
         }
-        let fetched_before = engine.handle.transfer_totals().unwrap_or_default().fetched;
-        for _ in 0..20 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            efs.reconcile_tick().await;
-        }
-        let refetched = engine
-            .handle
-            .transfer_totals()
-            .unwrap_or_default()
-            .fetched
-            .saturating_sub(fetched_before);
-        assert!(
-            refetched < RETENTION_BUDGET / 4,
-            "{refetched} bytes came back off the swarm after playback ended: \
-             what the policy released is being wanted again"
-        );
         assert!(
             worst > budget_pieces / 2,
             "the cache really filled ({worst} pieces at most), or the bound proves nothing"
@@ -8559,7 +8590,6 @@ mod tests {
             fetched_peak: 0,
             last: None,
             at_rest: 0,
-            at_rest_bytes: 0,
             deadline: std::time::Instant::now() + TEST_WAIT_BOUND,
         };
         let mut read = Vec::with_capacity(original.len());
@@ -8575,44 +8605,30 @@ mod tests {
         bound
             .read_until(&mut reader, &mut read, 4 * 1024 * 1024 + 64 * 1024)
             .await;
-        for pass in 0..30 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            // And a third of the way through the pause, the player reads
-            // the container index at the end of the file. See
-            // [`BoundWatch::probe_the_tail`].
-            if pass == 10 {
-                bound.probe_the_tail().await;
-            }
-            bound.tick(read.len()).await;
-        }
-        // Then plays the rest through.
+        // **The pause is where the tight half of the bound is read**, and
+        // it lasts as long as it takes -- twice. First until the fill has
+        // caught up with the window and the passes have stopped moving
+        // pieces; then the player reads the container index at the end of
+        // the file ([`BoundWatch::probe_the_tail`]), which is the read that
+        // used to move the window off the player; then until the stream is
+        // at rest again after it. How long settling takes is the machine's
+        // business: no pass is asked how much may land across it, since a
+        // tick on a loaded machine is as long as the machine makes it, and
+        // whatever was in flight lands when it lands, which only postpones
+        // the plateau. What never reaches a plateau is a window that moves
+        // off its reader, because that fetches again on every pass, and
+        // the watch's deadline is what ends the wait then.
+        bound.rest(read.len(), "before the tail was read").await;
+        bound.probe_the_tail().await;
+        bound.rest(read.len(), "after the tail was read").await;
+        // Then plays the rest through, with the disk and the total bound
+        // asked on every pass of that as well.
         bound
             .read_until(&mut reader, &mut read, original.len())
             .await;
         drop(reader);
         assert_eq!(read, original, "and it played: every byte is the film's");
 
-        // Thirty passes, and then as many more as it takes for the stream
-        // to have been measured at rest enough times to mean something.
-        //
-        // **How long settling takes is the machine's business.** At rest is
-        // a pass that delivered nothing and left the disk holding what it
-        // held, which is the only reading that bounds the network tightly
-        // -- and reaching it means the fill has caught up with the window
-        // and the passes have stopped moving pieces. A fixed one-and-a-half
-        // seconds is long enough for that here and is not on the Windows
-        // runner, where this test failed on nine at-rest passes out of the
-        // ten it wants while asserting nothing about a real regression. The
-        // watch's own deadline is what stops it if the stream never settles
-        // at all, and then the assertion below says so.
-        let mut passes = 0;
-        while passes < 30
-            || (bound.at_rest < AT_REST_PASSES && std::time::Instant::now() < bound.deadline)
-        {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            bound.tick(read.len()).await;
-            passes += 1;
-        }
         assert!(
             bound.worst > bound.budget_pieces / 2,
             "the cache really filled ({} pieces at most), or the bound proves nothing",
@@ -8624,29 +8640,15 @@ mod tests {
              was never measured against anything",
             bound.fetched_peak
         );
-        assert!(
-            bound.at_rest_bytes <= crate::backend::priorities::STREAMING_LOOKAHEAD_BYTES,
-            "{} bytes came off the swarm across {} passes that delivered nothing and \
-             left the disk where it was: that is a window moving off its reader, not \
-             a fill landing after the reading stopped",
-            bound.at_rest_bytes,
-            bound.at_rest
-        );
-        assert!(
-            bound.at_rest >= AT_REST_PASSES,
-            "only {} passes found the stream at rest, so the tight half of the network \
-             bound was hardly asked: the pause has to outlast the window filling",
-            bound.at_rest
-        );
     }
 
-    /// How many passes have to find the stream at rest before the tight
-    /// half of the network bound counts as asked.
+    /// How many passes running have to find the stream at rest before the
+    /// tight half of the network bound counts as asked.
     ///
-    /// At rest is a pass that delivered nothing to the reader and left the
-    /// same pieces on the disk, so what came off the peers across it must
-    /// be nothing but the piece a fill was part-way through. One such pass
-    /// could be an accident of timing; ten is a plateau.
+    /// At rest is a pass across which nothing came off the swarm, with the
+    /// reader where it was and the same pieces on the disk. One such pass
+    /// could be a lull; ten in a row is a plateau, and a window that moves
+    /// off its reader never has one, because it fetches again every pass.
     const AT_REST_PASSES: usize = 10;
 
     /// One retention pass at a time over a streaming engine, and the three
@@ -8680,22 +8682,33 @@ mod tests {
         /// What the last pass read: bytes delivered, pieces on the disk,
         /// bytes off the swarm. For [`Self::at_rest`].
         last: Option<(usize, usize, u64)>,
-        /// How many passes were measured at rest, so a run in which the
-        /// stream never settled cannot pass for nothing.
+        /// How many passes running have found the stream at rest: nothing
+        /// delivered, the same pieces on the disk, and nothing off the
+        /// swarm. Back to zero the moment any of the three moves, so what
+        /// it counts is a plateau and not a tally of lulls.
         at_rest: usize,
-        /// What came off the swarm across all of them together.
-        ///
-        /// **The per-pass bound tolerates a landing, this one refuses a
-        /// habit.** Bytes in flight when the reading stopped arrive after
-        /// it, and on a loaded machine several passes later -- but what was
-        /// in flight is bounded by the lookahead the reader was granted,
-        /// and it arrives once. A window that moves off its reader fetches
-        /// again every pass, without bound.
-        at_rest_bytes: u64,
         deadline: std::time::Instant,
     }
 
     impl BoundWatch<'_> {
+        /// Pass until the stream has been at rest [`AT_REST_PASSES`] times
+        /// running, or the deadline says it never will be; `when` names the
+        /// wait in the failure.
+        async fn rest(&mut self, read_so_far: usize, when: &str) {
+            self.at_rest = 0;
+            while self.at_rest < AT_REST_PASSES {
+                assert!(
+                    std::time::Instant::now() < self.deadline,
+                    "the stream was never at rest for {AT_REST_PASSES} passes running {when}: \
+                     bytes keep coming off the swarm with the reader parked and the disk \
+                     holding what it held, which is a window moving off its reader and \
+                     something being fetched and thrown away"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                self.tick(read_so_far).await;
+            }
+        }
+
         async fn tick(&mut self, read_so_far: usize) {
             self.efs.reconcile_tick().await;
             let held = self
@@ -8740,43 +8753,33 @@ mod tests {
                      part-read piece can account for: something is being fetched and \
                      thrown away"
                 );
-                // **And the bound at rest, which is the tight one.** The
-                // one above is slack by a whole budget: it is a bound on
-                // the total, and a total that may grow by 16 MiB says
-                // nothing about a pass that threw a megabyte away. This
-                // says what the plateau says. A pass that handed the
-                // reader nothing since the pass before it, and left the
-                // disk holding the same number of pieces, has a stream
-                // that is not asking for anything and a policy that is
-                // keeping what it kept -- so nothing may have come off the
-                // peers. That is the churn's own signature: the occupancy
-                // is one window wherever the window is, and the fetched
-                // count is the only place a window that moves under a
-                // parked player shows up at all.
-                //
-                // Slack for whatever was in flight when the reading
-                // stopped: a piece per consumer that could have had a fill
-                // running -- the player, and the read opened beside it
-                // ([`Self::probe_the_tail`]). A pass where either reading
-                // *did*
-                // move asserts nothing rather than guessing what the move
-                // was worth, so a disk that wobbles by a piece makes this
-                // measure less, never fail.
-                if let Some((was_read, was_held, was_fetched)) = self.last
-                    && read_so_far == was_read
-                    && held == was_held
-                {
-                    self.at_rest += 1;
-                    self.at_rest_bytes += fetched - was_fetched;
-                    assert!(
-                        fetched <= was_fetched + 4 * RETENTION_PIECE,
-                        "{} bytes came off the swarm across a pass that delivered nothing \
-                         to the reader and left the same {held} pieces on the disk: the \
-                         window moved off the reader and something is being fetched and \
-                         thrown away",
-                        fetched - was_fetched
-                    );
-                }
+                // **And rest, which is what the tight half of the bound is
+                // read from.** The one above is slack by a whole budget: it
+                // is a bound on the total, and a total that may grow by
+                // 16 MiB says nothing about a pass that threw a megabyte
+                // away. A pass that handed the reader nothing since the
+                // pass before it, left the disk holding the same pieces,
+                // and saw nothing come off the peers is a stream that is
+                // not asking for anything and a policy keeping what it
+                // kept. The churn's own signature is that such a pass
+                // never comes: the occupancy is one window wherever the
+                // window is, and the fetched count is the only place a
+                // window that moves under a parked player shows up at all
+                // -- so what is asserted, at the end, is that the plateau
+                // was reached. Nothing here says how much may land across
+                // one pass: a fill in flight when the reading stopped
+                // lands when it lands, later on a loaded machine, and
+                // that only postpones the plateau.
+                self.at_rest = match self.last {
+                    Some((was_read, was_held, was_fetched))
+                        if read_so_far == was_read
+                            && held == was_held
+                            && fetched == was_fetched =>
+                    {
+                        self.at_rest + 1
+                    }
+                    _ => 0,
+                };
                 self.last = Some((read_so_far, held, fetched));
             }
         }

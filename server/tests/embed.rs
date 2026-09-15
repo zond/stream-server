@@ -5264,8 +5264,13 @@ fn set_lan_media_toggles_the_listener_and_the_setting_can_forbid_it() -> anyhow:
 
     // Loopback media, hammered from another thread for as long as the
     // toggling below takes. Not a timing assertion -- it just has to be
-    // in flight while the LAN listener starts and stops.
+    // in flight while the LAN listener starts and stops. So the toggling
+    // waits for the thread's first answer before it starts: a thread that
+    // has not been scheduled yet is not in flight, and on a loaded runner
+    // the whole sequence below ran and stopped it before it had sent a
+    // request.
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (first_served, in_flight) = std::sync::mpsc::channel::<()>();
     let probe = {
         let stop = stop.clone();
         let url = format!("{base}/{info_hash}/{idx}");
@@ -5285,10 +5290,16 @@ fn set_lan_media_toggles_the_listener_and_the_setting_can_forbid_it() -> anyhow:
                 );
                 anyhow::ensure!(response.bytes()?.as_ref() == expected.as_slice());
                 served += 1;
+                if served == 1 {
+                    let _ = first_served.send(());
+                }
             }
             Ok(served)
         })
     };
+    in_flight
+        .recv_timeout(CHECK_WAIT_BOUND)
+        .map_err(|_| anyhow::anyhow!("the loopback probe never served its first request"))?;
 
     // Nothing is bound at startup, however the address is configured: the
     // listener is a cast session's, and there is none yet.
