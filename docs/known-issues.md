@@ -304,3 +304,60 @@ so a new stream cannot know whose window to inherit. Left as it is. The
 probe's stale `holders=0` lines (a task from an earlier park firing
 against the next) are fixed in `735b3ca3`.
 
+
+## Fourth field log on the latency claim rules (2026-09-15 20:31, xtremio 2272a51)
+
+A slower swarm than the third log's (connected peers' last latencies
+0.5-9 s, 12-30 seeders connected, 8-18 MB/s) and a worse run: stalls of
+7.9 s (open), 3.7 s, 3.7 s and 7.7 s, with reads waiting 5.4 s on piece
+2143 and 6.0 s on piece 1144. The probe lines say why, and it is not the
+comparison -- both are cases where the comparison was never asked.
+
+**Piece 2143 (5.4 s): ten of sixteen shares in the pool for two seconds
+with nobody asking for them.** At the probe the piece was 2.1 s old; two
+peers had finished two shares each (last latencies 162 ms and 1.2 s, both
+outpacing the piece many times over), one peer with 5.5 s latency held
+two shares undelivered, and 96..256 was unclaimed. The fast peers were not
+refused -- they never came back. A peer that finishes its two free shares
+asks again at once, finds the piece a few milliseconds old, which nobody
+outpaces, is turned away (`Crowded`) and the walk goes on to hand it a
+**whole** piece deeper in the window. The request loop then sends every
+one of that piece's 256 chunks before it asks for anything again (two
+128-chunk windows), so the peer is gone for seconds. By the time the head
+piece is old enough to be shared out, everyone who could share it is
+committed elsewhere. Pieces 5559 and 1123 show the same shape from the
+doubling side: the doublers (0.5-0.7 s latency) arrived at 1.5-1.9 s of
+piece age, one whole piece later than the rule would have let them in.
+
+**Piece 1144 (6.0 s): a claim held 14.6 s by a peer that never delivered
+a chunk, doubled once by a 5 s peer that then sat on it for 8.4 s, and
+`MAX_HOLDERS_PER_CLAIM` (2) refusing everyone else.** The piece was handed
+whole to a fresh peer during the window ramp, cut when the head reached
+it, and everything but the holder's own claim was fetched by others; the
+one claim left had two holders, both dead weight, and the count cap kept
+the fast peers off it. (A dead peer's claims go back to the pool in
+`release_pieces_owned_by`, so this holder was alive and silent.)
+
+Two changes proposed to zond, not built -- both are rule changes:
+
+1. **Ask the head at every request slot, not at every piece boundary.**
+   A slot frees when a chunk lands, which is the moment the peer's latency
+   is re-measured and the event the rule is about. Before each chunk of a
+   whole piece the peer would offer itself to the two head pieces (pool
+   share or double, the same rules), take what it is given first, and
+   resume the whole piece after. Cost: one short walk under the state
+   lock per chunk landing, a lock the write path takes per chunk anyway.
+2. **Replace the holder count cap with the same comparison at the claim:
+   another holder may join a claim iff its latency is shorter than the
+   time since the claim's newest holder was handed it.** A healthy holder
+   finishes a 16-chunk claim within one of its round trips, so a claim
+   still open that long is only joined by someone faster than its newest
+   holder; a silent one is joined by anyone live. No count and no
+   constant, and it implies outpacing the piece.
+
+Also seen, not to fix: the first tail read after one seek started 12 KB
+before the tail stream's earliest piece (5559 rather than 5560) and paid
+2.4 s for 4 MiB nobody else wanted -- once, and the piece is held after.
+Piece 0 took 3.6 s of which 1.7 s was before any peer had connected to
+reserve it. The startup bar reported 15/16 chunks; the probe reported no
+stale lines.
