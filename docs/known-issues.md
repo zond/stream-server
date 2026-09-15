@@ -71,33 +71,6 @@ Still stale:
 Each entry carries its plan, agreed with zond on 2026-09-15. Order is the
 order to do them in.
 
-- **The retention trace and mpv's verbose log are always on or always
-  off; make them a setting.** Today the trace is five `tracing::info!`
-  sites -- `retention/owner.rs` (`pass`, `planned_to_reclaim_inside_a_lookahead`),
-  `engine.rs` and `server/src/proxy_retention.rs` (`streams_seen`),
-  `server/src/cache_budget.rs` (`budget_published`) -- and xtremio forces
-  mpv to `MPVLogLevel.info` under three comments marked TEMPORARY in
-  `lib/features/player/playback_engine.dart`. There is no runtime
-  verbosity toggle anywhere: `RUST_LOG` at start-up is the only lever.
-
-  *Plan.* One device-local bool, "verbose diagnostics", following the
-  bold-focus pattern (`AppPrefs` key + `SwitchListTile` in
-  `core_settings.dart`; the prefs round-trip needs no new FRB code). Two
-  consumers: (1) xtremio pushes it to the server as `diagnosticsTrace`
-  through the existing `POST /settings` path (`server/src/routes/system.rs`,
-  like `seedingEnabled`), persisted in the settings file and applied live
-  by a new `Engine::set_diagnostics_trace` that flips one `AtomicBool` in
-  `retention::trace`; every trace function returns early when it is off,
-  so the call sites stay where they are. (2) `playback_engine.dart` reads
-  the same pref for mpv's `logLevel` and the `engineLog` filter, applied
-  at the next player start. The TEMPORARY wording goes; the trace module
-  becomes a feature, and `staged_over_held` keeps its reader. The
-  blocked-read lines (`blocked_read`, `blocked_read_claims`) stay
-  unconditional: they fire only when a read has waited over a second, and
-  they are what every field log was read by. Proof: a server test that the
-  setting flips the flag; an enginefs test with a capturing subscriber
-  that a pass emits nothing while it is off and the lines while it is on.
-
 - **The pin set is read at one moment and acted on at another.** The pass
   reads `pinned` (`engine.rs:362`, an `RwLock<BTreeSet>` on the engine)
   through `pinned_spans` while deciding, then awaits the backend to drop
@@ -189,10 +162,16 @@ nobody reopens them without knowing why they were shut.
 - **Head-of-line blocking.** Verified fixed: the fifth log (xtremio
   `7de2dea`, rqbit `cc969c7b`) had no read wait over 1.5 s. The design is
   rqbit's `crates/librqbit/src/CLAIMS.md`.
-- **The retention trace module's keep-until-verified hold.** Its condition
-  is met. The module, and xtremio's TEMPORARY mpv instrumentation, are still
-  in the code; removing them is a separate change, and `staged_over_held`
-  wants a permanent home beside `refused_reclaims` when they go.
+- **The retention trace module's keep-until-verified hold**, and then
+  the trace and mpv's verbose log themselves: **built as a setting**
+  (stream-server `7acaa6e`, xtremio the same day). "Verbose logging" in
+  Settings → Developer is a device preference; the app pushes it to the
+  server as `diagnosticsTrace`, which flips the `enginefs::retention::trace`
+  directive in the running process's log filter and is applied at every
+  start, and the next player opened reads it for mpv's log level, the
+  `msg-level` override and the engine-log filter. Off by default. The
+  trace module is a feature now, `staged_over_held` keeps its reader, and
+  the `stream_request` lines stay always on.
 - **A stalling link shrinks the window that would have ridden it out.**
   Accepted as a cost of streaming a torrent. The seeded rate stops one
   sample collapsing the window; a sustained bad patch still shrinks it.
