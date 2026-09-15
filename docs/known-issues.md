@@ -338,7 +338,7 @@ one claim left had two holders, both dead weight, and the count cap kept
 the fast peers off it. (A dead peer's claims go back to the pool in
 `release_pieces_owned_by`, so this holder was alive and silent.)
 
-Two changes proposed to zond, not built -- both are rule changes:
+Two changes proposed to zond and approved; built as rqbit `cc969c7b`:
 
 1. **Ask the head at every request slot, not at every piece boundary.**
    A slot frees when a chunk lands, which is the moment the peer's latency
