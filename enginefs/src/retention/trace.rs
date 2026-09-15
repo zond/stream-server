@@ -1,29 +1,32 @@
-//! **Temporary instrumentation for the retention bug, and nothing else.**
+//! **The retention trace: what a pass decided and why, in the log, under
+//! a setting.**
 //!
 //! A phone opened a 4K film and fetched 1.6 GB to play about a hundred
-//! megabytes. Four causes are fixed -- a tail probe claiming the playhead,
+//! megabytes. Four causes were fixed -- a tail probe claiming the playhead,
 //! a probe's window ordering a forward reach of fetch, a window sized under
 //! an open stream's lookahead, and a committed half sized from the disk
 //! rather than from the time it buys -- and every one of them was worked
 //! out afterwards, from piece counts, because nothing in the log said what
-//! a pass was deciding or why.
+//! a pass was deciding or why. This is what says it: one line per entity
+//! per ten seconds, a line per file on what its reads look like, the
+//! budget in force when it is published, and an immediate line for the one
+//! event that should never happen. Five field logs on the claim rules were
+//! read by these lines.
 //!
-//! **What closes this**: a field log from the device that opened the film,
-//! showing `ahead` holding at roughly the profile's seconds of the stream,
-//! `dropped`/`unlinked` settling to a piece or two per pass, and
-//! `unverified_since` staying a few per cent of `fetched_since` over a
-//! viewing. When that log exists, delete this
-//! module and its call sites -- `git rm` and the compiler names the rest.
-//! The two numbers that stay are [`crate::retention::TorrentStreamNumbers`]'s
-//! `refused_reclaims` and the unverified figure the app draws beside it;
-//! those
-//! are the permanent version of this and are already wired.
+//! It was written as temporary, to be deleted once a field log showed the
+//! fixes holding. That log exists (2026-09-15), and the lines stayed
+//! useful every time something else went wrong; so instead of going they
+//! are gated. Everything here logs at INFO on the `enginefs::retention::trace`
+//! target, and the server's log filter carries that target at `off` unless
+//! the `diagnosticsTrace` setting turns it on
+//! (`stream_server::diagnostics::logging::set_diagnostics_trace`), at which
+//! point it reaches the app's Diagnostics log without a debug build or an
+//! environment variable. Nothing here checks the setting: a disabled target
+//! is refused at the call site by `tracing` itself, and the tests that read
+//! these lines install their own subscriber.
 //!
-//! It logs at INFO on the `enginefs` target, which `DEFAULT_LOG_FILTER`
-//! carries in a release build, so it reaches the app's Diagnostics log
-//! without a debug build or an environment variable. One line per entity
-//! per ten seconds, plus an immediate line for the one event that should
-//! never happen.
+//! The two numbers that are always on are [`crate::retention::TorrentStreamNumbers`]'s
+//! `refused_reclaims` and the unverified figure the app draws beside it.
 
 use std::collections::HashMap;
 use std::fmt::Debug;

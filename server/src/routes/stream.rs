@@ -1180,8 +1180,11 @@ async fn stream_video_with(
         1
     };
     let playback_intent = playback_intent_for_request(priority, is_download);
-    // **TEMPORARY, with `enginefs::retention::trace`.** What the player
-    // actually asked for, before anything here interprets it.
+    // **Always on, unlike the retention trace.** What the player actually
+    // asked for, before anything here interprets it: two lines per range
+    // request, which is the order every field log so far has been read in
+    // -- the seeks, the tail crawl, the stall boundaries -- and the frame
+    // the retention trace's lines are placed into when that is on.
     //
     // `intent` is *our* label -- `playback_intent_for_request` derives it
     // from the priority header and the download flag. A player says neither;

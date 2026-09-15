@@ -662,8 +662,8 @@ pub trait Backing: Sized + Send + Sync + 'static {
     /// lost by answering it here rather than where it was served.
     fn reading(&self, domain: &Self::Domain, held: &BTreeSet<u32>, asking: Asking) -> Consumers;
 
-    /// **TEMPORARY**, with [`crate::retention::trace`] and deleted with it:
-    /// what the backing can say about the entity that the owner cannot.
+    /// For [`crate::retention::trace`]: what the backing can say about the
+    /// entity that the owner cannot.
     fn trace(
         &self,
         _store: &Self::Store,
@@ -2114,9 +2114,12 @@ impl<B: Backing> Retention<B> {
                 .map(|reader| reader.promised.clone())
                 .filter(|range| !range.is_empty())
                 .collect();
-            // TEMPORARY: see [`crate::retention::trace`]. The heads and the
-            // lookaheads of the reads that are open, and what the read that
-            // owns the head this pass measures from is for.
+            // For [`crate::retention::trace`]: the heads and the lookaheads
+            // of the reads that are open, and what the read that owns the
+            // head this pass measures from is for. Gathered whether or not
+            // the trace is on -- it is a few readers' worth of arithmetic,
+            // and the lines themselves are refused at the call site when the
+            // `diagnosticsTrace` setting is off.
             let traced_readers: Vec<(u32, u64)> = state
                 .readers
                 .values()
@@ -2331,8 +2334,8 @@ impl<B: Backing> Retention<B> {
             .backing
             .reclaim(store, &begin.domain, runs(&alone), door)
             .await;
-        // TEMPORARY: see [`crate::retention::trace`], and delete this block
-        // with that module.
+        // The pass's trace lines; see [`crate::retention::trace`] for what
+        // turns them on.
         {
             let (readers, buffering) = traced;
             let backing = self.backing.trace(store, &begin.domain);

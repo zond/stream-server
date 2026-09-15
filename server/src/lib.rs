@@ -981,11 +981,17 @@ pub async fn run(
         let json_writer = log_writers.json_writer;
         let guards = log_writers.guards;
 
-        let log_filter = std::env::var("RUST_LOG")
+        // `RUST_LOG` or the default, with the retention trace off until the
+        // settings say otherwise (`diagnosticsTrace`, applied below once
+        // they are loaded); the handle is what lets the setting change a
+        // filter that is already installed.
+        let log_directives = std::env::var("RUST_LOG")
             .ok()
             .filter(|directives| !directives.trim().is_empty())
-            .map(tracing_subscriber::EnvFilter::new)
-            .unwrap_or_else(|| tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER));
+            .unwrap_or_else(|| DEFAULT_LOG_FILTER.to_string());
+        let (log_filter, log_filter_handle) = tracing_subscriber::reload::Layer::new(
+            diagnostics::logging::log_filter(&log_directives, false),
+        );
         let registry = tracing_subscriber::registry().with(log_filter);
         let human_file_layer = tracing_subscriber::fmt::layer()
             .with_writer(human_writer)
@@ -1006,6 +1012,7 @@ pub async fn run(
 
         if init_result.is_ok() {
             diagnostics::logging::store_log_guards(guards);
+            diagnostics::logging::store_log_filter(log_directives, log_filter_handle);
             startup_log_paths = Some((human_log_path, json_log_path));
         }
     }
@@ -1168,7 +1175,15 @@ pub async fn run(
     // to stdout; nothing in a host process reads stdout.
     tracing::info!("control API requires `Authorization: Bearer <token>`");
 
-    let seeding_enabled = settings_arc.read().await.seeding_enabled;
+    let (seeding_enabled, diagnostics_trace) = {
+        let settings = settings_arc.read().await;
+        (settings.seeding_enabled, settings.diagnostics_trace)
+    };
+    // The filter was installed with the trace off, which is also what a
+    // fresh process means by `false`; only `true` has anything to apply.
+    if diagnostics_trace {
+        diagnostics::logging::set_diagnostics_trace(true);
+    }
     // The engine's flag starts on and the session opens uploading, so with
     // sharing off in the settings nothing stops the uploads until this
     // line. It stores the flag and applies the upload switch, and nothing

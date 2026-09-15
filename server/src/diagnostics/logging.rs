@@ -10,8 +10,60 @@ use std::{
 use chrono::Local;
 use tokio::task::JoinHandle;
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
+use tracing_subscriber::{EnvFilter, Registry, reload};
 
 static LOG_GUARDS: OnceLock<Vec<WorkerGuard>> = OnceLock::new();
+static LOG_FILTER: OnceLock<LogFilter> = OnceLock::new();
+
+/// The `tracing` target of the retention trace
+/// (`enginefs::retention::trace`): one line per entity per ten seconds
+/// saying what a pass decided and why, plus the per-file `streams_seen`
+/// line. Off unless the `diagnosticsTrace` setting turns it on.
+pub const RETENTION_TRACE_TARGET: &str = "enginefs::retention::trace";
+
+/// The process's log filter, kept so a setting can change it while the
+/// process runs. `tracing` allows one global subscriber per process and
+/// its filter is set when it is installed; `reload` is the one way to
+/// change a directive afterwards, and this is the handle it gives back,
+/// with the directives it was built over.
+struct LogFilter {
+    /// `RUST_LOG`, or `DEFAULT_LOG_FILTER`: everything but the one
+    /// directive the setting decides.
+    base: String,
+    handle: reload::Handle<EnvFilter, Registry>,
+}
+
+/// The filter for `base`'s directives with the retention trace on or off.
+///
+/// The trace target is appended last: `EnvFilter` prefers the more
+/// specific directive, so `enginefs=info` in the base still carries every
+/// other `enginefs` line while this one decides the trace alone.
+pub fn log_filter(base: &str, diagnostics_trace: bool) -> EnvFilter {
+    let level = if diagnostics_trace { "info" } else { "off" };
+    EnvFilter::new(format!("{base},{RETENTION_TRACE_TARGET}={level}"))
+}
+
+/// Remember the installed subscriber's filter handle, once per process.
+pub fn store_log_filter(base: String, handle: reload::Handle<EnvFilter, Registry>) {
+    let _ = LOG_FILTER.set(LogFilter { base, handle });
+}
+
+/// Turn the retention trace on or off in the running process's log.
+/// `false` when this process installed no log filter to change (an
+/// embedder that logs on its own, or a test), in which case the setting is
+/// persisted and applies at the next start that does.
+pub fn set_diagnostics_trace(on: bool) -> bool {
+    let Some(filter) = LOG_FILTER.get() else {
+        return false;
+    };
+    match filter.handle.reload(log_filter(&filter.base, on)) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(%error, on, "could not change the log filter");
+            false
+        }
+    }
+}
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 static ACTIVE_DIRECT_STREAMS: AtomicU64 = AtomicU64::new(0);
 
@@ -489,6 +541,36 @@ unsafe extern "system" fn windows_exception_filter(
 
 #[cfg(test)]
 mod tests {
+    /// **The setting reaches the lines.** The retention trace is off by
+    /// default and on under the setting, with the rest of `enginefs` at
+    /// INFO either way; and the change lands on a subscriber that is
+    /// already installed, which is the only kind a running process has.
+    ///
+    /// This installs the process's global subscriber, which the rest of
+    /// this test binary never does; nothing else in it reads the filter.
+    #[test]
+    fn the_retention_trace_follows_the_setting_on_an_installed_subscriber() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let base = crate::DEFAULT_LOG_FILTER;
+        let (layer, handle) = super::reload::Layer::new(super::log_filter(base, false));
+        let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer));
+        super::store_log_filter(base.to_string(), handle);
+        let trace =
+            || tracing::enabled!(target: "enginefs::retention::trace", tracing::Level::INFO);
+        let engine = || tracing::enabled!(target: "enginefs::engine", tracing::Level::INFO);
+
+        assert!(!trace(), "the retention trace is on before anyone asked");
+        assert!(engine(), "the rest of enginefs went quiet with the trace");
+
+        assert!(super::set_diagnostics_trace(true), "no filter to change");
+        assert!(trace(), "the setting did not turn the trace on");
+        assert!(engine());
+
+        assert!(super::set_diagnostics_trace(false));
+        assert!(!trace(), "the setting did not turn the trace off again");
+        assert!(engine());
+    }
+
     use super::*;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;

@@ -592,7 +592,7 @@ impl<S: Side> Backing for FakeBacking<S> {
         self.dropped.lock().push(unwanted);
     }
 
-    /// **TEMPORARY**, with [`crate::retention::trace`]: answering it at
+    /// For [`crate::retention::trace`]: answering it at
     /// all is what makes the pass emit the field's own trace lines, which
     /// is how a scenario reproduces a failure that was reported as a log
     /// line rather than as a number. The counters are zero -- this fake

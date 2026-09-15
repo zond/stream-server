@@ -351,9 +351,10 @@ where
     // (`docs/read-pattern-retention.md` section 4), so a fresh cap over a
     // stale headroom sizes a lookahead against a disk that never existed.
     let headroom = available.map(|available| available.saturating_sub(floor));
-    // TEMPORARY: see `enginefs::retention::trace`, and delete this line with
-    // that module. The pass reports the budget in force; this is the only
-    // place that knows which of the two numbers it came from.
+    // Part of the retention trace (`enginefs::retention::trace`, under the
+    // `diagnosticsTrace` setting). The pass reports the budget in force;
+    // this is the only place that knows which of the two numbers it came
+    // from.
     enginefs::retention::trace::budget_published(
         cap,
         (configured != 0).then_some(configured),

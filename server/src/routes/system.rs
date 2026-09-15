@@ -377,6 +377,16 @@ pub struct ServerSettings {
     #[serde(rename = "lanMediaEnabled", default)]
     pub lan_media_enabled: bool,
 
+    /// Whether the retention trace is in the log: one line per entity per
+    /// ten seconds on what a pass decided and why, and the per-file
+    /// `streams_seen` line (`enginefs::retention::trace`). Off by default;
+    /// it is what a field report is read by when playback misbehaves, and
+    /// noise the rest of the time. Applied to the running process's log
+    /// filter at once (`diagnostics::logging::set_diagnostics_trace`) and
+    /// at every start.
+    #[serde(rename = "diagnosticsTrace", default)]
+    pub diagnostics_trace: bool,
+
     /// How far ahead playback reads: the default
     /// [`BufferProfile`](enginefs::backend::priorities::BufferProfile) for
     /// every stream request that does not carry a `buffer=` override.
@@ -785,6 +795,7 @@ impl Default for ServerSettings {
             seeding_enabled: default_seeding_enabled(),
             dht_bootstrap_nodes: None,
             lan_media_enabled: false,
+            diagnostics_trace: false,
             buffer_profile: BufferProfile::default(),
         }
     }
@@ -973,6 +984,7 @@ pub async fn update_settings(
             settings.seeding_enabled = enabled;
         }
         update_bool_setting(obj, "lanMediaEnabled", &mut settings.lan_media_enabled);
+        update_bool_setting(obj, "diagnosticsTrace", &mut settings.diagnostics_trace);
         // Validated, not merged blindly: an unknown profile name leaves the
         // setting alone rather than failing the whole update.
         if let Some(profile) = obj
@@ -1000,6 +1012,7 @@ pub async fn update_settings(
 
     let seeding_enabled = settings.seeding_enabled;
     let lan_media_enabled = settings.lan_media_enabled;
+    let diagnostics_trace = settings.diagnostics_trace;
 
     // Build new speed profile from updated settings
     let new_profile = enginefs::backend::TorrentSpeedProfile {
@@ -1053,6 +1066,9 @@ pub async fn update_settings(
     }
 
     state.engine.set_seeding_enabled(seeding_enabled).await;
+    // The log filter of the running process, so the trace starts or stops
+    // with the switch rather than at the next start.
+    crate::diagnostics::logging::set_diagnostics_trace(diagnostics_trace);
     // `cacheSize` is half of what caps the cache, so a client that changed
     // it has changed the cap -- and that cap is the budget the retention
     // policy over the piece store and the proxy cache is sized from. Stated

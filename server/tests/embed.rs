@@ -754,6 +754,81 @@ fn create_engine_guesses_episode_from_season_pack() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// **`diagnosticsTrace` turns the retention trace on and off in the running
+/// process.** The trace target is `off` in the filter a start installs, a
+/// `POST /settings` with the switch on reaches the installed filter at once,
+/// and off again likewise; the value is persisted like any other setting.
+///
+/// This is the one test in the binary that starts a server with
+/// `init_logging`, because `tracing` takes one global subscriber per process
+/// and this test has to own it to read its filter; the log files land in the
+/// test's own config dir.
+#[test]
+fn the_diagnostics_trace_setting_changes_the_installed_log_filter() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_dir.path().join("cache")),
+        init_logging: true,
+        ..offline_config()
+    })?;
+    let trace_on = || tracing::enabled!(target: "enginefs::retention::trace", tracing::Level::INFO);
+    let rest_on = || tracing::enabled!(target: "enginefs::engine", tracing::Level::INFO);
+
+    assert!(
+        !handle.settings()?.diagnostics_trace,
+        "the trace is on by default"
+    );
+    assert!(
+        !trace_on(),
+        "the retention trace was in the log before anyone asked"
+    );
+    assert!(rest_on(), "the rest of enginefs is missing from the log");
+
+    let updated = handle.update_settings(serde_json::json!({ "diagnosticsTrace": true }))?;
+    assert!(updated.diagnostics_trace);
+    assert!(trace_on(), "the setting did not reach the installed filter");
+    assert!(rest_on());
+    let persisted: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+        config_dir.path().join("config").join("settings.json"),
+    )?)?;
+    assert_eq!(persisted["diagnosticsTrace"], true);
+
+    handle.update_settings(serde_json::json!({ "diagnosticsTrace": false }))?;
+    assert!(!trace_on(), "the setting did not turn the trace off again");
+    assert!(rest_on());
+
+    // A start over settings that already say `true` applies it: the second
+    // server in this process finds the log files installed and does not
+    // install them again, so what it changes is this process's one filter.
+    // The first server's whole file with the one value flipped: a partial
+    // file does not parse as settings and would fall through to defaults.
+    let mut persisted: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+        config_dir.path().join("config").join("settings.json"),
+    )?)?;
+    persisted["diagnosticsTrace"] = serde_json::Value::Bool(true);
+    let second_config = tempfile::tempdir()?;
+    std::fs::create_dir_all(second_config.path().join("config"))?;
+    std::fs::write(
+        second_config.path().join("config").join("settings.json"),
+        persisted.to_string(),
+    )?;
+    let second = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(second_config.path().join("config")),
+        cache_dir: Some(cache_dir.path().join("second")),
+        init_logging: true,
+        ..offline_config()
+    })?;
+    assert!(second.settings()?.diagnostics_trace);
+    assert!(trace_on(), "a persisted `true` was not applied at start");
+    second.update_settings(serde_json::json!({ "diagnosticsTrace": false }))?;
+    assert!(!trace_on());
+    Ok(())
+}
+
 /// The library API on `ServerHandle` is the same code the control routes
 /// run, so an embedder (FFI, no HTTP client) sees exactly what a client
 /// polling over HTTP would: `settings()` is `GET /settings`' `values`,
