@@ -361,3 +361,16 @@ before the tail stream's earliest piece (5559 rather than 5560) and paid
 Piece 0 took 3.6 s of which 1.7 s was before any peer had connected to
 reserve it. The startup bar reported 15/16 chunks; the probe reported no
 stale lines.
+
+## Fifth field log on the latency claim rules (2026-09-15 21:11, xtremio 7de2dea)
+
+The two changes of rqbit `cc969c7b` in the field, on the same torrent as
+the fourth log and a comparable swarm (6-17 peers, 5-16 seeders,
+5-10 MB/s): **no read waited two seconds, so the probe never fired.** The
+longest piece wait was 1.49 s (piece 0 at open); the other ten waits over
+a second were 1.0-1.5 s, one round trip of this swarm's typical peer.
+Stalls: 3.8 s at open (piece 0 plus the tail read), then 3.0, 3.8, 1.5 and
+1.6 s across four seeks -- against 7.9, 3.7, 3.7 and 7.7 s an hour
+earlier. The 3.0 s seek had no piece wait over a second at all: what is
+left of a seek's cost is the new stream's window ramp, which zond has
+chosen to leave as it is. Nothing to fix from this log.
