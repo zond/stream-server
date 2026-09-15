@@ -256,7 +256,9 @@ whose job was partly to say "not real" or "leave it". Three did.
   building APKs beside it, and passed on every rerun; it measures bytes
   fetched across a pass against a four-piece slack over a real librqbit
   swarm. Not a regression of anything that day; wants either a wider
-  slack or a fake swarm.
+  slack or a fake swarm. Its precondition -- the cache filling past half
+  the budget in the time allowed -- also failed once on the Windows runner
+  (29 pieces of 32), same cause.
 
 ## First field log on the latency claim rules (2026-09-15 06:09, xtremio a58f5f0)
 
