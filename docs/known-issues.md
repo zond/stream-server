@@ -275,3 +275,18 @@ last delivery and own latency. **Read the next log for those lines.** Also
 fixed: eighty "we already requested" warnings in ten milliseconds after a
 head cut (now debug).
 
+## Second field log on the latency claim rules (2026-09-15 06:54, xtremio ef6ac8c)
+
+The `blocked_read_claims` lines answered: piece 0 blocked 15 s with **ten of
+sixteen shares untaken** while three peers each held their two and fetched
+whole pieces deeper in the window (the "delivered since the last handout"
+gate never let them back in); whole pieces held by single peers with 3-6 s
+of latency and 128 requests in flight, delivering every few milliseconds
+and so never "quiet", took seconds each. Both are invisible to a clock set
+by the holder's last delivery. rqbit `a27fa9cd` measures every takeover --
+cut, double, share beyond one's own -- against the piece's age in flight
+instead (CLAIMS.md, "The one measurement"). Also: one `staged_over_held`
+on piece 3181, the write-into-a-finished-piece race, seen once; the probe
+fired for reads whose response had closed (fixed, `0fc8b1f7`); the
+startup bar counts landed chunks (same commit).
+
