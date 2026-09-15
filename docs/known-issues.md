@@ -290,3 +290,17 @@ on piece 3181, the write-into-a-finished-piece race, seen once; the probe
 fired for reads whose response had closed (fixed, `0fc8b1f7`); the
 startup bar counts landed chunks (same commit).
 
+## Third field log on the latency claim rules (2026-09-15 08:56, xtremio ad69105)
+
+The piece's age as the clock did it: piece 0 in 1.0 s (was 15.1 s), first
+frame 2.8 s after open (was 22.6 s), no read waited over 2.1 s across four
+seeks (was 24 and 30 s two logs ago). What a seek still costs is 4-5 s,
+made of three or four sequential 1.1-1.9 s piece waits: a seek to unheld
+ground is a new stream, its window starts at the two-piece floor and
+doubles once a pass, and mpv's post-seek burst outruns that ramp for ten
+seconds. Inheriting the last live stream's window was proposed and
+declined by zond: audio, subtitle and video streams cannot be told apart,
+so a new stream cannot know whose window to inherit. Left as it is. The
+probe's stale `holders=0` lines (a task from an earlier park firing
+against the next) are fixed in `735b3ca3`.
+
