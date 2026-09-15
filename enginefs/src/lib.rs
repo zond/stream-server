@@ -7137,6 +7137,41 @@ mod tests {
 
     /// A reader whose every read parks, like a `FileStream` on a piece the
     /// torrent is not downloading.
+    /// A stream that parks on its first poll, serves a byte on the second,
+    /// and parks again on the third and every poll after: a read served
+    /// between two waits, which is what every sequential read of a film is.
+    struct ParkServePark(u8);
+
+    impl tokio::io::AsyncRead for ParkServePark {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.0 += 1;
+            if self.0 == 2 {
+                buf.put_slice(&[7]);
+                return std::task::Poll::Ready(Ok(()));
+            }
+            std::task::Poll::Pending
+        }
+    }
+
+    impl tokio::io::AsyncSeek for ParkServePark {
+        fn start_seek(
+            self: std::pin::Pin<&mut Self>,
+            _position: std::io::SeekFrom,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn poll_complete(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<u64>> {
+            std::task::Poll::Ready(Ok(0))
+        }
+    }
+
     struct ParkedStream;
 
     impl tokio::io::AsyncRead for ParkedStream {
@@ -8702,6 +8737,62 @@ mod tests {
             "a read that closed while parked asked who holds its piece: {:?}",
             counters.claims_asked.lock().unwrap()
         );
+        drop(enginefs);
+    }
+
+    /// **A probe from an earlier park does not report the next one.**
+    ///
+    /// A read parks, is served within a second, and parks again on the
+    /// next piece; the first park's two-second task must not fire against
+    /// the second wait with the first park's offset. The field log had
+    /// five such lines in three seconds, each naming a piece long since
+    /// served, each saying nobody held it.
+    #[tokio::test]
+    async fn a_probe_from_an_earlier_park_does_not_report_the_next_one() {
+        let (enginefs, counters) = test_enginefs_for_reconciler(1);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.reconcile_tick().await;
+        engine.retention.install(0, 0).await;
+
+        use tokio::io::AsyncRead;
+        let opening = crate::files::Opening {
+            file_idx: 0,
+            start_offset: 10,
+            lookahead_bytes: 0,
+            buffer: crate::backend::priorities::BufferProfile::Normal,
+        };
+        let on_entity = opening.reader_on(&engine.retention);
+        let mut reader = crate::files::FileHandle::new(
+            100,
+            "video-0.mkv".to_string(),
+            Box::new(ParkServePark(0)),
+            engine.clone(),
+            opening,
+            on_entity,
+        );
+        engine.active_streams.fetch_add(1, Ordering::SeqCst);
+        let mut buf = [0u8; 16];
+        let mut poll = |reader: &mut crate::files::FileHandle<FakeHandle>| {
+            let mut read = tokio::io::ReadBuf::new(&mut buf);
+            let waker = std::task::Waker::noop();
+            let mut cx = std::task::Context::from_waker(waker);
+            std::pin::Pin::new(reader)
+                .poll_read(&mut cx, &mut read)
+                .is_pending()
+        };
+        // Park at 10, served a byte, parked again at 11.
+        assert!(poll(&mut reader));
+        assert!(!poll(&mut reader));
+        assert!(poll(&mut reader));
+
+        tokio::time::sleep(crate::files::BLOCKED_READ_PROBE_AFTER + Duration::from_millis(500))
+            .await;
+        assert_eq!(
+            *counters.claims_asked.lock().unwrap(),
+            vec![(0, 11)],
+            "the first park's probe reported against the second wait"
+        );
+        drop(reader);
         drop(enginefs);
     }
 

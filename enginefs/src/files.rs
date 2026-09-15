@@ -177,10 +177,14 @@ pub struct FileHandle<H: TorrentHandle> {
     /// for, and this handle does not exist until after that await. See
     /// there for what runs in the gap.
     reader: Option<crate::retention::owner::Reader<crate::engine::TorrentBacking<H>>>,
-    /// Whether a probe of the piece this read is parked on is armed; see
-    /// [`Self::arm_blocked_probe`]. Set when the read parks, cleared when
-    /// it is served, read by the probe task before it logs.
-    probe: Arc<std::sync::atomic::AtomicBool>,
+    /// Which park of this read a probe is armed for, or zero for none; see
+    /// [`Self::arm_blocked_probe`]. Set to a fresh generation when the read
+    /// parks, cleared when it is served, and read by the probe task before
+    /// it logs: a task from an earlier park finds a different generation
+    /// and says nothing. A flag was not enough -- a read served within a
+    /// second and parked again on the next piece had the first park's task
+    /// log the old offset against the new wait.
+    probe: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// What one read of one file is: where in the torrent, where in the file,
@@ -348,12 +352,15 @@ impl<H: TorrentHandle> FileHandle<H> {
     /// why nobody took the claim over. A task rather than a check in
     /// `poll_read`, which is not polled while the read is parked.
     fn arm_blocked_probe(&self) {
-        if self.probe.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        if self.probe.load(std::sync::atomic::Ordering::SeqCst) != 0 {
             return;
         }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
+        let generation = self.engine.next_reader_id();
+        self.probe
+            .store(generation, std::sync::atomic::Ordering::SeqCst);
         let probe = self.probe.clone();
         let engine = self.engine.clone();
         let (file_idx, offset) = (self.file_idx, self.cursor.position);
@@ -362,7 +369,7 @@ impl<H: TorrentHandle> FileHandle<H> {
             for delay in [BLOCKED_READ_PROBE_AFTER, BLOCKED_READ_PROBE_AGAIN] {
                 tokio::time::sleep(delay).await;
                 waited += delay;
-                if !probe.load(std::sync::atomic::Ordering::SeqCst) {
+                if probe.load(std::sync::atomic::Ordering::SeqCst) != generation {
                     return;
                 }
                 let piece_length = engine.handle.piece_length();
@@ -471,7 +478,7 @@ impl<H: TorrentHandle> AsyncRead for FileHandle<H> {
                 }
             }
             Poll::Ready(ref result) => {
-                self.probe.store(false, std::sync::atomic::Ordering::SeqCst);
+                self.probe.store(0, std::sync::atomic::Ordering::SeqCst);
                 let delivered = if result.is_ok() {
                     buf.filled().len().saturating_sub(before) as u64
                 } else {
@@ -525,7 +532,7 @@ impl<H: TorrentHandle> Drop for FileHandle<H> {
         // A read whose response closed while it was parked is not waiting
         // on anything; its probe must not report the piece as still held
         // up, or as held by nobody, ten seconds later.
-        self.probe.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.probe.store(0, std::sync::atomic::Ordering::SeqCst);
         self.engine.forget_read_waker(self.reader_id);
         self.engine.active_streams.fetch_sub(1, Ordering::SeqCst);
     }
