@@ -258,3 +258,18 @@ whose job was partly to say "not real" or "leave it". Three did.
   swarm. Not a regression of anything that day; wants either a wider
   slack or a fake swarm.
 
+## First field log on the latency claim rules (2026-09-15 06:09, xtremio a58f5f0)
+
+Two head-piece reads still blocked long with a fast swarm: piece 5 at
+start for 24.6 s (15 seeders, 5-20 MB/s going to pieces 6-27) and piece
+5560 after a seek for 30.1 s (22 seeders; the whole swarm at 160-350 KB/s
+and nothing completing for 24 s). Doubling was gated on the claim having
+delivered nothing, so a holder trickling a chunk a second was never
+rescued; rqbit `d4020903` widens doubling to the one rule (any outpaced
+holder). The idle-swarm shape of the 30-second case is not explained by
+that alone. stream-server `71f555aa` adds `blocked_read_claims`: two and
+ten seconds into a wait, the piece's holders with chunks missing, wait since
+last delivery and own latency. **Read the next log for those lines.** Also
+fixed: eighty "we already requested" warnings in ten milliseconds after a
+head cut (now debug).
+
