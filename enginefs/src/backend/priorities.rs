@@ -206,6 +206,14 @@ pub const fn librqbit_stream_lookahead_bytes(fetching: Fetching) -> u64 {
 /// say "waiting for the first piece (16 MiB)" instead of showing a stalled
 /// percentage. `ready == window` is unchanged either way: it still means
 /// exactly "every piece the window touches is verified".
+///
+/// **And a piece still arriving counts its landed chunks**, through
+/// [`initial_window_progress_with`]: on the field's 4 MiB pieces the two-
+/// piece startup window read 0, 50 or 100 percent and nothing between,
+/// which a viewer reads as stuck. A chunk that has landed is not verified
+/// and not readable yet, so the bar can move while the piece fails its
+/// hash and drops back -- a rare cost against a bar that moves in 512
+/// steps rather than two.
 pub fn initial_window_progress(
     file_offset: u64,
     file_len: u64,
@@ -213,6 +221,30 @@ pub fn initial_window_progress(
     window_bytes: u64,
     read_from: u64,
     have_piece: impl Fn(u64) -> bool,
+) -> (u64, u64) {
+    initial_window_progress_with(
+        file_offset,
+        file_len,
+        piece_length,
+        window_bytes,
+        read_from,
+        have_piece,
+        |_| 0,
+    )
+}
+
+/// [`initial_window_progress`] with `landed_bytes(piece)` saying how many
+/// bytes of a piece the window touches have arrived but not yet verified,
+/// for a piece `have_piece` answers `false` for. Clipped to the file's part
+/// of the piece, like a whole piece is.
+pub fn initial_window_progress_with(
+    file_offset: u64,
+    file_len: u64,
+    piece_length: u64,
+    window_bytes: u64,
+    read_from: u64,
+    have_piece: impl Fn(u64) -> bool,
+    landed_bytes: impl Fn(u64) -> u64,
 ) -> (u64, u64) {
     let read_from = read_from.min(file_len);
     let window = window_bytes.min(file_len - read_from);
@@ -230,12 +262,14 @@ pub fn initial_window_progress(
     let span_end = ((last_piece + 1) * piece_length).min(file_offset + file_len);
     let mut ready = 0u64;
     for piece in first_piece..=last_piece {
-        if !have_piece(piece) {
-            continue;
-        }
         let piece_start = (piece * piece_length).max(span_start);
         let piece_end = ((piece + 1) * piece_length).min(span_end);
-        ready += piece_end.saturating_sub(piece_start);
+        let in_file = piece_end.saturating_sub(piece_start);
+        ready += if have_piece(piece) {
+            in_file
+        } else {
+            landed_bytes(piece).min(in_file)
+        };
     }
     (ready, span_end - span_start)
 }
@@ -326,6 +360,28 @@ mod tests {
         assert_eq!(
             initial_window_progress(100, 1000, 256, 512, 0, have_none),
             (0, 668)
+        );
+    }
+
+    /// **A piece still arriving counts what has landed.** The two-piece
+    /// startup window read 0, 50 or 100 percent and nothing between; half a
+    /// piece's chunks on the wire is a quarter of the window.
+    #[test]
+    fn initial_window_progress_counts_the_chunks_of_a_piece_still_arriving() {
+        let piece = 256u64;
+        // Two pieces of window, the first verified, the second half landed.
+        let have_first = |p: u64| p == 0;
+        let half_of_second = |p: u64| if p == 1 { 128 } else { 0 };
+        assert_eq!(
+            initial_window_progress_with(0, 1000, piece, 512, 0, have_first, half_of_second),
+            (384, 512)
+        );
+        // Landed bytes never exceed the piece's part of the file, and a
+        // verified piece is not counted twice.
+        let claims_too_much = |_: u64| 10_000;
+        assert_eq!(
+            initial_window_progress_with(0, 300, piece, 512, 0, have_first, claims_too_much),
+            (300, 300)
         );
     }
 

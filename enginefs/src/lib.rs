@@ -8657,6 +8657,54 @@ mod tests {
         drop(enginefs);
     }
 
+    /// **A parked read whose response closes asks nothing.** Its probe is
+    /// disarmed with the handle, or ten seconds later the log would say
+    /// the piece was still held up -- or held by nobody -- for a read
+    /// nobody is waiting on.
+    #[tokio::test]
+    async fn a_parked_read_that_closes_asks_nothing_about_its_piece() {
+        let (enginefs, counters) = test_enginefs_for_reconciler(1);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.reconcile_tick().await;
+        engine.retention.install(0, 0).await;
+
+        use tokio::io::AsyncRead;
+        let opening = crate::files::Opening {
+            file_idx: 0,
+            start_offset: 0,
+            lookahead_bytes: 0,
+            buffer: crate::backend::priorities::BufferProfile::Normal,
+        };
+        let on_entity = opening.reader_on(&engine.retention);
+        let mut reader = crate::files::FileHandle::new(
+            100,
+            "video-0.mkv".to_string(),
+            Box::new(ParkedStream),
+            engine.clone(),
+            opening,
+            on_entity,
+        );
+        engine.active_streams.fetch_add(1, Ordering::SeqCst);
+        let mut buf = [0u8; 16];
+        let parked = std::future::poll_fn(|cx| {
+            let polled = std::pin::Pin::new(&mut reader)
+                .poll_read(cx, &mut tokio::io::ReadBuf::new(&mut buf));
+            std::task::Poll::Ready(matches!(polled, std::task::Poll::Pending))
+        })
+        .await;
+        assert!(parked);
+        drop(reader);
+
+        tokio::time::sleep(crate::files::BLOCKED_READ_PROBE_AFTER + Duration::from_millis(500))
+            .await;
+        assert!(
+            counters.claims_asked.lock().unwrap().is_empty(),
+            "a read that closed while parked asked who holds its piece: {:?}",
+            counters.claims_asked.lock().unwrap()
+        );
+        drop(enginefs);
+    }
+
     /// One poll of a fresh reader on this engine: `None` when the read
     /// parks -- what a read on a piece that is still coming does -- and the
     /// error when it is refused outright.

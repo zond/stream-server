@@ -2362,13 +2362,27 @@ impl TorrentHandle for LibrqbitHandle {
                     startup_cap.min(position.lookahead_bytes)
                 });
                 let window = haves.as_ref().map(|bf| {
-                    crate::backend::priorities::initial_window_progress(
+                    crate::backend::priorities::initial_window_progress_with(
                         offset,
                         f.len,
                         piece_length,
                         startup_window,
                         read_from.unwrap_or(0),
                         |piece| bf.get(piece as usize).is_some_and(|bit| *bit),
+                        // Chunks landed in a piece the window is waiting on,
+                        // so the bar moves between pieces; see
+                        // `initial_window_progress`.
+                        |piece| {
+                            let Some(chunk_size) = chunk_size else {
+                                return 0;
+                            };
+                            u32::try_from(piece)
+                                .ok()
+                                .and_then(|index| self.handle.piece_chunk_progress(index).ok())
+                                .map_or(0, |progress| {
+                                    u64::from(progress.downloaded_chunks).saturating_mul(chunk_size)
+                                })
+                        },
                     )
                 });
                 // Sub-piece progress for the piece this file's reader is

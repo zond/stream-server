@@ -365,13 +365,19 @@ impl<H: TorrentHandle> FileHandle<H> {
                 if !probe.load(std::sync::atomic::Ordering::SeqCst) {
                     return;
                 }
-                let claims = engine.handle.piece_claims_at(file_idx, offset);
                 let piece_length = engine.handle.piece_length();
+                let piece = ReadCursor::piece_of(offset, 0, piece_length);
+                // One line per piece per second: mpv parks several ranges
+                // on the same piece at once, and each is its own read.
+                if !engine.blocked_probe_may_log(file_idx, piece.unwrap_or(offset)) {
+                    continue;
+                }
+                let claims = engine.handle.piece_claims_at(file_idx, offset);
                 tracing::info!(
                     info_hash = %engine.info_hash,
                     file_idx,
                     offset,
-                    piece = ReadCursor::piece_of(offset, 0, piece_length),
+                    piece,
                     waited_ms = waited.as_millis() as u64,
                     holders = claims.len(),
                     claims = %claims
@@ -516,6 +522,10 @@ impl<H: TorrentHandle> AsyncRead for FileHandle<H> {
 
 impl<H: TorrentHandle> Drop for FileHandle<H> {
     fn drop(&mut self) {
+        // A read whose response closed while it was parked is not waiting
+        // on anything; its probe must not report the piece as still held
+        // up, or as held by nobody, ten seconds later.
+        self.probe.store(false, std::sync::atomic::Ordering::SeqCst);
         self.engine.forget_read_waker(self.reader_id);
         self.engine.active_streams.fetch_sub(1, Ordering::SeqCst);
     }

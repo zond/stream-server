@@ -1193,6 +1193,10 @@ pub struct Engine<H: TorrentHandle> {
     /// leaves its readers parked for good unless something here wakes them.
     read_wakers: parking_lot::Mutex<HashMap<u64, std::task::Waker>>,
     next_reader_id: AtomicU64,
+    /// When the blocked-read probe last logged each `(file, offset piece)`,
+    /// so mpv's several parallel ranges parked on one piece produce one
+    /// line and not four; see [`Self::blocked_probe_may_log`].
+    blocked_probes: parking_lot::Mutex<HashMap<(usize, u64), std::time::Instant>>,
     /// **What the reads of this torrent look like**, worked out from the
     /// reads themselves and obeyed by every pass over its files: what is
     /// fetched, what may not be unlinked and what is given back are all
@@ -1333,6 +1337,7 @@ impl<H: TorrentHandle> Engine<H> {
             reads_refused: AtomicBool::new(false),
             read_wakers: parking_lot::Mutex::new(HashMap::new()),
             next_reader_id: AtomicU64::new(1),
+            blocked_probes: parking_lot::Mutex::new(HashMap::new()),
             streams,
             retention,
             live,
@@ -1529,6 +1534,22 @@ impl<H: TorrentHandle> Engine<H> {
     }
 
     /// A fresh id for a reader that will register wakers.
+    /// Whether a blocked-read probe line for `piece` of `file_idx` may go
+    /// out now: one per piece per second, whatever the number of reads
+    /// parked on it. Entries older than a minute are dropped on the way.
+    pub(crate) fn blocked_probe_may_log(&self, file_idx: usize, piece: u64) -> bool {
+        let now = std::time::Instant::now();
+        let mut probes = self.blocked_probes.lock();
+        probes.retain(|_, at| now.duration_since(*at) < std::time::Duration::from_secs(60));
+        match probes.get(&(file_idx, piece)) {
+            Some(at) if now.duration_since(*at) < std::time::Duration::from_secs(1) => false,
+            _ => {
+                probes.insert((file_idx, piece), now);
+                true
+            }
+        }
+    }
+
     pub(crate) fn next_reader_id(&self) -> u64 {
         self.next_reader_id.fetch_add(1, Ordering::Relaxed)
     }
