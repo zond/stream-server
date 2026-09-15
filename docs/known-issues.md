@@ -243,15 +243,14 @@ whose job was partly to say "not real" or "leave it". Three did.
 
 ## Found 2026-09-15, not yet fixed
 
-- **The detector joins a read to a stream by held run alone.** A read
-  whose first piece is in the same run of held pieces as a stream's end
-  is that stream's, however far apart the two are; the `SAME_CONSUMER`
-  bound the comment in `FileStreams::observe` describes was never
-  written. On a fully held file (a rewatch, a film that fits the cache)
-  mpv's index crawl at the tail is folded into the viewer's stream, the
-  window is drawn at the tail and the head reads there. The field's disk
-  keeps the two apart because the pieces between are not held. See
-  `docs/review-2026-09-14.md` N1.
+- **The detector joins a read to a stream by held run alone** -- by design,
+  the disk being what a mistake costs. What went wrong on a fully held film
+  was the position following the last read, so mpv's tail crawl dragged
+  the viewer's stream to the tail. Fixed in 78663e6: the position is a
+  byte-weighted average of where reads end, so the crawler's 91 bytes move
+  it by a rounding error and a viewer's seek converges in a couple of
+  dozen reads; a read about to run out of held bytes places it outright.
+  See `docs/review-2026-09-14.md` N1.
 - **`a_stream_wider_than_its_window_is_fetched_inside_it` is timing-bound.**
   It failed twice in about eight runs on 2026-09-15 while the machine was
   building APKs beside it, and passed on every rerun; it measures bytes
