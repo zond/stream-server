@@ -841,6 +841,9 @@ pub async fn update_settings(
 
     // Merge with existing settings
     let mut settings = state.settings.write().await;
+    // What the log filter was last told by this server, to tell a change of
+    // `diagnosticsTrace` from an update that did not touch it; see below.
+    let was_diagnostics_trace = settings.diagnostics_trace;
 
     if let Some(obj) = payload.as_object() {
         // Update fields that are present in the payload
@@ -1067,8 +1070,16 @@ pub async fn update_settings(
 
     state.engine.set_seeding_enabled(seeding_enabled).await;
     // The log filter of the running process, so the trace starts or stops
-    // with the switch rather than at the next start.
-    crate::diagnostics::logging::set_diagnostics_trace(diagnostics_trace);
+    // with the switch rather than at the next start. **Only when the switch
+    // moved:** the filter belongs to the process, not to this server, so an
+    // update about anything else must not restate it. Two servers in one
+    // process -- which every test binary of this crate is -- would otherwise
+    // each reset the other's trace on every settings write, and the one
+    // started second would lose its persisted `true` to the first one's next
+    // unrelated update.
+    if diagnostics_trace != was_diagnostics_trace {
+        crate::diagnostics::logging::set_diagnostics_trace(diagnostics_trace);
+    }
     // `cacheSize` is half of what caps the cache, so a client that changed
     // it has changed the cap -- and that cap is the budget the retention
     // policy over the piece store and the proxy cache is sized from. Stated

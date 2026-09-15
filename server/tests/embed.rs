@@ -824,6 +824,17 @@ fn the_diagnostics_trace_setting_changes_the_installed_log_filter() -> anyhow::R
     })?;
     assert!(second.settings()?.diagnostics_trace);
     assert!(trace_on(), "a persisted `true` was not applied at start");
+
+    // An update that does not move the switch leaves the filter alone. The
+    // first server's own setting is `false`, and the filter is the process's:
+    // restated on every settings write, this turned the second server's trace
+    // off -- which is what failed CI, from another test's server writing its
+    // settings at the wrong moment.
+    handle.update_settings(serde_json::json!({ "btMaxConnections": 55 }))?;
+    assert!(
+        trace_on(),
+        "an update that did not touch diagnosticsTrace changed the log filter"
+    );
     second.update_settings(serde_json::json!({ "diagnosticsTrace": false }))?;
     assert!(!trace_on());
     Ok(())
