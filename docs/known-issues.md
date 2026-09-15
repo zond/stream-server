@@ -68,27 +68,99 @@ Still stale:
 
 ### Open in this repo
 
-Verified against the tree on 2026-09-14.
+Each entry carries its plan, agreed with zond on 2026-09-15. Order is the
+order to do them in.
 
-- **The boundary-piece race is real but not where this file said, and it
-  is healed where it is.** `TorrentStorage::remove_file` has no per-file
-  production caller -- librqbit reaches it only on a whole-torrent
-  delete-with-files -- so its boundary rule never races a pin. The race is
-  in `TorrentBacking::want` and `TorrentBacking::reclaim` (`engine.rs`,
-  the `Backing` impl), where the pin set is read and then acted on with no
-  lock spanning the two: `pin_download_locked` writes it under
-  `pin_locks`, which no pass takes, so it is a cross-thread window rather
-  than an await interleaving. Since `6744894` every acted-on run is
-  checked against the pins once more afterwards
-  (`TorrentBacking::rewant_pins_crossed_by`) and anything a pin has since
-  claimed is wanted again, so what the race costs is one boundary piece
-  fetched twice -- which the design accepts of a boundary piece everywhere
-  else -- rather than a pinned download left one piece short of done until
-  a heal that was conditional on a default three modules away.
+- **The retention trace and mpv's verbose log are always on or always
+  off; make them a setting.** Today the trace is five `tracing::info!`
+  sites -- `retention/owner.rs` (`pass`, `planned_to_reclaim_inside_a_lookahead`),
+  `engine.rs` and `server/src/proxy_retention.rs` (`streams_seen`),
+  `server/src/cache_budget.rs` (`budget_published`) -- and xtremio forces
+  mpv to `MPVLogLevel.info` under three comments marked TEMPORARY in
+  `lib/features/player/playback_engine.dart`. There is no runtime
+  verbosity toggle anywhere: `RUST_LOG` at start-up is the only lever.
 
-  Also noted while looking: `store.rs`'s `removed_files` set is
-  insert-only and never cleared on a re-pin. Unreachable today, and
-  exactly the read-once-trust-later shape that keeps recurring here.
+  *Plan.* One device-local bool, "verbose diagnostics", following the
+  bold-focus pattern (`AppPrefs` key + `SwitchListTile` in
+  `core_settings.dart`; the prefs round-trip needs no new FRB code). Two
+  consumers: (1) xtremio pushes it to the server as `diagnosticsTrace`
+  through the existing `POST /settings` path (`server/src/routes/system.rs`,
+  like `seedingEnabled`), persisted in the settings file and applied live
+  by a new `Engine::set_diagnostics_trace` that flips one `AtomicBool` in
+  `retention::trace`; every trace function returns early when it is off,
+  so the call sites stay where they are. (2) `playback_engine.dart` reads
+  the same pref for mpv's `logLevel` and the `engineLog` filter, applied
+  at the next player start. The TEMPORARY wording goes; the trace module
+  becomes a feature, and `staged_over_held` keeps its reader. The
+  blocked-read lines (`blocked_read`, `blocked_read_claims`) stay
+  unconditional: they fire only when a read has waited over a second, and
+  they are what every field log was read by. Proof: a server test that the
+  setting flips the flag; an enginefs test with a capturing subscriber
+  that a pass emits nothing while it is off and the lines while it is on.
+
+- **The pin set is read at one moment and acted on at another.** The pass
+  reads `pinned` (`engine.rs:362`, an `RwLock<BTreeSet>` on the engine)
+  through `pinned_spans` while deciding, then awaits the backend to drop
+  or release; `pin_download_locked` (`lib.rs:3630`) writes the set under
+  no lock the pass takes. Since `6744894` `rewant_pins_crossed_by` re-reads
+  the pins after every act and re-wants what a pin has since claimed, so
+  the cost is one boundary piece fetched twice -- but the decision itself
+  can be made on stale pins for the whole pass, and the heal is an
+  after-the-fact re-ask, the shape every retention defect has had.
+
+  *Plan.* The owner design, applied to pins: the pinned set moves into the
+  entity's retention state and is written through the owner
+  (`Retention::pin`/`unpin`, under the lock the pass decides under), so a
+  decision is made against the current pins by construction. The act
+  still happens outside the lock; a pin that arrives while a run is doomed
+  finds it marked so and is answered by the owner re-wanting it when the
+  act reports back -- one explicit state, not a window. That replaces the
+  global `rewant_pins_crossed_by` re-read with owner-local reconciliation.
+  Proof: the six existing pin tests in `enginefs/src/lib.rs` (from
+  `a_pin_that_lands_inside_a_run_is_wanted_again_after_it` on) plus two
+  new ones using the fake backend's gates: a pin landing before the
+  decision keeps the piece with no drop at all, and a pin landing between
+  decide and act re-wants it exactly once; mutation reads the pins outside
+  the lock.
+
+- **`removed_files` is insert-only.** `piece_store/store.rs:150`, a
+  `Mutex<BTreeSet<usize>>` inserted into only by `TorrentStorage::remove_file`
+  (`store.rs:1462`) and consulted there to decide whether a boundary piece
+  may go once every owning file is in the set. Never cleared, so a file
+  removed and then pinned again would still count as gone. Unreachable
+  today (librqbit calls `remove_file` only on a whole-torrent delete), and
+  the read-once-trust-later shape.
+
+  *Plan.* Delete the memo. `remove_file` decides from the live selection
+  at the moment it is called -- which files of the torrent are wanted now
+  -- instead of from a record of which have been removed. If the store
+  cannot see the selection, the fallback is to clear a file's entry when
+  it is wanted again (`reselect`/pin path). Proof: remove file A, pin it
+  again, remove file B that shares a boundary piece with A; the piece
+  survives. Mutation keeps the memo.
+
+- **Two tests depend on the clock.**
+  `a_stream_wider_than_its_window_is_fetched_inside_it`
+  (`backend/librqbit.rs:8505`) and its precondition
+  `a_stream_past_the_cache_budget_stays_under_it_and_still_plays`
+  (`:8304`) run a real loopback swarm and decide "at rest" by sampling
+  every 50 ms for consecutive unchanged ticks, needing ten of them inside
+  60 s; under load the swarm never holds still for the sampler and the
+  test fails without anything being wrong. `set_lan_media_toggles_the_listener_and_the_setting_can_forbid_it`
+  (`server/tests/embed.rs:5179`) spawns a probe thread and asserts it
+  served at least one request, with nothing ordering the thread's first
+  request before the main thread stops it.
+
+  *Plan.* The LAN test: the probe reports its first served request on a
+  channel and the main thread waits for it before it toggles anything --
+  a barrier, no sleep. The swarm tests: replace the sampled "at rest" with
+  the pass's own accounting, which is deterministic -- a pass reporting
+  `fetched_since == 0` with the reader idle *is* rest -- and bound the
+  precondition on `held` reaching half the budget rather than on a fixed
+  number of passes. If that still flakes, the next step is a fake
+  `TorrentHandle` whose piece arrival the test drives (the `FakeHandle`
+  and `FakeCounters` in `enginefs/src/lib.rs` are the model), which is a
+  bigger change and not the first move.
 
 ### Standing hazards
 
@@ -108,24 +180,6 @@ Verified against the tree on 2026-09-14.
 * **Never `git checkout <file>` to undo an experiment.** It restores from
   HEAD, not from the working tree, so it discards everything uncommitted in
   that file. Copy the file to the scratchpad and copy it back instead.
-
-### Other repos, not verified on this date
-
-* xtremio's remove/add race when a title is re-added while being removed,
-  and `remove()` never releasing a row's replaces debt.
-
-## Found 2026-09-15, not yet fixed
-
-- **`a_stream_wider_than_its_window_is_fetched_inside_it` is timing-bound.**
-  It failed twice in about eight runs on 2026-09-15 while the machine was
-  building APKs beside it, and passed on every rerun; it measures bytes
-  fetched across a pass against a four-piece slack over a real librqbit
-  swarm. Not a regression of anything that day; wants either a wider
-  slack or a fake swarm. Its precondition -- the cache filling past half
-  the budget in the time allowed -- also failed once on the Windows runner
-  (29 pieces of 32), same cause. The LAN media toggle test's loopback probe
-  (`set_lan_media_toggles...`) flakes the same way on CI and passes on a
-  rerun.
 
 ## Closed 2026-09-15
 
@@ -154,6 +208,18 @@ nobody reopens them without knowing why they were shut.
 - **The detector dragging a viewer's stream to mpv's tail crawl.** Fixed
   in `78663e6` (the byte-weighted position); it was still listed under
   "not yet fixed".
+- **xtremio's remove/add race.** Read against the code on 2026-09-15: it
+  is guarded. `remove()` marks the row `pending_removal` before it unpins
+  and forgets it only if it still names the same file; a re-add overwrites
+  the mark, and a pin landing for a removed row is released
+  (`rust/src/downloads.rs:1579-1688`, tests from
+  `a_removal_forgets_and_unmarks_only_the_row_it_marked` on).
+- **`remove()` never releasing a row's `replaces` debt.** By design: the
+  old pin is carried until the new one is confirmed and paid at the next
+  boot by `release_replaced_in` (`downloads.rs:1738`), so a kill
+  mid-removal cannot lose it; `replacing_a_row_that_wants_no_pin_owes_no_release`
+  is the test. What has no test is a debt that is never paid because that
+  boot reconciliation never runs; noted, not an issue.
 
 ## First field log on the latency claim rules (2026-09-15 06:09, xtremio a58f5f0)
 
